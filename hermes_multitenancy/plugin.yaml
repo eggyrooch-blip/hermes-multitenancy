@@ -1,0 +1,7 @@
+name: multitenancy
+version: 0.0.1.spike
+description: "Spike: multi-tenant Feishu routing — pre_gateway_dispatch hook + per-profile runtime"
+author: kite
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch

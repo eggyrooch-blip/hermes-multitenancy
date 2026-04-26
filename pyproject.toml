@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-multitenancy"
+version = "0.1.0"
+description = "Multi-tenant Feishu routing for hermes-agent — one bot, N users, N profiles"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "kite"}]
+requires-python = ">=3.10"
+keywords = ["hermes", "feishu", "lark", "multi-tenant", "agent", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    # hermes-agent provides the plugin host (PluginContext / pre_gateway_dispatch hook)
+    # plus all the FeishuAdapter/MessageEvent/RoutingTable types we extend. Pin
+    # narrowly: this plugin tracks hermes-agent's plugin contract closely.
+    "hermes-agent>=1.0",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kite/hermes-multitenancy"
+Repository = "https://github.com/kite/hermes-multitenancy"
+Issues = "https://github.com/kite/hermes-multitenancy/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
+
+[project.entry-points."hermes_agent.plugins"]
+multitenancy = "hermes_multitenancy:register"
+
+[tool.setuptools]
+packages = ["hermes_multitenancy", "hermes_multitenancy.sync"]
+
+[tool.setuptools.package-data]
+hermes_multitenancy = ["plugin.yaml"]

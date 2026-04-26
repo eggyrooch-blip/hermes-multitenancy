@@ -1,0 +1,322 @@
+"""US-009 — Slash command parsing + /stop /status /new dispatch."""
+from __future__ import annotations
+
+import asyncio
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+def _build_event(text: str, user_id: str = "ou_cmd", chat_id: str = "chat-cmd"):
+    return SimpleNamespace(
+        text=text,
+        source=SimpleNamespace(
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name="cmd-user",
+            chat_type="dm",
+            platform=SimpleNamespace(value="feishu"),
+        ),
+    )
+
+
+# -- parse_command ----------------------------------------------------------
+
+def test_parse_known_commands():
+    from hermes_multitenancy.commands import parse_command
+    assert parse_command("/stop") == ("stop", "")
+    assert parse_command("/status") == ("status", "")
+    assert parse_command("/new") == ("new", "")
+    assert parse_command("/STOP") == ("stop", "")
+    assert parse_command("/stop now please") == ("stop", "now please")
+
+
+def test_parse_unknown_returns_none():
+    from hermes_multitenancy.commands import parse_command
+    assert parse_command("/unknown") is None
+    assert parse_command("hello") is None
+    assert parse_command("") is None
+    assert parse_command("/") is None
+
+
+def test_parse_rejects_paths():
+    from hermes_multitenancy.commands import parse_command
+    assert parse_command("/some/path") is None
+
+
+# -- /stop ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stop_cancels_inflight_task(monkeypatch):
+    """/stop must cancel the user's currently-running dispatch."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import runtime as runtime_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+
+    cancelled_evt = asyncio.Event()
+
+    async def slow_runner(event, home):
+        try:
+            await asyncio.sleep(60)
+            return "never"
+        except asyncio.CancelledError:
+            cancelled_evt.set()
+            raise
+
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", slow_runner)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_stop", home)
+
+        sends = []
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None):
+                sends.append(m)
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+        # Fire a long-running dispatch
+        slow_task = asyncio.create_task(
+            handle_async(event=_build_event("hello", user_id="ou_stop"), gateway=gateway)
+        )
+        # Wait until it registers in the inflight map
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if "ou_stop" in _user_inflight_tasks:
+                break
+        assert "ou_stop" in _user_inflight_tasks
+
+        # Now send /stop — should cancel the slow task
+        await handle_async(event=_build_event("/stop", user_id="ou_stop"), gateway=gateway)
+
+        # The slow runner's CancelledError handler must have fired
+        await asyncio.wait_for(cancelled_evt.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await slow_task
+
+        # /stop reply was sent
+        assert any("已停止当前任务" in s for s in sends), sends
+        assert "ou_stop" not in _user_inflight_tasks
+
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_stop_when_idle_replies_no_inflight():
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+
+    _user_inflight_tasks.clear()
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/stop", user_id="ou_idle"), gateway=gateway)
+    assert any("没有进行中的任务" in s for s in sends), sends
+
+
+# -- /status ----------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_status_reports_idle_when_no_inflight():
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+
+    _user_inflight_tasks.clear()
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/status", user_id="ou_s"), gateway=gateway)
+    assert any("空闲" in s for s in sends), sends
+
+
+@pytest.mark.asyncio
+async def test_status_reports_running_when_inflight(monkeypatch):
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import runtime as runtime_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+
+    block = asyncio.Event()
+
+    async def slow_runner(event, home):
+        await block.wait()
+        return "ok"
+
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", slow_runner)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_run", home)
+
+        sends = []
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None):
+                sends.append(m)
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+        running = asyncio.create_task(
+            handle_async(event=_build_event("hi", user_id="ou_run"), gateway=gateway)
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if "ou_run" in _user_inflight_tasks:
+                break
+
+        await handle_async(event=_build_event("/status", user_id="ou_run"), gateway=gateway)
+        assert any("运行中" in s for s in sends), sends
+
+        block.set()
+        await running
+
+    clear_spike_routes()
+
+
+# -- /new and /reset --------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_new_command_resets_session_history():
+    """/new clears the per-user history when there is a route, replies otherwise."""
+    from hermes_multitenancy.router import (
+        handle_async,
+        _user_inflight_tasks,
+        _session_history,
+        _history_key,
+    )
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    import tempfile
+
+    _user_inflight_tasks.clear()
+    _session_history.clear()
+    clear_spike_routes()
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+    # Case 1: routed user with prior history → reset acknowledges
+    with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path
+        home = Path(tmp)
+        add_spike_route("ou_resetuser", home)
+        key = _history_key(home.name, "ou_resetuser", None)
+        _session_history[key] = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old"}]
+
+        await handle_async(event=_build_event("/new", user_id="ou_resetuser"), gateway=gateway)
+        assert sends and "重置" in sends[-1], sends
+        assert key not in _session_history, "history should be cleared"
+
+    # Case 2: unrouted user → reply explains
+    sends.clear()
+    clear_spike_routes()
+    await handle_async(event=_build_event("/new", user_id="ou_unrouted"), gateway=gateway)
+    assert sends and "未路由" in sends[-1], sends
+
+
+@pytest.mark.asyncio
+async def test_help_command_lists_commands():
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    _user_inflight_tasks.clear()
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/help", user_id="ou_h"), gateway=gateway)
+    assert sends, "help should reply"
+    text = sends[-1]
+    assert "/help" in text
+    assert "/status" in text
+    assert "/new" in text
+    assert "/stop" in text
+
+
+# -- replace policy --------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_second_message_cancels_first(monkeypatch):
+    """A new dispatch from the same user should replace the prior one."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import runtime as runtime_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+
+    cancelled = asyncio.Event()
+    second_done = asyncio.Event()
+    call_count = [0]
+
+    async def runner(event, home):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return "never"
+        else:
+            await asyncio.sleep(0.01)
+            second_done.set()
+            return "second-ok"
+
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", runner)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_replace", home)
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None): pass
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+        first = asyncio.create_task(
+            handle_async(event=_build_event("first", user_id="ou_replace"), gateway=gateway)
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if call_count[0] == 1:
+                break
+
+        # Second message comes in — should cancel first
+        second = asyncio.create_task(
+            handle_async(event=_build_event("second", user_id="ou_replace"), gateway=gateway)
+        )
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(second_done.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+
+    clear_spike_routes()
