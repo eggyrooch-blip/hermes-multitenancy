@@ -90,18 +90,81 @@ def _clear_history(key: tuple[str, str]) -> bool:
     return had_cache or rows > 0
 
 
-def _build_user_message(event: Any) -> dict:
+def _build_user_message(event: Any, *, text_override: Optional[str] = None) -> dict:
     """Construct the OpenAI-format user message, splicing in reply context if any.
 
     Reply context: hermes mainstream sets ``event.reply_to_text`` when the
     user is quoting an earlier message. We surface it inline so the model
     knows what's being replied to.
+
+    ``text_override`` lets ``_enrich_with_vision`` rewrite the text before
+    the message is built (so reply context still wraps the enriched text).
     """
-    text = getattr(event, "text", "") or ""
+    text = text_override if text_override is not None else (getattr(event, "text", "") or "")
     reply_to_text = getattr(event, "reply_to_text", None)
     if reply_to_text:
         text = f"(replying to: {reply_to_text})\n{text}"
     return {"role": "user", "content": text}
+
+
+async def _enrich_with_vision(event: Any) -> Optional[str]:
+    """Auto-describe attached images via hermes' ``vision_analyze_tool``.
+
+    Mirrors mainstream ``GatewayRunner._enrich_message_with_vision`` (run.py:8245)
+    so the plugin behaves identically when the user sends pictures: each image
+    is analyzed once with a generic prompt, and the description is prepended
+    to the user's text so the model "sees" the image without an extra round-trip.
+
+    Returns:
+        The enriched text (descriptions + original text), or ``None`` if there
+        was nothing to do (no media, vision tool unavailable, all calls failed).
+    """
+    media_urls = getattr(event, "media_urls", None) or []
+    media_types = getattr(event, "media_types", None) or []
+    if not media_urls:
+        return None
+
+    try:
+        from tools.vision_tools import vision_analyze_tool  # type: ignore
+    except ImportError:
+        logger.debug("multitenancy: hermes vision_analyze_tool unavailable")
+        return None
+
+    import json as _json
+
+    descriptions: list[str] = []
+    paired = list(zip(media_urls, media_types or [""] * len(media_urls)))
+    for path, mtype in paired:
+        if mtype and not mtype.startswith("image"):
+            continue
+        try:
+            result_json = await vision_analyze_tool(
+                image_url=path,
+                user_prompt=(
+                    "Describe everything visible in this image in thorough detail. "
+                    "Include any text, code, data, objects, people, layout, colors, "
+                    "and any other notable visual information."
+                ),
+            )
+            result = _json.loads(result_json) if isinstance(result_json, str) else result_json
+            if result.get("success"):
+                descriptions.append(
+                    f"[The user sent an image. Here's what I can see:\n"
+                    f"{result.get('analysis', '')}]"
+                )
+            else:
+                descriptions.append(
+                    f"[The user sent an image but vision analysis failed: "
+                    f"{result.get('error', 'unknown')}]"
+                )
+        except Exception as exc:
+            logger.debug("multitenancy: vision_analyze_tool error on %s: %s", path, exc)
+
+    if not descriptions:
+        return None
+
+    base_text = getattr(event, "text", "") or ""
+    return "\n".join(descriptions) + ("\n" + base_text if base_text else "")
 
 
 # -- Hook entry point --------------------------------------------------------
@@ -191,12 +254,17 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             except Exception as exc:
                 logger.debug("multitenancy: on_processing_start failed: %s", exc)
 
+        # Vision enrichment — let the model "see" any attached images by
+        # running hermes' vision_analyze_tool on each and prepending the
+        # description to the user's text. No-op if no media or tool absent.
+        enriched_text = await _enrich_with_vision(event)
+
         # Build the conversation: prior history + current user message (with
         # reply context spliced in). The runner prepends the profile's SOUL.
         # First lookup for a (profile, user) pair hydrates from SessionStore.
         hist_key = _history_key(profile_name, sender, sender_alt)
         prior = _load_history(hist_key)
-        user_msg = _build_user_message(event)
+        user_msg = _build_user_message(event, text_override=enriched_text)
         conversation = prior + [user_msg]
 
         try:

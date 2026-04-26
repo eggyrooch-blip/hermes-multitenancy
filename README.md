@@ -112,8 +112,8 @@ These have all been run live against `https://api.z.ai` (GLM 5.1) and Feishu's W
 | Rate-limit retry (429 backoff, mirrors hermes mainstream cadence) | ✅ |
 | Slash commands (`/help` `/status` `/stop` `/new` `/reset`) | ✅ |
 | Idempotent feishu-sync reconciler (CLI + library) | ✅ |
-| Vision (image attachments) | ❌ Phase 5 |
-| Tool use (real AIAgent loop with browser/search/shell) | ❌ Phase 5 |
+| Vision (image attachments) | ✅ — wraps hermes' `tools.vision_tools.vision_analyze_tool`, identical UX to mainstream |
+| Tool use (real AIAgent loop with browser/search/shell) | 🚧 — design hooks ready, swap to hermes' `AIAgent` (`run_agent.py:809`) is opt-in for Phase 5 |
 
 ---
 
@@ -263,11 +263,11 @@ We pin `hermes-agent>=1.0` in `pyproject.toml` but the plugin loader contract ev
 
 ### Wanted contributions (priority order)
 
-1. **Vision support** — surface `event.media_urls` (image attachments) into multimodal LLM calls
-2. **Tool use** — invoke hermes' AIAgent loop instead of the thin `agent_real` LLM client (lets the bot use browser/search/shell tools)
-3. **Per-profile real `SessionStore`** — currently we store all sessions in one shared `multitenancy.db`; for true 1000-user scale they should split per-profile
-4. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix (cuts token cost ~50% on long-running chats)
-5. **CI matrix** — GitHub Actions running tests against multiple hermes-agent versions
+1. **Tool use** — invoke hermes' `AIAgent` class (in `run_agent.py:809`) instead of our thin `agent_real` LLM client, so the bot can use browser/search/shell tools. The `AIAgent.__init__` signature has 50+ kwargs; the integration needs careful per-profile session_db wiring + callback bridging into our streaming loop. ~200-500 lines.
+2. **Per-profile `SessionStore`** — currently all session rows live in one shared `multitenancy.db`. For true 1000-user scale they should split into per-profile DBs (mirrors hermes' own profile isolation).
+3. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix. Cuts token cost ~50% on long-running chats.
+4. **CI matrix** — GitHub Actions running `pytest tests/ -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
+5. **More slash commands** — port hermes' `/update`, `/steer`, `/queue`, `/skill` from `gateway/run.py` into `commands.py`.
 
 ---
 
