@@ -107,64 +107,75 @@ def _build_user_message(event: Any, *, text_override: Optional[str] = None) -> d
     return {"role": "user", "content": text}
 
 
-async def _enrich_with_vision(event: Any) -> Optional[str]:
-    """Auto-describe attached images via hermes' ``vision_analyze_tool``.
+async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]:
+    """Delegate inbound preprocessing to hermes' ``_prepare_inbound_message_text``.
 
-    Mirrors mainstream ``GatewayRunner._enrich_message_with_vision`` (run.py:8245)
-    so the plugin behaves identically when the user sends pictures: each image
-    is analyzed once with a generic prompt, and the description is prepended
-    to the user's text so the model "sees" the image without an extra round-trip.
+    This is the single call that mainstream uses to:
+      - run vision_analyze_tool on attached images
+      - run transcribe_audio on voice messages
+      - inject text-file content (.txt / .md / .csv / etc.)
+      - prepend reply-quoted context
+      - attribute multi-user shared sessions
+
+    By calling the same gateway method, the plugin behaves *identically* to
+    mainstream for every multimodal input — no re-implementation, no drift.
+
+    Caveat: this depends on a private GatewayRunner method. If hermes-agent
+    refactors ``_prepare_inbound_message_text``, swap to local fallbacks
+    (``_local_enrich_with_vision_only`` below as a minimal safety net).
 
     Returns:
-        The enriched text (descriptions + original text), or ``None`` if there
-        was nothing to do (no media, vision tool unavailable, all calls failed).
+        Enriched text string, or None on failure (caller falls back to event.text).
+    """
+    if gateway is None:
+        return None
+    prep = getattr(gateway, "_prepare_inbound_message_text", None)
+    if prep is None or not callable(prep):
+        logger.debug("multitenancy: gateway._prepare_inbound_message_text unavailable")
+        return await _local_enrich_with_vision_only(event)
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    try:
+        return await prep(event=event, source=source, history=[])
+    except Exception as exc:
+        logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
+        return await _local_enrich_with_vision_only(event)
+
+
+async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
+    """Local fallback if hermes' ``_prepare_inbound_message_text`` is unavailable.
+
+    Only handles images (the most common multimodal input). Audio / files /
+    reply context degrade gracefully — the model will see ``event.text`` only.
     """
     media_urls = getattr(event, "media_urls", None) or []
     media_types = getattr(event, "media_types", None) or []
     if not media_urls:
         return None
-
     try:
         from tools.vision_tools import vision_analyze_tool  # type: ignore
     except ImportError:
-        logger.debug("multitenancy: hermes vision_analyze_tool unavailable")
         return None
-
     import json as _json
-
     descriptions: list[str] = []
-    paired = list(zip(media_urls, media_types or [""] * len(media_urls)))
-    for path, mtype in paired:
+    for path, mtype in zip(media_urls, media_types or [""] * len(media_urls)):
         if mtype and not mtype.startswith("image"):
             continue
         try:
             result_json = await vision_analyze_tool(
                 image_url=path,
-                user_prompt=(
-                    "Describe everything visible in this image in thorough detail. "
-                    "Include any text, code, data, objects, people, layout, colors, "
-                    "and any other notable visual information."
-                ),
+                user_prompt="Describe this image in thorough detail.",
             )
             result = _json.loads(result_json) if isinstance(result_json, str) else result_json
             if result.get("success"):
-                descriptions.append(
-                    f"[The user sent an image. Here's what I can see:\n"
-                    f"{result.get('analysis', '')}]"
-                )
-            else:
-                descriptions.append(
-                    f"[The user sent an image but vision analysis failed: "
-                    f"{result.get('error', 'unknown')}]"
-                )
+                descriptions.append(f"[Image: {result.get('analysis', '')}]")
         except Exception as exc:
-            logger.debug("multitenancy: vision_analyze_tool error on %s: %s", path, exc)
-
+            logger.debug("multitenancy: local vision fallback error on %s: %s", path, exc)
     if not descriptions:
         return None
-
-    base_text = getattr(event, "text", "") or ""
-    return "\n".join(descriptions) + ("\n" + base_text if base_text else "")
+    base = getattr(event, "text", "") or ""
+    return "\n".join(descriptions) + ("\n" + base if base else "")
 
 
 # -- Hook entry point --------------------------------------------------------
@@ -254,10 +265,11 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             except Exception as exc:
                 logger.debug("multitenancy: on_processing_start failed: %s", exc)
 
-        # Vision enrichment — let the model "see" any attached images by
-        # running hermes' vision_analyze_tool on each and prepending the
-        # description to the user's text. No-op if no media or tool absent.
-        enriched_text = await _enrich_with_vision(event)
+        # Multi-modal enrichment — delegate to hermes' canonical pipeline so
+        # vision (images), STT (audio), text-file inject (.txt/.md/.csv etc.),
+        # reply-context wrapping, and multi-user attribution all behave EXACTLY
+        # like mainstream. Falls back to local vision-only on missing API.
+        enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
 
         # Build the conversation: prior history + current user message (with
         # reply context spliced in). The runner prepends the profile's SOUL.
@@ -694,7 +706,17 @@ async def _stream_into_feishu(
                     last_render_len = len(rendered)
         except Exception as exc:
             logger.info("multitenancy: streaming failed (%s) — falling back to non-stream", exc)
-            content = await real_run_agent(event, profile_home, messages=messages)
+            try:
+                content = await real_run_agent(event, profile_home, messages=messages)
+            except Exception as fallback_exc:
+                # Both stream + non-stream LLM paths failed (e.g. region block,
+                # exhausted credentials). Surface a user-visible error instead
+                # of leaving the "..." placeholder hanging.
+                logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
+                content = (
+                    "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
+                    "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
+                )
 
     finally:
         _PROFILE_HOME_VAR.reset(token)

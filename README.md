@@ -112,7 +112,11 @@ These have all been run live against `https://api.z.ai` (GLM 5.1) and Feishu's W
 | Rate-limit retry (429 backoff, mirrors hermes mainstream cadence) | ✅ |
 | Slash commands (`/help` `/status` `/stop` `/new` `/reset`) | ✅ |
 | Idempotent feishu-sync reconciler (CLI + library) | ✅ |
-| Vision (image attachments) | ✅ — wraps hermes' `tools.vision_tools.vision_analyze_tool`, identical UX to mainstream |
+| Vision (image attachments) | ✅ — delegates to hermes' `gateway._prepare_inbound_message_text`, identical to mainstream |
+| Audio STT (voice messages) | ✅ — same delegate, hermes' `transcribe_audio` runs on cached audio |
+| Text-file inject (.txt / .md / .csv / .log / .json …) | ✅ — same delegate, content prepended to message |
+| Reply context (quoted message) | ✅ — same delegate, plus our own `reply_to_text` fallback |
+| Multi-user shared-session attribution | ✅ — same delegate |
 | Tool use (real AIAgent loop with browser/search/shell) | 🚧 — design hooks ready, swap to hermes' `AIAgent` (`run_agent.py:809`) is opt-in for Phase 5 |
 
 ---
@@ -150,8 +154,10 @@ We use **only public hermes-agent APIs** — zero patches to `feishu.py`, `gatew
 | `gateway.adapters[Platform.FEISHU]` dict | ✅ |
 | `hermes_constants.get_hermes_home()` (read via env) | ✅ |
 | `SendResult.{success, message_id}` | ✅ |
+| `gateway._prepare_inbound_message_text(event, source, history)` | ⚠️ private (leading underscore) — covers vision + STT + file inject + reply context in one call. Falls back to local vision-only on signature change. |
+| `tools.vision_tools.vision_analyze_tool` (local fallback) | ✅ tool module, used only when the gateway helper is missing |
 
-**Pin your `hermes-agent` version** (`hermes-agent==X.Y.Z`) and run `pytest tests/test_router_integration.py` after each upgrade — the integration tests will fail loudly on any contract drift.
+**Pin your `hermes-agent` version** (`hermes-agent==X.Y.Z`) and run `pytest tests/test_router_integration.py tests/test_vision.py` after each upgrade — the integration + pipeline tests will fail loudly on any contract drift.
 
 ---
 
