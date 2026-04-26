@@ -2,7 +2,9 @@
 
 > **One Feishu bot, N users, N profiles.** A [hermes-agent](https://github.com/NousResearch/hermes-agent) plugin that routes each Feishu user to their own profile (independent SOUL.md, sessions, memories, LLM credentials) — without modifying a single line of hermes-agent.
 
-[![tests](https://img.shields.io/badge/tests-66%20passing-brightgreen)](#testing)
+**English** | [简体中文](README.zh-CN.md)
+
+[![tests](https://img.shields.io/badge/tests-71%20passing-brightgreen)](#testing)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#how-it-stays-compatible)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#proof-of-end-to-end)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
