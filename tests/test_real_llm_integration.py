@@ -17,7 +17,9 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-DEFAULT_PROFILE_HOME = Path("/Users/kite/.hermes")
+DEFAULT_PROFILE_HOME = Path(
+    os.environ.get("HERMES_INTEGRATION_PROFILE_HOME", str(Path.home() / ".hermes"))
+).expanduser()
 
 
 def _has_credentials() -> bool:

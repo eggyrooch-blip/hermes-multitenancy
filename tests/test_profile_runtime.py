@@ -20,7 +20,10 @@ def _force_reload_hermes_constants():
 @pytest.mark.asyncio
 async def test_dispatch_switches_hermes_home_during_run():
     """Mid-dispatch, hermes_constants.get_hermes_home() must return profile_home."""
-    sys.path.insert(0, "/Users/kite/.hermes/hermes-agent")
+    hermes_agent_source = Path(
+        os.environ.get("HERMES_AGENT_SOURCE", str(Path.home() / ".hermes" / "hermes-agent"))
+    ).expanduser()
+    sys.path.insert(0, str(hermes_agent_source))
     try:
         import hermes_constants  # type: ignore
     finally:
