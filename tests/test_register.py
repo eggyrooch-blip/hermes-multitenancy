@@ -30,7 +30,7 @@ def test_pyproject_entry_point():
     """pyproject.toml declares the hermes_agent.plugins entry point."""
     proj = Path(__file__).parent.parent / "pyproject.toml"
     text = proj.read_text()
-    assert 'multitenancy = "hermes_multitenancy:register"' in text
+    assert 'multitenancy = "hermes_multitenancy"' in text
 
 
 def test_register_calls_register_hook_once():

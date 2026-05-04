@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-[![tests](https://img.shields.io/badge/tests-71%20passing-brightgreen)](#-测试)
+[![tests](https://img.shields.io/badge/tests-103%20passing-brightgreen)](#-测试)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#-为什么能保持兼容)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#-端到端验证)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -26,16 +26,50 @@
 
 这个插件就是答案: 用一个 **`pre_gateway_dispatch` hook** 拦截每条飞书消息, 在 SQLite 路由表里查到这个用户对应哪个 profile, 然后派发到一个独立的 `ProfileRuntime` (持有独立的 SOUL + 历史 + LLM 客户端)。一个 Bot 服务 N 个用户, 每个用户感觉自己拥有一个专属的 hermes Agent。
 
-```
-飞书 user A ─┐
-飞书 user B ─┼─► 1 个 Bot ─► hermes gateway ─► [pre_gateway_dispatch hook]
-飞书 user C ─┘                                   │
-                                                ├─► profile_a/SOUL.md + 独立 sessions + 独立 LLM
-                                                ├─► profile_b/SOUL.md + 独立 sessions + 独立 LLM
-                                                └─► profile_c/SOUL.md + 独立 sessions + 独立 LLM
+```mermaid
+flowchart LR
+    admin["飞书管理员 / 平台运维"]
+    app["一个飞书应用 + 一个 Bot\n复用 APP_ID / APP_SECRET"]
+    userA["飞书用户 A"]
+    userB["飞书用户 B"]
+    gateway["Hermes gateway\n单 websocket"]
+    router["multitenancy router\npre_gateway_dispatch"]
+    profileA["profile: coder\nSOUL.md + sessions + tools + LLM 凭证"]
+    profileB["profile: feishu_ou_xxx\n新 SOUL.md + sessions + tools + LLM 凭证"]
+    aiagent["AIAgent subprocess\n按 profile 切 HERMES_HOME + sender open_id scope"]
+    feishu["Feishu CardKit / IM\n文本、卡片、文件"]
+
+    admin --> app
+    userA --> app
+    userB --> app
+    app --> gateway --> router
+    router -->|open_id ou_*| profileA --> aiagent --> feishu
+    router -->|新 open_id ou_*| profileB --> aiagent --> feishu
 ```
 
 **hermes-agent: 改动 0 行。** `git status` 可验。
+
+---
+
+## 👥 角色说明
+
+| 角色 | 负责内容 |
+|---|---|
+| 飞书管理员 | 创建或复用一个内部飞书应用, 开启 Bot / websocket / 权限范围, 并保证共享 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 不进 git。 |
+| 平台运维 | 安装 hermes + 本插件, 运行 gateway, 维护路由表和 profile 目录。 |
+| 飞书用户 | 通过飞书授权/UAT 流程认证一次, 之后只和同一个 Bot 对话。用户 token 从共享 Hermes home 离线刷新。 |
+| Agent profile 负责人 | 维护每个 profile 的 `SOUL.md`, `config.yaml`, `.env`, 工具策略、会话库和模型凭证。 |
+
+## 🔁 App ID 复用模型
+
+你不需要给每个用户建一个飞书应用。所有租户复用同一个飞书应用/Bot:
+
+1. 共享飞书应用凭证只放在 gateway/default Hermes 配置或环境变量里。
+2. 新路由优先使用真实飞书发送者 `open_id` (`ou_*`)。为了迁移旧数据, router 仍可 fallback 到 `union_id` (`on_*`)。
+3. 每个用户的飞书 UAT token 放在 `~/.hermes/feishu_uat/<open_id>.json`, 不要提交 token 文件。
+4. 每个 profile 的模型/工具凭证放在 `~/.hermes/profiles/<profile>/`。飞书应用共享, 但人格、记忆、工具和 LLM 凭证隔离。
+
+讨论群组: [Eggyrooch 邀请你加入飞书群](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=419if828-a007-453f-ad1c-31edef49520f)。
 
 ---
 
@@ -43,30 +77,75 @@
 
 ### 1. 安装插件
 
+正常安装请使用 Hermes 自带插件安装器。它会把本仓库 clone 到
+`~/.hermes/plugins/multitenancy`, 读取根目录 `plugin.yaml`, 并在传入
+`--enable` 时自动写入 `plugins.enabled`。
+
+```bash
+hermes plugins install eggyrooch-blip/hermes-multitenancy --enable
+hermes plugins list
+hermes gateway restart
+```
+
+本地开发再使用 editable checkout:
+
 ```bash
 git clone https://github.com/eggyrooch-blip/hermes-multitenancy ~/projects/hermes-multitenancy
-
-# 软链到 hermes 用户插件目录
-mkdir -p ~/.hermes/plugins   # 默认 profile
-ln -s ~/projects/hermes-multitenancy/hermes_multitenancy ~/.hermes/plugins/multitenancy
-
-# (如果是命名 profile, 在 ~/.hermes/profiles/<name>/plugins/ 下重复一次)
+cd ~/projects/hermes-multitenancy
+hermes plugins install "file://$PWD" --force --enable
+python -m pip install --no-deps -e ".[test]"   # 可选: 只用于跑本仓库测试
+hermes gateway restart
 ```
 
 ### 2. 在 `config.yaml` 启用
 
+传入 `--enable` 时安装器会自动完成。手动安装时, 确保默认 gateway home 有:
+
 ```yaml
-# ~/.hermes/config.yaml —— 或某个 profile 的 config
+# ~/.hermes/config.yaml
 plugins:
   enabled:
     - multitenancy
 ```
 
-### 3. 写入路由规则
+### 3. 配置一个共享飞书 Bot
+
+在默认 gateway home 里使用你已有的 Hermes 飞书应用凭证。不同 Hermes 版本的外层配置可能略有差异, 关键是所有 profile 复用同一组应用凭证。
+
+```yaml
+# ~/.hermes/config.yaml
+platforms:
+  feishu:
+    enabled: true
+    extra:
+      app_id: "${FEISHU_APP_ID}"
+      app_secret: "${FEISHU_APP_SECRET}"
+```
+
+然后让每个真实用户各自跑一次 Hermes 飞书授权/UAT 流程。token 文件应落在共享 home 下, 例如:
+
+```text
+~/.hermes/feishu_uat/ou_xxx.json
+~/.hermes/feishu_uat/ou_yyy.json
+```
+
+### 4. 创建 profile 并写入路由规则
+
+给每种租户人格创建一个 Hermes profile。每个 profile 可以有独立的
+`SOUL.md`, `.env`, 模型配置和工具策略:
 
 ```bash
-# 用自带 CLI
-python -m hermes_multitenancy.sync apply users.json
+mkdir -p ~/.hermes/profiles/alice_profile ~/.hermes/profiles/bob_profile
+$EDITOR ~/.hermes/profiles/alice_profile/SOUL.md
+$EDITOR ~/.hermes/profiles/bob_profile/SOUL.md
+```
+
+```bash
+# directory-plugin 安装路径
+python ~/.hermes/plugins/multitenancy/sync.py apply users.json
+
+# 如果你额外以 editable/pip package 安装了本仓库, 也可以用:
+hermes-multitenancy-sync apply users.json
 ```
 
 `users.json` 格式:
@@ -78,25 +157,38 @@ python -m hermes_multitenancy.sync apply users.json
 ]
 ```
 
-每个 `profile_name` 必须事先存在于 `~/.hermes/profiles/<name>/` 下, 自带 `SOUL.md` / `config.yaml` / `auth.json`。插件会把 `alice` 的 union_id 路由到 `alice_profile` 的 SOUL+memory, 把 `bob` 的 union_id 路由到 `bob_profile`。
+每个 `profile_name` 必须事先存在于 `~/.hermes/profiles/<name>/` 下, 自带 `SOUL.md` / `config.yaml` / `auth.json` 或 `.env`。插件会把 `ou_xxx` 路由到 `alice_profile` 的 SOUL+memory, 把 `ou_yyy` 路由到 `bob_profile`。
+
+第一次 UAT 也可以保留自动建档开关 (`HERMES_MULTITENANCY_AUTO_PROVISION=1`, 默认开启)。未见过的发送者 `ou_new_user` 会得到一个确定性的 profile, 例如 `~/.hermes/profiles/feishu_ou_new_user/`, 由共享 Hermes 配置初始化, 后续对话独立路由。
 
 重启 hermes gateway。**搞定。**
+
+### 5. 验证
+
+```bash
+hermes plugins list
+hermes gateway status
+sqlite3 ~/.hermes/multitenancy.db 'select open_id, profile_name, active from multitenancy_routing;'
+```
+
+让两个不同飞书用户通过同一个 Bot 发送同一句提示。gateway 日志应该能看到
+不同的 sender `ou_*` 和不同的 profile home。
 
 ---
 
 ## ✅ 端到端验证
 
-这不是 paper plugin。作者本人在自己的飞书 Bot 上跑两个测试 profile 实测过:
+这不是 paper plugin。当前 UAT 链路已经用真实飞书 Bot 跑过两个独立飞书用户, 且两个用户使用同一个 Bot:
 
 | 步骤 | 操作 | 实测结果 |
 |---|---|---|
-| 1 | 用户 A 发 `hi` | Bot 回 `[SPIKE-TEST] hi! ...` (路由到 spike_test profile) |
-| 2 | 用户 B 发 `hi` | Bot 回 `[ALICE-TENANT] 你好!...` (路由到 spike_alice, 完全不同的 SOUL, 中文人格) |
-| 3 | 用户 A: `I like apples` 然后 `what did I just say I like?` | Bot 回答 `apples` (多轮记忆生效) |
-| 4 | 重启 gateway, 用户 A: `what did I say I liked earlier?` | Bot 回答 `apples` (SQLite 持久化跨重启) |
-| 5 | `/new` 然后 `tell me what I like` | Bot 回答 "I don't know" (历史确实被清掉了, 缓存 + DB 双清) |
+| 1 | 用户 A → 同一个 Bot → router | 按真实 `ou_*` open_id 路由到已有 `coder` profile。 |
+| 2 | 用户 B → 同一个 Bot → router | 自动建档并路由到新的 `feishu_ou_xxx` profile, 不会落到 `coder`。 |
+| 3 | 两个用户发送同一套工具压测案例 | AIAgent subprocess 使用正确的 profile home 和 sender open_id scope。 |
+| 4 | 回复经 Feishu CardKit / IM 返回 | 文本卡片和文件消息路径都复用 Feishu adapter 发送。 |
+| 5 | 双账号完整压测 | 用户 A: 168/168 passed。用户 B: 168/168 passed。0 failed, 0 skipped。 |
 
-以上全部跑在真实飞书 WebSocket gateway + `https://api.z.ai` (GLM 5.1) 上。
+以上全部跑在真实飞书 WebSocket gateway + OpenAI 兼容模型 provider 上。真实 open_id、token、chat ID、app secret 均不会进入本仓库。
 
 ---
 
@@ -107,7 +199,7 @@ python -m hermes_multitenancy.sync apply users.json
 | 按飞书 user (open_id / union_id) 多租户路由 | ✅ |
 | LRU 运行时池 (最多 50 个热 profile, 5 分钟空闲淘汰) | ✅ |
 | 流式 LLM 输出 (`edit_message` 打字机效果) | ✅ |
-| 推理内容分流 (GLM 5.x thinking 模型) | ✅ |
+| thinking/reasoning 模型的推理内容分流 | ✅ |
 | 表情反应 (👀 → ✅ / ❌) via `adapter.on_processing_*` | ✅ |
 | 多轮会话记忆 (SQLite 持久化, 跨重启) | ✅ |
 | 引用上下文注入 (回复消息) | ✅ |
@@ -119,32 +211,14 @@ python -m hermes_multitenancy.sync apply users.json
 | 文本文件注入 (.txt / .md / .csv / .log / .json …) | ✅ —— 同一委托, 内容前置到消息中 |
 | 引用上下文 (回复消息) | ✅ —— 同一委托, 加上我们自己的 `reply_to_text` 兜底 |
 | 多用户共享会话归属 | ✅ —— 同一委托 |
-| 工具调用 (真正的 AIAgent loop, 浏览器/搜索/shell) | 🚧 —— 设计接口已就绪, 切换到 hermes 的 `AIAgent` (`run_agent.py:809`) 是 Phase 5 的可选项 |
-
----
-
-## 🐢 慢? 用 Haiku 替换 GLM 5.1
-
-GLM 5.1 是 *推理* 模型 —— 在吐 `content` 之前要在 `reasoning_content` 里思考 5-15 秒。这让 Bot **看起来** 卡顿, 即使插件本身没问题。两种提速方法:
-
-**方法 1 —— 切换到非推理模型。** 在你 spike profile 的 `config.yaml`:
-
-```yaml
-model:
-  default: "openrouter/anthropic/claude-3.5-haiku"
-fallback:
-  - "zai/glm-5.1"
-```
-
-在 profile 的 `.env` 设置 `OPENROUTER_API_KEY`。Haiku 端到端快 5-10 倍。
-
-**方法 2 —— 保留 GLM, 接受打字机感。** 插件会在推理阶段显示 `💭 思考中…` 占位, 让用户看到 *在动*, 不是冻死。
+| 工具调用 (真正的 AIAgent loop, 浏览器/搜索/shell) | ✅ —— 通过隔离的 `AIAgent` subprocess bridge |
+| Feishu CardKit / IM 文件消息回复 | ✅ —— 流式卡片 + 原生 `MEDIA:<path>` 投递复用 |
 
 ---
 
 ## 🛡️ 为什么能保持兼容
 
-我们 **只用 hermes-agent 的公开 API** —— `feishu.py` / `gateway/run.py` 等内部模块零 patch。插件加载契约 (`hermes_cli/plugins.py:435 register_hook`) 是唯一入口。
+我们保持 **hermes-agent 零 patch**: 不改 `feishu.py` / `gateway/run.py` / 上游模块。插件加载契约 (`hermes_cli/plugins.py:435 register_hook`) 是 gateway 入口; AIAgent/tool bridge 还会消费少量 Hermes 集成面, 每个点都有回归测试覆盖。
 
 | 我们依赖的公开 API | 稳定性 |
 |---|---|
@@ -157,27 +231,54 @@ fallback:
 | `hermes_constants.get_hermes_home()` (走环境变量读) | ✅ |
 | `SendResult.{success, message_id}` | ✅ |
 | `gateway._prepare_inbound_message_text(event, source, history)` | ⚠️ 私有 (下划线开头) —— 一次调用覆盖图像 + 语音 + 文件注入 + 引用上下文。签名变了会自动降级到本地图像-only。 |
+| `gateway.stream_consumer.GatewayStreamConsumer` | ⚠️ Hermes 集成面 —— 存在时复用 Feishu CardKit 流式卡片, 不存在则回落到文本 edit。 |
+| `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ 私有 —— 复用原生 Feishu `MEDIA:<path>` 文件投递路径。不可用时 no-op。 |
+| `run_agent.AIAgent` | ⚠️ 核心运行时类 —— 隔离在 `aiagent_subprocess.py`, 出错时回落到旧 OpenAI-compatible path。 |
+| `tools.feishu_oapi_client.sender_open_id_scope` | ⚠️ Feishu UAT bridge —— 把 token 查找限定到 `~/.hermes/feishu_uat/<open_id>.json`。 |
 | `tools.vision_tools.vision_analyze_tool` (本地兜底) | ✅ 工具模块, 仅在 gateway 助手缺失时使用 |
 
 **锁定 `hermes-agent` 版本** (`hermes-agent==X.Y.Z`), 每次升级跑 `pytest tests/test_router_integration.py tests/test_vision.py` —— 集成 + 管线测试会在契约漂移时大声失败。
 
 ---
 
+## 🧭 上游策略
+
+这个仓库更适合先保持为第三方 Hermes 插件, 而不是 fork 或直接塞进 core。
+这样发布节奏更快, 也不会把飞书多租户的业务策略硬编码进 Hermes 主仓。
+更适合提交到 `NousResearch/hermes-agent` 的 PR 应该小而通用, 例如:
+
+| 上游候选 PR | 价值 |
+|---|---|
+| 在 `MessageEvent.source` 上稳定暴露真实飞书 sender `open_id` | 去掉本插件里的 raw-event 解析, 也帮助其他飞书插件。 |
+| 文档化 `pre_gateway_dispatch` gateway hook 和 deferred processing lifecycle | 让 router 类插件更容易安全实现。 |
+| 稳定 CardKit streaming / media delivery 扩展点 | 让插件复用原生飞书 UX, 不必碰私有 gateway helper。 |
+
+完整 multitenancy router 建议等这些通用扩展面稳定、外部使用验证充分之后,
+再考虑作为 Hermes bundled plugin 提案。
+
+---
+
 ## 🏗️ 架构
 
 ```
-~/.hermes/plugins/multitenancy/  (软链到本仓库)
-  ├─ __init__.py          register(ctx) → ctx.register_hook(pre_gateway_dispatch, ...)
-  ├─ router.py            同步 hook + 异步派发 + 命令 + 懒加载单例
-  ├─ runtime.py           ProfileRuntime + contextvars 隔离的 HERMES_HOME 切换
-  ├─ pool.py              LRU RuntimePool (50 热 / 5 分钟空闲 / 冷启信号量)
-  ├─ routing.py           SQLite multitenancy_routing 表 (open_id → profile)
-  ├─ sessions.py          SQLite multitenancy_sessions (按用户历史, 持久化)
-  ├─ commands.py          parse_command (/help /status /stop /new /reset)
-  ├─ agent_real.py        OpenAI 兼容的薄 LLM 客户端 (流式 + 推理内容分流)
-  └─ sync/
-     ├─ feishu_hr.py      apply_users (幂等同步器)
-     └─ cli.py            python -m hermes_multitenancy.sync apply users.json
+~/.hermes/plugins/multitenancy/  (由 `hermes plugins install` 安装)
+  ├─ plugin.yaml          Hermes directory-plugin manifest
+  ├─ after-install.md     Hermes 安装后展示的检查清单
+  ├─ __init__.py          根 shim → hermes_multitenancy.register(ctx)
+  ├─ sync.py              directory-plugin 安装时使用的路由同步 wrapper
+  └─ hermes_multitenancy/
+     ├─ __init__.py       register(ctx) → ctx.register_hook(pre_gateway_dispatch, ...)
+     ├─ router.py         同步 hook + 异步派发 + 命令 + 懒加载单例
+     ├─ runtime.py        ProfileRuntime + contextvars 隔离的 HERMES_HOME 切换
+     ├─ pool.py           LRU RuntimePool (50 热 / 5 分钟空闲 / 冷启信号量)
+     ├─ routing.py        SQLite multitenancy_routing 表 (open_id → profile)
+     ├─ sessions.py       SQLite multitenancy_sessions (按用户历史, 持久化)
+     ├─ commands.py       parse_command (/help /status /stop /new /reset)
+     ├─ agent_real.py     AIAgent subprocess bridge + 旧 OpenAI 兼容 fallback
+     ├─ aiagent_subprocess.py 隔离子进程入口, 跑 AIAgent/tool loop
+     └─ sync/
+        ├─ feishu_hr.py   apply_users (幂等同步器)
+        └─ cli.py         路由同步的共享实现
 ```
 
 状态存在 `~/.hermes/multitenancy.db` —— 与 hermes 自己的 `state.db` 分开, 写入互不争用。开启 WAL 模式。
@@ -189,7 +290,7 @@ fallback:
 | `config.yaml` key | 默认值 | 说明 |
 |---|---|---|
 | `plugins.enabled` | (无) | 必须包含 `multitenancy` |
-| `model.default` | (你的 hermes 默认) | 按 profile, 例如 `zai/glm-5.1` 或 `openrouter/anthropic/claude-3.5-haiku` |
+| `model.default` | (你的 hermes 默认) | 按 profile 配置模型; 使用你自己的 Hermes 部署已经标准化的 provider/model。 |
 | `model.fallback` | (你的 hermes 默认) | 主模型失败时 `agent_real` 用这个 |
 
 | 插件可调项 (`router.py` 里的 Python 常量) | 默认值 | 说明 |
@@ -217,10 +318,17 @@ fallback:
 ## 🧪 测试
 
 ```bash
-# 默认套件 (无网络) —— 71 测试
-PYTHONPATH=. python -m pytest tests/ -q
+# 默认套件 (无网络)
+PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q -m "not integration"
 
-# 真实 LLM 集成 —— 调真实的 GLM 5.1 (或你配置的 provider)
+# 本 PR 使用的飞书多租户重点回归套件
+PYTHONPATH=/path/to/hermes-agent python -m pytest \
+  tests/test_hook_dispatch.py \
+  tests/test_aiagent_subprocess.py \
+  tests/test_streaming_card_transport.py \
+  -q
+
+# 真实 LLM 集成 —— 调你配置的 provider
 PYTHONPATH=. python -m pytest tests/ -m integration -v
 ```
 
@@ -232,9 +340,9 @@ PYTHONPATH=. python -m pytest tests/ -m integration -v
 
 **"所有 Bot 都不响应了"** —— 路由规则的 `open_id` 或 `union_id` 大概率写错了。在 `router.on_pre_gateway_dispatch` 里临时 `print(event.source)` 看飞书实际发过来的值, 对一下日志。
 
-**"user_id 是 `g41a5b5g` 这种, 不是我以为的 `ou_`"** —— 飞书的 `event.source.user_id` 是 hermes 内部短 ID, **不是** open_id。用 `event.source.user_id_alt` (union_id) 作为路由键, 这就是本插件的默认行为。
+**"user_id 是 `g41a5b5g` 这种, 不是我以为的 `ou_`"** —— 某些 Feishu/Hermes 路径会把短 SDK user id 放在 `event.source.user_id`。本插件现在优先从飞书 raw sender metadata/context 解析真实发送者 `open_id`, 只有迁移旧数据时才 fallback 到 `user_id_alt` / `union_id`。
 
-**"感觉很卡, 1 秒一个字"** —— 大概率用了推理模型。看 [慢? 用 Haiku](#-慢-用-haiku-替换-glm-51)。
+**"感觉很卡, 1 秒一个字"** —— 先看 gateway 日志里的模型延迟、飞书限流重试和 CardKit 更新节流。支持 reasoning 的模型可能先吐 `reasoning_content` 再吐最终文本; 插件会把这部分显示成进度, 而不是让用户以为卡死。
 
 **"重启后会话丢了"** —— 检查 `~/.hermes/multitenancy.db` 是否存在, `multitenancy_sessions` 表有没有行。如果是空的, 看 gateway 日志有没有写入错误 (`logger.debug "SessionStore.append failed"`)。
 
@@ -256,7 +364,7 @@ PYTHONPATH=. python -m pytest tests/ -m integration -v
 ### Pull Request
 
 1. Fork → 起分支 → 跑 `pytest tests/ -q` (必须全绿) → 开 PR
-2. **行为变更必须有测试。** 我们卡死 `pytest tests/ -q` 必须 71+ 全绿。
+2. **行为变更必须有测试。** 我们卡死 `pytest tests/ -q -m "not integration"` 必须 103+ 全绿。
 3. **不要大批量重命名** —— 保持 diff 小且可审。
 4. **不要 patch `feishu.py`** —— 这个插件存在的全部意义就是 hermes-agent 不被改动。如果你撞到 hermes API 限制, 去上游 https://github.com/NousResearch/hermes-agent 提 issue, 然后在这里链过来。
 
@@ -271,11 +379,10 @@ PYTHONPATH=. python -m pytest tests/ -m integration -v
 
 ### 想要的贡献 (按优先级)
 
-1. **工具调用** —— 用 hermes 的 `AIAgent` 类 (在 `run_agent.py:809`) 替换我们薄的 `agent_real` LLM 客户端, 让 Bot 能用浏览器/搜索/shell 工具。`AIAgent.__init__` 签名有 50+ kwargs; 集成需要小心做按 profile 的 session_db 接线 + 回调桥接到我们的流式 loop。约 200-500 行。
-2. **按 profile 拆 `SessionStore`** —— 当前所有会话行都在一个共享 `multitenancy.db`。要做到真正 1000 用户规模, 应该按 profile 拆库 (与 hermes 自己的 profile 隔离对齐)。
-3. **Prompt 缓存** —— Anthropic `cache_control` 给 SOUL 前缀加缓存。长期对话 token 成本砍 ~50%。
-4. **CI 矩阵** —— GitHub Actions 在多个 `hermes-agent` 版本上跑 `pytest tests/ -q`, 提早发现上游契约漂移。
-5. **更多斜杠命令** —— 把 hermes 的 `/update`, `/steer`, `/queue`, `/skill` 从 `gateway/run.py` 移植到 `commands.py`。
+1. **按 profile 拆 `SessionStore`** —— 当前所有会话行都在一个共享 `multitenancy.db`。要做到真正 1000 用户规模, 应该按 profile 拆库 (与 hermes 自己的 profile 隔离对齐)。
+2. **Prompt 缓存** —— Anthropic `cache_control` 给 SOUL 前缀加缓存。长期对话 token 成本砍 ~50%。
+3. **CI 矩阵** —— GitHub Actions 在多个 `hermes-agent` 版本上跑 `pytest tests/ -q`, 提早发现上游契约漂移。
+4. **更多斜杠命令** —— 把 hermes 的 `/update`, `/steer`, `/queue`, `/skill` 从 `gateway/run.py` 移植到 `commands.py`。
 
 ---
 

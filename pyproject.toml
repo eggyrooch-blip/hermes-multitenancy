@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Multi-tenant Feishu routing for hermes-agent — one bot, N users, N profiles"
 readme = "README.md"
 license = {file = "LICENSE"}
-authors = [{name = "kite"}]
+authors = [{name = "Hermes Multitenancy Contributors"}]
 requires-python = ">=3.10"
 keywords = ["hermes", "feishu", "lark", "multi-tenant", "agent", "plugin"]
 classifiers = [
@@ -35,9 +35,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kite/hermes-multitenancy"
-Repository = "https://github.com/kite/hermes-multitenancy"
-Issues = "https://github.com/kite/hermes-multitenancy/issues"
+Homepage = "https://github.com/eggyrooch-blip/hermes-multitenancy"
+Repository = "https://github.com/eggyrooch-blip/hermes-multitenancy"
+Issues = "https://github.com/eggyrooch-blip/hermes-multitenancy/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "pytest-asyncio>=0.21"]
@@ -46,7 +46,7 @@ test = ["pytest>=7", "pytest-asyncio>=0.21"]
 hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
 
 [project.entry-points."hermes_agent.plugins"]
-multitenancy = "hermes_multitenancy:register"
+multitenancy = "hermes_multitenancy"
 
 [tool.setuptools]
 packages = ["hermes_multitenancy", "hermes_multitenancy.sync"]

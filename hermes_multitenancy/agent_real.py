@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -61,15 +63,43 @@ async def stream_run_agent(  # type: ignore[override]
     *,
     messages: Optional[list[dict]] = None,
 ):
-    """Yields ``(kind, text)`` tuples — see ``_stream_loop`` for the actual
-    implementation. ``kind`` is one of ``"thinking"`` or ``"content"``.
+    """Yields ``(kind, text)`` tuples — Phase 4 routes through the real AIAgent.
 
-    Splitting reasoning vs. final content is critical for thinking models
-    (e.g. GLM 5.x): without surfacing reasoning chunks the user sees no
-    progress for tens of seconds while the model "thinks", then a wall of
-    text. Caller (router) typically renders thinking in a folded preview
-    and the final content in full.
+    With the AIAgent path enabled, the LLM gets the full toolset and can
+    actually call PR-added UAT tools. The subprocess bridge emits NDJSON
+    events so the parent can forward tool/reasoning/text deltas into the
+    Feishu streaming card while the synchronous AIAgent loop is still running.
+
+    Falls back to the legacy streaming path on AIAgent failure (preserves
+    the visible-typing UX even when tools cannot fire). Note: ``messages``
+    (router-provided conversation history) is currently ignored on the
+    AIAgent path — AIAgent owns its own session-db history per ``session_id``.
+    Cross-call memory rejoin is deferred to a follow-up.
     """
+    try:
+        content_parts: list[str] = []
+        final_text = ""
+        async for kind, payload in _stream_aiagent_subprocess(event, profile_home):
+            if kind == "done":
+                final_text = str(payload or "")
+                continue
+            if kind == "content":
+                text = str(payload or "")
+                if text:
+                    content_parts.append(text)
+                    yield "content", text
+                continue
+            yield kind, payload
+        if final_text and not "".join(content_parts).strip():
+            yield "content", final_text
+        if final_text or content_parts:
+            return
+    except Exception as exc:
+        logger.warning(
+            "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
+            exc, exc_info=True,
+        )
+
     async for kind, text in _stream_loop(event, profile_home, messages=messages):
         yield kind, text
 
@@ -188,12 +218,36 @@ async def real_run_agent(
     *,
     messages: Optional[list[dict]] = None,
 ) -> str:
-    """Run a single LLM completion against the profile's configured model.
+    """Run the inbound event through hermes' real AIAgent (with tool-loop).
 
-    Returns the assistant text (always non-empty when a fallback succeeds).
-    Raises RuntimeError if every candidate model+credential combination
-    fails or returns empty content.
+    Phase 4 — replaces the spike one-shot ``chat.completions.create`` call
+    with a full ``AIAgent.run_conversation()`` loop, so PR-added UAT tools
+    (e.g. feishu_calendar_list_events) actually fire. Sets
+    ``sender_open_id_scope`` so per-user UAT files are loaded correctly.
+
+    Falls back to the legacy thin LLM call (kept below as
+    ``_legacy_real_run_agent``) on any AIAgent failure so the spike-style
+    fallback path still answers the user — without tools, but at least with
+    a coherent reply.
     """
+    try:
+        return await _run_aiagent_subprocess(event, profile_home)
+    except Exception as exc:
+        logger.warning(
+            "[multitenancy] AIAgent path failed (%s); falling back to legacy spike",
+            exc, exc_info=True,
+        )
+    # Legacy / fallback path — no tool-loop, but still answers.
+    return await _legacy_real_run_agent(event, profile_home, messages=messages)
+
+
+async def _legacy_real_run_agent(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> str:
+    """Original spike implementation — kept as a fallback for the AIAgent path."""
     from openai import AsyncOpenAI
     from dotenv import dotenv_values
 
@@ -332,3 +386,602 @@ def _load_soul(profile_home: Path) -> str:
         if text:
             return text
     return "You are a helpful assistant."
+
+
+def _resolve_shared_hermes_home(profile_home: Path) -> Path:
+    """Return the default Hermes root that stores cross-profile shared auth."""
+    explicit = os.getenv("HERMES_SHARED_HOME")
+    if explicit:
+        return Path(explicit).expanduser()
+    profile_home = Path(profile_home).expanduser()
+    if profile_home.parent.name == "profiles":
+        return profile_home.parent.parent
+    return profile_home
+
+
+def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> Path:
+    """Point Feishu UAT lookups at the shared Hermes root, not the profile dir."""
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    feishu_oapi_module.FEISHU_UAT_PATH = shared_home / "feishu_uat.json"
+    feishu_oapi_module.FEISHU_UAT_DIR = shared_home / "feishu_uat"
+    return shared_home
+
+
+def _log_aiagent_tool_progress(
+    event_type: str,
+    tool_name: str,
+    preview: Any = None,
+    args: Any = None,
+    **kwargs: Any,
+) -> None:
+    """Persist AIAgent tool progress for gateway stress-test observability."""
+    if event_type == "tool.started":
+        logger.info("[multitenancy] tool.started %s preview=%s", tool_name, preview or "")
+    elif event_type == "tool.completed":
+        logger.info(
+            "[multitenancy] tool.completed %s duration=%.2fs error=%s",
+            tool_name,
+            float(kwargs.get("duration") or 0.0),
+            bool(kwargs.get("is_error")),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Isolated AIAgent subprocess bridge
+# ---------------------------------------------------------------------------
+
+
+def _jsonable(value: Any) -> Any:
+    """Return a JSON-safe representation for dataclass/enum-ish event fields."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (str, int, float, bool)):
+        return enum_value
+    return str(value)
+
+
+def _get_nested_value(obj: Any, path: tuple[str, ...]) -> Any:
+    cur = obj
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            cur = getattr(cur, key, None)
+        if cur is None:
+            return None
+    return cur
+
+
+def _find_ou_value(obj: Any) -> str:
+    """Best-effort recursive search for a Feishu open_id in raw event data."""
+    if isinstance(obj, str):
+        return obj if obj.startswith("ou_") else ""
+    if isinstance(obj, dict):
+        for key in ("open_id", "openId"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.startswith("ou_"):
+                return value
+        for value in obj.values():
+            found = _find_ou_value(value)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            found = _find_ou_value(value)
+            if found:
+                return found
+    return ""
+
+
+def _resolve_subprocess_sender_open_id(event: Any) -> str:
+    """Resolve sender ou_* for the child process after Feishu batching."""
+    try:
+        from tools.feishu_oapi_client import current_sender_open_id
+        current = current_sender_open_id.get()
+        if current and str(current).startswith("ou_"):
+            return str(current)
+    except Exception:
+        pass
+
+    source = getattr(event, "source", None)
+    for candidate in (
+        getattr(event, "sender_open_id", None),
+        getattr(source, "open_id", None) if source is not None else None,
+        getattr(source, "user_id", None) if source is not None else None,
+        getattr(source, "user_id_alt", None) if source is not None else None,
+    ):
+        if candidate and str(candidate).startswith("ou_"):
+            return str(candidate)
+
+    raw = getattr(event, "raw_message", None)
+    for path in (
+        ("event", "sender", "sender_id", "open_id"),
+        ("event", "message", "sender", "sender_id", "open_id"),
+        ("sender", "sender_id", "open_id"),
+        ("message", "sender", "sender_id", "open_id"),
+        ("sender_id", "open_id"),
+    ):
+        value = _get_nested_value(raw, path)
+        if value and str(value).startswith("ou_"):
+            return str(value)
+    return _find_ou_value(raw)
+
+
+def _event_to_subprocess_payload(event: Any, profile_home: Path) -> dict[str, Any]:
+    """Serialize the small MessageEvent surface needed by the child runner."""
+    source = getattr(event, "source", None)
+    source_payload: dict[str, Any] = {}
+    if source is not None:
+        for key in (
+            "platform",
+            "chat_id",
+            "chat_name",
+            "chat_type",
+            "user_id",
+            "user_name",
+            "thread_id",
+            "chat_topic",
+            "user_id_alt",
+            "chat_id_alt",
+            "is_bot",
+            "guild_id",
+            "parent_chat_id",
+            "message_id",
+        ):
+            if hasattr(source, key):
+                source_payload[key] = _jsonable(getattr(source, key))
+
+    message_id = (
+        getattr(event, "message_id", None)
+        or source_payload.get("message_id")
+        or ""
+    )
+    return {
+        "event": {
+            "text": getattr(event, "text", "") or "",
+            "message_id": _jsonable(message_id),
+            "sender_open_id": _resolve_subprocess_sender_open_id(event),
+            "source": source_payload,
+        },
+        "profile_home": str(profile_home),
+    }
+
+
+async def _run_aiagent_subprocess(event: Any, profile_home: Path) -> str:
+    """Run the sync AIAgent body in a fresh Python process.
+
+    The gateway stays fully async while the child process owns the synchronous
+    AIAgent/tool loop. This avoids the gateway event-loop deadlock observed
+    when ``_run_with_aiagent`` runs through ``asyncio.to_thread``.
+    """
+    import asyncio
+
+    payload = json.dumps(
+        _event_to_subprocess_payload(event, profile_home),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
+    env = os.environ.copy()
+    env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
+    env["HERMES_HOME"] = str(profile_home)
+    child_script = Path(__file__).with_name("aiagent_subprocess.py")
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(child_script),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout_s)
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"AIAgent subprocess timed out after {timeout_s:g}s") from exc
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
+    stdout_text = stdout.decode("utf-8", errors="replace").strip()
+    if stderr_text:
+        logger.debug("[multitenancy] AIAgent subprocess stderr: %s", stderr_text[-4000:])
+
+    try:
+        data = json.loads(stdout_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "AIAgent subprocess returned invalid JSON "
+            f"(exit={proc.returncode}, stdout={stdout_text[-1000:]!r}, stderr={stderr_text[-1000:]!r})"
+        ) from exc
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"AIAgent subprocess exited {proc.returncode}: "
+            f"{data.get('error') or stderr_text or stdout_text}"
+        )
+    if data.get("error"):
+        raise RuntimeError(f"AIAgent subprocess failed: {data['error']}")
+    return str(data.get("result") or "")
+
+
+async def _stream_aiagent_subprocess(event: Any, profile_home: Path):
+    """Run AIAgent in a child process and yield its NDJSON progress events."""
+    import asyncio
+
+    payload = json.dumps(
+        _event_to_subprocess_payload(event, profile_home),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
+    env = os.environ.copy()
+    env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
+    env["HERMES_HOME"] = str(profile_home)
+    env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
+    child_script = Path(__file__).with_name("aiagent_subprocess.py")
+
+    started_at = time.monotonic()
+    logger.info(
+        "[multitenancy] AIAgent subprocess spawning profile_home=%s timeout=%.1fs",
+        profile_home,
+        timeout_s,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(child_script),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    logger.info(
+        "[multitenancy] AIAgent subprocess spawned pid=%s elapsed=%.3fs",
+        proc.pid,
+        time.monotonic() - started_at,
+    )
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    saw_done = False
+    first_event_logged = False
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        await proc.stdin.drain()
+        proc.stdin.close()
+        try:
+            await proc.stdin.wait_closed()
+        except Exception:
+            pass
+
+        assert proc.stdout is not None
+        while True:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout_s)
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.debug("[multitenancy] ignoring non-json child stream line: %r", text[-500:])
+                continue
+            event_name = data.get("event")
+            if not first_event_logged:
+                first_event_logged = True
+                logger.info(
+                    "[multitenancy] AIAgent subprocess first event kind=%s elapsed=%.3fs",
+                    event_name,
+                    time.monotonic() - started_at,
+                )
+            if event_name == "done":
+                saw_done = True
+                if data.get("error"):
+                    raise RuntimeError(f"AIAgent subprocess failed: {data['error']}")
+                logger.info(
+                    "[multitenancy] AIAgent subprocess done elapsed=%.3fs result_len=%s",
+                    time.monotonic() - started_at,
+                    len(str(data.get("result") or "")),
+                )
+                yield "done", str(data.get("result") or "")
+                continue
+            if event_name == "content":
+                yield "content", str(data.get("text") or "")
+            elif event_name == "thinking":
+                yield "thinking", str(data.get("text") or "")
+            elif event_name in {"tool_started", "tool_completed"}:
+                payload_data = {k: v for k, v in data.items() if k != "event"}
+                yield str(event_name), payload_data
+            else:
+                logger.debug("[multitenancy] ignoring unknown child stream event: %s", event_name)
+
+        returncode = await asyncio.wait_for(proc.wait(), timeout=5)
+        stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
+        if stderr_text:
+            logger.debug("[multitenancy] AIAgent subprocess stderr: %s", stderr_text[-4000:])
+        logger.info(
+            "[multitenancy] AIAgent subprocess exited returncode=%s elapsed=%.3fs",
+            returncode,
+            time.monotonic() - started_at,
+        )
+        if returncode != 0:
+            raise RuntimeError(f"AIAgent subprocess exited {returncode}: {stderr_text[-1000:]}")
+        if not saw_done:
+            raise RuntimeError("AIAgent subprocess stream ended without done event")
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    except Exception:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — real AIAgent runner with tool-loop (replaces the spike one-shot)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_sender_open_id(event: Any) -> str:
+    """Pick the real Feishu open_id (ou_*) from the event source for UAT lookup.
+
+    Prefer source.user_id (typical Feishu open_id); fall back to user_id_alt
+    when the former is a union_id (on_*). Returns "" if nothing usable is found.
+    """
+    source = getattr(event, "source", None)
+    event_sender = getattr(event, "sender_open_id", None)
+    if event_sender and str(event_sender).startswith("ou_"):
+        return str(event_sender)
+    if source is None:
+        return ""
+    for candidate in (
+        getattr(source, "open_id", None),
+        getattr(source, "user_id", None),
+        getattr(source, "user_id_alt", None),
+    ):
+        if candidate and str(candidate).startswith("ou_"):
+            return str(candidate)
+    # Fallback: any non-empty user_id, even if not ou_-prefixed
+    return str(getattr(source, "user_id", "") or "")
+
+
+def _run_with_aiagent(event: Any, profile_home: Path, *, event_sink=None) -> str:
+    """Synchronous body — runs hermes' real AIAgent against the profile config.
+
+    Constructs an AIAgent with the profile's enabled toolsets + LLM
+    credentials, sets the per-user open_id contextvar so UAT tools load the
+    right token file, and runs a full tool-loop conversation.
+
+    Designed to run inside ``aiagent_subprocess.py`` so the parent gateway
+    keeps its async event loop isolated from the synchronous AIAgent/tool loop.
+    """
+    # 1) Anchor HERMES_HOME so any module that reads it sees the profile.
+    os.environ["HERMES_HOME"] = str(profile_home)
+
+    # 2) Read profile LLM config + credentials (mirrors the spike loader).
+    config = _load_yaml(profile_home / "config.yaml")
+    auth = _load_json(profile_home / "auth.json")
+    from dotenv import dotenv_values
+    env_overrides = dict(
+        dotenv_values(profile_home / ".env")
+        if (profile_home / ".env").exists()
+        else {}
+    )
+
+    primary = (config.get("model") or {}).get("default")
+    if not primary:
+        raise RuntimeError("profile config missing model.default")
+    fallback_models = config.get("fallback") or []
+
+    provider, model_only = _split_model_spec(primary)
+    api_key = _resolve_api_key(provider, env_overrides, auth)
+    if not api_key:
+        raise RuntimeError(f"no API key for primary provider {provider!r}")
+
+    base_url = _resolve_base_url(provider, True, config)
+
+    # 3) Lazy-import hermes core (only when this code path is hit).
+    from run_agent import AIAgent
+    from tools import feishu_oapi_client as feishu_oapi
+    sender_open_id_scope = feishu_oapi.sender_open_id_scope
+    current_sender_open_id = feishu_oapi.current_sender_open_id
+    shared_hermes_home = _configure_feishu_uat_home(feishu_oapi, profile_home)
+    if shared_hermes_home != profile_home:
+        logger.info(
+            "[multitenancy] using shared Feishu UAT dir: %s",
+            shared_hermes_home / "feishu_uat",
+        )
+    try:
+        from hermes_cli.tools_config import _get_platform_tools
+    except Exception:
+        _get_platform_tools = None  # graceful: fall back to None toolsets
+
+    # 4) Resolve toolsets enabled for this platform on this profile.
+    platform_key = "feishu"
+    enabled_toolsets: Optional[list[str]] = None
+    # Per-profile explicit override: profile config can pin
+    # `platform_toolsets.<platform>` to a specific list, bypassing the
+    # default-toolset composite resolution. This is the only way to keep
+    # the LLM function-calling schema small for providers (e.g. z.ai)
+    # that silently hang on huge tool batches.
+    explicit = (config.get("platform_toolsets") or {}).get(platform_key)
+    if isinstance(explicit, list) and explicit:
+        enabled_toolsets = sorted(str(t) for t in explicit)
+        logger.info(
+            "[multitenancy] platform_toolsets override for %s: %s",
+            platform_key, enabled_toolsets,
+        )
+    elif _get_platform_tools is not None:
+        try:
+            enabled_toolsets = sorted(_get_platform_tools(config, platform_key))
+        except Exception as exc:
+            logger.warning(
+                "[multitenancy] _get_platform_tools failed for %s: %s",
+                platform_key, exc,
+            )
+
+    # 5) Sender's real Feishu open_id (ou_*) for per-user UAT routing.
+    # The feishu adapter already set this contextvar in
+    # _process_inbound_message before dispatching us — prefer that value
+    # because it comes straight from sender_id.open_id (the SDK gives the
+    # ou_* form). Only fall back to event.source on weird code paths
+    # (e.g., synthetic events constructed without going through the adapter).
+    sender_open_id = (current_sender_open_id.get() or "") or _resolve_sender_open_id(event)
+
+    # 6) Pull source / session metadata for AIAgent kwargs.
+    source = getattr(event, "source", None)
+    user_text = getattr(event, "text", "") or ""
+    session_id = (
+        getattr(event, "message_id", None)
+        or (getattr(source, "chat_id", None) if source else None)
+        or "multitenancy-session"
+    )
+
+    runtime_kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        runtime_kwargs["base_url"] = base_url
+
+    fallback_model = fallback_models[0] if fallback_models else None
+
+    # 7) Wrap the agent run in sender_open_id_scope so per-user UAT tools
+    #    pick up the right token from ~/.hermes/feishu_uat/<open_id>.json.
+    logger.info(
+        "[multitenancy] running AIAgent for sender=%s profile=%s toolsets=%s",
+        sender_open_id, profile_home.name,
+        enabled_toolsets if enabled_toolsets is not None else "<default>",
+    )
+    logger.info(
+        "[multitenancy] Feishu UAT lookup sender=%s dir=%s",
+        sender_open_id,
+        shared_hermes_home / "feishu_uat",
+    )
+    with sender_open_id_scope(sender_open_id or None):
+        try:
+            from gateway.session_context import clear_session_vars, set_session_vars
+        except Exception:
+            clear_session_vars = None
+            set_session_vars = None
+
+        platform_value = str(
+            getattr(getattr(source, "platform", ""), "value", None)
+            or getattr(source, "platform", "")
+            or platform_key
+        )
+        session_tokens = None
+        if set_session_vars is not None:
+            session_tokens = set_session_vars(
+                platform=platform_value,
+                chat_id=str(getattr(source, "chat_id", "") or "") if source else "",
+                chat_name=str(getattr(source, "chat_name", "") or "") if source else "",
+                thread_id=str(getattr(source, "thread_id", "") or "") if source else "",
+                user_id=str(getattr(source, "user_id", "") or "") if source else "",
+                user_name=str(getattr(source, "user_name", "") or "") if source else "",
+                session_key=str(session_id),
+            )
+        def _emit(event_name: str, **payload: Any) -> None:
+            if event_sink is None:
+                return
+            try:
+                event_sink(event_name, **payload)
+            except Exception:
+                logger.debug("[multitenancy] event_sink failed", exc_info=True)
+
+        def _tool_progress_event_callback(
+            event_type: str,
+            tool_name: str,
+            preview: Any = None,
+            args: Any = None,
+            **kwargs: Any,
+        ) -> None:
+            _log_aiagent_tool_progress(event_type, tool_name, preview, args, **kwargs)
+            if event_type == "tool.started":
+                _emit(
+                    "tool_started",
+                    name=str(tool_name or ""),
+                    preview=str(preview or "") if preview is not None else None,
+                )
+            elif event_type == "tool.completed":
+                _emit(
+                    "tool_completed",
+                    name=str(tool_name or ""),
+                    duration=float(kwargs.get("duration") or 0.0),
+                    is_error=bool(kwargs.get("is_error")),
+                )
+            elif event_type in {"reasoning.available", "_thinking"}:
+                text = str(preview or tool_name or "")
+                if text:
+                    _emit("thinking", text=text)
+
+        def _stream_delta_event_callback(text: Any) -> None:
+            if text is None:
+                return
+            text = str(text)
+            if text:
+                _emit("content", text=text)
+
+        def _reasoning_event_callback(text: Any) -> None:
+            if text is None:
+                return
+            text = str(text)
+            if text:
+                _emit("thinking", text=text)
+
+        def _tool_gen_event_callback(tool_name: str) -> None:
+            if tool_name:
+                _emit("tool_started", name=str(tool_name), preview="generating arguments")
+
+        agent_kwargs: dict[str, Any] = {
+            # AIAgent expects the bare model name (e.g. "glm-5.1"), not the
+            # provider-prefixed form. Provider was already used above to
+            # resolve api_key + base_url; the prefix would otherwise be
+            # forwarded verbatim to the OpenAI client and rejected with
+            # `1211 Unknown Model`.
+            "model": model_only,
+            **runtime_kwargs,
+            "max_iterations": int(os.getenv("HERMES_MAX_ITERATIONS", "30")),
+            "quiet_mode": True,
+            "verbose_logging": False,
+            "session_id": str(session_id),
+            "platform": platform_key,
+            "user_id": str(getattr(source, "user_id", "") or "") if source else "",
+            "user_name": str(getattr(source, "user_name", "") or "") if source else "",
+            "chat_id": str(getattr(source, "chat_id", "") or "") if source else "",
+            "chat_name": str(getattr(source, "chat_name", "") or "") if source else "",
+            "chat_type": str(getattr(source, "chat_type", "") or "") if source else "",
+            "tool_progress_callback": _tool_progress_event_callback,
+            "stream_delta_callback": _stream_delta_event_callback if event_sink is not None else None,
+            "reasoning_callback": _reasoning_event_callback if event_sink is not None else None,
+            "tool_gen_callback": _tool_gen_event_callback if event_sink is not None else None,
+        }
+        if enabled_toolsets is not None:
+            agent_kwargs["enabled_toolsets"] = enabled_toolsets
+        if fallback_model:
+            agent_kwargs["fallback_model"] = fallback_model
+
+        agent = AIAgent(**agent_kwargs)
+        try:
+            result = agent.run_conversation(
+                user_message=user_text,
+                task_id=str(session_id),
+            )
+        finally:
+            if clear_session_vars is not None and session_tokens is not None:
+                clear_session_vars(session_tokens)
+            try:
+                if hasattr(agent, "cleanup"):
+                    agent.cleanup()
+            except Exception:
+                pass
+
+    return (result or {}).get("final_response", "") or ""

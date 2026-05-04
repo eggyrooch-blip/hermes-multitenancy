@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[![tests](https://img.shields.io/badge/tests-71%20passing-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-103%20passing-brightgreen)](#testing)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#how-it-stays-compatible)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#proof-of-end-to-end)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -26,16 +26,50 @@ I love hermes-agent — it's the most polished personal-agent runtime I've used.
 
 This plugin is the answer: a **`pre_gateway_dispatch` hook** intercepts every Feishu message, looks up the user in a SQLite routing table, dispatches to a per-user `ProfileRuntime` that holds an independent SOUL + history + LLM client. One bot serves N users, each user feels like they have their own personal hermes agent.
 
-```
-飞书 user A ─┐
-飞书 user B ─┼─► 1 个 Bot ─► hermes gateway ─► [pre_gateway_dispatch hook]
-飞书 user C ─┘                                   │
-                                                ├─► profile_a/SOUL.md + 独立 sessions + 独立 LLM
-                                                ├─► profile_b/SOUL.md + 独立 sessions + 独立 LLM
-                                                └─► profile_c/SOUL.md + 独立 sessions + 独立 LLM
+```mermaid
+flowchart LR
+    admin["Feishu admin / operator"]
+    app["One Feishu app + one bot\nshared APP_ID / APP_SECRET"]
+    userA["Feishu user A"]
+    userB["Feishu user B"]
+    gateway["Hermes gateway\nsingle websocket"]
+    router["multitenancy router\npre_gateway_dispatch"]
+    profileA["profile: coder\nSOUL.md + sessions + tools + LLM creds"]
+    profileB["profile: feishu_ou_xxx\nnew SOUL.md + sessions + tools + LLM creds"]
+    aiagent["AIAgent subprocess\nper-profile HERMES_HOME + sender open_id scope"]
+    feishu["Feishu CardKit / IM\ntext, cards, files"]
+
+    admin --> app
+    userA --> app
+    userB --> app
+    app --> gateway --> router
+    router -->|open_id ou_*| profileA --> aiagent --> feishu
+    router -->|new open_id ou_*| profileB --> aiagent --> feishu
 ```
 
 **Hermes-agent: 0 lines changed.** Verified by `git status`.
+
+---
+
+## 👥 Roles
+
+| Role | Owns |
+|---|---|
+| Feishu admin | Creates or reuses one internal Feishu app, enables the bot/websocket/scopes, and keeps the shared `FEISHU_APP_ID` / `FEISHU_APP_SECRET` out of git. |
+| Platform operator | Installs hermes + this plugin, keeps the gateway running, manages routing rows and profile directories. |
+| End user | Authorizes once through the Feishu auth/UAT flow, then talks to the same bot. User tokens refresh offline from the shared Hermes home. |
+| Agent profile owner | Maintains each profile's `SOUL.md`, `config.yaml`, `.env`, tool policy, session DB, and model credentials. |
+
+## 🔁 App ID reuse model
+
+You do **not** need one Feishu app per user. Reuse one Feishu app/bot for all tenants:
+
+1. Put the shared Feishu app credentials only in the gateway/default Hermes config or environment.
+2. Route by the real Feishu sender `open_id` (`ou_*`). The router can fall back to `union_id` (`on_*`) for migration/legacy rows, but new users should be keyed by `ou_*`.
+3. Keep per-user Feishu UAT tokens under `~/.hermes/feishu_uat/<open_id>.json`. Do not commit token files.
+4. Keep per-profile model/tool credentials under `~/.hermes/profiles/<profile>/`. The Feishu app is shared; profile persona, memory, tools and LLM credentials stay isolated.
+
+Discussion group: [Eggyrooch's Feishu group invite](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=419if828-a007-453f-ad1c-31edef49520f).
 
 ---
 
@@ -43,30 +77,76 @@ This plugin is the answer: a **`pre_gateway_dispatch` hook** intercepts every Fe
 
 ### 1. Install the plugin
 
+Use Hermes' plugin installer for normal installs. It clones this repository into
+`~/.hermes/plugins/multitenancy`, reads the root `plugin.yaml`, and adds
+`multitenancy` to `plugins.enabled` when `--enable` is supplied.
+
+```bash
+hermes plugins install eggyrooch-blip/hermes-multitenancy --enable
+hermes plugins list
+hermes gateway restart
+```
+
+For local development, use an editable checkout:
+
 ```bash
 git clone https://github.com/eggyrooch-blip/hermes-multitenancy ~/projects/hermes-multitenancy
-
-# Symlink into your hermes user-plugin directory
-mkdir -p ~/.hermes/plugins   # for default profile
-ln -s ~/projects/hermes-multitenancy/hermes_multitenancy ~/.hermes/plugins/multitenancy
-
-# (For named profiles, repeat under ~/.hermes/profiles/<name>/plugins/)
+cd ~/projects/hermes-multitenancy
+hermes plugins install "file://$PWD" --force --enable
+python -m pip install --no-deps -e ".[test]"   # optional: only for running this repo's tests
+hermes gateway restart
 ```
 
 ### 2. Enable in `config.yaml`
 
+The installer handles this when you pass `--enable`. For manual installs,
+ensure the default gateway home contains:
+
 ```yaml
-# ~/.hermes/config.yaml — or per-profile config
+# ~/.hermes/config.yaml
 plugins:
   enabled:
     - multitenancy
 ```
 
-### 3. Add routing rules
+### 3. Configure one shared Feishu bot
+
+Use your existing Hermes Feishu app credentials in the default gateway home. The exact surrounding Hermes config can vary by version; the important part is that all profiles reuse the same app credentials.
+
+```yaml
+# ~/.hermes/config.yaml
+platforms:
+  feishu:
+    enabled: true
+    extra:
+      app_id: "${FEISHU_APP_ID}"
+      app_secret: "${FEISHU_APP_SECRET}"
+```
+
+Then run your Hermes Feishu authorization/UAT flow for each real user. Token files should land under the shared home, for example:
+
+```text
+~/.hermes/feishu_uat/ou_xxx.json
+~/.hermes/feishu_uat/ou_yyy.json
+```
+
+### 4. Create profiles and add routing rules
+
+Create one Hermes profile per tenant persona. Each profile can have its own
+`SOUL.md`, `.env`, model config and tool policy:
 
 ```bash
-# Use the bundled CLI
-python -m hermes_multitenancy.sync apply users.json
+mkdir -p ~/.hermes/profiles/alice_profile ~/.hermes/profiles/bob_profile
+$EDITOR ~/.hermes/profiles/alice_profile/SOUL.md
+$EDITOR ~/.hermes/profiles/bob_profile/SOUL.md
+```
+
+```bash
+# Directory-plugin install path
+python ~/.hermes/plugins/multitenancy/sync.py apply users.json
+
+# Editable/pip install path, if you installed this repo as a package too
+hermes-multitenancy-sync apply users.json
 ```
 
 Where `users.json` is:
@@ -78,25 +158,39 @@ Where `users.json` is:
 ]
 ```
 
-Each `profile_name` should already exist as a hermes profile directory at `~/.hermes/profiles/<name>/` with its own `SOUL.md`, `config.yaml`, `auth.json`. The plugin will route Feishu messages from `alice`'s union_id to `alice_profile`'s SOUL+memory, and from `bob`'s union_id to `bob_profile`'s.
+Each `profile_name` should already exist as a hermes profile directory at `~/.hermes/profiles/<name>/` with its own `SOUL.md`, `config.yaml`, `auth.json` or `.env`. The plugin will route Feishu messages from `ou_xxx` to `alice_profile`'s SOUL+memory, and from `ou_yyy` to `bob_profile`.
+
+For first-run UAT you can also leave auto-provision enabled (`HERMES_MULTITENANCY_AUTO_PROVISION=1`, the default). An unseen sender `ou_new_user` gets a deterministic profile such as `~/.hermes/profiles/feishu_ou_new_user/`, seeded from the shared Hermes config, then routed independently on the next turn.
 
 Restart the hermes gateway. **Done.**
+
+### 5. Verify
+
+```bash
+hermes plugins list
+hermes gateway status
+sqlite3 ~/.hermes/multitenancy.db 'select open_id, profile_name, active from multitenancy_routing;'
+```
+
+Send two different Feishu users the same prompt through the same bot. The
+gateway log should show different sender `ou_*` values and different profile
+homes.
 
 ---
 
 ## ✅ Proof of end-to-end
 
-This isn't a paper plugin. The current author runs it on his actual default Feishu bot with two test profiles:
+This isn't a paper plugin. The current UAT chain has been run against a real Feishu bot with two independent Feishu users on the same bot:
 
 | Step | Action | Verified result |
 |---|---|---|
-| 1 | User A sends `hi` | Bot replies `[SPIKE-TEST] hi! ...` (routed to spike_test profile) |
-| 2 | User B sends `hi` | Bot replies `[ALICE-TENANT] 你好！...` (routed to spike_alice, different SOUL, Chinese) |
-| 3 | User A: `I like apples` then `what did I just say I like?` | Bot answers `apples` (multi-turn memory works) |
-| 4 | Restart gateway. User A: `what did I say I liked earlier?` | Bot answers `apples` (SQLite persistence survives restart) |
-| 5 | `/new` then `tell me what I like` | Bot answers "I don't know" (history was actually wiped, both cache + DB) |
+| 1 | User A → same bot → router | Routed by real `ou_*` open_id to the existing `coder` profile. |
+| 2 | User B → same bot → router | Auto-provisioned and routed to a new `feishu_ou_xxx` profile, not the `coder` profile. |
+| 3 | Both users send the same tool-heavy UAT case set | AIAgent subprocess runs with the correct profile home and sender open_id scope. |
+| 4 | Replies stream back through Feishu CardKit / IM | Text cards and file-message paths are delivered through the Feishu adapter. |
+| 5 | Full dual-account stress suite | User A: 168/168 passed. User B: 168/168 passed. 0 failed, 0 skipped. |
 
-These have all been run live against `https://api.z.ai` (GLM 5.1) and Feishu's WebSocket gateway.
+These checks were run live through Feishu's WebSocket gateway and an OpenAI-compatible model provider. Real open_ids, tokens, chat IDs and app secrets are intentionally omitted from this repository.
 
 ---
 
@@ -107,7 +201,7 @@ These have all been run live against `https://api.z.ai` (GLM 5.1) and Feishu's W
 | Multi-tenant routing per Feishu user (open_id / union_id) | ✅ |
 | LRU runtime pool (max 50 hot profiles, idle evict 5min) | ✅ |
 | Streaming LLM via `edit_message` typewriter | ✅ |
-| Reasoning-content split (GLM 5.x thinking models) | ✅ |
+| Reasoning-content split for thinking models | ✅ |
 | Reactions (👀 → ✅ / ❌) via `adapter.on_processing_*` | ✅ |
 | Multi-turn session memory (SQLite-backed, survives restart) | ✅ |
 | Reply-context injection (quoted messages) | ✅ |
@@ -119,32 +213,14 @@ These have all been run live against `https://api.z.ai` (GLM 5.1) and Feishu's W
 | Text-file inject (.txt / .md / .csv / .log / .json …) | ✅ — same delegate, content prepended to message |
 | Reply context (quoted message) | ✅ — same delegate, plus our own `reply_to_text` fallback |
 | Multi-user shared-session attribution | ✅ — same delegate |
-| Tool use (real AIAgent loop with browser/search/shell) | 🚧 — design hooks ready, swap to hermes' `AIAgent` (`run_agent.py:809`) is opt-in for Phase 5 |
-
----
-
-## 🐢 Slow? Try Haiku instead of GLM 5.1
-
-GLM 5.1 is a *reasoning* model — it spends 5-15 seconds in `reasoning_content` before emitting `content`. That makes the bot **feel** sluggish even when the plugin is doing the right thing. Two ways to speed it up:
-
-**Option 1 — Switch to a non-reasoning model.** In your spike profile's `config.yaml`:
-
-```yaml
-model:
-  default: "openrouter/anthropic/claude-3.5-haiku"
-fallback:
-  - "zai/glm-5.1"
-```
-
-Set `OPENROUTER_API_KEY` in your profile's `.env`. Haiku is 5-10× faster end-to-end.
-
-**Option 2 — Keep GLM but accept the typewriter behaviour.** The plugin shows a `💭 思考中…` placeholder during reasoning so users see *something*; it's not frozen.
+| Tool use (real AIAgent loop with browser/search/shell) | ✅ — via isolated `AIAgent` subprocess bridge |
+| Feishu CardKit / IM file-message replies | ✅ — streaming cards plus native `MEDIA:<path>` delivery reuse |
 
 ---
 
 ## 🛡️ How it stays compatible
 
-We use **only public hermes-agent APIs** — zero patches to `feishu.py`, `gateway/run.py`, or any internal module. The plugin loader contract (`hermes_cli/plugins.py:435 register_hook`) is the only entry point.
+We keep **zero patches to hermes-agent**: no edits to `feishu.py`, `gateway/run.py`, or upstream modules. The plugin loader contract (`hermes_cli/plugins.py:435 register_hook`) is the gateway entry point; the AIAgent/tool bridge also consumes a few Hermes integration surfaces and has tests around each one.
 
 | Public API we depend on | Stability |
 |---|---|
@@ -157,27 +233,55 @@ We use **only public hermes-agent APIs** — zero patches to `feishu.py`, `gatew
 | `hermes_constants.get_hermes_home()` (read via env) | ✅ |
 | `SendResult.{success, message_id}` | ✅ |
 | `gateway._prepare_inbound_message_text(event, source, history)` | ⚠️ private (leading underscore) — covers vision + STT + file inject + reply context in one call. Falls back to local vision-only on signature change. |
+| `gateway.stream_consumer.GatewayStreamConsumer` | ⚠️ Hermes integration surface — reused for Feishu CardKit streaming when present, with text-edit fallback. |
+| `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ private — reused so `MEDIA:<path>` file replies follow the native Feishu path. No-op if unavailable. |
+| `run_agent.AIAgent` | ⚠️ core runtime class — isolated in `aiagent_subprocess.py` so failures fall back to the legacy OpenAI-compatible path. |
+| `tools.feishu_oapi_client.sender_open_id_scope` | ⚠️ Feishu UAT bridge — scopes token lookup to `~/.hermes/feishu_uat/<open_id>.json`. |
 | `tools.vision_tools.vision_analyze_tool` (local fallback) | ✅ tool module, used only when the gateway helper is missing |
 
 **Pin your `hermes-agent` version** (`hermes-agent==X.Y.Z`) and run `pytest tests/test_router_integration.py tests/test_vision.py` after each upgrade — the integration + pipeline tests will fail loudly on any contract drift.
 
 ---
 
+## 🧭 Upstream strategy
+
+This repository is intended to stay a third-party Hermes plugin, not a fork.
+That keeps rollout fast and avoids adding Feishu-multitenancy-specific policy
+to Hermes core. A good upstream PR to `NousResearch/hermes-agent` would be
+small and generic, for example:
+
+| Upstream candidate | Why |
+|---|---|
+| Expose real Feishu sender `open_id` directly on `MessageEvent.source` | Removes raw-event parsing from this plugin and helps any Feishu plugin. |
+| Document `pre_gateway_dispatch` gateway hooks and deferred processing lifecycle | Makes router-style plugins easier to build safely. |
+| Stabilize CardKit streaming/media delivery extension points | Lets plugins reuse native Feishu UX without touching private gateway helpers. |
+
+The full multitenancy router should only be proposed as a bundled Hermes plugin
+after those generic surfaces settle and external usage proves the behavior.
+
+---
+
 ## 🏗️ Architecture
 
 ```
-~/.hermes/plugins/multitenancy/  (symlink to this repo)
-  ├─ __init__.py          register(ctx) → ctx.register_hook(pre_gateway_dispatch, ...)
-  ├─ router.py            sync hook + async dispatch + commands + lazy singletons
-  ├─ runtime.py           ProfileRuntime + contextvars-isolated HERMES_HOME switch
-  ├─ pool.py              LRU RuntimePool (50 hot / 5min idle / cold-start sem)
-  ├─ routing.py           SQLite multitenancy_routing table (open_id → profile)
-  ├─ sessions.py          SQLite multitenancy_sessions (per-user history, persistent)
-  ├─ commands.py          parse_command (/help /status /stop /new /reset)
-  ├─ agent_real.py        OpenAI-compat thin LLM client (streaming + reasoning split)
-  └─ sync/
-     ├─ feishu_hr.py      apply_users (idempotent reconciler)
-     └─ cli.py            python -m hermes_multitenancy.sync apply users.json
+~/.hermes/plugins/multitenancy/  (installed by `hermes plugins install`)
+  ├─ plugin.yaml          Hermes directory-plugin manifest
+  ├─ after-install.md     post-install checklist rendered by Hermes
+  ├─ __init__.py          root shim → hermes_multitenancy.register(ctx)
+  ├─ sync.py              route-sync wrapper for directory-plugin installs
+  └─ hermes_multitenancy/
+     ├─ __init__.py       register(ctx) → ctx.register_hook(pre_gateway_dispatch, ...)
+     ├─ router.py         sync hook + async dispatch + commands + lazy singletons
+     ├─ runtime.py        ProfileRuntime + contextvars-isolated HERMES_HOME switch
+     ├─ pool.py           LRU RuntimePool (50 hot / 5min idle / cold-start sem)
+     ├─ routing.py        SQLite multitenancy_routing table (open_id → profile)
+     ├─ sessions.py       SQLite multitenancy_sessions (per-user history, persistent)
+     ├─ commands.py       parse_command (/help /status /stop /new /reset)
+     ├─ agent_real.py     AIAgent subprocess bridge + legacy OpenAI-compat fallback
+     ├─ aiagent_subprocess.py isolated child-process entry point for AIAgent/tool loop
+     └─ sync/
+        ├─ feishu_hr.py   apply_users (idempotent reconciler)
+        └─ cli.py         shared implementation for route sync
 ```
 
 State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from hermes' own `state.db` so writes don't contend. WAL mode is enabled.
@@ -189,7 +293,7 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | `config.yaml` key | Default | Notes |
 |---|---|---|
 | `plugins.enabled` | (none) | Must include `multitenancy` |
-| `model.default` | (your hermes default) | Per-profile, e.g. `zai/glm-5.1` or `openrouter/anthropic/claude-3.5-haiku` |
+| `model.default` | (your hermes default) | Per-profile model selection; use whatever provider/model your Hermes deployment already standardizes on. |
 | `model.fallback` | (your hermes default) | Used by `agent_real` if primary fails |
 
 | Plugin tunable (Python constants in `router.py`) | Default | Notes |
@@ -217,10 +321,17 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 ## 🧪 Testing
 
 ```bash
-# Default suite (no network) — 66 tests
-PYTHONPATH=. python -m pytest tests/ -q
+# Default suite (no network)
+PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q -m "not integration"
 
-# Live LLM integration — calls real GLM 5.1 (or your configured provider)
+# Focused Feishu multitenancy regression suite used for this PR
+PYTHONPATH=/path/to/hermes-agent python -m pytest \
+  tests/test_hook_dispatch.py \
+  tests/test_aiagent_subprocess.py \
+  tests/test_streaming_card_transport.py \
+  -q
+
+# Live LLM integration — calls your configured provider
 PYTHONPATH=. python -m pytest tests/ -m integration -v
 ```
 
@@ -232,9 +343,9 @@ PYTHONPATH=. python -m pytest tests/ -m integration -v
 
 **"all bots stopped responding"** — your routing rule probably has the wrong `open_id` or `union_id`. Check the actual values that arrive from Feishu by adding a temporary `print(event.source)` in `router.on_pre_gateway_dispatch` and watching the gateway log.
 
-**"user_id is `g41a5b5g`-ish, not the `ou_` I expected"** — Feishu's `event.source.user_id` is hermes' internal short ID, **not** open_id. Use `event.source.user_id_alt` (union_id) as your routing key, which is what this plugin does by default.
+**"user_id is `g41a5b5g`-ish, not the `ou_` I expected"** — some Feishu/Hermes paths expose a short SDK user ID on `event.source.user_id`. This plugin now resolves the real sender `open_id` from Feishu raw sender metadata/context first, and only falls back to `user_id_alt` / `union_id` for legacy rows.
 
-**"feels slow, 1s per character"** — you're probably using a reasoning model. See [Slow? Try Haiku](#-slow-try-haiku-instead-of-glm-51).
+**"feels slow, 1s per character"** — check the gateway log for model latency, Feishu rate-limit retries, and CardKit update throttling. Reasoning-capable models may stream `reasoning_content` before final text; the plugin surfaces that as progress instead of hiding it.
 
 **"sessions lost after restart"** — verify `~/.hermes/multitenancy.db` exists and the `multitenancy_sessions` table has rows. If it's empty, check for write errors in the gateway log (`logger.debug "SessionStore.append failed"`).
 
@@ -256,7 +367,7 @@ When filing a bug, please include:
 ### Pull requests
 
 1. Fork → create a branch → run `pytest tests/ -q` (must be green) → open PR.
-2. **Tests are required** for behaviour changes. We hold a hard line on `pytest tests/ -q` staying at 66+ green.
+2. **Tests are required** for behaviour changes. We hold a hard line on `pytest tests/ -q -m "not integration"` staying at 103+ green.
 3. **Don't mass-rename** — keep diffs small and reviewable.
 4. **No `feishu.py` patches** — the whole point of this plugin is hermes-agent stays unmodified. If you find a hermes API limitation, file an upstream issue at https://github.com/NousResearch/hermes-agent and link it here.
 
@@ -271,11 +382,10 @@ We pin `hermes-agent>=1.0` in `pyproject.toml` but the plugin loader contract ev
 
 ### Wanted contributions (priority order)
 
-1. **Tool use** — invoke hermes' `AIAgent` class (in `run_agent.py:809`) instead of our thin `agent_real` LLM client, so the bot can use browser/search/shell tools. The `AIAgent.__init__` signature has 50+ kwargs; the integration needs careful per-profile session_db wiring + callback bridging into our streaming loop. ~200-500 lines.
-2. **Per-profile `SessionStore`** — currently all session rows live in one shared `multitenancy.db`. For true 1000-user scale they should split into per-profile DBs (mirrors hermes' own profile isolation).
-3. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix. Cuts token cost ~50% on long-running chats.
-4. **CI matrix** — GitHub Actions running `pytest tests/ -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
-5. **More slash commands** — port hermes' `/update`, `/steer`, `/queue`, `/skill` from `gateway/run.py` into `commands.py`.
+1. **Per-profile `SessionStore`** — currently all session rows live in one shared `multitenancy.db`. For true 1000-user scale they should split into per-profile DBs (mirrors hermes' own profile isolation).
+2. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix. Cuts token cost ~50% on long-running chats.
+3. **CI matrix** — GitHub Actions running `pytest tests/ -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
+4. **More slash commands** — port hermes' `/update`, `/steer`, `/queue`, `/skill` from `gateway/run.py` into `commands.py`.
 
 ---
 
