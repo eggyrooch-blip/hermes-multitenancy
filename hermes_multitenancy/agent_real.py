@@ -415,6 +415,59 @@ def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> P
     return shared_home
 
 
+def _configure_cron_home(shared_home: Path) -> None:
+    """Make cronjob tool writes visible to the shared gateway scheduler.
+
+    The gateway cron ticker imports ``cron.jobs`` under the shared Hermes home
+    and only scans ``<shared>/cron/jobs.json``. Multitenant AIAgent subprocesses
+    run with ``HERMES_HOME=<profile>``, so importing ``cron.jobs`` there would
+    otherwise bind cron storage to ``<profile>/cron/jobs.json``. That creates
+    jobs that remain forever ``scheduled`` because no gateway ticker watches
+    that profile-local file.
+    """
+    import importlib
+
+    shared_home = Path(shared_home).expanduser()
+    old_home = os.environ.get("HERMES_HOME")
+    try:
+        os.environ["HERMES_HOME"] = str(shared_home)
+        cron_jobs = importlib.import_module("cron.jobs")
+        cron_jobs.HERMES_DIR = shared_home.resolve()
+        cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+
+        cronjob_tools = importlib.import_module("tools.cronjob_tools")
+
+        def _validate_shared_cron_script_path(script: Optional[str]) -> Optional[str]:
+            if not script or not str(script).strip():
+                return None
+            raw = str(script).strip()
+            if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
+                return (
+                    "Script path must be relative to shared ~/.hermes/scripts/. "
+                    f"Got absolute or home-relative path: {raw!r}."
+                )
+            from tools.path_security import validate_within_dir
+
+            scripts_dir = shared_home / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
+            if containment_error:
+                return f"Script path escapes the shared scripts directory via traversal: {raw!r}"
+            return None
+
+        cronjob_tools._validate_cron_script_path = _validate_shared_cron_script_path
+        logger.info("[multitenancy] cron jobs bound to shared Hermes home: %s", cron_jobs.JOBS_FILE)
+    except Exception as exc:
+        logger.warning("[multitenancy] failed to bind cron jobs to shared Hermes home: %s", exc)
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+
+
 def _log_aiagent_tool_progress(
     event_type: str,
     tool_name: str,
@@ -945,6 +998,7 @@ def _run_with_aiagent(
     sender_open_id_scope = feishu_oapi.sender_open_id_scope
     current_sender_open_id = feishu_oapi.current_sender_open_id
     shared_hermes_home = _configure_feishu_uat_home(feishu_oapi, profile_home)
+    _configure_cron_home(shared_hermes_home)
     if shared_hermes_home != profile_home:
         logger.info(
             "[multitenancy] using shared Feishu UAT dir: %s",
