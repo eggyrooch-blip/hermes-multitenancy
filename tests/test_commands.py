@@ -281,12 +281,13 @@ async def test_help_command_lists_commands():
 
 
 @pytest.mark.asyncio
-async def test_known_hermes_command_uses_gateway_handler_not_agent(monkeypatch, tmp_path):
+async def test_known_hermes_command_uses_gateway_handler_not_agent(monkeypatch, tmp_path, caplog):
     """/model and future Hermes commands should be handled by Hermes, not sent to AIAgent."""
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
+    caplog.set_level("INFO")
     clear_spike_routes()
     _user_inflight_tasks.clear()
     add_spike_route("ou_model", tmp_path)
@@ -312,6 +313,7 @@ async def test_known_hermes_command_uses_gateway_handler_not_agent(monkeypatch, 
     await handle_async(event=_build_event("/model glm-5.1", user_id="ou_model"), gateway=Gateway())
 
     assert sends == ["gateway handled /model glm-5.1"]
+    assert "Hermes gateway command handled: model" in caplog.text
     clear_spike_routes()
 
 
@@ -352,10 +354,11 @@ async def test_gateway_command_gets_profile_scoped_session_key(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unknown_slash_replies_without_agent_dispatch(monkeypatch):
+async def test_unknown_slash_replies_without_agent_dispatch(monkeypatch, caplog):
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy import router as router_mod
 
+    caplog.set_level("INFO")
     _user_inflight_tasks.clear()
     sends = []
 
@@ -376,10 +379,11 @@ async def test_unknown_slash_replies_without_agent_dispatch(monkeypatch):
         "Unknown command `/definitely_unknown`. Type /commands to see what's available, "
         "or resend without the leading slash to send as a regular message."
     ]
+    assert "Unknown command `/definitely_unknown`" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_path):
+async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_path, caplog):
     """Hermes skill slash commands are agent turns, not unknown gateway commands."""
     import sys
     from types import ModuleType
@@ -388,6 +392,7 @@ async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_p
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
+    caplog.set_level("INFO")
     clear_spike_routes()
     _user_inflight_tasks.clear()
     profile_home = tmp_path / "coder"
@@ -435,11 +440,12 @@ async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_p
         "text": "[skill:/demo-skill task:multitenancy:feishu:coder:chat-cmd:ou_skill] write docs",
     }
     assert sends == ["agent ok"]
+    assert "Hermes skill slash invocation" in caplog.text
     clear_spike_routes()
 
 
 @pytest.mark.asyncio
-async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_path):
+async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_path, caplog):
     """Plugin-registered slash commands should be delegated before unknown handling."""
     import sys
     from types import ModuleType
@@ -448,6 +454,7 @@ async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
+    caplog.set_level("INFO")
     clear_spike_routes()
     _user_inflight_tasks.clear()
     add_spike_route("ou_plugin", tmp_path)
@@ -481,16 +488,18 @@ async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_
 
     assert called == {"args": "hi there"}
     assert sends == ["plugin handled hi there"]
+    assert "Hermes plugin slash handler" in caplog.text
     clear_spike_routes()
 
 
 @pytest.mark.asyncio
-async def test_quick_command_alias_reuses_gateway_handler(monkeypatch, tmp_path):
+async def test_quick_command_alias_reuses_gateway_handler(monkeypatch, tmp_path, caplog):
     """Gateway quick-command aliases should expand before fallback unknown handling."""
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
+    caplog.set_level("INFO")
     clear_spike_routes()
     _user_inflight_tasks.clear()
     add_spike_route("ou_quick_alias", tmp_path)
@@ -517,16 +526,18 @@ async def test_quick_command_alias_reuses_gateway_handler(monkeypatch, tmp_path)
     await handle_async(event=_build_event("/mini high", user_id="ou_quick_alias"), gateway=Gateway())
 
     assert sends == ["model handler saw: /model glm-5.1 high"]
+    assert "Hermes quick command alias" in caplog.text
     clear_spike_routes()
 
 
 @pytest.mark.asyncio
-async def test_quick_command_exec_runs_without_agent_dispatch(monkeypatch, tmp_path):
+async def test_quick_command_exec_runs_without_agent_dispatch(monkeypatch, tmp_path, caplog):
     """Gateway quick-command exec entries are control-plane commands."""
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
+    caplog.set_level("INFO")
     clear_spike_routes()
     _user_inflight_tasks.clear()
     add_spike_route("ou_quick_exec", tmp_path)
@@ -550,6 +561,7 @@ async def test_quick_command_exec_runs_without_agent_dispatch(monkeypatch, tmp_p
     await handle_async(event=_build_event("/ping", user_id="ou_quick_exec"), gateway=gateway)
 
     assert sends == ["quick-ok"]
+    assert "Hermes quick command exec" in caplog.text
     clear_spike_routes()
 
 

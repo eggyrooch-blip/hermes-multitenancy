@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-[![tests](https://img.shields.io/badge/tests-103%20passing-brightgreen)](#-测试)
+[![tests](https://img.shields.io/badge/tests-128%20passing-brightgreen)](#-测试)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#-为什么能保持兼容)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#-端到端验证)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -38,6 +38,7 @@ flowchart LR
     unknown["未知用户\n未进入同步结果"]
     gateway["Hermes gateway\n单 websocket"]
     router["multitenancy router\npre_gateway_dispatch"]
+    slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
     fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
@@ -52,6 +53,9 @@ flowchart LR
     userB --> app
     unknown --> app
     app --> gateway --> router
+    router -->|slash command| slash
+    slash -->|gateway handler / quick / plugin / unknown| feishu
+    slash -->|skill invocation| aiagent
     router --> table
     table -->|active route| profileA --> aiagent --> feishu
     table -->|active route| profileB --> aiagent
@@ -226,6 +230,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 3 | 两个用户发送同一套工具压测案例 | AIAgent subprocess 使用正确的 profile home 和 sender open_id scope。 |
 | 4 | 回复经 Feishu CardKit / IM 返回 | 文本卡片和文件消息路径都复用 Feishu adapter 发送。 |
 | 5 | 双账号完整压测 | 使用 `--users <用户A>,<用户B> --parallel-users` 运行; 每个用例会记录独立的 `case_id::user` checkpoint。 |
+| 6 | 动态 slash 控制面 | 双账号 `slash` suite `16/16` 通过: `/model`、`/reasoning`、`/reload-mcp` 走 gateway handler; skill slash 改写为原生 skill invocation; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec 不进 LLM; unknown slash 返回 Hermes 风格 unknown-command。 |
 
 以上全部跑在真实飞书 WebSocket gateway + OpenAI 兼容模型 provider 上。真实 open_id、token、chat ID、app secret 均不会进入本仓库。
 
@@ -243,7 +248,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 多轮会话记忆 (SQLite 持久化, 跨重启) | ✅ |
 | 引用上下文注入 (回复消息) | ✅ |
 | 限流退避 (429 backoff, 与 hermes 主线节奏一致) | ✅ |
-| Hermes 斜杠命令控制面 | ✅ —— 动态识别 Hermes gateway 命令; multitenant 必须本地掌握的 `/stop` `/status` `/new` `/reset` 保留薄壳, 其他已知命令优先透传给 gateway handler, 不再漏进 LLM |
+| Hermes 斜杠命令控制面 | ✅ —— 动态识别 Hermes registry 命令; `/model`、`/reasoning`、`/reload-mcp` 等走 gateway handler; skill slash 改写为 Hermes 原生 skill invocation; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick_commands 支持 alias/exec; unknown slash 返回 Hermes 风格 unknown-command, 不漏进 LLM |
 | 幂等 feishu-sync 同步器 (CLI + 库) | ✅ |
 | Python 飞书通讯录组织同步 (`pull-feishu`) | ✅ —— 自动创建/更新 profile、SOUL 托管区块和路由表 |
 | 图像识别 (图片附件) | ✅ —— 委托给 hermes 的 `gateway._prepare_inbound_message_text`, 行为与主线一致 |
@@ -445,7 +450,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 ### Pull Request
 
 1. Fork → 起分支 → 跑 `pytest tests/ -q` (必须全绿) → 开 PR
-2. **行为变更必须有测试。** 我们卡死 `pytest tests/ -q -m "not integration"` 必须 103+ 全绿。
+2. **行为变更必须有测试。** 我们卡死 `pytest tests/ -q -m "not integration"` 必须 128+ 全绿。
 3. **不要大批量重命名** —— 保持 diff 小且可审。
 4. **不要 patch `feishu.py`** —— 这个插件存在的全部意义就是 hermes-agent 不被改动。如果你撞到 hermes API 限制, 去上游 https://github.com/NousResearch/hermes-agent 提 issue, 然后在这里链过来。
 
@@ -463,7 +468,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 1. **按 profile 拆 `SessionStore`** —— 当前所有会话行都在一个共享 `multitenancy.db`。要做到真正 1000 用户规模, 应该按 profile 拆库 (与 hermes 自己的 profile 隔离对齐)。
 2. **Prompt 缓存** —— Anthropic `cache_control` 给 SOUL 前缀加缓存。长期对话 token 成本砍 ~50%。
 3. **CI 矩阵** —— GitHub Actions 在多个 `hermes-agent` 版本上跑 `pytest tests/ -q`, 提早发现上游契约漂移。
-4. **更多斜杠命令** —— 把 hermes 的 `/update`, `/steer`, `/queue`, `/skill` 从 `gateway/run.py` 移植到 `commands.py`。
+4. **更多 live UAT fixture** —— 扩大写操作/破坏性路径覆盖,但不依赖共享生产类资源。
 
 ---
 
