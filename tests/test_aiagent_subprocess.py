@@ -87,6 +87,41 @@ def _install_fake_gateway_session_context(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
 
 
+def _install_fake_approval(monkeypatch):
+    registered: dict[str, object] = {}
+    resolved: list[tuple[str, str]] = []
+    current_session = contextvars.ContextVar("approval_session", default="")
+
+    def set_current_session_key(session_key: str):
+        return current_session.set(session_key)
+
+    def reset_current_session_key(token):
+        current_session.reset(token)
+
+    def register_gateway_notify(session_key: str, cb):
+        registered[session_key] = cb
+
+    def unregister_gateway_notify(session_key: str):
+        registered.pop(session_key, None)
+
+    def resolve_gateway_approval(session_key: str, choice: str, resolve_all=False):
+        resolved.append((session_key, choice))
+        return 1
+
+    fake_approval = SimpleNamespace(
+        set_current_session_key=set_current_session_key,
+        reset_current_session_key=reset_current_session_key,
+        register_gateway_notify=register_gateway_notify,
+        unregister_gateway_notify=unregister_gateway_notify,
+        resolve_gateway_approval=resolve_gateway_approval,
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.approval = fake_approval
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.approval", fake_approval)
+    return registered, resolved
+
+
 @pytest.mark.asyncio
 async def test_real_run_agent_uses_subprocess_runner(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
@@ -454,6 +489,19 @@ def test_aiagent_session_id_isolates_users_in_same_feishu_chat(tmp_path: Path):
     )
 
 
+def test_multitenant_gateway_session_key_matches_router_shape(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    event = _event()
+
+    assert agent_real._resolve_multitenant_gateway_session_key(
+        event,
+        profile_home,
+        "ou_test",
+    ) == "multitenancy:feishu:coder:oc_test:ou_test"
+
+
 def test_resolve_enabled_toolsets_merges_feishu_override_with_default_tools():
     from hermes_multitenancy import agent_real
 
@@ -558,6 +606,94 @@ def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path:
             "is_error": False,
         },
     ]
+
+
+def test_run_with_aiagent_bridges_gateway_approval_to_event_sink(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - feishu_chat\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_DIR", str(approval_dir))
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_TIMEOUT", "1")
+
+    registered, resolved = _install_fake_approval(monkeypatch)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            session_key = self.kwargs["gateway_session_key"]
+            assert session_key == "multitenancy:feishu:coder:oc_test:ou_test"
+            notify = registered[session_key]
+            notify({
+                "command": "python -c 'print(1)'",
+                "description": "script execution via -c flag",
+                "pattern_keys": ["script execution via -c flag"],
+            })
+            return {"final_response": "approved"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "approval_required":
+            Path(payload["decision_path"]).write_text(
+                json.dumps({"choice": "once"}),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    result = agent_real._run_with_aiagent(_event(), profile_home, event_sink=sink)
+
+    assert result == "approved"
+    assert events[0]["event"] == "approval_required"
+    assert events[0]["session_key"] == "multitenancy:feishu:coder:oc_test:ou_test"
+    assert events[0]["command"] == "python -c 'print(1)'"
+    assert events[1]["event"] == "approval_resolved"
+    assert events[1]["choice"] == "once"
+    assert resolved == [("multitenancy:feishu:coder:oc_test:ou_test", "once")]
+
+
+def test_run_with_aiagent_closes_real_agent_resources(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    seen = {"closed": False}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home) == "ok"
+    assert seen["closed"] is True
 
 
 @pytest.mark.asyncio

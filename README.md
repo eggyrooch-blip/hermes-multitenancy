@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-139%20passing-brightgreen)](#testing)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#how-it-stays-compatible)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#proof-of-end-to-end)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -40,10 +40,12 @@ flowchart LR
     router["multitenancy router\npre_gateway_dispatch"]
     guard["tenant boundary guard\ncanonical sender / env lock / media filter / exec opt-in"]
     slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
+    approval["approval bridge\nchild approval -> router /approve"]
+    cron["shared cron store\n~/.hermes/cron/jobs.json"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
     fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
-    aiagent["AIAgent subprocess\nper-profile HERMES_HOME + sender open_id scope"]
+    aiagent["AIAgent subprocess\nprofile HERMES_HOME + shared-return bridges"]
     feishu["Feishu CardKit / IM\ntext, cards, files"]
 
     admin --> app
@@ -63,6 +65,9 @@ flowchart LR
     table -->|active route| profileB --> aiagent
     guard -->|route miss + auto-provision| fallback --> aiagent
     aiagent -->|MEDIA path must stay in profile home| feishu
+    aiagent -->|cronjob create| cron -->|gateway ticker delivers| feishu
+    aiagent -->|dangerous command approval_required| approval -->|prompt + decision file| feishu
+    feishu -->|/approve / /deny| router --> approval
 ```
 
 **Hermes-agent: 0 lines changed.** Verified by `git status`.
@@ -78,12 +83,15 @@ If you are an agent taking over this repo, this is the main contract:
 3. **Routes live in SQLite.** `multitenancy_routing.open_id -> profile_name` decides which `~/.hermes/profiles/<profile>/` handles the turn. A real `ou_*` will not be absorbed by a stale `union_id`; legacy alt routes are used only when no real `ou_*` is available.
 4. **Normal messages run inside the routed profile.** The router builds a profile-scoped event, writes the resolved `sender_open_id` back to the event, then dispatches to the streaming AIAgent subprocess. The child process runs with that profile's `HERMES_HOME`; Feishu UAT tokens are still loaded from `~/.hermes/feishu_uat/<open_id>.json`.
 5. **Cron/reminder jobs use the shared gateway scheduler store.** Inside the AIAgent subprocess, `agent_real._configure_cron_home()` temporarily binds `cron.jobs` and `tools.cronjob_tools` to the shared Hermes home (`~/.hermes/cron/jobs.json`), not `~/.hermes/profiles/<profile>/cron/jobs.json`. This matters because the single gateway cron ticker only watches the shared store; otherwise "remind me in 3 minutes" jobs can stay forever `scheduled`.
-6. **Memory is keyed by `(profile, canonical sender)`.** `_history_key()` does not use `sender_alt or sender`, so stale/shared alternate IDs cannot merge two users' memory.
-7. **Slash commands never leak into the LLM.** `/model`, `/reasoning`, `/reload-mcp` and other registry commands use Hermes gateway handlers; skill slash rewrites into native skill invocation for the routed profile; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; unknown slash returns Hermes-style unknown-command.
-8. **Slash handlers run with a profile context lock.** Gateway/plugin handlers execute inside `_profile_gateway_context()`, which serializes temporary `HERMES_HOME` and gateway session-key overrides so concurrent slash commands cannot cross profiles.
-9. **Local exec is off by default.** `quick_commands` alias remains available; `type: exec` is denied unless `multitenancy.allow_quick_exec: true` or `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` is set. Allowed exec inherits the routed profile's `HERMES_HOME`. Keep it off in production until profile sandboxing is enforced.
-10. **Attachments and file replies stay in profile scope.** Inbound attachments still delegate to Hermes' native `_prepare_inbound_message_text`; outbound `MEDIA:<path>` replies are filtered so only paths resolving inside the routed `profile_home` are delivered.
-11. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0`, keep `multitenancy.allow_quick_exec=false`, and add OS-level profile sandboxing. The sandbox handles process/filesystem/network containment; this plugin handles application-layer route/session/slash/media boundaries.
+6. **Dangerous-command approvals cross the subprocess boundary.** The profile AIAgent registers `tools.approval` with a router-compatible gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`). The child emits `approval_required`; the router prompts Feishu; `/approve` / `/deny` writes a decision file that releases the child and resumes Hermes' native approval flow.
+7. **CardKit heartbeat lives in the parent router.** The router primes the card and sends idle heartbeat status updates before the child emits tokens; the heartbeat stops once reasoning/tool/content events arrive.
+8. **Memory is keyed by `(profile, canonical sender)`.** `_history_key()` does not use `sender_alt or sender`, so stale/shared alternate IDs cannot merge two users' memory.
+9. **Slash commands never leak into the LLM.** `/model`, `/reasoning`, `/reload-mcp` and other registry commands use Hermes gateway handlers; skill slash rewrites into native skill invocation for the routed profile; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec follows config; unknown slash returns Hermes-style unknown-command.
+10. **Slash handlers run with a profile context lock.** Gateway/plugin handlers execute inside `_profile_gateway_context()`, which serializes temporary `HERMES_HOME` and gateway session-key overrides so concurrent slash commands cannot cross profiles.
+11. **Local exec is off by default.** `quick_commands` alias remains available; `type: exec` is denied unless `multitenancy.allow_quick_exec: true` or `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` is set. Allowed exec inherits the routed profile's `HERMES_HOME`. Keep it off in production until profile sandboxing is enforced.
+12. **Attachments and file replies stay in profile scope.** Inbound attachments still delegate to Hermes' native `_prepare_inbound_message_text`; outbound `MEDIA:<path>` replies are filtered so only paths resolving inside the routed `profile_home` are delivered.
+13. **Background terminal notify is not claimed as supported.** A child-local `process_registry` is invisible to the parent gateway watcher. Each child calls `agent.close()` on exit to clean such resources instead of leaving unmanaged background processes. True `terminal(background=true, notify_on_complete=true)` support should move process ownership into the parent process.
+14. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0`, keep `multitenancy.allow_quick_exec=false`, and add OS-level profile sandboxing. The sandbox handles process/filesystem/network containment; this plugin handles application-layer route/session/slash/media boundaries.
 
 ---
 
@@ -280,6 +288,10 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Reply context (quoted message) | ✅ — same delegate, plus our own `reply_to_text` fallback |
 | Multi-user shared-session attribution | ✅ — same delegate |
 | Tool use (real AIAgent loop with browser/search/shell) | ✅ — via isolated `AIAgent` subprocess bridge |
+| Cron / reminder proactive delivery | ✅ — jobs are written to the shared cron store and delivered by the parent gateway ticker |
+| Dangerous-command approval proactive delivery | ✅ — child `approval_required` → router Feishu prompt → `/approve`/`/deny` decision file |
+| CardKit idle heartbeat | ✅ — parent router prime + heartbeat; does not depend on early child tokens |
+| Background terminal `notify_on_complete` | ⚠️ not claimed — child registry is invisible to the parent gateway; child exit calls `agent.close()` to avoid orphaned background work |
 | Feishu CardKit / IM file-message replies | ✅ — streaming cards plus native `MEDIA:<path>` delivery reuse, filtered to the routed profile home |
 
 ---
@@ -382,6 +394,8 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | `_SESSION_HISTORY_MAX`            | 20  | Messages kept per (profile, user) |
 | Streaming throttle (content)      | 1.0s / 60 chars | Mirrors hermes mainstream cadence |
 | Streaming throttle (thinking)     | 2.0s heartbeat | Reasoning preview |
+| CardKit idle heartbeat            | 2.5s | Keeps the card active before the first agent event |
+| Approval bridge timeout           | 300s | Override with `HERMES_MULTITENANCY_APPROVAL_TIMEOUT` |
 | Rate-limit backoffs               | 0.5s → 1s → 2s | 429-only; non-429 retried once |
 
 ---
@@ -421,7 +435,7 @@ package:
 ```bash
 python scripts/stress_test_feishu_pipeline.py \
   --suite full \
-  --users 用户A,美元本袁 \
+  --users UserA,UserB \
   --parallel-users \
   --chat-id "$HERMES_FEISHU_TEST_CHAT_ID" \
   --fixtures .uat/fixtures/dual-users.local.json \

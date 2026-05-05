@@ -37,6 +37,7 @@ _session_history: dict[tuple[str, str], list[dict]] = {}
 # Tracks which (profile, user_key) pairs we've lazy-loaded from SessionStore
 # so we only hit SQLite once per pair per process lifetime.
 _session_loaded: set[tuple[str, str]] = set()
+_pending_approval_requests: dict[str, list[dict]] = {}
 
 
 def _history_key(profile_name: str, sender: str, sender_alt: Optional[str]) -> tuple[str, str]:
@@ -650,7 +651,18 @@ async def _handle_command(
     cmd, _args = pair
     adapter = _get_feishu_adapter(gateway)
 
-    if cmd == "stop":
+    approval_reply = _handle_pending_approval_command(
+        cmd,
+        _args,
+        event,
+        profile_name=profile_name,
+        sender=sender,
+        sender_alt=sender_alt,
+        chat_id=chat_id,
+    )
+    if approval_reply is not None:
+        reply = approval_reply
+    elif cmd == "stop":
         task = _user_inflight_tasks.pop(sender, None)
         if task is not None and not task.done():
             task.cancel()
@@ -708,6 +720,131 @@ async def _handle_command(
 
     if adapter is not None:
         await _safe_call(adapter.send, chat_id, reply)
+
+
+def _handle_pending_approval_command(
+    cmd: str,
+    args: str,
+    event: Any,
+    *,
+    profile_name: Optional[str],
+    sender: str,
+    sender_alt: Optional[str],
+    chat_id: str,
+) -> Optional[str]:
+    """Resolve a child AIAgent approval bridge before falling back to gateway commands."""
+    if cmd not in {"approve", "deny"}:
+        return None
+    session_key = _multitenant_gateway_session_key(
+        event,
+        profile_name=profile_name,
+        sender=sender,
+        sender_alt=sender_alt,
+        chat_id=chat_id,
+    )
+    if not session_key or not _pending_approval_requests.get(session_key):
+        return None
+
+    if cmd == "deny":
+        resolve_all = "all" in str(args or "").lower().split()
+        count = _resolve_pending_approval_requests(session_key, "deny", resolve_all=resolve_all)
+        count_msg = f" ({count} commands)" if count > 1 else ""
+        return f"❌ Command{'s' if count > 1 else ''} denied{count_msg}."
+
+    parts = str(args or "").strip().lower().split()
+    resolve_all = "all" in parts
+    remaining = [part for part in parts if part != "all"]
+    if any(part in {"always", "permanent", "permanently"} for part in remaining):
+        choice = "always"
+        scope_msg = " (pattern approved permanently)"
+    elif any(part in {"session", "ses"} for part in remaining):
+        choice = "session"
+        scope_msg = " (pattern approved for this session)"
+    else:
+        choice = "once"
+        scope_msg = ""
+    count = _resolve_pending_approval_requests(session_key, choice, resolve_all=resolve_all)
+    count_msg = f" ({count} commands)" if count > 1 else ""
+    return f"✅ Command{'s' if count > 1 else ''} approved{scope_msg}{count_msg}. The agent is resuming..."
+
+
+def _resolve_pending_approval_requests(
+    session_key: str,
+    choice: str,
+    *,
+    resolve_all: bool = False,
+) -> int:
+    queue = _pending_approval_requests.get(session_key) or []
+    if not queue:
+        return 0
+    if resolve_all:
+        targets = list(queue)
+        queue.clear()
+    else:
+        targets = [queue.pop(0)]
+    if queue:
+        _pending_approval_requests[session_key] = queue
+    else:
+        _pending_approval_requests.pop(session_key, None)
+    for entry in targets:
+        raw_decision_path = str(entry.get("decision_path") or "").strip()
+        if not raw_decision_path:
+            continue
+        decision_path = Path(raw_decision_path)
+        try:
+            decision_path.parent.mkdir(parents=True, exist_ok=True)
+            decision_path.write_text(json.dumps({"choice": choice}), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "multitenancy: failed to write approval decision for %s: %s",
+                entry.get("approval_id") or "?",
+                exc,
+            )
+    return len(targets)
+
+
+def _record_pending_approval(payload: dict) -> None:
+    session_key = str(payload.get("session_key") or "").strip()
+    decision_path = str(payload.get("decision_path") or "").strip()
+    if not session_key or not decision_path:
+        return
+    approval_id = str(payload.get("approval_id") or decision_path)
+    queue = _pending_approval_requests.setdefault(session_key, [])
+    queue[:] = [
+        item for item in queue
+        if str(item.get("approval_id") or item.get("decision_path")) != approval_id
+    ]
+    queue.append(dict(payload))
+
+
+def _clear_pending_approval(payload: dict) -> None:
+    session_key = str(payload.get("session_key") or "").strip()
+    approval_id = str(payload.get("approval_id") or "").strip()
+    if not session_key or not approval_id:
+        return
+    queue = _pending_approval_requests.get(session_key) or []
+    queue[:] = [item for item in queue if str(item.get("approval_id") or "") != approval_id]
+    if queue:
+        _pending_approval_requests[session_key] = queue
+    else:
+        _pending_approval_requests.pop(session_key, None)
+
+
+async def _handle_child_approval_required(adapter: Any, chat_id: str, payload: Any) -> None:
+    data = payload if isinstance(payload, dict) else {}
+    _record_pending_approval(data)
+    command = str(data.get("command") or "")
+    description = str(data.get("description") or "dangerous command")
+    preview = command[:200] + "..." if len(command) > 200 else command
+    message = (
+        "⚠️ Dangerous command requires approval:\n"
+        f"```\n{preview}\n```\n"
+        f"Reason: {description}\n\n"
+        "Reply `/approve` to execute, `/approve session` to approve this pattern "
+        "for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+    )
+    if adapter is not None:
+        await _safe_call(adapter.send, chat_id, message)
 
 
 async def _dispatch_gateway_command(
@@ -1904,6 +2041,19 @@ async def _stream_into_feishu_shared_consumer(
                         )
                         continue
 
+                    if kind == "approval_required":
+                        await _handle_child_approval_required(adapter, chat_id, delta)
+                        try:
+                            await consumer.update_streaming_card_status("等待用户审批: /approve 或 /deny")
+                        except Exception as exc:
+                            logger.debug("multitenancy: approval status update failed: %s", exc)
+                        continue
+
+                    if kind == "approval_resolved":
+                        if isinstance(delta, dict):
+                            _clear_pending_approval(delta)
+                        continue
+
                     if kind == "done":
                         continue
 
@@ -2193,6 +2343,25 @@ async def _stream_into_feishu(
                             logger.debug("multitenancy: card tool-complete update failed: %s", exc)
                         last_edit_time = time.monotonic()
                         last_render_len = len(render())
+                        continue
+                    elif kind == "approval_required":
+                        await _handle_child_approval_required(adapter, chat_id, delta)
+                        try:
+                            await _update_feishu_stream_status(
+                                adapter,
+                                chat_id,
+                                placeholder_id,
+                                "等待用户审批: /approve 或 /deny",
+                                mode=stream_mode,
+                            )
+                        except Exception as exc:
+                            logger.debug("multitenancy: approval status update failed: %s", exc)
+                        last_edit_time = time.monotonic()
+                        last_render_len = len(render())
+                        continue
+                    elif kind == "approval_resolved":
+                        if isinstance(delta, dict):
+                            _clear_pending_approval(delta)
                         continue
                     elif kind == "done":
                         continue

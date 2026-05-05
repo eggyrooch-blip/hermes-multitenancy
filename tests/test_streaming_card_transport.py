@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -423,6 +424,90 @@ async def test_stream_into_feishu_keeps_card_alive_while_agent_is_silent(
     assert await task == "ready"
     assert adapter.updates[-1]["content"] == "ready"
     assert adapter.updates[-1]["finalize"] is True
+
+
+def test_stream_into_feishu_prompts_for_child_approval_and_approve_resolves(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_prompts_for_child_approval_and_approve_resolves(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_prompts_for_child_approval_and_approve_resolves(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    adapter = _CardCapableAdapter()
+    decision_path = tmp_path / "approval-decision.json"
+
+    async def fake_stream(event, home, *, messages=None):
+        yield (
+            "approval_required",
+            {
+                "approval_id": "approval-1",
+                "session_key": "multitenancy:feishu:profile:chat-1:ou_user",
+                "command": "python -c 'print(1)'",
+                "description": "script execution via -c flag",
+                "decision_path": str(decision_path),
+            },
+        )
+        while not decision_path.exists():
+            await asyncio.sleep(0.005)
+        yield ("content", "approved")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    task = asyncio.create_task(
+        router_mod._stream_into_feishu(
+            adapter,
+            "chat-1",
+            "profile",
+            tmp_path,
+            SimpleNamespace(text="hi"),
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    )
+
+    async def wait_for_approval_prompt():
+        while not adapter.sent:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(wait_for_approval_prompt(), timeout=1)
+    assert "requires approval" in adapter.sent[0]["content"]
+    assert "/approve" in adapter.sent[0]["content"]
+
+    event = SimpleNamespace(
+        text="/approve",
+        source=SimpleNamespace(
+            chat_id="chat-1",
+            user_id="ou_user",
+            user_name="tester",
+            chat_type="dm",
+            platform=SimpleNamespace(value="feishu"),
+        ),
+        get_command_args=lambda: "",
+    )
+    gateway = SimpleNamespace(adapters={"feishu": adapter}, config={})
+
+    await router_mod._handle_command(
+        ("approve", ""),
+        "ou_user",
+        None,
+        "profile",
+        tmp_path,
+        "chat-1",
+        gateway,
+        event,
+    )
+
+    assert json.loads(decision_path.read_text(encoding="utf-8")) == {"choice": "once"}
+    assert await task == "approved"
+    assert "approved" in adapter.sent[-1]["content"].lower()
 
 
 @pytest.mark.asyncio
