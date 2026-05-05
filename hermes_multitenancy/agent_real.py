@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import time
+import hashlib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -71,15 +72,20 @@ async def stream_run_agent(  # type: ignore[override]
     Feishu streaming card while the synchronous AIAgent loop is still running.
 
     Falls back to the legacy streaming path on AIAgent failure (preserves
-    the visible-typing UX even when tools cannot fire). Note: ``messages``
-    (router-provided conversation history) is currently ignored on the
-    AIAgent path — AIAgent owns its own session-db history per ``session_id``.
-    Cross-call memory rejoin is deferred to a follow-up.
+    the visible-typing UX even when tools cannot fire). ``messages`` is the
+    router-provided conversation history; the subprocess receives prior turns
+    as ``conversation_history`` and the current event text as the active user
+    message.
     """
     try:
         content_parts: list[str] = []
         final_text = ""
-        async for kind, payload in _stream_aiagent_subprocess(event, profile_home):
+        stream = (
+            _stream_aiagent_subprocess(event, profile_home, messages=messages)
+            if messages is not None
+            else _stream_aiagent_subprocess(event, profile_home)
+        )
+        async for kind, payload in stream:
             if kind == "done":
                 final_text = str(payload or "")
                 continue
@@ -231,6 +237,8 @@ async def real_run_agent(
     a coherent reply.
     """
     try:
+        if messages is not None:
+            return await _run_aiagent_subprocess(event, profile_home, messages=messages)
         return await _run_aiagent_subprocess(event, profile_home)
     except Exception as exc:
         logger.warning(
@@ -441,6 +449,16 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _jsonable_deep(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable_deep(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_deep(v) for v in value]
+    return _jsonable(value)
+
+
 def _get_nested_value(obj: Any, path: tuple[str, ...]) -> Any:
     cur = obj
     for key in path:
@@ -508,7 +526,24 @@ def _resolve_subprocess_sender_open_id(event: Any) -> str:
     return _find_ou_value(raw)
 
 
-def _event_to_subprocess_payload(event: Any, profile_home: Path) -> dict[str, Any]:
+def _jsonable_messages(messages: Optional[list[dict]]) -> list[dict] | None:
+    if not messages:
+        return None
+    payload_messages: list[dict] = []
+    for message in messages:
+        if isinstance(message, dict):
+            jsonable = _jsonable_deep(message)
+            if isinstance(jsonable, dict):
+                payload_messages.append(jsonable)
+    return payload_messages
+
+
+def _event_to_subprocess_payload(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> dict[str, Any]:
     """Serialize the small MessageEvent surface needed by the child runner."""
     source = getattr(event, "source", None)
     source_payload: dict[str, Any] = {}
@@ -537,7 +572,7 @@ def _event_to_subprocess_payload(event: Any, profile_home: Path) -> dict[str, An
         or source_payload.get("message_id")
         or ""
     )
-    return {
+    payload = {
         "event": {
             "text": getattr(event, "text", "") or "",
             "message_id": _jsonable(message_id),
@@ -546,9 +581,18 @@ def _event_to_subprocess_payload(event: Any, profile_home: Path) -> dict[str, An
         },
         "profile_home": str(profile_home),
     }
+    payload_messages = _jsonable_messages(messages)
+    if payload_messages is not None:
+        payload["messages"] = payload_messages
+    return payload
 
 
-async def _run_aiagent_subprocess(event: Any, profile_home: Path) -> str:
+async def _run_aiagent_subprocess(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+) -> str:
     """Run the sync AIAgent body in a fresh Python process.
 
     The gateway stays fully async while the child process owns the synchronous
@@ -558,7 +602,7 @@ async def _run_aiagent_subprocess(event: Any, profile_home: Path) -> str:
     import asyncio
 
     payload = json.dumps(
-        _event_to_subprocess_payload(event, profile_home),
+        _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
@@ -609,12 +653,17 @@ async def _run_aiagent_subprocess(event: Any, profile_home: Path) -> str:
     return str(data.get("result") or "")
 
 
-async def _stream_aiagent_subprocess(event: Any, profile_home: Path):
+async def _stream_aiagent_subprocess(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+):
     """Run AIAgent in a child process and yield its NDJSON progress events."""
     import asyncio
 
     payload = json.dumps(
-        _event_to_subprocess_payload(event, profile_home),
+        _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
@@ -756,7 +805,106 @@ def _resolve_sender_open_id(event: Any) -> str:
     return str(getattr(source, "user_id", "") or "")
 
 
-def _run_with_aiagent(event: Any, profile_home: Path, *, event_sink=None) -> str:
+def _session_part(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip() or default
+    safe = "".join(ch if (ch.isalnum() or ch in "._:-") else "_" for ch in text)
+    return safe[:160] or default
+
+
+def _resolve_platform_value(source: Any, default: str = "feishu") -> str:
+    if source is None:
+        return default
+    platform = getattr(source, "platform", None)
+    return str(getattr(platform, "value", None) or platform or default)
+
+
+def _resolve_aiagent_session_id(
+    event: Any,
+    profile_home: Path,
+    sender_open_id: str = "",
+) -> str:
+    """Build a stable, per-profile/per-user AIAgent session id.
+
+    Feishu ``message_id`` changes every turn, so it must only be a last-ditch
+    fallback. Keeping profile and sender in the key prevents cross-tenant or
+    cross-user history bleed when multiple Feishu users hit the same bot.
+    """
+    source = getattr(event, "source", None)
+    platform = _resolve_platform_value(source)
+    chat_type = getattr(source, "chat_type", "") if source else ""
+    chat_id = (
+        getattr(source, "chat_id", None)
+        or getattr(source, "parent_chat_id", None)
+        or getattr(source, "chat_id_alt", None)
+        if source
+        else ""
+    )
+    thread_id = (
+        getattr(source, "thread_id", None)
+        or getattr(source, "chat_topic", None)
+        if source
+        else ""
+    )
+    user_id = (
+        sender_open_id
+        or (getattr(source, "user_id", None) if source else "")
+        or (getattr(source, "user_id_alt", None) if source else "")
+    )
+    message_id = (
+        getattr(event, "message_id", None)
+        or (getattr(source, "message_id", None) if source else "")
+    )
+
+    parts = [
+        "agent",
+        "profile",
+        profile_home.name,
+        "platform",
+        platform,
+        "chat_type",
+        chat_type or "unknown",
+    ]
+    if chat_id:
+        parts.extend(["chat", chat_id])
+    if thread_id:
+        parts.extend(["thread", thread_id])
+    if user_id:
+        parts.extend(["user", user_id])
+    elif message_id:
+        parts.extend(["message", message_id])
+    else:
+        parts.append("fallback")
+
+    session_id = ":".join(_session_part(part) for part in parts)
+    if len(session_id) <= 220:
+        return session_id
+    digest = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:12]
+    return f"{session_id[:200]}:{digest}"
+
+
+def _conversation_history_for_aiagent(
+    messages: Optional[list[dict]],
+    user_text: str,
+) -> Optional[list[dict]]:
+    if not messages:
+        return None
+    history = [dict(message) for message in messages if isinstance(message, dict)]
+    if (
+        history
+        and history[-1].get("role") == "user"
+        and str(history[-1].get("content") or "") == user_text
+    ):
+        history = history[:-1]
+    return history or None
+
+
+def _run_with_aiagent(
+    event: Any,
+    profile_home: Path,
+    *,
+    messages: Optional[list[dict]] = None,
+    event_sink=None,
+) -> str:
     """Synchronous body — runs hermes' real AIAgent against the profile config.
 
     Constructs an AIAgent with the profile's enabled toolsets + LLM
@@ -826,11 +974,8 @@ def _run_with_aiagent(event: Any, profile_home: Path, *, event_sink=None) -> str
     # 6) Pull source / session metadata for AIAgent kwargs.
     source = getattr(event, "source", None)
     user_text = getattr(event, "text", "") or ""
-    session_id = (
-        getattr(event, "message_id", None)
-        or (getattr(source, "chat_id", None) if source else None)
-        or "multitenancy-session"
-    )
+    session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
+    conversation_history = _conversation_history_for_aiagent(messages, user_text)
 
     runtime_kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
@@ -955,10 +1100,13 @@ def _run_with_aiagent(event: Any, profile_home: Path, *, event_sink=None) -> str
 
         agent = AIAgent(**agent_kwargs)
         try:
-            result = agent.run_conversation(
-                user_message=user_text,
-                task_id=str(session_id),
-            )
+            run_kwargs: dict[str, Any] = {
+                "user_message": user_text,
+                "task_id": str(session_id),
+            }
+            if conversation_history is not None:
+                run_kwargs["conversation_history"] = conversation_history
+            result = agent.run_conversation(**run_kwargs)
         finally:
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)
