@@ -264,6 +264,13 @@ async def test_handle_async_auto_provisions_new_user_to_distinct_profile(monkeyp
     router_mod.override_routing_table(None)
 
 
+def test_auto_profile_config_does_not_invent_default_model():
+    from hermes_multitenancy.router import _normalize_profile_config
+
+    assert _normalize_profile_config({}) == {}
+    assert _normalize_profile_config({"tools": ["web"]}) == {"tools": ["web"]}
+
+
 @pytest.mark.asyncio
 async def test_new_open_id_auto_provisions_before_stale_alt_route(monkeypatch, tmp_path):
     """A new app-scoped Feishu open_id must not be absorbed by an old union route."""

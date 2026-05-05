@@ -12,6 +12,38 @@ Contract:
 """
 from __future__ import annotations
 
-from .feishu_hr import UserSpec, apply_users
+from .feishu_hr import UserSpec, apply_users, plan_users
+from .feishu_org import (
+    Department,
+    DepartmentUser,
+    Employee,
+    FeishuContactClient,
+    FeishuOrgSyncError,
+    OrgSnapshot,
+    build_org_snapshot,
+    build_user_specs,
+    profile_name_for_user_id,
+    pull_feishu_org,
+    save_snapshot,
+    sync_feishu_org,
+    sync_profiles,
+)
 
-__all__ = ["UserSpec", "apply_users"]
+__all__ = [
+    "Department",
+    "DepartmentUser",
+    "Employee",
+    "FeishuContactClient",
+    "FeishuOrgSyncError",
+    "OrgSnapshot",
+    "UserSpec",
+    "apply_users",
+    "build_org_snapshot",
+    "build_user_specs",
+    "plan_users",
+    "profile_name_for_user_id",
+    "pull_feishu_org",
+    "save_snapshot",
+    "sync_feishu_org",
+    "sync_profiles",
+]

@@ -29,13 +29,16 @@ def test_parse_known_commands():
     assert parse_command("/stop") == ("stop", "")
     assert parse_command("/status") == ("status", "")
     assert parse_command("/new") == ("new", "")
+    assert parse_command("/model glm-5.1") == ("model", "glm-5.1")
+    assert parse_command("/reasoning high") == ("reasoning", "high")
+    assert parse_command("/reload_mcp") == ("reload-mcp", "")
     assert parse_command("/STOP") == ("stop", "")
     assert parse_command("/stop now please") == ("stop", "now please")
 
 
-def test_parse_unknown_returns_none():
+def test_parse_unknown_slash_is_still_handled():
     from hermes_multitenancy.commands import parse_command
-    assert parse_command("/unknown") is None
+    assert parse_command("/unknown") == ("unknown", "")
     assert parse_command("hello") is None
     assert parse_command("") is None
     assert parse_command("/") is None
@@ -44,6 +47,24 @@ def test_parse_unknown_returns_none():
 def test_parse_rejects_paths():
     from hermes_multitenancy.commands import parse_command
     assert parse_command("/some/path") is None
+
+
+def test_parse_command_reads_hermes_registry_dynamically(monkeypatch):
+    """New Hermes COMMAND_REGISTRY entries must not require a plugin edit."""
+    from types import SimpleNamespace
+    import sys
+
+    fake_commands = SimpleNamespace(
+        resolve_command=lambda name: SimpleNamespace(name="fresh")
+        if name.lower().lstrip("/") in {"fresh", "fresh_alias"}
+        else None,
+        is_gateway_known_command=lambda name: name in {"fresh", "fresh_alias"},
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.commands", fake_commands)
+
+    from hermes_multitenancy.commands import parse_command
+
+    assert parse_command("/fresh_alias arg") == ("fresh", "arg")
 
 
 # -- /stop ------------------------------------------------------------------
@@ -257,6 +278,104 @@ async def test_help_command_lists_commands():
     assert "/status" in text
     assert "/new" in text
     assert "/stop" in text
+
+
+@pytest.mark.asyncio
+async def test_known_hermes_command_uses_gateway_handler_not_agent(monkeypatch, tmp_path):
+    """/model and future Hermes commands should be handled by Hermes, not sent to AIAgent."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    add_spike_route("ou_model", tmp_path)
+
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    class Gateway:
+        adapters = {"feishu": Adapter()}
+
+        async def _handle_model_command(self, event):
+            return f"gateway handled {event.text}"
+
+    class PoolShouldNotRun:
+        async def dispatch(self, *args, **kwargs):
+            raise AssertionError("Hermes slash command leaked into AIAgent dispatch")
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: PoolShouldNotRun())
+
+    await handle_async(event=_build_event("/model glm-5.1", user_id="ou_model"), gateway=Gateway())
+
+    assert sends == ["gateway handled /model glm-5.1"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_gateway_command_gets_profile_scoped_session_key(tmp_path):
+    """Hermes command handlers must see a profile-aware session key."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "coder"
+    profile_home.mkdir()
+    add_spike_route("ou_profile_cmd", profile_home)
+
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    class Gateway:
+        adapters = {"feishu": Adapter()}
+
+        def _session_key_for_source(self, source):
+            return "native-session-key"
+
+        async def _handle_model_command(self, event):
+            return self._session_key_for_source(event.source)
+
+    await handle_async(
+        event=_build_event("/model glm-5.1", user_id="ou_profile_cmd"),
+        gateway=Gateway(),
+    )
+
+    assert sends == ["multitenancy:feishu:coder:chat-cmd:ou_profile_cmd"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_replies_without_agent_dispatch(monkeypatch):
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy import router as router_mod
+
+    _user_inflight_tasks.clear()
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    class PoolShouldNotRun:
+        async def dispatch(self, *args, **kwargs):
+            raise AssertionError("unknown slash command leaked into AIAgent dispatch")
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: PoolShouldNotRun())
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/definitely_unknown", user_id="ou_unknown_cmd"), gateway=gateway)
+
+    assert sends == [
+        "Unknown command `/definitely_unknown`. Type /commands to see what's available, "
+        "or resend without the leading slash to send as a regular message."
+    ]
 
 
 # -- replace policy --------------------------------------------------------
