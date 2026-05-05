@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[![tests](https://img.shields.io/badge/tests-103%20passing-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-128%20passing-brightgreen)](#testing)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#how-it-stays-compatible)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#proof-of-end-to-end)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -38,6 +38,7 @@ flowchart LR
     unknown["Unknown sender\nnot in sync result"]
     gateway["Hermes gateway\nsingle websocket"]
     router["multitenancy router\npre_gateway_dispatch"]
+    slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
     fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
@@ -52,6 +53,9 @@ flowchart LR
     userB --> app
     unknown --> app
     app --> gateway --> router
+    router -->|slash command| slash
+    slash -->|gateway handler / quick / plugin / unknown| feishu
+    slash -->|skill invocation| aiagent
     router --> table
     table -->|active route| profileA --> aiagent --> feishu
     table -->|active route| profileB --> aiagent
@@ -228,6 +232,7 @@ This isn't a paper plugin. The current UAT chain has been run against a real Fei
 | 3 | Both users send the same tool-heavy UAT case set | AIAgent subprocess runs with the correct profile home and sender open_id scope. |
 | 4 | Replies stream back through Feishu CardKit / IM | Text cards and file-message paths are delivered through the Feishu adapter. |
 | 5 | Full dual-account stress suite | Run with `--users <userA>,<userB> --parallel-users`; each case records independent `case_id::user` checkpoint entries. |
+| 6 | Dynamic slash control plane | Dual-account `slash` suite passed `16/16`: `/model`, `/reasoning`, `/reload-mcp` use gateway handlers; skill slash rewrites into native skill invocation; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec bypass the LLM; unknown slash returns Hermes-style unknown-command. |
 
 These checks were run live through Feishu's WebSocket gateway and an OpenAI-compatible model provider. Real open_ids, tokens, chat IDs and app secrets are intentionally omitted from this repository.
 
@@ -245,7 +250,7 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Multi-turn session memory (SQLite-backed, survives restart) | ✅ |
 | Reply-context injection (quoted messages) | ✅ |
 | Rate-limit retry (429 backoff, mirrors hermes mainstream cadence) | ✅ |
-| Hermes slash command control plane | ✅ — dynamically recognizes Hermes gateway commands; local thin handlers cover multitenant `/stop` `/status` `/new` `/reset`, other known commands delegate to the gateway handler when available and never leak into the LLM |
+| Hermes slash command control plane | ✅ — dynamically recognizes Hermes registry commands; `/model`, `/reasoning`, `/reload-mcp` use gateway handlers; skill slash rewrites into native skill invocation; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick_commands support alias/exec; unknown slash returns Hermes-style unknown-command and never leaks into the LLM |
 | Idempotent feishu-sync reconciler (CLI + library) | ✅ |
 | Python Feishu Contact org sync (`pull-feishu`) | ✅ — creates/updates profiles, SOUL managed blocks and route rows |
 | Vision (image attachments) | ✅ — delegates to hermes' `gateway._prepare_inbound_message_text`, identical to mainstream |
@@ -449,7 +454,7 @@ When filing a bug, please include:
 ### Pull requests
 
 1. Fork → create a branch → run `pytest tests/ -q` (must be green) → open PR.
-2. **Tests are required** for behaviour changes. We hold a hard line on `pytest tests/ -q -m "not integration"` staying at 103+ green.
+2. **Tests are required** for behaviour changes. We hold a hard line on `pytest tests/ -q -m "not integration"` staying at 128+ green.
 3. **Don't mass-rename** — keep diffs small and reviewable.
 4. **No `feishu.py` patches** — the whole point of this plugin is hermes-agent stays unmodified. If you find a hermes API limitation, file an upstream issue at https://github.com/NousResearch/hermes-agent and link it here.
 
@@ -467,7 +472,7 @@ We pin `hermes-agent>=1.0` in `pyproject.toml` but the plugin loader contract ev
 1. **Per-profile `SessionStore`** — currently all session rows live in one shared `multitenancy.db`. For true 1000-user scale they should split into per-profile DBs (mirrors hermes' own profile isolation).
 2. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix. Cuts token cost ~50% on long-running chats.
 3. **CI matrix** — GitHub Actions running `pytest tests/ -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
-4. **More slash commands** — port hermes' `/update`, `/steer`, `/queue`, `/skill` from `gateway/run.py` into `commands.py`.
+4. **More live UAT fixtures** — broaden destructive/write-path coverage without relying on shared production-like resources.
 
 ---
 
