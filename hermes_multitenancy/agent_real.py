@@ -809,27 +809,11 @@ def _run_with_aiagent(event: Any, profile_home: Path, *, event_sink=None) -> str
 
     # 4) Resolve toolsets enabled for this platform on this profile.
     platform_key = "feishu"
-    enabled_toolsets: Optional[list[str]] = None
-    # Per-profile explicit override: profile config can pin
-    # `platform_toolsets.<platform>` to a specific list, bypassing the
-    # default-toolset composite resolution. This is the only way to keep
-    # the LLM function-calling schema small for providers (e.g. z.ai)
-    # that silently hang on huge tool batches.
-    explicit = (config.get("platform_toolsets") or {}).get(platform_key)
-    if isinstance(explicit, list) and explicit:
-        enabled_toolsets = sorted(str(t) for t in explicit)
-        logger.info(
-            "[multitenancy] platform_toolsets override for %s: %s",
-            platform_key, enabled_toolsets,
-        )
-    elif _get_platform_tools is not None:
-        try:
-            enabled_toolsets = sorted(_get_platform_tools(config, platform_key))
-        except Exception as exc:
-            logger.warning(
-                "[multitenancy] _get_platform_tools failed for %s: %s",
-                platform_key, exc,
-            )
+    enabled_toolsets = _resolve_enabled_toolsets(
+        config,
+        platform_key,
+        platform_tools_resolver=_get_platform_tools,
+    )
 
     # 5) Sender's real Feishu open_id (ou_*) for per-user UAT routing.
     # The feishu adapter already set this contextvar in
@@ -985,3 +969,96 @@ def _run_with_aiagent(event: Any, profile_home: Path, *, event_sink=None) -> str
                 pass
 
     return (result or {}).get("final_response", "") or ""
+
+
+def _resolve_enabled_toolsets(
+    config: dict[str, Any],
+    platform_key: str,
+    *,
+    platform_tools_resolver: Any,
+) -> Optional[list[str]]:
+    """Resolve profile toolsets without dropping core non-Feishu abilities.
+
+    A plain Hermes Feishu gateway defaults to the composite ``hermes-feishu``
+    toolset, which includes web/search/browser/file/etc. During multitenant
+    UAT it is common to add ``platform_toolsets.feishu`` only for Feishu user
+    token helpers; treating that list as a hard replacement makes the agent
+    look competent inside Feishu but unable to search the web.
+
+    Default mode therefore merges explicit profile entries with the platform
+    default. Set ``multitenancy.toolsets_mode: explicit`` or
+    ``HERMES_MULTITENANCY_TOOLSETS_MODE=explicit`` to preserve the old strict
+    replacement behavior for providers that need a smaller schema.
+    """
+    explicit = (config.get("platform_toolsets") or {}).get(platform_key)
+    explicit_toolsets = _normalize_toolset_list(explicit)
+    mode = _toolsets_mode(config)
+
+    if explicit_toolsets and mode in {"explicit", "strict", "replace"}:
+        logger.info(
+            "[multitenancy] platform_toolsets explicit mode for %s: %s",
+            platform_key, explicit_toolsets,
+        )
+        return explicit_toolsets
+
+    default_toolsets: list[str] = []
+    if platform_tools_resolver is not None:
+        resolver_config = config
+        if explicit_toolsets:
+            import copy
+
+            resolver_config = copy.deepcopy(config)
+            platform_toolsets = resolver_config.get("platform_toolsets")
+            if isinstance(platform_toolsets, dict):
+                platform_toolsets.pop(platform_key, None)
+        try:
+            try:
+                resolved = platform_tools_resolver(
+                    resolver_config,
+                    platform_key,
+                    include_default_mcp_servers=("no_mcp" not in explicit_toolsets),
+                )
+            except TypeError:
+                resolved = platform_tools_resolver(resolver_config, platform_key)
+            default_toolsets = _normalize_toolset_list(resolved)
+        except Exception as exc:
+            logger.warning(
+                "[multitenancy] _get_platform_tools failed for %s: %s",
+                platform_key, exc,
+            )
+
+    if explicit_toolsets:
+        merged = sorted(set(default_toolsets) | set(explicit_toolsets))
+        logger.info(
+            "[multitenancy] platform_toolsets merged for %s: explicit=%s default=%s merged=%s",
+            platform_key, explicit_toolsets, default_toolsets, merged,
+        )
+        return merged
+
+    return default_toolsets or None
+
+
+def _normalize_toolset_list(value: Any) -> list[str]:
+    """Return a sorted list of non-empty string toolset names."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, (set, tuple)):
+        items = list(value)
+    else:
+        return []
+    return sorted({str(item).strip() for item in items if str(item).strip()})
+
+
+def _toolsets_mode(config: dict[str, Any]) -> str:
+    """Return multitenancy toolset resolution mode."""
+    env_mode = os.getenv("HERMES_MULTITENANCY_TOOLSETS_MODE")
+    if env_mode:
+        return env_mode.strip().lower()
+    plugin_cfg = config.get("multitenancy") or {}
+    if isinstance(plugin_cfg, dict):
+        mode = plugin_cfg.get("toolsets_mode")
+        if mode:
+            return str(mode).strip().lower()
+    return "merge_default"
