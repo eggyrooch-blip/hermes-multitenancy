@@ -378,6 +378,181 @@ async def test_unknown_slash_replies_without_agent_dispatch(monkeypatch):
     ]
 
 
+@pytest.mark.asyncio
+async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_path):
+    """Hermes skill slash commands are agent turns, not unknown gateway commands."""
+    import sys
+    from types import ModuleType
+
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "coder"
+    profile_home.mkdir()
+    add_spike_route("ou_skill", profile_home)
+
+    fake_skill_commands = SimpleNamespace(
+        get_skill_commands=lambda: {"/demo-skill": {"name": "demo-skill"}},
+        resolve_skill_command_key=lambda command: "/demo-skill"
+        if command.replace("_", "-") == "demo-skill"
+        else None,
+        build_skill_invocation_message=lambda cmd_key, user_instruction, task_id=None: (
+            f"[skill:{cmd_key} task:{task_id}] {user_instruction}"
+        ),
+    )
+    fake_skill_utils = SimpleNamespace(get_disabled_skill_names=lambda platform=None: set())
+    monkeypatch.setitem(sys.modules, "agent", ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+    monkeypatch.setitem(sys.modules, "agent.skill_utils", fake_skill_utils)
+
+    seen = {}
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            seen["profile_name"] = profile_name
+            seen["home"] = home
+            seen["text"] = event.text
+            return "agent ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: Pool())
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/demo-skill write docs", user_id="ou_skill"), gateway=gateway)
+
+    assert seen == {
+        "profile_name": "coder",
+        "home": profile_home,
+        "text": "[skill:/demo-skill task:multitenancy:feishu:coder:chat-cmd:ou_skill] write docs",
+    }
+    assert sends == ["agent ok"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_path):
+    """Plugin-registered slash commands should be delegated before unknown handling."""
+    import sys
+    from types import ModuleType
+
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    add_spike_route("ou_plugin", tmp_path)
+
+    called = {}
+
+    async def plugin_handler(args):
+        called["args"] = args
+        return f"plugin handled {args}"
+
+    fake_plugins = SimpleNamespace(
+        get_plugin_command_handler=lambda name: plugin_handler if name == "demo-plugin" else None
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli", ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+
+    class PoolShouldNotRun:
+        async def dispatch(self, *args, **kwargs):
+            raise AssertionError("plugin slash command leaked into AIAgent dispatch")
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: PoolShouldNotRun())
+
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/demo_plugin hi there", user_id="ou_plugin"), gateway=gateway)
+
+    assert called == {"args": "hi there"}
+    assert sends == ["plugin handled hi there"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_quick_command_alias_reuses_gateway_handler(monkeypatch, tmp_path):
+    """Gateway quick-command aliases should expand before fallback unknown handling."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    add_spike_route("ou_quick_alias", tmp_path)
+
+    class PoolShouldNotRun:
+        async def dispatch(self, *args, **kwargs):
+            raise AssertionError("quick-command alias leaked into AIAgent dispatch")
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: PoolShouldNotRun())
+
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    class Gateway:
+        adapters = {"feishu": Adapter()}
+        config = {"quick_commands": {"mini": {"type": "alias", "target": "/model glm-5.1"}}}
+
+        async def _handle_model_command(self, event):
+            return f"model handler saw: {event.text}"
+
+    await handle_async(event=_build_event("/mini high", user_id="ou_quick_alias"), gateway=Gateway())
+
+    assert sends == ["model handler saw: /model glm-5.1 high"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_quick_command_exec_runs_without_agent_dispatch(monkeypatch, tmp_path):
+    """Gateway quick-command exec entries are control-plane commands."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    add_spike_route("ou_quick_exec", tmp_path)
+
+    class PoolShouldNotRun:
+        async def dispatch(self, *args, **kwargs):
+            raise AssertionError("quick-command exec leaked into AIAgent dispatch")
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: PoolShouldNotRun())
+
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(
+        adapters={"feishu": Adapter()},
+        config={"quick_commands": {"ping": {"type": "exec", "command": "printf quick-ok"}}},
+    )
+    await handle_async(event=_build_event("/ping", user_id="ou_quick_exec"), gateway=gateway)
+
+    assert sends == ["quick-ok"]
+    clear_spike_routes()
+
+
 # -- replace policy --------------------------------------------------------
 
 @pytest.mark.asyncio
