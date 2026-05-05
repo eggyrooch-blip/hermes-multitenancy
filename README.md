@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[![tests](https://img.shields.io/badge/tests-128%20passing-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)](#testing)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#how-it-stays-compatible)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#proof-of-end-to-end)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -38,6 +38,7 @@ flowchart LR
     unknown["Unknown sender\nnot in sync result"]
     gateway["Hermes gateway\nsingle websocket"]
     router["multitenancy router\npre_gateway_dispatch"]
+    guard["tenant boundary guard\ncanonical sender / env lock / media filter / exec opt-in"]
     slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
@@ -52,17 +53,36 @@ flowchart LR
     userA --> app
     userB --> app
     unknown --> app
-    app --> gateway --> router
-    router -->|slash command| slash
-    slash -->|gateway handler / quick / plugin / unknown| feishu
+    app --> gateway --> router --> guard
+    guard -->|slash command| slash
+    slash -->|gateway handler / quick alias / plugin / unknown| feishu
+    slash -->|quick exec only when explicitly enabled| aiagent
     slash -->|skill invocation| aiagent
-    router --> table
+    guard --> table
     table -->|active route| profileA --> aiagent --> feishu
     table -->|active route| profileB --> aiagent
-    router -->|route miss + auto-provision| fallback --> aiagent
+    guard -->|route miss + auto-provision| fallback --> aiagent
+    aiagent -->|MEDIA path must stay in profile home| feishu
 ```
 
 **Hermes-agent: 0 lines changed.** Verified by `git status`.
+
+---
+
+## 🧭 Implementation map for agents
+
+If you are an agent taking over this repo, this is the main contract:
+
+1. **Entry point, no Hermes core patches.** `hermes_multitenancy.register(ctx)` registers a `pre_gateway_dispatch` hook. For Feishu messages the hook returns `{"action": "skip"}` and the plugin's `handle_async()` owns routing and replies.
+2. **Identity uses the canonical sender.** `_resolve_sender_for_routing()` prefers the real Feishu `open_id` (`ou_*`) from the Feishu contextvar, `event.sender_open_id`, `source.open_id/user_id`, and `raw/raw_event/event`. `user_id_alt` / `union_id` is only a legacy route lookup helper, not the new session key.
+3. **Routes live in SQLite.** `multitenancy_routing.open_id -> profile_name` decides which `~/.hermes/profiles/<profile>/` handles the turn. A real `ou_*` will not be absorbed by a stale `union_id`; legacy alt routes are used only when no real `ou_*` is available.
+4. **Normal messages run inside the routed profile.** The router builds a profile-scoped event, writes the resolved `sender_open_id` back to the event, then dispatches to the streaming AIAgent subprocess. The child process runs with that profile's `HERMES_HOME`; Feishu UAT tokens are still loaded from `~/.hermes/feishu_uat/<open_id>.json`.
+5. **Memory is keyed by `(profile, canonical sender)`.** `_history_key()` does not use `sender_alt or sender`, so stale/shared alternate IDs cannot merge two users' memory.
+6. **Slash commands never leak into the LLM.** `/model`, `/reasoning`, `/reload-mcp` and other registry commands use Hermes gateway handlers; skill slash rewrites into native skill invocation for the routed profile; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; unknown slash returns Hermes-style unknown-command.
+7. **Slash handlers run with a profile context lock.** Gateway/plugin handlers execute inside `_profile_gateway_context()`, which serializes temporary `HERMES_HOME` and gateway session-key overrides so concurrent slash commands cannot cross profiles.
+8. **Local exec is off by default.** `quick_commands` alias remains available; `type: exec` is denied unless `multitenancy.allow_quick_exec: true` or `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` is set. Allowed exec inherits the routed profile's `HERMES_HOME`. Keep it off in production until profile sandboxing is enforced.
+9. **Attachments and file replies stay in profile scope.** Inbound attachments still delegate to Hermes' native `_prepare_inbound_message_text`; outbound `MEDIA:<path>` replies are filtered so only paths resolving inside the routed `profile_home` are delivered.
+10. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0`, keep `multitenancy.allow_quick_exec=false`, and add OS-level profile sandboxing. The sandbox handles process/filesystem/network containment; this plugin handles application-layer route/session/slash/media boundaries.
 
 ---
 
