@@ -664,6 +664,8 @@ async def _run_aiagent_subprocess(
     env = os.environ.copy()
     env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
     env["HERMES_HOME"] = str(profile_home)
+    env["HERMES_GATEWAY_SESSION"] = "1"
+    env["HERMES_EXEC_ASK"] = "1"
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
@@ -738,6 +740,8 @@ async def _stream_aiagent_subprocess(
     env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
     env["HERMES_HOME"] = str(profile_home)
     env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
+    env["HERMES_GATEWAY_SESSION"] = "1"
+    env["HERMES_EXEC_ASK"] = "1"
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
@@ -810,7 +814,12 @@ async def _stream_aiagent_subprocess(
                 yield "content", str(data.get("text") or "")
             elif event_name == "thinking":
                 yield "thinking", str(data.get("text") or "")
-            elif event_name in {"tool_started", "tool_completed"}:
+            elif event_name in {
+                "tool_started",
+                "tool_completed",
+                "approval_required",
+                "approval_resolved",
+            }:
                 payload_data = {k: v for k, v in data.items() if k != "event"}
                 yield str(event_name), payload_data
             else:
@@ -1045,6 +1054,17 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
         return lambda: None
 
     token = set_current_session_key(session_key)
+    old_env = {
+        "HERMES_SESSION_KEY": os.environ.get("HERMES_SESSION_KEY"),
+        "HERMES_GATEWAY_SESSION": os.environ.get("HERMES_GATEWAY_SESSION"),
+        "HERMES_EXEC_ASK": os.environ.get("HERMES_EXEC_ASK"),
+    }
+    # Terminal/process guards may execute in worker threads that do not inherit
+    # contextvars. The child subprocess is single-turn, so process-local env is
+    # the safest compatibility bridge for those thread-local tool paths.
+    os.environ["HERMES_SESSION_KEY"] = session_key
+    os.environ["HERMES_GATEWAY_SESSION"] = "1"
+    os.environ["HERMES_EXEC_ASK"] = "1"
     registered = False
 
     def _emit_bridge_event(event_name: str, **payload: Any) -> None:
@@ -1112,6 +1132,14 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
             reset_current_session_key(token)
         except Exception:
             pass
+        for key, old_value in old_env.items():
+            try:
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+            except Exception:
+                pass
 
     return _cleanup
 

@@ -835,6 +835,12 @@ async def _handle_child_approval_required(adapter: Any, chat_id: str, payload: A
     _record_pending_approval(data)
     command = str(data.get("command") or "")
     description = str(data.get("description") or "dangerous command")
+    logger.info(
+        "multitenancy child approval_required session=%s approval_id=%s command=%s",
+        str(data.get("session_key") or ""),
+        str(data.get("approval_id") or ""),
+        command[:120],
+    )
     preview = command[:200] + "..." if len(command) > 200 else command
     message = (
         "⚠️ Dangerous command requires approval:\n"
