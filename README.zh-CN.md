@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-[![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)](#-测试)
+[![tests](https://img.shields.io/badge/tests-139%20passing-brightgreen)](#-测试)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#-为什么能保持兼容)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#-端到端验证)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -40,10 +40,12 @@ flowchart LR
     router["multitenancy router\npre_gateway_dispatch"]
     guard["租户边界 guard\ncanonical sender / env lock / media filter / exec opt-in"]
     slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
+    approval["approval bridge\nchild approval -> router /approve"]
+    cron["shared cron store\n~/.hermes/cron/jobs.json"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
     fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
-    aiagent["AIAgent subprocess\n按 profile 切 HERMES_HOME + sender open_id scope"]
+    aiagent["AIAgent subprocess\nprofile HERMES_HOME + shared-return bridges"]
     feishu["Feishu CardKit / IM\n文本、卡片、文件"]
 
     admin --> app
@@ -63,6 +65,9 @@ flowchart LR
     table -->|active route| profileB --> aiagent
     guard -->|route miss + auto-provision| fallback --> aiagent
     aiagent -->|MEDIA path must stay in profile home| feishu
+    aiagent -->|cronjob create| cron -->|gateway ticker delivers| feishu
+    aiagent -->|dangerous command approval_required| approval -->|prompt + decision file| feishu
+    feishu -->|/approve / /deny| router --> approval
 ```
 
 **hermes-agent: 改动 0 行。** `git status` 可验。
@@ -78,12 +83,15 @@ flowchart LR
 3. **路由是 SQLite 表。** `multitenancy_routing.open_id -> profile_name` 决定用户进入哪个 `~/.hermes/profiles/<profile>/`。有真实 `ou_*` 时不会被 stale `union_id` 吸收到老 profile; 没有 `ou_*` 时才 fallback 到 legacy alt route。
 4. **普通消息进入 profile runtime。** router 构造 profile-scoped event, 把真实 `sender_open_id` 写回 event, 再进入 streaming AIAgent subprocess。子进程以该 profile 的 `HERMES_HOME` 运行, Feishu UAT token 仍按 `~/.hermes/feishu_uat/<open_id>.json` 查。
 5. **cron/提醒任务写共享 gateway 调度存储。** AIAgent 子进程里 `agent_real._configure_cron_home()` 会临时把 `cron.jobs` 和 `tools.cronjob_tools` 绑定到共享 Hermes home (`~/.hermes/cron/jobs.json`), 而不是 `~/.hermes/profiles/<profile>/cron/jobs.json`。原因是单 gateway 的 cron ticker 只轮询共享存储; 否则 "3 分钟后提醒我" 这类任务会一直停在 `scheduled`。
-6. **session 记忆按 `(profile, canonical sender)` 隔离。** `_history_key()` 不再用 `sender_alt or sender`, 避免 stale/shared alt 把两个用户记忆合并。
-7. **slash 命令不漏进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等走 Hermes gateway handler; skill slash 改写为 Hermes 原生 skill invocation 后进对应 profile 的 agent; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; unknown slash 返回 Hermes 风格 unknown-command。
-8. **slash handler 有 profile 上下文锁。** gateway/plugin handler 在 `_profile_gateway_context()` 内运行, 串行切换 `HERMES_HOME` 和 gateway session key, 防止并发 slash 串租户。
-9. **本机 exec 默认关闭。** `quick_commands` 的 alias 仍可用; `type: exec` 默认禁用。只有 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 后才允许, 且 exec 继承当前 profile 的 `HERMES_HOME`。生产建议等 profile 沙箱落地后再开。
-10. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。
-11. **生产推荐策略。** 公司/生产环境建议 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 做白名单路由, `multitenancy.allow_quick_exec=false`, 再叠加 profile 沙箱。沙箱负责 OS 级隔离; 本插件负责路由/session/slash/附件这些应用层边界。
+6. **危险命令审批跨子进程 bridge。** profile AIAgent 会用 router 兼容的 gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`) 注册 `tools.approval` notify。子进程发 `approval_required` stream event, router 给飞书发审批提示; 用户回 `/approve` / `/deny` 后, router 写 decision file, 子进程解除阻塞并继续原生 Hermes approval flow。
+7. **CardKit heartbeat 在父 router 内维持。** token 前空窗不依赖子进程主动发消息; `_stream_into_feishu*()` 会先 prime 卡片, 再用 idle heartbeat 更新状态, 等子进程出现 reasoning/tool/content 事件后停止 heartbeat。
+8. **session 记忆按 `(profile, canonical sender)` 隔离。** `_history_key()` 不再用 `sender_alt or sender`, 避免 stale/shared alt 把两个用户记忆合并。
+9. **slash 命令不漏进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等走 Hermes gateway handler; skill slash 改写为 Hermes 原生 skill invocation 后进对应 profile 的 agent; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec 按配置处理; unknown slash 返回 Hermes 风格 unknown-command。
+10. **slash handler 有 profile 上下文锁。** gateway/plugin handler 在 `_profile_gateway_context()` 内运行, 串行切换 `HERMES_HOME` 和 gateway session key, 防止并发 slash 串租户。
+11. **本机 exec 默认关闭。** `quick_commands` 的 alias 仍可用; `type: exec` 默认禁用。只有 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 后才允许, 且 exec 继承当前 profile 的 `HERMES_HOME`。生产建议等 profile 沙箱落地后再开。
+12. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。
+13. **后台 terminal notify 不是父 gateway 能直接接管的路径。** AIAgent 在子进程内运行, child-local `process_registry` 不会被父 gateway watcher 看到; 当前实现会在每次子进程结束时调用 `agent.close()` 清理这类资源, 避免留下无人管理的后台进程。需要真正支持 `terminal(background=true, notify_on_complete=true)` 时, 应改为父进程托管 process registry, 不能只在 profile 子进程里启用。
+14. **生产推荐策略。** 公司/生产环境建议 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 做白名单路由, `multitenancy.allow_quick_exec=false`, 再叠加 profile 沙箱。沙箱负责 OS 级隔离; 本插件负责路由/session/slash/附件这些应用层边界。
 
 ---
 
@@ -278,6 +286,10 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 引用上下文 (回复消息) | ✅ —— 同一委托, 加上我们自己的 `reply_to_text` 兜底 |
 | 多用户共享会话归属 | ✅ —— 同一委托 |
 | 工具调用 (真正的 AIAgent loop, 浏览器/搜索/shell) | ✅ —— 通过隔离的 `AIAgent` subprocess bridge |
+| Cron / reminder 主动回调 | ✅ —— job 写 shared cron store, 由父 gateway ticker 投递回原 Feishu chat |
+| 危险命令 approval 主动回调 | ✅ —— 子进程 `approval_required` → router 飞书提示 → `/approve`/`/deny` 写回 decision file |
+| CardKit idle heartbeat | ✅ —— 父 router prime + heartbeat, 不依赖子进程先吐 token |
+| Background terminal `notify_on_complete` | ⚠️ 不宣称支持 —— 子进程 registry 父 gateway 不可见; 子进程结束时执行 `agent.close()` 清理, 防止孤儿后台任务 |
 | Feishu CardKit / IM 文件消息回复 | ✅ —— 流式卡片 + 原生 `MEDIA:<path>` 投递复用, 但只允许发送当前 profile 目录内文件 |
 
 ---
@@ -379,6 +391,8 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | `_SESSION_HISTORY_MAX`            | 20  | 每 (profile, user) 保留的消息数 |
 | 流式节流 (content)                | 1.0s / 60 字 | 与 hermes 主线一致 |
 | 流式节流 (thinking)               | 2.0s 心跳 | 推理预览 |
+| CardKit idle heartbeat            | 2.5s | token 前保持卡片活动, 首个 agent event 后停止 |
+| 审批 bridge timeout                | 300s | 可用 `HERMES_MULTITENANCY_APPROVAL_TIMEOUT` 临时覆盖 |
 | 限流退避                          | 0.5s → 1s → 2s | 仅 429; 非 429 重试一次 |
 
 ---
@@ -417,7 +431,7 @@ PYTHONPATH=. python -m pytest tests/ -m integration -v
 ```bash
 python scripts/stress_test_feishu_pipeline.py \
   --suite full \
-  --users 用户A,美元本袁 \
+  --users 用户A,用户B \
   --parallel-users \
   --chat-id "$HERMES_FEISHU_TEST_CHAT_ID" \
   --fixtures .uat/fixtures/dual-users.local.json \

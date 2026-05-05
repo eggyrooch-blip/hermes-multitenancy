@@ -28,6 +28,8 @@ import os
 import sys
 import time
 import hashlib
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -662,26 +664,38 @@ async def _run_aiagent_subprocess(
     env = os.environ.copy()
     env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
     env["HERMES_HOME"] = str(profile_home)
+    approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
+    env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
 
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        str(child_script),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
+    proc = None
     try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(child_script),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
         stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout_s)
     except asyncio.TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
         raise RuntimeError(f"AIAgent subprocess timed out after {timeout_s:g}s") from exc
     except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
         raise
+    finally:
+        try:
+            import shutil
+
+            shutil.rmtree(approval_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     stdout_text = stdout.decode("utf-8", errors="replace").strip()
@@ -724,6 +738,8 @@ async def _stream_aiagent_subprocess(
     env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
     env["HERMES_HOME"] = str(profile_home)
     env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
+    approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
+    env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
 
     started_at = time.monotonic()
@@ -828,6 +844,12 @@ async def _stream_aiagent_subprocess(
             await proc.wait()
         if not stderr_task.done():
             stderr_task.cancel()
+        try:
+            import shutil
+
+            shutil.rmtree(approval_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +957,31 @@ def _resolve_aiagent_session_id(
     return f"{session_id[:200]}:{digest}"
 
 
+def _resolve_multitenant_gateway_session_key(
+    event: Any,
+    profile_home: Path,
+    sender_open_id: str = "",
+) -> str:
+    """Return the parent gateway session key used by multitenancy slash commands."""
+    source = getattr(event, "source", None)
+    platform = _resolve_platform_value(source)
+    chat_id = ""
+    if source is not None:
+        chat_id = str(
+            getattr(source, "chat_id", None)
+            or getattr(source, "parent_chat_id", None)
+            or getattr(source, "chat_id_alt", None)
+            or ""
+        )
+    user_key = str(
+        sender_open_id
+        or (getattr(source, "user_id", None) if source is not None else "")
+        or (getattr(source, "user_id_alt", None) if source is not None else "")
+        or "unknown"
+    )
+    return f"multitenancy:{platform}:{profile_home.name}:{chat_id or 'unknown'}:{user_key}"
+
+
 def _conversation_history_for_aiagent(
     messages: Optional[list[dict]],
     user_text: str,
@@ -949,6 +996,124 @@ def _conversation_history_for_aiagent(
     ):
         history = history[:-1]
     return history or None
+
+
+def _approval_bridge_timeout() -> float:
+    raw = os.getenv("HERMES_MULTITENANCY_APPROVAL_TIMEOUT")
+    if raw is None:
+        raw = os.getenv("HERMES_APPROVAL_GATEWAY_TIMEOUT", "300")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _approval_bridge_dir() -> Path:
+    raw = os.getenv("HERMES_MULTITENANCY_APPROVAL_DIR")
+    if raw:
+        root = Path(raw).expanduser()
+    else:
+        root = Path(tempfile.gettempdir()) / "hermes-multitenancy-approvals"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _read_approval_choice(path: Path) -> Optional[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("[multitenancy] approval decision read failed: %s", exc)
+        return "deny"
+    choice = str(data.get("choice") or "").strip().lower()
+    return choice if choice in {"once", "session", "always", "deny"} else "deny"
+
+
+def _configure_gateway_approval_bridge(event_sink, session_key: str):
+    """Register child-process approval notify and return a cleanup callback."""
+    try:
+        from tools.approval import (
+            register_gateway_notify,
+            reset_current_session_key,
+            resolve_gateway_approval,
+            set_current_session_key,
+            unregister_gateway_notify,
+        )
+    except Exception as exc:
+        logger.debug("[multitenancy] approval bridge unavailable: %s", exc)
+        return lambda: None
+
+    token = set_current_session_key(session_key)
+    registered = False
+
+    def _emit_bridge_event(event_name: str, **payload: Any) -> None:
+        if event_sink is None:
+            return
+        try:
+            event_sink(event_name, **payload)
+        except Exception:
+            logger.debug("[multitenancy] approval bridge event emit failed", exc_info=True)
+
+    if event_sink is not None:
+        approval_dir = _approval_bridge_dir()
+
+        def _approval_notify_sync(approval_data: dict) -> None:
+            approval_id = f"approval_{uuid.uuid4().hex}"
+            decision_path = approval_dir / f"{approval_id}.json"
+            command = str(approval_data.get("command") or "")
+            description = str(approval_data.get("description") or "dangerous command")
+            _emit_bridge_event(
+                "approval_required",
+                approval_id=approval_id,
+                session_key=session_key,
+                command=command,
+                description=description,
+                pattern_keys=approval_data.get("pattern_keys") or [],
+                decision_path=str(decision_path),
+            )
+
+            timeout_s = _approval_bridge_timeout()
+            deadline = time.monotonic() + timeout_s
+            choice: Optional[str] = None
+            timed_out = False
+            while True:
+                choice = _read_approval_choice(decision_path)
+                if choice is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    choice = "deny"
+                    timed_out = True
+                    break
+                time.sleep(0.1)
+
+            try:
+                resolve_gateway_approval(session_key, choice)
+            except Exception as exc:
+                logger.debug("[multitenancy] child approval resolve failed: %s", exc)
+            _emit_bridge_event(
+                "approval_resolved",
+                approval_id=approval_id,
+                session_key=session_key,
+                choice=choice,
+                timed_out=timed_out,
+            )
+
+        register_gateway_notify(session_key, _approval_notify_sync)
+        registered = True
+
+    def _cleanup() -> None:
+        if registered:
+            try:
+                unregister_gateway_notify(session_key)
+            except Exception:
+                pass
+        try:
+            reset_current_session_key(token)
+        except Exception:
+            pass
+
+    return _cleanup
 
 
 def _run_with_aiagent(
@@ -1029,6 +1194,11 @@ def _run_with_aiagent(
     source = getattr(event, "source", None)
     user_text = getattr(event, "text", "") or ""
     session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
+    gateway_session_key = _resolve_multitenant_gateway_session_key(
+        event,
+        profile_home,
+        sender_open_id,
+    )
     conversation_history = _conversation_history_for_aiagent(messages, user_text)
 
     runtime_kwargs: dict[str, Any] = {"api_key": api_key}
@@ -1070,7 +1240,7 @@ def _run_with_aiagent(
                 thread_id=str(getattr(source, "thread_id", "") or "") if source else "",
                 user_id=str(getattr(source, "user_id", "") or "") if source else "",
                 user_name=str(getattr(source, "user_name", "") or "") if source else "",
-                session_key=str(session_id),
+                session_key=str(gateway_session_key),
             )
         def _emit(event_name: str, **payload: Any) -> None:
             if event_sink is None:
@@ -1142,6 +1312,7 @@ def _run_with_aiagent(
             "chat_id": str(getattr(source, "chat_id", "") or "") if source else "",
             "chat_name": str(getattr(source, "chat_name", "") or "") if source else "",
             "chat_type": str(getattr(source, "chat_type", "") or "") if source else "",
+            "gateway_session_key": str(gateway_session_key),
             "tool_progress_callback": _tool_progress_event_callback,
             "stream_delta_callback": _stream_delta_event_callback if event_sink is not None else None,
             "reasoning_callback": _reasoning_event_callback if event_sink is not None else None,
@@ -1152,6 +1323,10 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
+        approval_cleanup = _configure_gateway_approval_bridge(
+            event_sink,
+            str(gateway_session_key),
+        )
         agent = AIAgent(**agent_kwargs)
         try:
             run_kwargs: dict[str, Any] = {
@@ -1162,11 +1337,16 @@ def _run_with_aiagent(
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
         finally:
+            approval_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)
             try:
-                if hasattr(agent, "cleanup"):
-                    agent.cleanup()
+                close_agent = getattr(agent, "close", None)
+                cleanup_agent = getattr(agent, "cleanup", None)
+                if callable(close_agent):
+                    close_agent()
+                elif callable(cleanup_agent):
+                    cleanup_agent()
             except Exception:
                 pass
 
