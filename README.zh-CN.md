@@ -230,7 +230,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 3 | 两个用户发送同一套工具压测案例 | AIAgent subprocess 使用正确的 profile home 和 sender open_id scope。 |
 | 4 | 回复经 Feishu CardKit / IM 返回 | 文本卡片和文件消息路径都复用 Feishu adapter 发送。 |
 | 5 | 双账号完整压测 | 使用 `--users <用户A>,<用户B> --parallel-users` 运行; 每个用例会记录独立的 `case_id::user` checkpoint。 |
-| 6 | 动态 slash 控制面 | 双账号 `slash` suite `16/16` 通过: `/model`、`/reasoning`、`/reload-mcp` 走 gateway handler; skill slash 改写为原生 skill invocation; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec 不进 LLM; unknown slash 返回 Hermes 风格 unknown-command。 |
+| 6 | 动态 slash 控制面 | 双账号 `slash` suite `16/16` 通过: `/model`、`/reasoning`、`/reload-mcp` 走 gateway handler; skill slash 改写为原生 skill invocation; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias 不进 LLM, quick exec 只允许显式开启; unknown slash 返回 Hermes 风格 unknown-command。 |
 
 以上全部跑在真实飞书 WebSocket gateway + OpenAI 兼容模型 provider 上。真实 open_id、token、chat ID、app secret 均不会进入本仓库。
 
@@ -248,7 +248,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 多轮会话记忆 (SQLite 持久化, 跨重启) | ✅ |
 | 引用上下文注入 (回复消息) | ✅ |
 | 限流退避 (429 backoff, 与 hermes 主线节奏一致) | ✅ |
-| Hermes 斜杠命令控制面 | ✅ —— 动态识别 Hermes registry 命令; `/model`、`/reasoning`、`/reload-mcp` 等走 gateway handler; skill slash 改写为 Hermes 原生 skill invocation; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick_commands 支持 alias/exec; unknown slash 返回 Hermes 风格 unknown-command, 不漏进 LLM |
+| Hermes 斜杠命令控制面 | ✅ —— 动态识别 Hermes registry 命令; `/model`、`/reasoning`、`/reload-mcp` 等走 gateway handler; skill slash 改写为 Hermes 原生 skill invocation; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick_commands 支持 alias 和显式开启的 exec; unknown slash 返回 Hermes 风格 unknown-command, 不漏进 LLM |
 | 幂等 feishu-sync 同步器 (CLI + 库) | ✅ |
 | Python 飞书通讯录组织同步 (`pull-feishu`) | ✅ —— 自动创建/更新 profile、SOUL 托管区块和路由表 |
 | 图像识别 (图片附件) | ✅ —— 委托给 hermes 的 `gateway._prepare_inbound_message_text`, 行为与主线一致 |
@@ -257,7 +257,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 引用上下文 (回复消息) | ✅ —— 同一委托, 加上我们自己的 `reply_to_text` 兜底 |
 | 多用户共享会话归属 | ✅ —— 同一委托 |
 | 工具调用 (真正的 AIAgent loop, 浏览器/搜索/shell) | ✅ —— 通过隔离的 `AIAgent` subprocess bridge |
-| Feishu CardKit / IM 文件消息回复 | ✅ —— 流式卡片 + 原生 `MEDIA:<path>` 投递复用 |
+| Feishu CardKit / IM 文件消息回复 | ✅ —— 流式卡片 + 原生 `MEDIA:<path>` 投递复用, 但只允许发送当前 profile 目录内文件 |
 
 ---
 
@@ -278,7 +278,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | `SendResult.{success, message_id}` | ✅ |
 | `gateway._prepare_inbound_message_text(event, source, history)` | ⚠️ 私有 (下划线开头) —— 一次调用覆盖图像 + 语音 + 文件注入 + 引用上下文。签名变了会自动降级到本地图像-only。 |
 | `gateway.stream_consumer.GatewayStreamConsumer` | ⚠️ Hermes 集成面 —— 存在时复用 Feishu CardKit 流式卡片, 不存在则回落到文本 edit。 |
-| `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ 私有 —— 复用原生 Feishu `MEDIA:<path>` 文件投递路径。不可用时 no-op。 |
+| `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ 私有 —— 过滤到当前路由 profile 目录后, 复用原生 Feishu `MEDIA:<path>` 文件投递路径。不可用时 no-op。 |
 | `run_agent.AIAgent` | ⚠️ 核心运行时类 —— 隔离在 `aiagent_subprocess.py`, 出错时回落到旧 OpenAI-compatible path。 |
 | `tools.feishu_oapi_client.sender_open_id_scope` | ⚠️ Feishu UAT bridge —— 把 token 查找限定到 `~/.hermes/feishu_uat/<open_id>.json`。 |
 | `tools.vision_tools.vision_analyze_tool` (本地兜底) | ✅ 工具模块, 仅在 gateway 助手缺失时使用 |
@@ -340,6 +340,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | `model.default` | (你的 hermes 默认) | 按 profile 配置模型; 使用你自己的 Hermes 部署已经标准化的 provider/model。 |
 | `model.fallback` | (你的 hermes 默认) | 主模型失败时 `agent_real` 用这个 |
 | `multitenancy.toolsets_mode` | `merge_default` | profile 里写了 `platform_toolsets.feishu` 时, 默认与 Hermes Feishu 默认工具集合并, 保留 web/browser/search 等通用能力。设为 `explicit` 可恢复严格替换。 |
+| `multitenancy.allow_quick_exec` | `false` | 允许 Feishu 多租户里的 `quick_commands` 使用 `type: exec`。生产环境请保持关闭, 直到 profile 沙箱已经强制生效; 开启后的 exec 会继承当前路由 profile 的 `HERMES_HOME`。 |
 
 | 同步命令 / 环境变量 | 默认值 | 说明 |
 |---|---|---|
@@ -348,6 +349,7 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | `pull-feishu --soft-delete-missing` | full sync 开, `--dept` 关 | 软删除本次同步结果里缺失的 active 路由 |
 | `pull-feishu --no-soft-delete-missing` | off | 强制不软删除缺失路由, 适合 pilot 或排障 |
 | `HERMES_MULTITENANCY_AUTO_PROVISION` | `1` | 未知飞书用户首次发消息时自动创建 `feishu_<open_id>` 兜底 profile; 设为 `0` 可改成严格白名单 |
+| `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC` | 未设置 / off | `quick_commands` exec 的环境变量开关。生产建议优先用配置白名单并配合沙箱。 |
 
 | 插件可调项 (`router.py` 里的 Python 常量) | 默认值 | 说明 |
 |---|---|---|
@@ -465,7 +467,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 ### 想要的贡献 (按优先级)
 
-1. **按 profile 拆 `SessionStore`** —— 当前所有会话行都在一个共享 `multitenancy.db`。要做到真正 1000 用户规模, 应该按 profile 拆库 (与 hermes 自己的 profile 隔离对齐)。
+1. **按 profile 拆 `SessionStore`** —— 当前会话行按 `(profile, canonical sender)` 在共享 `multitenancy.db` 中隔离; 按 profile 拆库仍是规模化加固项, 也更贴近 hermes 自己的 profile 布局。
 2. **Prompt 缓存** —— Anthropic `cache_control` 给 SOUL 前缀加缓存。长期对话 token 成本砍 ~50%。
 3. **CI 矩阵** —— GitHub Actions 在多个 `hermes-agent` 版本上跑 `pytest tests/ -q`, 提早发现上游契约漂移。
 4. **更多 live UAT fixture** —— 扩大写操作/破坏性路径覆盖,但不依赖共享生产类资源。

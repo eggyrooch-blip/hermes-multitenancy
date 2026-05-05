@@ -232,7 +232,7 @@ This isn't a paper plugin. The current UAT chain has been run against a real Fei
 | 3 | Both users send the same tool-heavy UAT case set | AIAgent subprocess runs with the correct profile home and sender open_id scope. |
 | 4 | Replies stream back through Feishu CardKit / IM | Text cards and file-message paths are delivered through the Feishu adapter. |
 | 5 | Full dual-account stress suite | Run with `--users <userA>,<userB> --parallel-users`; each case records independent `case_id::user` checkpoint entries. |
-| 6 | Dynamic slash control plane | Dual-account `slash` suite passed `16/16`: `/model`, `/reasoning`, `/reload-mcp` use gateway handlers; skill slash rewrites into native skill invocation; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec bypass the LLM; unknown slash returns Hermes-style unknown-command. |
+| 6 | Dynamic slash control plane | Dual-account `slash` suite passed `16/16`: `/model`, `/reasoning`, `/reload-mcp` use gateway handlers; skill slash rewrites into native skill invocation; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias bypasses the LLM, and quick exec is explicit opt-in only; unknown slash returns Hermes-style unknown-command. |
 
 These checks were run live through Feishu's WebSocket gateway and an OpenAI-compatible model provider. Real open_ids, tokens, chat IDs and app secrets are intentionally omitted from this repository.
 
@@ -250,7 +250,7 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Multi-turn session memory (SQLite-backed, survives restart) | ✅ |
 | Reply-context injection (quoted messages) | ✅ |
 | Rate-limit retry (429 backoff, mirrors hermes mainstream cadence) | ✅ |
-| Hermes slash command control plane | ✅ — dynamically recognizes Hermes registry commands; `/model`, `/reasoning`, `/reload-mcp` use gateway handlers; skill slash rewrites into native skill invocation; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick_commands support alias/exec; unknown slash returns Hermes-style unknown-command and never leaks into the LLM |
+| Hermes slash command control plane | ✅ — dynamically recognizes Hermes registry commands; `/model`, `/reasoning`, `/reload-mcp` use gateway handlers; skill slash rewrites into native skill invocation; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick_commands support alias and explicitly-enabled exec; unknown slash returns Hermes-style unknown-command and never leaks into the LLM |
 | Idempotent feishu-sync reconciler (CLI + library) | ✅ |
 | Python Feishu Contact org sync (`pull-feishu`) | ✅ — creates/updates profiles, SOUL managed blocks and route rows |
 | Vision (image attachments) | ✅ — delegates to hermes' `gateway._prepare_inbound_message_text`, identical to mainstream |
@@ -259,7 +259,7 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Reply context (quoted message) | ✅ — same delegate, plus our own `reply_to_text` fallback |
 | Multi-user shared-session attribution | ✅ — same delegate |
 | Tool use (real AIAgent loop with browser/search/shell) | ✅ — via isolated `AIAgent` subprocess bridge |
-| Feishu CardKit / IM file-message replies | ✅ — streaming cards plus native `MEDIA:<path>` delivery reuse |
+| Feishu CardKit / IM file-message replies | ✅ — streaming cards plus native `MEDIA:<path>` delivery reuse, filtered to the routed profile home |
 
 ---
 
@@ -280,7 +280,7 @@ We keep **zero patches to hermes-agent**: no edits to `feishu.py`, `gateway/run.
 | `SendResult.{success, message_id}` | ✅ |
 | `gateway._prepare_inbound_message_text(event, source, history)` | ⚠️ private (leading underscore) — covers vision + STT + file inject + reply context in one call. Falls back to local vision-only on signature change. |
 | `gateway.stream_consumer.GatewayStreamConsumer` | ⚠️ Hermes integration surface — reused for Feishu CardKit streaming when present, with text-edit fallback. |
-| `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ private — reused so `MEDIA:<path>` file replies follow the native Feishu path. No-op if unavailable. |
+| `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ private — reused so `MEDIA:<path>` file replies follow the native Feishu path after filtering paths to the routed profile home. No-op if unavailable. |
 | `run_agent.AIAgent` | ⚠️ core runtime class — isolated in `aiagent_subprocess.py` so failures fall back to the legacy OpenAI-compatible path. |
 | `tools.feishu_oapi_client.sender_open_id_scope` | ⚠️ Feishu UAT bridge — scopes token lookup to `~/.hermes/feishu_uat/<open_id>.json`. |
 | `tools.vision_tools.vision_analyze_tool` (local fallback) | ✅ tool module, used only when the gateway helper is missing |
@@ -343,6 +343,7 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | `model.default` | (your hermes default) | Per-profile model selection; use whatever provider/model your Hermes deployment already standardizes on. |
 | `model.fallback` | (your hermes default) | Used by `agent_real` if primary fails |
 | `multitenancy.toolsets_mode` | `merge_default` | When a profile sets `platform_toolsets.feishu`, merge it with Hermes' default Feishu toolsets so web/browser/search remain available. Set `explicit` for strict replacement. |
+| `multitenancy.allow_quick_exec` | `false` | Allows `quick_commands` entries with `type: exec` over Feishu multitenancy. Keep off until the profile sandbox is enforced; allowed exec inherits the routed profile's `HERMES_HOME`. |
 
 | Sync command / env var | Default | Notes |
 |---|---|---|
@@ -351,6 +352,7 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | `pull-feishu --soft-delete-missing` | on for full sync, off for `--dept` | Soft-delete active routes missing from the current pull |
 | `pull-feishu --no-soft-delete-missing` | off | Force missing routes to stay active, useful for pilots and incident recovery |
 | `HERMES_MULTITENANCY_AUTO_PROVISION` | `1` | Auto-create `feishu_<open_id>` fallback profiles for unknown Feishu senders; set `0` for strict allowlist mode |
+| `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC` | unset / off | Environment override for `quick_commands` exec. Prefer config-level allowlisting plus sandboxing in production. |
 
 | Plugin tunable (Python constants in `router.py`) | Default | Notes |
 |---|---|---|
@@ -469,7 +471,7 @@ We pin `hermes-agent>=1.0` in `pyproject.toml` but the plugin loader contract ev
 
 ### Wanted contributions (priority order)
 
-1. **Per-profile `SessionStore`** — currently all session rows live in one shared `multitenancy.db`. For true 1000-user scale they should split into per-profile DBs (mirrors hermes' own profile isolation).
+1. **Per-profile `SessionStore`** — session rows are isolated by `(profile, canonical sender)` in the shared `multitenancy.db`; splitting into per-profile DBs is still useful scale hardening and mirrors hermes' own profile layout.
 2. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix. Cuts token cost ~50% on long-running chats.
 3. **CI matrix** — GitHub Actions running `pytest tests/ -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
 4. **More live UAT fixtures** — broaden destructive/write-path coverage without relying on shared production-like resources.
