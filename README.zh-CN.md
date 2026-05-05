@@ -30,21 +30,32 @@
 flowchart LR
     admin["飞书管理员 / 平台运维"]
     app["一个飞书应用 + 一个 Bot\n复用 APP_ID / APP_SECRET"]
-    userA["飞书用户 A"]
-    userB["飞书用户 B"]
+    contact["Feishu Contact v3\n部门 + 用户"]
+    sync["pull-feishu 组织同步\nsnapshot + profile + route"]
+    table["SQLite multitenancy_routing\nopen_id / union_id -> profile"]
+    userA["飞书用户 A\nopen_id ou_*"]
+    userB["飞书用户 B\nopen_id ou_*"]
+    unknown["未知用户\n未进入同步结果"]
     gateway["Hermes gateway\n单 websocket"]
     router["multitenancy router\npre_gateway_dispatch"]
-    profileA["profile: coder\nSOUL.md + sessions + tools + LLM 凭证"]
-    profileB["profile: feishu_ou_xxx\n新 SOUL.md + sessions + tools + LLM 凭证"]
+    profileA["profile: ee966643\ncanonical Feishu user_id"]
+    profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
+    fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
     aiagent["AIAgent subprocess\n按 profile 切 HERMES_HOME + sender open_id scope"]
     feishu["Feishu CardKit / IM\n文本、卡片、文件"]
 
     admin --> app
+    admin --> contact --> sync --> table
+    sync --> profileA
+    sync --> profileB
     userA --> app
     userB --> app
+    unknown --> app
     app --> gateway --> router
-    router -->|open_id ou_*| profileA --> aiagent --> feishu
-    router -->|新 open_id ou_*| profileB --> aiagent --> feishu
+    router --> table
+    table -->|active route| profileA --> aiagent --> feishu
+    table -->|active route| profileB --> aiagent
+    router -->|route miss + auto-provision| fallback --> aiagent
 ```
 
 **hermes-agent: 改动 0 行。** `git status` 可验。

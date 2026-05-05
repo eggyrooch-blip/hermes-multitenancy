@@ -30,21 +30,32 @@ This plugin is the answer: a **`pre_gateway_dispatch` hook** intercepts every Fe
 flowchart LR
     admin["Feishu admin / operator"]
     app["One Feishu app + one bot\nshared APP_ID / APP_SECRET"]
-    userA["Feishu user A"]
-    userB["Feishu user B"]
+    contact["Feishu Contact v3\ndepartments + users"]
+    sync["pull-feishu org sync\nsnapshot + profiles + routes"]
+    table["SQLite multitenancy_routing\nopen_id / union_id -> profile"]
+    userA["Feishu user A\nopen_id ou_*"]
+    userB["Feishu user B\nopen_id ou_*"]
+    unknown["Unknown sender\nnot in sync result"]
     gateway["Hermes gateway\nsingle websocket"]
     router["multitenancy router\npre_gateway_dispatch"]
-    profileA["profile: coder\nSOUL.md + sessions + tools + LLM creds"]
-    profileB["profile: feishu_ou_xxx\nnew SOUL.md + sessions + tools + LLM creds"]
+    profileA["profile: ee966643\ncanonical Feishu user_id"]
+    profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
+    fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
     aiagent["AIAgent subprocess\nper-profile HERMES_HOME + sender open_id scope"]
     feishu["Feishu CardKit / IM\ntext, cards, files"]
 
     admin --> app
+    admin --> contact --> sync --> table
+    sync --> profileA
+    sync --> profileB
     userA --> app
     userB --> app
+    unknown --> app
     app --> gateway --> router
-    router -->|open_id ou_*| profileA --> aiagent --> feishu
-    router -->|new open_id ou_*| profileB --> aiagent --> feishu
+    router --> table
+    table -->|active route| profileA --> aiagent --> feishu
+    table -->|active route| profileB --> aiagent
+    router -->|route miss + auto-provision| fallback --> aiagent
 ```
 
 **Hermes-agent: 0 lines changed.** Verified by `git status`.
