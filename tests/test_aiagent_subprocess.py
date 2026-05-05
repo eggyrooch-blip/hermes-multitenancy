@@ -254,6 +254,96 @@ def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Pa
     ]
 
 
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({
+                    "event": "approval_required",
+                    "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+                    "approval_id": "approval_1",
+                    "command": "python -c \"print(1)\"",
+                    "description": "script execution via -e/-c flag",
+                    "decision_path": "/tmp/approval_1.json",
+                }).encode() + b"\n",
+                json.dumps({
+                    "event": "approval_resolved",
+                    "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+                    "approval_id": "approval_1",
+                    "choice": "once",
+                }).encode() + b"\n",
+                b'{"event": "done", "result": "ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    events = [
+        item
+        async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+    ]
+
+    assert events == [
+        ("approval_required", {
+            "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+            "approval_id": "approval_1",
+            "command": "python -c \"print(1)\"",
+            "description": "script execution via -e/-c flag",
+            "decision_path": "/tmp/approval_1.json",
+        }),
+        ("approval_resolved", {
+            "session_key": "multitenancy:feishu:coder:oc_test:ou_test",
+            "approval_id": "approval_1",
+            "choice": "once",
+        }),
+        ("done", "ok"),
+    ]
+
+
 def test_event_payload_carries_sender_open_id_from_raw_message(tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -665,6 +755,59 @@ def test_run_with_aiagent_bridges_gateway_approval_to_event_sink(monkeypatch, tm
     assert events[1]["event"] == "approval_resolved"
     assert events[1]["choice"] == "once"
     assert resolved == [("multitenancy:feishu:coder:oc_test:ou_test", "once")]
+
+
+def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    approval_dir = tmp_path / "approval"
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_DIR", str(approval_dir))
+    monkeypatch.setenv("HERMES_MULTITENANCY_APPROVAL_TIMEOUT", "1")
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    registered, resolved = _install_fake_approval(monkeypatch)
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "approval_required":
+            Path(payload["decision_path"]).write_text(
+                json.dumps({"choice": "once"}),
+                encoding="utf-8",
+            )
+
+    cleanup = agent_real._configure_gateway_approval_bridge(
+        sink,
+        "multitenancy:feishu:coder:oc_test:ou_test",
+    )
+    try:
+        worker_result: dict[str, str] = {}
+
+        def worker_thread_tool_guard():
+            session_key = os.getenv("HERMES_SESSION_KEY", "default")
+            notify = registered.get(session_key)
+            if notify is None:
+                worker_result["status"] = "missing"
+                return
+            notify({
+                "command": "python -c 'print(1)'",
+                "description": "script execution via -c flag",
+                "pattern_keys": ["script execution via -c flag"],
+            })
+            worker_result["status"] = "notified"
+
+        worker_thread_tool_guard()
+
+        assert worker_result == {"status": "notified"}
+        assert events[0]["event"] == "approval_required"
+        assert resolved == [("multitenancy:feishu:coder:oc_test:ou_test", "once")]
+    finally:
+        cleanup()
+
+    assert os.getenv("HERMES_SESSION_KEY") is None
+    assert os.getenv("HERMES_GATEWAY_SESSION") is None
+    assert os.getenv("HERMES_EXEC_ASK") is None
 
 
 def test_run_with_aiagent_closes_real_agent_resources(monkeypatch, tmp_path: Path):

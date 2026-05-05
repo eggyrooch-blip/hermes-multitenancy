@@ -40,7 +40,7 @@ flowchart LR
     router["multitenancy router\npre_gateway_dispatch"]
     guard["tenant boundary guard\ncanonical sender / env lock / media filter / exec opt-in"]
     slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
-    approval["approval bridge\nchild approval -> router /approve"]
+    approval["approval bridge\nsession env + stream events + decision file"]
     cron["shared cron store\n~/.hermes/cron/jobs.json"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
@@ -66,7 +66,7 @@ flowchart LR
     guard -->|route miss + auto-provision| fallback --> aiagent
     aiagent -->|MEDIA path must stay in profile home| feishu
     aiagent -->|cronjob create| cron -->|gateway ticker delivers| feishu
-    aiagent -->|dangerous command approval_required| approval -->|prompt + decision file| feishu
+    aiagent -->|dangerous command approval_required/resolved| approval -->|router prompt + decision file| feishu
     feishu -->|/approve / /deny| router --> approval
 ```
 
@@ -83,7 +83,7 @@ If you are an agent taking over this repo, this is the main contract:
 3. **Routes live in SQLite.** `multitenancy_routing.open_id -> profile_name` decides which `~/.hermes/profiles/<profile>/` handles the turn. A real `ou_*` will not be absorbed by a stale `union_id`; legacy alt routes are used only when no real `ou_*` is available.
 4. **Normal messages run inside the routed profile.** The router builds a profile-scoped event, writes the resolved `sender_open_id` back to the event, then dispatches to the streaming AIAgent subprocess. The child process runs with that profile's `HERMES_HOME`; Feishu UAT tokens are still loaded from `~/.hermes/feishu_uat/<open_id>.json`.
 5. **Cron/reminder jobs use the shared gateway scheduler store.** Inside the AIAgent subprocess, `agent_real._configure_cron_home()` temporarily binds `cron.jobs` and `tools.cronjob_tools` to the shared Hermes home (`~/.hermes/cron/jobs.json`), not `~/.hermes/profiles/<profile>/cron/jobs.json`. This matters because the single gateway cron ticker only watches the shared store; otherwise "remind me in 3 minutes" jobs can stay forever `scheduled`.
-6. **Dangerous-command approvals cross the subprocess boundary.** The profile AIAgent registers `tools.approval` with a router-compatible gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`). The child emits `approval_required`; the router prompts Feishu; `/approve` / `/deny` writes a decision file that releases the child and resumes Hermes' native approval flow.
+6. **Dangerous-command approvals cross the subprocess boundary.** The profile AIAgent registers `tools.approval` with a router-compatible gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`). The child also sets child-local `HERMES_SESSION_KEY` / `HERMES_GATEWAY_SESSION` / `HERMES_EXEC_ASK`, because terminal/process guards may run in worker threads that do not inherit contextvars. The child emits `approval_required` / `approval_resolved`; the parent `_stream_aiagent_subprocess()` must forward those events to the router; the router prompts Feishu; `/approve` / `/deny` writes a decision file that releases the child and resumes Hermes' native approval flow. The matching Hermes core terminal guard must run before sandbox/environment creation, otherwise the approval prompt can be blocked by environment startup.
 7. **CardKit heartbeat lives in the parent router.** The router primes the card and sends idle heartbeat status updates before the child emits tokens; the heartbeat stops once reasoning/tool/content events arrive.
 8. **Memory is keyed by `(profile, canonical sender)`.** `_history_key()` does not use `sender_alt or sender`, so stale/shared alternate IDs cannot merge two users' memory.
 9. **Slash commands never leak into the LLM.** `/model`, `/reasoning`, `/reload-mcp` and other registry commands use Hermes gateway handlers; skill slash rewrites into native skill invocation for the routed profile; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec follows config; unknown slash returns Hermes-style unknown-command.
@@ -289,7 +289,7 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Multi-user shared-session attribution | ✅ — same delegate |
 | Tool use (real AIAgent loop with browser/search/shell) | ✅ — via isolated `AIAgent` subprocess bridge |
 | Cron / reminder proactive delivery | ✅ — jobs are written to the shared cron store and delivered by the parent gateway ticker |
-| Dangerous-command approval proactive delivery | ✅ — child `approval_required` → router Feishu prompt → `/approve`/`/deny` decision file |
+| Dangerous-command approval proactive delivery | ✅ — child `approval_required`/`approval_resolved` → parent stream parser → router Feishu prompt → `/approve`/`/deny` decision file; child-local session env covers terminal worker threads; core terminal guard runs before environment creation |
 | CardKit idle heartbeat | ✅ — parent router prime + heartbeat; does not depend on early child tokens |
 | Background terminal `notify_on_complete` | ⚠️ not claimed — child registry is invisible to the parent gateway; child exit calls `agent.close()` to avoid orphaned background work |
 | Feishu CardKit / IM file-message replies | ✅ — streaming cards plus native `MEDIA:<path>` delivery reuse, filtered to the routed profile home |
