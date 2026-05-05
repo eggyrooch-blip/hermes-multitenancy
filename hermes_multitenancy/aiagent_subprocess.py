@@ -9,7 +9,7 @@ The fix: shell out to a fresh Python process with no parent event loop.
 Cost: ~0.5-1s extra startup per message.
 
 I/O contract:
-  stdin:  JSON {"event": {...}, "profile_home": "/path/to/profile"}
+  stdin:  JSON {"event": {...}, "profile_home": "/path/to/profile", "messages": [...]}
   stdout: JSON {"result": "...", "error": null}  on success
           JSON {"result": "", "error": "..."}    on failure
   exit:   0 always (errors are reported via JSON)
@@ -68,6 +68,9 @@ def main() -> None:
     payload = json.loads(sys.stdin.read())
     event = _ReplayedEvent(payload["event"])
     profile_home = Path(payload["profile_home"])
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        messages = None
 
     # Lazy import so import errors are reported as JSON, not crash
     _run_with_aiagent = _load_run_with_aiagent()
@@ -85,10 +88,21 @@ def main() -> None:
         # parse stdout deterministically.
         sys.stdout = sys.stderr
         if event_stream:
-            result = _run_with_aiagent(event, profile_home, event_sink=emit)
+            if messages is None:
+                result = _run_with_aiagent(event, profile_home, event_sink=emit)
+            else:
+                result = _run_with_aiagent(
+                    event,
+                    profile_home,
+                    messages=messages,
+                    event_sink=emit,
+                )
             out = {"event": "done", "result": result or "", "error": None}
         else:
-            result = _run_with_aiagent(event, profile_home)
+            if messages is None:
+                result = _run_with_aiagent(event, profile_home)
+            else:
+                result = _run_with_aiagent(event, profile_home, messages=messages)
             out = {"result": result or "", "error": None}
     except Exception as exc:
         if event_stream:

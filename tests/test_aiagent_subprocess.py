@@ -239,6 +239,20 @@ def test_event_payload_carries_sender_open_id_from_raw_message(tmp_path: Path):
     assert payload["event"]["sender_open_id"] == "ou_raw_sender"
 
 
+def test_event_payload_carries_router_messages(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "created doc doxcn123"},
+        {"role": "user", "content": "send me the link"},
+    ]
+
+    payload = agent_real._event_to_subprocess_payload(_event(), tmp_path, messages=messages)
+
+    assert payload["messages"] == messages
+
+
 def test_configure_feishu_uat_home_uses_default_home_for_named_profile(tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -320,6 +334,89 @@ def test_run_with_aiagent_sets_gateway_session_context(monkeypatch, tmp_path: Pa
         "session_chat_id": "oc_current",
         "session_platform": "feishu",
     }
+
+
+def test_run_with_aiagent_passes_router_history_without_current_user(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - feishu_chat\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, conversation_history=None):
+            seen["user_message"] = user_message
+            seen["conversation_history"] = conversation_history
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.text = "send me the link"
+    messages = [
+        {"role": "user", "content": "create a doc"},
+        {"role": "assistant", "content": "created doc doxcn123"},
+        {"role": "user", "content": "send me the link"},
+    ]
+
+    assert agent_real._run_with_aiagent(event, profile_home, messages=messages) == "ok"
+    assert seen == {
+        "user_message": "send me the link",
+        "conversation_history": [
+            {"role": "user", "content": "create a doc"},
+            {"role": "assistant", "content": "created doc doxcn123"},
+        ],
+    }
+
+
+def test_aiagent_session_id_is_stable_across_feishu_message_ids(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    first = _event()
+    second = _event()
+    second.message_id = "om_next"
+    second.source.message_id = "om_source_next"
+
+    first_session = agent_real._resolve_aiagent_session_id(
+        first,
+        profile_home,
+        "ou_sender",
+    )
+    second_session = agent_real._resolve_aiagent_session_id(
+        second,
+        profile_home,
+        "ou_sender",
+    )
+
+    assert first_session == second_session
+    assert "profile:coder" in first_session
+    assert "chat:oc_test" in first_session
+    assert "user:ou_sender" in first_session
+
+
+def test_aiagent_session_id_isolates_users_in_same_feishu_chat(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    event = _event()
+
+    assert agent_real._resolve_aiagent_session_id(event, profile_home, "ou_owner") != (
+        agent_real._resolve_aiagent_session_id(event, profile_home, "ou_yuan")
+    )
 
 
 def test_resolve_enabled_toolsets_merges_feishu_override_with_default_tools():
