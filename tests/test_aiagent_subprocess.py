@@ -5,6 +5,9 @@ import json
 import logging
 import sys
 import asyncio
+import contextvars
+import types
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +29,61 @@ def _event() -> SimpleNamespace:
             message_id="om_source",
         ),
     )
+
+
+def _install_fake_feishu_oapi(monkeypatch) -> None:
+    current_sender_open_id = contextvars.ContextVar("current_sender_open_id", default=None)
+
+    @contextmanager
+    def sender_open_id_scope(value):
+        token = current_sender_open_id.set(value)
+        try:
+            yield
+        finally:
+            current_sender_open_id.reset(token)
+
+    fake_feishu_oapi = SimpleNamespace(
+        current_sender_open_id=current_sender_open_id,
+        sender_open_id_scope=sender_open_id_scope,
+        FEISHU_UAT_PATH=None,
+        FEISHU_UAT_DIR=None,
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.feishu_oapi_client = fake_feishu_oapi
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.feishu_oapi_client", fake_feishu_oapi)
+
+
+def _install_fake_gateway_session_context(monkeypatch) -> None:
+    session_env = contextvars.ContextVar("session_env", default={})
+
+    def set_session_vars(**kwargs):
+        env = {
+            "HERMES_SESSION_PLATFORM": kwargs.get("platform", ""),
+            "HERMES_SESSION_CHAT_ID": kwargs.get("chat_id", ""),
+            "HERMES_SESSION_CHAT_NAME": kwargs.get("chat_name", ""),
+            "HERMES_SESSION_THREAD_ID": kwargs.get("thread_id", ""),
+            "HERMES_SESSION_USER_ID": kwargs.get("user_id", ""),
+            "HERMES_SESSION_USER_NAME": kwargs.get("user_name", ""),
+            "HERMES_SESSION_KEY": kwargs.get("session_key", ""),
+        }
+        return session_env.set(env)
+
+    def clear_session_vars(token):
+        session_env.reset(token)
+
+    def get_session_env(name):
+        return session_env.get({}).get(name)
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=clear_session_vars,
+        get_session_env=get_session_env,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
 
 
 @pytest.mark.asyncio
@@ -249,6 +307,8 @@ def test_run_with_aiagent_sets_gateway_session_context(monkeypatch, tmp_path: Pa
             pass
 
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
 
     event = _event()
     event.source.chat_id = "oc_current"
@@ -260,6 +320,50 @@ def test_run_with_aiagent_sets_gateway_session_context(monkeypatch, tmp_path: Pa
         "session_chat_id": "oc_current",
         "session_platform": "feishu",
     }
+
+
+def test_resolve_enabled_toolsets_merges_feishu_override_with_default_tools():
+    from hermes_multitenancy import agent_real
+
+    seen: dict[str, object] = {}
+
+    def fake_get_platform_tools(config, platform, *, include_default_mcp_servers=True):
+        seen["platform_toolsets"] = config.get("platform_toolsets")
+        seen["platform"] = platform
+        seen["include_default_mcp_servers"] = include_default_mcp_servers
+        return {"web", "browser", "feishu_doc"}
+
+    config = {
+        "platform_toolsets": {
+            "feishu": ["feishu_drive"],
+        }
+    }
+
+    assert agent_real._resolve_enabled_toolsets(
+        config,
+        "feishu",
+        platform_tools_resolver=fake_get_platform_tools,
+    ) == ["browser", "feishu_doc", "feishu_drive", "web"]
+    assert seen == {
+        "platform_toolsets": {},
+        "platform": "feishu",
+        "include_default_mcp_servers": True,
+    }
+
+
+def test_resolve_enabled_toolsets_allows_explicit_mode(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    def fake_get_platform_tools(*_args, **_kwargs):
+        raise AssertionError("explicit mode must not resolve platform defaults")
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_TOOLSETS_MODE", "explicit")
+
+    assert agent_real._resolve_enabled_toolsets(
+        {"platform_toolsets": {"feishu": ["feishu_drive", "web"]}},
+        "feishu",
+        platform_tools_resolver=fake_get_platform_tools,
+    ) == ["feishu_drive", "web"]
 
 
 def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path: Path):
@@ -298,6 +402,7 @@ def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path:
 
     events: list[dict] = []
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
 
     result = agent_real._run_with_aiagent(
         _event(),

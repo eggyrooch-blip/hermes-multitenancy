@@ -447,8 +447,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         finally:
             if feishu_full:
                 try:
-                    from gateway.platforms.base import ProcessingOutcome  # type: ignore
-                    out = ProcessingOutcome.FAILURE if outcome_failed else ProcessingOutcome.SUCCESS
+                    out = _processing_outcome(failed=outcome_failed)
                     complete_deferred = getattr(adapter, "complete_deferred_processing", None)
                     if callable(complete_deferred):
                         await complete_deferred(event, out)
@@ -462,6 +461,21 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         raise
     except Exception as exc:
         logger.exception("multitenancy: handle_async failed: %s", exc)
+
+
+def _processing_outcome(*, failed: bool) -> Any:
+    """Return Hermes' ProcessingOutcome enum, or a string-compatible fallback."""
+    try:
+        from gateway.platforms.base import ProcessingOutcome  # type: ignore
+
+        return ProcessingOutcome.FAILURE if failed else ProcessingOutcome.SUCCESS
+    except Exception:
+        class _FallbackOutcome:
+            def __str__(self) -> str:
+                status = "FAILURE" if failed else "SUCCESS"
+                return f"ProcessingOutcome.{status}"
+
+        return _FallbackOutcome()
 
 
 # -- Command dispatch --------------------------------------------------------
