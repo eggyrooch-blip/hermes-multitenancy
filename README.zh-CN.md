@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-[![tests](https://img.shields.io/badge/tests-128%20passing-brightgreen)](#-测试)
+[![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)](#-测试)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#-为什么能保持兼容)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#-端到端验证)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -38,6 +38,7 @@ flowchart LR
     unknown["未知用户\n未进入同步结果"]
     gateway["Hermes gateway\n单 websocket"]
     router["multitenancy router\npre_gateway_dispatch"]
+    guard["租户边界 guard\ncanonical sender / env lock / media filter / exec opt-in"]
     slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
     profileA["profile: ee966643\ncanonical Feishu user_id"]
     profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
@@ -52,17 +53,36 @@ flowchart LR
     userA --> app
     userB --> app
     unknown --> app
-    app --> gateway --> router
-    router -->|slash command| slash
-    slash -->|gateway handler / quick / plugin / unknown| feishu
+    app --> gateway --> router --> guard
+    guard -->|slash command| slash
+    slash -->|gateway handler / quick alias / plugin / unknown| feishu
+    slash -->|quick exec only when explicitly enabled| aiagent
     slash -->|skill invocation| aiagent
-    router --> table
+    guard --> table
     table -->|active route| profileA --> aiagent --> feishu
     table -->|active route| profileB --> aiagent
-    router -->|route miss + auto-provision| fallback --> aiagent
+    guard -->|route miss + auto-provision| fallback --> aiagent
+    aiagent -->|MEDIA path must stay in profile home| feishu
 ```
 
 **hermes-agent: 改动 0 行。** `git status` 可验。
+
+---
+
+## 🧭 给 Agent 看的实现速览
+
+如果你是接手这个仓库的 Agent, 先读这一节就能知道主链路和配置边界:
+
+1. **入口不改 Hermes core。** `hermes_multitenancy.register(ctx)` 注册 `pre_gateway_dispatch` hook。收到飞书消息后, hook 返回 `{"action": "skip"}`, 由插件自己的 `handle_async()` 接管后续路由和回复。
+2. **身份只认 canonical sender。** `_resolve_sender_for_routing()` 优先取真实飞书 `open_id` (`ou_*`): Feishu contextvar、`event.sender_open_id`、`source.open_id/user_id`、`raw/raw_event/event` 都会查。`user_id_alt` / `union_id` 只用于旧路由查找, 不作为新 session key。
+3. **路由是 SQLite 表。** `multitenancy_routing.open_id -> profile_name` 决定用户进入哪个 `~/.hermes/profiles/<profile>/`。有真实 `ou_*` 时不会被 stale `union_id` 吸收到老 profile; 没有 `ou_*` 时才 fallback 到 legacy alt route。
+4. **普通消息进入 profile runtime。** router 构造 profile-scoped event, 把真实 `sender_open_id` 写回 event, 再进入 streaming AIAgent subprocess。子进程以该 profile 的 `HERMES_HOME` 运行, Feishu UAT token 仍按 `~/.hermes/feishu_uat/<open_id>.json` 查。
+5. **session 记忆按 `(profile, canonical sender)` 隔离。** `_history_key()` 不再用 `sender_alt or sender`, 避免 stale/shared alt 把两个用户记忆合并。
+6. **slash 命令不漏进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等走 Hermes gateway handler; skill slash 改写为 Hermes 原生 skill invocation 后进对应 profile 的 agent; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; unknown slash 返回 Hermes 风格 unknown-command。
+7. **slash handler 有 profile 上下文锁。** gateway/plugin handler 在 `_profile_gateway_context()` 内运行, 串行切换 `HERMES_HOME` 和 gateway session key, 防止并发 slash 串租户。
+8. **本机 exec 默认关闭。** `quick_commands` 的 alias 仍可用; `type: exec` 默认禁用。只有 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 后才允许, 且 exec 继承当前 profile 的 `HERMES_HOME`。生产建议等 profile 沙箱落地后再开。
+9. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。
+10. **生产推荐策略。** 公司/生产环境建议 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 做白名单路由, `multitenancy.allow_quick_exec=false`, 再叠加 profile 沙箱。沙箱负责 OS 级隔离; 本插件负责路由/session/slash/附件这些应用层边界。
 
 ---
 
