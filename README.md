@@ -393,7 +393,7 @@ package:
 ```bash
 python scripts/stress_test_feishu_pipeline.py \
   --suite full \
-  --users 孙可,美元本袁 \
+  --users 用户A,美元本袁 \
   --parallel-users \
   --chat-id "$HERMES_FEISHU_TEST_CHAT_ID" \
   --fixtures .uat/fixtures/dual-users.local.json \
