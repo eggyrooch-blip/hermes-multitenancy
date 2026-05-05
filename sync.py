@@ -10,9 +10,17 @@ This wrapper makes route sync runnable without modifying PYTHONPATH:
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+plugin_root = Path(__file__).resolve().parent
+sys.path.insert(0, str(plugin_root))
+
+hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+shared_home = hermes_home.parent.parent if hermes_home.parent.name == "profiles" else hermes_home
+agent_checkout = shared_home / "hermes-agent"
+if agent_checkout.exists():
+    sys.path.insert(0, str(agent_checkout))
 
 from hermes_multitenancy.sync.cli import main
 

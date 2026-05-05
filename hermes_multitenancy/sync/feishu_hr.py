@@ -26,7 +26,12 @@ class UserSpec:
     union_id: Optional[str] = None
 
 
-def apply_users(table, users: Iterable[UserSpec]) -> dict[str, int]:
+def apply_users(
+    table,
+    users: Iterable[UserSpec],
+    *,
+    soft_delete_missing: bool = True,
+) -> dict[str, int]:
     """Reconcile ``table`` to match ``users``.
 
     Returns a counters dict::
@@ -35,14 +40,8 @@ def apply_users(table, users: Iterable[UserSpec]) -> dict[str, int]:
 
     The numbers are per-row-action, useful for ops dashboards and tests.
     """
-    desired = {u.user_id: u for u in users}
-
-    # Snapshot current active rows so we can detect deletes.
-    cur = table._conn.execute(
-        "SELECT user_id, profile_name, open_id, union_id"
-        " FROM multitenancy_routing WHERE active = 1"
-    )
-    current = {r["user_id"]: dict(r) for r in cur.fetchall()}
+    desired, current = _desired_and_current(table, users)
+    current_by_open_id = {row["open_id"]: row for row in current.values()}
 
     upserted = 0
     soft_deleted = 0
@@ -58,6 +57,15 @@ def apply_users(table, users: Iterable[UserSpec]) -> dict[str, int]:
         ):
             kept += 1
             continue
+        conflicting = current_by_open_id.get(u.open_id)
+        if conflicting and conflicting["user_id"] != u.user_id:
+            # Common migration path: an unseen sender was auto-provisioned as
+            # user_id=open_id, then the org sync later learns the real
+            # Feishu user_id for the same open_id. Deactivate the temporary
+            # row before inserting the canonical user_id route.
+            if table.soft_delete(conflicting["user_id"]):
+                soft_deleted += 1
+            current.pop(conflicting["user_id"], None)
         table.upsert(
             user_id=u.user_id,
             profile_name=u.profile_name,
@@ -67,9 +75,55 @@ def apply_users(table, users: Iterable[UserSpec]) -> dict[str, int]:
         upserted += 1
 
     # 2. Soft-delete rows in table but missing from desired
-    for user_id in current:
-        if user_id not in desired:
-            if table.soft_delete(user_id):
-                soft_deleted += 1
+    if soft_delete_missing:
+        for user_id in current:
+            if user_id not in desired:
+                if table.soft_delete(user_id):
+                    soft_deleted += 1
 
     return {"upserted": upserted, "soft_deleted": soft_deleted, "kept": kept}
+
+
+def plan_users(
+    table,
+    users: Iterable[UserSpec],
+    *,
+    soft_delete_missing: bool = True,
+) -> dict[str, int]:
+    """Return the same counters as ``apply_users`` without writing rows."""
+    desired, current = _desired_and_current(table, users)
+    current_by_open_id = {row["open_id"]: row for row in current.values()}
+
+    upserted = 0
+    soft_deleted = 0
+    kept = 0
+    for u in desired.values():
+        existing = current.get(u.user_id)
+        if existing and (
+            existing["profile_name"] == u.profile_name
+            and existing["open_id"] == u.open_id
+            and (existing["union_id"] or None) == u.union_id
+        ):
+            kept += 1
+        else:
+            conflicting = current_by_open_id.get(u.open_id)
+            if conflicting and conflicting["user_id"] != u.user_id:
+                soft_deleted += 1
+                current.pop(conflicting["user_id"], None)
+            upserted += 1
+
+    if soft_delete_missing:
+        soft_deleted += sum(1 for user_id in current if user_id not in desired)
+    return {"upserted": upserted, "soft_deleted": soft_deleted, "kept": kept}
+
+
+def _desired_and_current(table, users: Iterable[UserSpec]) -> tuple[dict[str, UserSpec], dict[str, dict]]:
+    desired = {u.user_id: u for u in users}
+
+    # Snapshot current active rows so we can detect deletes.
+    cur = table._conn.execute(
+        "SELECT user_id, profile_name, open_id, union_id"
+        " FROM multitenancy_routing WHERE active = 1"
+    )
+    current = {r["user_id"]: dict(r) for r in cur.fetchall()}
+    return desired, current

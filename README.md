@@ -130,16 +130,23 @@ Then run your Hermes Feishu authorization/UAT flow for each real user. Token fil
 ~/.hermes/feishu_uat/ou_yyy.json
 ```
 
-### 4. Create profiles and add routing rules
+### 4. Sync Feishu org into profiles + routes
 
-Create one Hermes profile per tenant persona. Each profile can have its own
-`SOUL.md`, `.env`, model config and tool policy:
+If your Feishu app has Contact read scopes, use the Python org sync:
 
 ```bash
-mkdir -p ~/.hermes/profiles/alice_profile ~/.hermes/profiles/bob_profile
-$EDITOR ~/.hermes/profiles/alice_profile/SOUL.md
-$EDITOR ~/.hermes/profiles/bob_profile/SOUL.md
+# Preview only; does not write profiles or DB rows
+python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dry-run
+
+# Apply and save an org snapshot
+mkdir -p ~/.hermes/org-snapshots
+python ~/.hermes/plugins/multitenancy/sync.py pull-feishu \
+  --snapshot-out ~/.hermes/org-snapshots
 ```
+
+The sync command reuses the current `HERMES_HOME` Feishu config (`config.yaml` / `.env` / environment), pulls Feishu Contact v3 departments and users, creates `~/.hermes/profiles/<user_id>/` from Feishu `user_id`, and writes `multitenancy_routing`. It only updates a managed org block inside `SOUL.md`; manually edited content outside that block is preserved.
+
+If you do not have Contact scopes yet, or want to run a strict manual allowlist, keep using the JSON route reconciler:
 
 ```bash
 # Directory-plugin install path
@@ -160,7 +167,7 @@ Where `users.json` is:
 
 Each `profile_name` should already exist as a hermes profile directory at `~/.hermes/profiles/<name>/` with its own `SOUL.md`, `config.yaml`, `auth.json` or `.env`. The plugin will route Feishu messages from `ou_xxx` to `alice_profile`'s SOUL+memory, and from `ou_yyy` to `bob_profile`.
 
-For first-run UAT you can also leave auto-provision enabled (`HERMES_MULTITENANCY_AUTO_PROVISION=1`, the default). An unseen sender `ou_new_user` gets a deterministic profile such as `~/.hermes/profiles/feishu_ou_new_user/`, seeded from the shared Hermes config, then routed independently on the next turn.
+For first-run UAT you can also leave auto-provision enabled (`HERMES_MULTITENANCY_AUTO_PROVISION=1`, the default). An unseen sender `ou_new_user` gets a deterministic fallback profile such as `~/.hermes/profiles/feishu_ou_new_user/`, seeded from the shared Hermes config. Once org sync learns that user's canonical Feishu `user_id`, it takes over the route to the `user_id` profile.
 
 Restart the hermes gateway. **Done.**
 
@@ -176,6 +183,27 @@ Send two different Feishu users the same prompt through the same bot. The
 gateway log should show different sender `ou_*` values and different profile
 homes.
 
+### 6. Automate, scope, and recover
+
+After the first sync, run a periodic full sync through cron or a systemd timer. A full sync handles join/move/leave: new employees get profiles + routes, department or manager changes refresh only the managed org block in `SOUL.md`, and users missing from the full Contact result are soft-deleted from routing (`active=0`) while their profiles, memories, and sessions remain on disk.
+
+```cron
+*/30 * * * * HERMES_HOME=/Users/kite/.hermes /usr/bin/python3 /Users/kite/.hermes/plugins/multitenancy/sync.py pull-feishu --snapshot-out /Users/kite/.hermes/org-snapshots >> /Users/kite/.hermes/logs/multitenancy-sync.log 2>&1
+```
+
+When only some people need org sync, use a department-scoped sync or a manual allowlist:
+
+```bash
+# Sync one department subtree; out-of-scope routes are not soft-deleted by default
+python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dept <open_department_id> --dry-run
+python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dept <open_department_id>
+
+# Strict allowlist mode: unknown users do not auto-create fallback profiles
+export HERMES_MULTITENANCY_AUTO_PROVISION=0
+```
+
+If sync goes wrong, stop the timer first, then inspect `pull-feishu --dry-run` and the latest snapshot. A user can send `/status` in Feishu to see the current profile; locally, run `hermes -p <profile_name> chat` to enter that profile. Unknown-user fallback profiles live at `~/.hermes/profiles/feishu_<open_id>/`.
+
 ---
 
 ## ✅ Proof of end-to-end
@@ -188,7 +216,7 @@ This isn't a paper plugin. The current UAT chain has been run against a real Fei
 | 2 | User B → same bot → router | Auto-provisioned and routed to a new `feishu_ou_xxx` profile, not the `coder` profile. |
 | 3 | Both users send the same tool-heavy UAT case set | AIAgent subprocess runs with the correct profile home and sender open_id scope. |
 | 4 | Replies stream back through Feishu CardKit / IM | Text cards and file-message paths are delivered through the Feishu adapter. |
-| 5 | Full dual-account stress suite | User A: 168/168 passed. User B: 168/168 passed. 0 failed, 0 skipped. |
+| 5 | Full dual-account stress suite | Run with `--users <userA>,<userB> --parallel-users`; each case records independent `case_id::user` checkpoint entries. |
 
 These checks were run live through Feishu's WebSocket gateway and an OpenAI-compatible model provider. Real open_ids, tokens, chat IDs and app secrets are intentionally omitted from this repository.
 
@@ -206,8 +234,9 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Multi-turn session memory (SQLite-backed, survives restart) | ✅ |
 | Reply-context injection (quoted messages) | ✅ |
 | Rate-limit retry (429 backoff, mirrors hermes mainstream cadence) | ✅ |
-| Slash commands (`/help` `/status` `/stop` `/new` `/reset`) | ✅ |
+| Hermes slash command control plane | ✅ — dynamically recognizes Hermes gateway commands; local thin handlers cover multitenant `/stop` `/status` `/new` `/reset`, other known commands delegate to the gateway handler when available and never leak into the LLM |
 | Idempotent feishu-sync reconciler (CLI + library) | ✅ |
+| Python Feishu Contact org sync (`pull-feishu`) | ✅ — creates/updates profiles, SOUL managed blocks and route rows |
 | Vision (image attachments) | ✅ — delegates to hermes' `gateway._prepare_inbound_message_text`, identical to mainstream |
 | Audio STT (voice messages) | ✅ — same delegate, hermes' `transcribe_audio` runs on cached audio |
 | Text-file inject (.txt / .md / .csv / .log / .json …) | ✅ — same delegate, content prepended to message |
@@ -231,6 +260,7 @@ We keep **zero patches to hermes-agent**: no edits to `feishu.py`, `gateway/run.
 | `Platform.FEISHU` enum + `ProcessingOutcome` enum | ✅ |
 | `gateway.adapters[Platform.FEISHU]` dict | ✅ |
 | `hermes_constants.get_hermes_home()` (read via env) | ✅ |
+| `hermes_cli.commands.resolve_command / is_gateway_known_command` | ✅ — slash command recognition comes from Hermes' central registry, with a tiny fallback for tests outside Hermes |
 | `SendResult.{success, message_id}` | ✅ |
 | `gateway._prepare_inbound_message_text(event, source, history)` | ⚠️ private (leading underscore) — covers vision + STT + file inject + reply context in one call. Falls back to local vision-only on signature change. |
 | `gateway.stream_consumer.GatewayStreamConsumer` | ⚠️ Hermes integration surface — reused for Feishu CardKit streaming when present, with text-edit fallback. |
@@ -276,11 +306,12 @@ after those generic surfaces settle and external usage proves the behavior.
      ├─ pool.py           LRU RuntimePool (50 hot / 5min idle / cold-start sem)
      ├─ routing.py        SQLite multitenancy_routing table (open_id → profile)
      ├─ sessions.py       SQLite multitenancy_sessions (per-user history, persistent)
-     ├─ commands.py       parse_command (/help /status /stop /new /reset)
+     ├─ commands.py       Hermes registry-backed slash command parser
      ├─ agent_real.py     AIAgent subprocess bridge + legacy OpenAI-compat fallback
      ├─ aiagent_subprocess.py isolated child-process entry point for AIAgent/tool loop
      └─ sync/
         ├─ feishu_hr.py   apply_users (idempotent reconciler)
+        ├─ feishu_org.py  Feishu Contact v3 pull + profile/SOUL/route sync
         └─ cli.py         shared implementation for route sync
 ```
 
@@ -296,6 +327,14 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | `model.default` | (your hermes default) | Per-profile model selection; use whatever provider/model your Hermes deployment already standardizes on. |
 | `model.fallback` | (your hermes default) | Used by `agent_real` if primary fails |
 | `multitenancy.toolsets_mode` | `merge_default` | When a profile sets `platform_toolsets.feishu`, merge it with Hermes' default Feishu toolsets so web/browser/search remain available. Set `explicit` for strict replacement. |
+
+| Sync command / env var | Default | Notes |
+|---|---|---|
+| `pull-feishu --dry-run` | off | Preview planned changes without writing profiles or DB rows |
+| `pull-feishu --dept <id>` | off | Sync one Feishu department subtree; out-of-scope routes are not soft-deleted by default |
+| `pull-feishu --soft-delete-missing` | on for full sync, off for `--dept` | Soft-delete active routes missing from the current pull |
+| `pull-feishu --no-soft-delete-missing` | off | Force missing routes to stay active, useful for pilots and incident recovery |
+| `HERMES_MULTITENANCY_AUTO_PROVISION` | `1` | Auto-create `feishu_<open_id>` fallback profiles for unknown Feishu senders; set `0` for strict allowlist mode |
 
 | Plugin tunable (Python constants in `router.py`) | Default | Notes |
 |---|---|---|
@@ -316,6 +355,7 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | `/status` | Show current profile + history length + run state |
 | `/new` / `/reset` | Reset this user's session history (per profile) — clears both cache + SQLite |
 | `/stop`   | Cancel the in-flight LLM call for this user |
+| Other Hermes gateway commands | Recognized dynamically from Hermes' registry and delegated to the gateway handler when available; otherwise they return a control-plane warning instead of entering the agent prompt. |
 
 ---
 
@@ -336,6 +376,23 @@ PYTHONPATH=/path/to/hermes-agent python -m pytest \
 PYTHONPATH=. python -m pytest tests/ -m integration -v
 ```
 
+Full dual-account Feishu UAT lives in the Hermes UAT worktree, not this plugin
+package:
+
+```bash
+python scripts/stress_test_feishu_pipeline.py \
+  --suite full \
+  --users owner,美元本袁 \
+  --parallel-users \
+  --chat-id "$HERMES_FEISHU_TEST_CHAT_ID" \
+  --fixtures .uat/fixtures/dual-users.local.json \
+  --allow-destructive \
+  --strict-identity \
+  --route-mode multitenant \
+  --require-card-final \
+  --checkpoint ~/.hermes/uat/checkpoints/full-dual-20260505.jsonl
+```
+
 ---
 
 ## 🐛 Troubleshooting
@@ -343,6 +400,17 @@ PYTHONPATH=. python -m pytest tests/ -m integration -v
 **"plugin loaded but no replies"** — `pkill -f gateway && hermes gateway run`. Plugins are loaded at gateway startup, so any change requires a restart.
 
 **"all bots stopped responding"** — your routing rule probably has the wrong `open_id` or `union_id`. Check the actual values that arrive from Feishu by adding a temporary `print(event.source)` in `router.on_pre_gateway_dispatch` and watching the gateway log.
+
+**"org sync routed someone incorrectly"** — stop cron/systemd first, then run `pull-feishu --dry-run` to inspect planned changes. The user can send `/status` in Feishu to see the current profile; locally inspect `sqlite3 ~/.hermes/multitenancy.db 'select user_id, open_id, profile_name, active from multitenancy_routing;'`.
+
+**"I need to bypass a bad route immediately"** — soft-delete the active route and let the next message auto-provision a fallback profile:
+
+```bash
+sqlite3 ~/.hermes/multitenancy.db \
+  "update multitenancy_routing set active=0, deleted_at=strftime('%s','now'), updated_at=strftime('%s','now'), version=version+1 where open_id='ou_xxx' and active=1;"
+```
+
+The fallback profile is `~/.hermes/profiles/feishu_ou_xxx/`; open it with `hermes -p feishu_ou_xxx chat`.
 
 **"user_id is `g41a5b5g`-ish, not the `ou_` I expected"** — some Feishu/Hermes paths expose a short SDK user ID on `event.source.user_id`. This plugin now resolves the real sender `open_id` from Feishu raw sender metadata/context first, and only falls back to `user_id_alt` / `union_id` for legacy rows.
 
