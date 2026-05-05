@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import sys
 import asyncio
 import contextvars
@@ -268,6 +269,40 @@ def test_configure_feishu_uat_home_uses_default_home_for_named_profile(tmp_path:
     assert shared_home == default_home
     assert fake_feishu_oapi.FEISHU_UAT_PATH == default_home / "feishu_uat.json"
     assert fake_feishu_oapi.FEISHU_UAT_DIR == default_home / "feishu_uat"
+
+
+def test_configure_cron_home_uses_shared_gateway_store(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "coder"
+    shared_home = tmp_path / ".hermes"
+    profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    tools_pkg = types.ModuleType("tools")
+    cronjob_tools = types.ModuleType("tools.cronjob_tools")
+    path_security = types.ModuleType("tools.path_security")
+    path_security.validate_within_dir = lambda path, root: None
+    cron_pkg.jobs = cron_jobs
+    tools_pkg.cronjob_tools = cronjob_tools
+    tools_pkg.path_security = path_security
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
+    monkeypatch.setitem(sys.modules, "tools.path_security", path_security)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    agent_real._configure_cron_home(shared_home)
+
+    assert cron_jobs.JOBS_FILE == shared_home.resolve() / "cron" / "jobs.json"
+    assert cron_jobs.OUTPUT_DIR == shared_home.resolve() / "cron" / "output"
+    assert os.environ["HERMES_HOME"] == str(profile_home)
+    assert cronjob_tools._validate_cron_script_path("reminder.py") is None
+    assert "relative to shared" in cronjob_tools._validate_cron_script_path("/tmp/reminder.py")
 
 
 def test_tool_progress_logger_records_tool_names(caplog):
