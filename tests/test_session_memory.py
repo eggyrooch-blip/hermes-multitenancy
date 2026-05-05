@@ -239,3 +239,51 @@ async def test_history_isolated_between_users(monkeypatch, tmp_path):
     assert all("bob" not in m for m in msgs), msgs
 
     clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_history_key_prefers_sender_over_shared_alt(monkeypatch, tmp_path):
+    """A stale/shared alternate ID must not merge two users' memory."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.router import handle_async, _session_history, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    _user_inflight_tasks.clear()
+    _session_history.clear()
+    clear_spike_routes()
+
+    home = tmp_path / "shared-alt"
+    home.mkdir()
+    add_spike_route("ou_alt_a", home)
+    add_spike_route("ou_alt_b", home)
+
+    seen = []
+
+    async def fake_stream(event, hh, *, messages=None):
+        seen.append((event.source.user_id, [m["content"] for m in messages]))
+        yield ("content", f"resp-{event.source.user_id}-{len(seen)}")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    adapter = _StreamAdapter()
+    gateway = SimpleNamespace(adapters={"feishu": adapter})
+
+    event_a1 = _build_event("alice-1", user_id="ou_alt_a")
+    event_a1.source.user_id_alt = "shared_alt"
+    event_b1 = _build_event("bob-1", user_id="ou_alt_b")
+    event_b1.source.user_id_alt = "shared_alt"
+    event_a2 = _build_event("alice-2", user_id="ou_alt_a")
+    event_a2.source.user_id_alt = "shared_alt"
+
+    await handle_async(event=event_a1, gateway=gateway)
+    await handle_async(event=event_b1, gateway=gateway)
+    await handle_async(event=event_a2, gateway=gateway)
+
+    _user, msgs = seen[2]
+    assert _user == "ou_alt_a"
+    assert any("alice-1" in m for m in msgs)
+    assert all("bob" not in m for m in msgs), msgs
+    assert (home.name, "ou_alt_a") in _session_history
+    assert (home.name, "shared_alt") not in _session_history
+
+    clear_spike_routes()

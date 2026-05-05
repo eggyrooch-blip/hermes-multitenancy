@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,12 +345,80 @@ async def test_gateway_command_gets_profile_scoped_session_key(tmp_path):
         async def _handle_model_command(self, event):
             return self._session_key_for_source(event.source)
 
-    await handle_async(
-        event=_build_event("/model glm-5.1", user_id="ou_profile_cmd"),
-        gateway=Gateway(),
-    )
+    event = _build_event("/model glm-5.1", user_id="ou_profile_cmd")
+    event.source.user_id_alt = "shared_alt"
+    await handle_async(event=event, gateway=Gateway())
 
     assert sends == ["multitenancy:feishu:coder:chat-cmd:ou_profile_cmd"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_gateway_commands_keep_profile_context(tmp_path):
+    """Concurrent slash handlers must not observe another profile's HERMES_HOME/session key."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_a = tmp_path / "alice"
+    profile_b = tmp_path / "bob"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    add_spike_route("ou_cmd_a", profile_a)
+    add_spike_route("ou_cmd_b", profile_b)
+
+    sends = []
+    observations = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append((c, m))
+
+    class Gateway:
+        adapters = {"feishu": Adapter()}
+
+        def _session_key_for_source(self, source):
+            return "native-session-key"
+
+        async def _handle_model_command(self, event):
+            source = event.source
+            observations.append(
+                (
+                    source.user_id,
+                    "start",
+                    os.environ.get("HERMES_HOME"),
+                    self._session_key_for_source(source),
+                )
+            )
+            await asyncio.sleep(0.01)
+            observations.append(
+                (
+                    source.user_id,
+                    "end",
+                    os.environ.get("HERMES_HOME"),
+                    self._session_key_for_source(source),
+                )
+            )
+            return os.environ.get("HERMES_HOME")
+
+    gateway = Gateway()
+    await asyncio.gather(
+        handle_async(event=_build_event("/model glm-5.1", user_id="ou_cmd_a", chat_id="chat-a"), gateway=gateway),
+        handle_async(event=_build_event("/model glm-5.1", user_id="ou_cmd_b", chat_id="chat-b"), gateway=gateway),
+    )
+
+    expected_home = {"ou_cmd_a": str(profile_a), "ou_cmd_b": str(profile_b)}
+    expected_key = {
+        "ou_cmd_a": "multitenancy:feishu:alice:chat-a:ou_cmd_a",
+        "ou_cmd_b": "multitenancy:feishu:bob:chat-b:ou_cmd_b",
+    }
+    assert sorted(message for _chat, message in sends) == sorted(expected_home.values())
+    assert observations
+    for user_id, _when, home, session_key in observations:
+        assert home == expected_home[user_id]
+        assert session_key == expected_key[user_id]
+
     clear_spike_routes()
 
 
@@ -463,6 +532,7 @@ async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_
 
     async def plugin_handler(args):
         called["args"] = args
+        called["hermes_home"] = os.environ.get("HERMES_HOME")
         return f"plugin handled {args}"
 
     fake_plugins = SimpleNamespace(
@@ -486,7 +556,8 @@ async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_
     gateway = SimpleNamespace(adapters={"feishu": Adapter()})
     await handle_async(event=_build_event("/demo_plugin hi there", user_id="ou_plugin"), gateway=gateway)
 
-    assert called == {"args": "hi there"}
+    assert called["args"] == "hi there"
+    assert called["hermes_home"] == str(tmp_path)
     assert sends == ["plugin handled hi there"]
     assert "Hermes plugin slash handler" in caplog.text
     clear_spike_routes()
@@ -531,16 +602,15 @@ async def test_quick_command_alias_reuses_gateway_handler(monkeypatch, tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_quick_command_exec_runs_without_agent_dispatch(monkeypatch, tmp_path, caplog):
-    """Gateway quick-command exec entries are control-plane commands."""
+async def test_quick_command_exec_disabled_by_default(monkeypatch, tmp_path):
+    """Shell quick commands must be opt-in for multitenant Feishu."""
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
-    caplog.set_level("INFO")
     clear_spike_routes()
     _user_inflight_tasks.clear()
-    add_spike_route("ou_quick_exec", tmp_path)
+    add_spike_route("ou_quick_exec_denied", tmp_path)
 
     class PoolShouldNotRun:
         async def dispatch(self, *args, **kwargs):
@@ -558,9 +628,51 @@ async def test_quick_command_exec_runs_without_agent_dispatch(monkeypatch, tmp_p
         adapters={"feishu": Adapter()},
         config={"quick_commands": {"ping": {"type": "exec", "command": "printf quick-ok"}}},
     )
+    await handle_async(event=_build_event("/ping", user_id="ou_quick_exec_denied"), gateway=gateway)
+
+    assert sends == [
+        "Quick command '/ping' exec is disabled for Feishu multitenancy. "
+        "Enable only after profile sandboxing is in place."
+    ]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_quick_command_exec_runs_in_profile_env_when_explicitly_enabled(monkeypatch, tmp_path, caplog):
+    """Allowed exec commands inherit the routed profile HERMES_HOME."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    caplog.set_level("INFO")
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "quick-exec-profile"
+    profile_home.mkdir()
+    add_spike_route("ou_quick_exec", profile_home)
+
+    class PoolShouldNotRun:
+        async def dispatch(self, *args, **kwargs):
+            raise AssertionError("quick-command exec leaked into AIAgent dispatch")
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: PoolShouldNotRun())
+
+    sends = []
+
+    class Adapter:
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(
+        adapters={"feishu": Adapter()},
+        config={
+            "multitenancy": {"allow_quick_exec": True},
+            "quick_commands": {"ping": {"type": "exec", "command": "printf \"$HERMES_HOME\""}},
+        },
+    )
     await handle_async(event=_build_event("/ping", user_id="ou_quick_exec"), gateway=gateway)
 
-    assert sends == ["quick-ok"]
+    assert sends == [str(profile_home)]
     assert "Hermes quick command exec" in caplog.text
     clear_spike_routes()
 

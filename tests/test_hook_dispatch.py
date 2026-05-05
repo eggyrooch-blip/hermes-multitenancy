@@ -338,6 +338,95 @@ async def test_new_open_id_auto_provisions_before_stale_alt_route(monkeypatch, t
 
 
 @pytest.mark.asyncio
+async def test_legacy_alt_route_used_when_real_open_id_unavailable(monkeypatch, tmp_path):
+    """If no ou_* is present, a legacy alt route should win over auto-provision."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import clear_spike_routes
+
+    clear_spike_routes()
+    db_path = tmp_path / "routing.db"
+    router_mod.override_routing_table(db_path)
+    table = router_mod._get_routing_table()
+    table.upsert(
+        user_id="legacy",
+        profile_name="legacy_profile",
+        open_id="on_legacy_user",
+        union_id="on_legacy_user",
+    )
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    event = _build_event(user_id="short_without_open_id")
+    event.source.user_id_alt = "on_legacy_user"
+    dispatched = {}
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            dispatched["profile_name"] = profile_name
+            dispatched["profile_home"] = profile_home
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    await router_mod.handle_async(event=event, gateway=SimpleNamespace(adapters={}))
+
+    assert dispatched == {
+        "profile_name": "legacy_profile",
+        "profile_home": tmp_path / "profiles" / "legacy_profile",
+    }
+    assert table.lookup_by_open_id("short_without_open_id") is None
+
+    router_mod.override_routing_table(None)
+
+
+@pytest.mark.asyncio
+async def test_handle_async_sets_resolved_raw_event_open_id_on_agent_event(monkeypatch, tmp_path):
+    """The sender selected by router must be visible to AIAgent/subprocess payload code."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "raw-sender"
+    profile_home.mkdir()
+    add_spike_route("ou_raw_event_sender", profile_home)
+
+    event = _build_event(user_id="short_sender_without_ou")
+    event.raw_event = {
+        "event": {
+            "message": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_raw_event_sender",
+                        "union_id": "on_raw_event_sender",
+                    }
+                }
+            }
+        }
+    }
+    captured = {}
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            captured["profile_name"] = profile_name
+            captured["sender_open_id"] = getattr(agent_event, "sender_open_id", None)
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    await router_mod.handle_async(event=event, gateway=SimpleNamespace(adapters={}))
+
+    assert captured == {
+        "profile_name": "raw-sender",
+        "sender_open_id": "ou_raw_event_sender",
+    }
+
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
 async def test_auto_provision_normalizes_existing_profile_config(monkeypatch, tmp_path):
     """Existing auto profiles are repaired if their model.default lacks provider."""
     from hermes_multitenancy import router as router_mod
@@ -553,6 +642,57 @@ async def test_handle_async_reuses_gateway_media_delivery_after_stream(monkeypat
             "adapter": adapter,
         }
     ]
+
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_handle_async_blocks_outbound_media_outside_profile(monkeypatch, tmp_path):
+    """A tenant must not be able to attach files outside its routed profile home."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "profiles" / "media-profile"
+    profile_home.mkdir(parents=True)
+    add_spike_route("ou_media_block", profile_home)
+
+    outside_path = tmp_path / "other-profile" / "secret.md"
+    outside_path.parent.mkdir()
+    outside_path.write_text("do not send", encoding="utf-8")
+
+    async def fake_enrich(event, gateway):
+        return "make a file"
+
+    async def fake_stream(adapter, chat_id, profile_name, profile_home, event, *, messages=None):
+        return f"created\nMEDIA:{outside_path}"
+
+    class FullFeishuAdapter:
+        async def on_processing_start(self, event):
+            return None
+
+        async def on_processing_complete(self, event, outcome):
+            return None
+
+        async def edit_message(self, *args, **kwargs):
+            return None
+
+    delivered = []
+
+    async def deliver_media(response, delivered_event, adapter):
+        delivered.append(response)
+
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+
+    gateway = SimpleNamespace(
+        adapters={"feishu": FullFeishuAdapter()},
+        _deliver_media_from_response=deliver_media,
+    )
+
+    await router_mod.handle_async(event=_build_event(text="make a file", user_id="ou_media_block"), gateway=gateway)
+
+    assert delivered == []
 
     clear_spike_routes()
 

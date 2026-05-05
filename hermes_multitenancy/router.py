@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,9 +29,9 @@ except Exception:  # pragma: no cover - allows plugin unit tests without gateway
 _user_inflight_tasks: dict[str, asyncio.Task] = {}
 
 # Multi-turn session memory: maps (profile_name, user_key) → list of messages.
-# user_key prefers the real Feishu open_id (ou_*) used for routing, falling
-# back to union_id / alternate identifiers for legacy rows. SessionStore
-# persists the same key so memory survives gateway restarts.
+# user_key is the canonical sender chosen by routing. Alternate IDs are lookup
+# helpers only; using them as the memory key can merge distinct users that share
+# a stale or tenant-global alias.
 _SESSION_HISTORY_MAX = 20  # keep last N messages (user + assistant alternating)
 _session_history: dict[tuple[str, str], list[dict]] = {}
 # Tracks which (profile, user_key) pairs we've lazy-loaded from SessionStore
@@ -40,7 +41,16 @@ _session_loaded: set[tuple[str, str]] = set()
 
 def _history_key(profile_name: str, sender: str, sender_alt: Optional[str]) -> tuple[str, str]:
     """Return the per-(profile, user) key used to look up conversation history."""
-    return (profile_name, sender_alt or sender)
+    return (profile_name, _tenant_user_key(sender, sender_alt))
+
+
+def _tenant_user_key(sender: str, sender_alt: Optional[str]) -> str:
+    """Return the canonical per-user key for memory/session scoping."""
+    sender_key = str(sender or "").strip()
+    if sender_key and sender_key != "unknown":
+        return sender_key
+    alt_key = str(sender_alt or "").strip()
+    return alt_key or sender_key or "unknown"
 
 
 def _trim_history(history: list[dict]) -> list[dict]:
@@ -207,12 +217,46 @@ def _clean_stream_display_text(text: str) -> str:
         return cleaned.rstrip()
 
 
-async def _deliver_media_from_stream_response(gateway: Any, response: str, event: Any, adapter: Any) -> None:
+_MEDIA_DIRECTIVE_RE = re.compile(r'''(?P<prefix>[`"']?MEDIA:\s*)(?P<path>\S+)(?P<suffix>[`"']?)''')
+
+
+async def _deliver_media_from_stream_response(
+    gateway: Any,
+    response: str,
+    event: Any,
+    adapter: Any,
+    profile_home: Path,
+) -> None:
     """Delegate post-stream media attachment delivery to Hermes' native gateway path."""
     deliver = getattr(gateway, "_deliver_media_from_response", None)
     if not callable(deliver):
         return
-    await deliver(response, event, adapter)
+    scoped_response = _profile_scoped_media_response(response, profile_home)
+    if "MEDIA:" not in scoped_response:
+        return
+    await deliver(scoped_response, event, adapter)
+
+
+def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
+    """Drop MEDIA directives that point outside the routed profile home."""
+    root = profile_home.expanduser().resolve(strict=False)
+
+    def repl(match: re.Match[str]) -> str:
+        raw_path = match.group("path").strip()
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved == root or root in resolved.parents:
+            return f"{match.group('prefix')}{resolved}{match.group('suffix')}"
+        logger.warning(
+            "multitenancy: blocked outbound MEDIA outside profile home path=%s profile_home=%s",
+            raw_path,
+            root,
+        )
+        return ""
+
+    return _MEDIA_DIRECTIVE_RE.sub(repl, str(response or ""))
 
 
 async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]:
@@ -330,7 +374,14 @@ def _should_defer_gateway_processing_complete(event: Any) -> bool:
     if parse_command(text) is not None:
         return False
     _profile_name, profile_home = _resolve_route(sender, alt_id=sender_alt)
-    return profile_home is not None or _auto_provision_enabled()
+    if profile_home is not None:
+        return True
+    return (
+        _auto_provision_enabled()
+        and _get_routing_table() is not None
+        and bool(sender)
+        and sender != "unknown"
+    )
 
 
 def _defer_gateway_processing_complete(event: Any, gateway: Any) -> None:
@@ -356,6 +407,8 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         chat_id = getattr(source, "chat_id", "unknown") if source else "unknown"
         fallback_sender = getattr(source, "user_id", "unknown") if source else "unknown"
         sender = _resolve_sender_for_routing(event, fallback=fallback_sender)
+        if _is_feishu_open_id(sender):
+            setattr(event, "sender_open_id", sender)
         text = getattr(event, "text", "") or ""
 
         sender_alt = getattr(source, "user_id_alt", None) if source else None
@@ -453,7 +506,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 )
                 if response_text:
                     await _deliver_media_from_stream_response(
-                        gateway, response_text, agent_event, adapter
+                        gateway, response_text, agent_event, adapter, profile_home
                     )
             else:
                 # Mock / minimal adapter — old non-stream path (send_typing + pool.dispatch + send)
@@ -673,7 +726,7 @@ async def _dispatch_gateway_command(
 
     dispatcher = getattr(gateway, "_dispatch_slash_command", None)
     if callable(dispatcher):
-        with _profile_gateway_context(
+        async with _profile_gateway_context(
             gateway,
             event,
             sender=sender,
@@ -716,8 +769,17 @@ async def _dispatch_gateway_command(
         )
         if quick_result is not None:
             return quick_result
-        return await _dispatch_plugin_command(cmd, event)
-    with _profile_gateway_context(
+        return await _dispatch_plugin_command(
+            cmd,
+            event,
+            gateway,
+            sender=sender,
+            sender_alt=sender_alt,
+            profile_name=profile_name,
+            profile_home=profile_home,
+            chat_id=chat_id,
+        )
+    async with _profile_gateway_context(
         gateway,
         event,
         sender=sender,
@@ -754,12 +816,21 @@ async def _dispatch_quick_command(
         exec_cmd = qcmd.get("command", "")
         if not exec_cmd:
             return f"Quick command '/{cmd}' has no command defined."
+        if not _quick_exec_allowed(gateway, qcmd):
+            return (
+                f"Quick command '/{cmd}' exec is disabled for Feishu multitenancy. "
+                "Enable only after profile sandboxing is in place."
+            )
         logger.info("Hermes quick command exec: %s", cmd)
         try:
+            env = os.environ.copy()
+            if profile_home is not None:
+                env["HERMES_HOME"] = str(profile_home)
             proc = await asyncio.create_subprocess_shell(
                 exec_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
             output = (stdout or stderr).decode().strip()
@@ -807,7 +878,44 @@ def _get_quick_command(gateway: Any, cmd: str) -> Any:
     return quick_commands.get(cmd)
 
 
-async def _dispatch_plugin_command(cmd: str, event: Any) -> Optional[str]:
+def _quick_exec_allowed(gateway: Any, qcmd: dict[str, Any]) -> bool:
+    """Return True only when multitenant Feishu quick exec is explicitly enabled."""
+    qcmd_flag = qcmd.get("multitenancy_allow_exec")
+    if qcmd_flag is None:
+        qcmd_cfg = qcmd.get("multitenancy")
+        if isinstance(qcmd_cfg, dict):
+            qcmd_flag = qcmd_cfg.get("allow_exec")
+    if qcmd_flag is not None:
+        return _truthy(qcmd_flag)
+
+    config = getattr(gateway, "config", None)
+    plugin_cfg = None
+    if isinstance(config, dict):
+        plugin_cfg = config.get("multitenancy")
+    else:
+        plugin_cfg = getattr(config, "multitenancy", None)
+    if isinstance(plugin_cfg, dict) and "allow_quick_exec" in plugin_cfg:
+        return _truthy(plugin_cfg.get("allow_quick_exec"))
+
+    env_value = os.getenv("HERMES_MULTITENANCY_ALLOW_QUICK_EXEC")
+    return _truthy(env_value) if env_value is not None else False
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "allow", "enabled"}
+
+
+async def _dispatch_plugin_command(
+    cmd: str,
+    event: Any,
+    gateway: Any,
+    *,
+    sender: str,
+    sender_alt: Optional[str],
+    profile_name: Optional[str],
+    profile_home: Optional[Path],
+    chat_id: str,
+) -> Optional[str]:
     """Delegate plugin-registered slash commands to Hermes' plugin manager."""
     handler = _get_plugin_command_handler(cmd)
     if handler is None:
@@ -817,9 +925,18 @@ async def _dispatch_plugin_command(cmd: str, event: Any) -> Optional[str]:
     get_args = getattr(event, "get_command_args", None)
     if callable(get_args):
         user_args = (get_args() or "").strip()
-    result = handler(user_args)
-    if asyncio.iscoroutine(result):
-        result = await result
+    async with _profile_gateway_context(
+        gateway,
+        event,
+        sender=sender,
+        sender_alt=sender_alt,
+        profile_name=profile_name,
+        profile_home=profile_home,
+        chat_id=chat_id,
+    ):
+        result = handler(user_args)
+        if asyncio.iscoroutine(result):
+            result = await result
     return str(result) if result else None
 
 
@@ -881,7 +998,8 @@ def _event_platform_value(event: Any) -> Optional[str]:
     return str(value) if value else None
 
 
-def _profile_gateway_context(
+@asynccontextmanager
+async def _profile_gateway_context(
     gateway: Any,
     event: Any,
     *,
@@ -892,42 +1010,40 @@ def _profile_gateway_context(
     chat_id: str,
 ):
     """Temporarily scope Hermes gateway helpers to the routed profile."""
-    class _Context:
-        def __enter__(self):
-            self._old_home = os.environ.get("HERMES_HOME")
-            self._had_home = "HERMES_HOME" in os.environ
-            self._old_session_key_for_source = getattr(gateway, "_session_key_for_source", None)
-            if profile_home is not None:
-                os.environ["HERMES_HOME"] = str(profile_home)
-            session_key = _multitenant_gateway_session_key(
-                event,
-                profile_name=profile_name,
-                sender=sender,
-                sender_alt=sender_alt,
-                chat_id=chat_id,
-            )
-            if session_key:
-                def _scoped_session_key_for_source(source):
-                    return session_key
+    from .runtime import _get_env_lock
 
-                setattr(gateway, "_session_key_for_source", _scoped_session_key_for_source)
-            return self
+    async with _get_env_lock():
+        old_home = os.environ.get("HERMES_HOME")
+        had_home = "HERMES_HOME" in os.environ
+        old_session_key_for_source = getattr(gateway, "_session_key_for_source", None)
+        if profile_home is not None:
+            os.environ["HERMES_HOME"] = str(profile_home)
+        session_key = _multitenant_gateway_session_key(
+            event,
+            profile_name=profile_name,
+            sender=sender,
+            sender_alt=sender_alt,
+            chat_id=chat_id,
+        )
+        if session_key:
+            def _scoped_session_key_for_source(source):
+                return session_key
 
-        def __exit__(self, exc_type, exc, tb):
-            if self._old_session_key_for_source is not None:
-                setattr(gateway, "_session_key_for_source", self._old_session_key_for_source)
+            setattr(gateway, "_session_key_for_source", _scoped_session_key_for_source)
+        try:
+            yield
+        finally:
+            if old_session_key_for_source is not None:
+                setattr(gateway, "_session_key_for_source", old_session_key_for_source)
             elif hasattr(gateway, "_session_key_for_source"):
                 try:
                     delattr(gateway, "_session_key_for_source")
                 except Exception:
                     pass
-            if self._had_home:
-                os.environ["HERMES_HOME"] = self._old_home or ""
+            if had_home:
+                os.environ["HERMES_HOME"] = old_home or ""
             else:
                 os.environ.pop("HERMES_HOME", None)
-            return False
-
-    return _Context()
 
 
 def _multitenant_gateway_session_key(
@@ -942,7 +1058,7 @@ def _multitenant_gateway_session_key(
         return None
     source = getattr(event, "source", None)
     platform = getattr(getattr(source, "platform", None), "value", None) or "feishu"
-    user_key = sender_alt or sender
+    user_key = _tenant_user_key(sender, sender_alt)
     return f"multitenancy:{platform}:{profile_name}:{chat_id}:{user_key}"
 
 
@@ -1017,7 +1133,8 @@ def _resolve_or_auto_provision_route(
     alt_id: Optional[str] = None,
 ) -> tuple[str, Optional[Path]]:
     """Resolve an existing route, or create a dedicated profile for a new sender."""
-    profile_name, profile_home = _resolve_route(sender, alt_id=None)
+    alt_lookup = None if _is_feishu_open_id(sender) else alt_id
+    profile_name, profile_home = _resolve_route(sender, alt_id=alt_lookup)
     if profile_home is not None:
         _repair_auto_profile(profile_name, profile_home, route_key=sender, sender=sender)
         return profile_name, profile_home
