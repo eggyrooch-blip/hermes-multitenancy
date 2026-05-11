@@ -67,10 +67,10 @@
 --ro-bind-try ${USER_HOME}/.config/git ${USER_HOME}/.config/git
 --ro-bind-try ${USER_HOME}/.gitconfig ${USER_HOME}/.gitconfig
 
-# ── This profile — read + write ─────────────────────────────────────
---bind ${PROFILE_HOME} ${PROFILE_HOME}
-
 # ── Shared hermes home — narrow rw, broad ro ────────────────────────
+# Must come BEFORE the per-profile bind: bwrap mounts override earlier
+# ones at the same path, so SHARED_HOME ro would re-mask PROFILE_HOME
+# (which lives at ${SHARED_HOME}/profiles/<name>) if it came after.
 # Parallel to profile-default.sb:129-165.
 --ro-bind ${SHARED_HOME} ${SHARED_HOME}
 --bind-try ${SHARED_HOME}/cron ${SHARED_HOME}/cron
@@ -79,6 +79,12 @@
 --bind-try ${SHARED_HOME}/multitenancy.db ${SHARED_HOME}/multitenancy.db
 --bind-try ${SHARED_HOME}/multitenancy.db-wal ${SHARED_HOME}/multitenancy.db-wal
 --bind-try ${SHARED_HOME}/multitenancy.db-shm ${SHARED_HOME}/multitenancy.db-shm
+
+# ── This profile — read + write ─────────────────────────────────────
+# Placed AFTER the SHARED_HOME ro-bind so it overrides the parent ro
+# mount (bwrap evaluates --bind / --ro-bind in source order, with the
+# last operation winning at any given path).
+--bind ${PROFILE_HOME} ${PROFILE_HOME}
 
 # ── Cross-tenant deny by construction ───────────────────────────────
 # ${SHARED_HOME}/profiles/<other> directories are NOT bind-mounted, so
