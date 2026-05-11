@@ -356,3 +356,90 @@ def test_cli_pull_feishu_delegates_to_sync(monkeypatch, capsys):
     assert calls[0]["dry_run"] is True
     assert calls[0]["soft_delete_missing"] is None
     assert json.loads(capsys.readouterr().out)["employees"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 档 A — profile directory hardening (chmod 0700 + isolation pivot dirs)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_profiles_creates_isolation_pivot_dirs(tmp_path):
+    """Provision must create the per-profile HOME/XDG/TMPDIR backing dirs."""
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: zai/glm-5.1\n",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    profile_home = profiles_root / "alice"
+    # Every isolation pivot dir referenced by _build_subprocess_env must exist
+    # so the first child spawn doesn't have to create them.
+    for sub in ("home", "cache", "config", "state", "data", "tmp"):
+        path = profile_home / sub
+        assert path.is_dir(), f"{sub}/ missing — child subprocess would create it world-readable"
+
+
+def test_sync_profiles_chmods_profile_tree_to_0700(tmp_path):
+    """profile_home and all subdirs must be 0700 to prevent cross-user enumeration."""
+    import stat as stat_mod
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: zai/glm-5.1\n",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    profile_home = profiles_root / "alice"
+    profile_mode = stat_mod.S_IMODE(profile_home.stat().st_mode)
+    assert profile_mode == 0o700, f"profile_home is {oct(profile_mode)}, expected 0o700"
+
+    for sub in ("home", "cache", "config", "state", "data", "tmp", "memories", "sessions"):
+        path = profile_home / sub
+        mode = stat_mod.S_IMODE(path.stat().st_mode)
+        assert mode == 0o700, f"{sub}/ is {oct(mode)}, expected 0o700"
+
+
+def test_sync_profiles_reapplies_chmod_on_drift(tmp_path):
+    """If someone loosens a dir to 0755 externally, next sync re-tightens it."""
+    import stat as stat_mod
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: zai/glm-5.1\n",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    profile_home = profiles_root / "alice"
+    drifted = profile_home / "cache"
+    import os as _os
+    _os.chmod(drifted, 0o755)
+    assert stat_mod.S_IMODE(drifted.stat().st_mode) == 0o755
+
+    # Second sync must restore 0700.
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+    assert stat_mod.S_IMODE(drifted.stat().st_mode) == 0o700
