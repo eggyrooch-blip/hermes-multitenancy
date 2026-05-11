@@ -1096,6 +1096,59 @@ def test_wrap_with_sandbox_is_noop_when_disabled(monkeypatch, tmp_path: Path):
     assert wrapped == cmd, "sandbox wrap must be a no-op when disabled"
 
 
+def test_wrap_with_sandbox_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):
+    """HERMES_SANDBOX_PROFILES allowlist scopes sandboxing to listed profiles only."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "p.sb"
+    fake_policy.write_text("(version 1) (deny default)")
+    fake_bin = tmp_path / "sandbox-exec"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "spike_test, researcher")
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(fake_bin))
+
+    cmd = ["/usr/bin/python3", "child.py"]
+
+    # Listed profile → wrapped.
+    spike = tmp_path / "profiles" / "spike_test"
+    spike.mkdir(parents=True)
+    wrapped_spike = agent_real._wrap_with_sandbox(cmd, spike)
+    assert wrapped_spike[0] == str(fake_bin), "spike_test must be sandboxed"
+
+    # Unlisted profile → bypass.
+    prod = tmp_path / "profiles" / "feishu_g41a5b5g"
+    prod.mkdir(parents=True)
+    wrapped_prod = agent_real._wrap_with_sandbox(cmd, prod)
+    assert wrapped_prod == cmd, "unlisted profile must NOT be sandboxed during pilot"
+
+
+def test_wrap_with_sandbox_empty_allowlist_means_all(monkeypatch, tmp_path: Path):
+    """HERMES_SANDBOX_PROFILES unset (or empty) → all profiles get sandboxed."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "p.sb"
+    fake_policy.write_text("(version 1) (deny default)")
+    fake_bin = tmp_path / "sandbox-exec"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(fake_bin))
+
+    profile = tmp_path / "profiles" / "anybody"
+    profile.mkdir(parents=True)
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+    assert wrapped[0] == str(fake_bin), "no allowlist → everyone is sandboxed"
+
+
 def test_wrap_with_sandbox_falls_back_when_policy_missing(monkeypatch, tmp_path: Path):
     """HERMES_USE_SANDBOX=1 but policy file missing → unsandboxed with warning."""
     from hermes_multitenancy import agent_real
