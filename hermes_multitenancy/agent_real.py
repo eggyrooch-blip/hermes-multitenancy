@@ -782,19 +782,6 @@ def _build_subprocess_env(
         }:
             env["HERMES_SANDBOX_HOST"] = "1"
 
-    # Forward Feishu sender open_id through env so AIAgent tool execution
-    # threads can recover identity. Python ContextVar does NOT propagate
-    # across ThreadPoolExecutor workers, but hermes AIAgent dispatches each
-    # tool to a worker (run_agent.py:1104 / 8479). The hermes-feishu-uat
-    # patch (for_user env fallback) reads this var when contextvar is empty.
-    try:
-        from tools import feishu_oapi_client as _foc
-        _sender = _foc.current_sender_open_id.get()
-        if _sender:
-            env["HERMES_FEISHU_USER_OPEN_ID"] = str(_sender)
-    except Exception:
-        pass
-
     if extra:
         env.update(extra)
     return env
@@ -1031,7 +1018,9 @@ async def _run_aiagent_subprocess(
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    env = _build_subprocess_env(profile_home, approval_dir=approval_dir)
+    _sender_oid = getattr(event, "sender_open_id", "") or ""
+    _extra_env = {"HERMES_FEISHU_USER_OPEN_ID": _sender_oid} if _sender_oid else None
+    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, extra=_extra_env)
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
     # The plugin is typically loaded via a profile-local symlink
     # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
@@ -1330,7 +1319,9 @@ async def _stream_aiagent_subprocess(
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
+    _sender_oid = getattr(event, "sender_open_id", "") or ""
+    _extra_env = {"HERMES_FEISHU_USER_OPEN_ID": _sender_oid} if _sender_oid else None
+    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True, extra=_extra_env)
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
     # The plugin is typically loaded via a profile-local symlink
     # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
