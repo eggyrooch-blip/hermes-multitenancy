@@ -900,3 +900,133 @@ async def test_run_aiagent_subprocess_executes_sibling_script(monkeypatch, tmp_p
     assert seen_args[0] == sys.executable
     assert seen_args[1].endswith("aiagent_subprocess.py")
     assert "-m" not in seen_args
+
+
+# ---------------------------------------------------------------------------
+# 档 A — env whitelist + HOME/XDG/TMPDIR pivot
+# ---------------------------------------------------------------------------
+
+
+def test_build_subprocess_env_drops_non_allowlisted_parent_env(monkeypatch, tmp_path: Path):
+    """Parent env not on the allowlist (e.g. ambient OPENAI_API_KEY) must NOT leak."""
+    from hermes_multitenancy import agent_real
+
+    # Simulate gateway process having a bunch of secret env vars set.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-parent")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-parent")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # allowlisted — must survive
+    monkeypatch.setenv("PYTHONUNBUFFERED", "1")  # allowlisted — must survive
+
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(tmp_path / "profile", approval_dir=approval_dir)
+
+    # Allowlisted keys carry over verbatim.
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["PYTHONUNBUFFERED"] == "1"
+
+    # Secret-ish env keys must be absent.
+    for leaked in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GITLAB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+    ):
+        assert leaked not in env, f"{leaked} leaked into subprocess env"
+
+
+def test_build_subprocess_env_pivots_home_and_xdg_into_profile(tmp_path: Path):
+    """HOME / XDG_* / TMPDIR redirect to per-profile dirs, isolating skill caches."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["HOME"] == str(profile / "home")
+    assert env["XDG_CACHE_HOME"] == str(profile / "cache")
+    assert env["XDG_CONFIG_HOME"] == str(profile / "config")
+    assert env["XDG_STATE_HOME"] == str(profile / "state")
+    assert env["XDG_DATA_HOME"] == str(profile / "data")
+    assert env["TMPDIR"] == str(profile / "tmp")
+
+    # Each pivot dir must exist and be private (mode 0700).
+    for sub in ("home", "cache", "config", "state", "data", "tmp"):
+        d = profile / sub
+        assert d.is_dir(), f"{sub} not created"
+        mode = d.stat().st_mode & 0o777
+        assert mode == 0o700, f"{sub} mode is {oct(mode)}, expected 0o700"
+
+
+def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
+    """HERMES_HOME / SHARED_HOME / approval_dir / event_stream flag plumbed correctly."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "bob"
+    approval_dir = tmp_path / "approval-bob"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    assert env["HERMES_HOME"] == str(profile)
+    assert env["HERMES_GATEWAY_SESSION"] == "1"
+    assert env["HERMES_EXEC_ASK"] == "1"
+    assert env["HERMES_MULTITENANCY_APPROVAL_DIR"] == str(approval_dir)
+    assert "HERMES_AIAGENT_EVENT_STREAM" not in env
+
+    stream_env = agent_real._build_subprocess_env(
+        profile, approval_dir=approval_dir, event_stream=True
+    )
+    assert stream_env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
+
+
+def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
+    """`extra` parameter wins over defaults so callers can override per-spawn."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "carol"
+    approval_dir = tmp_path / "approval-carol"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(
+        profile,
+        approval_dir=approval_dir,
+        extra={"HERMES_MAX_ITERATIONS": "5", "CUSTOM_KEY": "hello"},
+    )
+    assert env["HERMES_MAX_ITERATIONS"] == "5"
+    assert env["CUSTOM_KEY"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_run_aiagent_subprocess_passes_sanitized_env_to_child(
+    monkeypatch, tmp_path: Path
+):
+    """End-to-end: spawned child receives the sanitized env, not parent's full env."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent-leak")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self, _payload):
+            return b'{"result": "ok", "error": null}', b""
+
+    async def fake_create_subprocess_exec(*_args, env=None, **_kwargs):
+        captured["env"] = dict(env or {})
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    profile = tmp_path / "profiles" / "isolated"
+    assert await agent_real._run_aiagent_subprocess(_event(), profile) == "ok"
+
+    child_env = captured["env"]
+    assert "OPENAI_API_KEY" not in child_env, "parent secret leaked to child"
+    assert child_env["HOME"] == str(profile / "home")
+    assert child_env["TMPDIR"] == str(profile / "tmp")
+    assert child_env["HERMES_HOME"] == str(profile)
