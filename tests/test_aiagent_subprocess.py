@@ -1096,6 +1096,7 @@ def test_wrap_with_sandbox_is_noop_when_disabled(monkeypatch, tmp_path: Path):
     assert wrapped == cmd, "sandbox wrap must be a no-op when disabled"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec backend")
 def test_wrap_with_sandbox_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):
     """HERMES_SANDBOX_PROFILES allowlist scopes sandboxing to listed profiles only."""
     import os as _os
@@ -1127,6 +1128,7 @@ def test_wrap_with_sandbox_per_profile_gate_excludes_others(monkeypatch, tmp_pat
     assert wrapped_prod == cmd, "unlisted profile must NOT be sandboxed during pilot"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec backend")
 def test_wrap_with_sandbox_empty_allowlist_means_all(monkeypatch, tmp_path: Path):
     """HERMES_SANDBOX_PROFILES unset (or empty) → all profiles get sandboxed."""
     import os as _os
@@ -1149,6 +1151,7 @@ def test_wrap_with_sandbox_empty_allowlist_means_all(monkeypatch, tmp_path: Path
     assert wrapped[0] == str(fake_bin), "no allowlist → everyone is sandboxed"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only fallback semantics; Linux fails closed (raises)")
 def test_wrap_with_sandbox_falls_back_when_policy_missing(monkeypatch, tmp_path: Path):
     """HERMES_USE_SANDBOX=1 but policy file missing → unsandboxed with warning."""
     from hermes_multitenancy import agent_real
@@ -1164,6 +1167,7 @@ def test_wrap_with_sandbox_falls_back_when_policy_missing(monkeypatch, tmp_path:
     )
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only fallback semantics; Linux fails closed (raises)")
 def test_wrap_with_sandbox_falls_back_when_binary_missing(monkeypatch, tmp_path: Path):
     """If /usr/bin/sandbox-exec is not executable (non-mac), no-op + warning."""
     from hermes_multitenancy import agent_real
@@ -1176,6 +1180,7 @@ def test_wrap_with_sandbox_falls_back_when_binary_missing(monkeypatch, tmp_path:
     assert wrapped == cmd
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec argv shape")
 def test_wrap_with_sandbox_builds_full_invocation(monkeypatch, tmp_path: Path):
     """HERMES_USE_SANDBOX=1 + policy present + binary present → full wrap."""
     import os as _os
@@ -1243,6 +1248,7 @@ def test_sandbox_policy_file_is_valid_syntax():
             "-D", "SHARED_HOME=/tmp/probe-shared",
             "-D", "USER_HOME=/tmp/probe-user",
             "-D", "HERMES_VENV=/tmp/probe-venv",
+            "-D", "HERMES_AGENT_INSTALL=/tmp/probe-install",
             "-D", "HERMES_AGENT_REPO=/tmp/probe-agent",
             "-D", "HERMES_MT_REPO=/tmp/probe-mt",
             "/usr/bin/true",
@@ -1255,3 +1261,169 @@ def test_sandbox_policy_file_is_valid_syntax():
         f"sandbox-exec rejected policy {policy}:\n"
         f"stderr: {result.stderr}\nstdout: {result.stdout}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 档 B — Linux bwrap backend (cross-platform — runs on macOS via platform mock)
+# ---------------------------------------------------------------------------
+
+
+def test_render_bwrap_args_strips_comments_and_substitutes(tmp_path: Path):
+    """_render_bwrap_args splits whitespace, drops comments, substitutes ${KEY}."""
+    from hermes_multitenancy import agent_real
+
+    text = (
+        "# leading comment\n"
+        "\n"
+        "--ro-bind /usr /usr   # inline comment\n"
+        "--bind ${PROFILE_HOME} ${PROFILE_HOME}\n"
+        "  --chdir ${PROFILE_HOME}  \n"
+    )
+    tokens = agent_real._render_bwrap_args(text, {"PROFILE_HOME": "/p"})
+    assert tokens == [
+        "--ro-bind", "/usr", "/usr",
+        "--bind", "/p", "/p",
+        "--chdir", "/p",
+    ]
+
+
+def test_wrap_linux_bwrap_raises_when_policy_missing(monkeypatch, tmp_path: Path):
+    """Linux backend is fail-closed: missing policy raises (no silent fallback)."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", tmp_path / "nonexistent.args")
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="bwrap policy.*is missing"):
+        agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+
+def test_wrap_linux_bwrap_raises_when_binary_missing(monkeypatch, tmp_path: Path):
+    """Linux backend is fail-closed: missing bwrap binary raises."""
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--die-with-parent\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(tmp_path / "no-such-bwrap"))
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="bwrap is not.*executable"):
+        agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+
+def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
+    """Linux backend assembles bwrap + args + -- + cmd in that order."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text(
+        "--die-with-parent\n"
+        "--ro-bind /usr /usr\n"
+        "--bind ${PROFILE_HOME} ${PROFILE_HOME}\n"
+        "--chdir ${PROFILE_HOME}\n"
+    )
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, profile)
+
+    assert wrapped[0] == str(fake_bin)
+    # PROFILE_HOME substitution happened.
+    profile_resolved = str(profile.resolve())
+    assert profile_resolved in wrapped
+    # -- separator before user cmd.
+    assert "--" in wrapped
+    sep_idx = wrapped.index("--")
+    assert wrapped[sep_idx + 1:] == cmd
+
+
+def test_wrap_linux_bwrap_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):
+    """Per-profile allowlist works the same way on Linux as on macOS."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--die-with-parent\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "spike_test")
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    cmd = ["/usr/bin/python3"]
+
+    # Unlisted profile bypasses the sandbox.
+    prod = tmp_path / "profiles" / "feishu_g41a5b5g"
+    prod.mkdir(parents=True)
+    assert agent_real._wrap_with_sandbox(cmd, prod) == cmd
+
+    # Listed profile gets wrapped.
+    spike = tmp_path / "profiles" / "spike_test"
+    spike.mkdir(parents=True)
+    wrapped = agent_real._wrap_with_sandbox(cmd, spike)
+    assert wrapped[0] == str(fake_bin)
+
+
+def test_wrap_unknown_platform_is_noop_with_info_log(monkeypatch, tmp_path: Path, caplog):
+    """Non-darwin, non-linux platforms log INFO and return cmd unchanged."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    cmd = ["/usr/bin/python3"]
+    with caplog.at_level(logging.INFO, logger="hermes_multitenancy.agent_real"):
+        wrapped = agent_real._wrap_with_sandbox(cmd, profile)
+
+    assert wrapped == cmd
+    assert any("no sandbox backend" in rec.message for rec in caplog.records)
+
+
+def test_bwrap_default_args_is_valid_syntax():
+    """Smoke test: shipped bwrap-default.args renders without unresolved placeholders."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    assert args_file.is_file(), f"policy {args_file} not bundled with plugin"
+
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/profile",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+    # No unresolved ${...} placeholders.
+    leftover = [t for t in tokens if "${" in t]
+    assert not leftover, f"unresolved placeholders in bwrap-default.args: {leftover}"
+    # Sanity: contains the expected core flags.
+    assert "--die-with-parent" in tokens
+    assert "--proc" in tokens
+    assert "--chdir" in tokens

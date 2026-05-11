@@ -768,6 +768,20 @@ def _build_subprocess_env(
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
 
+    # Mirror _wrap_with_sandbox's toggle + per-profile gate so the subprocess
+    # knows it's running inside a sandbox host. tools/approval.py reads
+    # HERMES_SANDBOX_HOST to bypass dangerous-command approval: the sandbox
+    # already enforces filesystem/network isolation at the kernel layer, so
+    # asking the user about `python -c ...` inside it is duplicate friction.
+    # The hardline blocklist (rm -rf /, mkfs, dd /dev/sd, shutdown, fork bomb)
+    # is checked BEFORE the bypass in approval.py and remains in effect.
+    if os.environ.get("HERMES_USE_SANDBOX") == "1":
+        allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
+        if not allowlist_raw or profile_home.name in {
+            p.strip() for p in allowlist_raw.split(",") if p.strip()
+        }:
+            env["HERMES_SANDBOX_HOST"] = "1"
+
     if extra:
         env.update(extra)
     return env
@@ -779,6 +793,13 @@ def _build_subprocess_env(
 
 _SANDBOX_POLICY_FILE = Path(__file__).parent / "sandbox" / "profile-default.sb"
 _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+# Linux backend — bubblewrap. Policy is a sibling file written one bwrap arg
+# per line, with ${KEY} placeholders substituted at runtime. Kept parallel to
+# the macOS .sb file rather than compiled from a shared DSL (see
+# sandbox-cross-platform-design.md §6 for the trade-off).
+_BWRAP_EXEC = "/usr/bin/bwrap"
+_BWRAP_ARGS_FILE = Path(__file__).parent / "sandbox" / "bwrap-default.args"
 
 
 def _resolve_hermes_agent_repo() -> Path:
@@ -839,6 +860,29 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
             )
             return cmd
 
+    # Platform dispatch. Each backend owns its own preflight checks and
+    # failure semantics (macOS keeps a pilot-era WARNING+fallback; Linux is
+    # post-pilot and raises on missing bwrap so systemd surfaces it).
+    if sys.platform == "darwin":
+        return _wrap_macos_sandbox(cmd, profile_home)
+    if sys.platform.startswith("linux"):
+        return _wrap_linux_bwrap(cmd, profile_home)
+    logger.info(
+        "[multitenancy] HERMES_USE_SANDBOX=1 but platform %s has no sandbox "
+        "backend — spawning subprocess unsandboxed.",
+        sys.platform,
+    )
+    return cmd
+
+
+def _wrap_macos_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
+    """macOS backend: wrap with /usr/bin/sandbox-exec + profile-default.sb.
+
+    Behaviour identical to the pre-2026-05-11 monolithic implementation —
+    same preflight checks, same WARNING+fallback when policy/binary missing,
+    same -D parameter set, same wrapped argv order. Existing tests in
+    tests/test_aiagent_subprocess.py:1099-1222 assert this exact shape.
+    """
     if not _SANDBOX_POLICY_FILE.is_file():
         logger.warning(
             "[multitenancy] HERMES_USE_SANDBOX=1 but policy %s is missing — "
@@ -881,6 +925,75 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     logger.info(
         "[multitenancy] sandbox-exec wrap: policy=%s profile=%s agent_repo=%s",
         _SANDBOX_POLICY_FILE.name, profile_home_resolved.name, agent_repo,
+    )
+    return wrapped
+
+
+def _render_bwrap_args(text: str, substitutions: dict[str, str]) -> list[str]:
+    """Render bwrap-default.args text into a list of CLI tokens.
+
+    Strips '#'-led comments and blank lines, then substitutes ${KEY} with
+    values from ``substitutions``. Each remaining line is split on
+    whitespace so a single line can carry multiple tokens
+    (e.g. ``--ro-bind /usr /usr``).
+    """
+    tokens: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for key, value in substitutions.items():
+            line = line.replace(f"${{{key}}}", value)
+        tokens.extend(line.split())
+    return tokens
+
+
+def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
+    """Linux backend: wrap with /usr/bin/bwrap + bwrap-default.args.
+
+    Fail-closed: missing policy or binary raises RuntimeError. Rationale:
+    Linux rollout is post-pilot, operator intent is "must be sandboxed".
+    Silently falling back to unsandboxed would mask the misconfiguration.
+    systemd Restart=on-failure will surface the crash for ops.
+    """
+    if not _BWRAP_ARGS_FILE.is_file():
+        msg = (
+            f"[multitenancy] HERMES_USE_SANDBOX=1 but bwrap policy "
+            f"{_BWRAP_ARGS_FILE} is missing — refusing to spawn unsandboxed."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+    if not os.access(_BWRAP_EXEC, os.X_OK):
+        msg = (
+            f"[multitenancy] HERMES_USE_SANDBOX=1 but bwrap is not "
+            f"executable at {_BWRAP_EXEC} — install via "
+            f"`dnf install -y bubblewrap` (or apt equivalent)."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    venv = Path(sys.prefix).resolve()
+    agent_install = venv.parent
+    shared_home = _resolve_shared_hermes_home(profile_home).resolve()
+    agent_repo = _resolve_hermes_agent_repo().resolve()
+    mt_repo = Path(__file__).resolve().parent.parent
+    user_home = Path.home().resolve()
+    profile_home_resolved = profile_home.expanduser().resolve()
+
+    substitutions = {
+        "PROFILE_HOME": str(profile_home_resolved),
+        "SHARED_HOME": str(shared_home),
+        "USER_HOME": str(user_home),
+        "HERMES_VENV": str(venv),
+        "HERMES_AGENT_INSTALL": str(agent_install),
+        "HERMES_AGENT_REPO": str(agent_repo),
+        "HERMES_MT_REPO": str(mt_repo),
+    }
+    bwrap_args = _render_bwrap_args(_BWRAP_ARGS_FILE.read_text(), substitutions)
+    wrapped = [_BWRAP_EXEC, *bwrap_args, "--", *cmd]
+    logger.info(
+        "[multitenancy] bwrap wrap: policy=%s profile=%s agent_repo=%s",
+        _BWRAP_ARGS_FILE.name, profile_home_resolved.name, agent_repo,
     )
     return wrapped
 
@@ -1522,6 +1635,20 @@ def _run_with_aiagent(
             except Exception:
                 logger.debug("[multitenancy] event_sink failed", exc_info=True)
 
+        # In-flight workaround — see _mark_session_source_feishu docstring for
+        # why we need to opportunistically retag. Called at multiple lifecycle
+        # points (tool.started during run, finally pre-close, finally
+        # post-close) because Hermes core may insert the sessions row at any
+        # of those phases. UPDATE is idempotent so multiple calls are cheap.
+        def _retag_source_now(reason: str) -> None:
+            try:
+                _mark_session_source_feishu(profile_home, str(session_id))
+            except Exception:
+                logger.exception(
+                    "[multitenancy] failed to rewrite session.source -> feishu (reason=%s)",
+                    reason,
+                )
+
         def _tool_progress_event_callback(
             event_type: str,
             tool_name: str,
@@ -1531,6 +1658,12 @@ def _run_with_aiagent(
         ) -> None:
             _log_aiagent_tool_progress(event_type, tool_name, preview, args, **kwargs)
             if event_type == "tool.started":
+                # First tool-start is the earliest deterministic signal that
+                # Hermes core has inserted the session row into state.db with
+                # source='api_server'. Flip it now so a long-running tool
+                # (especially one blocked on user approval) doesn't strand the
+                # row in the wrong source bucket while we wait.
+                _retag_source_now("tool.started")
                 _emit(
                     "tool_started",
                     name=str(tool_name or ""),
@@ -1608,18 +1741,11 @@ def _run_with_aiagent(
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
-            # Hermes-agent tags every AIAgent-driven session as source='api_server'
-            # regardless of the `platform` kwarg, which makes Feishu chats hide
-            # under the API Server group in web-ui. Re-tag the row (and any
-            # parent-chained descendants) so the web-ui sidebar shows Feishu
-            # sessions in their own bucket.
-            try:
-                _mark_session_source_feishu(profile_home, str(session_id))
-            except Exception:
-                logger.exception(
-                    "[multitenancy] failed to rewrite session.source -> feishu"
-                )
         finally:
+            # First pass — catches any sessions row Hermes core inserted
+            # mid-run (e.g. on the first AIAgent tool call). Cheap UPDATE
+            # even when no rows match.
+            _retag_source_now("finally-pre-close")
             approval_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)
@@ -1632,6 +1758,11 @@ def _run_with_aiagent(
                     cleanup_agent()
             except Exception:
                 pass
+            # Second pass — covers the common case where AIAgent commits the
+            # sessions row in close()/cleanup(). Without this, the row stays
+            # source='api_server' and the web-ui sidebar groups the chat
+            # under "飞书 / API SERVER" instead of "FEISHU".
+            _retag_source_now("finally-post-close")
 
     return (result or {}).get("final_response", "") or ""
 

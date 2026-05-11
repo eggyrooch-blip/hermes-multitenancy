@@ -1,0 +1,90 @@
+# bwrap-default.args — Linux sandbox policy for AIAgent subprocesses
+#
+# Applied by hermes_multitenancy.agent_real._wrap_linux_bwrap when running on
+# Linux with HERMES_USE_SANDBOX=1. Each non-comment, non-blank line is split
+# on whitespace and substituted at runtime; ${KEY} placeholders pull from:
+#
+#   PROFILE_HOME          absolute path of the routed Hermes profile (rw)
+#   SHARED_HOME           ~/.hermes (or HERMES_SHARED_HOME)
+#   USER_HOME             real user home (host CLI dotdirs source)
+#   HERMES_VENV           Python venv root
+#   HERMES_AGENT_INSTALL  venv.parent (editable-install source root)
+#   HERMES_AGENT_REPO     hermes-agent repo (gateway/, tools/, hermes_cli/)
+#   HERMES_MT_REPO        hermes-multitenancy plugin repo
+#
+# Parallel to sandbox/profile-default.sb (macOS). When adding a path here,
+# add the equivalent allow rule there too. See sandbox-cross-platform-design.md
+# §6 for the maintenance checklist.
+
+# ── Process / namespace isolation ───────────────────────────────────
+--die-with-parent
+--new-session
+--unshare-pid
+--unshare-ipc
+--unshare-uts
+--unshare-cgroup-try
+--share-net
+
+# Minimal /dev (bwrap synthesises null/zero/full/random/urandom/tty)
+--dev /dev
+--proc /proc
+--tmpfs /tmp
+
+# ── System (read-only) ──────────────────────────────────────────────
+# RHEL 9 / CentOS Stream 9 is usr-merge: /bin /lib /lib64 /sbin are
+# symlinks into /usr/.../. Use --symlink to recreate the link structure;
+# --ro-bind /lib /lib silently breaks binary RPATHs (verified 2026-05-11
+# on 10.250.1.66: produces "execvp /usr/bin/echo: No such file or
+# directory" because ld-linux-x86-64.so.2 lookup goes through /lib64).
+# Pre-usr-merge distros can swap to four --ro-bind /lib /lib lines.
+--ro-bind /usr /usr
+--symlink usr/lib /lib
+--symlink usr/lib64 /lib64
+--symlink usr/bin /bin
+--symlink usr/sbin /sbin
+--ro-bind /etc /etc
+
+# ── Python venv + hermes source trees (read-only) ───────────────────
+# Code must not self-modify; HERMES_AGENT_INSTALL covers editable installs
+# where `import run_agent` resolves outside venv/site-packages.
+--ro-bind ${HERMES_VENV} ${HERMES_VENV}
+--ro-bind ${HERMES_AGENT_INSTALL} ${HERMES_AGENT_INSTALL}
+--ro-bind ${HERMES_AGENT_REPO} ${HERMES_AGENT_REPO}
+--ro-bind ${HERMES_MT_REPO} ${HERMES_MT_REPO}
+
+# uv-managed Python interpreter, if present. On macOS this is the canonical
+# install path; on CentOS 9 (10.250.1.66) venv/bin/python typically symlinks
+# to /usr/bin/python3.11 instead, in which case --ro-bind-try is a no-op.
+--ro-bind-try ${USER_HOME}/.local/share/uv ${USER_HOME}/.local/share/uv
+
+# ── Host CLI dotdirs (read-only) ────────────────────────────────────
+# Mirrors profile-default.sb lines 105-110. .ssh / Keychains / .password-store
+# are deliberately NOT bound here; they don't exist in the namespace so the
+# sandboxed subprocess cannot reach host SSH keys or secret stores.
+--ro-bind-try ${USER_HOME}/.kep-cli ${USER_HOME}/.kep-cli
+--ro-bind-try ${USER_HOME}/.aws ${USER_HOME}/.aws
+--ro-bind-try ${USER_HOME}/.config/gh ${USER_HOME}/.config/gh
+--ro-bind-try ${USER_HOME}/.config/git ${USER_HOME}/.config/git
+--ro-bind-try ${USER_HOME}/.gitconfig ${USER_HOME}/.gitconfig
+
+# ── This profile — read + write ─────────────────────────────────────
+--bind ${PROFILE_HOME} ${PROFILE_HOME}
+
+# ── Shared hermes home — narrow rw, broad ro ────────────────────────
+# Parallel to profile-default.sb:129-165.
+--ro-bind ${SHARED_HOME} ${SHARED_HOME}
+--bind ${SHARED_HOME}/cron ${SHARED_HOME}/cron
+--bind ${SHARED_HOME}/snapshots ${SHARED_HOME}/snapshots
+--bind ${SHARED_HOME}/audio_cache ${SHARED_HOME}/audio_cache
+--bind-try ${SHARED_HOME}/multitenancy.db ${SHARED_HOME}/multitenancy.db
+--bind-try ${SHARED_HOME}/multitenancy.db-wal ${SHARED_HOME}/multitenancy.db-wal
+--bind-try ${SHARED_HOME}/multitenancy.db-shm ${SHARED_HOME}/multitenancy.db-shm
+
+# ── Cross-tenant deny by construction ───────────────────────────────
+# ${SHARED_HOME}/profiles/<other> directories are NOT bind-mounted, so
+# they simply don't exist in this mount namespace. A compromised skill
+# can't enumerate sibling tenants because the parent directory itself
+# is invisible. This is stronger than macOS's deny-default model.
+
+# ── Working directory pinned to profile home ────────────────────────
+--chdir ${PROFILE_HOME}
