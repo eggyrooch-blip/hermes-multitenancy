@@ -782,6 +782,19 @@ def _build_subprocess_env(
         }:
             env["HERMES_SANDBOX_HOST"] = "1"
 
+    # Forward Feishu sender open_id through env so AIAgent tool execution
+    # threads can recover identity. Python ContextVar does NOT propagate
+    # across ThreadPoolExecutor workers, but hermes AIAgent dispatches each
+    # tool to a worker (run_agent.py:1104 / 8479). The hermes-feishu-uat
+    # patch (for_user env fallback) reads this var when contextvar is empty.
+    try:
+        from tools import feishu_oapi_client as _foc
+        _sender = _foc.current_sender_open_id.get()
+        if _sender:
+            env["HERMES_FEISHU_USER_OPEN_ID"] = str(_sender)
+    except Exception:
+        pass
+
     if extra:
         env.update(extra)
     return env
