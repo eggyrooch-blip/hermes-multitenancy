@@ -855,6 +855,12 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
         return cmd
 
     venv = Path(sys.prefix).resolve()
+    # venv is typically installed as <agent_install>/venv/, with the
+    # hermes-agent source tree (run_agent.py, gateway/, tools/) living
+    # one directory up. Editable installs (`pip install -e .`) cause
+    # `import run_agent` to resolve to that source path, so the sandbox
+    # must allow reads on the install root, not just venv/.
+    agent_install = venv.parent
     shared_home = _resolve_shared_hermes_home(profile_home).resolve()
     agent_repo = _resolve_hermes_agent_repo().resolve()
     mt_repo = Path(__file__).resolve().parent.parent
@@ -868,6 +874,7 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
         "-D", f"SHARED_HOME={shared_home}",
         "-D", f"USER_HOME={user_home}",
         "-D", f"HERMES_VENV={venv}",
+        "-D", f"HERMES_AGENT_INSTALL={agent_install}",
         "-D", f"HERMES_AGENT_REPO={agent_repo}",
         "-D", f"HERMES_MT_REPO={mt_repo}",
     ] + list(cmd)
@@ -899,7 +906,13 @@ async def _run_aiagent_subprocess(
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env = _build_subprocess_env(profile_home, approval_dir=approval_dir)
-    child_script = Path(__file__).with_name("aiagent_subprocess.py")
+    # Resolve symlinks so sandbox-exec's path-based allow rules match.
+    # The plugin is typically loaded via a profile-local symlink
+    # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
+    # but the sandbox policy only whitelists the resolved repo path.
+    # Without .resolve() the child python sees an [Errno 1] Operation not
+    # permitted when trying to open aiagent_subprocess.py through the symlink.
+    child_script = Path(__file__).with_name("aiagent_subprocess.py").resolve()
     cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     proc = None
@@ -969,7 +982,13 @@ async def _stream_aiagent_subprocess(
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
-    child_script = Path(__file__).with_name("aiagent_subprocess.py")
+    # Resolve symlinks so sandbox-exec's path-based allow rules match.
+    # The plugin is typically loaded via a profile-local symlink
+    # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
+    # but the sandbox policy only whitelists the resolved repo path.
+    # Without .resolve() the child python sees an [Errno 1] Operation not
+    # permitted when trying to open aiagent_subprocess.py through the symlink.
+    child_script = Path(__file__).with_name("aiagent_subprocess.py").resolve()
     cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     started_at = time.monotonic()
@@ -1618,17 +1637,17 @@ def _run_with_aiagent(
 
 
 def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
-    """Re-tag this session's source from 'api_server' to 'feishu'.
+    """Re-tag every ``source='api_server'`` row in this profile to ``'feishu'``.
 
-    Hermes-agent always writes ``sessions.source = 'api_server'`` for any
-    AIAgent.run_conversation() call (even when ``platform='feishu'`` is
-    passed). Without this rewrite, web-ui groups every multitenant Feishu
-    chat under "API Server" and hides the channel boundary the operator
-    cares about.
+    Hermes-agent always writes ``sessions.source = 'api_server'`` for
+    AIAgent.run_conversation() (even with ``platform='feishu'``), and the
+    SQLite row id is unrelated to the AIAgent session_id we hold in this
+    scope, so we can't target one row. The per-user Feishu profile only
+    ever receives Feishu-routed traffic from the multitenancy router, so
+    it is safe to rewrite the whole api_server bucket in this profile.
 
-    Updates the row matching ``session_id`` plus the recursive parent-chain
-    descendants. No-op if the session row was never persisted (e.g. when
-    the AIAgent crashed before its first DB write).
+    ``session_id`` is kept in the signature for future per-row targeting
+    (e.g. via a session-id ↔ row-id mapping table). For now it's unused.
     """
     import sqlite3
 
@@ -1636,21 +1655,14 @@ def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
     if not db_path.exists():
         return
     with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            WITH RECURSIVE chain(id) AS (
-                SELECT id FROM sessions WHERE id = ?
-                UNION ALL
-                SELECT s.id
-                FROM sessions s
-                JOIN chain c ON s.parent_session_id = c.id
-            )
-            UPDATE sessions
-            SET source = 'feishu'
-            WHERE source = 'api_server' AND id IN (SELECT id FROM chain)
-            """,
-            (session_id,),
+        cur = conn.execute(
+            "UPDATE sessions SET source = 'feishu' WHERE source = 'api_server'"
         )
+        if cur.rowcount:
+            logger.info(
+                "[multitenancy] rewrote %d session(s) source=api_server -> feishu in %s",
+                cur.rowcount, db_path,
+            )
         conn.commit()
 
 
