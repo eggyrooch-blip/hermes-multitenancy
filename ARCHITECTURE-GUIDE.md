@@ -1,0 +1,1412 @@
+---
+title: hermes-multitenancy 架构指南
+updated: 2026-05-11
+status: living
+scope: /Users/kite/code/hermes-multitenancy（plugin 真源；通过 ~/.hermes/plugins/multitenancy symlink 被 hermes-agent 加载）
+audience: 后续 Claude / 用户本人；改这个仓前必读
+sources:
+  - /Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes/.omc/research/02-multitenancy-plugin.md
+  - /Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes/ARCHITECTURE-GUIDE.md (§3.2–§3.7, §5, §6.1–§6.8)
+  - hermes_multitenancy/{__init__,router,routing,runtime,pool,agent_real,aiagent_subprocess,commands,sessions}.py
+  - plugin.yaml / pyproject.toml
+  - sqlite3 ~/.hermes/multitenancy.db ".schema"
+---
+
+# hermes-multitenancy 架构指南
+
+> 本 GUIDE 是 hermes-multitenancy 仓的"内部地图"。每个章节都是为"下一次改它的人"写的——着重锚点、契约、陷阱，而不是教科书介绍。
+>
+> 上游主仓 `hermes-feishu-uat` 的 GUIDE 把"飞书 inbound → adapter → hook"那段讲完了。**本 GUIDE 从 hook 被触发开始**：从 `pre_gateway_dispatch` 接管，到子进程 `AIAgent` 把字节流回吐回 streaming card，再到落历史，全链路在这。
+
+---
+
+## §1 TL;DR
+
+### 1.1 一图
+
+```
+飞书 inbound (MessageEvent)
+   │
+   │  hermes-agent gateway pre-dispatch
+   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ hermes-multitenancy plugin (本仓, in-process)                        │
+│                                                                      │
+│  on_pre_gateway_dispatch (sync hook)  ── return {"action":"skip"}    │
+│       │ asyncio.create_task                                          │
+│       ▼                                                              │
+│  handle_async                                                        │
+│     ├─ _resolve_sender_for_routing (ou_*/on_*/fallback 7 层)         │
+│     ├─ parse_command  → /stop|/status|/new|/approve|/deny|...        │
+│     ├─ _resolve_or_auto_provision_route                              │
+│     │     SQLite RoutingTable.lookup_by_open_id (主)                 │
+│     │   + lookup_by_union_id  (5/11 dirty 修, alt 是 on_* 时)        │
+│     │   + spike _SPIKE_ROUTING  (Phase 1/tests fallback)             │
+│     │   + auto-provision (默认开)                                    │
+│     ├─ _enrich_via_hermes_pipeline (vision/STT/file/reply 复用主线)  │
+│     ├─ _load_history (cache miss → SessionStore.load_recent)         │
+│     └─ RuntimePool.dispatch(profile_name, profile_home, event)       │
+│           ├─ LRU OrderedDict, max=50, idle_evict=300s                │
+│           ├─ cold-start Semaphore(8)                                 │
+│           └─ ProfileRuntime.dispatch                                 │
+│                 ├─ ContextVar(_PROFILE_HOME_VAR) ← 真相               │
+│                 ├─ os.environ[HERMES_HOME] (env lock, legacy)        │
+│                 └─ real_run_agent / stream_run_agent                  │
+│                       └─ asyncio.create_subprocess_exec              │
+│                             aiagent_subprocess.py                    │
+│                             │ stdin: JSON event+messages+profile     │
+│                             │ stdout: NDJSON 流 (content/thinking/   │
+│                             │         tool_*/approval_*/done)        │
+│                             ▼                                        │
+│                          AIAgent.run_conversation (同步, 子进程)     │
+└──────────────────────────────────────────────────────────────────────┘
+   │
+   │  父进程消费 NDJSON → GatewayStreamConsumer
+   ▼
+飞书 streaming card (update_streaming_card / _edit_message 节流回写)
+```
+
+### 1.2 一段话
+
+multitenancy 是 hermes-agent 的**进程内插件**。它在 `pre_gateway_dispatch` 钩子里**接管**飞书 inbound，做三件事：(1) 把 `sender_open_id` 路由到一个独立 `profile_home` 目录（`~/.hermes/profiles/<name>/`）；(2) 在 LRU `RuntimePool` 里维护 per-profile 的 `ProfileRuntime`；(3) 用 `asyncio.create_subprocess_exec` 起一个 `aiagent_subprocess.py` 子进程，把 `AIAgent` 跑在那里——通过 NDJSON 协议把 `content/thinking/tool_started/tool_completed/approval_required/approval_resolved/done` 事件流回父进程，父进程再喂给 `GatewayStreamConsumer` 走飞书 streaming card 更新。**"One Feishu bot, N users, N profiles"** 这一行宣传的实现就在这。
+
+### 1.3 它不做什么
+
+- **不**自己跟飞书 OpenAPI 直接说话——adapter 是 hermes-agent 的 `FeishuAdapter`，token/OAuth/Device Flow 全在 `hermes-feishu-uat` 那边
+- **不**写飞书 token 文件——`~/.hermes/feishu_uat/<ou_*>.json` 是 `hermes-feishu-uat` 的产物
+- **不**起 launchd/supervisor——`hermes_multitenancy` 是 plugin，跟 gateway 同进程
+- **不**直接 import hermes-agent 的私有路径——所有跨仓 import 都 `try/except` 兜底（router.py 里有一票 `from hermes_cli.commands import ...` / `from gateway.stream_consumer import ...` / `from agent.skill_commands import ...` 的优雅降级）
+
+---
+
+## §2 Plugin manifest 与加载
+
+### 2.1 物理注册位置
+
+| 位置 | 类型 | 说明 |
+|---|---|---|
+| `/Users/kite/code/hermes-multitenancy` | git 仓 (eggyrooch-blip/hermes-multitenancy, main) | 真源 |
+| `~/.hermes/plugins/multitenancy` | **symlink** → 上面 | hermes-agent 实际加载路径 |
+
+验证：
+
+```bash
+$ ls -la ~/.hermes/plugins/multitenancy
+lrwxr-xr-x ... multitenancy -> /Users/kite/code/hermes-multitenancy
+```
+
+所以**直接在 `~/code/hermes-multitenancy` 里改 .py 文件就生效**，不需要 reinstall。改完重启 gateway 即可（plugin import 是 startup-once 的）。
+
+### 2.2 manifest 三件套
+
+#### `plugin.yaml` (`/Users/kite/code/hermes-multitenancy/plugin.yaml:1-9`)
+
+```yaml
+manifest_version: 1
+name: multitenancy
+version: 0.1.0
+description: "Multi-tenant Feishu routing for Hermes: one bot, many users, isolated profiles."
+author: Hermes Multitenancy Contributors
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
+```
+
+唯一 hook 声明：`pre_gateway_dispatch`。`kind: standalone` 意味着这个插件可以独立 `pip install`（不需要 hermes-agent 的 monorepo 上下文）。
+
+#### `pyproject.toml` (`/Users/kite/code/hermes-multitenancy/pyproject.toml:1-56`)
+
+- 包名 `hermes-multitenancy`，version `0.1.0`
+- 依赖：`hermes-agent>=1.0`、`openai>=1.0`、`python-dotenv>=1.0`、`PyYAML>=6.0`
+- console script：`hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"`
+- **entry-point**：
+
+  ```toml
+  [project.entry-points."hermes_agent.plugins"]
+  multitenancy = "hermes_multitenancy"
+  ```
+
+  发布到 PyPI 后，hermes-agent 通过 `importlib.metadata.entry_points(group="hermes_agent.plugins")` 自动发现。开发环境走 `~/.hermes/plugins/<name>/` 目录扫描这条路径。
+- packages：`["hermes_multitenancy", "hermes_multitenancy.sync"]`
+
+#### `hermes_multitenancy/plugin.yaml`
+
+`MANIFEST.in` 里 `package-data` 把 `plugin.yaml` 打进 wheel，但**当前 hermes 加载逻辑只看顶层 `/Users/kite/code/hermes-multitenancy/plugin.yaml`**——子目录那份只是 setuptools 打包形式上的副本。
+
+### 2.3 顶层 `__init__.py` shim
+
+`/Users/kite/code/hermes-multitenancy/__init__.py`：
+
+```python
+try:
+    from .hermes_multitenancy import on_pre_gateway_dispatch, register
+except ImportError:
+    from hermes_multitenancy import on_pre_gateway_dispatch, register
+__all__ = ["register", "on_pre_gateway_dispatch"]
+```
+
+这层 shim 让 hermes 走 `~/.hermes/plugins/multitenancy/__init__.py` 这条**目录式 install path** 时，能直接 import 到 `register`。生产链路走的就是这条。
+
+### 2.4 `register(ctx)` 入口
+
+(`hermes_multitenancy/__init__.py:18-38`)：
+
+```python
+def register(ctx) -> None:
+    from .agent_real import real_run_agent
+    from .pool import RuntimePool
+    from .router import override_pool
+    from .runtime import ProfileRuntime
+
+    def _real_factory(profile_name, profile_home):
+        return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
+
+    override_pool(RuntimePool(runtime_factory=_real_factory))
+    ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+```
+
+做两件事，**顺序很重要**：
+
+1. **`override_pool(RuntimePool(...))`** — 用 `real_run_agent` 把 `pool.py:_default_factory` / `runtime.py:_default_run_agent` echo stub 全替掉。这一步发生在 hook 注册之前，确保插件 enable 后**第一条消息**就走真 LLM，不会先 echo 一发。
+2. **`ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)`** — `ctx` 是 hermes-agent 的 `hermes_cli.plugins.PluginContext`，`register_hook` 是它的标准方法。
+
+`override_pool` 在 `router.py:1605-1612` 实现，写入 `_GLOBAL_POOL` singleton；后续 `_get_pool()` 读这个 singleton（router.py:1614-1622）。
+
+---
+
+## §3 `pre_gateway_dispatch` hook 流程
+
+### 3.1 Sync 回调入口
+
+(`hermes_multitenancy/router.py:337-363`)
+
+```python
+def on_pre_gateway_dispatch(*, event, gateway, session_store=None, **_kwargs) -> dict:
+    try:
+        if _should_defer_gateway_processing_complete(event):
+            _defer_gateway_processing_complete(event, gateway)
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(handle_async(event=event, gateway=gateway))
+        task.add_done_callback(_log_task_failure)
+    except RuntimeError:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            try:
+                asyncio.run(handle_async(event=event, gateway=gateway))
+            except Exception as exc:
+                logger.warning("multitenancy: sync fallback dispatch failed: %s", exc)
+        else:
+            logger.error("multitenancy: pre_gateway_dispatch invoked without a running loop — dropping event")
+    except Exception as exc:
+        logger.warning("multitenancy: failed to schedule handle_async: %s", exc)
+    return {"action": "skip", "reason": "multitenancy router took over"}
+```
+
+四个关键点：
+
+| 关键 | 说明 |
+|---|---|
+| **kwargs-only 签名** | `(*, event, gateway, session_store=None, **_kwargs)`。`session_store` 入参没用上——插件用自己的 `SessionStore`（§9） |
+| **fire-and-forget** | sync hook 拿到 loop → `create_task(handle_async(...))` → 立即返回。`_log_task_failure` (router.py:2509-2515) 把后台异常打到 logger.error |
+| **返回 `action: skip`** | 这是 hermes-agent gateway 的契约：让 gateway 主流程**不**再继续处理这条消息。控制权完全交给插件 |
+| **pytest fallback** | 没有 running loop（test 直接 sync 调） + `PYTEST_CURRENT_TEST` 在 env → `asyncio.run(handle_async(...))`。生产永不走这条 |
+
+### 3.2 `_should_defer_gateway_processing_complete`
+
+(`router.py:366-385`)
+
+判断"是否要阻止 gateway 自己 ack 这条消息（reaction/读状态等），交给插件最后再 ack"。返回 True 的条件：
+
+- 不是 slash command（slash 让 gateway 自己 ack）
+- 已能 resolve 到 profile_home，或
+- auto-provision 开了 + routing table 可用 + sender 不为 `unknown`/空
+
+然后 `_defer_gateway_processing_complete` (router.py:388-396) 调用 `adapter.defer_processing_complete(event)`。这个方法由 `FeishuAdapter` 提供——hermes-feishu-uat 那边的 `gateway/platforms/feishu/...` 里实现。
+
+### 3.3 `handle_async` 主路径
+
+(`router.py:402-544`)
+
+```
+sender         = _resolve_sender_for_routing(event)
+sender_alt     = event.source.user_id_alt
+text           = event.text
+
+# ── Slash 短路 ────────────────────────────────────
+cmd = parse_command(text)
+if cmd:
+    cmd_profile = _resolve_route(sender, alt_id=sender_alt)
+    if _maybe_rewrite_skill_slash_command(...):
+        text = event.text (重写后)
+    else:
+        await _handle_command(...)   # /stop /status /new /approve /deny /help /...
+        return
+
+# ── 路由 ──────────────────────────────────────────
+profile_name, profile_home = _resolve_or_auto_provision_route(sender, alt_id=sender_alt)
+if profile_home is None: return                # 无路由,丢
+
+# ── 槽位（per-sender in-flight task）─────────────
+prev = _user_inflight_tasks.get(sender)
+if prev and not prev.done() and prev != current:
+    prev.cancel()
+_user_inflight_tasks[sender] = current_task
+
+# ── 适配器探测 ────────────────────────────────────
+adapter      = _get_feishu_adapter(gateway)
+feishu_full  = adapter has edit_message + on_processing_start + on_processing_complete
+
+if feishu_full: await adapter.on_processing_start(event)
+
+# ── 多模态 enrichment（复用 hermes 主线）───────────
+enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
+    # 委托给 gateway._prepare_inbound_message_text(event, source, history=[])
+
+# ── 历史 ──────────────────────────────────────────
+hist_key = (profile_name, _tenant_user_key(sender, sender_alt))
+prior    = _load_history(hist_key)             # cache miss → SessionStore.load_recent
+user_msg = _build_user_message(event, text_override=enriched_text)
+conversation = prior + [user_msg]
+agent_event  = _event_with_text(event, user_msg["content"])
+
+# ── 发送（双路径）─────────────────────────────────
+if feishu_full:
+    response = await _stream_into_feishu(adapter, chat_id, profile_name, profile_home,
+                                          agent_event, messages=conversation)
+    if response:
+        await _deliver_media_from_stream_response(gateway, response, agent_event, adapter, profile_home)
+else:
+    await adapter.send_typing(chat_id)
+    response = await _get_pool().dispatch(profile_name, profile_home, agent_event)
+    await adapter.send(chat_id, response)
+
+# ── 落历史 ────────────────────────────────────────
+if response: _persist_turn(hist_key, user_msg, response)
+_touch_route(sender, sender_alt)
+
+# ── 收尾 ──────────────────────────────────────────
+if feishu_full:
+    adapter.complete_deferred_processing(event, outcome) or on_processing_complete
+if _user_inflight_tasks.get(sender) is current:
+    _user_inflight_tasks.pop(sender, None)
+```
+
+---
+
+## §4 Sender 解析层叠
+
+`_resolve_sender_for_routing` (`router.py:158-196`) 按优先级挑稳定的飞书用户键：
+
+```
+1. feishu_oapi_client.current_sender_open_id.get()    # adapter 设的 ContextVar,最权威
+2. event.sender_open_id
+3. event.source.open_id
+4. event.source.user_id
+5. event.source.user_id_alt
+6. event.raw / event.raw_event / event.event 里 5 条 nested path:
+     (sender, sender_id, open_id)
+     (event, sender, sender_id, open_id)
+     (event, message, sender, sender_id, open_id)
+     (message, sender, sender_id, open_id)
+     (sender_id, open_id)
+7. fallback (默认 "unknown")
+```
+
+`_is_feishu_open_id` 只接受 `ou_*` 开头的 string——**不是 `ou_*` 就跳过**，继续往下找。
+
+注释里讲明了原因：飞书 SDK 偶尔会把 `source.user_id` 填成 tenant-local 短 ID（例 `g41a5b5g`），但**真权威**是 app-scoped 的 `ou_*`。UAT 文件和路由表都按 `ou_*` 索引。
+
+### 4.1 alt_id 是什么
+
+`sender_alt = event.source.user_id_alt`。这一字段是飞书 IM 给的"备用 ID"——通常是 `on_*`（union_id 风格，跨 app 稳定）。multitenancy 把它当成"如果 sender 没拿到 `ou_*` 就用它，且查路由时也再查一遍"。
+
+`_resolve_route` 用 `candidates = [sender] + ([alt_id] if alt_id != sender)` 两个都查 `lookup_by_open_id`——这意味着 sync 把行的 `open_id` 列填成 `on_*` 时也能命中。
+
+---
+
+## §5 Routing 表 schema 与 lookup 层叠
+
+### 5.1 数据库定位
+
+(`routing.py:24`)
+
+```python
+DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
+```
+
+**独立**于 `~/.hermes/state.db`（注释明说为了不跟 gateway 的 sessions/pairing/cron 抢 WAL）。同一个 `.db` 文件里有两张表：
+
+- `multitenancy_routing` — `RoutingTable` 用
+- `multitenancy_sessions` — `SessionStore` 用（§9）
+
+两个 class 各开一个 `sqlite3.connect(..., check_same_thread=False)`，共享 WAL。
+
+> **历史坑**：`~/.hermes/multitenancy_routing.db`（**不是** `multitenancy.db`）是个 0 字节空壳，没人用。路由真正落地的是 `multitenancy.db`。改 schema 别认错文件。
+
+### 5.2 multitenancy_routing schema
+
+实测 `sqlite3 ~/.hermes/multitenancy.db ".schema"` 输出：
+
+```sql
+CREATE TABLE multitenancy_routing (
+    user_id        TEXT PRIMARY KEY NOT NULL,
+    profile_name   TEXT NOT NULL,
+    open_id        TEXT NOT NULL,
+    union_id       TEXT,
+    active         INTEGER NOT NULL DEFAULT 1,
+    deleted_at     INTEGER,
+    synced_at      INTEGER NOT NULL,
+    version        INTEGER NOT NULL DEFAULT 1,
+    last_active_at INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_routing_open_id_active
+    ON multitenancy_routing(open_id) WHERE active = 1;   -- partial UNIQUE
+CREATE INDEX idx_routing_active_user
+    ON multitenancy_routing(active, user_id);
+```
+
+定义在 `routing.py:26-44`。
+
+**关键约束** — `idx_routing_open_id_active` 是 **partial UNIQUE INDEX**：
+
+- 同一 `open_id` 在 active=1 中只能有一条（防止双路由）
+- 同一 `open_id` 软删历史可堆 N 条（active=0）—— 允许迁移：临时行 soft_delete 后插正式行
+
+`profile_name` **不 UNIQUE**：guest profile 可以服务多个用户（一对多）。
+
+### 5.3 open_id 列的设计意图（最容易混淆的点）
+
+`open_id` 列被注释明确**过载**为"任何 stable Feishu user identifier"（router.py:1234-1282 `_resolve_route` 注释也讲了这一点）。它可以是：
+
+- 真 `ou_*`（sync 正常拉的）
+- 真 `on_*`（某些 alt 路径）
+- 或 sync 自选的占位 token（例如 auto-provision 路径下，sender 是 tenant 短 ID 时直接把它当 open_id）
+
+也就是说：**"open_id 列"≠ "Feishu open_id 协议字段"**。它是个广义的稳定查找键。
+
+`union_id` 列**是真正的 union_id 通道**——sync 会把 employee 的 `union_id`（`on_*`）写到这里。
+
+### 5.4 三条 lookup 通道
+
+`RoutingTable` 暴露三个 lookup（routing.py:82-119）：
+
+| 方法 | 行 | 走的列 | 谁在用 |
+|---|---|---|---|
+| `lookup_by_open_id(open_id)` | 82-89 | `open_id` | router 主路径（`_resolve_route` 先查 sender、再查 alt） |
+| `lookup_by_union_id(union_id)` | 91-103 | `union_id` | **5/11 dirty 修**：alt 是 `on_*` 时显式查 union_id 列 |
+| `lookup_by_user_id(user_id)` | 105-119 | `user_id` PK | sync / ops 工具用 |
+
+三个都加了 `AND active = 1` 过滤，软删历史不会被误命中。
+
+### 5.5 `_resolve_route` 当前完整流程（含 5/11 dirty）
+
+(`router.py:1234-1282` + dirty 改动)
+
+```python
+def _resolve_route(sender: str, *, alt_id: str | None = None) -> tuple[str, Path | None]:
+    candidates = [sender] + ([alt_id] if alt_id and alt_id != sender else [])
+
+    table = _get_routing_table()
+    if table is not None:
+        # ── 主通道:open_id 列 ──
+        for candidate in candidates:
+            try:
+                row = table.lookup_by_open_id(candidate)
+            except Exception as exc:
+                logger.debug("multitenancy: routing lookup_by_open_id failed (%s)", exc)
+                continue
+            if row is not None:
+                return (row.profile_name, _profile_name_to_home(row.profile_name))
+
+        # ── 5/11 dirty:union_id 列回查 ──
+        # alt_id is the dedicated union_id channel — when sync chose to store a
+        # tenant user_id placeholder in the open_id column, the real on_* still
+        # lives in the union_id column. Query it directly so router doesn't end
+        # up provisioning a duplicate route for the same physical user.
+        if alt_id and isinstance(alt_id, str) and alt_id.startswith("on_"):
+            try:
+                row = table.lookup_by_union_id(alt_id)
+            except Exception as exc:
+                logger.debug("multitenancy: routing union_id lookup failed (%s)", exc)
+            else:
+                if row is not None:
+                    return (row.profile_name, _profile_name_to_home(row.profile_name))
+
+    # ── Spike fallback (Phase 1 compat / unit tests) ──
+    for candidate in candidates:
+        spike_home = _spike_resolve(candidate)
+        if spike_home is not None:
+            return (spike_home.name, spike_home)
+
+    return (sender, None)  # 没命中
+```
+
+### 5.6 5/11 dirty 修的具体场景
+
+**问题**：同一物理用户的 `on_*` 被 sync 写到了 `union_id` 列，但 `open_id` 列被填了 tenant `user_id` 占位符（auto-provision 早期路径下会发生）。原 `_resolve_route` 只查 `open_id` 列就会漏，触发 `_auto_provision_route` 又开一条新路由——同一物理用户出现两条 active 行，LLM 历史割裂。
+
+**修法**：明确知道 alt 是 `on_*` 时（`startswith("on_")`）显式走一遍 `union_id` 列。
+
+**为什么不直接合并这两个 lookup**：因为 `open_id` 列被过载成"广义稳定键"，存的可能根本不是 Feishu 协议意义上的 union_id；而 `union_id` 列 schema 保证只有真正的 `on_*`。两条通道职责清晰。
+
+**未提交状态**：截 2026-05-11，这两个改动还在 working tree dirty 里，没 commit、没 stash。`git status` 看：
+
+```
+modified:   hermes_multitenancy/router.py
+modified:   hermes_multitenancy/routing.py
+```
+
+HEAD 是 `bd97b1f Wire sandbox wrapper + simplify session-source retag`，dirty 是在它之上的增量。
+
+### 5.7 auto-provision 触发条件
+
+(`_resolve_or_auto_provision_route` `router.py:1285-1301` + `_auto_provision_route` `router.py:1324-1365`)
+
+```
+alt_lookup = None if sender 是 ou_* else alt_id
+profile_name, profile_home = _resolve_route(sender, alt_id=alt_lookup)
+
+if profile_home:
+    _repair_auto_profile(...)              # 已有路由也跑 ensure,补缺失文件
+    return (profile_name, profile_home)
+
+if HERMES_MULTITENANCY_AUTO_PROVISION (默认 "1"):
+    return _auto_provision_route(sender, alt_id) 或 fallback
+```
+
+`_auto_provision_route`：
+
+- 拒绝 `sender == "" or "unknown"`
+- `profile_name = _auto_profile_name(sender)` = `"feishu_<safe_chars>"`（`router.py:1368-1373` 把 sender 里非 `[a-z0-9_-]` 换成 `_`）
+- `profile_home = ~/.hermes/profiles/feishu_<safe_chars>`（`router.py:1516-1521`）
+- `_ensure_auto_profile`: mkdir + 写 `config.yaml` / `SOUL.md` + symlink `auth.json`/`.env` 到 shared home
+- `table.upsert(user_id=sender, profile_name=..., open_id=sender, union_id=alt_id if alt_id != sender else None)`
+
+> 这就是 §5.3 提的"`open_id` 列被填 tenant 短串"的来源：auto-provision 时 sender 是 tenant 短 ID（不是 `ou_*`）就直接当 open_id 写进去。后续 sync 拉到真 employee 信息会触发 `apply_users` 的 `current_by_open_id` 冲突路径，soft_delete 占位行 + insert 正式行。
+
+### 5.8 当前 active 路由（实测）
+
+```bash
+$ sqlite3 ~/.hermes/multitenancy.db "SELECT COUNT(*) FROM multitenancy_routing WHERE active=1;"
+2
+```
+
+具体两行内容不在本 GUIDE 里转录（属于运行时状态）。诊断时直接 `sqlite3 ~/.hermes/multitenancy.db "SELECT user_id, profile_name, open_id, union_id, last_active_at FROM multitenancy_routing WHERE active=1;"` 自查。
+
+---
+
+## §6 ContextVar `HERMES_HOME` 切换语义
+
+### 6.1 为什么不用 env var
+
+(`runtime.py:1-21, 38-40, 90-156`)
+
+```python
+_PROFILE_HOME_VAR: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
+    "hermes_multitenancy_profile_home", default=None
+)
+```
+
+**ContextVar 是真相**。原因：
+
+- 每个 asyncio task 拿到独立的 context 拷贝，**并发**多 profile dispatch 时彼此看不到对方的 profile_home
+- env var 是进程全局，A profile 写完 B profile 立刻能看见——这才需要 lock 串行
+
+但纯 ContextVar 不够，因为 hermes-agent 的 `hermes_constants.get_hermes_home()` 等 **legacy 模块从 `os.environ` 读** HERMES_HOME。两者必须同时切。
+
+### 6.2 `ProfileRuntime.dispatch` 双切实现
+
+(`runtime.py:117-133`)
+
+```python
+async def dispatch(self, event: Any) -> str:
+    token = _PROFILE_HOME_VAR.set(self.profile_home)      # 先切 ContextVar
+    try:
+        async with _get_env_lock():                       # 拿 env lock
+            original = os.environ.get(HERMES_HOME_ENV)
+            os.environ[HERMES_HOME_ENV] = str(self.profile_home)   # 再切 env
+            try:
+                self._verify_switch()                     # sanity check
+                return await self._run_agent_fn(event, self.profile_home)
+            finally:
+                if original is None:
+                    os.environ.pop(HERMES_HOME_ENV, None)
+                else:
+                    os.environ[HERMES_HOME_ENV] = original
+    finally:
+        _PROFILE_HOME_VAR.reset(token)
+```
+
+### 6.3 env lock 为什么按 loop 分
+
+(`runtime.py:48-64`)
+
+```python
+_ENV_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+
+def _get_env_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _ENV_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ENV_LOCKS[loop] = lock
+    return lock
+```
+
+`asyncio.Lock` 在第一次 acquire 时**绑定 loop**。pytest 每个 test 起新 loop——如果用 module-level lock，第二个 test 会抛 "bound to a different event loop"。所以按 loop 缓存。生产单 loop，这个 dict 一直只有 1 条。
+
+### 6.4 `_verify_switch` sanity check
+
+(`runtime.py:135-156`)
+
+跑一次："ContextVar.get() 跟 `hermes_constants.get_hermes_home()` 都对齐到 self.profile_home 了吗"。**对不齐只 warning，不抛**——为了在 hermes_constants 不可 import 的纯插件单测里也能跑。
+
+### 6.5 已知 caveat
+
+注释 `runtime.py:14-17`：
+
+> Modules that cache `_hermes_home` at import time (e.g. `run.py:93`) do NOT see the env switch. Either reload them or add a contextvars-based upstream PR so Hermes reads the same ContextVar this module sets.
+
+也就是说：**hermes-agent 上游有些模块在 import 时一次性缓存 HERMES_HOME**，dispatch 切了它们也不变。规避方式是把这些模块的 `get_hermes_home()` 调用懒迁到运行时——或者推 upstream PR 让 hermes 直接读 `_PROFILE_HOME_VAR`。
+
+---
+
+## §7 RuntimePool + ProfileRuntime
+
+### 7.1 默认参数
+
+(`pool.py:28-31`)
+
+```python
+DEFAULT_MAX_LOADED            = 50      # LRU 上限
+DEFAULT_IDLE_EVICT            = 300.0   # 秒,空闲驱逐
+DEFAULT_COLD_START_CONCURRENCY = 8      # 冷启动 Semaphore
+DEFAULT_INFLIGHT_TIMEOUT      = 600.0   # 单次 dispatch 总超时
+```
+
+### 7.2 数据结构
+
+(`pool.py:34-39`)
+
+```python
+@dataclass
+class _PoolEntry:
+    profile_name: str
+    runtime: ProfileRuntime
+    last_used: float = field(default_factory=time.time)
+    in_flight: int = 0
+
+self._entries: OrderedDict[str, _PoolEntry]
+self._cold_start_sem: asyncio.Semaphore(8)
+```
+
+### 7.3 `dispatch` 主路径
+
+(`pool.py:93-111`)
+
+```python
+async def dispatch(self, profile_name, profile_home, event) -> str:
+    entry = await self._acquire(profile_name, profile_home)
+    try:
+        return await asyncio.wait_for(
+            entry.runtime.dispatch(event),
+            timeout=self.inflight_timeout_seconds,    # 600s 默认
+        )
+    finally:
+        entry.in_flight -= 1
+        entry.last_used = self._now()
+```
+
+### 7.4 `_acquire` LRU + cold-start
+
+(`pool.py:115-141`)
+
+```python
+async def _acquire(self, profile_name, profile_home) -> _PoolEntry:
+    self._evict_idle_inplace()                # 每次 acquire 先扫一遍 idle
+
+    existing = self._entries.get(profile_name)
+    if existing:
+        self._entries.move_to_end(profile_name)    # LRU 续命
+        existing.in_flight += 1
+        existing.last_used = self._now()
+        return existing
+
+    # cold-start path
+    async with self._cold_start_sem:
+        existing = self._entries.get(profile_name)    # double-check
+        if existing:
+            self._entries.move_to_end(profile_name)
+            existing.in_flight += 1
+            existing.last_used = self._now()
+            return existing
+        self._evict_to_capacity()
+        runtime = self._factory(profile_name, profile_home)
+        entry = _PoolEntry(profile_name, runtime, self._now(), in_flight=1)
+        self._entries[profile_name] = entry
+        return entry
+```
+
+### 7.5 驱逐策略
+
+(`pool.py:143-181`)
+
+- `_evict_idle_inplace`：`last_used < now - 300` 且 `in_flight == 0` → 删除
+- `_evict_to_capacity`：满时丢最老的非-in-flight。**全部 in-flight 时不阻塞**，允许超容量 + `logger.warning("pool over capacity ... all in-flight")`。注释说 Phase 3 才加 wait queue
+- `inflight_no_evict` 不是单独参数，是 `if entry.in_flight > 0: continue` 内联在 evict 里（pool.py:148）
+
+### 7.6 ProfileRuntime 工厂
+
+由 `register(ctx)` 在 `__init__.py:33-36` 装的：
+
+```python
+def _real_factory(profile_name, profile_home):
+    return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
+```
+
+`real_run_agent` 来自 `agent_real.py`——见 §8。
+
+---
+
+## §8 AIAgent subprocess + NDJSON 协议
+
+`agent_real.py` 是这个仓最长的文件（1474 行），承担"把 hermes-agent 的 `AIAgent` 跑在隔离子进程里"这件事。
+
+### 8.1 三个外部入口
+
+| 函数 | 行 | 用途 |
+|---|---|---|
+| `real_run_agent(event, profile_home, *, messages=None) -> str` | 223-251 | 单次调用,返回最终文本。优先 `_run_aiagent_subprocess`,失败 fallback `_legacy_real_run_agent`（裸 OpenAI client） |
+| `stream_run_agent(event, profile_home, *, messages=None)` | 63-112 | async generator,yield `(kind, payload)`。优先 `_stream_aiagent_subprocess`,失败 fallback `_stream_loop`（裸 OpenAI `chat.completions.create(stream=True)`） |
+| `_run_with_aiagent(event, profile_home, *, messages=None, event_sink=None) -> str` | 1147-1381 | **同步**! 在 `aiagent_subprocess.py` 里被调用,真正构造 `AIAgent` 实例并跑 `run_conversation` |
+
+### 8.2 子进程 spawn — `_run_aiagent_subprocess`
+
+(`agent_real.py:645-722`)
+
+```python
+proc = await asyncio.create_subprocess_exec(
+    sys.executable,
+    str(child_script),       # Path(__file__).with_name("aiagent_subprocess.py")
+    stdin=PIPE, stdout=PIPE, stderr=PIPE,
+    env={**os.environ,
+         "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
+         "HERMES_HOME": str(profile_home),
+         "HERMES_GATEWAY_SESSION": "1",
+         "HERMES_EXEC_ASK": "1",
+         "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir)})
+```
+
+**为什么用子进程而不是 `asyncio.to_thread`**：注释明说"避免 gateway-async-loop ↔ AIAgent-sync deadlock"。代价是每次 ~0.5-1s 启动开销。
+
+`approval_dir = tempfile.mkdtemp(prefix="hermes-mt-approval-")`，finally 里 `shutil.rmtree(ignore_errors=True)`。
+
+`HERMES_AIAGENT_SUBPROCESS_TIMEOUT` 默认 300s，超时 `proc.kill()` 抛 `RuntimeError`。
+
+### 8.3 stdin payload
+
+(`_event_to_subprocess_payload` `agent_real.py:596-642`)
+
+```json
+{
+  "event": {
+    "text": "...",
+    "message_id": "...",
+    "sender_open_id": "ou_xxx",
+    "source": {"platform": "feishu", "chat_id": "...", "user_id": "...", ...}
+  },
+  "profile_home": "/Users/.../.hermes/profiles/<name>",
+  "messages": [...]
+}
+```
+
+`sender_open_id` 由 `_resolve_subprocess_sender_open_id` 在父进程里挑出真 `ou_*` 后传过去。
+
+### 8.4 stdout NDJSON 协议（流式）
+
+(`_stream_aiagent_subprocess` `agent_real.py:725-861`)
+
+额外 env：`HERMES_AIAGENT_EVENT_STREAM=1`。
+
+每行一条 JSON：
+
+```json
+{"event": "content",          "text": "..."}
+{"event": "thinking",         "text": "..."}
+{"event": "tool_started",     "name": "feishu_calendar_list_events", "preview": "..."}
+{"event": "tool_completed",   "name": "...", "duration": 1.2, "is_error": false}
+{"event": "approval_required","approval_id": "approval_xxx", "session_key": "...",
+                              "command": "...", "decision_path": "/tmp/.../approval_xxx.json",
+                              "pattern_keys": [...], "description": "..."}
+{"event": "approval_resolved","approval_id": "...", "session_key": "...",
+                              "choice": "once|session|always|deny", "timed_out": false}
+{"event": "done",             "result": "...", "error": null}
+```
+
+Generator yield 形式：
+
+- `("content", text)` / `("thinking", text)` — 直接转发 string
+- `("tool_started", payload_dict)` / `("tool_completed", payload_dict)`
+- `("approval_required", payload_dict)` / `("approval_resolved", payload_dict)`
+- `("done", final_text)` — 最后
+
+读到 `done` 不立即 break，继续读完 EOF。`saw_done=False` 且 EOF → `RuntimeError("AIAgent subprocess stream ended without done event")`。
+
+### 8.5 非流式协议
+
+(`_run_aiagent_subprocess` `agent_real.py:645-722`)
+
+stdout 只一条 JSON `{"result": str, "error": str|null}`，最后一行。stderr 是 hermes 内部 `print` 全部被 `aiagent_subprocess.py:88-89 sys.stdout = sys.stderr` 重定向过去的"脏 output"。
+
+### 8.6 子进程脚本 `aiagent_subprocess.py`
+
+(`hermes_multitenancy/aiagent_subprocess.py`)
+
+```python
+def main():
+    payload = json.loads(sys.stdin.read())
+    event = _ReplayedEvent(payload["event"])      # 鸭子类型,只暴露 text/message_id/sender_open_id/source
+    profile_home = Path(payload["profile_home"])
+    messages = payload.get("messages") or None
+
+    _run_with_aiagent = _load_run_with_aiagent()  # 兼容 hermes_multitenancy 包名/独立路径
+    event_stream = os.getenv("HERMES_AIAGENT_EVENT_STREAM") == "1"
+
+    def emit(event, **payload):
+        protocol_stdout.write(json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n")
+        flush()
+
+    sys.stdout = sys.stderr   # 把 hermes 内部 print 全部赶到 stderr
+    if event_stream:
+        result = _run_with_aiagent(event, profile_home, [messages=,] event_sink=emit)
+        out = {"event": "done", "result": result, "error": None}
+    else:
+        result = _run_with_aiagent(event, profile_home, [messages=])
+        out = {"result": result, "error": None}
+
+    sys.stdout = protocol_stdout
+    protocol_stdout.write(json.dumps(out)); if event_stream: write("\n"); flush()
+```
+
+关键：**exit code always 0**。所有错误走 `out["error"]`。
+
+### 8.7 `_run_with_aiagent` 同步主体
+
+(`agent_real.py:1147-1381`)
+
+子进程里跑的"真核心"。流程：
+
+1. `os.environ["HERMES_HOME"] = str(profile_home)` 锚定
+2. 读 profile config：`config.yaml`（`_load_yaml`）+ `auth.json`（`_load_json`）+ `.env`（`dotenv_values`）
+3. `_split_model_spec("zai/glm-5.1") → ("zai", "glm-5.1")`（`agent_real.py:335-340`）
+4. 解析 api_key：env vars (`<PROVIDER>_API_KEY`) → `auth.credential_pool[provider][?].access_token`（跳 `last_status=="exhausted"`）
+5. 解析 base_url：primary 走 `config.model.base_url` overrides，否则 `_PROVIDER_BASE_URLS[provider]`（见 §8.10 表）
+6. lazy import `from run_agent import AIAgent`
+7. **`_configure_feishu_uat_home(feishu_oapi_module, profile_home)`**（`agent_real.py:412-417`）：
+    - `feishu_oapi.FEISHU_UAT_PATH = shared_home / "feishu_uat.json"`
+    - `feishu_oapi.FEISHU_UAT_DIR  = shared_home / "feishu_uat"`
+    - `shared_home` = `HERMES_SHARED_HOME` env > `profile_home.parent.parent`（如 profile 在 `profiles/xxx`）> profile_home
+    - **关键**：UAT token 物理只一份在 shared `~/.hermes/feishu_uat/`，不是 per-profile 副本
+8. **`_configure_cron_home(shared_home)`**（`agent_real.py:420-470`）：
+    - `cron.jobs.JOBS_FILE = shared_home/cron/jobs.json`
+    - patch `tools.cronjob_tools._validate_cron_script_path` 强制脚本必须在 `shared_home/scripts/` 内（防穿越，用 `tools.path_security.validate_within_dir`）
+    - **Why**：gateway 的 cron ticker 只看 shared home，profile-local cron 永远不被 tick
+9. **`_resolve_enabled_toolsets(config, "feishu", ...)`**（`agent_real.py:1384-1448`）：
+    - 默认 = **merge default**（把 `platform_toolsets.feishu` 跟 hermes feishu 默认 toolsets 取并集）
+    - 设 `HERMES_MULTITENANCY_TOOLSETS_MODE=explicit/strict/replace` 或 `config.multitenancy.toolsets_mode=...` 才走严格替换
+    - **Why**：注释明说"otherwise profile-local `platform_toolsets.feishu` 想加点 UAT toolset，反而把 web/search/file 全清空了——agent 在飞书里看着能用,一搜网就傻"
+10. `sender_open_id = current_sender_open_id.get() or _resolve_sender_open_id(event)`（agent_real.py:1219）
+11. **`session_id`**（`_resolve_aiagent_session_id` `agent_real.py:905-966`）：
+    ```
+    agent:profile:<name>:platform:feishu:chat_type:<type>:chat:<id>:thread:<id>:user:<ou_*>
+    ```
+    过长用 sha1 后缀。**关键：不用 message_id 做 key**（message_id 每轮变会丢历史；只在没其他字段时 fallback）
+12. **`gateway_session_key`**（`_resolve_multitenant_gateway_session_key` `agent_real.py:969-991`）：
+    ```
+    multitenancy:<platform>:<profile_name>:<chat_id>:<user_key>
+    ```
+    给 hermes 的 approval bridge 用（`tools.approval.set_current_session_key`）
+13. `with sender_open_id_scope(sender_open_id):` 把 contextvar 改到这个用户——UAT 工具用 `current_sender_open_id` 找 token 文件
+14. `gateway.session_context.set_session_vars` / `clear_session_vars` 把 platform/chat_id/user_id 等塞到 hermes session contextvars
+15. 注册 stream callbacks：`tool_progress_callback` / `stream_delta_callback` / `reasoning_callback` / `tool_gen_callback`——各自调 `event_sink(...)` emit NDJSON 给父进程
+16. **`approval_cleanup = _configure_gateway_approval_bridge(event_sink, gateway_session_key)`**（`agent_real.py:1042-1144`）：
+    - register `_approval_notify_sync` callback
+    - 这个 callback 在子进程里**同步**轮询 `approval_dir/<approval_id>.json` 文件（0.1s 一次,timeout 默认 300s）
+    - 父进程那边由 router 的 `_handle_pending_approval_command`（`router.py:725-768`）把 `/approve [args]` `/deny [args]` 写进 decision_path 文件
+17. 构造 `AIAgent`：
+    ```python
+    agent = AIAgent(
+        model=model_only,
+        api_key=..., base_url=...,
+        max_iterations=os.getenv("HERMES_MAX_ITERATIONS","30"),
+        quiet_mode=True,
+        session_id=..., platform="feishu",
+        user_id=..., chat_id=...,
+        gateway_session_key=...,
+        tool_progress_callback=..., stream_delta_callback=...,
+        reasoning_callback=..., tool_gen_callback=...,
+        enabled_toolsets=..., fallback_model=...,
+    )
+    ```
+18. `result = agent.run_conversation(user_message=user_text, task_id=session_id, conversation_history=...)` 同步阻塞
+19. finally：approval bridge cleanup + session vars clear + `agent.close()` / `agent.cleanup()`
+20. return `result["final_response"]`
+
+**fallback model**：`fallback_models[0] if fallback_models else None`（agent_real.py:1236）。**只取第一个**，不是整个 list。
+
+### 8.8 `AIAgent` 收到的 model name 去 provider 前缀
+
+注释 `agent_real.py:1326-1331`：
+
+> AIAgent expects bare model name; provider prefix would otherwise be forwarded verbatim to OpenAI client and rejected with `1211 Unknown Model`.
+
+所以 `_split_model_spec("zai/glm-5.1") → ("zai", "glm-5.1")` 后，传给 `AIAgent` 的是 `"glm-5.1"`。
+
+### 8.9 `_legacy_real_run_agent` fallback
+
+(`agent_real.py:254-329`)
+
+回退路径（subprocess spawn 失败时）：裸 `AsyncOpenAI(api_key, base_url).chat.completions.create(messages=[soul, *history, user], max_tokens=512)`，按 candidates 顺序遍历直到 `text != ""`。
+
+**没有 tool-loop**——但至少能回话，不会让 bot 沉默。
+
+### 8.10 Provider 表
+
+(`_PROVIDER_ENV_KEYS` agent_real.py:41-48; `_PROVIDER_BASE_URLS` agent_real.py:53-60)
+
+| provider | env vars | base_url |
+|---|---|---|
+| `zai` | `GLM_API_KEY`, `ZAI_API_KEY` | `https://api.z.ai/api/coding/paas/v4` |
+| `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
+| `anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1` |
+| `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
+| `moonshot` | `MOONSHOT_API_KEY` | `https://api.moonshot.cn/v1` |
+| `deepseek` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
+
+---
+
+## §9 SessionStore（multitenancy.db 第二张表）
+
+### 9.1 表
+
+(`sessions.py:25-38`)
+
+```sql
+CREATE TABLE multitenancy_sessions (
+    profile_name TEXT NOT NULL,
+    user_key     TEXT NOT NULL,
+    ts           INTEGER NOT NULL,
+    role         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    PRIMARY KEY (profile_name, user_key, ts, role)
+);
+CREATE INDEX idx_sessions_profile_user
+    ON multitenancy_sessions(profile_name, user_key, ts);
+```
+
+`ts` 用 `time.monotonic_ns()`（sessions.py:56）—— 纳秒避免 burst dedupe。
+
+### 9.2 API
+
+| 方法 | 行 | 用途 |
+|---|---|---|
+| `append(profile_name, user_key, role, content)` | 54-62 | `INSERT OR IGNORE` 单行 |
+| `load_recent(profile_name, user_key, limit)` | 64-74 | `ORDER BY ts DESC LIMIT N` 然后 `rows.reverse()` 还原 oldest-first |
+| `clear(profile_name, user_key) -> int` | 76-83 | DELETE rowcount |
+| `count(profile_name, user_key) -> int` | 85-92 | 诊断 |
+
+### 9.3 router 的两层 cache
+
+(`router.py:36-39, 64-111`)
+
+```python
+_session_history: dict[(profile_name, user_key), list[dict]] = {}    # 进程内 cache,trim 到 20
+_session_loaded: set[(profile_name, user_key)] = set()               # hydrate 标记(仅一次)
+_pending_approval_requests: dict[session_key, list[dict]] = {}       # /approve /deny 用
+
+_SESSION_HISTORY_MAX = 20    # 最多保留 20 条 message(user+assistant 交替)
+```
+
+`_load_history(key)`：第一次访问 → `SessionStore.load_recent(profile, user, 20)` 注入 cache；后续直接读 cache。
+
+`_persist_turn(key, user_msg, assistant_text)`：cache append + trim 20，同时 `SessionStore.append(profile, user, role, content)` 两次（user + assistant）。
+
+`_clear_history(key)`：cache pop + `SessionStore.clear`。
+
+`_history_key(profile, sender, sender_alt) = (profile, _tenant_user_key(sender, sender_alt))`，其中 `_tenant_user_key` 优先 sender 非空非 unknown，否则 sender_alt。
+
+> **注意**：历史 key 不带 alt_id 双通道。意味着同一物理用户的 sender 表示形式变化（例如从 tenant 短 ID 切到真 `ou_*`）会**切割历史**。union_id fallback 修复减小了这种概率，但没根治。
+
+---
+
+## §10 Slash commands
+
+### 10.1 `parse_command` 短路
+
+(`commands.py:64-80`)
+
+```python
+def parse_command(text: str) -> Optional[tuple[str, str]]:
+    if not text or not text.startswith("/"):
+        return None
+    parts = text.split(maxsplit=1)
+    raw = parts[0][1:].lower()
+    args = parts[1] if len(parts) > 1 else ""
+    if "/" in raw or not raw:
+        return None
+    canonical = resolve_command_name(raw) or raw
+    return (canonical, args)
+```
+
+**未知命令也返回**——让 router 回 "unknown command" 而不是把 `/foo` 当 prompt 喂给 LLM。
+
+### 10.2 `resolve_command_name` 三层 lookup
+
+(`commands.py:83-108`)
+
+1. 先 try `from hermes_cli.commands import is_gateway_known_command, resolve_command`（hermes-agent 模块）→ 命中拿 canonical
+2. 失败 fallback dict：
+    - `_FALLBACK_ALIASES`（9 条：`provider→model, reset→new, bg/btw→background, tasks→agents, q→queue, fork→branch, set-home→sethome, reload_mcp→reload-mcp`）
+    - `_FALLBACK_GATEWAY_COMMANDS`（31 条 frozenset：`agents, approve, background, branch, commands, compress, debug, deny, fast, help, insights, model, new, personality, profile, queue, reasoning, reload-mcp, restart, resume, retry, rollback, sethome, status, steer, stop, title, undo, update, usage, verbose, voice, yolo`）
+
+fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"。
+
+### 10.3 router 里的命令分发
+
+(`_handle_command` `router.py:640-722`)
+
+| cmd | 处理 |
+|---|---|
+| `approve` / `deny`（有 pending child approval） | `_handle_pending_approval_command` 写 decision file,reply ✅/❌ |
+| `stop` | `_user_inflight_tasks.pop().cancel()` |
+| `status` | 报告 `运行中/空闲` + profile + history len |
+| `new` / `reset` | `_clear_history(key)` |
+| `help` | `_gateway_help_text()` — 先 try hermes 的 `gateway_help_lines` |
+| 其它 | `_dispatch_gateway_command` → `_dispatch_quick_command` → `_dispatch_plugin_command` → 否则 `is_known_command` 给 "recognized but not exposed by this gateway"，否则 `unknown_command_message` |
+
+### 10.4 Skill slash 重写
+
+`_maybe_rewrite_skill_slash_command`（`router.py:565-637`）：
+
+- cmd 不是 gateway-known、不是 quick command、不是 plugin command,但 `agent.skill_commands.resolve_skill_command_key(cmd)` 命中 skill → 用 `build_skill_invocation_message(cmd_key, args, task_id=...)` **重写 `event.text`** 走 LLM（返回 `(True, None)`）
+- skill 在该平台 disabled → 回报 "...is disabled for feishu" `(True, "Enable it with: hermes skills config")`
+
+### 10.5 Gateway / quick / plugin command 委托
+
+- **gateway**（`_dispatch_gateway_command` `router.py:856-938`）：先 `gateway._dispatch_slash_command(event, multitenancy_context={profile_name, profile_home, sender_open_id, session_key_override})`；否则按命名约定找 `gateway._handle_<normalized>_command`（`sethome` 多挂 `_handle_set_home_command`）。整段进 `async with _profile_gateway_context(...)`：env lock 下临时把 `HERMES_HOME` 设到 profile_home，monkey-patch `gateway._session_key_for_source` 返回 multitenancy session key
+- **quick**（`_dispatch_quick_command` `router.py:941-1010`）：`gateway.config.quick_commands[cmd]`；`type=exec` 默认禁，需 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 或 plugin config `multitenancy.allow_quick_exec=true` 或单条 `multitenancy_allow_exec=true` 才放；`type=alias` 重写 `event.text` 然后递归 `_dispatch_gateway_command(new_cmd, ...)`
+- **plugin**（`_dispatch_plugin_command` `router.py:1051-1083`）：`hermes_cli.plugins.get_plugin_command_handler(cmd.replace("_","-"))`，handler 接 `args`，可能是 coro
+
+---
+
+## §11 Sync 子流程
+
+`hermes_multitenancy/sync/` 子包：从飞书 Contact v3 API 拉员工 → 写 routing 表 + per-profile 目录。
+
+### 11.1 CLI 入口
+
+(`sync/cli.py`, 触发命令 `python -m hermes_multitenancy.sync` 或 `hermes-multitenancy-sync`)
+
+```
+apply  <users.json>  [--db PATH]
+  └─ JSON list of UserSpec → apply_users(table, users) → {upserted, soft_deleted, kept}
+
+pull-feishu  [--dept ID] [--dry-run] [--db PATH] [--snapshot-out PATH]
+             [--api-delay 0.65]
+             [--soft-delete-missing/--no-soft-delete-missing]
+  └─ sync_feishu_org(...)
+```
+
+**默认 `--api-delay 0.65`**：Feishu Contact API 限流间隔。
+
+**`soft_delete_missing` 默认**：full sync（`dept_id is None`）默认开；`--dept` 子树同步默认关——子树同步不应该影响树外的路由。
+
+### 11.2 `apply_users` 幂等核心
+
+(`sync/feishu_hr.py:29-84`)
+
+```python
+def apply_users(table, users, *, soft_delete_missing=True) -> dict[str, int]:
+    desired = {u.user_id: u for u in users}
+    current = {row.user_id: row for row in active rows}
+    current_by_open_id = {row.open_id: row for row in current.values()}
+
+    upserted = soft_deleted = kept = 0
+    for u in desired.values():
+        existing = current.get(u.user_id)
+        if existing matches profile_name + open_id + union_id:
+            kept += 1; continue
+        # open_id 冲突:同一 open_id 已被另一条 active 行(不同 user_id)占
+        conflict = current_by_open_id.get(u.open_id)
+        if conflict and conflict.user_id != u.user_id:
+            if table.soft_delete(conflict.user_id): soft_deleted += 1
+            current.pop(conflict.user_id, None)
+        table.upsert(user_id=u.user_id, profile_name=u.profile_name,
+                     open_id=u.open_id, union_id=u.union_id)
+        upserted += 1
+
+    if soft_delete_missing:
+        for user_id in current:
+            if user_id not in desired:
+                if table.soft_delete(user_id): soft_deleted += 1
+
+    return {"upserted": ..., "soft_deleted": ..., "kept": ...}
+```
+
+**幂等**：再跑一次同样的 list = 0 upsert + 0 soft_delete + N kept（modulo synced_at/version，这俩在 kept 路径不动）。
+
+`plan_users`（sync/feishu_hr.py:87-117）：同样的逻辑但不写——`--dry-run` 用。
+
+### 11.3 `UserSpec`
+
+(`sync/feishu_hr.py:20-26`)
+
+```python
+@dataclass(frozen=True)
+class UserSpec:
+    user_id: str
+    profile_name: str
+    open_id: str
+    union_id: Optional[str] = None
+```
+
+### 11.4 Feishu Contact v3 拉取
+
+`sync_feishu_org` (`sync/feishu_org.py:349-400`)：
+
+```
+snapshot = pull_feishu_org(dept_id, client, api_delay)
+users = build_user_specs(snapshot)
+delete_missing = (dept_id is None) if soft_delete_missing is None else soft_delete_missing
+profile_stats = sync_profiles(snapshot, dry_run, profiles_root, source_home)
+
+if dry_run:
+    route_stats = _plan_routes_without_db_writes(...)
+else:
+    table = RoutingTable(db_path)
+    try: route_stats = apply_users(table, users, soft_delete_missing=delete_missing)
+    finally: table.close()
+
+if snapshot_out and not dry_run: snapshot_path = save_snapshot(snapshot, snapshot_out, dept_id)
+
+return {departments, employees, missing_user_id, leaders,
+        profiles_*, routes_*, snapshot_path, dry_run}
+```
+
+`pull_feishu_org`（sync/feishu_org.py:197-215）：
+- `FeishuContactClient.for_current_home()` → `tools.feishu_oapi_client.FeishuClient.for_tenant()`（hermes-agent 模块）
+- `fetch_department_tree(root_id="0" or dept_id)` BFS 子树
+- 每个 dept 跑 `fetch_department_users(dept_id)`（分页 `/open-apis/contact/v3/users/find_by_department`）
+- `build_org_snapshot(departments, dept_user_map)` 拼 `Employee`，标 `is_leader`（对照 `dept.leader_user_id`），组 `subordinates` 元组
+
+`build_user_specs`（sync/feishu_org.py:296-310）：跳过 `user_id` 为空的 employee（只剩 `oid-` 开头的 fake agent_id），其它打成 `UserSpec(user_id=, profile_name=profile_name_for_user_id(user_id), open_id=, union_id=)`。
+
+`profile_name_for_user_id`（sync/feishu_org.py:313-324）：
+
+- 小写、`[^a-z0-9_-]+` → `_`、strip
+- 撞保留名（`hermes`、`default`、`test`、`tmp`、`profile`、`gateway`... 30+ 个）→ 加 `feishu_` 前缀
+- 长 > 64 → 截 55 + sha1 摘要 8 位
+- 必须匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`
+
+### 11.5 `sync_profiles` 写盘
+
+(`sync/feishu_org.py:327-346` + `_sync_one_profile` 410-446)
+
+每个 employee：
+
+- `~/.hermes/profiles/<profile_name>/`
+- 不存在 → `created`
+- 创建 9 个子目录：`memories sessions skills skins logs plans workspace cron home`
+- `_ensure_profile_config`：`config.yaml` 不存在用 `_profile_config_from_shared_home(shared)` 写一份；存在跑 `_normalize_profile_config_file` 重整（模型前缀、合并 shared `platforms.feishu`）
+- `SOUL.md`：写带 ORG_SYNC_BEGIN/END marker 块的内容（`_render_org_block` 487-506）— profile_name、user_id、open_id、department、role、leader_user_id、direct_subordinates。已有 SOUL → 替换 marker 间内容
+- `auth.json`、`.env`：symlink 到 shared home，失败 copy
+
+比较 before/after 内容判断 `kept` vs `updated`。
+
+### 11.6 `current_by_open_id` 冲突场景
+
+`apply_users` 里的"open_id 冲突 → soft_delete + insert" 路径专门为这种迁移设计：
+
+> auto-provision 早期写 `user_id == sender == tenant_short_id`，open_id 列也填了 tenant_short_id。后来 sync 拉到真 employee，desired user_id 是真飞书 user_id，open_id 是真 `ou_*`。但 sync 看 `current_by_open_id` 时**不会撞**（因为占位行的 open_id 列是 tenant 短串不是 `ou_*`）—— 真正撞的是 union_id 列。`apply_users` 当前**只看 open_id 列冲突**，所以这种"占位行 open_id 列 ≠ 真 ou_*"的情况下，soft_delete 不会触发，会出现双 active 行（直到下次 sync 改逻辑或 router union_id fallback 命中）。
+
+5/11 dirty 的 `lookup_by_union_id` 修复就是从 router 侧救场：sync 没合并的双行至少不会被路由成两个 profile。
+
+---
+
+## §12 Streaming card 消费
+
+multitenancy 不实现 streaming card 协议——**消费** `hermes-feishu-uat` adapter 提供的 `StreamingCardController` 接口。
+
+### 12.1 双路径
+
+(`_stream_into_feishu` `router.py:2142-2506`)
+
+- **路径 1**：没 adapter（单元测试） → `async for kind, c in stream_run_agent(...):` 累积 → fallback `real_run_agent(...)`
+- **路径 2**：adapter 支持 streaming card → `_stream_into_feishu_shared_consumer`（router.py:1905-2139）用 hermes 主线 `GatewayStreamConsumer + StreamConsumerConfig`
+- **路径 3（legacy）**：`_start_feishu_stream_target` + 手动 `edit_message` 节流 + 429 backoff `(0.5, 1.0, 2.0)` 4 次后放弃
+
+### 12.2 共享 consumer 路径
+
+(`_stream_into_feishu_shared_consumer` `router.py:1905-2139`)
+
+```python
+consumer = GatewayStreamConsumer(
+    adapter, chat_id,
+    StreamConsumerConfig(edit_interval=1.0, buffer_threshold=60, cursor=" ▉"),
+)
+await consumer.ensure_streaming_card_started()    # 失败返回 None,外层走 legacy
+consumer_task = asyncio.create_task(consumer.run())
+for delta:
+    consumer.on_delta(piece)
+    # consumer.update_streaming_card_status / reasoning / tool_started / tool_completed
+consumer.finish()
+await consumer_task
+# cancel → consumer.abort_streaming_card(content) (带 _run_terminal_stream_update shield)
+```
+
+### 12.3 适配器探测
+
+`_adapter_supports_streaming_card`（router.py:1699-1710）：
+
+```python
+if hasattr(adapter, "supports_streaming_card") and callable: return adapter.supports_streaming_card()
+else: return bool(adapter.SUPPORTS_STREAMING_CARD)   # 类级别属性
+```
+
+由 `FeishuAdapter`（hermes-feishu-uat 仓）自己声明。
+
+### 12.4 节流参数
+
+(`router.py:1887-1896`)
+
+```python
+_STREAM_CONTENT_MIN_CHARS              = 60
+_STREAM_CONTENT_MIN_SECONDS            = 1.0      # 对齐 hermes 主线 _PROGRESS_EDIT_INTERVAL
+_STREAM_THINKING_MIN_SECONDS           = 2.0
+_STREAM_CARD_REASONING_MIN_CHARS       = 40
+_STREAM_CARD_REASONING_MIN_SECONDS     = 0.8
+_STREAM_CARD_IDLE_HEARTBEAT_SECONDS    = 2.5
+_STREAM_MAX_VISIBLE_CHARS              = 3_000   # 超长截 + "...[已截断: ...]" 后缀
+```
+
+### 12.5 Legacy 节流路径事件转发
+
+(`router.py:2142-2506`)
+
+```
+mode, placeholder_id = await _start_feishu_stream_target(adapter, chat_id)
+if not placeholder_id:
+    text = await real_run_agent(...); adapter.send; return text   # 一次性
+
+if mode == "card": 用 _STREAM_CARD_PRIME_STATUS 暖卡 + 起 idle heartbeat task
+async for kind, delta in stream_run_agent(event, profile_home, messages=...):
+    if kind == "thinking":          累积 + 节流刷 reasoning 区
+    if kind == "tool_started":      _update_feishu_stream_tool_event
+    if kind == "tool_completed":    同上
+    if kind == "approval_required": _handle_child_approval_required + 状态条 "等待用户审批: /approve 或 /deny"
+    if kind == "approval_resolved": _clear_pending_approval(payload)
+    else:                            累积 content + 节流 edit
+finally: 终态 finalize=True 提交; cancel 时 _abort_feishu_stream_target
+```
+
+---
+
+## §13 与 hermes-feishu-uat / UAT OAuth 的接口契约
+
+multitenancy 消费 UAT 但**不**实现 UAT。
+
+| 契约 | 谁提供 | 谁消费 | 链接点 |
+|---|---|---|---|
+| `feishu_oapi.FEISHU_UAT_PATH` | hermes-feishu-uat | multitenancy `_run_with_aiagent` | `agent_real.py:412-417` 把 `feishu_oapi_module.FEISHU_UAT_PATH` 改到 `shared_home/feishu_uat.json` |
+| `feishu_oapi.FEISHU_UAT_DIR` | 同上 | 同上 | 改到 `shared_home/feishu_uat`（`~/.hermes/feishu_uat/` 真物理位置） |
+| `current_sender_open_id` ContextVar | hermes-feishu-uat 的 `tools.feishu_oapi_client` | multitenancy 路由 + 子进程 sender 抢答 | `router.py:147-155`（routing） + `agent_real.py:1219, sender_open_id_scope(...)`（子进程） |
+| `defer_processing_complete` / `complete_deferred_processing` / `on_processing_start` / `on_processing_complete` | `FeishuAdapter`（hermes-feishu-uat） | multitenancy `handle_async` 收尾 | router.py:480-484, 528-540 |
+| `supports_streaming_card`、`start_streaming_card`、`update_streaming_card*`、`abort_streaming_card`、`edit_message` | `FeishuAdapter` | multitenancy 双路径流式输出 | router.py:1699-1739, 2142-2506 |
+| `GatewayStreamConsumer` + `StreamConsumerConfig` | hermes-agent 主线 `gateway.stream_consumer` | multitenancy 主流式路径 | router.py:22-26, 1905-2139 |
+| `gateway._prepare_inbound_message_text(event, source, history=[])` | hermes-agent 主线 `GatewayRunner` | multitenancy enrichment | router.py:263-296 |
+| `gateway._deliver_media_from_response(...)` | 同上 | multitenancy 出站媒体投递 | router.py:224-238 |
+| `tools.approval.set_current_session_key` + `resolve_gateway_approval` | hermes-agent 主线 | multitenancy approval bridge | `agent_real.py:1042-1144`（子进程注册）+ `router.py:725-768`（父进程命令写文件） |
+| `agent.skill_commands.{resolve_skill_command_key, build_skill_invocation_message, get_skill_commands}` | hermes-agent 主线 | multitenancy skill rewrite | router.py:592-629 |
+| `hermes_cli.commands.{is_gateway_known_command, resolve_command}` | hermes-agent 主线 | multitenancy `resolve_command_name` | commands.py:87-103 |
+| `hermes_cli.plugins.PluginContext.register_hook` | hermes-agent 主线 | multitenancy `register(ctx)` | __init__.py:38 |
+| `gateway.session_context.set_session_vars` / `clear_session_vars` | hermes-agent 主线 | multitenancy 子进程内 | agent_real.py:1147-1381 |
+| `run_agent.AIAgent` | hermes-agent 主线 | multitenancy 子进程 _run_with_aiagent | agent_real.py:1147-1381 lazy import |
+
+**所有跨仓 import 都包了 `try/except Exception`**——目的是：
+
+- 单元测试在纯插件环境跑得起来（mock 掉这些上游模块）
+- hermes-agent 上游路径改名/重构时不至于直接 crash，只是某个 feature 静默降级
+
+---
+
+## §14 已知问题 + TODO
+
+| ID | 描述 | 状态 |
+|---|---|---|
+| MT-DIRTY-1 | `RoutingTable.lookup_by_union_id` + `_resolve_route` 走 union_id 列：5/11 working tree 已写但**未 commit** | 待用户决定 |
+| MT-DIRTY-2 | `RoutingTable.lookup_by_user_id`（PK lookup）：同次 dirty 中加的，**未 commit**，目前 router 不调 | 待用户决定 |
+| MT-1 | 历史 key 不带 alt_id 双通道（`_history_key` 只用 `_tenant_user_key(sender, sender_alt)`）。同一用户 sender 形式变化（tenant 短 ID → ou_*）会切割历史 | 已知，未修 |
+| MT-2 | `_evict_to_capacity` 全 in-flight 时允许超容量（`pool.py:154-174`）。Phase 3 计划加 wait queue | 已知,Spike 接受 |
+| MT-3 | hermes_constants 等模块 import 时 cache `_hermes_home`，dispatch 切了它们不变 | runtime.py 注释里讲了；规避靠延迟 import 或 upstream PR |
+| MT-4 | `apply_users` 只看 open_id 列冲突；如果占位行 open_id 列是 tenant 短串（非 `ou_*`），sync 不会 soft_delete 它，会留双 active 行 | 5/11 dirty 从 router 侧救场；根治需要 sync 侧也加 union_id 冲突检测 |
+| MT-5 | `fallback_model` 只取 list 的第一个（`agent_real.py:1236`）。多 fallback 模型只生效一个 | 已知 |
+| MT-6 | `_legacy_real_run_agent`（subprocess spawn 失败时的回退）没有 tool-loop，只裸 OpenAI client，max_tokens=512 | 设计如此（"至少能回话"）|
+
+---
+
+## 附录 A：file:line 锚点速查
+
+| 概念 | 文件 | 行 |
+|---|---|---|
+| plugin manifest | `/Users/kite/code/hermes-multitenancy/plugin.yaml` | 1-9 |
+| `register(ctx)` | `hermes_multitenancy/__init__.py` | 18-38 |
+| `on_pre_gateway_dispatch` sync hook | `router.py` | 337-363 |
+| `_should_defer_gateway_processing_complete` | `router.py` | 366-385 |
+| `_defer_gateway_processing_complete` | `router.py` | 388-396 |
+| `handle_async` async dispatch | `router.py` | 402-544 |
+| `_resolve_sender_for_routing` | `router.py` | 158-196 |
+| `_resolve_route` | `router.py` | 1234-1282 + 5/11 dirty 1264-1275 |
+| `_resolve_or_auto_provision_route` | `router.py` | 1285-1301 |
+| `_auto_provision_route` | `router.py` | 1324-1365 |
+| `_auto_profile_name` | `router.py` | 1368-1373 |
+| `_ensure_auto_profile` | `router.py` | 1376-1414 |
+| `_profile_name_to_home` | `router.py` | 1516-1521 |
+| `_adapter_supports_streaming_card` | `router.py` | 1699-1710 |
+| `_start_feishu_stream_target` | `router.py` | 1713-1739 |
+| `_stream_into_feishu_shared_consumer` | `router.py` | 1905-2139 |
+| `_stream_into_feishu` legacy | `router.py` | 2142-2506 |
+| `_user_inflight_tasks` slot dict | `router.py` | 29 |
+| `_session_history` cache + helpers | `router.py` | 36-39, 64-111 |
+| 命令短路 + skill rewrite | `router.py` | 565-722 |
+| approval bridge command | `router.py` | 725-853 |
+| `_dispatch_gateway_command` | `router.py` | 856-938 |
+| `_dispatch_quick_command` | `router.py` | 941-1010 |
+| `_dispatch_plugin_command` | `router.py` | 1051-1083 |
+| singletons (`_routing_table`/`_pool`/`_session_store`) | `router.py` | 1547-1622 |
+| `override_pool` / `override_session_store` | `router.py` | 1567-1612 |
+| `ProfileRuntime.dispatch` | `runtime.py` | 117-133 |
+| `_PROFILE_HOME_VAR` ContextVar | `runtime.py` | 38-40 |
+| env lock helper `_get_env_lock` | `runtime.py` | 55-64 |
+| `_verify_switch` | `runtime.py` | 135-156 |
+| `_default_run_agent` echo stub | `runtime.py` | 159-166 |
+| `RuntimePool.dispatch` / `_acquire` | `pool.py` | 93-141 |
+| `_evict_idle_inplace` / `_evict_to_capacity` | `pool.py` | 143-181 |
+| `_PoolEntry` dataclass | `pool.py` | 34-39 |
+| AIAgent subprocess (non-stream) | `agent_real.py` | 645-722 |
+| AIAgent subprocess (NDJSON stream) | `agent_real.py` | 725-861 |
+| `_run_with_aiagent` 同步主体 | `agent_real.py` | 1147-1381 |
+| `_resolve_enabled_toolsets` merge | `agent_real.py` | 1384-1448 |
+| `_configure_feishu_uat_home` | `agent_real.py` | 412-417 |
+| `_configure_cron_home` | `agent_real.py` | 420-470 |
+| `_configure_gateway_approval_bridge` | `agent_real.py` | 1042-1144 |
+| `_resolve_aiagent_session_id` | `agent_real.py` | 905-966 |
+| `_resolve_multitenant_gateway_session_key` | `agent_real.py` | 969-991 |
+| `_PROVIDER_ENV_KEYS` / `_PROVIDER_BASE_URLS` | `agent_real.py` | 41-48 / 53-60 |
+| `_split_model_spec` | `agent_real.py` | 335-340 |
+| `_legacy_real_run_agent` fallback | `agent_real.py` | 254-329 |
+| `aiagent_subprocess.main` | `aiagent_subprocess.py` | 67-126 |
+| RoutingTable schema | `routing.py` | 26-44 |
+| `lookup_by_open_id` | `routing.py` | 82-89 |
+| `lookup_by_union_id` (5/11 dirty) | `routing.py` | 91-103 |
+| `lookup_by_user_id` (5/11 dirty) | `routing.py` | 105-119 |
+| `touch_active` | `routing.py` | 121-127 |
+| `upsert` | `routing.py` | 131-159 |
+| `soft_delete` | `routing.py` | 161-173 |
+| `count_active` | `routing.py` | 177-181 |
+| SessionStore schema/api | `sessions.py` | 27-95 |
+| `apply_users` | `sync/feishu_hr.py` | 29-84 |
+| `plan_users` | `sync/feishu_hr.py` | 87-117 |
+| `UserSpec` | `sync/feishu_hr.py` | 20-26 |
+| `sync_feishu_org` | `sync/feishu_org.py` | 349-400 |
+| `pull_feishu_org` | `sync/feishu_org.py` | 197-215 |
+| `build_user_specs` | `sync/feishu_org.py` | 296-310 |
+| `profile_name_for_user_id` | `sync/feishu_org.py` | 313-324 |
+| `sync_profiles` / `_sync_one_profile` | `sync/feishu_org.py` | 327-346 / 410-446 |
+| sync CLI entry | `sync/cli.py` | 18-86 |
+| `parse_command` | `commands.py` | 64-80 |
+| `resolve_command_name` | `commands.py` | 83-108 |
+| `_FALLBACK_ALIASES` / `_FALLBACK_GATEWAY_COMMANDS` | `commands.py` | 13-23 / 25-61 |
+
+---
+
+## 附录 B：环境变量速查
+
+| env | 默认 | 作用 | 设置位置 |
+|---|---|---|---|
+| `HERMES_HOME` | `~/.hermes` | profile home,被 `ProfileRuntime.dispatch` 临时改 | env-lock 内 |
+| `HERMES_SHARED_HOME` | `profile.parent.parent` 或 profile_home | feishu_uat / cron 共享根 | `_run_aiagent_subprocess` env |
+| `HERMES_MULTITENANCY_AUTO_PROVISION` | `1`（开） | 未知 sender 自动建 profile + 路由 | `_auto_provision_enabled` |
+| `HERMES_MULTITENANCY_TOOLSETS_MODE` | `merge_default` | `explicit / strict / replace` 切严格替换 | `_resolve_enabled_toolsets` |
+| `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC` | unset | 允许 quick command `type=exec` 在 multitenancy 路径生效 | `_quick_exec_allowed` |
+| `HERMES_MULTITENANCY_APPROVAL_DIR` | unset → tempdir | 子进程 approval 决策文件目录 | `_run_aiagent_subprocess` env |
+| `HERMES_MULTITENANCY_APPROVAL_TIMEOUT` | `300` 或 `HERMES_APPROVAL_GATEWAY_TIMEOUT` | 子进程等待 approval 文件超时 | `_approval_bridge_timeout` |
+| `HERMES_AIAGENT_SUBPROCESS_TIMEOUT` | `300` | 子进程总超时 | `_run_aiagent_subprocess` |
+| `HERMES_AIAGENT_EVENT_STREAM` | unset | 子进程切 NDJSON 流式输出 | `_stream_aiagent_subprocess` env |
+| `HERMES_GATEWAY_SESSION` | `1`（子进程强制）| hermes 内部判定 gateway 模式 | 子进程 env |
+| `HERMES_EXEC_ASK` | `1`（子进程强制）| hermes 内部 approval 路径开关 | 子进程 env |
+| `HERMES_MAX_ITERATIONS` | `30` | AIAgent.max_iterations | `agent_kwargs` |
+| `HERMES_SESSION_KEY` | gateway_session_key | hermes 内部 session contextvar 兜底 | `_configure_gateway_approval_bridge` |
+| `PYTEST_CURRENT_TEST` | unset | hook 在 no-loop 时切 `asyncio.run(...)` 单测路径 | pytest 自动设 |
+| `<PROVIDER>_API_KEY` | env | `GLM_API_KEY`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 等，见 §8.10 | profile `.env` 或 process env |
+
+---
+
+## 附录 C：multitenancy.db schema dump
+
+实测 2026-05-11，`sqlite3 ~/.hermes/multitenancy.db ".schema"` 输出：
+
+```sql
+CREATE TABLE multitenancy_routing (
+    user_id        TEXT PRIMARY KEY NOT NULL,
+    profile_name   TEXT NOT NULL,
+    open_id        TEXT NOT NULL,
+    union_id       TEXT,
+    active         INTEGER NOT NULL DEFAULT 1,
+    deleted_at     INTEGER,
+    synced_at      INTEGER NOT NULL,
+    version        INTEGER NOT NULL DEFAULT 1,
+    last_active_at INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_routing_open_id_active
+    ON multitenancy_routing(open_id) WHERE active = 1;
+CREATE INDEX idx_routing_active_user
+    ON multitenancy_routing(active, user_id);
+
+CREATE TABLE multitenancy_sessions (
+    profile_name TEXT NOT NULL,
+    user_key     TEXT NOT NULL,
+    ts           INTEGER NOT NULL,
+    role         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    PRIMARY KEY (profile_name, user_key, ts, role)
+);
+CREATE INDEX idx_sessions_profile_user
+    ON multitenancy_sessions(profile_name, user_key, ts);
+```
+
+诊断时常用：
+
+```bash
+# 当前 active 路由数 (2026-05-11 实测 = 2)
+sqlite3 ~/.hermes/multitenancy.db "SELECT COUNT(*) FROM multitenancy_routing WHERE active=1;"
+
+# 看具体路由（注意 open_id / union_id 列可能包含 ***REDACTED*** 类敏感字段）
+sqlite3 ~/.hermes/multitenancy.db \
+  "SELECT user_id, profile_name, open_id, union_id, last_active_at
+   FROM multitenancy_routing WHERE active=1;"
+
+# 看历史条数
+sqlite3 ~/.hermes/multitenancy.db \
+  "SELECT profile_name, user_key, COUNT(*) FROM multitenancy_sessions
+   GROUP BY profile_name, user_key;"
+
+# 软删历史（看看占位行残留）
+sqlite3 ~/.hermes/multitenancy.db \
+  "SELECT user_id, profile_name, open_id, union_id, deleted_at
+   FROM multitenancy_routing WHERE active=0 ORDER BY deleted_at DESC LIMIT 10;"
+```
+
+> 字段里 user_id / open_id / union_id 实际值是飞书发的稳定 token，**对外分享时一律 `***REDACTED***`**。schema 本身不敏感。
