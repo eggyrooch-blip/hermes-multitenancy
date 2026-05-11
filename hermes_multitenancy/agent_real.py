@@ -1085,8 +1085,231 @@ async def _stream_aiagent_subprocess(
     *,
     messages: Optional[list[dict]] = None,
 ):
-    """Run AIAgent in a child process and yield its NDJSON progress events."""
+    """Run AIAgent in a child process and yield its NDJSON progress events.
+
+    State.db mirroring (user/assistant/tool rows + source retag) is done here
+    in the parent process — the subprocess sandbox blocks sqlite WAL opens on
+    PROFILE_HOME/state.db, so any write logic running inside the sandbox fails
+    silently with ``sqlite3.OperationalError: unable to open database file``.
+    The parent has no sandbox and can write freely.
+    """
     import asyncio
+    import sqlite3 as _sqlite3
+    import time as _time
+
+    # Resolve identifiers the mirror needs. All derivable from ``event`` and
+    # ``profile_home`` so we don't have to push them across the NDJSON pipe.
+    # current_sender_open_id contextvar is set by the feishu adapter on the
+    # gateway loop; lazy-import it so this module still imports if
+    # tools.feishu_oapi_client is unavailable in tests / non-feishu
+    # deployments.
+    sender_open_id = ""
+    try:
+        from tools.feishu_oapi_client import current_sender_open_id as _cv
+        sender_open_id = _cv.get() or ""
+    except Exception:
+        pass
+    if not sender_open_id:
+        sender_open_id = _resolve_sender_open_id(event)
+    _canonical_session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
+    user_text = getattr(event, "text", "") or ""
+    _state_db_path = profile_home / "state.db"
+
+    # ── Session-boundary epoch ────────────────────────────────────────────
+    # The canonical session_id is keyed only by (chat_id, user_id), so it
+    # stays the same forever — including across ``/new`` resets. That
+    # collapses every turn from the same DM into a single web-ui sidebar
+    # entry, which is wrong UX after the user explicitly asked for a fresh
+    # session.
+    #
+    # The router (``router.py:_clear_history``) wipes its in-process history
+    # dict on ``/new``, so the next turn arrives with ``messages`` either
+    # None or containing only the current user message. We use that signal
+    # as the session boundary: on a fresh-start turn we rotate the epoch
+    # (written to a per-(chat,user) text file in ``profile_home``), on a
+    # continuation turn we reuse it. Appending ``:epoch:<ts>`` to the
+    # canonical id yields a new session row in state.db after each ``/new``
+    # while preserving session continuity within a chat-history run.
+    _is_session_start = messages is None or len(messages) <= 1
+    _chat_id_for_epoch = ""
+    _source_for_epoch = getattr(event, "source", None)
+    if _source_for_epoch is not None:
+        _chat_id_for_epoch = str(
+            getattr(_source_for_epoch, "chat_id", "")
+            or getattr(_source_for_epoch, "parent_chat_id", "")
+            or getattr(_source_for_epoch, "chat_id_alt", "")
+            or ""
+        )
+
+    def _epoch_path() -> Optional[Path]:
+        if not _chat_id_for_epoch:
+            return None
+        def _safe(s: str) -> str:
+            return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in s)[:80]
+        return (
+            profile_home
+            / "mirror_epochs"
+            / f"{_safe(_chat_id_for_epoch)}__{_safe(sender_open_id or 'unknown')}.txt"
+        )
+
+    def _resolve_epoch() -> str:
+        ep = _epoch_path()
+        if ep is None:
+            return str(int(_time.time()))
+        try:
+            if _is_session_start or not ep.exists():
+                try:
+                    ep.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                value = str(int(_time.time()))
+                try:
+                    ep.write_text(value, encoding="utf-8")
+                except Exception:
+                    pass
+                return value
+            current = ep.read_text(encoding="utf-8").strip()
+            return current or str(int(_time.time()))
+        except Exception:
+            return str(int(_time.time()))
+
+    session_id = f"{_canonical_session_id}:epoch:{_resolve_epoch()}"
+
+    class _StateDbMirror:
+        """Parent-side write-through to ``profile_home/state.db`` for web-ui visibility.
+
+        Holds the in-flight assistant row id so streaming deltas update the
+        same row instead of creating a new one per chunk. Tool calls seal the
+        active assistant row so the next assistant text starts a new bubble.
+        """
+
+        def __init__(self) -> None:
+            self.active_assistant_id: Optional[int] = None
+            self.assistant_content: str = ""
+            self.assistant_reasoning: str = ""
+            self.session_ensured: bool = False
+            self.user_inserted: bool = False
+            self.retagged: bool = False
+
+        def _conn(self):
+            return _sqlite3.connect(str(_state_db_path), timeout=2.0)
+
+        def ensure_session(self) -> None:
+            if self.session_ensured or not _state_db_path.exists():
+                self.session_ensured = True
+                return
+            try:
+                with self._conn() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO sessions (id, source, started_at) "
+                        "VALUES (?, 'feishu', ?)",
+                        (str(session_id), _time.time()),
+                    )
+                self.session_ensured = True
+            except Exception:
+                logger.exception("[multitenancy] mirror ensure_session failed")
+
+        def insert_user(self, text: str) -> None:
+            if self.user_inserted:
+                return
+            self.ensure_session()
+            try:
+                with self._conn() as conn:
+                    conn.execute(
+                        "INSERT INTO messages (session_id, role, content, timestamp) "
+                        "VALUES (?, 'user', ?, ?)",
+                        (str(session_id), text or "", _time.time()),
+                    )
+                self.user_inserted = True
+            except Exception:
+                logger.exception("[multitenancy] mirror insert_user failed")
+
+        def upsert_assistant(self, text_delta: str, reasoning_delta: str) -> None:
+            if text_delta:
+                self.assistant_content += text_delta
+            if reasoning_delta:
+                self.assistant_reasoning += reasoning_delta
+            if not self.assistant_content and not self.assistant_reasoning:
+                return
+            self.ensure_session()
+            try:
+                with self._conn() as conn:
+                    if self.active_assistant_id is None:
+                        cur = conn.execute(
+                            "INSERT INTO messages (session_id, role, content, reasoning, timestamp) "
+                            "VALUES (?, 'assistant', ?, ?, ?)",
+                            (
+                                str(session_id),
+                                self.assistant_content,
+                                self.assistant_reasoning or None,
+                                _time.time(),
+                            ),
+                        )
+                        self.active_assistant_id = cur.lastrowid
+                    else:
+                        conn.execute(
+                            "UPDATE messages SET content=?, reasoning=? WHERE id=?",
+                            (
+                                self.assistant_content,
+                                self.assistant_reasoning or None,
+                                self.active_assistant_id,
+                            ),
+                        )
+            except Exception:
+                logger.exception("[multitenancy] mirror upsert_assistant failed")
+
+        def seal_assistant(self) -> None:
+            self.active_assistant_id = None
+            self.assistant_content = ""
+            self.assistant_reasoning = ""
+
+        def insert_tool_call(self, tool_name: str, preview: Any, args: Any) -> None:
+            if not tool_name:
+                return
+            self.ensure_session()
+            try:
+                payload = json.dumps(
+                    {"name": str(tool_name), "args": args, "preview": preview},
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except Exception:
+                payload = None
+            try:
+                with self._conn() as conn:
+                    conn.execute(
+                        "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
+                        "VALUES (?, 'assistant', '', ?, ?, ?)",
+                        (str(session_id), str(tool_name), payload, _time.time()),
+                    )
+            except Exception:
+                logger.exception("[multitenancy] mirror insert_tool_call failed")
+
+        def retag_source(self) -> None:
+            if self.retagged:
+                return
+            try:
+                _mark_session_source_feishu(profile_home, str(session_id))
+                self.retagged = True
+            except Exception:
+                logger.exception("[multitenancy] mirror retag_source failed")
+
+        def dedupe(self) -> None:
+            try:
+                with self._conn() as conn:
+                    conn.execute(
+                        "DELETE FROM messages WHERE session_id = ? AND id NOT IN ("
+                        "SELECT MIN(id) FROM messages WHERE session_id = ? "
+                        "GROUP BY role, IFNULL(content,''), IFNULL(tool_name,''))",
+                        (str(session_id), str(session_id)),
+                    )
+            except Exception:
+                logger.exception("[multitenancy] mirror dedupe failed")
+
+    _mirror = _StateDbMirror()
+    # Pre-write the user message so the web-ui shows the question instantly,
+    # even if the run later times out / aborts before any reply.
+    _mirror.insert_user(user_text)
 
     payload = json.dumps(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
@@ -1165,11 +1388,19 @@ async def _stream_aiagent_subprocess(
                     time.monotonic() - started_at,
                     len(str(data.get("result") or "")),
                 )
+                # Seal any trailing assistant chunk, retag source to feishu,
+                # and dedupe against whatever Hermes core's own end-of-run
+                # write inserted.
+                _mirror.seal_assistant()
+                _mirror.retag_source()
+                _mirror.dedupe()
                 yield "done", str(data.get("result") or "")
                 continue
             if event_name == "content":
+                _mirror.upsert_assistant(str(data.get("text") or ""), "")
                 yield "content", str(data.get("text") or "")
             elif event_name == "thinking":
+                _mirror.upsert_assistant("", str(data.get("text") or ""))
                 yield "thinking", str(data.get("text") or "")
             elif event_name in {
                 "tool_started",
@@ -1178,6 +1409,22 @@ async def _stream_aiagent_subprocess(
                 "approval_resolved",
             }:
                 payload_data = {k: v for k, v in data.items() if k != "event"}
+                if event_name == "tool_started":
+                    # Seal any pre-tool assistant text into its own row, then
+                    # mirror the tool invocation. First tool-start is also
+                    # the safest moment to retag — Hermes core has had time
+                    # to insert the sessions row by now.
+                    _mirror.seal_assistant()
+                    _mirror.insert_tool_call(
+                        str(payload_data.get("name") or ""),
+                        payload_data.get("preview"),
+                        payload_data.get("args"),
+                    )
+                    _mirror.retag_source()
+                elif event_name == "tool_completed":
+                    # Tool finished — subsequent assistant text is a new
+                    # bubble. Seal so upsert starts a fresh row.
+                    _mirror.seal_assistant()
                 yield str(event_name), payload_data
             else:
                 logger.debug("[multitenancy] ignoring unknown child stream event: %s", event_name)
@@ -1649,6 +1896,14 @@ def _run_with_aiagent(
                     reason,
                 )
 
+        # NOTE: state.db.messages live mirror lives in the parent process
+        # (_stream_aiagent_subprocess), NOT here. The subprocess sandbox
+        # blocks sqlite WAL opens on PROFILE_HOME/state.db, so every write
+        # attempt failed with sqlite3.OperationalError: unable to open
+        # database file. Moving the mirror to the parent — which has no
+        # sandbox — sidesteps that. _retag_source_now below remains as a
+        # best-effort second writer; it fails silently in sandboxed runs.
+
         def _tool_progress_event_callback(
             event_type: str,
             tool_name: str,
@@ -1742,9 +1997,8 @@ def _run_with_aiagent(
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
         finally:
-            # First pass — catches any sessions row Hermes core inserted
-            # mid-run (e.g. on the first AIAgent tool call). Cheap UPDATE
-            # even when no rows match.
+            # Best-effort retag from inside the sandbox; if it fails the
+            # parent process re-runs it post-done with full write access.
             _retag_source_now("finally-pre-close")
             approval_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
@@ -1758,10 +2012,6 @@ def _run_with_aiagent(
                     cleanup_agent()
             except Exception:
                 pass
-            # Second pass — covers the common case where AIAgent commits the
-            # sessions row in close()/cleanup(). Without this, the row stays
-            # source='api_server' and the web-ui sidebar groups the chat
-            # under "飞书 / API SERVER" instead of "FEISHU".
             _retag_source_now("finally-post-close")
 
     return (result or {}).get("final_response", "") or ""
