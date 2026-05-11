@@ -18,11 +18,11 @@ the trade-offs below.
 
 | Threat | Before档 A | After档 A |
 |---|---|---|
-| Skill A reads skill B's cached OAuth token via `~/.cache/<other>/token` | ✅ trivially possible | ❌ blocked: `~/` is pivoted to `<profile>/home`, caches land in `<profile>/cache` |
+| Skill A reads skill B's cached OAuth token via `~/.cache/<other>/token` | ✅ trivially possible | ❌ blocked: `XDG_CACHE_HOME` pivoted to `<profile>/cache`, so XDG-aware caches land per-profile |
 | Profile X's subprocess reads profile Y's Feishu UAT from `~/.hermes/feishu_uat/ou_*.json` | ✅ trivially possible via `os.listdir` | ❌ blocked: `FEISHU_UAT_DIR` rebound to `<profile>/feishu_uat/`; the dir only contains the user's own UAT |
 | Parent gateway process leaks `OPENAI_API_KEY` (or any shell-exported secret) to a tenant's subprocess via `os.environ` | ✅ leaked by default (`env = os.environ.copy()`) | ❌ blocked: subprocess env is built from a 18-key allowlist |
 | Other system users running `ls ~/.hermes/profiles/` enumerate the tenant tree | ✅ mode 0755 | ❌ blocked: mode 0700, applied on every sync |
-| A skill that writes a token to `Path.home() / ".myskill"` lands in the shared home | ✅ leaks across profiles | ❌ blocked: `HOME` pivoted to `<profile>/home` |
+| A skill that writes a token to `Path.home() / ".myskill"` lands in the shared home | ✅ leaks across profiles | ⚠️ partially: HOME is NOT pivoted (host CLIs like `kep-cli` rely on it); use `skill_storage.write_token()` to land in `<profile>/tokens/` explicitly |
 | A skill writes a transient secret to `tempfile.gettempdir()` (`/var/folders/...` on macOS) where another tenant's skill can `os.listdir` it | ✅ leaks | ❌ blocked: `TMPDIR` pivoted to `<profile>/tmp` |
 
 ---
@@ -59,7 +59,7 @@ directory, applied by `_sync_one_profile` on every sync pass):
 │   ├── google_drive.json        # 0600
 │   ├── notion.json              # 0600
 │   └── ...
-├── home/                        # HOME pivot — child subprocess sees this as ~
+├── home/                        # provisioned but NOT used as HOME pivot (see below)
 ├── cache/                       # XDG_CACHE_HOME
 ├── config/                      # XDG_CONFIG_HOME
 ├── state/                       # XDG_STATE_HOME
@@ -72,11 +72,25 @@ directory, applied by `_sync_one_profile` on every sync pass):
 └── ...                          # logs, plans, workspace, skins
 ```
 
-The five "isolation pivot" directories (`home`, `cache`, `config`,
-`state`, `data`, `tmp`) back the env redirect set by
-`agent_real._build_subprocess_env`. They are created at provision time so
-the first AIAgent subprocess spawn does not have to materialise them at
+The five "isolation pivot" directories (`cache`, `config`, `state`,
+`data`, `tmp`) back the env redirect set by
+`agent_real._build_subprocess_env` (XDG_CACHE_HOME, XDG_CONFIG_HOME,
+XDG_STATE_HOME, XDG_DATA_HOME, TMPDIR). They are created at provision time
+so the first AIAgent subprocess spawn does not have to materialise them at
 the umask default (typically 0755) before they are tightened.
+
+**`home/` is intentionally NOT used as the HOME env target.** A prior
+iteration of `_build_subprocess_env` rebound `HOME` to `<profile>/home/`
+(modelled after the OpenClaw `keep-record` workspace-bridge pattern), but
+that turned out to be a host/container category error: the OpenClaw pattern
+works inside Docker where the workspace IS the sandbox; this plugin runs as
+a host Python process where `Path.home()` must keep pointing at the real
+user home so host-installed CLI tools (`kep-cli`, `aws`, `gh`, …) can find
+`~/.kep-cli`, `~/.aws`, `~/.config/gh` etc. Skill-level token isolation is
+enforced explicitly via `skill_storage.write_token()` rather than
+implicitly via HOME redirection. The `home/` subdir is still provisioned
+so future per-profile-home features can use it, but the env var is not
+rebound.
 
 ---
 
@@ -224,4 +238,7 @@ boundary. A skill that wants to read `~/.ssh/` can still do so.
   * `OpenClaw/排障 — gatekeeper 群聊 kep-prd-analysis 全链路修复 2026-05-08.md`
     — the source of the `sanitizeEnvVars` allowlist pattern
   * `OpenClaw/keep-record 最终架构 2026-04-24.md` — the HOME pivot
-    pattern (`process.env.HOME = workspace-bridge`)
+    pattern (`process.env.HOME = workspace-bridge`). Tried in档 A v1,
+    rolled back because that pattern is container-only — see
+    `架构 — Hermes Profiles 安装 kep-cli 2026-05-07.md` for why a host
+    Python process must keep `Path.home()` at the real user home.

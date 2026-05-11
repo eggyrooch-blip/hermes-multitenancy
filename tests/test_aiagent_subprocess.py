@@ -962,8 +962,13 @@ def test_build_subprocess_env_drops_non_allowlisted_parent_env(monkeypatch, tmp_
         assert leaked not in env, f"{leaked} leaked into subprocess env"
 
 
-def test_build_subprocess_env_pivots_home_and_xdg_into_profile(tmp_path: Path):
-    """HOME / XDG_* / TMPDIR redirect to per-profile dirs, isolating skill caches."""
+def test_build_subprocess_env_pivots_xdg_and_tmpdir_into_profile(tmp_path: Path):
+    """XDG_* / TMPDIR redirect to per-profile dirs, isolating skill caches.
+
+    HOME is deliberately NOT pivoted — host CLI tools (kep-cli, aws, etc.)
+    rely on ``Path.home() / ".kep-cli"`` style paths to find their state, so
+    rebinding HOME would break them. See _build_subprocess_env docstring.
+    """
     from hermes_multitenancy import agent_real
 
     profile = tmp_path / "profiles" / "alice"
@@ -971,19 +976,34 @@ def test_build_subprocess_env_pivots_home_and_xdg_into_profile(tmp_path: Path):
     approval_dir.mkdir()
     env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
 
-    assert env["HOME"] == str(profile / "home")
     assert env["XDG_CACHE_HOME"] == str(profile / "cache")
     assert env["XDG_CONFIG_HOME"] == str(profile / "config")
     assert env["XDG_STATE_HOME"] == str(profile / "state")
     assert env["XDG_DATA_HOME"] == str(profile / "data")
     assert env["TMPDIR"] == str(profile / "tmp")
 
-    # Each pivot dir must exist and be private (mode 0700).
-    for sub in ("home", "cache", "config", "state", "data", "tmp"):
+    # HOME must NOT be pivoted to <profile>/home. Either it stays inherited
+    # from parent (PATH/etc. allowlist did not include HOME, so it should be
+    # absent unless added) or it's empty. The point is that Path.home() inside
+    # the child still resolves to the user's real home, so host-installed
+    # CLIs (kep-cli, aws) can find ~/.kep-cli, ~/.aws etc.
+    if "HOME" in env:
+        assert env["HOME"] != str(profile / "home"), (
+            "HOME must not pivot to profile — that would break host CLIs that "
+            "use Path.home() to locate their per-user state directories."
+        )
+
+    # XDG/TMPDIR pivot dirs must exist and be private (mode 0700).
+    for sub in ("cache", "config", "state", "data", "tmp"):
         d = profile / sub
         assert d.is_dir(), f"{sub} not created"
         mode = d.stat().st_mode & 0o777
         assert mode == 0o700, f"{sub} mode is {oct(mode)}, expected 0o700"
+
+    # ``home/`` subdir is no longer created automatically by env build —
+    # provisioned by sync only if explicit (kept for tools that ask for a
+    # per-profile-home location, but it's not the HOME env target).
+    assert not (profile / "home").exists()
 
 
 def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
@@ -1052,6 +1072,10 @@ async def test_run_aiagent_subprocess_passes_sanitized_env_to_child(
 
     child_env = captured["env"]
     assert "OPENAI_API_KEY" not in child_env, "parent secret leaked to child"
-    assert child_env["HOME"] == str(profile / "home")
+    # HOME is NOT pivoted to profile (would break host CLIs like kep-cli).
+    # If HOME survives the allowlist (it currently does not) it must not point
+    # at the profile.
+    if "HOME" in child_env:
+        assert child_env["HOME"] != str(profile / "home")
     assert child_env["TMPDIR"] == str(profile / "tmp")
     assert child_env["HERMES_HOME"] == str(profile)
