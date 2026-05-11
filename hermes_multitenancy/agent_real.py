@@ -773,6 +773,89 @@ def _build_subprocess_env(
     return env
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 档 B — sandbox-exec wrapper (kernel-level filesystem + network deny)
+# ─────────────────────────────────────────────────────────────────────────
+
+_SANDBOX_POLICY_FILE = Path(__file__).parent / "sandbox" / "profile-default.sb"
+_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def _resolve_hermes_agent_repo() -> Path:
+    """Best-effort resolution of the hermes-agent source repo path.
+
+    Used to grant the sandboxed subprocess file-read* on the agent source
+    tree. Falls back to the venv's site-packages parent if not findable.
+    """
+    explicit = os.getenv("HERMES_AGENT_REPO")
+    if explicit:
+        return Path(explicit).expanduser()
+    # gateway typically runs with cwd == hermes-agent repo root (see plist
+    # WorkingDirectory). os.getcwd() is the most reliable signal when
+    # HERMES_AGENT_REPO is unset.
+    cwd = Path(os.getcwd()).resolve()
+    if (cwd / "hermes_cli").is_dir() or (cwd / "gateway").is_dir():
+        return cwd
+    # Fallback: walk up from sys.prefix (venv root → repo root)
+    venv_parent = Path(sys.prefix).parent
+    if (venv_parent / "hermes_cli").is_dir() or (venv_parent / "gateway").is_dir():
+        return venv_parent
+    return cwd  # Best guess; sandbox will deny if wrong, easy to spot.
+
+
+def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
+    """Wrap ``cmd`` with ``sandbox-exec`` when ``HERMES_USE_SANDBOX=1``.
+
+    When the toggle is off (default for now), returns ``cmd`` unchanged so
+    docker-style isolation can be rolled out gradually. When on, builds
+    the parameterised invocation for ``hermes_multitenancy/sandbox/
+    profile-default.sb``.
+
+    Falls back to unsandboxed exec with a loud WARNING if the policy
+    file is missing — better to keep the bot working than to fail closed
+    in a way that masks the cause.
+    """
+    if os.environ.get("HERMES_USE_SANDBOX") != "1":
+        return cmd
+    if not _SANDBOX_POLICY_FILE.is_file():
+        logger.warning(
+            "[multitenancy] HERMES_USE_SANDBOX=1 but policy %s is missing — "
+            "spawning subprocess unsandboxed. Investigate the deployment.",
+            _SANDBOX_POLICY_FILE,
+        )
+        return cmd
+    if not os.access(_SANDBOX_EXEC, os.X_OK):
+        logger.warning(
+            "[multitenancy] HERMES_USE_SANDBOX=1 but %s is not executable on "
+            "this platform — spawning subprocess unsandboxed.",
+            _SANDBOX_EXEC,
+        )
+        return cmd
+
+    venv = Path(sys.prefix).resolve()
+    shared_home = _resolve_shared_hermes_home(profile_home).resolve()
+    agent_repo = _resolve_hermes_agent_repo().resolve()
+    mt_repo = Path(__file__).resolve().parent.parent
+    user_home = Path.home().resolve()
+    profile_home_resolved = profile_home.expanduser().resolve()
+
+    wrapped = [
+        _SANDBOX_EXEC,
+        "-f", str(_SANDBOX_POLICY_FILE),
+        "-D", f"PROFILE_HOME={profile_home_resolved}",
+        "-D", f"SHARED_HOME={shared_home}",
+        "-D", f"USER_HOME={user_home}",
+        "-D", f"HERMES_VENV={venv}",
+        "-D", f"HERMES_AGENT_REPO={agent_repo}",
+        "-D", f"HERMES_MT_REPO={mt_repo}",
+    ] + list(cmd)
+    logger.info(
+        "[multitenancy] sandbox-exec wrap: policy=%s profile=%s agent_repo=%s",
+        _SANDBOX_POLICY_FILE.name, profile_home_resolved.name, agent_repo,
+    )
+    return wrapped
+
+
 async def _run_aiagent_subprocess(
     event: Any,
     profile_home: Path,
@@ -795,12 +878,12 @@ async def _run_aiagent_subprocess(
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env = _build_subprocess_env(profile_home, approval_dir=approval_dir)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
+    cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(child_script),
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -865,6 +948,7 @@ async def _stream_aiagent_subprocess(
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
+    cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     started_at = time.monotonic()
     logger.info(
@@ -873,8 +957,7 @@ async def _stream_aiagent_subprocess(
         timeout_s,
     )
     proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        str(child_script),
+        *cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
