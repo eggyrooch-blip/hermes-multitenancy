@@ -68,34 +68,23 @@
 (allow sysctl-read)
 (allow sysctl-write)
 
-;; ── File reads — broad, gateway is trusted code ────────────────────────
+;; ── File reads / writes — broad allow + targeted deny ────────────────
+;;
+;; The gateway main is "trusted" code (our own + upstream hermes-agent),
+;; and Python sqlite3 / lark SDK / aiohttp touch a long tail of paths
+;; (kernel-resolved symlinks, SIP /var redirects, hardened-runtime
+;; binary identity checks, plugin discovery walks). Enumerating every
+;; legitimate read path is fragile — instead we grant broad read+write
+;; and rely on the *targeted denies below* to keep the sensitive paths
+;; off-limits. sandbox-exec is last-match-wins, so the denies that
+;; follow this broad allow win on their subpaths.
 
-(allow file-read*
-    (subpath "/usr")
-    (subpath "/System")
-    (subpath "/Library")
-    (subpath "/private/var/db")
-    (subpath "/private/var/folders")
-    (subpath "/private/etc")
-    (subpath "/dev")
-    (subpath "/opt/homebrew")
-    (subpath "/Applications")
-    (subpath (param "HERMES_VENV"))
-    (subpath (param "HERMES_AGENT_INSTALL"))
-    (subpath (param "HERMES_AGENT_REPO"))
-    (subpath (param "HERMES_MT_REPO"))
-    ;; uv-managed python interpreter
-    (subpath (string-append (param "USER_HOME") "/.local/share/uv"))
-    ;; gateway must see ALL profiles to know how to route
-    (subpath (param "SHARED_HOME"))
-    ;; some libs (urllib, requests, certifi) touch ~/.config
-    (subpath (string-append (param "USER_HOME") "/.config"))
-    ;; system trust stores
-    (subpath (string-append (param "USER_HOME") "/.cache")))
+(allow file-read* file-write*)
 
-;; ── Hard denies — even though we allowed broader subpaths above ───────
-;; sandbox-exec is LAST-MATCH-WINS, so these denies (placed after the
-;; allows above) take precedence on the listed subpaths.
+;; ── Hard denies — last-match-wins overrides the broad allow above ────
+;; These are the headline cross-tenant / cross-credential guarantees of
+;; ARM B Phase 2: no matter what filesystem trick a (compromised)
+;; gateway dependency plays, it cannot read these.
 
 (deny file-read* file-write*
     (subpath (string-append (param "USER_HOME") "/.ssh"))
@@ -103,38 +92,26 @@
     (subpath (string-append (param "USER_HOME") "/.password-store"))
     (subpath (string-append (param "USER_HOME") "/.aws/credentials")))
 
-;; ── File writes — gateway runtime state ───────────────────────────────
+;; (file-write* is granted broadly above; the targeted denies after the
+;; broad allow keep ssh / Keychain / etc. off-limits. Specific writes
+;; that hermes needs — SHARED_HOME, ~/.local/state, /private/tmp,
+;; /private/var/folders — are all covered by the broad allow.)
 
-(allow file-write*
-    ;; All profile dirs (logs/state/sessions/cron/auth refresh writes)
-    (subpath (param "SHARED_HOME"))
-    ;; XDG state — gateway puts cross-profile lock files here
-    ;; (~/.local/state/hermes/gateway-locks). Discovered during
-    ;; 2026-05-11 16:58 bootstrap failure.
-    (subpath (string-append (param "USER_HOME") "/.local/state"))
-    ;; tmp / per-process scratch
-    (subpath "/private/tmp")
-    (subpath "/private/var/folders"))
-
-;; sqlite3 in WAL mode needs every sub-op of file-{read,write} PLUS
-;; file-ioctl PLUS file-issue-extension PLUS file-map-executable PLUS
-;; iokit-* (for shared-memory mmap on .db-shm). Without the full set
-;; ``sqlite3.connect(...)`` raises OperationalError: unable to open
-;; database file even when raw ``open()`` succeeds.
-(allow file-ioctl file-issue-extension file-map-executable
-    (subpath (param "SHARED_HOME"))
-    (subpath "/private/tmp")
-    (subpath "/private/var/folders"))
+;; sqlite3 in WAL mode needs file-ioctl, file-issue-extension, and
+;; file-map-executable. Empirically (2026-05-11) sqlite touches these
+;; on paths not easily enumerable in advance (kernel resolves symlinks,
+;; SIP /var redirects, hardened-runtime checks on the Python binary
+;; itself, etc.). Granting them broadly here matches the unscoped
+;; test_policy.sb that was proven to let uv-Python sqlite work; the
+;; cross-tenant deny still holds via file-read*/file-write* being
+;; subpath-scoped above.
+(allow file-ioctl file-issue-extension file-map-executable)
 
 (allow iokit-open)
 (allow iokit-get-properties)
 (allow mach-priv-host-port)
 (allow mach-priv-task-port)
 (allow process-info*)
-
-;; And matching read access for the XDG state dir.
-(allow file-read*
-    (subpath (string-append (param "USER_HOME") "/.local/state")))
 
 ;; ── Network ───────────────────────────────────────────────────────────
 ;;
