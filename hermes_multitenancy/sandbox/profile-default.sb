@@ -17,6 +17,12 @@
 ;;;                     specific dotfiles below, NOT the whole home.
 ;;;   HERMES_VENV     — Python venv root (where the interpreter +
 ;;;                     site-packages live).
+;;;   HERMES_AGENT_INSTALL — venv.parent. Editable installs leave the
+;;;                     hermes-agent source (run_agent.py, gateway/,
+;;;                     tools/) one directory up from venv/, and
+;;;                     ``import run_agent`` resolves there; allow
+;;;                     reads on this dir or the subprocess cannot
+;;;                     import the AIAgent class.
 ;;;   HERMES_AGENT_REPO — hermes-agent main repo (gateway/, tools/,
 ;;;                     hermes_cli/ source).
 ;;;   HERMES_MT_REPO  — hermes-multitenancy plugin source.
@@ -44,7 +50,13 @@
     (subpath "/usr/local/bin")
     (subpath "/opt/homebrew")
     ;; kep-cli + hades-cli + tirith live under ~/.hermes/bin/
-    (subpath (string-append (param "SHARED_HOME") "/bin")))
+    (subpath (string-append (param "SHARED_HOME") "/bin"))
+    ;; uv-managed Python interpreters. venv/bin/python is typically a
+    ;; symlink to ~/.local/share/uv/python/cpython-X.Y.../python, and
+    ;; sandbox-exec checks the *resolved* binary path before allowing
+    ;; exec. Without this rule sandboxed spawn fails with
+    ;; "Operation not permitted" on execvp() (gateway 13:59-14:12 logs).
+    (subpath (string-append (param "USER_HOME") "/.local/share/uv")))
 
 (allow signal (target self))
 (allow mach-lookup)
@@ -65,11 +77,19 @@
     (literal "/dev/random")
     (literal "/dev/tty")
     (literal "/dev/dtracehelper")
-    ;; Python venv + source code reads
+    ;; Python venv + source code reads.
+    ;; HERMES_AGENT_INSTALL is venv.parent; an editable install
+    ;; (``pip install -e .``) makes ``import run_agent`` resolve to
+    ;; ``<install>/run_agent.py``, not into venv/site-packages.
     (subpath (param "HERMES_VENV"))
+    (subpath (param "HERMES_AGENT_INSTALL"))
     (subpath (param "HERMES_AGENT_REPO"))
     (subpath (param "HERMES_MT_REPO"))
-    (subpath "/opt/homebrew"))
+    (subpath "/opt/homebrew")
+    ;; uv-managed Python install (venv/bin/python is a symlink into here).
+    ;; Must allow read AND exec — see the process-exec* block above for
+    ;; the exec rule and the rationale.
+    (subpath (string-append (param "USER_HOME") "/.local/share/uv")))
 
 ;; ── Host home: ONLY the specific dotdirs host CLI tools need ──────────
 ;;
@@ -114,18 +134,51 @@
     (literal (string-append (param "SHARED_HOME") "/multitenancy.db-shm"))
     (literal (string-append (param "SHARED_HOME") "/config.yaml"))
     (literal (string-append (param "SHARED_HOME") "/active_profile"))
-    (literal (string-append (param "SHARED_HOME") "/.env")))
+    (literal (string-append (param "SHARED_HOME") "/.env"))
+    ;; Per-profile auth.json is *often* a symlink into the shared root
+    ;; (e.g. ~/.hermes/profiles/<p>/auth.json -> ~/.hermes/auth.json), and
+    ;; sandbox-exec resolves the symlink before checking the allow list.
+    ;; Allow the shared target explicitly. The .lock sibling is the
+    ;; advisory lockfile used by hermes_cli auth helpers.
+    (literal (string-append (param "SHARED_HOME") "/auth.json"))
+    (literal (string-append (param "SHARED_HOME") "/auth.lock")))
 
 ;; Read shared feishu_uat (legacy fallback during migration; once OAuth
 ;; callback is fixed cross-repo this can become deny).
 (allow file-read*
     (subpath (string-append (param "SHARED_HOME") "/feishu_uat")))
 
-;; Hard deny: other profiles' homes. This is the headline guarantee of
-;; ARM B — no matter what filesystem trick a skill plays, it cannot
-;; read another tenant's .env / auth.json / sessions DB.
-(deny file-read* file-write*
-    (subpath (string-append (param "SHARED_HOME") "/profiles")))
+;; Audio cache directory for tts_tool — read AND write because hermes
+;; populates it at runtime. Verified necessary during sandbox e2e
+;; probe: ``Could not import tool module tools.tts_tool: [Errno 1]
+;; Operation not permitted: '/Users/kite/.hermes/audio_cache'``.
+(allow file-read* file-write*
+    (subpath (string-append (param "SHARED_HOME") "/audio_cache")))
+
+;; Top-level stat/readdir on SHARED_HOME. hermes_cli init scans the
+;; root to load the "permanent allowlist" + discover plugins; without
+;; metadata access it logs a confusing "Failed to load permanent
+;; allowlist" warning. file-read-metadata grants stat/readdir but not
+;; read-data — actual file contents stay denied unless an explicit
+;; literal/subpath above grants file-read*.
+(allow file-read-metadata
+    (subpath (param "SHARED_HOME")))
+
+;; NOTE: other profiles' homes (~/.hermes/profiles/<other>) are denied
+;; automatically by the (deny default) at the top of this file — there's
+;; no explicit allow for them.
+;;
+;; A previous iteration of this policy added an explicit
+;;
+;;   (deny file-read* file-write*
+;;       (subpath (string-append (param "SHARED_HOME") "/profiles")))
+;;
+;; right here, intending to make the cross-tenant denial extra-loud.
+;; That was wrong: sandbox-exec is last-match-wins (verified empirically
+;; at 14:34 — the explicit deny overrode the earlier allow for
+;; PROFILE_HOME itself, so the routed profile's auth.json became
+;; unreadable too). Default-deny + a single positive allow for
+;; PROFILE_HOME is the correct shape.
 
 ;; …but re-allow the one profile we're routed to, narrower wins.
 (allow file-read* file-write*
