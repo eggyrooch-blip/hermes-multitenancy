@@ -139,8 +139,8 @@ TOKEN_FILE = get_token_path("myskill", extension="json")
 
 ## 6. Feishu UAT bindings
 
-The org-sync pass (`hermes-multitenancy sync feishu-org`) does two
-things on every run:
+The org-sync pass (`python -m hermes_multitenancy.sync.cli pull-feishu`) does
+two things on every run:
 
 1. Reconciles the routing table from Feishu Contact v3 (existing
    behavior).
@@ -154,7 +154,12 @@ The AIAgent subprocess won't see that token until the next sync pass.
 For low-latency rebind, trigger sync manually:
 
 ```bash
-python -m hermes_multitenancy.sync.cli feishu-org --dept-id <YOUR_DEPT> --soft-delete-missing=false
+# Sync one department (subtree). Default --soft-delete-missing is off when
+# --dept is set, so this won't deactivate routes outside the queried subtree.
+python -m hermes_multitenancy.sync.cli pull-feishu --dept <OPEN_DEPARTMENT_ID>
+
+# Or full-org sync (will soft-delete routes for users that disappeared).
+python -m hermes_multitenancy.sync.cli pull-feishu
 ```
 
 (The `soft-delete-missing=false` flag prevents the partial-scope sync
