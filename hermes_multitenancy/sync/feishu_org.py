@@ -25,6 +25,14 @@ ORG_SYNC_BEGIN = "<!-- BEGIN HERMES MULTITENANCY ORG SYNC -->"
 ORG_SYNC_END = "<!-- END HERMES MULTITENANCY ORG SYNC -->"
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# Subdirectories created inside every profile home. Order is not significant.
+#
+# The block under "isolation pivot" backs the per-profile env redirect set by
+# ``agent_real._build_subprocess_env``: when a skill subprocess sees HOME /
+# XDG_CACHE_HOME / TMPDIR pointing inside the profile, these are the
+# directories it lands in. Creating them at provision time (mode 0700, applied
+# below in ``_sync_one_profile``) means new profiles start out hardened — no
+# race where the child subprocess creates them world-readable on first spawn.
 _PROFILE_DIRS = [
     "memories",
     "sessions",
@@ -34,7 +42,13 @@ _PROFILE_DIRS = [
     "plans",
     "workspace",
     "cron",
-    "home",
+    # isolation pivot — see agent_real._build_subprocess_env
+    "home",    # HOME redirect
+    "cache",   # XDG_CACHE_HOME
+    "config",  # XDG_CONFIG_HOME
+    "state",   # XDG_STATE_HOME
+    "data",    # XDG_DATA_HOME
+    "tmp",     # TMPDIR
 ]
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
@@ -407,6 +421,23 @@ def save_snapshot(snapshot: OrgSnapshot, path: Path, *, dept_id: Optional[str] =
     return target
 
 
+def _tighten_dir_mode(path: Path, mode: int) -> None:
+    """Apply ``chmod mode`` to ``path``, swallowing OS errors.
+
+    Best-effort: on filesystems that do not honor POSIX modes (network mounts,
+    bind-mounted volumes in some Linux containers) the chmod is a no-op and we
+    do not want sync to fail because of it. We log at debug level so the
+    failure is still discoverable when investigating mode drift.
+    """
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        # No logger module imported at sync layer — use a quiet print only
+        # under HERMES_MULTITENANCY_VERBOSE_PROVISION=1 to aid postmortems.
+        if os.getenv("HERMES_MULTITENANCY_VERBOSE_PROVISION") == "1":
+            print(f"[multitenancy:sync] chmod {oct(mode)} failed on {path}")
+
+
 def _sync_one_profile(
     employee: Employee,
     profile_home: Path,
@@ -430,8 +461,14 @@ def _sync_one_profile(
         return "updated" if soul_changed or config_missing else "kept"
 
     profile_home.mkdir(parents=True, exist_ok=True)
+    # Tighten profile_home to 0700 so other system users cannot enumerate the
+    # tenant tree. We always re-apply (chmod is idempotent) so an externally
+    # loosened directory gets corrected on the next sync pass.
+    _tighten_dir_mode(profile_home, 0o700)
     for subdir in _PROFILE_DIRS:
-        (profile_home / subdir).mkdir(parents=True, exist_ok=True)
+        sub = profile_home / subdir
+        sub.mkdir(parents=True, exist_ok=True)
+        _tighten_dir_mode(sub, 0o700)
 
     config_changed = _ensure_profile_config(profile_home, shared_home=shared_home)
     soul_path = profile_home / "SOUL.md"
