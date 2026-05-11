@@ -1946,11 +1946,15 @@ async def _update_feishu_stream_tool_event(
 # (run.py:9502 _PROGRESS_EDIT_INTERVAL); we mirror that as the floor for the
 # content phase. CardKit reasoning can update more often because it streams
 # into a stable card element; legacy edit_message keeps the wider heartbeat.
-_STREAM_CONTENT_MIN_CHARS = 60
-_STREAM_CONTENT_MIN_SECONDS = 1.0
+# Streaming card flush throttle (tuned 2026-05-12 for remote-RTT UX).
+# CardKit only exposes cardElement.content as the streaming endpoint, and
+# every call fully replaces the rendered markdown — high-frequency flushes
+# cause visible flicker when the gateway sits an RTT away from open.feishu.cn.
+_STREAM_CONTENT_MIN_CHARS = 120
+_STREAM_CONTENT_MIN_SECONDS = 2.0
 _STREAM_THINKING_MIN_SECONDS = 2.0
-_STREAM_CARD_REASONING_MIN_CHARS = 40
-_STREAM_CARD_REASONING_MIN_SECONDS = 0.8
+_STREAM_CARD_REASONING_MIN_CHARS = 100
+_STREAM_CARD_REASONING_MIN_SECONDS = 2.0
 _STREAM_CARD_PRIME_STATUS = "Hermes 正在准备响应..."
 _STREAM_CARD_IDLE_HEARTBEAT_SECONDS = 2.5
 _STREAM_ABORT_FALLBACK = "Aborted."
