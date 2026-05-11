@@ -410,10 +410,35 @@ def _resolve_shared_hermes_home(profile_home: Path) -> Path:
 
 
 def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> Path:
-    """Point Feishu UAT lookups at the shared Hermes root, not the profile dir."""
+    """Bind Feishu UAT lookups to the profile's own ``feishu_uat/`` subdir.
+
+    Previously pointed at ``<shared>/feishu_uat/`` (one directory shared by
+    every profile). That layout meant every profile's subprocess could
+    enumerate every tenant's UAT JSON via ``os.listdir(FEISHU_UAT_DIR)``;
+    the per-open_id filename was the only thing keeping reads separate.
+
+    With this change, ``FEISHU_UAT_DIR`` is rebound to ``<profile>/feishu_uat/``
+    so a subprocess sees only the JSON files that belong to its tenant.
+    Combined with the 0700 profile_home (commit "Harden profile directory
+    tree at provision time") and the env whitelist (commit "Isolate AIAgent
+    subprocess env"), cross-tenant UAT enumeration becomes a filesystem-level
+    deny under档 A.
+
+    Caveat: the gateway-process OAuth callback handler lives in the upstream
+    hermes-agent repo and still writes new bindings to ``<shared>/feishu_uat/``.
+    The org-sync pass copies those forward into the right profile via
+    :func:`hermes_multitenancy.sync.feishu_org._migrate_feishu_uat_for_employee`.
+    New bindings captured between sync passes are invisible to the AIAgent
+    subprocess until the next sync — TODO: route OAuth callbacks through the
+    multitenancy router so writes land profile-scoped from the start.
+
+    Returns the shared_home (still used for cron jobs and snapshot cache).
+    """
     shared_home = _resolve_shared_hermes_home(profile_home)
-    feishu_oapi_module.FEISHU_UAT_PATH = shared_home / "feishu_uat.json"
-    feishu_oapi_module.FEISHU_UAT_DIR = shared_home / "feishu_uat"
+    profile_uat_dir = profile_home / "feishu_uat"
+    profile_uat_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    feishu_oapi_module.FEISHU_UAT_PATH = profile_home / "feishu_uat.json"
+    feishu_oapi_module.FEISHU_UAT_DIR = profile_uat_dir
     return shared_home
 
 
