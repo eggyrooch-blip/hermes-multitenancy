@@ -138,7 +138,7 @@ else
     echo
     echo "Remediation:"
     echo "  * Mode drift (not 0700/0600): re-run org sync —"
-    echo "      python -m hermes_multitenancy.sync.cli feishu-org"
+    echo "      python -m hermes_multitenancy.sync.cli pull-feishu"
     echo "    which re-applies chmod via _tighten_dir_mode on every pass."
     echo "  * Missing isolation pivot directories: same fix — sync rebuilds the layout."
     echo "  * Multiple ou_*.json under feishu_uat/: investigate routing-table"
