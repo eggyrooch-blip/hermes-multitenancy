@@ -1037,7 +1037,7 @@ async def _run_aiagent_subprocess(
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    _sender_oid = getattr(event, "sender_open_id", "") or ""
+    _sender_oid = _resolve_sender_open_id(event)
     _extra_env = {"HERMES_FEISHU_USER_OPEN_ID": _sender_oid} if _sender_oid else None
     env = _build_subprocess_env(profile_home, approval_dir=approval_dir, extra=_extra_env)
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
@@ -1338,7 +1338,7 @@ async def _stream_aiagent_subprocess(
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    _sender_oid = getattr(event, "sender_open_id", "") or ""
+    _sender_oid = _resolve_sender_open_id(event)
     _extra_env = {"HERMES_FEISHU_USER_OPEN_ID": _sender_oid} if _sender_oid else None
     env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True, extra=_extra_env)
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
