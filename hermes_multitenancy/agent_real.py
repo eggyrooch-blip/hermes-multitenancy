@@ -784,6 +784,25 @@ def _build_subprocess_env(
 
     if extra:
         env.update(extra)
+
+    # Feishu per-user UAT identity: forward sender open_id so that AIAgent
+    # tool-worker threads (which lose ContextVar across ThreadPoolExecutor
+    # workers per run_agent.py:1104 / 8479) can recover identity via
+    # os.environ. The contextvar is set by sender_open_id_scope in the
+    # feishu adapter; asyncio.create_task copies context so it is still
+    # alive here even when called from a batched / deferred flush task.
+    # Note: MessageEvent dataclass (gateway/platforms/base.py:785) has no
+    # sender_open_id field, so a caller-driven getattr would always return
+    # empty. ContextVar is the reliable source.
+    # Must come AFTER extra so an explicit caller-supplied value wins.
+    if "HERMES_FEISHU_USER_OPEN_ID" not in env:
+        try:
+            from tools import feishu_oapi_client as _foc
+            _sender = _foc.current_sender_open_id.get()
+            if _sender:
+                env["HERMES_FEISHU_USER_OPEN_ID"] = str(_sender)
+        except Exception:
+            pass
     return env
 
 
