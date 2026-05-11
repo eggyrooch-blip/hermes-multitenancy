@@ -1261,8 +1261,20 @@ def _resolve_route(sender: str, *, alt_id: Optional[str] = None) -> tuple[str, O
                 continue
             if row is not None:
                 return (row.profile_name, _profile_name_to_home(row.profile_name))
+        # alt_id is the dedicated union_id channel — when sync chose to store a
+        # tenant user_id placeholder in the open_id column, the real on_* still
+        # lives in the union_id column. Query it directly so router doesn't end
+        # up provisioning a duplicate route for the same physical user.
+        if alt_id and isinstance(alt_id, str) and alt_id.startswith("on_"):
+            try:
+                row = table.lookup_by_union_id(alt_id)
+            except Exception as exc:
+                logger.debug("multitenancy: routing union_id lookup failed (%s)", exc)
+            else:
+                if row is not None:
+                    return (row.profile_name, _profile_name_to_home(row.profile_name))
 
-    # Fallback: in-memory spike routing dict
+    # Spike routing dict (Phase 1 compat / unit tests)
     for candidate in candidates:
         spike_home = _spike_resolve(candidate)
         if spike_home is not None:

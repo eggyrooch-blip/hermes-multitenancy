@@ -88,6 +88,36 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    def lookup_by_union_id(self, union_id: str) -> Optional[RoutingRow]:
+        """Return the active row whose union_id column matches.
+
+        The schema has a dedicated union_id column populated by feishu-sync
+        precisely to enable this lookup path; without it _resolve_route would
+        only see the open_id column even when sync stored a stable union_id.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing WHERE union_id = ? AND active = 1 LIMIT 1",
+            (union_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    def lookup_by_user_id(self, user_id: str) -> Optional[RoutingRow]:
+        """Return the active row by tenant user_id (PRIMARY KEY).
+
+        Closes the third lookup channel: open_id / union_id / user_id. Used
+        when sync upstream (e.g. Feishu Contact v3) hands router a stable
+        user_id but neither open_id nor union_id, or when callers prefer the
+        canonical PK. Compared to a generic SELECT-by-PK, this filter on
+        active=1 keeps soft-deleted historical rows out of the lookup result.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing WHERE user_id = ? AND active = 1 LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
     def touch_active(self, open_id: str) -> None:
         """Update last_active_at — router-only, does NOT bump version."""
         self._conn.execute(
