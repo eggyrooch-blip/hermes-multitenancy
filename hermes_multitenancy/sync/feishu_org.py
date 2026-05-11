@@ -49,6 +49,8 @@ _PROFILE_DIRS = [
     "state",   # XDG_STATE_HOME
     "data",    # XDG_DATA_HOME
     "tmp",     # TMPDIR
+    # Profile-scoped secret storage for skills — see hermes_multitenancy.skill_storage
+    "tokens",
 ]
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
