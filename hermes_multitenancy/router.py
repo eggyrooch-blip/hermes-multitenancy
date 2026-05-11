@@ -334,6 +334,61 @@ async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
 # -- Hook entry point --------------------------------------------------------
 
 
+def _register_session_guard_for_dispatch(event: Any, gateway: Any, task: Any) -> None:
+    """Mark this dispatch's session as active so flush-batch re-dispatch is no-op.
+
+    Feishu adapter coalesces multiple WS text chunks into a single message via
+    _pending_text_batches, then flushes ~0.6s later by calling handle_message
+    again through _handle_message_with_guards. Without this guard, the flush
+    sees no active session in base.handle_message and spawns a second
+    handle_async task (creating a duplicate streaming card).
+    """
+    try:
+        from gateway.session import build_session_key  # type: ignore
+    except Exception:
+        return
+    try:
+        adapter = None
+        adapters = getattr(gateway, "adapters", None)
+        if isinstance(adapters, dict):
+            adapter = adapters.get("feishu")
+        if adapter is None:
+            adapter = getattr(gateway, "feishu_adapter", None)
+        if adapter is None:
+            return
+        active = getattr(adapter, "_active_sessions", None)
+        if active is None:
+            return
+        source = getattr(event, "source", None)
+        if source is None:
+            return
+        config = getattr(adapter, "config", None)
+        extra = getattr(config, "extra", {}) if config is not None else {}
+        if not isinstance(extra, dict):
+            extra = {}
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=bool(extra.get("group_sessions_per_user", True)),
+            thread_sessions_per_user=bool(extra.get("thread_sessions_per_user", False)),
+        )
+        if not session_key or session_key in active:
+            return
+        import asyncio as _asyncio
+        guard = _asyncio.Event()
+        active[session_key] = guard
+
+        def _cleanup(_t: Any) -> None:
+            try:
+                if active.get(session_key) is guard:
+                    active.pop(session_key, None)
+            except Exception:
+                pass
+
+        task.add_done_callback(_cleanup)
+    except Exception as exc:
+        logger.debug("multitenancy: session guard registration failed: %s", exc)
+
+
 def on_pre_gateway_dispatch(*, event: Any, gateway: Any, session_store: Any = None, **_kwargs) -> dict:
     """Sync hook callback (registered to ``pre_gateway_dispatch``).
 
@@ -346,6 +401,13 @@ def on_pre_gateway_dispatch(*, event: Any, gateway: Any, session_store: Any = No
         loop = asyncio.get_running_loop()
         task = loop.create_task(handle_async(event=event, gateway=gateway))
         task.add_done_callback(_log_task_failure)
+        # Prevent Feishu's text-batch flush (feishu.py:_flush_text_batch_now,
+        # ~0.6s after WS dispatch) from re-routing this message through
+        # base.handle_message → pre_gateway_dispatch a SECOND time, which
+        # would spawn a duplicate handle_async task and create a second
+        # streaming card. Register a synthetic guard in the adapter's
+        # _active_sessions so handle_message sees the session as busy.
+        _register_session_guard_for_dispatch(event, gateway, task)
     except RuntimeError:
         # Test-only fallback: hook called from sync context (no running loop).
         if os.environ.get("PYTEST_CURRENT_TEST"):
