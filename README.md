@@ -81,7 +81,7 @@ If you are an agent taking over this repo, this is the main contract:
 1. **Entry point, no Hermes core patches.** `hermes_multitenancy.register(ctx)` registers a `pre_gateway_dispatch` hook. For Feishu messages the hook returns `{"action": "skip"}` and the plugin's `handle_async()` owns routing and replies.
 2. **Identity uses the canonical sender.** `_resolve_sender_for_routing()` prefers the real Feishu `open_id` (`ou_*`) from the Feishu contextvar, `event.sender_open_id`, `source.open_id/user_id`, and `raw/raw_event/event`. `user_id_alt` / `union_id` is only a legacy route lookup helper, not the new session key.
 3. **Routes live in SQLite.** `multitenancy_routing.open_id -> profile_name` decides which `~/.hermes/profiles/<profile>/` handles the turn. A real `ou_*` will not be absorbed by a stale `union_id`; legacy alt routes are used only when no real `ou_*` is available.
-4. **Normal messages run inside the routed profile.** The router builds a profile-scoped event, writes the resolved `sender_open_id` back to the event, then dispatches to the streaming AIAgent subprocess. The child process runs with that profile's `HERMES_HOME`; Feishu UAT tokens are still loaded from `~/.hermes/feishu_uat/<open_id>.json`.
+4. **Normal messages run inside the routed profile.** The router builds a profile-scoped event, writes the resolved `sender_open_id` back to the event, then dispatches to the streaming AIAgent subprocess. The child runs with that profile's `HERMES_HOME`; `agent_real._build_subprocess_env` strips the parent gateway's environment down to an explicit allowlist and pivots `HOME`/`XDG_*`/`TMPDIR` into `<profile>/{home,cache,config,state,data,tmp}` so skill caches stay tenant-scoped. Feishu UAT tokens are loaded from `<profile>/feishu_uat/<open_id>.json` (rebound at runtime by `_configure_feishu_uat_home`); the org-sync pass migrates the legacy shared `<hermes_home>/feishu_uat/<ou_*>.json` forward. See `docs/profile-isolation.md`.
 5. **Cron/reminder jobs use the shared gateway scheduler store.** Inside the AIAgent subprocess, `agent_real._configure_cron_home()` temporarily binds `cron.jobs` and `tools.cronjob_tools` to the shared Hermes home (`~/.hermes/cron/jobs.json`), not `~/.hermes/profiles/<profile>/cron/jobs.json`. This matters because the single gateway cron ticker only watches the shared store; otherwise "remind me in 3 minutes" jobs can stay forever `scheduled`.
 6. **Dangerous-command approvals cross the subprocess boundary.** The profile AIAgent registers `tools.approval` with a router-compatible gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`). The child also sets child-local `HERMES_SESSION_KEY` / `HERMES_GATEWAY_SESSION` / `HERMES_EXEC_ASK`, because terminal/process guards may run in worker threads that do not inherit contextvars. The child emits `approval_required` / `approval_resolved`; the parent `_stream_aiagent_subprocess()` must forward those events to the router; the router prompts Feishu; `/approve` / `/deny` writes a decision file that releases the child and resumes Hermes' native approval flow. The matching Hermes core terminal guard must run before sandbox/environment creation, otherwise the approval prompt can be blocked by environment startup.
 7. **CardKit heartbeat lives in the parent router.** The router primes the card and sends idle heartbeat status updates before the child emits tokens; the heartbeat stops once reasoning/tool/content events arrive.
@@ -91,7 +91,7 @@ If you are an agent taking over this repo, this is the main contract:
 11. **Local exec is off by default.** `quick_commands` alias remains available; `type: exec` is denied unless `multitenancy.allow_quick_exec: true` or `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` is set. Allowed exec inherits the routed profile's `HERMES_HOME`. Keep it off in production until profile sandboxing is enforced.
 12. **Attachments and file replies stay in profile scope.** Inbound attachments still delegate to Hermes' native `_prepare_inbound_message_text`; outbound `MEDIA:<path>` replies are filtered so only paths resolving inside the routed `profile_home` are delivered.
 13. **Background terminal notify is not claimed as supported.** A child-local `process_registry` is invisible to the parent gateway watcher. Each child calls `agent.close()` on exit to clean such resources instead of leaving unmanaged background processes. True `terminal(background=true, notify_on_complete=true)` support should move process ownership into the parent process.
-14. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0`, keep `multitenancy.allow_quick_exec=false`, and add OS-level profile sandboxing. The sandbox handles process/filesystem/network containment; this plugin handles application-layer route/session/slash/media boundaries.
+14. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0` and keep `multitenancy.allow_quick_exec=false`. Application-layer isolation (route/session/slash/media boundaries) is handled by this plugin. Profile execution-environment sandboxing档 A — parent-env allowlist, HOME/XDG/TMPDIR pivot, `chmod 0700` on the profile tree, per-profile `feishu_uat/` and `tokens/` directories — is enabled by default; verify a deployed profile with `scripts/verify-isolation.sh`. Kernel-level containment via `sandbox-exec` (档 B) is on the roadmap; until it lands, treat档 A as defense-in-depth rather than an authorisation boundary. Full details: `docs/profile-isolation.md`.
 
 ---
 
@@ -110,7 +110,7 @@ You do **not** need one Feishu app per user. Reuse one Feishu app/bot for all te
 
 1. Put the shared Feishu app credentials only in the gateway/default Hermes config or environment.
 2. Route by the real Feishu sender `open_id` (`ou_*`). The router can fall back to `union_id` (`on_*`) for migration/legacy rows, but new users should be keyed by `ou_*`.
-3. Keep per-user Feishu UAT tokens under `~/.hermes/feishu_uat/<open_id>.json`. Do not commit token files.
+3. Per-user Feishu UAT tokens are first captured by OAuth into `~/.hermes/feishu_uat/<open_id>.json` (gateway-side, shared), then migrated to `~/.hermes/profiles/<profile>/feishu_uat/<open_id>.json` by the org-sync pass — that per-profile copy is what the AIAgent subprocess actually reads. Do not commit token files. See `docs/profile-isolation.md` §6.
 4. Keep per-profile model/tool credentials under `~/.hermes/profiles/<profile>/`. The Feishu app is shared; profile persona, memory, tools and LLM credentials stay isolated.
 
 Discussion group: [Eggyrooch's Feishu group invite](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=419if828-a007-453f-ad1c-31edef49520f).
@@ -167,12 +167,14 @@ platforms:
       app_secret: "${FEISHU_APP_SECRET}"
 ```
 
-Then run your Hermes Feishu authorization/UAT flow for each real user. Token files should land under the shared home, for example:
+Then run your Hermes Feishu authorization/UAT flow for each real user. Token files initially land under the shared home (OAuth callback writes there):
 
 ```text
 ~/.hermes/feishu_uat/ou_xxx.json
 ~/.hermes/feishu_uat/ou_yyy.json
 ```
+
+The next org-sync pass copies each user's token forward into their profile (`~/.hermes/profiles/<profile>/feishu_uat/<open_id>.json`), which is the path the AIAgent subprocess actually reads from after档 A profile isolation. See `docs/profile-isolation.md` §6.
 
 ### 4. Sync Feishu org into profiles + routes
 
@@ -315,7 +317,7 @@ We keep **zero patches to hermes-agent**: no edits to `feishu.py`, `gateway/run.
 | `gateway.stream_consumer.GatewayStreamConsumer` | ⚠️ Hermes integration surface — reused for Feishu CardKit streaming when present, with text-edit fallback. |
 | `gateway._deliver_media_from_response(response, event, adapter)` | ⚠️ private — reused so `MEDIA:<path>` file replies follow the native Feishu path after filtering paths to the routed profile home. No-op if unavailable. |
 | `run_agent.AIAgent` | ⚠️ core runtime class — isolated in `aiagent_subprocess.py` so failures fall back to the legacy OpenAI-compatible path. |
-| `tools.feishu_oapi_client.sender_open_id_scope` | ⚠️ Feishu UAT bridge — scopes token lookup to `~/.hermes/feishu_uat/<open_id>.json`. |
+| `tools.feishu_oapi_client.sender_open_id_scope` | ⚠️ Feishu UAT bridge — scopes token lookup to `<FEISHU_UAT_DIR>/<open_id>.json`. `agent_real._configure_feishu_uat_home` rebinds `FEISHU_UAT_DIR` to `<profile>/feishu_uat/` per subprocess so a tenant only sees its own UAT (档 A isolation). |
 | `tools.vision_tools.vision_analyze_tool` (local fallback) | ✅ tool module, used only when the gateway helper is missing |
 
 **Pin your `hermes-agent` version** (`hermes-agent==X.Y.Z`) and run `pytest tests/test_router_integration.py tests/test_vision.py` after each upgrade — the integration + pipeline tests will fail loudly on any contract drift.
