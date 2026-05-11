@@ -416,6 +416,117 @@ def test_sync_profiles_chmods_profile_tree_to_0700(tmp_path):
         assert mode == 0o700, f"{sub}/ is {oct(mode)}, expected 0o700"
 
 
+# ---------------------------------------------------------------------------
+# 档 A — feishu_uat per-profile拆分 + migration
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_feishu_uat_copies_from_shared_to_profile(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import _migrate_feishu_uat_for_employee
+    import stat as stat_mod
+
+    shared = tmp_path / "shared"
+    profile = tmp_path / "profile"
+    (shared / "feishu_uat").mkdir(parents=True)
+    src = shared / "feishu_uat" / "ou_alice.json"
+    src.write_text('{"access_token": "alice-token"}', encoding="utf-8")
+
+    copied = _migrate_feishu_uat_for_employee(profile, shared, "ou_alice")
+
+    assert copied is True
+    dst = profile / "feishu_uat" / "ou_alice.json"
+    assert dst.read_text(encoding="utf-8") == '{"access_token": "alice-token"}'
+    # File chmod 0600, parent dir 0700.
+    assert stat_mod.S_IMODE(dst.stat().st_mode) == 0o600
+    assert stat_mod.S_IMODE(dst.parent.stat().st_mode) == 0o700
+
+
+def test_migrate_feishu_uat_is_idempotent(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import _migrate_feishu_uat_for_employee
+
+    shared = tmp_path / "shared"
+    profile = tmp_path / "profile"
+    (shared / "feishu_uat").mkdir(parents=True)
+    (shared / "feishu_uat" / "ou_bob.json").write_text("token-v1", encoding="utf-8")
+
+    assert _migrate_feishu_uat_for_employee(profile, shared, "ou_bob") is True
+    # Second call: dst exists and has same/newer mtime — no copy.
+    assert _migrate_feishu_uat_for_employee(profile, shared, "ou_bob") is False
+
+
+def test_migrate_feishu_uat_refreshes_on_newer_source(tmp_path):
+    import os as _os
+    from hermes_multitenancy.sync.feishu_org import _migrate_feishu_uat_for_employee
+
+    shared = tmp_path / "shared"
+    profile = tmp_path / "profile"
+    (shared / "feishu_uat").mkdir(parents=True)
+    src = shared / "feishu_uat" / "ou_carol.json"
+    src.write_text("v1", encoding="utf-8")
+    _migrate_feishu_uat_for_employee(profile, shared, "ou_carol")
+
+    # OAuth callback "refreshes" the shared token; bump mtime forward.
+    src.write_text("v2", encoding="utf-8")
+    future = src.stat().st_mtime + 10
+    _os.utime(src, (future, future))
+
+    assert _migrate_feishu_uat_for_employee(profile, shared, "ou_carol") is True
+    assert (profile / "feishu_uat" / "ou_carol.json").read_text() == "v2"
+
+
+def test_migrate_feishu_uat_rejects_non_ou_open_id(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import _migrate_feishu_uat_for_employee
+
+    shared = tmp_path / "shared"
+    profile = tmp_path / "profile"
+    # Even if the file exists, a non-ou_ id is refused.
+    (shared / "feishu_uat").mkdir(parents=True)
+    (shared / "feishu_uat" / "on_alice.json").write_text("union-id-token", encoding="utf-8")
+
+    assert _migrate_feishu_uat_for_employee(profile, shared, "on_alice") is False
+    assert _migrate_feishu_uat_for_employee(profile, shared, "") is False
+
+
+def test_migrate_feishu_uat_silent_when_source_missing(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import _migrate_feishu_uat_for_employee
+
+    shared = tmp_path / "shared"
+    profile = tmp_path / "profile"
+    assert _migrate_feishu_uat_for_employee(profile, shared, "ou_never_bound") is False
+    # Should not create empty destinations either.
+    assert not (profile / "feishu_uat" / "ou_never_bound.json").exists()
+
+
+def test_sync_profiles_pulls_feishu_uat_into_profile(tmp_path):
+    """End-to-end: sync_profiles invokes the migration for each employee's open_id."""
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: zai/glm-5.1\n",
+        encoding="utf-8",
+    )
+    # Drop a "previously OAuth'd" UAT token under the legacy shared path.
+    (shared_home / "feishu_uat").mkdir()
+    (shared_home / "feishu_uat" / "ou_alice.json").write_text("alice-token", encoding="utf-8")
+    (shared_home / "feishu_uat" / "ou_unrelated.json").write_text("not-mine", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    alice_uat = profiles_root / "alice" / "feishu_uat" / "ou_alice.json"
+    assert alice_uat.is_file()
+    assert alice_uat.read_text() == "alice-token"
+    # Strangers' tokens did NOT leak into alice's profile.
+    stranger = profiles_root / "alice" / "feishu_uat" / "ou_unrelated.json"
+    assert not stranger.exists()
+
+
 def test_sync_profiles_reapplies_chmod_on_drift(tmp_path):
     """If someone loosens a dir to 0755 externally, next sync re-tightens it."""
     import stat as stat_mod

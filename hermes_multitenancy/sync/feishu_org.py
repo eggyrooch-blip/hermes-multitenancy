@@ -51,6 +51,10 @@ _PROFILE_DIRS = [
     "tmp",     # TMPDIR
     # Profile-scoped secret storage for skills — see hermes_multitenancy.skill_storage
     "tokens",
+    # Profile-scoped Feishu UAT (user_access_token) per-open_id JSON files.
+    # Rebound at runtime by agent_real._configure_feishu_uat_home so each
+    # profile sees only the tokens that belong to its tenant.
+    "feishu_uat",
 ]
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
@@ -423,6 +427,44 @@ def save_snapshot(snapshot: OrgSnapshot, path: Path, *, dept_id: Optional[str] =
     return target
 
 
+def _migrate_feishu_uat_for_employee(
+    profile_home: Path,
+    shared_home: Path,
+    open_id: str,
+) -> bool:
+    """Copy ``<shared>/feishu_uat/<open_id>.json`` into ``<profile>/feishu_uat/``.
+
+    Bridges the read-side change (``agent_real._configure_feishu_uat_home``
+    now points at the per-profile dir) against the still-shared write-side
+    OAuth callback. Idempotent — only copies when the profile-local file is
+    missing or older than the shared source.
+
+    Returns ``True`` if a copy happened, ``False`` otherwise (no source,
+    invalid open_id, or destination already current).
+    """
+    if not open_id or not str(open_id).startswith("ou_"):
+        return False
+    src = shared_home / "feishu_uat" / f"{open_id}.json"
+    if not src.is_file():
+        return False
+    dst_dir = profile_home / "feishu_uat"
+    dst_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(dst_dir, 0o700)
+    except OSError:
+        pass
+    dst = dst_dir / f"{open_id}.json"
+    if dst.is_file() and dst.stat().st_mtime >= src.stat().st_mtime:
+        return False
+    import shutil
+    shutil.copy2(src, dst)
+    try:
+        os.chmod(dst, 0o600)
+    except OSError:
+        pass
+    return True
+
+
 def _tighten_dir_mode(path: Path, mode: int) -> None:
     """Apply ``chmod mode`` to ``path``, swallowing OS errors.
 
@@ -479,6 +521,13 @@ def _sync_one_profile(
 
     for name in ("auth.json", ".env"):
         _ensure_shared_profile_file(profile_home, shared_home, name)
+
+    # Best-effort migration of the user's Feishu UAT token from the legacy
+    # shared location into this profile's own feishu_uat/ dir. agent_real
+    # rebinds FEISHU_UAT_DIR per-profile at runtime, so without this copy a
+    # subprocess for a freshly-synced profile would not find the token even
+    # though OAuth had captured it under the shared path.
+    _migrate_feishu_uat_for_employee(profile_home, shared_home, employee.open_id)
 
     if not existed:
         return "created"

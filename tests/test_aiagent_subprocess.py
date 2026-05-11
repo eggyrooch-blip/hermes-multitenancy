@@ -379,21 +379,46 @@ def test_event_payload_carries_router_messages(tmp_path: Path):
     assert payload["messages"] == messages
 
 
-def test_configure_feishu_uat_home_uses_default_home_for_named_profile(tmp_path: Path):
+def test_configure_feishu_uat_home_binds_to_profile_local_dir(tmp_path: Path):
+    """档 A change: FEISHU_UAT_DIR points at <profile>/feishu_uat/, not shared."""
     from hermes_multitenancy import agent_real
 
     default_home = tmp_path / ".hermes"
     profile_home = default_home / "profiles" / "coder"
     fake_feishu_oapi = SimpleNamespace(
-        FEISHU_UAT_PATH=profile_home / "feishu_uat.json",
-        FEISHU_UAT_DIR=profile_home / "feishu_uat",
+        FEISHU_UAT_PATH=None,
+        FEISHU_UAT_DIR=None,
     )
 
     shared_home = agent_real._configure_feishu_uat_home(fake_feishu_oapi, profile_home)
 
+    # shared_home is still derived correctly (cron etc. still need it).
     assert shared_home == default_home
-    assert fake_feishu_oapi.FEISHU_UAT_PATH == default_home / "feishu_uat.json"
-    assert fake_feishu_oapi.FEISHU_UAT_DIR == default_home / "feishu_uat"
+    # But UAT lookups are now scoped to the profile.
+    assert fake_feishu_oapi.FEISHU_UAT_PATH == profile_home / "feishu_uat.json"
+    assert fake_feishu_oapi.FEISHU_UAT_DIR == profile_home / "feishu_uat"
+    # And the dir is created mode 0700.
+    import stat as stat_mod
+    mode = stat_mod.S_IMODE((profile_home / "feishu_uat").stat().st_mode)
+    assert mode == 0o700
+
+
+def test_configure_feishu_uat_home_does_not_leak_other_profiles_dir(tmp_path: Path):
+    """Pointing two profiles at the same fake_feishu_oapi must give them disjoint dirs."""
+    from hermes_multitenancy import agent_real
+
+    default_home = tmp_path / ".hermes"
+    alice = default_home / "profiles" / "alice"
+    bob = default_home / "profiles" / "bob"
+    fake = SimpleNamespace(FEISHU_UAT_PATH=None, FEISHU_UAT_DIR=None)
+
+    agent_real._configure_feishu_uat_home(fake, alice)
+    assert fake.FEISHU_UAT_DIR == alice / "feishu_uat"
+
+    agent_real._configure_feishu_uat_home(fake, bob)
+    assert fake.FEISHU_UAT_DIR == bob / "feishu_uat"
+    # The previous binding must not still be reachable through any property.
+    assert alice / "feishu_uat" != bob / "feishu_uat"
 
 
 def test_configure_cron_home_uses_shared_gateway_store(monkeypatch, tmp_path: Path):
