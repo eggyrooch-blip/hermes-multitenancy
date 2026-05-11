@@ -642,6 +642,97 @@ def _event_to_subprocess_payload(
     return payload
 
 
+# Whitelisted parent-process env keys carried into AIAgent subprocesses.
+#
+# Anything not listed here is dropped before spawning the child — this is the
+# core of profile isolation档 A. New HERMES_* plumbing variables MUST be added
+# explicitly so a future feature does not accidentally widen the surface.
+#
+# Secrets (API keys, tokens) are NEVER on this list. They live in
+# ``<profile_home>/.env`` or ``auth.json`` and are loaded inside the child by
+# ``_run_with_aiagent``'s own dotenv path.
+_SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    # POSIX basics
+    "PATH", "USER", "LOGNAME", "SHELL", "TERM",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    # Python runtime
+    "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONIOENCODING",
+    "PYTHONDONTWRITEBYTECODE",
+    # macOS Cocoa text-encoding marker (some Python builds require it)
+    "__CF_USER_TEXT_ENCODING",
+    # SSL trust stores — some skills call HTTPS endpoints and need CA bundles
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # Hermes plumbing the child reads directly. Add new keys here when wiring
+    # additional configuration through to the subprocess.
+    "HERMES_AIAGENT_SUBPROCESS_TIMEOUT",
+    "HERMES_MAX_ITERATIONS",
+    "HERMES_MULTITENANCY_APPROVAL_TIMEOUT",
+    "HERMES_MULTITENANCY_TOOLSETS_MODE",
+    "HERMES_APPROVAL_GATEWAY_TIMEOUT",
+})
+
+
+def _build_subprocess_env(
+    profile_home: Path,
+    *,
+    approval_dir: Path,
+    event_stream: bool = False,
+    extra: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Build a sanitized env for the AIAgent subprocess (档 A isolation).
+
+    Two guarantees enforced here:
+
+      1. **Env whitelist** — the parent gateway's full env is NOT inherited.
+         Only keys in :data:`_SUBPROCESS_ENV_ALLOWLIST` carry over. This stops
+         API keys / OAuth tokens / shell secrets exported into the gateway
+         process from leaking into a profile's tool execution.
+
+      2. **HOME / XDG / TMPDIR pivot** — anything that normally lands in
+         ``~/<...>`` or ``$TMPDIR`` is redirected into the profile's own
+         directory tree, so a skill that caches via ``Path.home()`` or
+         ``tempfile.gettempdir()`` writes to ``<profile>/cache/...`` instead
+         of the gateway user's shared cache.
+
+    The directories ``home/``, ``cache/``, ``config/``, ``state/``, ``data/``
+    and ``tmp/`` are created on first use (mode 0700).
+
+    Profile-local secrets are loaded inside the child by
+    :func:`_run_with_aiagent` from ``<profile_home>/.env`` and ``auth.json``;
+    they are intentionally NOT injected here so the child never sees a parent
+    env-derived key as an "ambient" credential.
+    """
+    parent = os.environ
+    env: dict[str, str] = {
+        key: parent[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in parent
+    }
+
+    profile_home = profile_home.expanduser()
+    pivot = {
+        "HOME":            profile_home / "home",
+        "XDG_CACHE_HOME":  profile_home / "cache",
+        "XDG_CONFIG_HOME": profile_home / "config",
+        "XDG_STATE_HOME":  profile_home / "state",
+        "XDG_DATA_HOME":   profile_home / "data",
+        "TMPDIR":          profile_home / "tmp",
+    }
+    for path in pivot.values():
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env.update({key: str(path) for key, path in pivot.items()})
+
+    env["HERMES_HOME"]                      = str(profile_home)
+    env["HERMES_SHARED_HOME"]               = str(_resolve_shared_hermes_home(profile_home))
+    env["HERMES_GATEWAY_SESSION"]           = "1"
+    env["HERMES_EXEC_ASK"]                  = "1"
+    env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    if event_stream:
+        env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
+
+    if extra:
+        env.update(extra)
+    return env
+
+
 async def _run_aiagent_subprocess(
     event: Any,
     profile_home: Path,
@@ -661,13 +752,8 @@ async def _run_aiagent_subprocess(
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
-    env = os.environ.copy()
-    env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
-    env["HERMES_HOME"] = str(profile_home)
-    env["HERMES_GATEWAY_SESSION"] = "1"
-    env["HERMES_EXEC_ASK"] = "1"
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    env = _build_subprocess_env(profile_home, approval_dir=approval_dir)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
 
     proc = None
@@ -736,14 +822,8 @@ async def _stream_aiagent_subprocess(
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
-    env = os.environ.copy()
-    env["HERMES_SHARED_HOME"] = str(_resolve_shared_hermes_home(profile_home))
-    env["HERMES_HOME"] = str(profile_home)
-    env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
-    env["HERMES_GATEWAY_SESSION"] = "1"
-    env["HERMES_EXEC_ASK"] = "1"
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
     child_script = Path(__file__).with_name("aiagent_subprocess.py")
 
     started_at = time.monotonic()
