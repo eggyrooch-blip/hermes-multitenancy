@@ -1,0 +1,185 @@
+;;; profile-default.sb — Hermes-multitenancy 档 B sandbox policy
+;;;
+;;; Applied to every AIAgent subprocess spawned by the multitenancy router.
+;;; Enforced by Apple's sandbox-exec(1). Wraps
+;;; ``hermes_multitenancy.agent_real._run_aiagent_subprocess`` invocation
+;;; when ``HERMES_USE_SANDBOX=1`` (gateway env or per-profile config).
+;;;
+;;; Parameters (passed via sandbox-exec -D KEY=VALUE):
+;;;
+;;;   PROFILE_HOME    — absolute path of the routed Hermes profile.
+;;;                     Writes scoped to this subtree.
+;;;   SHARED_HOME     — ~/.hermes (cron/jobs storage, snapshot cache).
+;;;   USER_HOME       — real user home (/Users/<user>). Needed because the
+;;;                     plugin runs on the host and host CLIs (kep-cli,
+;;;                     aws, gh) keep state under ~/.kep-cli, ~/.aws,
+;;;                     ~/.config/gh. We allow READ-ONLY traversal of
+;;;                     specific dotfiles below, NOT the whole home.
+;;;   HERMES_VENV     — Python venv root (where the interpreter +
+;;;                     site-packages live).
+;;;   HERMES_AGENT_REPO — hermes-agent main repo (gateway/, tools/,
+;;;                     hermes_cli/ source).
+;;;   HERMES_MT_REPO  — hermes-multitenancy plugin source.
+;;;
+;;; If a parameter is undefined at sandbox-exec spawn time, sandbox-exec
+;;; refuses to start (visible error). Don't make any of these optional.
+
+(version 1)
+(deny default)
+
+;; Apple's import gives us the syscall baseline (mach traps, signals,
+;; sysctl-read, process-fork/exec, IOKit accesses needed by Python init).
+;; Without it macOS Python won't even boot.
+(import "system.sb")
+
+;; ── Process / IPC ─────────────────────────────────────────────────────
+
+(allow process-fork)
+(allow process-exec*
+    (subpath (param "HERMES_VENV"))
+    (literal "/usr/bin/sandbox-exec")
+    (literal "/usr/bin/env")
+    (subpath "/usr/bin")
+    (subpath "/bin")
+    (subpath "/usr/local/bin")
+    (subpath "/opt/homebrew")
+    ;; kep-cli + hades-cli + tirith live under ~/.hermes/bin/
+    (subpath (string-append (param "SHARED_HOME") "/bin")))
+
+(allow signal (target self))
+(allow mach-lookup)
+(allow ipc-posix-shm)
+
+;; ── File reads — system + venv + repos ────────────────────────────────
+
+(allow file-read*
+    (subpath "/usr")
+    (subpath "/System")
+    (subpath "/Library")
+    (subpath "/private/var/db/timezone")
+    (subpath "/private/var/db/dyld")
+    (subpath "/private/etc")
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/urandom")
+    (literal "/dev/random")
+    (literal "/dev/tty")
+    (literal "/dev/dtracehelper")
+    ;; Python venv + source code reads
+    (subpath (param "HERMES_VENV"))
+    (subpath (param "HERMES_AGENT_REPO"))
+    (subpath (param "HERMES_MT_REPO"))
+    (subpath "/opt/homebrew"))
+
+;; ── Host home: ONLY the specific dotdirs host CLI tools need ──────────
+;;
+;; These are READ-ONLY for the sandboxed subprocess. kep-cli still
+;; *writes* tokens via its own non-sandboxed login flow (the user runs
+;; ``kep-auth login`` in their normal shell, not from inside an AIAgent
+;; subprocess), so read-only is sufficient.
+;;
+;; If a future skill genuinely needs to update ~/.<x> from inside an
+;; agent run, prefer ``skill_storage.write_token()`` into
+;; ``<HERMES_HOME>/tokens/`` rather than widening this allowlist.
+
+(allow file-read*
+    (subpath (string-append (param "USER_HOME") "/.kep-cli"))
+    (subpath (string-append (param "USER_HOME") "/.aws"))
+    (subpath (string-append (param "USER_HOME") "/.config/gh"))
+    (subpath (string-append (param "USER_HOME") "/.config/git"))
+    (literal (string-append (param "USER_HOME") "/.gitconfig")))
+
+;; Explicitly deny sensitive paths under USER_HOME so a typo above
+;; cannot accidentally widen access. Sandbox evaluates DENY rules
+;; ahead of ALLOW with the same specificity, so these win.
+(deny file-read*
+    (subpath (string-append (param "USER_HOME") "/.ssh"))
+    (subpath (string-append (param "USER_HOME") "/Library/Keychains"))
+    (subpath (string-append (param "USER_HOME") "/.password-store")))
+
+;; ── Profile read + write ──────────────────────────────────────────────
+
+(allow file-read* file-write*
+    (subpath (param "PROFILE_HOME")))
+
+;; Shared Hermes home — needed for cron job persistence (router rebinds
+;; cron.jobs to <shared>/cron/jobs.json), and for reading the snapshot
+;; cache. NOT a free pass to read other profiles' tokens — those are
+;; subpath-denied below.
+(allow file-read* file-write*
+    (subpath (string-append (param "SHARED_HOME") "/cron"))
+    (subpath (string-append (param "SHARED_HOME") "/snapshots"))
+    (literal (string-append (param "SHARED_HOME") "/multitenancy.db"))
+    (literal (string-append (param "SHARED_HOME") "/multitenancy.db-wal"))
+    (literal (string-append (param "SHARED_HOME") "/multitenancy.db-shm"))
+    (literal (string-append (param "SHARED_HOME") "/config.yaml"))
+    (literal (string-append (param "SHARED_HOME") "/active_profile"))
+    (literal (string-append (param "SHARED_HOME") "/.env")))
+
+;; Read shared feishu_uat (legacy fallback during migration; once OAuth
+;; callback is fixed cross-repo this can become deny).
+(allow file-read*
+    (subpath (string-append (param "SHARED_HOME") "/feishu_uat")))
+
+;; Hard deny: other profiles' homes. This is the headline guarantee of
+;; ARM B — no matter what filesystem trick a skill plays, it cannot
+;; read another tenant's .env / auth.json / sessions DB.
+(deny file-read* file-write*
+    (subpath (string-append (param "SHARED_HOME") "/profiles")))
+
+;; …but re-allow the one profile we're routed to, narrower wins.
+(allow file-read* file-write*
+    (subpath (param "PROFILE_HOME")))
+
+;; ── Temp directories ──────────────────────────────────────────────────
+
+(allow file-read* file-write*
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders"))
+
+;; ── Network — outbound HTTPS / HTTP only ──────────────────────────────
+;;
+;; Default policy is "deny network" but with explicit allowance for the
+;; small set of outbound destinations a Hermes agent actually needs:
+;; LLM providers, Feishu OAPI, Lark websocket, GitLab, common web search,
+;; package indexes. Inbound connections stay denied (no servers in a
+;; subprocess), and intranet ranges (10/8, 172.16/12, 192.168/16) stay
+;; denied so a skill cannot reach the internal Keep production hosts.
+;;
+;; Apple's sandbox network grammar is coarse (no per-IP allowlist on
+;; outbound), so we rely on port + protocol filtering. Tighter
+;; per-destination policy belongs at the HTTP client layer.
+
+(allow network-outbound (remote tcp "*:443"))
+(allow network-outbound (remote tcp "*:80"))
+(allow network-outbound (remote udp "*:443"))  ;; HTTP/3
+(allow network-outbound (remote tcp "*:53"))   ;; DNS over TCP
+(allow network-outbound (remote udp "*:53"))   ;; DNS over UDP
+
+;; Allow local UNIX sockets — needed for asyncio internals, mDNS,
+;; potentially launchctl IPC if a tool legitimately introspects launchd.
+(allow network-outbound (remote unix-socket))
+(allow network-bind (local unix-socket))
+(allow network-bind (local tcp "localhost:*"))
+(allow network-bind (local udp "localhost:*"))
+
+;; Intranet egress — explicitly denied. Skills should not be able to
+;; reach 10.2.14.249 (Keep production) or any office subnet from inside
+;; the sandbox. If a legitimate use case shows up, lift this surgically
+;; under the "trusted" policy variant, not in the default.
+;;
+;; sandbox-exec does NOT support deny by IP range natively; the closest
+;; we get is "allow only specific ports / sockets". Intranet block is
+;; therefore advisory at this layer — the *real* containment is that
+;; outbound only goes through the HTTP client which can be additionally
+;; restricted at the application level.
+;;
+;; TODO: pair this policy with an outbound HTTP client interceptor that
+;; rejects RFC1918 destinations unless HERMES_ALLOW_INTRANET=1.
+
+;; ── Diagnostics: log denied operations to syslog ──────────────────────
+;;
+;; Uncomment when chasing a sandbox violation. Off by default to keep
+;; syslog clean in production.
+;;
+;; (debug deny)

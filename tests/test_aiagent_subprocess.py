@@ -1079,3 +1079,126 @@ async def test_run_aiagent_subprocess_passes_sanitized_env_to_child(
         assert child_env["HOME"] != str(profile / "home")
     assert child_env["TMPDIR"] == str(profile / "tmp")
     assert child_env["HERMES_HOME"] == str(profile)
+
+
+# ---------------------------------------------------------------------------
+# 档 B — sandbox-exec wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_with_sandbox_is_noop_when_disabled(monkeypatch, tmp_path: Path):
+    """Default behaviour: HERMES_USE_SANDBOX unset returns cmd unchanged."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, tmp_path / "profile")
+    assert wrapped == cmd, "sandbox wrap must be a no-op when disabled"
+
+
+def test_wrap_with_sandbox_falls_back_when_policy_missing(monkeypatch, tmp_path: Path):
+    """HERMES_USE_SANDBOX=1 but policy file missing → unsandboxed with warning."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", tmp_path / "nonexistent.sb")
+
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, tmp_path / "profile")
+    assert wrapped == cmd, (
+        "Missing policy must fall back to unsandboxed exec (loud warning), "
+        "not silently crash or block the gateway."
+    )
+
+
+def test_wrap_with_sandbox_falls_back_when_binary_missing(monkeypatch, tmp_path: Path):
+    """If /usr/bin/sandbox-exec is not executable (non-mac), no-op + warning."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(tmp_path / "fake-sandbox-exec"))
+
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, tmp_path / "profile")
+    assert wrapped == cmd
+
+
+def test_wrap_with_sandbox_builds_full_invocation(monkeypatch, tmp_path: Path):
+    """HERMES_USE_SANDBOX=1 + policy present + binary present → full wrap."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "sandbox" / "profile-default.sb"
+    fake_policy.parent.mkdir()
+    fake_policy.write_text("(version 1) (deny default)")
+    fake_bin = tmp_path / "bin" / "sandbox-exec"
+    fake_bin.parent.mkdir()
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_SANDBOX_POLICY_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_SANDBOX_EXEC", str(fake_bin))
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+
+    cmd = ["/usr/bin/python3", "child.py"]
+    wrapped = agent_real._wrap_with_sandbox(cmd, profile)
+
+    assert wrapped[0] == str(fake_bin)
+    assert wrapped[1] == "-f"
+    assert wrapped[2] == str(fake_policy)
+
+    # All required -D params must be present.
+    params = {}
+    i = 3
+    while i < len(wrapped) - len(cmd):
+        if wrapped[i] == "-D":
+            key, _, value = wrapped[i + 1].partition("=")
+            params[key] = value
+            i += 2
+        else:
+            break
+    for required in ("PROFILE_HOME", "SHARED_HOME", "USER_HOME",
+                     "HERMES_VENV", "HERMES_AGENT_REPO", "HERMES_MT_REPO"):
+        assert required in params, f"-D {required}=... missing from sandbox-exec args"
+
+    # Original cmd is appended verbatim at the end.
+    assert wrapped[-len(cmd):] == cmd
+
+
+def test_sandbox_policy_file_is_valid_syntax():
+    """Smoke test: the shipped profile-default.sb parses successfully."""
+    import subprocess
+    from pathlib import Path as _P
+
+    if not _P("/usr/bin/sandbox-exec").is_file():
+        import pytest as _pytest
+        _pytest.skip("sandbox-exec only available on macOS")
+
+    from hermes_multitenancy import agent_real
+    policy = agent_real._SANDBOX_POLICY_FILE
+    assert policy.is_file(), f"policy {policy} not bundled with plugin"
+
+    result = subprocess.run(
+        [
+            "/usr/bin/sandbox-exec",
+            "-f", str(policy),
+            "-D", "PROFILE_HOME=/tmp/probe-profile",
+            "-D", "SHARED_HOME=/tmp/probe-shared",
+            "-D", "USER_HOME=/tmp/probe-user",
+            "-D", "HERMES_VENV=/tmp/probe-venv",
+            "-D", "HERMES_AGENT_REPO=/tmp/probe-agent",
+            "-D", "HERMES_MT_REPO=/tmp/probe-mt",
+            "/usr/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (
+        f"sandbox-exec rejected policy {policy}:\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
