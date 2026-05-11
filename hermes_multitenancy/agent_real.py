@@ -1836,6 +1836,13 @@ def _run_with_aiagent(
     runtime_kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
         runtime_kwargs["base_url"] = base_url
+    if provider:
+        # Forward provider name so AIAgent.__init__ selects the correct
+        # transport (anthropic_messages for anthropic, codex_responses for
+        # openai-codex / xai, etc.). Without this, AIAgent falls back to
+        # chat_completions and ignores ANTHROPIC_BASE_URL, breaking
+        # Anthropic-compatible providers like Tencent TokenHub.
+        runtime_kwargs["provider"] = provider
 
     fallback_model = fallback_models[0] if fallback_models else None
 
