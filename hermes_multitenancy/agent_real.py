@@ -817,6 +817,28 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     """
     if os.environ.get("HERMES_USE_SANDBOX") != "1":
         return cmd
+
+    # Per-profile gate. If HERMES_SANDBOX_PROFILES is set, the sandbox only
+    # wraps subprocesses for profiles named in that comma-separated list.
+    # Unset → all profiles are sandboxed (when the master toggle is on).
+    # This lets operators dial sandboxing up gradually:
+    #
+    #   HERMES_USE_SANDBOX=1 HERMES_SANDBOX_PROFILES=spike_test
+    #     → only spike_test routes get sandbox-exec; production profiles
+    #       (feishu_g41a5b5g etc.) continue unsandboxed during pilot.
+    #
+    #   HERMES_USE_SANDBOX=1
+    #     → every routed profile is sandboxed (final state after pilot).
+    allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
+    if allowlist_raw:
+        allowed = {p.strip() for p in allowlist_raw.split(",") if p.strip()}
+        if profile_home.name not in allowed:
+            logger.debug(
+                "[multitenancy] sandbox gated: profile=%s not in HERMES_SANDBOX_PROFILES=%s",
+                profile_home.name, allowlist_raw,
+            )
+            return cmd
+
     if not _SANDBOX_POLICY_FILE.is_file():
         logger.warning(
             "[multitenancy] HERMES_USE_SANDBOX=1 but policy %s is missing — "
