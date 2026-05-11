@@ -208,22 +208,143 @@ tail -f ~/.hermes/logs/*.log | grep -i 'subprocess spawning'
 
 ---
 
-## 8. Roadmap to档 B (kernel-level sandboxing)
+## 8. 档 B — kernel-level sandboxing (implemented, opt-in)
 
-档 A closes the convention-based leaks. To close the *capability*-based
-ones (file-system reads outside the profile, arbitrary network egress),
-the next step is `sandbox-exec` policies under `hermes_multitenancy/sandbox/`:
+档 A closes the convention-based leaks. 档 B closes the
+*capability*-based ones (filesystem reads outside the profile, arbitrary
+network egress) by wrapping every AIAgent subprocess with Apple's
+`sandbox-exec(1)`. **Code is in place but disabled by default — flip the
+toggle profile-by-profile during pilot.**
 
-* `readonly.sb` — file-read into profile + system trees only, no network
-* `network.sb` — readonly + 443/80 outbound to a small allowlist
-* `trusted.sb` — readonly + full HTTPS outbound (admin profile only)
+### 8.1 Policy file
 
-These will be invoked by wrapping `_run_aiagent_subprocess`'s `argv` with
-`/usr/bin/sandbox-exec -f <policy>.sb -D PROFILE_HOME=...` when
-`HERMES_USE_SANDBOX=1` is set.
+`hermes_multitenancy/sandbox/profile-default.sb` is the only policy
+currently shipped. Highlights:
 
-Until档 B ships, treat档 A as defense-in-depth, not as an authorisation
-boundary. A skill that wants to read `~/.ssh/` can still do so.
+* **Default deny** everything; `(import "system.sb")` for the syscall
+  baseline Python needs to boot.
+* **Reads allowed**: `/usr`, `/System`, `/Library`, `/opt/homebrew`,
+  `HERMES_VENV`, `HERMES_AGENT_REPO`, `HERMES_MT_REPO`, plus the
+  narrow set of dot-dirs host CLIs use (`~/.kep-cli`, `~/.aws`,
+  `~/.config/gh`, `~/.config/git`, `~/.gitconfig`).
+* **Writes allowed**: the routed `PROFILE_HOME` subtree, the shared
+  `SHARED_HOME/cron` + `/snapshots`, and `/private/tmp`+`/private/var/folders`
+  (per-process temp).
+* **Hard denies**: `~/.ssh`, `~/Library/Keychains`, `~/.password-store`,
+  *other* profiles' home trees under `SHARED_HOME/profiles`.
+* **Network**: outbound 443/80/53 (TCP+UDP) only. Inbound denied. Local
+  UNIX sockets allowed (asyncio internals). Note: sandbox-exec has no
+  IP-range grammar, so intranet (RFC1918) blocking has to come from an
+  application-level HTTP interceptor — TODO marker in the policy file.
+
+The shipped policy is the **"network" variant**. A stricter
+`readonly.sb` (no network) and a more permissive `trusted.sb` (full
+HTTPS, intended for admin profiles) are designed but not yet written —
+add them when the default policy has cleared its pilot.
+
+### 8.2 Wrapper code
+
+`agent_real._wrap_with_sandbox(cmd, profile_home)` wraps the argv at
+spawn time when both toggles say go:
+
+```python
+if os.environ.get("HERMES_USE_SANDBOX") != "1":
+    return cmd                              # disabled — no-op
+
+if HERMES_SANDBOX_PROFILES is set and profile_home.name not in list:
+    return cmd                              # gated out during pilot
+
+if policy file missing OR /usr/bin/sandbox-exec not executable:
+    return cmd  + WARNING log               # loud fallback, not crash
+```
+
+Otherwise it prepends:
+
+```
+/usr/bin/sandbox-exec -f profile-default.sb \
+  -D PROFILE_HOME=...  -D SHARED_HOME=...  -D USER_HOME=... \
+  -D HERMES_VENV=...   -D HERMES_AGENT_REPO=... -D HERMES_MT_REPO=...
+```
+
+Both `_run_aiagent_subprocess` (one-shot path) and
+`_stream_aiagent_subprocess` (CardKit streaming path) use the same
+wrapper.
+
+### 8.3 Enabling SOP (recommended rollout)
+
+#### 8.3.1 Pilot one profile (week 0)
+
+Edit the target launchd plist (e.g. `spike_test`):
+
+```bash
+/usr/libexec/PlistBuddy \
+  -c "Add :EnvironmentVariables:HERMES_USE_SANDBOX string 1" \
+  -c "Add :EnvironmentVariables:HERMES_SANDBOX_PROFILES string spike_test" \
+  ~/Library/LaunchAgents/ai.hermes.gateway-spike_test.plist
+
+launchctl bootout gui/$(id -u)/ai.hermes.gateway-spike_test
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.hermes.gateway-spike_test.plist
+```
+
+`bootout` + `bootstrap` is mandatory — `launchctl kickstart -k` does
+**not** re-read the plist (OpenClaw 5/9 教训).
+
+Note that `spike_test` is its own gateway; for sandboxing **routed**
+profiles (`feishu_g41a5b5g` etc.) the toggle must go on the
+`multitenancy_router` plist, since that is the gateway that spawns the
+AIAgent subprocess.
+
+#### 8.3.2 Monitor (week 0-1)
+
+```bash
+# Live sandbox denies:
+log stream --predicate 'sender CONTAINS "sandbox"' --info
+# Or look for past denies:
+log show --last 1h --predicate 'sender CONTAINS "sandbox"' --info
+```
+
+For verbose tracing inside the policy itself, uncomment `(debug deny)`
+at the bottom of `profile-default.sb` and bootstrap again.
+
+#### 8.3.3 Expand allowlist (week 1+)
+
+Once `spike_test` runs clean, add real tenants one at a time:
+
+```bash
+/usr/libexec/PlistBuddy \
+  -c "Set :EnvironmentVariables:HERMES_SANDBOX_PROFILES feishu_g41a5b5g,spike_test" \
+  ~/Library/LaunchAgents/ai.hermes.gateway-multitenancy_router.plist
+# bootout + bootstrap as above
+```
+
+#### 8.3.4 Final state (week 2+)
+
+Once every tenant is covered, drop the allowlist entirely:
+
+```bash
+/usr/libexec/PlistBuddy \
+  -c "Delete :EnvironmentVariables:HERMES_SANDBOX_PROFILES" \
+  ~/Library/LaunchAgents/ai.hermes.gateway-multitenancy_router.plist
+# bootout + bootstrap
+```
+
+`HERMES_USE_SANDBOX=1` alone now sandboxes everyone.
+
+### 8.4 Rollback
+
+Single env edit + bootout/bootstrap reverts to档 A:
+
+```bash
+/usr/libexec/PlistBuddy \
+  -c "Delete :EnvironmentVariables:HERMES_USE_SANDBOX" \
+  ~/Library/LaunchAgents/ai.hermes.gateway-multitenancy_router.plist
+launchctl bootout … && launchctl bootstrap … …
+```
+
+If the policy file itself is wrong (subprocess refuses to spawn or
+silently fails), the wrapper's loud-fallback path keeps the gateway
+working — look for `WARNING [multitenancy] HERMES_USE_SANDBOX=1 but
+policy ... is missing` lines.
 
 ---
 
