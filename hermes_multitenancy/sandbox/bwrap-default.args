@@ -73,9 +73,9 @@
 # ── Shared hermes home — narrow rw, broad ro ────────────────────────
 # Parallel to profile-default.sb:129-165.
 --ro-bind ${SHARED_HOME} ${SHARED_HOME}
---bind ${SHARED_HOME}/cron ${SHARED_HOME}/cron
---bind ${SHARED_HOME}/snapshots ${SHARED_HOME}/snapshots
---bind ${SHARED_HOME}/audio_cache ${SHARED_HOME}/audio_cache
+--bind-try ${SHARED_HOME}/cron ${SHARED_HOME}/cron
+--bind-try ${SHARED_HOME}/snapshots ${SHARED_HOME}/snapshots
+--bind-try ${SHARED_HOME}/audio_cache ${SHARED_HOME}/audio_cache
 --bind-try ${SHARED_HOME}/multitenancy.db ${SHARED_HOME}/multitenancy.db
 --bind-try ${SHARED_HOME}/multitenancy.db-wal ${SHARED_HOME}/multitenancy.db-wal
 --bind-try ${SHARED_HOME}/multitenancy.db-shm ${SHARED_HOME}/multitenancy.db-shm
