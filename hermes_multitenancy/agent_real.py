@@ -713,14 +713,29 @@ def _build_subprocess_env(
          API keys / OAuth tokens / shell secrets exported into the gateway
          process from leaking into a profile's tool execution.
 
-      2. **HOME / XDG / TMPDIR pivot** — anything that normally lands in
-         ``~/<...>`` or ``$TMPDIR`` is redirected into the profile's own
-         directory tree, so a skill that caches via ``Path.home()`` or
-         ``tempfile.gettempdir()`` writes to ``<profile>/cache/...`` instead
-         of the gateway user's shared cache.
+      2. **XDG / TMPDIR pivot** — XDG cache/config/state/data and TMPDIR
+         redirect into the profile's own directory tree, so a skill that
+         caches via ``XDG_CACHE_HOME`` / ``tempfile.gettempdir()`` writes to
+         ``<profile>/cache/...`` instead of the gateway user's shared cache.
 
-    The directories ``home/``, ``cache/``, ``config/``, ``state/``, ``data/``
-    and ``tmp/`` are created on first use (mode 0700).
+    HOME is intentionally **not** pivoted. The plugin runs as a host process
+    (not inside a container), so the user's home directory is the real
+    ``/Users/<user>`` and host-installed CLIs (``kep-cli``, ``aws``, etc.)
+    rely on ``Path.home() / ".kep-cli"`` style paths to find their state.
+    Rebinding HOME would break those tools — see the kep-cli profile
+    convention note (``架构 — Hermes Profiles 安装 kep-cli 2026-05-07.md``)
+    in the Second Brain vault for the lookup pattern. A previous iteration
+    of this helper did rebind HOME (modelled after the OpenClaw
+    ``keep-record`` workspace-bridge pattern), but that pattern applies only
+    inside Docker containers where the workspace IS the sandbox boundary;
+    here HOME stays at the user.
+
+    Skill-level token isolation is therefore enforced explicitly by
+    :mod:`hermes_multitenancy.skill_storage` (writes always go to
+    ``<HERMES_HOME>/tokens/``) rather than implicitly via HOME redirection.
+
+    The directories ``cache/``, ``config/``, ``state/``, ``data/`` and
+    ``tmp/`` are created on first use (mode 0700).
 
     Profile-local secrets are loaded inside the child by
     :func:`_run_with_aiagent` from ``<profile_home>/.env`` and ``auth.json``;
@@ -733,8 +748,8 @@ def _build_subprocess_env(
     }
 
     profile_home = profile_home.expanduser()
+    # HOME is NOT pivoted (see docstring). Only XDG/TMPDIR redirect.
     pivot = {
-        "HOME":            profile_home / "home",
         "XDG_CACHE_HOME":  profile_home / "cache",
         "XDG_CONFIG_HOME": profile_home / "config",
         "XDG_STATE_HOME":  profile_home / "state",
@@ -1469,6 +1484,17 @@ def _run_with_aiagent(
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
+            # Hermes-agent tags every AIAgent-driven session as source='api_server'
+            # regardless of the `platform` kwarg, which makes Feishu chats hide
+            # under the API Server group in web-ui. Re-tag the row (and any
+            # parent-chained descendants) so the web-ui sidebar shows Feishu
+            # sessions in their own bucket.
+            try:
+                _mark_session_source_feishu(profile_home, str(session_id))
+            except Exception:
+                logger.exception(
+                    "[multitenancy] failed to rewrite session.source -> feishu"
+                )
         finally:
             approval_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
@@ -1484,6 +1510,43 @@ def _run_with_aiagent(
                 pass
 
     return (result or {}).get("final_response", "") or ""
+
+
+def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
+    """Re-tag this session's source from 'api_server' to 'feishu'.
+
+    Hermes-agent always writes ``sessions.source = 'api_server'`` for any
+    AIAgent.run_conversation() call (even when ``platform='feishu'`` is
+    passed). Without this rewrite, web-ui groups every multitenant Feishu
+    chat under "API Server" and hides the channel boundary the operator
+    cares about.
+
+    Updates the row matching ``session_id`` plus the recursive parent-chain
+    descendants. No-op if the session row was never persisted (e.g. when
+    the AIAgent crashed before its first DB write).
+    """
+    import sqlite3
+
+    db_path = profile_home / "state.db"
+    if not db_path.exists():
+        return
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            WITH RECURSIVE chain(id) AS (
+                SELECT id FROM sessions WHERE id = ?
+                UNION ALL
+                SELECT s.id
+                FROM sessions s
+                JOIN chain c ON s.parent_session_id = c.id
+            )
+            UPDATE sessions
+            SET source = 'feishu'
+            WHERE source = 'api_server' AND id IN (SELECT id FROM chain)
+            """,
+            (session_id,),
+        )
+        conn.commit()
 
 
 def _resolve_enabled_toolsets(
