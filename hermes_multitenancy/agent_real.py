@@ -443,15 +443,27 @@ def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> P
 
 
 def _configure_cron_home(shared_home: Path) -> None:
-    """Make cronjob tool writes visible to the shared gateway scheduler.
+    """Bind cron storage path for AIAgent subprocesses.
 
-    The gateway cron ticker imports ``cron.jobs`` under the shared Hermes home
-    and only scans ``<shared>/cron/jobs.json``. Multitenant AIAgent subprocesses
-    run with ``HERMES_HOME=<profile>``, so importing ``cron.jobs`` there would
-    otherwise bind cron storage to ``<profile>/cron/jobs.json``. That creates
-    jobs that remain forever ``scheduled`` because no gateway ticker watches
-    that profile-local file.
+    Behavior depends on HERMES_HOME layout:
+    - Multitenancy nested layout (``<root>/profiles/<name>``): no-op. Cron
+      writes go to the profile default ``<profile>/cron/jobs.json``; a
+      dedicated multi-profile worker in this plugin (see ``cron_worker``)
+      scans all profiles and dispatches due jobs.
+    - Single-profile or legacy layout: rebind to shared Hermes home so the
+      gateway's built-in cron ticker (which scans ``<shared>/cron/jobs.json``)
+      can see the jobs.
     """
+    current_home = os.environ.get("HERMES_HOME")
+    if current_home:
+        current_path = Path(current_home).expanduser()
+        if current_path.parent.name == "profiles":
+            logger.info(
+                "[multitenancy] cron jobs stay in profile-default location: %s/cron/",
+                current_path,
+            )
+            return
+
     import importlib
 
     shared_home = Path(shared_home).expanduser()
@@ -1219,6 +1231,11 @@ async def _stream_aiagent_subprocess(
             if self.session_ensured or not _state_db_path.exists():
                 self.session_ensured = True
                 return
+            try:
+                from hermes_state import SessionDB
+                SessionDB(_state_db_path).close()
+            except Exception:
+                logger.exception("[multitenancy] mirror schema init failed")
             try:
                 with self._conn() as conn:
                     conn.execute(

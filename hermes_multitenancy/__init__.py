@@ -9,9 +9,13 @@ Plugin contract (what `register(ctx)` does):
   - Registers ONE pre_gateway_dispatch callback (sync def, returns dict)
   - Callback uses asyncio.create_task to dispatch async work
   - Callback returns {"action": "skip"} so gateway main flow does not handle the message
+  - Lazy-starts a per-profile cron worker on first dispatch (multi-profile cron support)
 """
 from __future__ import annotations
 
+from typing import Any
+
+from .cron_worker import ensure_cron_worker_started
 from .router import on_pre_gateway_dispatch
 
 
@@ -35,7 +39,15 @@ def register(ctx) -> None:
 
     override_pool(RuntimePool(runtime_factory=_real_factory))
 
-    ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+    ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
+
+
+def _dispatch_with_worker_init(**kwargs: Any) -> dict:
+    """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
+    gateway = kwargs.get("gateway")
+    if gateway is not None:
+        ensure_cron_worker_started(gateway)
+    return on_pre_gateway_dispatch(**kwargs)
 
 
 __all__ = ["register", "on_pre_gateway_dispatch"]

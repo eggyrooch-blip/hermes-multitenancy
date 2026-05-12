@@ -34,8 +34,13 @@ def test_pyproject_entry_point():
 
 
 def test_register_calls_register_hook_once():
-    """register(ctx) must call ctx.register_hook('pre_gateway_dispatch', callback) exactly once."""
-    from hermes_multitenancy import register, on_pre_gateway_dispatch
+    """register(ctx) must call ctx.register_hook('pre_gateway_dispatch', callback) exactly once.
+
+    The callback may be a thin wrapper around ``on_pre_gateway_dispatch``
+    (used to lazy-start the multi-profile cron worker on first dispatch).
+    Identity is not required — callable and same dispatch contract are.
+    """
+    from hermes_multitenancy import register
 
     calls = []
 
@@ -47,7 +52,7 @@ def test_register_calls_register_hook_once():
     assert len(calls) == 1, f"expected exactly one register_hook call, got {len(calls)}"
     name, cb = calls[0]
     assert name == "pre_gateway_dispatch"
-    assert cb is on_pre_gateway_dispatch
+    assert callable(cb)
 
 
 def test_hook_callback_is_sync_def():
