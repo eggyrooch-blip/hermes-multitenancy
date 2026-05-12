@@ -421,12 +421,44 @@ def test_configure_feishu_uat_home_does_not_leak_other_profiles_dir(tmp_path: Pa
     assert alice / "feishu_uat" != bob / "feishu_uat"
 
 
-def test_configure_cron_home_uses_shared_gateway_store(monkeypatch, tmp_path: Path):
+def test_configure_cron_home_skips_binding_in_multitenancy_layout(monkeypatch, tmp_path: Path):
+    """In multitenancy nested layout (<root>/profiles/<name>) the function is
+    a no-op: cron writes stay at the profile-default path and the dedicated
+    multi-profile worker (``cron_worker``) handles tick-time delivery."""
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / ".hermes" / "profiles" / "coder"
     shared_home = tmp_path / ".hermes"
     profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    sentinel_jobs = object()
+    sentinel_output = object()
+    cron_jobs.JOBS_FILE = sentinel_jobs
+    cron_jobs.OUTPUT_DIR = sentinel_output
+    cron_pkg.jobs = cron_jobs
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    agent_real._configure_cron_home(shared_home)
+
+    # Untouched: multitenancy layout triggers early return before any rebinding.
+    assert cron_jobs.JOBS_FILE is sentinel_jobs
+    assert cron_jobs.OUTPUT_DIR is sentinel_output
+
+
+def test_configure_cron_home_binds_shared_in_legacy_layout(monkeypatch, tmp_path: Path):
+    """Outside the multitenancy nested layout (e.g. single-profile or legacy
+    deployments) the function still rebinds cron paths to the shared store."""
+    from hermes_multitenancy import agent_real
+
+    legacy_home = tmp_path / ".hermes-legacy"
+    shared_home = tmp_path / ".hermes"
+    legacy_home.mkdir(parents=True)
     shared_home.mkdir(exist_ok=True)
 
     cron_pkg = types.ModuleType("cron")
@@ -444,13 +476,13 @@ def test_configure_cron_home_uses_shared_gateway_store(monkeypatch, tmp_path: Pa
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
     monkeypatch.setitem(sys.modules, "tools.path_security", path_security)
-    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_HOME", str(legacy_home))
 
     agent_real._configure_cron_home(shared_home)
 
     assert cron_jobs.JOBS_FILE == shared_home.resolve() / "cron" / "jobs.json"
     assert cron_jobs.OUTPUT_DIR == shared_home.resolve() / "cron" / "output"
-    assert os.environ["HERMES_HOME"] == str(profile_home)
+    assert os.environ["HERMES_HOME"] == str(legacy_home)
     assert cronjob_tools._validate_cron_script_path("reminder.py") is None
     assert "relative to shared" in cronjob_tools._validate_cron_script_path("/tmp/reminder.py")
 
