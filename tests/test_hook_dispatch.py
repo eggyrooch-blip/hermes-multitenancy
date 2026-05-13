@@ -46,22 +46,53 @@ async def test_hook_returns_skip_action():
     await asyncio.sleep(0)
 
 
-def test_gateway_startup_hook_starts_cron_worker(monkeypatch):
-    """gateway_startup should initialize profile cron without waiting for Feishu inbound."""
-    import hermes_multitenancy
+def test_startup_watch_starts_cron_worker_when_adapters_ready(monkeypatch):
+    """The plugin startup watcher initializes cron without Feishu inbound."""
+    from hermes_multitenancy import cron_worker
 
     calls = []
     monkeypatch.setattr(
-        hermes_multitenancy,
+        cron_worker,
         "ensure_cron_worker_started",
         lambda gateway: calls.append(gateway),
     )
     gateway = SimpleNamespace(adapters={"feishu": object()})
 
-    result = hermes_multitenancy._startup_with_worker_init(gateway=gateway)
+    asyncio.run(cron_worker._start_worker_when_adapters_ready(gateway, attempts=1))
 
-    assert result is None
     assert calls == [gateway]
+
+
+def test_cron_delivery_patch_resolves_owner_open_id(monkeypatch):
+    """Bare deliver=feishu can target the WebUI owner's Feishu open_id."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+
+    def original_resolver(_job, _deliver_value):
+        return None
+
+    scheduler._resolve_single_delivery_target = original_resolver
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    cron_worker._patch_scheduler_owner_open_id_delivery()
+
+    target = scheduler._resolve_single_delivery_target(
+        {"deliver": "feishu", "owner_open_id": "ou_test_owner"},
+        "feishu",
+    )
+
+    assert target == {
+        "platform": "feishu",
+        "chat_id": "ou_test_owner",
+        "thread_id": None,
+    }
 
 
 @pytest.mark.asyncio

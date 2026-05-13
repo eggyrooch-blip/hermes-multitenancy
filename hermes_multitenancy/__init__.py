@@ -13,11 +13,18 @@ Plugin contract (what `register(ctx)` does):
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
-from .cron_worker import ensure_cron_worker_started
+from .cron_worker import (
+    ensure_cron_worker_started,
+    install_cron_runtime_patches,
+    install_gateway_startup_watcher,
+)
 from .router import on_pre_gateway_dispatch
+
+logger = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -78,23 +85,20 @@ def register(ctx) -> None:
         return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
 
     override_pool(_build_runtime_pool(_real_factory))
+    install_cron_runtime_patches()
+    install_gateway_startup_watcher()
 
-    ctx.register_hook("gateway_startup", _startup_with_worker_init)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
-
-
-def _startup_with_worker_init(**kwargs: Any) -> None:
-    """Start the multi-profile cron worker as soon as the router gateway is ready."""
-    gateway = kwargs.get("gateway")
-    if gateway is not None:
-        ensure_cron_worker_started(gateway)
 
 
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
     gateway = kwargs.get("gateway")
     if gateway is not None:
-        ensure_cron_worker_started(gateway)
+        try:
+            ensure_cron_worker_started(gateway)
+        except Exception:
+            logger.exception("[multitenancy] cron worker lazy-start failed")
     return on_pre_gateway_dispatch(**kwargs)
 
 

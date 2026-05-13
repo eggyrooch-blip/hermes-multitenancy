@@ -9,8 +9,9 @@ subprocess write reminders to its own profile-default cron path
 This module starts a single background thread inside the gateway process that
 periodically scans every profile under ``<root>/profiles/*/cron/jobs.json``
 and reuses hermes-agent's native ``cron.scheduler.tick()`` to dispatch due
-jobs. The worker is lazy-started on the first ``pre_gateway_dispatch`` hook
-call (when the gateway runner and platform adapters are ready).
+jobs. The worker is started by a plugin-installed gateway watcher once the
+router has connected at least one adapter, with the pre-dispatch hook kept as
+a lazy fallback.
 
 Race safety: the worker mutates module-level constants in ``cron.jobs`` to
 point at each profile in turn, holds an internal lock for the
@@ -22,9 +23,11 @@ a duplicate-tick attempt that resolves into a no-op.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,6 +37,9 @@ _worker_lock = threading.Lock()
 _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop: Optional[threading.Event] = None
+_runtime_patches_installed = False
+_gateway_watcher_installed = False
+_watcher_attr = "_hermes_multitenancy_cron_watch_scheduled"
 
 
 def ensure_cron_worker_started(gateway: Any) -> None:
@@ -76,6 +82,165 @@ def ensure_cron_worker_started(gateway: Any) -> None:
         )
 
 
+def install_cron_runtime_patches() -> None:
+    """Install multitenancy cron delivery adapters without modifying Hermes files."""
+    global _runtime_patches_installed
+    if _runtime_patches_installed:
+        return
+    _patch_scheduler_owner_open_id_delivery()
+    _patch_feishu_open_id_send()
+    _runtime_patches_installed = True
+
+
+def install_gateway_startup_watcher() -> None:
+    """Start the cron worker after GatewayRunner connects adapters.
+
+    Hermes core has no generic "gateway started" plugin hook in the upstream
+    code we run against. Rather than patching core files, the plugin wraps
+    ``GatewayRunner._create_adapter`` early in startup and schedules a small
+    async watcher on the same event loop. Once the gateway's adapter map is
+    populated, the normal worker start path receives the live gateway object.
+    """
+    global _gateway_watcher_installed
+    if _gateway_watcher_installed:
+        return
+    try:
+        from gateway.run import GatewayRunner
+    except Exception:
+        logger.exception("[multitenancy] failed to install gateway cron startup watcher")
+        return
+
+    original = getattr(GatewayRunner, "_create_adapter", None)
+    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+        _gateway_watcher_installed = True
+        return
+
+    @functools.wraps(original)
+    def wrapped_create_adapter(self: Any, *args: Any, **kwargs: Any) -> Any:
+        adapter = original(self, *args, **kwargs)
+        _schedule_startup_watch(self)
+        return adapter
+
+    setattr(wrapped_create_adapter, "_hermes_multitenancy_patched", True)
+    GatewayRunner._create_adapter = wrapped_create_adapter
+    _gateway_watcher_installed = True
+    logger.info("[multitenancy] installed gateway cron startup watcher")
+
+
+def _schedule_startup_watch(gateway: Any) -> None:
+    if getattr(gateway, _watcher_attr, False):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.info("[multitenancy] cron startup watcher delayed: no running loop")
+        return
+    setattr(gateway, _watcher_attr, True)
+    task = loop.create_task(_start_worker_when_adapters_ready(gateway))
+    task.add_done_callback(_log_startup_watch_failure)
+
+
+async def _start_worker_when_adapters_ready(gateway: Any, attempts: int = 90) -> None:
+    for _ in range(attempts):
+        if getattr(gateway, "adapters", None):
+            ensure_cron_worker_started(gateway)
+            return
+        await asyncio.sleep(1)
+    logger.warning("[multitenancy] cron worker not started: gateway adapters stayed empty")
+
+
+def _log_startup_watch_failure(task: "asyncio.Task[Any]") -> None:
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except Exception as err:
+        logger.error("[multitenancy] cron startup watcher result unavailable: %s", err)
+        return
+    if exc is not None:
+        logger.error(
+            "[multitenancy] cron startup watcher failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+def _patch_scheduler_owner_open_id_delivery() -> None:
+    try:
+        import cron.scheduler as scheduler
+    except Exception:
+        logger.exception("[multitenancy] failed to patch cron owner delivery")
+        return
+
+    original = getattr(scheduler, "_resolve_single_delivery_target", None)
+    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+        return
+
+    @functools.wraps(original)
+    def resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
+        target = original(job, deliver_value)
+        if target is not None:
+            return target
+        if str(deliver_value).strip().lower() != "feishu":
+            return None
+        owner_open_id = str(job.get("owner_open_id") or "").strip()
+        if not owner_open_id.startswith("ou_"):
+            return None
+        return {
+            "platform": "feishu",
+            "chat_id": owner_open_id,
+            "thread_id": None,
+        }
+
+    setattr(resolve_single_delivery_target, "_hermes_multitenancy_patched", True)
+    scheduler._resolve_single_delivery_target = resolve_single_delivery_target
+    logger.info("[multitenancy] patched cron delivery fallback to owner open_id")
+
+
+def _patch_feishu_open_id_send() -> None:
+    try:
+        from gateway.platforms.feishu import FeishuAdapter
+    except Exception:
+        logger.exception("[multitenancy] failed to patch Feishu open_id delivery")
+        return
+
+    original = getattr(FeishuAdapter, "_send_raw_message", None)
+    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+        return
+
+    @functools.wraps(original)
+    async def send_raw_message(
+        self: Any,
+        *,
+        chat_id: str,
+        msg_type: str,
+        payload: str,
+        reply_to: Optional[str],
+        metadata: Optional[dict],
+    ) -> Any:
+        if reply_to or not str(chat_id).startswith("ou_"):
+            return await original(
+                self,
+                chat_id=chat_id,
+                msg_type=msg_type,
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+        body = self._build_create_message_body(
+            receive_id=chat_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_create_message_request("open_id", body)
+        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+
+    setattr(send_raw_message, "_hermes_multitenancy_patched", True)
+    FeishuAdapter._send_raw_message = send_raw_message
+    logger.info("[multitenancy] patched Feishu delivery for user open_id targets")
+
+
 def _resolve_profiles_root() -> Optional[Path]:
     hermes_home = os.environ.get("HERMES_HOME")
     if not hermes_home:
@@ -100,7 +265,7 @@ def _multiprofile_cron_worker(
 ) -> None:
     try:
         import cron.jobs as cron_jobs
-        from cron.scheduler import tick as cron_tick
+        import cron.scheduler as cron_scheduler
     except Exception:
         logger.exception("[multitenancy] cron modules not importable; worker aborted")
         return
@@ -116,7 +281,7 @@ def _multiprofile_cron_worker(
                     continue
                 _tick_one_profile(
                     cron_jobs,
-                    cron_tick,
+                    cron_scheduler,
                     profile_dir,
                     jobs_file,
                     adapters,
@@ -131,7 +296,7 @@ def _multiprofile_cron_worker(
 
 def _tick_one_profile(
     cron_jobs: Any,
-    cron_tick: Any,
+    cron_scheduler: Any,
     profile_dir: Path,
     jobs_file: Path,
     adapters: Any,
@@ -144,13 +309,22 @@ def _tick_one_profile(
             cron_jobs.CRON_DIR,
             cron_jobs.JOBS_FILE,
             cron_jobs.OUTPUT_DIR,
+            getattr(cron_scheduler, "_hermes_home", None),
+            getattr(cron_scheduler, "_LOCK_DIR", None),
+            getattr(cron_scheduler, "_LOCK_FILE", None),
+            os.environ.get("HERMES_HOME"),
         )
         try:
-            cron_jobs.HERMES_DIR = profile_dir.resolve()
+            profile_home = profile_dir.resolve()
+            os.environ["HERMES_HOME"] = str(profile_home)
+            cron_jobs.HERMES_DIR = profile_home
             cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
             cron_jobs.JOBS_FILE = jobs_file
             cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-            cron_tick(verbose=False, adapters=adapters, loop=loop)
+            cron_scheduler._hermes_home = profile_home
+            cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
+            cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
+            cron_scheduler.tick(verbose=False, adapters=adapters, loop=loop)
         except Exception:
             logger.exception(
                 "[multitenancy] cron tick failed for profile %s",
@@ -162,4 +336,12 @@ def _tick_one_profile(
                 cron_jobs.CRON_DIR,
                 cron_jobs.JOBS_FILE,
                 cron_jobs.OUTPUT_DIR,
+                cron_scheduler._hermes_home,
+                cron_scheduler._LOCK_DIR,
+                cron_scheduler._LOCK_FILE,
+                previous_home,
             ) = saved
+            if previous_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = previous_home
