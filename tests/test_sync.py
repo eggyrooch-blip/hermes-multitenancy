@@ -127,6 +127,7 @@ def test_profile_name_for_user_id_normalizes_to_hermes_profile_id():
     from hermes_multitenancy.sync import profile_name_for_user_id
 
     assert profile_name_for_user_id("Alice.User") == "alice_user"
+    assert profile_name_for_user_id("owner") == "owner"
     assert profile_name_for_user_id("chat") == "feishu_chat"
     assert profile_name_for_user_id("-bad") == "bad"
     assert len(profile_name_for_user_id("A" * 100)) == 64

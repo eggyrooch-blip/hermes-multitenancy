@@ -55,6 +55,23 @@ def test_register_calls_register_hook_once():
     assert callable(cb)
 
 
+def test_runtime_pool_settings_can_be_overridden_from_env(monkeypatch):
+    """Production can relax runtime cache/timeout without code changes."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_MAX_LOADED_RUNTIMES", "12")
+    monkeypatch.setenv("HERMES_MULTITENANCY_IDLE_EVICT_SECONDS", "1800")
+    monkeypatch.setenv("HERMES_MULTITENANCY_COLD_START_CONCURRENCY", "3")
+    monkeypatch.setenv("HERMES_MULTITENANCY_INFLIGHT_TIMEOUT_SECONDS", "1200")
+
+    from hermes_multitenancy import _build_runtime_pool
+    from hermes_multitenancy.runtime import ProfileRuntime
+
+    pool = _build_runtime_pool(lambda _name, home: ProfileRuntime(home))
+
+    assert pool.max_loaded_runtimes == 12
+    assert pool.idle_evict_seconds == 1800
+    assert pool.inflight_timeout_seconds == 1200
+
+
 def test_hook_callback_is_sync_def():
     """Critical: invoke_hook (plugins.py:954) calls cb(**kwargs) synchronously.
 
