@@ -95,6 +95,40 @@ def test_cron_delivery_patch_resolves_owner_open_id(monkeypatch):
     }
 
 
+def test_cron_delivery_mirror_persists_owner_context(tmp_path, monkeypatch):
+    """Successful cron delivery is remembered for the owner's next Feishu turn."""
+    from hermes_multitenancy import cron_worker
+    from hermes_multitenancy.router import override_session_store
+    from hermes_multitenancy.sessions import SessionStore
+
+    store = SessionStore(tmp_path / "multitenancy.db")
+    override_session_store(store)
+    try:
+        cron_worker._mirror_cron_delivery_to_owner(
+            {
+                "id": "job123",
+                "name": "Daily summary",
+                "owner_profile": "sunke",
+                "owner_open_id": "ou_test_owner",
+            },
+            "summary content",
+        )
+
+        messages = store.load_recent("sunke", "ou_test_owner", 5)
+        assert messages == [{
+            "role": "assistant",
+            "content": (
+                "[Scheduled task delivery]\n"
+                "Task: Daily summary\n"
+                "Job ID: job123\n\n"
+                "summary content"
+            ),
+        }]
+    finally:
+        override_session_store(None)
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_hook_schedules_background_task():
     """callback creates a background asyncio task (fire-and-forget)."""
