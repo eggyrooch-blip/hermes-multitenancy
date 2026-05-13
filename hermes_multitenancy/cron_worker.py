@@ -88,6 +88,7 @@ def install_cron_runtime_patches() -> None:
     if _runtime_patches_installed:
         return
     _patch_scheduler_owner_open_id_delivery()
+    _patch_cron_delivery_mirror()
     _patch_feishu_open_id_send()
     _runtime_patches_installed = True
 
@@ -194,6 +195,76 @@ def _patch_scheduler_owner_open_id_delivery() -> None:
     setattr(resolve_single_delivery_target, "_hermes_multitenancy_patched", True)
     scheduler._resolve_single_delivery_target = resolve_single_delivery_target
     logger.info("[multitenancy] patched cron delivery fallback to owner open_id")
+
+
+def _patch_cron_delivery_mirror() -> None:
+    try:
+        import cron.scheduler as scheduler
+    except Exception:
+        logger.exception("[multitenancy] failed to patch cron delivery mirror")
+        return
+
+    original = getattr(scheduler, "_deliver_result", None)
+    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+        return
+
+    @functools.wraps(original)
+    def deliver_result(job: dict, content: str, adapters: Any = None, loop: Any = None) -> Optional[str]:
+        error = original(job, content, adapters=adapters, loop=loop)
+        if error is None:
+            _mirror_cron_delivery_to_owner(job, content)
+        return error
+
+    setattr(deliver_result, "_hermes_multitenancy_patched", True)
+    scheduler._deliver_result = deliver_result
+    logger.info("[multitenancy] patched cron delivery mirror to owner session")
+
+
+def _mirror_cron_delivery_to_owner(job: dict, content: str) -> None:
+    owner_open_id = str(job.get("owner_open_id") or "").strip()
+    if not owner_open_id.startswith("ou_"):
+        return
+
+    owner_profile = str(job.get("owner_profile") or "").strip()
+    if not owner_profile:
+        try:
+            from . import router
+
+            resolved_profile, profile_home = router._resolve_route(owner_open_id)
+            if profile_home is not None:
+                owner_profile = resolved_profile
+        except Exception:
+            logger.debug("[multitenancy] cron mirror route lookup failed", exc_info=True)
+    if not owner_profile:
+        return
+
+    job_name = str(job.get("name") or job.get("id") or "scheduled task")
+    job_id = str(job.get("id") or "")
+    mirrored_content = (
+        f"[Scheduled task delivery]\n"
+        f"Task: {job_name}\n"
+        f"Job ID: {job_id}\n\n"
+        f"{content}"
+    )
+
+    try:
+        from . import router
+
+        key = (owner_profile, owner_open_id)
+        existing = router._session_history.get(key, [])
+        router._session_history[key] = router._trim_history(
+            existing + [{"role": "assistant", "content": mirrored_content}]
+        )
+        store = router._get_session_store()
+        if store is not None:
+            store.append(owner_profile, owner_open_id, "assistant", mirrored_content)
+        logger.info(
+            "[multitenancy] mirrored cron delivery to profile session profile=%s job=%s",
+            owner_profile,
+            job_id,
+        )
+    except Exception:
+        logger.exception("[multitenancy] failed to mirror cron delivery to owner session")
 
 
 def _patch_feishu_open_id_send() -> None:
