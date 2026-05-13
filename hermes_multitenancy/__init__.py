@@ -79,7 +79,15 @@ def register(ctx) -> None:
 
     override_pool(_build_runtime_pool(_real_factory))
 
+    ctx.register_hook("gateway_startup", _startup_with_worker_init)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
+
+
+def _startup_with_worker_init(**kwargs: Any) -> None:
+    """Start the multi-profile cron worker as soon as the router gateway is ready."""
+    gateway = kwargs.get("gateway")
+    if gateway is not None:
+        ensure_cron_worker_started(gateway)
 
 
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:

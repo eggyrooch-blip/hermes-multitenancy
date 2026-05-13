@@ -46,6 +46,24 @@ async def test_hook_returns_skip_action():
     await asyncio.sleep(0)
 
 
+def test_gateway_startup_hook_starts_cron_worker(monkeypatch):
+    """gateway_startup should initialize profile cron without waiting for Feishu inbound."""
+    import hermes_multitenancy
+
+    calls = []
+    monkeypatch.setattr(
+        hermes_multitenancy,
+        "ensure_cron_worker_started",
+        lambda gateway: calls.append(gateway),
+    )
+    gateway = SimpleNamespace(adapters={"feishu": object()})
+
+    result = hermes_multitenancy._startup_with_worker_init(gateway=gateway)
+
+    assert result is None
+    assert calls == [gateway]
+
+
 @pytest.mark.asyncio
 async def test_hook_schedules_background_task():
     """callback creates a background asyncio task (fire-and-forget)."""
