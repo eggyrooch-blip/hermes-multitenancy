@@ -344,20 +344,45 @@ def _event_with_text(event: Any, text: str) -> Any:
     return cloned
 
 
-def _clean_stream_display_text(text: str) -> str:
+def _clean_stream_display_text(text: str, profile_home: Optional[Path] = None) -> str:
     """Hide native media-delivery directives from visible streaming text."""
     try:
         from gateway.stream_consumer import GatewayStreamConsumer  # type: ignore
 
-        return GatewayStreamConsumer._clean_for_display(text)
+        cleaned = GatewayStreamConsumer._clean_for_display(text)
     except Exception:
         cleaned = str(text or "").replace("[[audio_as_voice]]", "")
         cleaned = re.sub(r'''[`"']?MEDIA:\s*\S+[`"']?''', "", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        return cleaned.rstrip()
+        cleaned = cleaned.rstrip()
+    if profile_home is not None:
+        cleaned = _strip_plain_profile_file_paths_for_display(cleaned, profile_home)
+    return cleaned
 
 
 _MEDIA_DIRECTIVE_RE = re.compile(r'''(?P<prefix>[`"']?MEDIA:\s*)(?P<path>\S+)(?P<suffix>[`"']?)''')
+_PROFILE_FILE_PATH_RE = re.compile(
+    r'''(?P<path>(?:/workspace|/[^`"'<>\n\r]+?)'''
+    r'''\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'''
+    r'''epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|json|md))'''
+)
+_AUTO_FILE_DELIVERY_MAX_BYTES = int(os.getenv("HERMES_MULTITENANCY_AUTO_FILE_DELIVERY_MAX_BYTES", "52428800"))
+_SENSITIVE_PROFILE_FILE_NAMES = {
+    ".env",
+    "auth.json",
+    "config.yaml",
+    "credential-materialization.yaml",
+    "credential-materialization.yml",
+}
+_SENSITIVE_PROFILE_DIR_NAMES = {
+    ".aws",
+    ".config",
+    ".gnupg",
+    ".ssh",
+    "credentials",
+    "feishu_uat",
+    "tokens",
+}
 
 
 async def _deliver_media_from_stream_response(
@@ -371,10 +396,60 @@ async def _deliver_media_from_stream_response(
     deliver = getattr(gateway, "_deliver_media_from_response", None)
     if not callable(deliver):
         return
-    scoped_response = _profile_scoped_media_response(response, profile_home)
+    response_with_files = _append_profile_file_media_directives(response, profile_home)
+    scoped_response = _profile_scoped_media_response(response_with_files, profile_home)
     if "MEDIA:" not in scoped_response:
         return
     await deliver(scoped_response, event, adapter)
+
+
+def _append_profile_file_media_directives(response: str, profile_home: Path) -> str:
+    """Attach profile-local files that the model mentioned as plain paths."""
+    text = str(response or "")
+    if not text:
+        return text
+    root = profile_home.expanduser().resolve(strict=False)
+    media_paths = {match.group("path").strip() for match in _MEDIA_DIRECTIVE_RE.finditer(text)}
+    additions: list[str] = []
+    seen: set[Path] = set()
+    for match in _PROFILE_FILE_PATH_RE.finditer(text):
+        raw_path = match.group("path").strip().rstrip(".,;:)]}")
+        if not raw_path or raw_path in media_paths:
+            continue
+        published = _publish_mentioned_profile_file(raw_path, root)
+        if published is None or published in seen:
+            continue
+        seen.add(published)
+        additions.append(f"MEDIA:{published}")
+    if not additions:
+        return text
+    return f"{text.rstrip()}\n" + "\n".join(additions)
+
+
+def _strip_plain_profile_file_paths_for_display(text: str, profile_home: Path) -> str:
+    """Avoid exposing host absolute paths when the file will be attached."""
+    raw = str(text or "")
+    if not raw:
+        return raw
+    root = profile_home.expanduser().resolve(strict=False)
+
+    def repl(match: re.Match[str]) -> str:
+        raw_path = match.group("path").strip().rstrip(".,;:)]}")
+        if not raw_path:
+            return match.group(0)
+        if _publish_mentioned_profile_file(raw_path, root) is not None:
+            return "[文件已作为附件发送]"
+        candidate = Path(raw_path).expanduser()
+        if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
+            candidate = root / "workspace" / raw_path.removeprefix("/workspace").lstrip("/")
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved.exists() and (resolved == root or root in resolved.parents):
+            return "[受保护文件路径已隐藏]"
+        return match.group(0)
+
+    return _PROFILE_FILE_PATH_RE.sub(repl, raw)
 
 
 def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
@@ -411,6 +486,70 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
         return ""
 
     return _MEDIA_DIRECTIVE_RE.sub(repl, str(response or ""))
+
+
+def _publish_mentioned_profile_file(raw_path: str, profile_home: Path) -> Optional[Path]:
+    if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
+        workspace_relative = raw_path.removeprefix("/workspace").lstrip("/")
+        candidate = profile_home / "workspace" / workspace_relative
+    else:
+        candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = profile_home / candidate
+    source = candidate.resolve(strict=False)
+    if not _is_deliverable_profile_file(source, profile_home):
+        return None
+    workspace_root = (profile_home / "workspace").resolve(strict=False)
+    if source == workspace_root or workspace_root in source.parents:
+        return source
+    target_dir = (workspace_root / "Downloads").resolve(strict=False)
+    target = (target_dir / source.name).resolve(strict=False)
+    if not (target == profile_home or profile_home in target.parents):
+        return None
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if source != target:
+            shutil.copy2(source, target)
+        logger.info(
+            "multitenancy: auto-attached mentioned profile file source=%s target=%s",
+            source,
+            target,
+        )
+        return target
+    except Exception as exc:
+        logger.warning(
+            "multitenancy: failed to auto-attach mentioned profile file source=%s target=%s error=%s",
+            source,
+            target,
+            exc,
+        )
+        return None
+
+
+def _is_deliverable_profile_file(source: Path, profile_home: Path) -> bool:
+    root = profile_home.resolve(strict=False)
+    if not (source.exists() and source.is_file() and root in source.parents):
+        return False
+    try:
+        if source.stat().st_size > _AUTO_FILE_DELIVERY_MAX_BYTES:
+            logger.warning(
+                "multitenancy: skipped auto file delivery for oversized file path=%s size=%s",
+                source,
+                source.stat().st_size,
+            )
+            return False
+    except OSError:
+        return False
+    relative_parts = source.relative_to(root).parts
+    lowered = [part.lower() for part in relative_parts]
+    if any(part in _SENSITIVE_PROFILE_DIR_NAMES for part in lowered[:-1]):
+        logger.warning("multitenancy: blocked auto file delivery for sensitive directory path=%s", source)
+        return False
+    name = lowered[-1] if lowered else ""
+    if name in _SENSITIVE_PROFILE_FILE_NAMES:
+        logger.warning("multitenancy: blocked auto file delivery for sensitive file path=%s", source)
+        return False
+    return True
 
 
 def _resolve_profile_media_artifact(raw_path: str, profile_home: Path) -> Optional[Path]:
@@ -2888,7 +3027,7 @@ async def _stream_into_feishu_shared_consumer(
 
     def _abort_content() -> str:
         raw = content if content else (thinking if thinking else _STREAM_ABORT_FALLBACK)
-        return _clean_stream_display_text(raw)
+        return _clean_stream_display_text(raw, profile_home)
 
     async def _finish_consumer() -> None:
         if consumer_task is None:
@@ -3009,7 +3148,7 @@ async def _stream_into_feishu_shared_consumer(
                     if len(piece) > remaining:
                         piece = piece[:remaining] + _STREAM_TRUNCATION_SUFFIX
                         content = content[:_STREAM_MAX_VISIBLE_CHARS] + _STREAM_TRUNCATION_SUFFIX
-                        consumer.on_delta(piece)
+                        consumer.on_delta(_clean_stream_display_text(piece, profile_home))
                         content_delta_seen = True
                         logger.info(
                             "multitenancy: shared stream content truncated max_chars=%s",
@@ -3017,7 +3156,7 @@ async def _stream_into_feishu_shared_consumer(
                         )
                         break
                     content += piece
-                    consumer.on_delta(piece)
+                    consumer.on_delta(_clean_stream_display_text(piece, profile_home))
                     content_delta_seen = True
             except Exception as exc:
                 logger.info("multitenancy: shared streaming failed (%s) — falling back to non-stream", exc)
@@ -3030,7 +3169,7 @@ async def _stream_into_feishu_shared_consumer(
                         "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
                     )
                 if not content_delta_seen:
-                    consumer.on_delta(_clean_stream_display_text(content))
+                    consumer.on_delta(_clean_stream_display_text(content, profile_home))
                     content_delta_seen = True
         finally:
             _PROFILE_HOME_VAR.reset(token)
@@ -3038,7 +3177,7 @@ async def _stream_into_feishu_shared_consumer(
 
         full = content if content else (thinking if thinking else "(empty response)")
         if not content_delta_seen:
-            consumer.on_delta(_clean_stream_display_text(full))
+            consumer.on_delta(_clean_stream_display_text(full, profile_home))
 
         await _finish_consumer()
         terminal_update_sent = True
@@ -3157,13 +3296,13 @@ async def _stream_into_feishu(
 
     def render() -> str:
         if content:
-            return _clean_stream_display_text(content)
+            return _clean_stream_display_text(content, profile_home)
         preview = thinking[-160:].strip() if thinking else ""
         return f"💭 思考中…\n{preview}" if preview else "💭 思考中…"
 
     def abort_content() -> str:
         raw = content if content else (thinking if thinking else _STREAM_ABORT_FALLBACK)
-        return _clean_stream_display_text(raw)
+        return _clean_stream_display_text(raw, profile_home)
 
     try:
         # Create/send can complete remotely after this task is cancelled. Shield
@@ -3384,7 +3523,7 @@ async def _stream_into_feishu(
             await _stop_idle_card_heartbeat()
 
         full = content if content else (thinking if thinking else "(empty response)")
-        display_full = _clean_stream_display_text(full)
+        display_full = _clean_stream_display_text(full, profile_home)
 
         # 3. Final commit. finalize=True signals end of stream to Feishu.
         try:

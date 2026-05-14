@@ -89,7 +89,7 @@ flowchart LR
 9. **slash 命令不漏进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等走 Hermes gateway handler; skill slash 改写为 Hermes 原生 skill invocation 后进对应 profile 的 agent; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec 按配置处理; unknown slash 返回 Hermes 风格 unknown-command。
 10. **slash handler 有 profile 上下文锁。** gateway/plugin handler 在 `_profile_gateway_context()` 内运行, 串行切换 `HERMES_HOME` 和 gateway session key, 防止并发 slash 串租户。
 11. **本机 exec 默认关闭。** `quick_commands` 的 alias 仍可用; `type: exec` 默认禁用。只有 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 后才允许, 且 exec 继承当前 profile 的 `HERMES_HOME`。生产建议等 profile 沙箱落地后再开。
-12. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。
+12. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。若模型只在回复文本里写出一个真实存在的 profile-local 文件路径，router 会自动复制一个 WebUI 可见副本到 `workspace/Downloads`，把可见卡片里的宿主路径替换为附件提示，并追加内部 `MEDIA:` 指令让飞书直接发文件；`.env`、`auth.json`、`feishu_uat/`、`credentials/`、`tokens/` 等敏感路径会被拦截。
 13. **后台 terminal notify 不是父 gateway 能直接接管的路径。** AIAgent 在子进程内运行, child-local `process_registry` 不会被父 gateway watcher 看到; 当前实现会在每次子进程结束时调用 `agent.close()` 清理这类资源, 避免留下无人管理的后台进程。需要真正支持 `terminal(background=true, notify_on_complete=true)` 时, 应改为父进程托管 process registry, 不能只在 profile 子进程里启用。
 14. **生产推荐策略。** 公司/生产环境建议 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 做白名单路由, `multitenancy.allow_quick_exec=false`, 再叠加 profile 沙箱。沙箱负责 OS 级隔离; 本插件负责路由/session/slash/附件这些应用层边界。
 
