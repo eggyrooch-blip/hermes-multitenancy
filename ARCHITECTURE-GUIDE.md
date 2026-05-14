@@ -26,9 +26,13 @@ sources:
 >
 > `fcd55ac` 把 Feishu app credential 也收进 vault：`_install_feishu_app_db_broker()` patch `tools.feishu_oapi_client._resolve_feishu_credentials()`，优先取全局行 `profile_name=__global__ / subject_id=feishu_app / provider=feishu / secret_kind=app`；用户 UAT 仍按 `profile_name + open_id + provider=feishu + secret_kind=uat` 精确过滤。`_build_subprocess_env()` 不再转发 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOMAIN`，profile `.env` 中这三项也会被过滤。生产 `yaojunhua` canary 已验证 app credential 与 UAT 均从 credential vault 加载，`feishu_get_my_user_info` `error=False`。
 >
+> `7471cac` 补齐 UAT refresh -> vault 同步边：`sync.feishu_org._migrate_feishu_uat_for_employee()` 在把 shared `feishu_uat/<open_id>.json` 复制进 profile-local `feishu_uat/` 时，也 best-effort 写入 `multitenancy_credentials`。这保持 DB credential source 与 OAuth/refresh daemon 产出的 JSON 对齐；缺少 credential key 的旧部署仍保留 JSON copy fallback。
+>
 > `91221d3` 修正 shared model env 继承边界：sandboxed AIAgent 在 bwrap 前会从 shared `~/.hermes/.env` 只继承 `_MODEL_ENV_ALLOWLIST` 中的 provider key/base URL（如 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`），profile-local `.env` 仍可覆盖；若 profile `.env` symlink 到 shared `.env`，同样按 shared allowlist 过滤，避免 `GITLAB_TOKEN` / `PUBLIC_RUNTIME_FLAG` 这类非模型配置进入租户 AIAgent env。Feishu app/UAT 继续由 credential vault 读取，不走 env。生产 `sunke` / `zhanglina` RunBroker canary 已验证 bwrap AIAgent 正常取到模型 key。
 >
 > `69fe59a` 修正 sandbox media 投递兜底：AIAgent/浏览器类工具可能把真实文件保存到 `PROFILE_HOME/home/Downloads/logo.png`，但模型回复仍写 `MEDIA:/tmp/logo/logo.png`。router 仍禁止投递 profile 外路径；只有当同名文件存在于当前 profile 的固定产物目录（`home/Downloads`、`cache/images`、`tmp`、`data`）时，才接受该产物。当前实现会进一步把这类产物发布到 WebUI 可见的 `PROFILE_HOME/workspace/Downloads/<name>`，并让 Feishu `MEDIA:` 也引用这个 workspace 路径；没有 profile 内产物时继续拦截，避免 host `/tmp` 或其他租户文件泄露。
+>
+> `299f0a4` / `00f22a0` 把 Feishu 入站 CSV/XLSX 兼容收敛到 multitenancy router：仍优先调用 Hermes 原生 `gateway._prepare_inbound_message_text()`，仅当上游没有内联本地缓存的表格附件时，由 plugin 用 stdlib 提取小片段追加到模型上下文。`00f22a0` 确保 `media_types` 数量少于 `media_urls` 时仍处理后续附件，并对本地文件、文本预览、XLSX XML member 做大小上限。不要再为 `.csv/.xlsx` 修改 `hermes-agent/gateway/platforms/feishu.py`；升级时只检查这个 plugin fallback 与 upstream 私有方法签名是否仍匹配。
 
 > [!warning] 2026-05-14 generic token runtime compatibility
 > 多租户不再要求 token-bearing skills 为 Hermes 改写专用 storage API。`agent_real._build_subprocess_env()` 把 `HOME`、`WORKSPACE`、`XDG_*`、`TMPDIR` 统一 pivot 到当前 `PROFILE_HOME`，设置 `HERMES_PROFILE` / `KEP_PROFILE`，并把 shared `~/.hermes/bin` 放到 PATH 首位；Linux bwrap 同步把 `PROFILE_HOME/workspace` bind 到 `/workspace`，`hermes-agent` 的 MCP stdio safe env 也允许这些 profile anchor 下传。`agent_real._install_skill_runtime_compat()` 只在 routed AIAgent 子进程内把 OpenClaw/ClawHub 常见的 `{baseDir}` skill 模板变量解释为当前 skill 根目录，不修改 skill 包或 hermes-agent 源码。结果是 ClawHub/Hermes skills hub 的主流玩法（`~/.tool`、XDG cache、MCP env、npx/uvx、`/workspace/credentials`、`{baseDir}/scripts/...`、profile-aware CLI）按当前 routed profile 自然隔离。全员默认 skill 由运行时 `<shared>/.hermes/profile-skill-defaults.yaml` 指向 `<shared>/.hermes/skills/...`，org sync/auto-provision 复制到每个 profile 并跳过 `.env`、`*.token`、`*.secret`、`*.key` 等敏感文件；后续新员工下一次 sync 自动继承。批量/部门级 token 由 `credential_materializer.py` 从 vault 行 `profile_name=__shared__` 按 `credential-materialization.yaml` audience list 写入目标 profile（如 `workspace/credentials/gitlab.token`），`profiles: ["*"]` 表示活跃 routing profile 全量；若 entry 声明 `env: GITLAB_TOKEN`，routed AIAgent 还会从 vault 注入该 env 并注册 terminal/code passthrough，让命令使用 `${GITLAB_TOKEN}` 而不是让模型读取 token 文件。这样避免 OpenClaw 式 per-skill wrapper/fanout。
@@ -1661,6 +1665,8 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | `7471cac` | **fix(uat vault sync)**: Feishu org sync 复制 refreshed UAT JSON 时同步写入 credential vault，避免 DB token 长期滞后 | `生产环境的实况.md` §8 | 顶部 credential vault；§10A |
+| 2026-05-14 | `00f22a0` | **fix(tabular fallback)**: Feishu CSV/XLSX router fallback 不再因 `media_types` 缺项漏附件，并加入本地文件/文本/XLSX XML 大小保护 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
 | 2026-05-14 | `b5c48c6` | **fix(media workspace)**: profile 内生成产物统一发布到 `workspace/Downloads`，Feishu `MEDIA:` 与 WebUI 文件页消费同一位置 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
 | 2026-05-14 | `91221d3` | **fix(model env)**: sandboxed AIAgent 从 shared `.env` 只继承模型 provider allowlist，profile `.env` 可覆盖；Feishu app/UAT 与其他 shared token 不进入 env | `生产环境的实况.md` §8 | 顶部 credential vault；§10A/§13 |
 | 2026-05-14 | `69fe59a` | **fix(media)**: `MEDIA:/tmp/...` 只有在当前 profile 固定产物目录存在同名文件时才改写投递，否则继续拦截 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |

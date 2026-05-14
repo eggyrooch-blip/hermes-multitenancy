@@ -477,6 +477,7 @@ def _migrate_feishu_uat_for_employee(
         pass
     dst = dst_dir / f"{open_id}.json"
     if dst.is_file() and dst.stat().st_mtime >= src.stat().st_mtime:
+        _store_feishu_uat_json_in_vault(profile_home, shared_home, open_id, dst)
         return False
     import shutil
     shutil.copy2(src, dst)
@@ -484,7 +485,44 @@ def _migrate_feishu_uat_for_employee(
         os.chmod(dst, 0o600)
     except OSError:
         pass
+    _store_feishu_uat_json_in_vault(profile_home, shared_home, open_id, dst)
     return True
+
+
+def _store_feishu_uat_json_in_vault(
+    profile_home: Path,
+    shared_home: Path,
+    open_id: str,
+    token_path: Path,
+) -> None:
+    """Best-effort mirror of refreshed Feishu UAT JSON into credential vault."""
+    try:
+        data = json.loads(token_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data.get("access_token"):
+            return
+        scopes = data.get("scopes") or data.get("scope") or []
+        if isinstance(scopes, str):
+            scopes = [part for part in scopes.replace(",", " ").split() if part]
+        expires_at = data.get("expires_at")
+        from hermes_multitenancy.credentials import CredentialStore
+
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            store.put_credential(
+                profile_name=profile_home.name,
+                subject_id=open_id,
+                provider="feishu",
+                secret_kind="uat",
+                payload=data,
+                scopes=scopes,
+                expires_at=int(expires_at) if expires_at else None,
+            )
+        finally:
+            store.close()
+    except Exception:
+        # Credential vault is optional for dry local tests and older installs. The
+        # profile-local JSON copy remains the migration fallback.
+        return
 
 
 def _tighten_dir_mode(path: Path, mode: int) -> None:

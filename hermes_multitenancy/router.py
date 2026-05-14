@@ -16,6 +16,7 @@ import re
 import shutil
 import zipfile
 from contextlib import asynccontextmanager
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
@@ -526,15 +527,17 @@ _TEXT_FILE_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
     ".log", ".xml", ".html", ".htm",
 }
+_MAX_LOCAL_ENRICH_FILE_BYTES = 10 * 1024 * 1024
+_MAX_LOCAL_TEXT_PREVIEW_BYTES = 100_000
+_MAX_XLSX_XML_BYTES = 2 * 1024 * 1024
 
 
 def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> Optional[str]:
     """Plugin-owned fallback for Feishu document attachments Hermes does not inline.
 
-    Hermes core remains the first choice for multimodal preprocessing.  This
-    fallback only covers plain/tabular files that are already cached as local
-    paths on the event, keeping the compatibility logic in multitenancy rather
-    than patching Hermes-agent's Feishu adapter for every upgrade.
+    Hermes core remains the first choice for multimodal preprocessing. This
+    fallback only covers plain/tabular files already cached as local event paths,
+    keeping compatibility in multitenancy instead of patching Hermes-agent.
     """
     media_urls = getattr(event, "media_urls", None) or []
     media_types = getattr(event, "media_types", None) or []
@@ -542,12 +545,18 @@ def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> O
         return None
     existing = str(existing_text or "")
     parts: list[str] = []
-    for raw_path, raw_mtype in zip(media_urls, media_types or [""] * len(media_urls)):
+    for raw_path, raw_mtype in zip_longest(media_urls, media_types, fillvalue=""):
         path = Path(str(raw_path))
         if not path.is_file():
             continue
         name = path.name
         if f"[Content of {name}]" in existing:
+            continue
+        try:
+            if path.stat().st_size > _MAX_LOCAL_ENRICH_FILE_BYTES:
+                logger.debug("multitenancy: local file enrichment skipped oversized file %s", path)
+                continue
+        except OSError:
             continue
         suffix = path.suffix.lower()
         media_type = str(raw_mtype or "").lower()
@@ -555,7 +564,8 @@ def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> O
             if suffix == ".xlsx":
                 content = _extract_xlsx_text(path)
             elif media_type.startswith("text/") or suffix in _TEXT_FILE_EXTENSIONS:
-                content = path.read_text(encoding="utf-8", errors="replace")[:100_000]
+                with path.open("rb") as handle:
+                    content = handle.read(_MAX_LOCAL_TEXT_PREVIEW_BYTES).decode("utf-8", errors="replace")
             else:
                 continue
         except Exception as exc:
@@ -576,35 +586,38 @@ def _extract_xlsx_text(path: Path, *, max_sheets: int = 3, max_rows: int = 50, m
     with zipfile.ZipFile(path) as zf:
         shared_strings: list[str] = []
         if "xl/sharedStrings.xml" in zf.namelist():
-            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            root = ET.fromstring(_read_zip_member_limited(zf, "xl/sharedStrings.xml"))
             for si in root.findall("main:si", ns):
                 texts = [node.text or "" for node in si.findall(".//main:t", ns)]
                 shared_strings.append("".join(texts))
 
         sheet_names: dict[str, str] = {}
         if "xl/workbook.xml" in zf.namelist():
-            workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            workbook = ET.fromstring(_read_zip_member_limited(zf, "xl/workbook.xml"))
             for idx, sheet in enumerate(workbook.findall(".//main:sheet", ns), start=1):
                 rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
                 sheet_names[rel_id or f"rId{idx}"] = sheet.attrib.get("name") or f"sheet{idx}"
 
         rel_targets: list[tuple[str, str]] = []
         if "xl/_rels/workbook.xml.rels" in zf.namelist():
-            rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            rels = ET.fromstring(_read_zip_member_limited(zf, "xl/_rels/workbook.xml.rels"))
             for rel in rels.findall("rel:Relationship", rel_ns):
                 target = rel.attrib.get("Target") or ""
                 if target.startswith("worksheets/"):
                     rel_targets.append((rel.attrib.get("Id") or "", "xl/" + target))
         if not rel_targets:
-            rel_targets = [(f"rId{idx}", name) for idx, name in enumerate(sorted(
-                n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
-            ), start=1)]
+            rel_targets = [
+                (f"rId{idx}", name)
+                for idx, name in enumerate(sorted(
+                    n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+                ), start=1)
+            ]
 
         sections: list[str] = []
         for rel_id, sheet_path in rel_targets[:max_sheets]:
             if sheet_path not in zf.namelist():
                 continue
-            root = ET.fromstring(zf.read(sheet_path))
+            root = ET.fromstring(_read_zip_member_limited(zf, sheet_path))
             rows: list[str] = []
             for row in root.findall(".//main:sheetData/main:row", ns)[:max_rows]:
                 cells: list[str] = []
@@ -620,6 +633,13 @@ def _extract_xlsx_text(path: Path, *, max_sheets: int = 3, max_rows: int = 50, m
             if rows:
                 sections.append(f"[{sheet_names.get(rel_id, rel_id or sheet_path)}]\n" + "\n".join(rows))
         return "\n\n".join(sections)
+
+
+def _read_zip_member_limited(zf: zipfile.ZipFile, name: str) -> bytes:
+    info = zf.getinfo(name)
+    if info.file_size > _MAX_XLSX_XML_BYTES:
+        raise ValueError(f"xlsx member too large: {name}")
+    return zf.read(name)
 
 
 async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
