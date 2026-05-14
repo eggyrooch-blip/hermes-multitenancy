@@ -20,7 +20,7 @@ from typing import Any, Callable, Optional
 
 import yaml
 
-from hermes_multitenancy.routing import DEFAULT_DB_PATH, RoutingTable
+from ..routing import DEFAULT_DB_PATH, RoutingTable
 
 from .feishu_hr import UserSpec, apply_users
 
@@ -416,7 +416,7 @@ def sync_feishu_org(
 
     credential_stats = None
     if materialize_credentials_after_sync and not dry_run:
-        from hermes_multitenancy.credential_materializer import materialize_credentials
+        from ..credential_materializer import materialize_credentials
 
         credential_stats = materialize_credentials(
             shared_home=source_home,
@@ -506,7 +506,7 @@ def _store_feishu_uat_json_in_vault(
         if isinstance(scopes, str):
             scopes = [part for part in scopes.replace(",", " ").split() if part]
         expires_at = data.get("expires_at")
-        from hermes_multitenancy.credentials import CredentialStore
+        from ..credentials import CredentialStore
 
         store = CredentialStore(shared_home / "multitenancy.db")
         try:
