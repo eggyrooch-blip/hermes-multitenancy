@@ -1646,6 +1646,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
 | 2026-05-14 | 本次提交 | **fix(feishu card)**: synthetic session guard 增加 ownership transfer；新消息打断旧 streaming 时，新 dispatch 接管 flush guard，旧任务 cleanup 不再拆掉新消息 guard | `ARCHITECTURE-GUIDE.md` / `生产环境的实况.md` | §12 |
+| 2026-05-14 | 本次提交 | **fix(run broker model env)**: sandboxed AIAgent 的 provider base URL 解析优先读取 profile `.env` / env（如 `ANTHROPIC_BASE_URL`），避免 TokenHub Anthropic-shape 模型误打官方 Anthropic `/v1/chat/completions` 后 404 | `生产环境的实况.md` | §10A / §13 |
 | 2026-05-14 | `0d2504d` | **feat(run broker)**: 新增 opt-in cron run broker seam；`HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时 due job 构造 `RunRequest(channel="cron")` 并通过 `RunBroker.run()` 执行 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A；§15 |
 | 2026-05-14 | `b9da974` | **feat(run broker)**: 新增 WebUI broker HTTP/SSE sidecar endpoint，`HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 时提供 `/api/run-broker/runs`，支持 Bearer shared secret | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | §10A |
 | 2026-05-14 | `efbd4f6` | **feat(run broker)**: full Feishu CardKit streaming 分支也通过 `RunBroker.run(..., admitted=True)` 持有 run lifecycle，内部仍复用 `_stream_into_feishu(...)` | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |

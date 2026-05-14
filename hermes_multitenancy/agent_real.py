@@ -59,6 +59,15 @@ _PROVIDER_BASE_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com",
 }
 
+_PROVIDER_BASE_URL_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "anthropic": ("ANTHROPIC_BASE_URL",),
+    "openai": ("OPENAI_BASE_URL",),
+    "openrouter": ("OPENROUTER_BASE_URL",),
+    "zai": ("ZAI_BASE_URL", "GLM_BASE_URL"),
+    "moonshot": ("MOONSHOT_BASE_URL",),
+    "deepseek": ("DEEPSEEK_BASE_URL",),
+}
+
 
 async def stream_run_agent(  # type: ignore[override]
     event: Any,
@@ -182,7 +191,7 @@ async def _stream_loop(
         api_key = _resolve_api_key(provider, env_overrides, auth)
         if not api_key:
             continue
-        base_url = _resolve_base_url(provider, model_spec == primary, config)
+        base_url = _resolve_base_url(provider, model_spec == primary, config, env_overrides)
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         try:
@@ -300,7 +309,7 @@ async def _legacy_real_run_agent(
             logger.debug("real_run_agent: no API key for provider %s", provider)
             continue
 
-        base_url = _resolve_base_url(provider, model_spec == primary, config)
+        base_url = _resolve_base_url(provider, model_spec == primary, config, env_overrides)
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         try:
@@ -363,12 +372,21 @@ def _resolve_api_key(
     return None
 
 
-def _resolve_base_url(provider: str, is_primary: bool, config: dict[str, Any]) -> Optional[str]:
-    """Resolve the API base URL for *provider*. Primary model honors config.model.base_url."""
+def _resolve_base_url(
+    provider: str,
+    is_primary: bool,
+    config: dict[str, Any],
+    env_overrides: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve the API base URL for *provider*. Primary model honors profile config/env."""
     if is_primary:
         explicit = config.get("model", {}).get("base_url")
         if explicit:
             return explicit
+        for env_name in _PROVIDER_BASE_URL_ENV_KEYS.get(provider, ()):
+            value = (env_overrides or {}).get(env_name) or os.environ.get(env_name)
+            if value:
+                return str(value)
     return _PROVIDER_BASE_URLS.get(provider)
 
 
@@ -1970,7 +1988,7 @@ def _run_with_aiagent(
     if not api_key:
         raise RuntimeError(f"no API key for primary provider {provider!r}")
 
-    base_url = _resolve_base_url(provider, True, config)
+    base_url = _resolve_base_url(provider, True, config, env_overrides)
 
     # 3) Lazy-import hermes core (only when this code path is hit).
     from run_agent import AIAgent
