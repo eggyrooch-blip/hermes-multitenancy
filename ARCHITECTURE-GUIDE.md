@@ -1,6 +1,6 @@
 ---
 title: hermes-multitenancy 架构指南
-updated: 2026-05-14
+updated: 2026-05-15
 status: living
 scope: /Users/kite/code/hermes-multitenancy（plugin 真源；通过 ~/.hermes/plugins/multitenancy symlink 被 hermes-agent 加载）
 audience: 后续 Claude / 用户本人；改这个仓前必读
@@ -38,6 +38,8 @@ sources:
 
 > [!warning] 2026-05-14 generic token runtime compatibility
 > 多租户不再要求 token-bearing skills 为 Hermes 改写专用 storage API。`agent_real._build_subprocess_env()` 把 `HOME`、`WORKSPACE`、`XDG_*`、`TMPDIR` 统一 pivot 到当前 `PROFILE_HOME`，设置 `HERMES_PROFILE` / `KEP_PROFILE`，并把 shared `~/.hermes/bin` 放到 PATH 首位；Linux bwrap 同步把 `PROFILE_HOME/workspace` bind 到 `/workspace`，`hermes-agent` 的 MCP stdio safe env 也允许这些 profile anchor 下传。`agent_real._install_skill_runtime_compat()` 只在 routed AIAgent 子进程内把 OpenClaw/ClawHub 常见的 `{baseDir}` skill 模板变量解释为当前 skill 根目录，不修改 skill 包或 hermes-agent 源码。结果是 ClawHub/Hermes skills hub 的主流玩法（`~/.tool`、XDG cache、MCP env、npx/uvx、`/workspace/credentials`、`{baseDir}/scripts/...`、profile-aware CLI）按当前 routed profile 自然隔离。全员默认 skill 由运行时 `<shared>/.hermes/profile-skill-defaults.yaml` 指向 `<shared>/.hermes/skills/...`，org sync/auto-provision 复制到每个 profile 并跳过 `.env`、`*.token`、`*.secret`、`*.key` 等敏感文件；后续新员工下一次 sync 自动继承。批量/部门级 token 由 `credential_materializer.py` 从 vault 行 `profile_name=__shared__` 按 `credential-materialization.yaml` audience list 写入目标 profile（如 `workspace/credentials/gitlab.token`），`profiles: ["*"]` 表示活跃 routing profile 全量；若 entry 声明 `env: GITLAB_TOKEN`，routed AIAgent 还会从 vault 注入该 env 并注册 terminal/code passthrough，让命令使用 `${GITLAB_TOKEN}` 而不是让模型读取 token 文件。这样避免 OpenClaw 式 per-skill wrapper/fanout。
+>
+> 2026-05-15 生产二次收口：WebUI/Feishu 真实 UAT 暴露出 Hermes terminal/code 子进程还有一层 secret-name scrub，单靠 env passthrough registry 在 routed AIAgent 路径不够稳。`hermes-multitenancy@09cdfdd` 在 credential env 注入时同步设置 `_HERMES_FORCE_<ENV>` plumbing，复用 Hermes local environment builder 的 force-prefix 通道，把 `GITLAB_TOKEN` 还原给 terminal/code 子命令，但不把 `_HERMES_FORCE_*` 本身暴露给 shell。WebUI 会话 `webui_gitlab_visible_20260515_0130` 返回 `WEBUI_GITLAB_ENV_OK LEN=20`；Feishu DM UAT 返回 `FEISHU_GITLAB_ENV_OK LEN=20`；`kep-prd-analysis` 进一步完成 GitLab clone + L1/L2 sparse-checkout + 飞书 PRD 读取。
 
 > [!info] 2026-05-14 全员可进入目标态
 > 生产目标不是灰度 allowlist。Feishu org sync 负责为全员创建/更新 canonical routing/profile；用户自己完成 `feishu_auth` 后即可通过 Feishu bot / WebUI 消费工具。`HERMES_MULTITENANCY_AUTO_PROVISION=0` 只表示不为未知 open_id 创建临时 fallback profile，避免历史 `feishu_ou_*` 残留继续扩散；它不等于人工准入。未命中 routing/profile 时应优先排查 org sync 是否覆盖到该用户，而不是要求人工审批。
