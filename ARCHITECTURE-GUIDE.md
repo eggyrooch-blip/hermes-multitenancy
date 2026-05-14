@@ -1642,7 +1642,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
-| 2026-05-14 | uncommitted | **feat(run broker)**: 新增 WebUI broker HTTP/SSE sidecar endpoint，`HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 时提供 `/api/run-broker/runs`，支持 Bearer shared secret | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | §10A |
+| 2026-05-14 | `b9da974` | **feat(run broker)**: 新增 WebUI broker HTTP/SSE sidecar endpoint，`HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 时提供 `/api/run-broker/runs`，支持 Bearer shared secret | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | §10A |
 | 2026-05-14 | `efbd4f6` | **feat(run broker)**: full Feishu CardKit streaming 分支也通过 `RunBroker.run(..., admitted=True)` 持有 run lifecycle，内部仍复用 `_stream_into_feishu(...)` | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `fc2c05e` | **feat(run broker)**: minimal 非 streaming Feishu adapter 分支通过 `RunBroker.run(..., admitted=True)` 执行真实 `pool.dispatch`；CardKit streaming 仍未迁 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `84dcfee` | **feat(run broker)**: Feishu routed path 构造 `RunRequest(channel="feishu")` 并进入 `RunBroker.admit()`；broker admission 接管 idempotency/sandbox policy，实际 streaming/dispatch 仍在 router | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
