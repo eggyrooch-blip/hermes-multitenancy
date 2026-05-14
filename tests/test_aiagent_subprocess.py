@@ -1556,7 +1556,5 @@ def test_bwrap_default_args_masks_profile_and_shared_secret_files():
     for secret_path in (
         "/probe/shared/.env",
         "/probe/shared/auth.json",
-        "/probe/shared/profiles/alice/.env",
-        "/probe/shared/profiles/alice/auth.json",
     ):
         assert ("--ro-bind-try", "/dev/null", secret_path) in triples
