@@ -68,15 +68,6 @@ def install_feishu_bot_added_hook() -> None:
     FeishuAdapter._on_bot_added_to_chat = wrapped
     _HOOK_INSTALLED = True
     logger.info("[multitenancy] installed bot-added inviter hook on FeishuAdapter class")
-    # Sentinel for diagnostic: confirms register() actually ran in this process.
-    try:
-        from pathlib import Path
-        import os as _os
-        sentinel = Path.home() / ".hermes" / "logs" / "multitenancy-hook-installed.log"
-        sentinel.parent.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text(f"pid={_os.getpid()} at={__import__('time').strftime('%Y-%m-%d %H:%M:%S')}\n")
-    except Exception:
-        pass
 
 
 def _capture_inviter_from_event(data: Any) -> None:
