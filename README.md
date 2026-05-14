@@ -290,7 +290,7 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Reply context (quoted message) | ✅ — same delegate, plus our own `reply_to_text` fallback |
 | Multi-user shared-session attribution | ✅ — same delegate |
 | Tool use (real AIAgent loop with browser/search/shell) | ✅ — via isolated `AIAgent` subprocess bridge |
-| Cron / reminder proactive delivery | ✅ — jobs are written to the shared cron store and delivered by the parent gateway ticker |
+| Cron / reminder proactive delivery | ✅ — WebUI/broker-created jobs default to `deliver=feishu`, are stored in the routed profile cron store, and are executed/delivered by the router multi-profile worker |
 | Dangerous-command approval proactive delivery | ✅ — child `approval_required`/`approval_resolved` → parent stream parser → router Feishu prompt → `/approve`/`/deny` decision file; child-local session env covers terminal worker threads; core terminal guard runs before environment creation |
 | CardKit idle heartbeat | ✅ — parent router prime + heartbeat; does not depend on early child tokens |
 | Background terminal `notify_on_complete` | ⚠️ not claimed — child registry is invisible to the parent gateway; child exit calls `agent.close()` to avoid orphaned background work |

@@ -37,6 +37,8 @@ sources:
 
 > [!info] 2026-05-14 Run Broker jobs API 收口
 > `5d48dcd` 新增 `cron_api.py` 与 `/api/run-broker/jobs`，WebUI chat plane 的 job 创建、列表、修改、删除、暂停、恢复都进入本仓 sidecar，不再要求 `hermes-gateway@sunke.service` profile apiserver 常驻。生产验证时停止 `hermes-gateway@sunke.service`，WebUI BFF 仍能创建并删除 job `0dbd12ced3b1`。`a19f456` / `7d2cf1e` 是本 GUIDE 的 docs-only 同步。
+>
+> `114fd3e` 修正 WebUI/broker cron 创建的服务端默认投递语义：`POST /api/run-broker/jobs` 若未显式传 `deliver`，`cron_api.create_job()` 默认写入 `deliver=feishu`，仍允许显式 `local` 作为调试/本地目标。生产 `yaojunhua` canary `87272ee05aa6` 验证：创建请求未传 `deliver`，返回 job 为 `deliver=feishu`，真实 router worker 输出 `Run Path: RunBroker`，日志记录 `delivered to feishu:ou_ec1d... via live adapter`，并 mirror 到 `multitenancy_sessions(profile=yaojunhua, user_key=ou_ec1d...)`。
 
 ---
 
@@ -1052,6 +1054,8 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 
 `webui_broker_server.py` 是 WebUI 迁移 seam：启用 `HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 后，router gateway 进程内会调度一个 localhost-only aiohttp sidecar，默认监听 `127.0.0.1:8766`，提供 `POST /api/run-broker/runs`。该 endpoint 接收 WebUI 构造的 `RunRequest(channel="webui")`，通过 `RunBroker.run()` 执行，返回 `text/event-stream` 格式的 channel-neutral events。若设置 `HERMES_MULTITENANCY_RUN_BROKER_KEY`，请求必须带 `Authorization: Bearer <key>`；WebUI 侧对应 `HERMES_RUN_BROKER_KEY`。
 
+同一 sidecar 的 `/api/run-broker/jobs` 是 profile-aware cron management API。创建 job 时会强制覆盖 `owner_open_id=user_key` 与 `owner_profile=profile_name`，防止前端伪造 owner；如果请求没传 `deliver`，服务端默认写入 `deliver=feishu`。这是 WebUI cron 的主路径语义：提醒/定时任务默认回投给 Feishu 用户，`local` 只能显式指定。
+
 cron 的 opt-in seam 在 `cron_worker._patch_cron_run_broker()`：plugin register 时 patch `cron.scheduler.run_job`，但只有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时才启用。启用后，due job 先复用 scheduler 的 `_build_job_prompt(job, prerun_script=None)` 得到最终 prompt，再构造 `RunRequest(channel="cron", profile_name, user_key, content, session_id="cron:<job_id>", message_id=<job_id>, credential_subject, requires_host_tools=True)`，通过 `RunBroker.run()` 调 profile runtime，最后返回原 scheduler 期待的 `(success, output_doc, final_response, error)`。`cron.scheduler.tick()` 仍负责 save output、Feishu delivery、mark_job_run 和 repeat/next_run_at 语义。
 
 这不是最终 broker。最终要把现有 `router.handle_async` 的 session history、Feishu renderer、`_stream_into_feishu`、approval bridge、`agent_real.stream_run_agent` 等逐步迁到这个 contract 后面。
@@ -1645,6 +1649,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | `114fd3e` | **fix(cron)**: `/api/run-broker/jobs` 未传 `deliver` 时默认 `feishu`；WebUI cron 不再静默落成本地 output-only job | `生产环境的实况.md` §23 | 顶部 Run Broker jobs；§10A |
 | 2026-05-14 | `fcd55ac` | **fix(feishu vault)**: Feishu app credential 迁入 `multitenancy_credentials` 全局 app 行；AIAgent env 不再转发 app_id/app_secret/domain | `生产环境的实况.md` §22 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | `b2eeb1c` | **fix(feishu retag)**: Run Broker/WebUI profile `state.db` 尚无 `sessions` 表时，`session.source` retag 静默跳过，避免每个工具事件刷 `sqlite3.OperationalError` | `生产环境的实况.md` §21 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | `ae495ae` | **fix(feishu env)**: sandboxed AIAgent 在 app_id/app_secret 存在但缺 `FEISHU_DOMAIN` 时默认补 `feishu`，避免 Feishu tool client 读取被遮蔽的 profile `.env` | `生产环境的实况.md` §21 | 顶部 credential vault；§10A/Run Broker |
