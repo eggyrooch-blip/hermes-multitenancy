@@ -2299,7 +2299,10 @@ def _ensure_auto_profile(
 
 
 def _sync_default_skills_for_profile(profile_home: Path, shared_home: Path) -> None:
-    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+    # Use a relative import so the call works both when the package is loaded
+    # as ``hermes_multitenancy`` (pytest/direct install) and when the Hermes
+    # plugin loader exposes it as ``hermes_plugins.multitenancy.hermes_multitenancy``.
+    from .sync.feishu_org import _sync_default_profile_skills
 
     _sync_default_profile_skills(profile_home, shared_home)
 
