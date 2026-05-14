@@ -32,6 +32,8 @@ sources:
 >
 > `69fe59a` 修正 sandbox media 投递兜底：AIAgent/浏览器类工具可能把真实文件保存到 `PROFILE_HOME/home/Downloads/logo.png`，但模型回复仍写 `MEDIA:/tmp/logo/logo.png`。router 仍禁止投递 profile 外路径；只有当同名文件存在于当前 profile 的固定产物目录（`home/Downloads`、`cache/images`、`tmp`、`data`）时，才接受该产物。当前实现会进一步把这类产物发布到 WebUI 可见的 `PROFILE_HOME/workspace/Downloads/<name>`，并让 Feishu `MEDIA:` 也引用这个 workspace 路径；没有 profile 内产物时继续拦截，避免 host `/tmp` 或其他租户文件泄露。
 >
+> 2026-05-15 追加收口：如果模型没有写 `MEDIA:`，而是在回复文本里直接写出一个当前 profile 内真实存在的文件路径（例如 `.ai-docs/.../*.md`），router 出站层会自动复制一个 WebUI 可见副本到 `PROFILE_HOME/workspace/Downloads/`，把可见卡片里的宿主路径替换为附件提示，并追加内部 `MEDIA:` 指令让 Feishu 直接投递文件。敏感路径仍 fail-closed：`.env`、`auth.json`、`config.yaml`、`feishu_uat/`、`credentials/`、`tokens/`、`.ssh/` 等不会自动发送。
+>
 > `299f0a4` / `00f22a0` 把 Feishu 入站 CSV/XLSX 兼容收敛到 multitenancy router：仍优先调用 Hermes 原生 `gateway._prepare_inbound_message_text()`，仅当上游没有内联本地缓存的表格附件时，由 plugin 用 stdlib 提取小片段追加到模型上下文。`00f22a0` 确保 `media_types` 数量少于 `media_urls` 时仍处理后续附件，并对本地文件、文本预览、XLSX XML member 做大小上限。不要再为 `.csv/.xlsx` 修改 `hermes-agent/gateway/platforms/feishu.py`；升级时只检查这个 plugin fallback 与 upstream 私有方法签名是否仍匹配。
 
 > [!warning] 2026-05-14 generic token runtime compatibility
@@ -1665,6 +1667,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-15 | 本次提交 | **fix(auto file delivery)**: 模型回复里的普通 profile 文件路径自动发布到 `workspace/Downloads` 并经 Feishu 文件投递；敏感路径 fail-closed | `生产环境的实况.md` §8 | 顶部 media/workspace |
 | 2026-05-14 | `7471cac` | **fix(uat vault sync)**: Feishu org sync 复制 refreshed UAT JSON 时同步写入 credential vault，避免 DB token 长期滞后 | `生产环境的实况.md` §8 | 顶部 credential vault；§10A |
 | 2026-05-14 | `00f22a0` | **fix(tabular fallback)**: Feishu CSV/XLSX router fallback 不再因 `media_types` 缺项漏附件，并加入本地文件/文本/XLSX XML 大小保护 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
 | 2026-05-14 | `b5c48c6` | **fix(media workspace)**: profile 内生成产物统一发布到 `workspace/Downloads`，Feishu `MEDIA:` 与 WebUI 文件页消费同一位置 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |

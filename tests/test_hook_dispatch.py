@@ -1244,6 +1244,127 @@ async def test_handle_async_reuses_gateway_media_delivery_after_stream(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_handle_async_auto_delivers_plain_profile_file_path(monkeypatch, tmp_path):
+    """Plain profile-local file paths in replies become Feishu files and WebUI workspace artifacts."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "profiles" / "plain-path-profile"
+    profile_home.mkdir(parents=True)
+    add_spike_route("ou_plain_file", profile_home)
+
+    report = profile_home / ".ai-docs" / "kep-prd-analysis" / "技术方案_AI饮食记录_20260515.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("profile report", encoding="utf-8")
+
+    async def fake_enrich(event, gateway):
+        return "make report"
+
+    async def fake_stream(adapter, chat_id, profile_name, profile_home, event, *, messages=None):
+        return f"done: {report}"
+
+    class FullFeishuAdapter:
+        async def on_processing_start(self, event):
+            return None
+
+        async def on_processing_complete(self, event, outcome):
+            return None
+
+        async def edit_message(self, *args, **kwargs):
+            return None
+
+    delivered = []
+
+    async def deliver_media(response, delivered_event, adapter):
+        delivered.append(response)
+
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+
+    gateway = SimpleNamespace(
+        adapters={"feishu": FullFeishuAdapter()},
+        _deliver_media_from_response=deliver_media,
+    )
+
+    await router_mod.handle_async(event=_build_event(text="make report", user_id="ou_plain_file"), gateway=gateway)
+
+    workspace_report = profile_home / "workspace" / "Downloads" / report.name
+    assert workspace_report.read_text(encoding="utf-8") == "profile report"
+    assert delivered == [f"done: {report}\nMEDIA:{workspace_report.resolve()}"]
+
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_handle_async_does_not_auto_deliver_sensitive_profile_file_path(monkeypatch, tmp_path):
+    """Automatic path delivery must not leak credential or token files."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "profiles" / "sensitive-path-profile"
+    profile_home.mkdir(parents=True)
+    add_spike_route("ou_sensitive_file", profile_home)
+
+    token_file = profile_home / "feishu_uat" / "ou_user.json"
+    token_file.parent.mkdir(parents=True)
+    token_file.write_text('{"access_token":"secret"}', encoding="utf-8")
+
+    async def fake_enrich(event, gateway):
+        return "show token path"
+
+    async def fake_stream(adapter, chat_id, profile_name, profile_home, event, *, messages=None):
+        return f"debug file: {token_file}"
+
+    class FullFeishuAdapter:
+        async def on_processing_start(self, event):
+            return None
+
+        async def on_processing_complete(self, event, outcome):
+            return None
+
+        async def edit_message(self, *args, **kwargs):
+            return None
+
+    delivered = []
+
+    async def deliver_media(response, delivered_event, adapter):
+        delivered.append(response)
+
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+
+    gateway = SimpleNamespace(
+        adapters={"feishu": FullFeishuAdapter()},
+        _deliver_media_from_response=deliver_media,
+    )
+
+    await router_mod.handle_async(event=_build_event(text="show token path", user_id="ou_sensitive_file"), gateway=gateway)
+
+    assert delivered == []
+    assert not (profile_home / "workspace" / "Downloads" / token_file.name).exists()
+
+    clear_spike_routes()
+
+
+def test_plain_profile_file_paths_are_hidden_from_visible_text(tmp_path):
+    """Visible card text should not expose host paths that will be sent as files."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "visible-path-profile"
+    report = profile_home / ".ai-docs" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("report", encoding="utf-8")
+
+    visible = router_mod._clean_stream_display_text(f"saved at {report}", profile_home)
+
+    assert str(report) not in visible
+    assert "[文件已作为附件发送]" in visible
+    assert (profile_home / "workspace" / "Downloads" / "report.md").read_text(encoding="utf-8") == "report"
+
+
+@pytest.mark.asyncio
 async def test_handle_async_blocks_outbound_media_outside_profile(monkeypatch, tmp_path):
     """A tenant must not be able to attach files outside its routed profile home."""
     from hermes_multitenancy import router as router_mod
