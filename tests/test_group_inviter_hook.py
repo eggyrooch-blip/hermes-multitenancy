@@ -195,6 +195,128 @@ def test_install_hook_idempotent():
         group_inviter_hook._HOOK_INSTALLED = False
 
 
+def test_install_hook_patches_chat_added_welcome_for_groups():
+    """The class-level patch must replace _send_chat_added_onboarding with a
+    group-aware wrapper that sends the group message when chat_type is 'group'.
+    """
+    import asyncio
+    from hermes_multitenancy import group_inviter_hook
+    import sys, types
+
+    sent = []
+
+    class FakeFeishuAdapter:
+        def __init__(self):
+            self._chat_info_cache = {}
+
+        async def get_chat_info(self, chat_id):
+            return {"type": "group", "name": "测试群"}
+
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        async def _on_bot_added_to_chat(self, data):
+            return None
+
+        async def _send_chat_added_onboarding(self, chat_id):
+            await self.send(chat_id, "ORIGINAL_P2P_WELCOME")
+
+    fake_module = types.ModuleType("gateway.platforms.feishu")
+    fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
+    parents = ("gateway", "gateway.platforms")
+    saved_parents = {name: sys.modules.get(name) for name in parents}
+    saved_module = sys.modules.get("gateway.platforms.feishu")
+    for name in parents:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules["gateway.platforms.feishu"] = fake_module
+    group_inviter_hook._HOOK_INSTALLED = False
+    original_welcome = FakeFeishuAdapter._send_chat_added_onboarding
+    try:
+        group_inviter_hook.install_feishu_bot_added_hook()
+        assert FakeFeishuAdapter._send_chat_added_onboarding is not original_welcome
+
+        adapter = FakeFeishuAdapter()
+        # Pre-seed cache so the wrapper doesn't have to call get_chat_info
+        adapter._chat_info_cache["oc_group"] = {"type": "group", "name": "测试群"}
+
+        asyncio.run(adapter._send_chat_added_onboarding("oc_group"))
+        assert sent, "wrapper should have sent the group welcome"
+        chat_id, text = sent[-1]
+        assert chat_id == "oc_group"
+        assert "群" in text and "/feishu_auth" in text
+        # Original p2p text MUST NOT have been sent — the wrapper short-circuited
+        assert "ORIGINAL_P2P_WELCOME" not in text
+    finally:
+        FakeFeishuAdapter._send_chat_added_onboarding = original_welcome
+        if saved_module is None:
+            sys.modules.pop("gateway.platforms.feishu", None)
+        else:
+            sys.modules["gateway.platforms.feishu"] = saved_module
+        for name, mod in saved_parents.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        group_inviter_hook._HOOK_INSTALLED = False
+
+
+def test_install_hook_welcome_p2p_falls_through_to_original():
+    """For p2p chats, the wrapper must delegate to the original welcome."""
+    import asyncio
+    from hermes_multitenancy import group_inviter_hook
+    import sys, types
+
+    sent = []
+
+    class FakeFeishuAdapter:
+        def __init__(self):
+            self._chat_info_cache = {}
+
+        async def get_chat_info(self, chat_id):
+            return {"type": "p2p"}
+
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        async def _on_bot_added_to_chat(self, data):
+            return None
+
+        async def _send_chat_added_onboarding(self, chat_id):
+            await self.send(chat_id, "ORIGINAL_P2P_WELCOME_OK")
+
+    fake_module = types.ModuleType("gateway.platforms.feishu")
+    fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
+    parents = ("gateway", "gateway.platforms")
+    saved_parents = {name: sys.modules.get(name) for name in parents}
+    saved_module = sys.modules.get("gateway.platforms.feishu")
+    for name in parents:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules["gateway.platforms.feishu"] = fake_module
+    group_inviter_hook._HOOK_INSTALLED = False
+    original_welcome = FakeFeishuAdapter._send_chat_added_onboarding
+    try:
+        group_inviter_hook.install_feishu_bot_added_hook()
+        adapter = FakeFeishuAdapter()
+        adapter._chat_info_cache["oc_p2p"] = {"type": "p2p"}
+
+        asyncio.run(adapter._send_chat_added_onboarding("oc_p2p"))
+        assert sent == [("oc_p2p", "ORIGINAL_P2P_WELCOME_OK")]
+    finally:
+        FakeFeishuAdapter._send_chat_added_onboarding = original_welcome
+        if saved_module is None:
+            sys.modules.pop("gateway.platforms.feishu", None)
+        else:
+            sys.modules["gateway.platforms.feishu"] = saved_module
+        for name, mod in saved_parents.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        group_inviter_hook._HOOK_INSTALLED = False
+
+
 def test_install_hook_skips_when_module_not_importable():
     """If FeishuAdapter cannot be imported (e.g. in a unit-test process), the
     helper must log + return rather than raise."""
