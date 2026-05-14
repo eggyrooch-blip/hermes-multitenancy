@@ -367,7 +367,7 @@ async def _deliver_media_from_stream_response(
 
 
 def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
-    """Drop MEDIA directives that point outside the routed profile home."""
+    """Drop MEDIA directives outside profile scope and publish artifacts to workspace."""
     root = profile_home.expanduser().resolve(strict=False)
 
     def repl(match: re.Match[str]) -> str:
@@ -377,11 +377,13 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
             candidate = root / candidate
         resolved = candidate.resolve(strict=False)
         if resolved == root or root in resolved.parents:
-            return f"{match.group('prefix')}{resolved}{match.group('suffix')}"
+            workspace_artifact = _publish_profile_media_artifact(resolved, root)
+            deliver_path = workspace_artifact or resolved
+            return f"{match.group('prefix')}{deliver_path}{match.group('suffix')}"
         profile_artifact = _resolve_profile_media_artifact(raw_path, root)
         if profile_artifact is not None:
             logger.info(
-                "multitenancy: rewrote outbound MEDIA to profile artifact path=%s resolved=%s",
+                "multitenancy: rewrote outbound MEDIA to profile workspace artifact path=%s resolved=%s",
                 raw_path,
                 profile_artifact,
             )
@@ -397,7 +399,7 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
 
 
 def _resolve_profile_media_artifact(raw_path: str, profile_home: Path) -> Optional[Path]:
-    """Map tool-reported temp media paths to same-name artifacts inside profile_home."""
+    """Map tool-reported temp media paths to same-name artifacts in the workspace."""
     name = Path(raw_path).name
     if not name:
         return None
@@ -410,8 +412,49 @@ def _resolve_profile_media_artifact(raw_path: str, profile_home: Path) -> Option
     for directory in search_dirs:
         candidate = (directory / name).resolve(strict=False)
         if candidate.exists() and candidate.is_file() and profile_home in candidate.parents:
-            return candidate
+            return _publish_profile_media_artifact(candidate, profile_home)
     return None
+
+
+def _publish_profile_media_artifact(source: Path, profile_home: Path) -> Optional[Path]:
+    """Copy a profile-local generated artifact into the WebUI-visible workspace."""
+    source = source.resolve(strict=False)
+    root = profile_home.resolve(strict=False)
+    if not (source.exists() and source.is_file() and root in source.parents):
+        return None
+    workspace_root = (root / "workspace").resolve(strict=False)
+    if source == workspace_root or workspace_root in source.parents:
+        return source
+    artifact_dirs = (
+        root / "home" / "Downloads",
+        root / "cache" / "images",
+        root / "tmp",
+        root / "data",
+    )
+    source_in_artifacts = any(
+        source == directory.resolve(strict=False)
+        or directory.resolve(strict=False) in source.parents
+        for directory in artifact_dirs
+    )
+    if not source_in_artifacts:
+        return None
+    target_dir = (workspace_root / "Downloads").resolve(strict=False)
+    target = (target_dir / source.name).resolve(strict=False)
+    if not (target == root or root in target.parents):
+        return None
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if source != target:
+            shutil.copy2(source, target)
+        return target
+    except Exception as exc:
+        logger.warning(
+            "multitenancy: failed to publish media artifact to workspace source=%s target=%s error=%s",
+            source,
+            target,
+            exc,
+        )
+        return None
 
 
 async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]:
