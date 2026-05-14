@@ -706,11 +706,11 @@ def _ensure_profile_config(profile_home: Path, *, shared_home: Path) -> bool:
     config_path = profile_home / "config.yaml"
     before = config_path.read_text(encoding="utf-8") if config_path.exists() else None
     if config_path.exists():
-        from hermes_multitenancy.router import _normalize_profile_config_file
+        from ..router import _normalize_profile_config_file
 
         _normalize_profile_config_file(config_path, shared_home=shared_home)
     else:
-        from hermes_multitenancy.router import _dump_profile_config, _profile_config_from_shared_home
+        from ..router import _dump_profile_config, _profile_config_from_shared_home
 
         config_path.write_text(
             _dump_profile_config(_profile_config_from_shared_home(shared_home)),
@@ -721,7 +721,7 @@ def _ensure_profile_config(profile_home: Path, *, shared_home: Path) -> bool:
 
 
 def _ensure_shared_profile_file(profile_home: Path, shared_home: Path, name: str) -> None:
-    from hermes_multitenancy.router import _ensure_shared_profile_file as ensure
+    from ..router import _ensure_shared_profile_file as ensure
 
     ensure(profile_home, shared_home, name)
 
