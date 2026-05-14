@@ -1078,6 +1078,29 @@ def test_build_subprocess_env_forwards_feishu_app_plumbing(monkeypatch, tmp_path
     assert "FEISHU_UAT_REFRESH_TOKEN" not in env
 
 
+def test_build_subprocess_env_defaults_feishu_domain_for_app_plumbing(monkeypatch, tmp_path: Path):
+    """Sandboxed Feishu tools must not read masked .env just to infer the default domain."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.delenv("FEISHU_DOMAIN", raising=False)
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "user-token")
+    monkeypatch.setenv("FEISHU_UAT_REFRESH_TOKEN", "refresh-token")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["FEISHU_APP_ID"] == "cli_test"
+    assert env["FEISHU_APP_SECRET"] == "app-secret"
+    assert env["FEISHU_DOMAIN"] == "feishu"
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+    assert "FEISHU_UAT_REFRESH_TOKEN" not in env
+
+
 def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path: Path):
     """Auth-only profiles still work when auth.json is masked inside bwrap."""
     from hermes_multitenancy import agent_real
