@@ -44,6 +44,7 @@ test = ["pytest>=7", "pytest-asyncio>=0.21"]
 
 [project.scripts]
 hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
+hermes-multitenancy-credentials = "hermes_multitenancy.credential_materializer:main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"

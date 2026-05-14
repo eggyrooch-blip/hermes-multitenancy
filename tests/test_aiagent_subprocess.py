@@ -254,6 +254,102 @@ def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Pa
     ]
 
 
+def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypatch, tmp_path: Path):
+    """OpenClaw/ClawHub skills often use ``{baseDir}``.
+
+    The compatibility belongs in multitenancy's routed runtime so upstream
+    skills can remain unchanged and hermes-agent does not need a local fork
+    patch for every profile-scoped skill convention.
+    """
+    from hermes_multitenancy import agent_real
+
+    calls: list[tuple[str, str | None]] = []
+
+    def original_substitute(content, skill_dir, session_id):
+        calls.append((content, str(skill_dir) if skill_dir else None))
+        return content.replace("${HERMES_SKILL_DIR}", str(skill_dir))
+
+    fake_skill_preprocessing = SimpleNamespace(
+        substitute_template_vars=original_substitute,
+    )
+    fake_skill_commands = SimpleNamespace(
+        _substitute_template_vars=original_substitute,
+    )
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    agent_pkg.skill_preprocessing = fake_skill_preprocessing
+    agent_pkg.skill_commands = fake_skill_commands
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_preprocessing", fake_skill_preprocessing)
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+
+    profile_home = tmp_path / "profile"
+    skill_dir = profile_home / "skills" / "Keep" / "keep-record"
+
+    agent_real._install_skill_runtime_compat(profile_home)
+
+    content = "node {baseDir}/scripts/mcp-call.js and ${HERMES_SKILL_DIR}/README.md"
+    assert fake_skill_preprocessing.substitute_template_vars(content, skill_dir, "s1") == (
+        f"node {skill_dir}/scripts/mcp-call.js and {skill_dir}/README.md"
+    )
+    assert fake_skill_commands._substitute_template_vars(content, skill_dir, "s1") == (
+        f"node {skill_dir}/scripts/mcp-call.js and {skill_dir}/README.md"
+    )
+    assert calls == [
+        (content, str(skill_dir)),
+        (content, str(skill_dir)),
+    ]
+
+
+def test_credential_env_runtime_compat_loads_env_and_registers_passthrough(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [alice]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-test"},
+        )
+    finally:
+        store.close()
+
+    registered: list[list[str]] = []
+    fake_env_passthrough = SimpleNamespace(
+        register_env_passthrough=lambda names: registered.append(list(names)),
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough)
+
+    assert agent_real._credential_env_for_aiagent(profile_home) == {
+        "GITLAB_TOKEN": "glpat-test",
+    }
+
+    agent_real._install_credential_env_passthrough(profile_home)
+
+    assert registered == [["GITLAB_TOKEN"]]
+
+
 @pytest.mark.asyncio
 async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real

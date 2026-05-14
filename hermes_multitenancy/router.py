@@ -14,9 +14,11 @@ import logging
 import os
 import re
 import shutil
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
+from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,14 @@ except Exception:  # pragma: no cover - allows plugin unit tests without gateway
 # Per-user in-flight dispatch tasks — used by /stop to cancel the right task.
 _user_inflight_tasks: dict[str, asyncio.Task] = {}
 _synthetic_session_guards: dict[str, Any] = {}
+
+# Group-chat profile state. Populated by the bot_added hook (Layer 4) and
+# consumed by the auto-provision path. Persistent state lives in the SQLite
+# routing table; this dict only covers the (typically <5s) window between
+# bot_added and the first @mention from the inviter.
+_chat_inviter_cache: dict[str, dict[str, Any]] = {}
+_GROUP_PROFILE_PREFIX = "feishu_group_"
+_GROUP_CHAT_TYPES: frozenset[str] = frozenset({"group", "topic"})
 
 # Multi-turn session memory: maps (profile_name, user_key) → list of messages.
 # user_key is the canonical sender chosen by routing. Alternate IDs are lookup
@@ -481,20 +491,135 @@ async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]
     Returns:
         Enriched text string, or None on failure (caller falls back to event.text).
     """
-    if gateway is None:
-        return None
+    native_text: Optional[str] = None
     prep = getattr(gateway, "_prepare_inbound_message_text", None)
-    if prep is None or not callable(prep):
+    if gateway is None or prep is None or not callable(prep):
         logger.debug("multitenancy: gateway._prepare_inbound_message_text unavailable")
-        return await _local_enrich_with_vision_only(event)
-    source = getattr(event, "source", None)
-    if source is None:
+    else:
+        source = getattr(event, "source", None)
+        if source is not None:
+            try:
+                native_text = await prep(event=event, source=source, history=[])
+            except Exception as exc:
+                logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
+
+    local_file_text = _local_enrich_with_file_content(event, existing_text=native_text or "")
+    if local_file_text:
+        return _append_enrichment(native_text or getattr(event, "text", "") or "", local_file_text)
+
+    if native_text:
+        return native_text
+    return await _local_enrich_with_vision_only(event)
+
+
+def _append_enrichment(base: str, enrichment: str) -> str:
+    base = str(base or "").strip()
+    enrichment = str(enrichment or "").strip()
+    if not enrichment:
+        return base
+    if not base:
+        return enrichment
+    return f"{enrichment}\n{base}"
+
+
+_TEXT_FILE_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
+    ".log", ".xml", ".html", ".htm",
+}
+
+
+def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> Optional[str]:
+    """Plugin-owned fallback for Feishu document attachments Hermes does not inline.
+
+    Hermes core remains the first choice for multimodal preprocessing.  This
+    fallback only covers plain/tabular files that are already cached as local
+    paths on the event, keeping the compatibility logic in multitenancy rather
+    than patching Hermes-agent's Feishu adapter for every upgrade.
+    """
+    media_urls = getattr(event, "media_urls", None) or []
+    media_types = getattr(event, "media_types", None) or []
+    if not media_urls:
         return None
-    try:
-        return await prep(event=event, source=source, history=[])
-    except Exception as exc:
-        logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
-        return await _local_enrich_with_vision_only(event)
+    existing = str(existing_text or "")
+    parts: list[str] = []
+    for raw_path, raw_mtype in zip(media_urls, media_types or [""] * len(media_urls)):
+        path = Path(str(raw_path))
+        if not path.is_file():
+            continue
+        name = path.name
+        if f"[Content of {name}]" in existing:
+            continue
+        suffix = path.suffix.lower()
+        media_type = str(raw_mtype or "").lower()
+        try:
+            if suffix == ".xlsx":
+                content = _extract_xlsx_text(path)
+            elif media_type.startswith("text/") or suffix in _TEXT_FILE_EXTENSIONS:
+                content = path.read_text(encoding="utf-8", errors="replace")[:100_000]
+            else:
+                continue
+        except Exception as exc:
+            logger.debug("multitenancy: local file enrichment failed for %s: %s", path, exc)
+            continue
+        content = content.strip()
+        if content:
+            parts.append(f"[Content of {name}]:\n{content}")
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _extract_xlsx_text(path: Path, *, max_sheets: int = 3, max_rows: int = 50, max_cells: int = 20) -> str:
+    """Extract a small text preview from an XLSX file using only stdlib."""
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rel_ns = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    with zipfile.ZipFile(path) as zf:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root.findall("main:si", ns):
+                texts = [node.text or "" for node in si.findall(".//main:t", ns)]
+                shared_strings.append("".join(texts))
+
+        sheet_names: dict[str, str] = {}
+        if "xl/workbook.xml" in zf.namelist():
+            workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            for idx, sheet in enumerate(workbook.findall(".//main:sheet", ns), start=1):
+                rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                sheet_names[rel_id or f"rId{idx}"] = sheet.attrib.get("name") or f"sheet{idx}"
+
+        rel_targets: list[tuple[str, str]] = []
+        if "xl/_rels/workbook.xml.rels" in zf.namelist():
+            rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            for rel in rels.findall("rel:Relationship", rel_ns):
+                target = rel.attrib.get("Target") or ""
+                if target.startswith("worksheets/"):
+                    rel_targets.append((rel.attrib.get("Id") or "", "xl/" + target))
+        if not rel_targets:
+            rel_targets = [(f"rId{idx}", name) for idx, name in enumerate(sorted(
+                n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+            ), start=1)]
+
+        sections: list[str] = []
+        for rel_id, sheet_path in rel_targets[:max_sheets]:
+            if sheet_path not in zf.namelist():
+                continue
+            root = ET.fromstring(zf.read(sheet_path))
+            rows: list[str] = []
+            for row in root.findall(".//main:sheetData/main:row", ns)[:max_rows]:
+                cells: list[str] = []
+                for cell in row.findall("main:c", ns)[:max_cells]:
+                    value = cell.find("main:v", ns)
+                    raw = value.text if value is not None else ""
+                    if cell.attrib.get("t") == "s" and raw.isdigit():
+                        idx = int(raw)
+                        raw = shared_strings[idx] if idx < len(shared_strings) else raw
+                    cells.append(raw or "")
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                sections.append(f"[{sheet_names.get(rel_id, rel_id or sheet_path)}]\n" + "\n".join(rows))
+        return "\n\n".join(sections)
 
 
 async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
@@ -642,6 +767,21 @@ def _should_defer_gateway_processing_complete(event: Any) -> bool:
     text = getattr(event, "text", "") or ""
     if parse_command(text) is not None:
         return False
+
+    chat_type = _extract_chat_type(event)
+    if _is_group_chat_type(chat_type):
+        chat_id = _extract_chat_id(event)
+        if not chat_id:
+            return False
+        table = _get_routing_table()
+        if table is not None and table.lookup_by_chat_id(chat_id) is not None:
+            return True
+        return (
+            _auto_provision_enabled()
+            and table is not None
+            and chat_id in _chat_inviter_cache
+        )
+
     _profile_name, profile_home = _resolve_route(sender, alt_id=sender_alt)
     if profile_home is not None:
         return True
@@ -682,13 +822,46 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
 
         sender_alt = getattr(source, "user_id_alt", None) if source else None
 
+        # Group-chat profile resolution — when the event is from a group/topic
+        # chat, the route is keyed by chat_id (not the @-er's open_id). This
+        # branch runs before slash-command short-circuit so /status & friends
+        # see the group profile instead of the @-er's private profile.
+        chat_type = _extract_chat_type(event)
+        is_group_chat = _is_group_chat_type(chat_type)
+        group_profile_name: Optional[str] = None
+        group_profile_home: Optional[Path] = None
+        if is_group_chat and chat_id and chat_id != "unknown":
+            group_profile_name, group_profile_home = (
+                await resolve_or_auto_provision_group_route(
+                    chat_id=chat_id, gateway=gateway,
+                )
+            )
+
         # Slash command short-circuit (resolve route first so /status / /new
         # know which profile's history to inspect). When _resolve_route signals
         # a miss with profile_home=None, surface profile_name=None so command
         # handlers reply "未路由" instead of leaking the sender id.
         cmd_pair = parse_command(text)
         if cmd_pair is not None:
-            cmd_profile_name, cmd_profile_home = _resolve_route(sender, alt_id=sender_alt)
+            # Group profiles do not own any UAT — /feishu_auth is hard-rejected
+            # so a curious member can't trigger an OAuth dance that would
+            # store a per-user token under the group's profile_home.
+            if is_group_chat and cmd_pair[0] == "feishu_auth":
+                adapter = _get_feishu_adapter(gateway)
+                if adapter is not None:
+                    await _safe_call(
+                        adapter.send,
+                        chat_id,
+                        "群聊模式下不支持 /feishu_auth。"
+                        "如需以你本人的身份调用飞书数据，请在与我私聊时执行。",
+                    )
+                return
+
+            if is_group_chat:
+                cmd_profile_name = group_profile_name
+                cmd_profile_home = group_profile_home
+            else:
+                cmd_profile_name, cmd_profile_home = _resolve_route(sender, alt_id=sender_alt)
             cmd_profile = cmd_profile_name if cmd_profile_home is not None else None
             skill_handled, skill_reply = _maybe_rewrite_skill_slash_command(
                 cmd_pair,
@@ -720,11 +893,29 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 )
                 return
 
-        # Routing: SQLite table first, then in-memory spike fallback.
-        profile_name, profile_home = _resolve_or_auto_provision_route(sender, alt_id=sender_alt)
-        if profile_home is None:
-            logger.info("multitenancy: no route for sender=%s, ignoring", sender)
-            return
+        # Routing: group already resolved above; sender-based path for p2p.
+        if is_group_chat:
+            profile_name, profile_home = group_profile_name, group_profile_home
+            if profile_home is None:
+                logger.info(
+                    "multitenancy: no group route for chat_id=%s (inviter "
+                    "not captured), ignoring",
+                    chat_id,
+                )
+                adapter = _get_feishu_adapter(gateway)
+                if adapter is not None:
+                    await _safe_call(
+                        adapter.send,
+                        chat_id,
+                        "👋 我还没有这个群的专属 Profile。"
+                        "请移除我后再次拉我进群，让我捕获邀请人身份。",
+                    )
+                return
+        else:
+            profile_name, profile_home = _resolve_or_auto_provision_route(sender, alt_id=sender_alt)
+            if profile_home is None:
+                logger.info("multitenancy: no route for sender=%s, ignoring", sender)
+                return
 
         adapter = _get_feishu_adapter(gateway)
         # Detect whether adapter supports the streaming/reaction APIs we use.
@@ -1701,6 +1892,350 @@ def _auto_profile_name(route_key: str) -> str:
     return f"feishu_{clean}"
 
 
+# -- Group-chat profile routing (Layer 2) -----------------------------------
+
+
+def _extract_chat_type(event: Any) -> str:
+    """Best-effort chat_type extraction.
+
+    Feishu v1 message events expose ``source.chat_type`` (``"p2p"`` |
+    ``"group"`` | ``"topic"``). Some test fixtures and webhook variants only
+    have ``event.chat_type`` or ``event.message.chat_type``. Returns ``""``
+    if nothing is available.
+    """
+    source = getattr(event, "source", None)
+    candidates = (
+        getattr(source, "chat_type", None) if source is not None else None,
+        getattr(event, "chat_type", None),
+        getattr(getattr(event, "message", None), "chat_type", None),
+    )
+    for candidate in candidates:
+        if candidate:
+            return str(candidate).strip().lower()
+    return ""
+
+
+def _extract_chat_id(event: Any) -> str:
+    """Best-effort chat_id extraction with the same fallback chain as feishu.py."""
+    source = getattr(event, "source", None)
+    candidates = (
+        getattr(source, "chat_id", None) if source is not None else None,
+        getattr(source, "parent_chat_id", None) if source is not None else None,
+        getattr(source, "chat_id_alt", None) if source is not None else None,
+        getattr(event, "chat_id", None),
+        getattr(getattr(event, "message", None), "chat_id", None),
+    )
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def _is_group_chat_type(chat_type: str) -> bool:
+    return chat_type.lower() in _GROUP_CHAT_TYPES
+
+
+def _short_chat_id(chat_id: str) -> str:
+    """Return a deterministic short tag for a chat_id, safe in profile names.
+
+    Use a 12-char alnum prefix (after stripping the ``oc_``) plus a 4-char
+    sha1 suffix to keep total length ≤ 22 chars while preserving uniqueness
+    against ~16M chat_ids before collision risk becomes meaningful.
+    """
+    raw = re.sub(r"[^A-Za-z0-9]+", "", str(chat_id or ""))
+    if raw.lower().startswith("oc"):
+        raw = raw[2:]
+    prefix = raw[:12] or "noid"
+    suffix = hashlib.sha1(str(chat_id).encode("utf-8")).hexdigest()[:4]
+    return f"{prefix}_{suffix}"
+
+
+def _make_group_profile_name(chat_id: str) -> str:
+    return f"{_GROUP_PROFILE_PREFIX}{_short_chat_id(chat_id)}"
+
+
+def is_group_profile_name(name: Optional[str]) -> bool:
+    return bool(name) and str(name).startswith(_GROUP_PROFILE_PREFIX)
+
+
+def register_chat_inviter(
+    chat_id: str,
+    inviter_open_id: str,
+    *,
+    chat_name: Optional[str] = None,
+    inviter_display: Optional[str] = None,
+) -> None:
+    """Layer 4 hook entry — cache who pulled the bot into a chat.
+
+    The cache survives only until the first @mention in the chat (or until
+    the process restarts); the durable owner record is the routing row's
+    ``owner_open_id`` column written by ``_provision_group_route``.
+    """
+    if not chat_id or not _is_feishu_open_id(inviter_open_id):
+        return
+    _chat_inviter_cache[chat_id] = {
+        "inviter_open_id": inviter_open_id,
+        "chat_name": chat_name,
+        "inviter_display": inviter_display,
+    }
+
+
+def _resolve_group_inviter_from_cache(chat_id: str) -> Optional[dict[str, Any]]:
+    return _chat_inviter_cache.get(chat_id)
+
+
+async def resolve_or_auto_provision_group_route(
+    *,
+    chat_id: str,
+    gateway: Any,
+) -> tuple[Optional[str], Optional[Path]]:
+    """Resolve a group route by chat_id, auto-provisioning on first use.
+
+    Honors ``HERMES_MULTITENANCY_AUTO_PROVISION`` (same toggle as user routes).
+    Returns ``(profile_name, profile_home)`` on success, ``(None, None)`` if
+    no route exists and provisioning is disabled, or if no inviter was
+    captured for this chat. Inviter identity MUST come from the
+    ``im.chat.member.bot.added_v1.operator_id`` cache entry (see
+    ``register_chat_inviter``); we never fall back to the group's current
+    owner_id because that is not the same person who added the bot.
+    """
+    if not chat_id:
+        return None, None
+    table = _get_routing_table()
+    if table is None:
+        return None, None
+    row = table.lookup_by_chat_id(chat_id)
+    if row is not None:
+        return row.profile_name, _profile_name_to_home(row.profile_name)
+    if not _auto_provision_enabled():
+        return None, None
+    return await _provision_group_route(chat_id=chat_id, gateway=gateway)
+
+
+async def _provision_group_route(
+    *,
+    chat_id: str,
+    gateway: Any,
+) -> tuple[Optional[str], Optional[Path]]:
+    """Create a new group routing row + profile skeleton.
+
+    Returns ``(None, None)`` if no inviter is known for the chat — that is
+    the explicit "refuse silently" path. The caller is responsible for
+    surfacing a user-facing message.
+    """
+    table = _get_routing_table()
+    if table is None:
+        return None, None
+    cached = _resolve_group_inviter_from_cache(chat_id)
+    if not cached or not _is_feishu_open_id(cached.get("inviter_open_id")):
+        logger.warning(
+            "multitenancy: cannot auto-provision group route chat_id=%s "
+            "(bot_added inviter not captured — re-add the bot to retry)",
+            chat_id,
+        )
+        return None, None
+
+    inviter_open_id: str = cached["inviter_open_id"]
+    chat_name: Optional[str] = cached.get("chat_name")
+    inviter_display: Optional[str] = cached.get("inviter_display")
+
+    if not chat_name:
+        chat_name = await _fetch_chat_name(chat_id, gateway) or chat_id
+    if not inviter_display:
+        inviter_display = (
+            await _fetch_user_display(inviter_open_id, gateway) or inviter_open_id
+        )
+
+    display_label = f"{inviter_display}-{chat_name}".strip("-") or chat_id
+    profile_name = _make_group_profile_name(chat_id)
+    profile_home = _profile_name_to_home(profile_name)
+    try:
+        _ensure_group_profile(
+            profile_name=profile_name,
+            profile_home=profile_home,
+            chat_id=chat_id,
+            owner_open_id=inviter_open_id,
+            display_label=display_label,
+        )
+        table.upsert_group(
+            chat_id=chat_id,
+            profile_name=profile_name,
+            owner_open_id=inviter_open_id,
+            display_label=display_label,
+        )
+    except Exception as exc:
+        logger.warning(
+            "multitenancy: failed to provision group route chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
+        return None, None
+
+    logger.info(
+        "multitenancy: auto-provisioned group profile chat_id=%s profile=%s owner=%s",
+        chat_id,
+        profile_name,
+        inviter_open_id,
+    )
+    # Eagerly evict the cache entry so a later bot-removal + re-add cycle
+    # repopulates from the fresh event rather than reusing stale chat_name.
+    _chat_inviter_cache.pop(chat_id, None)
+    return profile_name, profile_home
+
+
+def _ensure_group_profile(
+    *,
+    profile_name: str,
+    profile_home: Path,
+    chat_id: str,
+    owner_open_id: str,
+    display_label: str,
+) -> None:
+    """Create the on-disk profile skeleton for a group profile.
+
+    Mirrors ``_ensure_auto_profile`` for shared config + SOUL.md, but adds a
+    ``group_profile.json`` marker so downstream tools can detect the group
+    context and refuse UAT-dependent operations.
+    """
+    profile_home.mkdir(parents=True, exist_ok=True)
+    shared_home = _shared_home_for_profile(profile_home)
+
+    config_path = profile_home / "config.yaml"
+    if config_path.exists():
+        _normalize_profile_config_file(config_path, shared_home=shared_home)
+    else:
+        config_path.write_text(
+            _dump_profile_config(_profile_config_from_shared_home(shared_home)),
+            encoding="utf-8",
+        )
+
+    soul_path = profile_home / "SOUL.md"
+    if not soul_path.exists():
+        soul_path.write_text(
+            "\n".join(
+                [
+                    f"# Hermes Group Profile {profile_name}",
+                    "",
+                    f"You are a Feishu group-chat agent for chat `{chat_id}`.",
+                    f"This profile is owned by Feishu user `{owner_open_id}` "
+                    f"(display label: `{display_label}`).",
+                    "Identity rules (strict):",
+                    "- 你不能以群成员任何一个个人的身份操作飞书数据。",
+                    "- /feishu_auth 在群聊模式下被禁用，任何用户的 UAT 不会被加载。",
+                    "- 仅响应被 @ 的消息；群里的旁白不要回复。",
+                    "- 该群的对话和记忆与其它群、与个人私聊完全隔离。",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    # Group profiles get an empty feishu_uat/ directory but no per-user JSON;
+    # the marker file below tells UAT helpers to refuse to load user tokens.
+    (profile_home / "feishu_uat").mkdir(parents=True, exist_ok=True, mode=0o700)
+    _sync_default_skills_for_profile(profile_home, shared_home)
+
+    marker_path = profile_home / "group_profile.json"
+    if not marker_path.exists():
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "kind": "group",
+                    "chat_id": chat_id,
+                    "owner_open_id": owner_open_id,
+                    "display_label": display_label,
+                    "feishu_auth_disabled": True,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    # The group profile's home channel IS the group itself. Pre-write
+    # FEISHU_HOME_CHANNEL into .env so the gateway's "no home channel set"
+    # onboarding prompt never fires for a group profile.
+    _write_group_profile_env(profile_home, shared_home, chat_id)
+
+    # .env is owned by us above; auth.json still follows the shared symlink.
+    _ensure_shared_profile_file(profile_home, shared_home, "auth.json")
+
+
+def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str) -> None:
+    """Materialize <profile>/.env inheriting shared values + FEISHU_HOME_CHANNEL.
+
+    Group profiles preempt the gateway's home-channel onboarding prompt by
+    declaring the group chat itself as the home channel. Re-runs are
+    idempotent and overwrite a stale FEISHU_HOME_CHANNEL line.
+    """
+    shared_env = shared_home / ".env"
+    target = profile_home / ".env"
+    base_lines: list[str] = []
+    if shared_env.exists():
+        try:
+            shared_text = shared_env.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.debug(
+                "multitenancy: shared .env unreadable (%s); group .env will only set FEISHU_HOME_CHANNEL",
+                exc,
+            )
+            shared_text = ""
+        base_lines = [
+            line
+            for line in shared_text.splitlines()
+            if not line.lstrip().startswith("FEISHU_HOME_CHANNEL=")
+        ]
+    base_lines.append(f"FEISHU_HOME_CHANNEL={chat_id}")
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    target.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+
+
+async def _fetch_chat_name(chat_id: str, gateway: Any) -> Optional[str]:
+    """Pull chat_name from the live Feishu adapter via its async API."""
+    adapter = _get_feishu_adapter(gateway)
+    getter = getattr(adapter, "get_chat_info", None) if adapter else None
+    if getter is None:
+        return None
+    try:
+        info = await getter(chat_id)
+    except Exception as exc:
+        logger.debug("multitenancy: get_chat_info(%s) failed: %s", chat_id, exc)
+        return None
+    if isinstance(info, dict):
+        for key in ("name", "chat_name", "title"):
+            value = info.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+async def _fetch_user_display(open_id: str, gateway: Any) -> Optional[str]:
+    """Look up a Feishu user's display name through any adapter method
+    that the running Feishu adapter exposes. Tested method names are kept
+    intentionally small — these match the names the adapter and its sync
+    helpers currently expose; new names would need a follow-up edit here."""
+    adapter = _get_feishu_adapter(gateway)
+    for attr in ("get_user_name", "get_user_display", "get_user_info"):
+        fn = getattr(adapter, attr, None)
+        if fn is None:
+            continue
+        try:
+            result = await fn(open_id)
+        except Exception as exc:
+            logger.debug("multitenancy: %s(%s) failed: %s", attr, open_id, exc)
+            continue
+        if isinstance(result, str) and result:
+            return result
+        if isinstance(result, dict):
+            for key in ("name", "display_name", "nickname"):
+                value = result.get(key)
+                if value:
+                    return str(value)
+    return None
+
+
+
 def _ensure_auto_profile(
     profile_name: str,
     profile_home: Path,
@@ -1740,6 +2275,13 @@ def _ensure_auto_profile(
 
     for name in ("auth.json", ".env"):
         _ensure_shared_profile_file(profile_home, shared_home, name)
+    _sync_default_skills_for_profile(profile_home, shared_home)
+
+
+def _sync_default_skills_for_profile(profile_home: Path, shared_home: Path) -> None:
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    _sync_default_profile_skills(profile_home, shared_home)
 
 
 def _shared_home_for_profile(profile_home: Path) -> Path:

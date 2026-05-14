@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
@@ -17,12 +18,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import yaml
+
 from hermes_multitenancy.routing import DEFAULT_DB_PATH, RoutingTable
 
 from .feishu_hr import UserSpec, apply_users
 
 ORG_SYNC_BEGIN = "<!-- BEGIN HERMES MULTITENANCY ORG SYNC -->"
 ORG_SYNC_END = "<!-- END HERMES MULTITENANCY ORG SYNC -->"
+DEFAULT_PROFILE_SKILL_CONFIG_NAMES = (
+    "profile-skill-defaults.yaml",
+    "profile-skill-defaults.yml",
+)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # Subdirectories created inside every profile home. Order is not significant.
@@ -56,6 +63,8 @@ _PROFILE_DIRS = [
     # profile sees only the tokens that belong to its tenant.
     "feishu_uat",
 ]
+_SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
+_SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -377,6 +386,7 @@ def sync_feishu_org(
     source_home: Optional[Path] = None,
     api_delay: float = 0.65,
     soft_delete_missing: Optional[bool] = None,
+    materialize_credentials_after_sync: bool = True,
 ) -> dict[str, Any]:
     """Pull Feishu org data, sync profiles, and reconcile the routing table."""
     snapshot = pull_feishu_org(dept_id, client=client, api_delay=api_delay)
@@ -402,6 +412,17 @@ def sync_feishu_org(
     if snapshot_out and not dry_run:
         snapshot_path = save_snapshot(snapshot, snapshot_out, dept_id=dept_id)
 
+    credential_stats = None
+    if materialize_credentials_after_sync and not dry_run:
+        from hermes_multitenancy.credential_materializer import materialize_credentials
+
+        credential_stats = materialize_credentials(
+            shared_home=source_home,
+            profiles_root=profiles_root,
+            db_path=db_path,
+            dry_run=False,
+        )
+
     return {
         "dry_run": dry_run,
         "departments": snapshot.stats["total_depts"],
@@ -416,6 +437,7 @@ def sync_feishu_org(
         "routes_soft_deleted": route_stats["soft_deleted"],
         "routes_kept": route_stats["kept"],
         "routes_soft_delete_enabled": delete_missing,
+        "credential_materialization": credential_stats,
         "snapshot_path": str(snapshot_path) if snapshot_path else None,
     }
 
@@ -528,10 +550,84 @@ def _sync_one_profile(
     # subprocess for a freshly-synced profile would not find the token even
     # though OAuth had captured it under the shared path.
     _migrate_feishu_uat_for_employee(profile_home, shared_home, employee.open_id)
+    skills_changed = _sync_default_profile_skills(profile_home, shared_home)
 
     if not existed:
         return "created"
-    return "updated" if soul_changed or config_changed else "kept"
+    return "updated" if soul_changed or config_changed or skills_changed else "kept"
+
+
+def _sync_default_profile_skills(profile_home: Path, shared_home: Path) -> bool:
+    changed = False
+    for rel_path in _default_profile_skill_paths(shared_home):
+        src = shared_home / "skills" / rel_path
+        if not src.is_dir():
+            continue
+        dst = profile_home / "skills" / rel_path
+        changed = _copy_skill_tree(src, dst) or changed
+    return changed
+
+
+def _default_profile_skill_paths(shared_home: Path) -> list[Path]:
+    config_path = next((shared_home / name for name in DEFAULT_PROFILE_SKILL_CONFIG_NAMES if (shared_home / name).exists()), None)
+    if config_path is None:
+        return []
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    items = raw.get("skills") or []
+    if not isinstance(items, list):
+        raise ValueError("profile skill defaults config must contain skills: []")
+    result: list[Path] = []
+    for item in items:
+        path = _safe_skill_relative_path(item)
+        if path is not None:
+            result.append(path)
+    return sorted(set(result), key=lambda p: str(p))
+
+
+def _safe_skill_relative_path(value: Any) -> Optional[Path]:
+    raw = str(value or "").strip()
+    path = Path(raw)
+    if not raw or path.is_absolute():
+        return None
+    if any(part in ("", ".", "..") or part.startswith(".") for part in path.parts):
+        return None
+    return path
+
+
+def _copy_skill_tree(src: Path, dst: Path) -> bool:
+    changed = False
+    for item in src.rglob("*"):
+        if item.is_symlink():
+            continue
+        rel = item.relative_to(src)
+        target = dst / rel
+        if item.is_dir():
+            if not target.exists():
+                target.mkdir(parents=True, exist_ok=True)
+                changed = True
+            _tighten_dir_mode(target, 0o700)
+            continue
+        if _is_secret_skill_file(rel):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() or item.read_bytes() != target.read_bytes():
+            shutil.copy2(item, target)
+            changed = True
+    if src.exists() and not dst.exists():
+        dst.mkdir(parents=True, exist_ok=True)
+        changed = True
+    if dst.exists():
+        _tighten_dir_mode(dst, 0o700)
+    return changed
+
+
+def _is_secret_skill_file(rel_path: Path) -> bool:
+    name = rel_path.name.lower()
+    if name in _SKILL_SECRET_FILE_NAMES:
+        return True
+    if name.endswith((".token", ".secret", ".key")):
+        return True
+    return any(part in name for part in _SKILL_SECRET_NAME_PARTS)
 
 
 def _ensure_profile_config(profile_home: Path, *, shared_home: Path) -> bool:

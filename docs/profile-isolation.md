@@ -22,7 +22,7 @@ the trade-offs below.
 | Profile X's subprocess reads profile Y's Feishu UAT from `~/.hermes/feishu_uat/ou_*.json` | ✅ trivially possible via `os.listdir` | ❌ blocked: `FEISHU_UAT_DIR` rebound to `<profile>/feishu_uat/`; the dir only contains the user's own UAT |
 | Parent gateway process leaks `OPENAI_API_KEY` (or any shell-exported secret) to a tenant's subprocess via `os.environ` | ✅ leaked by default (`env = os.environ.copy()`) | ❌ blocked: subprocess env is built from a 18-key allowlist |
 | Other system users running `ls ~/.hermes/profiles/` enumerate the tenant tree | ✅ mode 0755 | ❌ blocked: mode 0700, applied on every sync |
-| A skill that writes a token to `Path.home() / ".myskill"` lands in the shared home | ✅ leaks across profiles | ⚠️ partially: HOME is NOT pivoted (host CLIs like `kep-cli` rely on it); use `skill_storage.write_token()` to land in `<profile>/tokens/` explicitly |
+| A skill/CLI/MCP server that writes a token to `Path.home() / ".myskill"` lands in the shared service user's home | ✅ leaks across profiles | ❌ blocked: `HOME` is pivoted to `<profile>/home`, so unmodified user-token tooling lands inside the routed profile |
 | A skill writes a transient secret to `tempfile.gettempdir()` (`/var/folders/...` on macOS) where another tenant's skill can `os.listdir` it | ✅ leaks | ❌ blocked: `TMPDIR` pivoted to `<profile>/tmp` |
 
 ---
@@ -59,7 +59,8 @@ directory, applied by `_sync_one_profile` on every sync pass):
 │   ├── google_drive.json        # 0600
 │   ├── notion.json              # 0600
 │   └── ...
-├── home/                        # provisioned but NOT used as HOME pivot (see below)
+├── home/                        # HOME
+├── workspace/                   # WORKSPACE and Linux /workspace bind
 ├── cache/                       # XDG_CACHE_HOME
 ├── config/                      # XDG_CONFIG_HOME
 ├── state/                       # XDG_STATE_HOME
@@ -69,28 +70,30 @@ directory, applied by `_sync_one_profile` on every sync pass):
 ├── sessions/                    # hermes session blobs
 ├── skills/                      # per-profile skill copies
 ├── cron/                        # per-profile cronjobs
-└── ...                          # logs, plans, workspace, skins
+└── ...                          # logs, plans, skins
 ```
 
-The five "isolation pivot" directories (`cache`, `config`, `state`,
-`data`, `tmp`) back the env redirect set by
-`agent_real._build_subprocess_env` (XDG_CACHE_HOME, XDG_CONFIG_HOME,
-XDG_STATE_HOME, XDG_DATA_HOME, TMPDIR). They are created at provision time
-so the first AIAgent subprocess spawn does not have to materialise them at
-the umask default (typically 0755) before they are tightened.
+The isolation pivot directories (`home`, `workspace`, `cache`, `config`,
+`state`, `data`, `tmp`) back the env redirect set by
+`agent_real._build_subprocess_env`: `HOME`, `WORKSPACE`, `XDG_CACHE_HOME`,
+`XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME` and `TMPDIR`.
+They are created at provision time so the first AIAgent subprocess spawn
+does not have to materialise them at the umask default (typically 0755)
+before they are tightened.
 
-**`home/` is intentionally NOT used as the HOME env target.** A prior
-iteration of `_build_subprocess_env` rebound `HOME` to `<profile>/home/`
-(modelled after the OpenClaw `keep-record` workspace-bridge pattern), but
-that turned out to be a host/container category error: the OpenClaw pattern
-works inside Docker where the workspace IS the sandbox; this plugin runs as
-a host Python process where `Path.home()` must keep pointing at the real
-user home so host-installed CLI tools (`kep-cli`, `aws`, `gh`, …) can find
-`~/.kep-cli`, `~/.aws`, `~/.config/gh` etc. Skill-level token isolation is
-enforced explicitly via `skill_storage.write_token()` rather than
-implicitly via HOME redirection. The `home/` subdir is still provisioned
-so future per-profile-home features can use it, but the env var is not
-rebound.
+The profile runtime deliberately behaves like a small per-user environment:
+
+* `HOME=<profile>/home` catches ordinary `~/.tool/token.json`,
+  `Path.home()`, npm/npx caches, OAuth dotdirs and CLI state without any
+  skill changes.
+* `WORKSPACE=<profile>/workspace` and, under Linux bwrap, `/workspace`
+  support OpenClaw/ClawHub-style enterprise skills that already look for
+  `/workspace/credentials/...`.
+* `HERMES_PROFILE=<profile_name>` is the generic profile identity. Keep's
+  existing CLI convention also gets `KEP_PROFILE=<profile_name>`.
+* `<shared>/bin` is prepended to `PATH` so Hermes-managed shared binaries
+  are installed once while token/state writes still land under the active
+  profile.
 
 ---
 
@@ -118,10 +121,94 @@ OpenClaw 5/9 incident — `sanitizeEnvVars` is the right pattern.)
 
 ---
 
-## 5. Skill token storage
+## 5. Token-bearing skills, MCP servers and CLIs
 
-Skills caching OAuth tokens or API keys MUST go through
-`hermes_multitenancy.skill_storage`:
+The default compatibility path is runtime-level, not skill-level. Unmodified
+skills, MCP servers and CLI tools should work when they follow the common
+conventions above: `$HOME`, XDG dirs, `$WORKSPACE`, `/workspace`, `$PATH`, or
+profile/env identity.
+
+The routed AIAgent child also installs a small skill-template bridge before
+Hermes core loads skills: `{baseDir}` is expanded to the current skill root,
+matching common OpenClaw/ClawHub packages such as `keep-record`. This bridge
+lives in `agent_real._install_skill_runtime_compat()` and is intentionally not
+a change to the skill package or to hermes-agent.
+
+For group-scoped credentials, keep one encrypted payload in the credential
+vault and let `hermes-multitenancy-sync pull-feishu` materialize only the
+compatibility file into each authorized profile:
+
+```yaml
+# <shared HERMES_HOME>/credential-materialization.yaml
+credentials:
+  - subject_id: kep-prd-analysis
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    profile_file: lists/kep-prd-analysis.txt
+    profiles: [gatekeeper]
+```
+
+The source vault row is `profile_name=__shared__`, `subject_id`/`provider`/
+`secret_kind` from the entry, with payload `{"token": "..."}` by default.
+`profile_file` contains one profile name per line and supports `#` comments.
+Use `profiles: ["*"]` only for company-wide credentials: it expands to active
+`multitenancy_routing` rows at materialization time, so a new employee
+inherits the compatibility file after the next org-sync pass without adding
+their profile name to a static list. Inactive routes are not targeted.
+Targets must stay under `workspace/`, `home/`, or `tokens/`; writes are atomic
+and mode `0600`. Because Linux bwrap binds `PROFILE_HOME/workspace` to
+`/workspace`, existing skills that read `/workspace/credentials/gitlab.token`
+work unchanged. Operators can run the same step directly:
+
+```bash
+hermes-multitenancy-sync materialize-credentials --dry-run
+hermes-multitenancy-sync materialize-credentials
+```
+
+Entries can also declare an env name for skills that already expect a
+conventional variable such as `GITLAB_TOKEN`:
+
+```yaml
+credentials:
+  - subject_id: kep-prd-analysis
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [gatekeeper]
+```
+
+The routed AIAgent process receives `GITLAB_TOKEN` from the vault and
+multitenancy registers that name with Hermes' terminal/code env passthrough,
+so shell commands can use `${GITLAB_TOKEN}` without the model reading or
+printing the token. Hermes-agent output redaction also masks exact values of
+secret-like env vars, so an accidental `echo "$GITLAB_TOKEN"` does not render
+the raw token back to the employee. Agent file tools should not read
+`workspace/credentials/` or `tokens/` directly; those paths are compatibility
+inputs for subprocesses.
+
+Company-default skills are inherited via an operator-managed runtime file, not
+by committing skill payloads or tokens to this repository:
+
+```yaml
+# <shared HERMES_HOME>/profile-skill-defaults.yaml
+skills:
+  - Keep/keep-record
+  - Keep/kep-hades-cli
+  - Keep/kep-prd-analysis
+  - Keep/kep-prd-review
+```
+
+Each listed path is copied from `<shared HERMES_HOME>/skills/` into the
+profile's `skills/` directory during org sync and auto-provisioning. Secret
+files inside the skill source, such as `.env`, `*.token`, `*.secret`,
+`*.key`, and names containing `token`/`secret`/`credential`/`password`, are
+never copied. The token source remains the credential vault plus the runtime
+env/materialization layer above.
+
+For newly written Hermes-native code, `hermes_multitenancy.skill_storage`
+remains the explicit storage API:
 
 ```python
 from hermes_multitenancy.skill_storage import write_token, read_token
@@ -137,8 +224,9 @@ Skill names are validated against `[a-z0-9][a-z0-9._-]{0,62}`. Mixed
 case raises `SkillStorageError` rather than silently lowercasing — this
 prevents `"Google_Drive"` and `"google_drive"` from sharing a file.
 
-If you migrate an upstream skill that hardcodes `Path.home() / ".cache"
-/ "myskill"`, the migration path is:
+You do not need to rewrite upstream skills only to replace `Path.home()`.
+Use `skill_storage` when you are adding a native Hermes integration and want
+a narrow, audited token file under `<profile>/tokens/`:
 
 ```python
 # Before
@@ -358,8 +446,7 @@ policy ... is missing` lines.
 * Prior-art notes:
   * `OpenClaw/排障 — gatekeeper 群聊 kep-prd-analysis 全链路修复 2026-05-08.md`
     — the source of the `sanitizeEnvVars` allowlist pattern
-  * `OpenClaw/keep-record 最终架构 2026-04-24.md` — the HOME pivot
-    pattern (`process.env.HOME = workspace-bridge`). Tried in档 A v1,
-    rolled back because that pattern is container-only — see
-    `架构 — Hermes Profiles 安装 kep-cli 2026-05-07.md` for why a host
-    Python process must keep `Path.home()` at the real user home.
+  * `OpenClaw/keep-record 最终架构 2026-04-24.md` — the HOME/workspace
+    compatibility pattern and `{baseDir}` skill template convention. Hermes
+    now implements these once at profile runtime instead of requiring per-skill
+    wrappers or workspace fanout scripts.

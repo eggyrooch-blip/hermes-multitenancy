@@ -3,13 +3,19 @@
 Schema (per architect-verification.md follow-up + review v2 笔记 D4 修订版):
   - user_id PRIMARY KEY (business key for ops/feishu-sync)
   - profile_name (NOT UNIQUE — guest profile can serve multiple users)
-  - open_id (queryable hot path, UNIQUE among active rows only)
+  - open_id (queryable hot path, UNIQUE among active user rows only)
   - union_id (cross-app stable id, optional)
   - active flag + deleted_at + synced_at + version (soft-delete + sync-staleness)
+  - kind ('user' | 'group') — group rows are per-chat-id profiles
+  - chat_id (UNIQUE among active group rows; NULL for user rows)
+  - owner_open_id (group inviter; NULL for user rows)
+  - display_label (Web UI label like "sunke-IT组"; NULL for user rows)
 
-Read/write contract (per design D6 in review v2):
+Read/write contract (per design D6 in review v2 + group-profile extension):
   - feishu-sync writes user_id / profile_name / open_id / union_id (and version++)
-  - router only updates last_active_at via touch_active(open_id)
+  - router writes group rows via upsert_group()
+  - router only updates last_active_at via touch_active(open_id) for user rows
+    and touch_active_group(chat_id) for group rows.
 """
 from __future__ import annotations
 
@@ -23,11 +29,14 @@ from typing import Optional
 # contend with gateway sessions/pairing/cron writes for the WAL.
 DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
 
+KIND_USER = "user"
+KIND_GROUP = "group"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS multitenancy_routing (
     user_id        TEXT PRIMARY KEY NOT NULL,
     profile_name   TEXT NOT NULL,
-    open_id        TEXT NOT NULL,
+    open_id        TEXT,
     union_id       TEXT,
     active         INTEGER NOT NULL DEFAULT 1,
     deleted_at     INTEGER,
@@ -35,25 +44,70 @@ CREATE TABLE IF NOT EXISTS multitenancy_routing (
     version        INTEGER NOT NULL DEFAULT 1,
     last_active_at INTEGER,
     created_at     INTEGER NOT NULL,
-    updated_at     INTEGER NOT NULL
+    updated_at     INTEGER NOT NULL,
+    kind           TEXT NOT NULL DEFAULT 'user',
+    chat_id        TEXT,
+    owner_open_id  TEXT,
+    display_label  TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_open_id_active
-    ON multitenancy_routing(open_id) WHERE active = 1;
-CREATE INDEX IF NOT EXISTS idx_routing_active_user
-    ON multitenancy_routing(active, user_id);
 """
+
+# Idempotent migrations for databases created by an earlier schema. SQLite
+# does not support `IF NOT EXISTS` on ADD COLUMN, so probe pragma_table_info.
+_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("kind", "TEXT NOT NULL DEFAULT 'user'"),
+    ("chat_id", "TEXT"),
+    ("owner_open_id", "TEXT"),
+    ("display_label", "TEXT"),
+)
+
+# Old (pre-group) index name to drop before recreating a kind-aware version.
+_LEGACY_OPEN_ID_INDEX = "idx_routing_open_id_active"
+
+_NEW_INDEXES = (
+    # User rows: at most one active row per open_id. Group rows are exempt so
+    # multiple group profiles can share NULL/empty open_id.
+    (
+        "idx_routing_open_id_active_user",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_open_id_active_user "
+        "ON multitenancy_routing(open_id) "
+        "WHERE active = 1 AND kind = 'user' AND open_id IS NOT NULL",
+    ),
+    # Group rows: at most one active row per chat_id. User rows are exempt.
+    (
+        "idx_routing_chat_id_active_group",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_chat_id_active_group "
+        "ON multitenancy_routing(chat_id) "
+        "WHERE active = 1 AND kind = 'group' AND chat_id IS NOT NULL",
+    ),
+    (
+        "idx_routing_active_user",
+        "CREATE INDEX IF NOT EXISTS idx_routing_active_user "
+        "ON multitenancy_routing(active, user_id)",
+    ),
+    (
+        "idx_routing_owner_open_id",
+        "CREATE INDEX IF NOT EXISTS idx_routing_owner_open_id "
+        "ON multitenancy_routing(owner_open_id, kind) "
+        "WHERE active = 1 AND owner_open_id IS NOT NULL",
+    ),
+)
 
 
 @dataclass(frozen=True)
 class RoutingRow:
     user_id: str
     profile_name: str
-    open_id: str
+    open_id: Optional[str]
     union_id: Optional[str]
     active: bool
     last_active_at: Optional[int]
     synced_at: int
     version: int
+    kind: str = KIND_USER
+    chat_id: Optional[str] = None
+    owner_open_id: Optional[str] = None
+    display_label: Optional[str] = None
 
 
 class RoutingTable:
@@ -75,28 +129,49 @@ class RoutingTable:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript("PRAGMA journal_mode=WAL;")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring an older DB up to the current schema. Safe to call repeatedly."""
+        cur = self._conn.execute("PRAGMA table_info(multitenancy_routing)")
+        existing_cols = {row["name"] for row in cur.fetchall()}
+        for col_name, col_def in _NEW_COLUMNS:
+            if col_name not in existing_cols:
+                self._conn.execute(
+                    f"ALTER TABLE multitenancy_routing ADD COLUMN {col_name} {col_def}"
+                )
+
+        # Drop the legacy open_id unique index — its predicate doesn't include
+        # `kind`, so it would block group rows that store chat_id in open_id.
+        # The replacement (idx_routing_open_id_active_user) keeps user-row
+        # uniqueness while leaving group rows free.
+        self._conn.execute(f"DROP INDEX IF EXISTS {_LEGACY_OPEN_ID_INDEX}")
+        for _name, sql in _NEW_INDEXES:
+            self._conn.execute(sql)
 
     # -- read path (router) -----------------------------------------------
 
     def lookup_by_open_id(self, open_id: str) -> Optional[RoutingRow]:
-        """Return the active row for open_id, or None if missing/soft-deleted."""
+        """Return the active user row for open_id, or None if missing.
+
+        Restricted to ``kind = 'user'`` so group rows (which may carry an
+        owner's open_id for ACL purposes but are not the lookup key) do not
+        shadow real user routes.
+        """
         cur = self._conn.execute(
-            "SELECT * FROM multitenancy_routing WHERE open_id = ? AND active = 1",
+            "SELECT * FROM multitenancy_routing "
+            "WHERE open_id = ? AND active = 1 AND kind = 'user'",
             (open_id,),
         )
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
     def lookup_by_union_id(self, union_id: str) -> Optional[RoutingRow]:
-        """Return the active row whose union_id column matches.
-
-        The schema has a dedicated union_id column populated by feishu-sync
-        precisely to enable this lookup path; without it _resolve_route would
-        only see the open_id column even when sync stored a stable union_id.
-        """
+        """Return the active user row whose union_id column matches."""
         cur = self._conn.execute(
-            "SELECT * FROM multitenancy_routing WHERE union_id = ? AND active = 1 LIMIT 1",
+            "SELECT * FROM multitenancy_routing "
+            "WHERE union_id = ? AND active = 1 AND kind = 'user' LIMIT 1",
             (union_id,),
         )
         row = cur.fetchone()
@@ -108,8 +183,7 @@ class RoutingTable:
         Closes the third lookup channel: open_id / union_id / user_id. Used
         when sync upstream (e.g. Feishu Contact v3) hands router a stable
         user_id but neither open_id nor union_id, or when callers prefer the
-        canonical PK. Compared to a generic SELECT-by-PK, this filter on
-        active=1 keeps soft-deleted historical rows out of the lookup result.
+        canonical PK.
         """
         cur = self._conn.execute(
             "SELECT * FROM multitenancy_routing WHERE user_id = ? AND active = 1 LIMIT 1",
@@ -118,11 +192,50 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    def lookup_by_chat_id(self, chat_id: str) -> Optional[RoutingRow]:
+        """Return the active group row for chat_id, or None if missing.
+
+        Group profiles are keyed by Feishu ``chat_id`` (``oc_*``). User rows
+        never carry chat_id, so this is restricted to ``kind = 'group'``.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group' LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    def list_by_owner(self, owner_open_id: str, *, kind: str = KIND_GROUP) -> list[RoutingRow]:
+        """Return all active rows belonging to ``owner_open_id``.
+
+        Used by the Web UI to render the set of group profiles a given user
+        (the inviter) is permitted to operate. The owner_open_id is set when
+        a group route is provisioned and is immutable thereafter.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE owner_open_id = ? AND active = 1 AND kind = ? "
+            "ORDER BY created_at ASC",
+            (owner_open_id, kind),
+        )
+        return [_row_to_dataclass(row) for row in cur.fetchall()]
+
     def touch_active(self, open_id: str) -> None:
         """Update last_active_at — router-only, does NOT bump version."""
         self._conn.execute(
-            "UPDATE multitenancy_routing SET last_active_at = ? WHERE open_id = ? AND active = 1",
+            "UPDATE multitenancy_routing SET last_active_at = ? "
+            "WHERE open_id = ? AND active = 1 AND kind = 'user'",
             (_now(), open_id),
+        )
+        self._conn.commit()
+
+    def touch_active_group(self, chat_id: str) -> None:
+        """Update last_active_at for a group row — does NOT bump version."""
+        self._conn.execute(
+            "UPDATE multitenancy_routing SET last_active_at = ? "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
+            (_now(), chat_id),
         )
         self._conn.commit()
 
@@ -136,14 +249,14 @@ class RoutingTable:
         open_id: str,
         union_id: Optional[str] = None,
     ) -> None:
-        """Insert or refresh a route. Bumps version, sets synced_at to now."""
+        """Insert or refresh a USER route. Bumps version, sets synced_at to now."""
         now = _now()
         self._conn.execute(
             """
             INSERT INTO multitenancy_routing
                 (user_id, profile_name, open_id, union_id, active,
-                 synced_at, version, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?)
+                 synced_at, version, created_at, updated_at, kind)
+            VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?, 'user')
             ON CONFLICT(user_id) DO UPDATE SET
                 profile_name = excluded.profile_name,
                 open_id      = excluded.open_id,
@@ -152,14 +265,113 @@ class RoutingTable:
                 deleted_at   = NULL,
                 synced_at    = excluded.synced_at,
                 version      = version + 1,
-                updated_at   = excluded.updated_at
+                updated_at   = excluded.updated_at,
+                kind         = 'user'
             """,
             (user_id, profile_name, open_id, union_id, now, now, now),
         )
         self._conn.commit()
 
+    def upsert_group(
+        self,
+        *,
+        chat_id: str,
+        profile_name: str,
+        owner_open_id: str,
+        display_label: Optional[str] = None,
+    ) -> str:
+        """Insert or refresh a GROUP route keyed by chat_id.
+
+        Returns the synthetic ``user_id`` (``group:<chat_id>``) used as the
+        PRIMARY KEY for the row, so callers can soft-delete by it later.
+
+        ``owner_open_id`` is immutable on a resurrected row — if a row with
+        the same chat_id already exists, owner_open_id is preserved.
+        ``display_label`` is mutable (group renames refresh it).
+        """
+        if not chat_id:
+            raise ValueError("chat_id is required for group routing rows")
+        if not owner_open_id:
+            raise ValueError("owner_open_id is required for group routing rows")
+        synthetic_user_id = f"group:{chat_id}"
+        now = _now()
+        # Two-step: first SELECT to preserve owner_open_id on resurrect; then
+        # INSERT or UPDATE.
+        cur = self._conn.execute(
+            "SELECT owner_open_id, profile_name FROM multitenancy_routing "
+            "WHERE user_id = ? LIMIT 1",
+            (synthetic_user_id,),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            preserved_owner = existing["owner_open_id"] or owner_open_id
+            self._conn.execute(
+                """
+                UPDATE multitenancy_routing SET
+                    profile_name  = ?,
+                    chat_id       = ?,
+                    owner_open_id = ?,
+                    display_label = COALESCE(?, display_label),
+                    active        = 1,
+                    deleted_at    = NULL,
+                    synced_at     = ?,
+                    version       = version + 1,
+                    updated_at    = ?,
+                    kind          = 'group',
+                    open_id       = '',
+                    union_id      = NULL
+                WHERE user_id = ?
+                """,
+                (
+                    profile_name,
+                    chat_id,
+                    preserved_owner,
+                    display_label,
+                    now,
+                    now,
+                    synthetic_user_id,
+                ),
+            )
+        else:
+            self._conn.execute(
+                """
+                INSERT INTO multitenancy_routing
+                    (user_id, profile_name, open_id, union_id, active,
+                     synced_at, version, created_at, updated_at,
+                     kind, chat_id, owner_open_id, display_label)
+                VALUES (?, ?, '', NULL, 1, ?, 1, ?, ?,
+                        'group', ?, ?, ?)
+                """,
+                (
+                    synthetic_user_id,
+                    profile_name,
+                    now,
+                    now,
+                    now,
+                    chat_id,
+                    owner_open_id,
+                    display_label,
+                ),
+            )
+        self._conn.commit()
+        return synthetic_user_id
+
+    def update_display_label(self, chat_id: str, display_label: str) -> bool:
+        """Refresh a group row's display_label (e.g. after group rename).
+
+        Does NOT bump version — display label is a presentation-only field.
+        Returns True if a row was updated.
+        """
+        cur = self._conn.execute(
+            "UPDATE multitenancy_routing SET display_label = ?, updated_at = ? "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
+            (display_label, _now(), chat_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def soft_delete(self, user_id: str) -> bool:
-        """Mark a route as inactive. Returns True if a row was updated."""
+        """Mark a route as inactive (kind-agnostic). Returns True on update."""
         now = _now()
         cur = self._conn.execute(
             """
@@ -172,12 +384,23 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def soft_delete_group(self, chat_id: str) -> bool:
+        """Soft-delete a group row by chat_id. Returns True if a row was updated."""
+        return self.soft_delete(f"group:{chat_id}")
+
     # -- diagnostics -------------------------------------------------------
 
-    def count_active(self) -> int:
-        cur = self._conn.execute(
-            "SELECT COUNT(*) FROM multitenancy_routing WHERE active = 1"
-        )
+    def count_active(self, *, kind: Optional[str] = None) -> int:
+        if kind is None:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM multitenancy_routing WHERE active = 1"
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM multitenancy_routing "
+                "WHERE active = 1 AND kind = ?",
+                (kind,),
+            )
         return int(cur.fetchone()[0])
 
     def close(self) -> None:
@@ -194,6 +417,10 @@ def _row_to_dataclass(row: sqlite3.Row) -> RoutingRow:
         last_active_at=row["last_active_at"],
         synced_at=row["synced_at"],
         version=row["version"],
+        kind=(row["kind"] if "kind" in row.keys() else KIND_USER) or KIND_USER,
+        chat_id=row["chat_id"] if "chat_id" in row.keys() else None,
+        owner_open_id=row["owner_open_id"] if "owner_open_id" in row.keys() else None,
+        display_label=row["display_label"] if "display_label" in row.keys() else None,
     )
 
 

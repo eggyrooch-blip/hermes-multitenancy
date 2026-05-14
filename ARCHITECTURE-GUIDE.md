@@ -30,6 +30,9 @@ sources:
 >
 > `69fe59a` 修正 sandbox media 投递兜底：AIAgent/浏览器类工具可能把真实文件保存到 `PROFILE_HOME/home/Downloads/logo.png`，但模型回复仍写 `MEDIA:/tmp/logo/logo.png`。router 仍禁止投递 profile 外路径；只有当同名文件存在于当前 profile 的固定产物目录（`home/Downloads`、`cache/images`、`tmp`、`data`）时，才接受该产物。当前实现会进一步把这类产物发布到 WebUI 可见的 `PROFILE_HOME/workspace/Downloads/<name>`，并让 Feishu `MEDIA:` 也引用这个 workspace 路径；没有 profile 内产物时继续拦截，避免 host `/tmp` 或其他租户文件泄露。
 
+> [!warning] 2026-05-14 generic token runtime compatibility
+> 多租户不再要求 token-bearing skills 为 Hermes 改写专用 storage API。`agent_real._build_subprocess_env()` 把 `HOME`、`WORKSPACE`、`XDG_*`、`TMPDIR` 统一 pivot 到当前 `PROFILE_HOME`，设置 `HERMES_PROFILE` / `KEP_PROFILE`，并把 shared `~/.hermes/bin` 放到 PATH 首位；Linux bwrap 同步把 `PROFILE_HOME/workspace` bind 到 `/workspace`，`hermes-agent` 的 MCP stdio safe env 也允许这些 profile anchor 下传。`agent_real._install_skill_runtime_compat()` 只在 routed AIAgent 子进程内把 OpenClaw/ClawHub 常见的 `{baseDir}` skill 模板变量解释为当前 skill 根目录，不修改 skill 包或 hermes-agent 源码。结果是 ClawHub/Hermes skills hub 的主流玩法（`~/.tool`、XDG cache、MCP env、npx/uvx、`/workspace/credentials`、`{baseDir}/scripts/...`、profile-aware CLI）按当前 routed profile 自然隔离。全员默认 skill 由运行时 `<shared>/.hermes/profile-skill-defaults.yaml` 指向 `<shared>/.hermes/skills/...`，org sync/auto-provision 复制到每个 profile 并跳过 `.env`、`*.token`、`*.secret`、`*.key` 等敏感文件；后续新员工下一次 sync 自动继承。批量/部门级 token 由 `credential_materializer.py` 从 vault 行 `profile_name=__shared__` 按 `credential-materialization.yaml` audience list 写入目标 profile（如 `workspace/credentials/gitlab.token`），`profiles: ["*"]` 表示活跃 routing profile 全量；若 entry 声明 `env: GITLAB_TOKEN`，routed AIAgent 还会从 vault 注入该 env 并注册 terminal/code passthrough，让命令使用 `${GITLAB_TOKEN}` 而不是让模型读取 token 文件。这样避免 OpenClaw 式 per-skill wrapper/fanout。
+
 > [!info] 2026-05-14 全员可进入目标态
 > 生产目标不是灰度 allowlist。Feishu org sync 负责为全员创建/更新 canonical routing/profile；用户自己完成 `feishu_auth` 后即可通过 Feishu bot / WebUI 消费工具。`HERMES_MULTITENANCY_AUTO_PROVISION=0` 只表示不为未知 open_id 创建临时 fallback profile，避免历史 `feishu_ou_*` 残留继续扩散；它不等于人工准入。未命中 routing/profile 时应优先排查 org sync 是否覆盖到该用户，而不是要求人工审批。
 
@@ -716,15 +719,20 @@ proc = await asyncio.create_subprocess_exec(
     sys.executable,
     str(child_script),       # Path(__file__).with_name("aiagent_subprocess.py")
     stdin=PIPE, stdout=PIPE, stderr=PIPE,
-    env={**os.environ,
-         "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
-         "HERMES_HOME": str(profile_home),
-         "HERMES_GATEWAY_SESSION": "1",
-         "HERMES_EXEC_ASK": "1",
-         "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir)})
+    env=_build_subprocess_env(profile_home, approval_dir=approval_dir)
 ```
 
 **为什么用子进程而不是 `asyncio.to_thread`**：注释明说"避免 gateway-async-loop ↔ AIAgent-sync deadlock"。代价是每次 ~0.5-1s 启动开销。
+
+`_build_subprocess_env` 是 token-bearing skills/MCP/CLI 的通用兼容层：
+
+- 从父 gateway env 只继承 allowlist，避免 `GITLAB_TOKEN` / `OPENAI_API_KEY` 等 ambient secret 泄露。
+- 把 `HOME`、`WORKSPACE`、`XDG_CACHE_HOME`、`XDG_CONFIG_HOME`、`XDG_STATE_HOME`、`XDG_DATA_HOME`、`TMPDIR` 都指到当前 `PROFILE_HOME` 下。
+- 设置 `HERMES_HOME`、`HERMES_SHARED_HOME`、`HERMES_PROFILE`、`KEP_PROFILE`，并把 shared `~/.hermes/bin` 放到 PATH 首位。
+- Linux bwrap 下同时把 `PROFILE_HOME/workspace` bind 到 `/workspace`，让 OpenClaw/ClawHub 风格 `/workspace/credentials/...` 不用改 skill。
+- `_install_skill_runtime_compat()` 在 import `run_agent.AIAgent` 前 patch skill template substitution，把 `{baseDir}` 展开为当前 skill 根目录；这是 multitenancy 子进程内兼容，不改 upstream skill 或 hermes-agent 文件。
+- `profile-skill-defaults.yaml` 存在时，org sync/auto-provision 会从 shared `skills/` 复制默认 skill 到 profile `skills/`，并跳过 secret-looking 文件。
+- `credential-materialization.yaml` 存在时，`pull-feishu` 结束后会把 vault 中的 group token materialize 到授权 profile 的 workspace/home/tokens 目标路径；`profiles: ["*"]` 展开为 active routing profile；若 entry 有 `env`，AIAgent env 同步注入并注册 terminal/code passthrough；也可单独跑 `hermes-multitenancy-sync materialize-credentials`。
 
 `approval_dir = tempfile.mkdtemp(prefix="hermes-mt-approval-")`，finally 里 `shutil.rmtree(ignore_errors=True)`。
 
@@ -1230,7 +1238,7 @@ return {departments, employees, missing_user_id, leaders,
 
 - `~/.hermes/profiles/<profile_name>/`
 - 不存在 → `created`
-- 创建 9 个子目录：`memories sessions skills skins logs plans workspace cron home`
+- 创建 profile 运行时目录：`memories sessions skills skins logs plans workspace cron home cache config state data tmp tokens feishu_uat`
 - `_ensure_profile_config`：`config.yaml` 不存在用 `_profile_config_from_shared_home(shared)` 写一份；存在跑 `_normalize_profile_config_file` 重整（模型前缀、合并 shared `platforms.feishu`）
 - `SOUL.md`：写带 ORG_SYNC_BEGIN/END marker 块的内容（`_render_org_block` 487-506）— profile_name、user_id、open_id、department、role、leader_user_id、direct_subordinates。已有 SOUL → 替换 marker 间内容
 - `auth.json`、`.env`：symlink 到 shared home，失败 copy
@@ -1778,7 +1786,7 @@ StandardError=append:/home/hermes/.hermes/profiles/multitenancy_router/logs/web-
 | Env | 值 | 来源 | 备注 |
 |---|---|---|---|
 | `HERMES_AUTH_MODE` | `feishu-oauth-dev` | webui .env | OAuth 模式 |
-| `FEISHU_APP_ID` | `cli_a97469ad7bfb9bec` | `multitenancy_credentials` global app row；env 仅 fallback | 飞书 app id |
+| `FEISHU_APP_ID` | `cli_***REDACTED***` | `multitenancy_credentials` global app row；env 仅 fallback | 飞书 app id |
 | `FEISHU_APP_SECRET` | (set) | `multitenancy_credentials` global app row；env 仅 fallback | 飞书 app secret，AIAgent env 不转发 |
 | `FEISHU_REDIRECT_URI` | `https://hermes.gotokeep.com/api/auth/feishu/callback` | webui .env | **必须跟飞书 app 后台 callback 白名单完全一致** |
 | `FEISHU_SESSION_SECRET` | (32-byte hex) | webui .env | 签 OAuth state cookie；`openssl rand -hex 32` 生成 |

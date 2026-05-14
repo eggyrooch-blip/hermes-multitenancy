@@ -36,6 +36,30 @@ reports current-profile status:
 It never returns `access_token`, `refresh_token`, API keys, or raw payloads.
 Cross-profile status queries are rejected.
 
+## Group credential materialization
+
+Some existing skills are not vault-aware and expect a filesystem token, for
+example `/workspace/credentials/gitlab.token`. For those cases, keep the raw
+token in this vault once and materialize a profile-local compatibility file for
+the authorized audience:
+
+```yaml
+# <shared HERMES_HOME>/credential-materialization.yaml
+credentials:
+  - subject_id: kep-prd-analysis
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    profile_file: lists/kep-prd-analysis.txt
+```
+
+The source row is `profile_name=__shared__`, and the payload defaults to the
+`token` field. `hermes-multitenancy-sync pull-feishu` runs this step after
+profile sync when the config exists; operators can also run
+`hermes-multitenancy-sync materialize-credentials --dry-run` before applying.
+Generated files stay inside the profile, are written atomically, and are mode
+`0600`.
+
 Feishu UAT migration is read-through:
 
 1. The sandboxed AIAgent asks Feishu tools for the current user's UAT.
