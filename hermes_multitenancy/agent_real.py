@@ -2247,6 +2247,10 @@ def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
     if not db_path.exists():
         return
     with sqlite3.connect(str(db_path)) as conn:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone() is None:
+            return
         cur = conn.execute(
             "UPDATE sessions SET source = 'feishu' WHERE source = 'api_server'"
         )

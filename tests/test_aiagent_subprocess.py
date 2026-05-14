@@ -1101,6 +1101,19 @@ def test_build_subprocess_env_defaults_feishu_domain_for_app_plumbing(monkeypatc
     assert "FEISHU_UAT_REFRESH_TOKEN" not in env
 
 
+def test_mark_session_source_feishu_ignores_state_db_without_sessions_table(tmp_path: Path):
+    """Some Run Broker profiles have a state.db before Hermes core creates sessions."""
+    import sqlite3
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    with sqlite3.connect(profile / "state.db") as conn:
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT)")
+
+    agent_real._mark_session_source_feishu(profile, "session-id")
+
+
 def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path: Path):
     """Auth-only profiles still work when auth.json is masked inside bwrap."""
     from hermes_multitenancy import agent_real
