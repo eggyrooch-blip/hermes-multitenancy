@@ -129,6 +129,31 @@ def test_cron_delivery_mirror_persists_owner_context(tmp_path, monkeypatch):
         store.close()
 
 
+def test_cron_worker_reads_active_profiles_from_routing_db(tmp_path):
+    """Inactive historical profiles should not be scanned for cron jobs."""
+    import sqlite3
+
+    from hermes_multitenancy import cron_worker
+
+    profiles_root = tmp_path / "profiles"
+    profiles_root.mkdir()
+    db_path = tmp_path / "multitenancy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE multitenancy_routing (profile_name TEXT, active INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO multitenancy_routing(profile_name, active) VALUES (?, ?)",
+            ("sunke", 1),
+        )
+        conn.execute(
+            "INSERT INTO multitenancy_routing(profile_name, active) VALUES (?, ?)",
+            ("feishu_ou_old", 0),
+        )
+
+    assert cron_worker._active_cron_profiles(profiles_root) == {"sunke"}
+
+
 @pytest.mark.asyncio
 async def test_hook_schedules_background_task():
     """callback creates a background asyncio task (fire-and-forget)."""

@@ -26,6 +26,7 @@ import asyncio
 import functools
 import logging
 import os
+import sqlite3
 import threading
 import uuid
 from pathlib import Path
@@ -327,6 +328,23 @@ def _resolve_profiles_root() -> Optional[Path]:
     return profile_home.parent
 
 
+def _active_cron_profiles(profiles_root: Path) -> Optional[set[str]]:
+    """Return active routed profile names, or None when no routing DB exists."""
+    db_path = profiles_root.parent / "multitenancy.db"
+    if not db_path.is_file():
+        return None
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT profile_name FROM multitenancy_routing "
+                "WHERE active = 1 AND profile_name IS NOT NULL AND profile_name != ''"
+            ).fetchall()
+    except Exception:
+        logger.exception("[multitenancy] cron worker failed to read active routing profiles")
+        return None
+    return {str(row[0]) for row in rows if row and row[0]}
+
+
 def _multiprofile_cron_worker(
     profiles_root: Path,
     adapters: Any,
@@ -344,8 +362,11 @@ def _multiprofile_cron_worker(
     patch_lock = threading.Lock()
     while not stop_event.is_set():
         try:
+            active_profiles = _active_cron_profiles(profiles_root)
             for profile_dir in sorted(profiles_root.iterdir()):
                 if not profile_dir.is_dir():
+                    continue
+                if active_profiles is not None and profile_dir.name not in active_profiles:
                     continue
                 jobs_file = profile_dir / "cron" / "jobs.json"
                 if not jobs_file.exists():
