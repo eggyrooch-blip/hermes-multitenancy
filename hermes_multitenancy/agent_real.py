@@ -898,29 +898,21 @@ def _build_subprocess_env(
          API keys / OAuth tokens / shell secrets exported into the gateway
          process from leaking into a profile's tool execution.
 
-      2. **XDG / TMPDIR pivot** — XDG cache/config/state/data and TMPDIR
-         redirect into the profile's own directory tree, so a skill that
-         caches via ``XDG_CACHE_HOME`` / ``tempfile.gettempdir()`` writes to
-         ``<profile>/cache/...`` instead of the gateway user's shared cache.
+      2. **Profile compatibility pivots** — HOME, WORKSPACE, XDG
+         cache/config/state/data and TMPDIR redirect into the profile's own
+         directory tree. Token-oriented skills and CLIs that were written for
+         OpenClaw-style ``$HOME`` or ``/workspace`` semantics can therefore run
+         unchanged: ``Path.home() / ".keepai"`` lands in the current profile,
+         ``/workspace/credentials/gitlab.token`` maps to the profile workspace,
+         and CLIs/MCP servers see stable profile identity via ``HERMES_PROFILE``
+         plus ``KEP_PROFILE`` for existing Keep tooling.
 
-    HOME is intentionally **not** pivoted. The plugin runs as a host process
-    (not inside a container), so the user's home directory is the real
-    ``/Users/<user>`` and host-installed CLIs (``kep-cli``, ``aws``, etc.)
-    rely on ``Path.home() / ".kep-cli"`` style paths to find their state.
-    Rebinding HOME would break those tools — see the kep-cli profile
-    convention note (``架构 — Hermes Profiles 安装 kep-cli 2026-05-07.md``)
-    in the Second Brain vault for the lookup pattern. A previous iteration
-    of this helper did rebind HOME (modelled after the OpenClaw
-    ``keep-record`` workspace-bridge pattern), but that pattern applies only
-    inside Docker containers where the workspace IS the sandbox boundary;
-    here HOME stays at the user.
+    Skills that already use :mod:`hermes_multitenancy.skill_storage` continue
+    to work, but it is no longer the only safe path. The multitenancy runtime
+    itself provides the compatibility boundary for unmodified upstream skills.
 
-    Skill-level token isolation is therefore enforced explicitly by
-    :mod:`hermes_multitenancy.skill_storage` (writes always go to
-    ``<HERMES_HOME>/tokens/``) rather than implicitly via HOME redirection.
-
-    The directories ``cache/``, ``config/``, ``state/``, ``data/`` and
-    ``tmp/`` are created on first use (mode 0700).
+    The directories ``home/``, ``workspace/``, ``cache/``, ``config/``,
+    ``state/``, ``data/`` and ``tmp/`` are created on first use (mode 0700).
 
     Profile-local secrets are loaded inside the child by
     :func:`_run_with_aiagent` from ``<profile_home>/.env`` and ``auth.json``;
@@ -935,8 +927,12 @@ def _build_subprocess_env(
     profile_home = profile_home.expanduser()
     env.update(_profile_env_for_aiagent(profile_home))
 
-    # HOME is NOT pivoted (see docstring). Only XDG/TMPDIR redirect.
+    # OpenClaw-compatible token boundary: HOME and /workspace-style variables
+    # point into the routed profile so unmodified token skills do not write to
+    # the shared service user's home.
     pivot = {
+        "HOME":            profile_home / "home",
+        "WORKSPACE":       profile_home / "workspace",
         "XDG_CACHE_HOME":  profile_home / "cache",
         "XDG_CONFIG_HOME": profile_home / "config",
         "XDG_STATE_HOME":  profile_home / "state",
@@ -949,11 +945,19 @@ def _build_subprocess_env(
 
     env["HERMES_HOME"]                      = str(profile_home)
     env["HERMES_SHARED_HOME"]               = str(_resolve_shared_hermes_home(profile_home))
+    env["HERMES_PROFILE"]                   = profile_home.name
+    env["KEP_PROFILE"]                      = profile_home.name
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
+
+    shared_bin = str(_resolve_shared_hermes_home(profile_home) / "bin")
+    existing_path = env.get("PATH", "")
+    path_parts = [part for part in existing_path.split(os.pathsep) if part]
+    if shared_bin not in path_parts:
+        env["PATH"] = os.pathsep.join([shared_bin, *path_parts]) if path_parts else shared_bin
 
     # Mirror _wrap_with_sandbox's toggle + per-profile gate so the subprocess
     # knows it's running inside a sandbox host. tools/approval.py reads
