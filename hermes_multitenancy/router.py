@@ -372,7 +372,11 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
 
     def repl(match: re.Match[str]) -> str:
         raw_path = match.group("path").strip()
-        candidate = Path(raw_path).expanduser()
+        if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
+            workspace_relative = raw_path.removeprefix("/workspace").lstrip("/")
+            candidate = root / "workspace" / workspace_relative
+        else:
+            candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             candidate = root / candidate
         resolved = candidate.resolve(strict=False)
@@ -732,13 +736,21 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             and hasattr(adapter, "on_processing_complete")
         )
 
+        # Multi-modal enrichment must happen before RunRequest admission because
+        # file-only Feishu events have empty event.text.  The enriched content is
+        # the real prompt and the dedupe/admission key should reflect it.
+        enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
+        run_content = enriched_text or text
+        if not run_content and getattr(event, "media_urls", None):
+            run_content = "[media attachment]"
+
         run_request = _run_request_for_routed_event(
             event=event,
             profile_name=profile_name,
             sender=sender,
             sender_alt=sender_alt,
             chat_id=chat_id,
-            text=text,
+            text=run_content,
         )
         from .run_broker import RunRejected
 
@@ -791,12 +803,6 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 await adapter.on_processing_start(event)
             except Exception as exc:
                 logger.debug("multitenancy: on_processing_start failed: %s", exc)
-
-        # Multi-modal enrichment — delegate to hermes' canonical pipeline so
-        # vision (images), STT (audio), text-file inject (.txt/.md/.csv etc.),
-        # reply-context wrapping, and multi-user attribution all behave EXACTLY
-        # like mainstream. Falls back to local vision-only on missing API.
-        enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
 
         # Build the conversation: prior history + current user message (with
         # reply context spliced in). The runner prepends the profile's SOUL.
