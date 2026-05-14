@@ -29,6 +29,38 @@ def _build_event(
     return event
 
 
+def test_profile_scoped_media_response_rewrites_temp_path_to_profile_artifact(tmp_path):
+    """External temp MEDIA tags may point to a profile-scoped browser/download artifact."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    artifact = profile_home / "home" / "Downloads" / "logo.png"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"png")
+
+    response = router_mod._profile_scoped_media_response(
+        "created\nMEDIA:/tmp/logo/logo.png",
+        profile_home,
+    )
+
+    assert response == f"created\nMEDIA:{artifact.resolve()}"
+
+
+def test_profile_scoped_media_response_blocks_temp_path_without_profile_artifact(tmp_path):
+    """Unknown /tmp media stays blocked instead of being delivered from the host."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+
+    response = router_mod._profile_scoped_media_response(
+        "created\nMEDIA:/tmp/logo/logo.png",
+        profile_home,
+    )
+
+    assert response == "created\n"
+
+
 @pytest.mark.asyncio
 async def test_hook_returns_skip_action():
     """callback returns {action: skip} so Hermes main flow halts."""

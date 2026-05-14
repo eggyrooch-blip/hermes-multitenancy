@@ -378,6 +378,14 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
         resolved = candidate.resolve(strict=False)
         if resolved == root or root in resolved.parents:
             return f"{match.group('prefix')}{resolved}{match.group('suffix')}"
+        profile_artifact = _resolve_profile_media_artifact(raw_path, root)
+        if profile_artifact is not None:
+            logger.info(
+                "multitenancy: rewrote outbound MEDIA to profile artifact path=%s resolved=%s",
+                raw_path,
+                profile_artifact,
+            )
+            return f"{match.group('prefix')}{profile_artifact}{match.group('suffix')}"
         logger.warning(
             "multitenancy: blocked outbound MEDIA outside profile home path=%s profile_home=%s",
             raw_path,
@@ -386,6 +394,24 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
         return ""
 
     return _MEDIA_DIRECTIVE_RE.sub(repl, str(response or ""))
+
+
+def _resolve_profile_media_artifact(raw_path: str, profile_home: Path) -> Optional[Path]:
+    """Map tool-reported temp media paths to same-name artifacts inside profile_home."""
+    name = Path(raw_path).name
+    if not name:
+        return None
+    search_dirs = (
+        profile_home / "home" / "Downloads",
+        profile_home / "cache" / "images",
+        profile_home / "tmp",
+        profile_home / "data",
+    )
+    for directory in search_dirs:
+        candidate = (directory / name).resolve(strict=False)
+        if candidate.exists() and candidate.is_file() and profile_home in candidate.parents:
+            return candidate
+    return None
 
 
 async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]:
