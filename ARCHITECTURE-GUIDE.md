@@ -23,6 +23,11 @@ sources:
 
 > [!warning] 2026-05-14 credential vault
 > `51044dc` 新增 `hermes_multitenancy.credentials.CredentialStore` 与 `multitenancy_credentials` 表，用 dedicated credential rows 存 Feishu UAT / provider token metadata + encrypted payload，不把 token 混进 routing table。`credential_tool.py` 注册的是 status-only 诊断工具，只返回 provider、subject、scope、expires_at、status、storage，不返回 access_token/refresh_token/api_key。`agent_real._install_feishu_uat_db_broker()` 会优先从 DB 取当前 profile/open_id 的 Feishu UAT；缺失时兼容读取 profile-local JSON 并写入 DB。生产 router gateway 通过 systemd drop-in 提供 `HERMES_MULTITENANCY_CREDENTIAL_KEY`，该 key 只作为 AIAgent 子进程 plumbing 透传，terminal/code subprocess 仍按 secret-name 过滤。
+>
+> 追加本轮修复后，`agent_real._build_subprocess_env()` 明确把 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOMAIN` 作为 app-level plumbing 透传给 sandboxed AIAgent。原因是 Feishu tool client 需要 app 配置才能再按 profile/open_id 加载用户 UAT；这些值不是用户 UAT。`FEISHU_UAT_ACCESS_TOKEN` / `FEISHU_UAT_REFRESH_TOKEN` 仍不在 allowlist，必须留在 profile-local `feishu_uat` 或 credential vault。
+
+> [!info] 2026-05-14 全员可进入目标态
+> 生产目标不是灰度 allowlist。Feishu org sync 负责为全员创建/更新 canonical routing/profile；用户自己完成 `feishu_auth` 后即可通过 Feishu bot / WebUI 消费工具。`HERMES_MULTITENANCY_AUTO_PROVISION=0` 只表示不为未知 open_id 创建临时 fallback profile，避免历史 `feishu_ou_*` 残留继续扩散；它不等于人工准入。未命中 routing/profile 时应优先排查 org sync 是否覆盖到该用户，而不是要求人工审批。
 
 > [!warning] 2026-05-14 Feishu inbound duplicate guard
 > 真实 Feishu DM canary 后发现：同一会话中旧长任务可能被 Feishu/WebSocket flush 或事件重投递再次送入 router，绕过仅内存态的 `_active_sessions` guard，重新启动 `bwrap -> aiagent_subprocess.py`。本仓新增 `multitenancy_processed_events` 表：优先按 Feishu `message_id` 做 24h 持久化去重；无稳定 `message_id` 时，对 40 字以上 normalized prompt 做 2h hash fallback。去重发生在 route 命中之后、in-flight cancellation 与 sandbox 子进程启动之前；slash command 不走这条去重。
