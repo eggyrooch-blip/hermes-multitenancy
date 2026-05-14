@@ -1142,6 +1142,25 @@ def _install_credential_env_passthrough(profile_home: Path) -> None:
         logger.debug("[multitenancy] credential env passthrough skipped", exc_info=True)
 
 
+def _apply_runtime_env_for_aiagent(profile_home: Path):
+    """Temporarily expose profile/credential env for in-process AIAgent runs."""
+    runtime_env = _profile_env_for_aiagent(profile_home)
+    runtime_env.update(_credential_env_for_aiagent(profile_home))
+    if not runtime_env:
+        return lambda: None
+    old_env = {key: os.environ.get(key) for key in runtime_env}
+    os.environ.update(runtime_env)
+
+    def _cleanup() -> None:
+        for key, old_value in old_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+    return _cleanup
+
+
 def _install_skill_runtime_compat(profile_home: Path) -> None:
     """Install profile-scoped skill template compatibility in the AIAgent child.
 
@@ -2422,6 +2441,7 @@ def _run_with_aiagent(
             event_sink,
             str(gateway_session_key),
         )
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
         agent = AIAgent(**agent_kwargs)
         try:
             run_kwargs: dict[str, Any] = {
@@ -2436,6 +2456,7 @@ def _run_with_aiagent(
             # parent process re-runs it post-done with full write access.
             _retag_source_now("finally-pre-close")
             approval_cleanup()
+            runtime_env_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)
             try:
