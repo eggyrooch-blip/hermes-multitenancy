@@ -439,7 +439,94 @@ def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> P
     profile_uat_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     feishu_oapi_module.FEISHU_UAT_PATH = profile_home / "feishu_uat.json"
     feishu_oapi_module.FEISHU_UAT_DIR = profile_uat_dir
+    _install_feishu_uat_db_broker(feishu_oapi_module, profile_home, shared_home)
     return shared_home
+
+
+def _install_feishu_uat_db_broker(feishu_oapi_module: Any, profile_home: Path, shared_home: Path) -> None:
+    """Patch Feishu UAT loading to prefer the multitenancy credential vault.
+
+    This is a read-through migration bridge: existing profile-local JSON files
+    keep working, but successful reads are copied into ``multitenancy.db`` as
+    sealed credential rows.  Once production canaries prove parity, JSON can be
+    demoted to a migration-only fallback.
+    """
+    original = getattr(feishu_oapi_module, "_hermes_mt_original_load_uat", None)
+    if original is None:
+        original = getattr(feishu_oapi_module, "_load_uat", None)
+        if original is None:
+            return
+        setattr(feishu_oapi_module, "_hermes_mt_original_load_uat", original)
+
+    def _load_uat_with_broker(open_id: Optional[str] = None) -> dict:
+        if open_id:
+            from .credentials import CredentialStore
+
+            try:
+                store = CredentialStore(shared_home / "multitenancy.db")
+                status = store.get_status(
+                    profile_name=profile_home.name,
+                    subject_id=open_id,
+                    provider="feishu",
+                    secret_kind="uat",
+                )
+                if status.get("status") == "valid":
+                    payload = store.get_secret_for_runtime(
+                        profile_name=profile_home.name,
+                        subject_id=open_id,
+                        provider="feishu",
+                        secret_kind="uat",
+                    )
+                    if status.get("expires_at") is not None and "expires_at" not in payload:
+                        payload["expires_at"] = status["expires_at"]
+                    store.close()
+                    logger.info(
+                        "[multitenancy] loaded Feishu UAT from credential vault profile=%s subject=%s",
+                        profile_home.name,
+                        open_id,
+                    )
+                    return payload
+                store.close()
+            except Exception:
+                logger.debug(
+                    "[multitenancy] Feishu UAT credential vault lookup skipped",
+                    exc_info=True,
+                )
+
+        data = original(open_id)
+        if open_id and isinstance(data, dict) and data.get("access_token"):
+            _store_feishu_uat_payload(shared_home, profile_home.name, open_id, data)
+        return data
+
+    feishu_oapi_module._load_uat = _load_uat_with_broker
+
+
+def _store_feishu_uat_payload(shared_home: Path, profile_name: str, open_id: str, data: dict[str, Any]) -> None:
+    try:
+        from .credentials import CredentialStore
+
+        scopes = data.get("scopes") or data.get("scope") or []
+        if isinstance(scopes, str):
+            scopes = [part for part in scopes.replace(",", " ").split() if part]
+        expires_at = data.get("expires_at")
+        store = CredentialStore(shared_home / "multitenancy.db")
+        store.put_credential(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+            payload=data,
+            scopes=scopes,
+            expires_at=int(expires_at) if expires_at else None,
+        )
+        store.close()
+        logger.info(
+            "[multitenancy] imported profile Feishu UAT into credential vault profile=%s subject=%s",
+            profile_name,
+            open_id,
+        )
+    except Exception:
+        logger.debug("[multitenancy] failed to import Feishu UAT into credential vault", exc_info=True)
 
 
 def _configure_cron_home(shared_home: Path) -> None:
@@ -685,9 +772,12 @@ def _event_to_subprocess_payload(
 # core of profile isolation档 A. New HERMES_* plumbing variables MUST be added
 # explicitly so a future feature does not accidentally widen the surface.
 #
-# Secrets (API keys, tokens) are NEVER on this list. They live in
+# Provider API keys/tokens are NEVER on this list. They live in
 # ``<profile_home>/.env`` or ``auth.json`` and are loaded inside the child by
-# ``_run_with_aiagent``'s own dotenv path.
+# ``_run_with_aiagent``'s own dotenv path. Credential-vault encryption keys
+# are explicit Hermes plumbing so the sandboxed Feishu client can decrypt only
+# its own DB credential row; terminal/code subprocesses apply secret-name env
+# filtering before executing model-generated commands.
 _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     # POSIX basics
     "PATH", "USER", "LOGNAME", "SHELL", "TERM",
@@ -705,6 +795,8 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MAX_ITERATIONS",
     "HERMES_MULTITENANCY_APPROVAL_TIMEOUT",
     "HERMES_MULTITENANCY_TOOLSETS_MODE",
+    "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+    "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
 })
 
