@@ -48,6 +48,23 @@ def test_profile_scoped_media_response_rewrites_temp_path_to_profile_artifact(tm
     assert workspace_artifact.read_bytes() == b"png"
 
 
+def test_profile_scoped_media_response_maps_sandbox_workspace_path(tmp_path):
+    """Sandbox /workspace MEDIA paths map back to the routed profile workspace."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    report = profile_home / "workspace" / "reports" / "summary.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("ok", encoding="utf-8")
+
+    response = router_mod._profile_scoped_media_response(
+        "created\nMEDIA:/workspace/reports/summary.md",
+        profile_home,
+    )
+
+    assert response == f"created\nMEDIA:{report.resolve()}"
+
+
 def test_profile_scoped_media_response_blocks_temp_path_without_profile_artifact(tmp_path):
     """Unknown /tmp media stays blocked instead of being delivered from the host."""
     from hermes_multitenancy import router as router_mod
