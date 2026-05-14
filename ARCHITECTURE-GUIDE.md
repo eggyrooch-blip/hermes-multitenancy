@@ -1653,7 +1653,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
-| 2026-05-14 | `a74e23a` | **fix(media workspace)**: profile 内生成产物统一发布到 `workspace/Downloads`，Feishu `MEDIA:` 与 WebUI 文件页消费同一位置 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
+| 2026-05-14 | `b5c48c6` | **fix(media workspace)**: profile 内生成产物统一发布到 `workspace/Downloads`，Feishu `MEDIA:` 与 WebUI 文件页消费同一位置 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
 | 2026-05-14 | `91221d3` | **fix(model env)**: sandboxed AIAgent 从 shared `.env` 只继承模型 provider allowlist，profile `.env` 可覆盖；Feishu app/UAT 与其他 shared token 不进入 env | `生产环境的实况.md` §8 | 顶部 credential vault；§10A/§13 |
 | 2026-05-14 | `69fe59a` | **fix(media)**: `MEDIA:/tmp/...` 只有在当前 profile 固定产物目录存在同名文件时才改写投递，否则继续拦截 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
 | 2026-05-14 | `114fd3e` | **fix(cron)**: `/api/run-broker/jobs` 未传 `deliver` 时默认 `feishu`；WebUI cron 不再静默落成本地 output-only job | `生产环境的实况.md` §23 | 顶部 Run Broker jobs；§10A |
