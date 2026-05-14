@@ -78,6 +78,7 @@ def register(ctx) -> None:
     Bot replies would be the echo string, not real model output.
     """
     from .agent_real import real_run_agent
+    from .credential_tool import register_credential_status_tool
     from .router import override_pool
     from .runtime import ProfileRuntime
 
@@ -88,6 +89,7 @@ def register(ctx) -> None:
     install_cron_runtime_patches()
     install_gateway_startup_watcher()
 
+    register_credential_status_tool(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
 
 

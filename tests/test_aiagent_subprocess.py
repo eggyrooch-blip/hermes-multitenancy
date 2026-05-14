@@ -1023,6 +1023,27 @@ def test_build_subprocess_env_loads_profile_env_for_agent_only(monkeypatch, tmp_
     assert env["PUBLIC_RUNTIME_FLAG"] == "enabled"
 
 
+def test_build_subprocess_env_forwards_credential_vault_key_only(monkeypatch, tmp_path: Path):
+    """Credential vault key is router plumbing; unrelated parent secrets still stay out."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "vault-key")
+    monkeypatch.setenv("HERMES_CREDENTIAL_KEY", "legacy-vault-key")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-parent")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "vault-key"
+    assert env["HERMES_CREDENTIAL_KEY"] == "legacy-vault-key"
+    assert "GITLAB_TOKEN" not in env
+    assert "OPENAI_API_KEY" not in env
+
+
 def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path: Path):
     """Auth-only profiles still work when auth.json is masked inside bwrap."""
     from hermes_multitenancy import agent_real
