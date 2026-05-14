@@ -879,6 +879,9 @@ def _build_subprocess_env(
 
     profile_home = profile_home.expanduser()
     env.update(_profile_env_for_aiagent(profile_home))
+    if env.get("FEISHU_APP_ID") and env.get("FEISHU_APP_SECRET") and not env.get("FEISHU_DOMAIN"):
+        env["FEISHU_DOMAIN"] = "feishu"
+
     # HOME is NOT pivoted (see docstring). Only XDG/TMPDIR redirect.
     pivot = {
         "XDG_CACHE_HOME":  profile_home / "cache",
