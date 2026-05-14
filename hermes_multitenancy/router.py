@@ -14,9 +14,11 @@ import logging
 import os
 import re
 import shutil
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
+from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -481,20 +483,137 @@ async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]
     Returns:
         Enriched text string, or None on failure (caller falls back to event.text).
     """
-    if gateway is None:
-        return None
+    native_text: Optional[str] = None
     prep = getattr(gateway, "_prepare_inbound_message_text", None)
-    if prep is None or not callable(prep):
+    if gateway is None or prep is None or not callable(prep):
         logger.debug("multitenancy: gateway._prepare_inbound_message_text unavailable")
-        return await _local_enrich_with_vision_only(event)
-    source = getattr(event, "source", None)
-    if source is None:
+    else:
+        source = getattr(event, "source", None)
+        if source is not None:
+            try:
+                native_text = await prep(event=event, source=source, history=[])
+            except Exception as exc:
+                logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
+
+    local_file_text = _local_enrich_with_file_content(event, existing_text=native_text or "")
+    if local_file_text:
+        return _append_enrichment(native_text or getattr(event, "text", "") or "", local_file_text)
+
+    if native_text:
+        return native_text
+    return await _local_enrich_with_vision_only(event)
+
+
+def _append_enrichment(base: str, enrichment: str) -> str:
+    base = str(base or "").strip()
+    enrichment = str(enrichment or "").strip()
+    if not enrichment:
+        return base
+    if not base:
+        return enrichment
+    return f"{enrichment}\n{base}"
+
+
+_TEXT_FILE_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
+    ".log", ".xml", ".html", ".htm",
+}
+
+
+def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> Optional[str]:
+    """Plugin-owned fallback for Feishu document attachments Hermes does not inline.
+
+    Hermes core remains the first choice for multimodal preprocessing. This
+    fallback only covers plain/tabular files already cached as local event paths,
+    keeping compatibility in multitenancy instead of patching Hermes-agent.
+    """
+    media_urls = getattr(event, "media_urls", None) or []
+    media_types = getattr(event, "media_types", None) or []
+    if not media_urls:
         return None
-    try:
-        return await prep(event=event, source=source, history=[])
-    except Exception as exc:
-        logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
-        return await _local_enrich_with_vision_only(event)
+    existing = str(existing_text or "")
+    parts: list[str] = []
+    for raw_path, raw_mtype in zip(media_urls, media_types or [""] * len(media_urls)):
+        path = Path(str(raw_path))
+        if not path.is_file():
+            continue
+        name = path.name
+        if f"[Content of {name}]" in existing:
+            continue
+        suffix = path.suffix.lower()
+        media_type = str(raw_mtype or "").lower()
+        try:
+            if suffix == ".xlsx":
+                content = _extract_xlsx_text(path)
+            elif media_type.startswith("text/") or suffix in _TEXT_FILE_EXTENSIONS:
+                content = path.read_text(encoding="utf-8", errors="replace")[:100_000]
+            else:
+                continue
+        except Exception as exc:
+            logger.debug("multitenancy: local file enrichment failed for %s: %s", path, exc)
+            continue
+        content = content.strip()
+        if content:
+            parts.append(f"[Content of {name}]:\n{content}")
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _extract_xlsx_text(path: Path, *, max_sheets: int = 3, max_rows: int = 50, max_cells: int = 20) -> str:
+    """Extract a small text preview from an XLSX file using only stdlib."""
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rel_ns = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    with zipfile.ZipFile(path) as zf:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root.findall("main:si", ns):
+                texts = [node.text or "" for node in si.findall(".//main:t", ns)]
+                shared_strings.append("".join(texts))
+
+        sheet_names: dict[str, str] = {}
+        if "xl/workbook.xml" in zf.namelist():
+            workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            for idx, sheet in enumerate(workbook.findall(".//main:sheet", ns), start=1):
+                rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                sheet_names[rel_id or f"rId{idx}"] = sheet.attrib.get("name") or f"sheet{idx}"
+
+        rel_targets: list[tuple[str, str]] = []
+        if "xl/_rels/workbook.xml.rels" in zf.namelist():
+            rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            for rel in rels.findall("rel:Relationship", rel_ns):
+                target = rel.attrib.get("Target") or ""
+                if target.startswith("worksheets/"):
+                    rel_targets.append((rel.attrib.get("Id") or "", "xl/" + target))
+        if not rel_targets:
+            rel_targets = [
+                (f"rId{idx}", name)
+                for idx, name in enumerate(sorted(
+                    n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+                ), start=1)
+            ]
+
+        sections: list[str] = []
+        for rel_id, sheet_path in rel_targets[:max_sheets]:
+            if sheet_path not in zf.namelist():
+                continue
+            root = ET.fromstring(zf.read(sheet_path))
+            rows: list[str] = []
+            for row in root.findall(".//main:sheetData/main:row", ns)[:max_rows]:
+                cells: list[str] = []
+                for cell in row.findall("main:c", ns)[:max_cells]:
+                    value = cell.find("main:v", ns)
+                    raw = value.text if value is not None else ""
+                    if cell.attrib.get("t") == "s" and raw.isdigit():
+                        idx = int(raw)
+                        raw = shared_strings[idx] if idx < len(shared_strings) else raw
+                    cells.append(raw or "")
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                sections.append(f"[{sheet_names.get(rel_id, rel_id or sheet_path)}]\n" + "\n".join(rows))
+        return "\n\n".join(sections)
 
 
 async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
