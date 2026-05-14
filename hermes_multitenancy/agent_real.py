@@ -778,6 +778,10 @@ def _event_to_subprocess_payload(
 # are explicit Hermes plumbing so the sandboxed Feishu client can decrypt only
 # its own DB credential row; terminal/code subprocesses apply secret-name env
 # filtering before executing model-generated commands.
+#
+# Feishu app credentials are app-level plumbing, not per-user UAT. They are
+# required by Feishu tool clients before loading the user's profile-scoped UAT.
+# User access/refresh tokens remain profile-local or credential-vault backed.
 _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     # POSIX basics
     "PATH", "USER", "LOGNAME", "SHELL", "TERM",
@@ -798,6 +802,10 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MULTITENANCY_CREDENTIAL_KEY",
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
+    # Feishu app-level plumbing for sandboxed Feishu tools.
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_DOMAIN",
 })
 
 
