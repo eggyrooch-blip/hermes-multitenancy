@@ -1079,7 +1079,7 @@ cron 的 opt-in seam 在 `cron_worker._patch_cron_run_broker()`：plugin registe
 
 ### 10A.4 下一步
 
-2026-05-14 生产验证：66 已拉取 `hermes-multitenancy@2a4d688` 并启用 `HERMES_MULTITENANCY_RUN_BROKER_SERVER=1`、`HERMES_MULTITENANCY_CRON_RUN_BROKER=1`。WebUI Socket.IO canary 通过 `POST /api/run-broker/runs` 进入 bwrap，terminal 输出 `SANDBOX=1`；profile-local one-shot cron job `e79412276d8f` 由真实 router worker 扫描执行，输出文件包含 `Run Path: RunBroker` 与 `SANDBOX=1`。回滚方式是关闭 WebUI/cron broker feature flag，但保留 host-tool sandbox guard。
+2026-05-14 生产验证：66 已拉取 `hermes-multitenancy@5d48dcd` 并启用 `HERMES_MULTITENANCY_RUN_BROKER_SERVER=1`、`HERMES_MULTITENANCY_CRON_RUN_BROKER=1`。WebUI Socket.IO canary 通过 `POST /api/run-broker/runs` 进入 bwrap，terminal 输出 `SANDBOX=1`；profile-local one-shot cron job `e79412276d8f` 由真实 router worker 扫描执行，输出文件包含 `Run Path: RunBroker` 与 `SANDBOX=1`；WebUI jobs canary 在 `hermes-gateway@sunke.service` 停止期间通过 `POST /api/run-broker/jobs` 创建并删除 job `0dbd12ced3b1`。回滚方式是关闭 WebUI/cron broker feature flag，但保留 host-tool sandbox guard。
 
 ### 10.3 router 里的命令分发
 
@@ -1472,7 +1472,7 @@ v2 假设 job 的 `origin.chat_id` 已经可投递。v3 改成更适合 WebUI �
 
 已有 job 的执行和投递依赖 `hermes-gateway.service` 里的 router worker，不依赖 `hermes-gateway@<profile>.service` 常驻。2026-05-14 生产实测停止 `hermes-gateway@sunke.service` 后，job `f956dab900b3` 仍由 router 执行、写 output，并 mirror 到 `multitenancy_sessions`。
 
-但 WebUI 创建/管理任务仍需要 API 面。当前生产 API 面仍是 `hermes-gateway@sunke.service`；若后续要完全去掉 profile apiserver，应新增 router/profile-aware cron management API，而不是让 WebUI 直接写文件。
+WebUI 创建/管理任务也已收敛到 router API 面。`webui_broker_server.py` 提供 `/api/run-broker/jobs` profile-aware cron management API，内部复用 hermes-agent `cron.jobs` 原生存储格式，并通过 profile-scoped module binding 避免 WebUI 直接写文件或依赖 `hermes-gateway@<profile>.service`。2026-05-14 生产实测停止 `hermes-gateway@sunke.service` 后，WebUI BFF 仍可创建、列表、删除 job `0dbd12ced3b1`。
 
 ### 15.6 Mirror schema lazy init（v2 同步修复）
 
