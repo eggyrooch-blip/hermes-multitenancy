@@ -317,6 +317,51 @@ def test_handle_async_skips_duplicate_feishu_message_id(monkeypatch, tmp_path):
     clear_spike_routes()
 
 
+def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, tmp_path):
+    """Feishu route should enter the channel-neutral broker before dispatch."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy.run_models import RunResult
+
+    clear_spike_routes()
+    profile_home = tmp_path / "sunke"
+    profile_home.mkdir()
+    add_spike_route("ou_broker", profile_home)
+
+    admitted = []
+    dispatched = []
+
+    class FakeBroker:
+        async def admit(self, request):
+            admitted.append(request)
+            return RunResult(content="", duplicate=False)
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            dispatched.append((profile_name, agent_event.text))
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_make_routed_run_broker", lambda: FakeBroker())
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    event = _build_event(text="hello broker", user_id="ou_broker")
+    event.message_id = "om_broker"
+
+    asyncio.run(router_mod.handle_async(event=event, gateway=SimpleNamespace(adapters={})))
+
+    assert len(admitted) == 1
+    request = admitted[0]
+    assert request.channel == "feishu"
+    assert request.profile_name == "sunke"
+    assert request.user_key == "ou_broker"
+    assert request.content == "hello broker"
+    assert request.chat_id == "chat-123"
+    assert request.message_id == "om_broker"
+    assert request.credential_subject == "ou_broker"
+    assert dispatched == [("sunke", "hello broker")]
+    clear_spike_routes()
+
+
 def test_handle_async_skips_duplicate_long_content_without_message_id(monkeypatch, tmp_path):
     """Fallback dedupe catches Feishu retries that arrive without a stable message_id."""
     from hermes_multitenancy import router as router_mod

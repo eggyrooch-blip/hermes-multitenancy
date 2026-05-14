@@ -105,6 +105,45 @@ def test_run_broker_dedupes_before_dispatch():
     assert calls == ["hi"]
 
 
+def test_run_broker_admit_runs_policy_and_dedupe_without_dispatch():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    calls = []
+    seen = set()
+
+    async def dispatch(request):
+        calls.append(request.content)
+        return "ok"
+
+    def mark_seen(request):
+        key = request.effective_idempotency_key
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="feishu",
+        profile_name="sunke",
+        user_key="ou_1",
+        content="hi",
+        message_id="om_1",
+    )
+
+    first = asyncio.run(broker.admit(request))
+    second = asyncio.run(broker.admit(request))
+
+    assert first.duplicate is False
+    assert second.duplicate is True
+    assert calls == []
+
+
 def test_run_broker_emits_channel_neutral_events():
     from hermes_multitenancy.run_broker import RunBroker
     from hermes_multitenancy.run_models import RunEvent, RunRequest

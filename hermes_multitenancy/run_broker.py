@@ -58,6 +58,20 @@ class RunBroker:
 
     async def run(self, request: RunRequest) -> RunResult:
         """Execute a request after policy and idempotency checks."""
+        admission = await self.admit(request)
+        if admission.duplicate:
+            await self._emit(RunEvent(kind="done"))
+            return admission
+
+        response = await _maybe_await(self._dispatch_agent(request))
+        content = str(response or "")
+        if content:
+            await self._emit(RunEvent(kind="content", text=content))
+        await self._emit(RunEvent(kind="done"))
+        return RunResult(content=content, duplicate=False)
+
+    async def admit(self, request: RunRequest) -> RunResult:
+        """Run policy/idempotency checks without dispatching the agent."""
         if (
             request.requires_host_tools
             and self._require_sandbox_for_host_tools
@@ -66,15 +80,9 @@ class RunBroker:
             raise RunRejected("sandbox is required for host-tool-capable runs")
 
         if self._mark_seen is not None and not self._mark_seen(request):
-            await self._emit(RunEvent(kind="done"))
             return RunResult(content="", duplicate=True)
 
-        response = await _maybe_await(self._dispatch_agent(request))
-        content = str(response or "")
-        if content:
-            await self._emit(RunEvent(kind="content", text=content))
-        await self._emit(RunEvent(kind="done"))
-        return RunResult(content=content, duplicate=False)
+        return RunResult(content="", duplicate=False)
 
     async def _emit(self, event: RunEvent) -> None:
         if self._emit_event is None:

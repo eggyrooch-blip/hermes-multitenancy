@@ -143,14 +143,11 @@ def _normalize_dedupe_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def _event_dedupe_record(
-    *,
-    event: Any,
-    profile_name: str,
-    user_key: str,
-    text: str,
-) -> Optional[tuple[str, Optional[str], Optional[str], int]]:
-    message_id = _event_message_id(event)
+def _run_request_dedupe_record(request: Any) -> Optional[tuple[str, Optional[str], Optional[str], int]]:
+    message_id = str(getattr(request, "message_id", "") or "").strip()
+    profile_name = str(getattr(request, "profile_name", "") or "").strip()
+    user_key = str(getattr(request, "user_key", "") or "").strip()
+    content = str(getattr(request, "content", "") or "")
     if message_id:
         ttl = _dedupe_env_int(
             "HERMES_MULTITENANCY_EVENT_DEDUPE_TTL_SECONDS",
@@ -158,7 +155,7 @@ def _event_dedupe_record(
         )
         return (f"msg:{profile_name}:{user_key}:{message_id}", message_id, None, ttl)
 
-    normalized = _normalize_dedupe_text(text)
+    normalized = _normalize_dedupe_text(content)
     min_chars = _dedupe_env_int(
         "HERMES_MULTITENANCY_CONTENT_DEDUPE_MIN_CHARS",
         _DEDUPE_CONTENT_MIN_CHARS,
@@ -173,40 +170,72 @@ def _event_dedupe_record(
     return (f"content:{profile_name}:{user_key}:{digest}", None, digest, ttl)
 
 
-def _mark_routed_event_seen(
-    *,
-    event: Any,
-    profile_name: str,
-    sender: str,
-    sender_alt: Optional[str],
-    text: str,
-) -> bool:
-    """Return False when this routed inbound event was processed recently."""
+def _mark_run_request_seen(request: Any) -> bool:
+    """Return False when this broker RunRequest was processed recently."""
     store = _get_session_store()
     if store is None:
         return True
-    user_key = _tenant_user_key(sender, sender_alt)
-    record = _event_dedupe_record(
-        event=event,
-        profile_name=profile_name,
-        user_key=user_key,
-        text=text,
-    )
+    record = _run_request_dedupe_record(request)
     if record is None:
         return True
     event_key, message_id, content_hash, ttl = record
     try:
         return bool(store.mark_event_processed(
             event_key,
-            profile_name=profile_name,
-            user_key=user_key,
+            profile_name=str(getattr(request, "profile_name", "") or ""),
+            user_key=str(getattr(request, "user_key", "") or ""),
             message_id=message_id,
             content_hash=content_hash,
             ttl_seconds=ttl,
         ))
     except Exception as exc:
-        logger.debug("multitenancy: event dedupe check failed (%s)", exc)
+        logger.debug("multitenancy: run request dedupe check failed (%s)", exc)
         return True
+
+
+def _host_tools_require_sandbox() -> bool:
+    value = os.environ.get("HERMES_REQUIRE_SANDBOX_FOR_HOST_TOOLS", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _router_sandbox_available() -> bool:
+    value = os.environ.get("HERMES_USE_SANDBOX", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _run_request_for_routed_event(
+    *,
+    event: Any,
+    profile_name: str,
+    sender: str,
+    sender_alt: Optional[str],
+    chat_id: str,
+    text: str,
+):
+    from .run_models import RunRequest
+
+    user_key = _tenant_user_key(sender, sender_alt)
+    return RunRequest(
+        channel="feishu",
+        profile_name=profile_name,
+        user_key=user_key,
+        content=text,
+        chat_id=chat_id,
+        message_id=_event_message_id(event),
+        credential_subject=user_key,
+        requires_host_tools=_host_tools_require_sandbox(),
+        metadata={"sender_alt": sender_alt} if sender_alt else {},
+    )
+
+
+def _make_routed_run_broker():
+    from .run_broker import RunBroker
+
+    return RunBroker(
+        dispatch_agent=lambda _request: "",
+        mark_seen=_mark_run_request_seen,
+        sandbox_available=_router_sandbox_available,
+    )
 
 
 def _build_user_message(event: Any, *, text_override: Optional[str] = None) -> dict:
@@ -628,13 +657,33 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             and hasattr(adapter, "on_processing_complete")
         )
 
-        if not _mark_routed_event_seen(
+        run_request = _run_request_for_routed_event(
             event=event,
             profile_name=profile_name,
             sender=sender,
             sender_alt=sender_alt,
+            chat_id=chat_id,
             text=text,
-        ):
+        )
+        from .run_broker import RunRejected
+
+        try:
+            run_admission = await _make_routed_run_broker().admit(run_request)
+        except RunRejected as exc:
+            logger.warning("multitenancy: routed run rejected profile=%s sender=%s: %s", profile_name, sender, exc)
+            if feishu_full:
+                try:
+                    out = _processing_outcome(failed=True)
+                    complete_deferred = getattr(adapter, "complete_deferred_processing", None)
+                    if callable(complete_deferred):
+                        await complete_deferred(event, out)
+                    else:
+                        await adapter.on_processing_complete(event, out)
+                except Exception as complete_exc:
+                    logger.debug("multitenancy: rejected processing_complete failed: %s", complete_exc)
+            return
+
+        if run_admission.duplicate:
             logger.info(
                 "multitenancy: duplicate inbound event skipped profile=%s sender=%s message_id=%s",
                 profile_name,
