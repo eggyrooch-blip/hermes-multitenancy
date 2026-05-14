@@ -760,6 +760,7 @@ def _build_subprocess_env(
     }
 
     profile_home = profile_home.expanduser()
+    env.update(_profile_env_for_aiagent(profile_home))
     # HOME is NOT pivoted (see docstring). Only XDG/TMPDIR redirect.
     pivot = {
         "XDG_CACHE_HOME":  profile_home / "cache",
@@ -816,6 +817,48 @@ def _build_subprocess_env(
         except Exception:
             pass
     return env
+
+
+def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Load profile-local env for the AIAgent process before sandboxing.
+
+    The bwrap policy masks ``.env`` and ``auth.json`` from tool-visible file
+    paths, so credentials needed by the provider/tool clients must be injected
+    into the AIAgent process environment instead. Terminal/code subprocesses
+    apply their own secret-name env filter before running model-generated code.
+    """
+    loaded: dict[str, str] = {}
+    try:
+        from dotenv import dotenv_values
+        for key, value in dotenv_values(profile_home / ".env").items():
+            if key and value is not None:
+                loaded[str(key)] = str(value)
+    except Exception:
+        logger.debug("[multitenancy] failed to load profile .env for subprocess", exc_info=True)
+
+    try:
+        config = _load_yaml(profile_home / "config.yaml")
+        primary = ((config.get("model") or {}).get("default") or "").strip()
+        provider = _split_model_spec(primary)[0] if primary else ""
+        if provider:
+            env_names = _PROVIDER_ENV_KEYS.get(provider, ())
+            if env_names and not any(loaded.get(name) for name in env_names):
+                auth = _load_json(profile_home / "auth.json")
+                pool = auth.get("credential_pool", {}).get(provider)
+                if isinstance(pool, list):
+                    for cred in pool:
+                        if not isinstance(cred, dict):
+                            continue
+                        if cred.get("last_status") == "exhausted":
+                            continue
+                        token = cred.get("access_token")
+                        if token:
+                            loaded[env_names[0]] = str(token)
+                            break
+    except Exception:
+        logger.debug("[multitenancy] failed to load profile auth env for subprocess", exc_info=True)
+
+    return loaded
 
 
 # ─────────────────────────────────────────────────────────────────────────
