@@ -229,6 +229,46 @@ def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
     asyncio.run(runner())
 
 
+def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Profile": "yaojunhua",
+            "X-Hermes-User-Key": "ou_yaojunhua",
+        }
+        try:
+            created = await client.post("/api/run-broker/jobs", headers=headers, json={
+                "name": "cron canary",
+                "schedule": "*/5 * * * *",
+                "prompt": "ping",
+            })
+            create_body = await created.json()
+        finally:
+            await client.close()
+
+        assert created.status == 200
+        assert create_body["job"]["deliver"] == "feishu"
+        assert create_body["job"]["owner_open_id"] == "ou_yaojunhua"
+        assert create_body["job"]["owner_profile"] == "yaojunhua"
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_jobs_reject_invalid_profile(monkeypatch, tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 

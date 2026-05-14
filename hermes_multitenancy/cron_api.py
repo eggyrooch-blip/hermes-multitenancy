@@ -148,12 +148,13 @@ def create_job(profile_name: str, user_key: str, body: dict[str, Any]) -> dict[s
     if not user_key:
         raise CronApiError("user_key is required", 400)
     _validate_common_fields(body, require_create_fields=True)
+    deliver = str(body.get("deliver") or "").strip() or "feishu"
 
     kwargs: dict[str, Any] = {
         "prompt": body.get("prompt", ""),
         "schedule": str(body.get("schedule") or "").strip(),
         "name": str(body.get("name") or "").strip(),
-        "deliver": body.get("deliver", "local"),
+        "deliver": deliver,
         "owner_open_id": user_key,
         "owner_profile": profile_name,
     }
