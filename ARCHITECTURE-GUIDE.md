@@ -31,7 +31,7 @@ sources:
 > `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。WebUI 已有 HTTP/SSE sidecar endpoint；cron 已有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` run_job patch，会把 due job 构造成 `RunRequest(channel="cron")`。生产 66 已启用 WebUI/cron broker：`127.0.0.1:8766` sidecar active，WebUI Socket.IO canary 返回 `SANDBOX=1`，真实 router cron worker job `e79412276d8f` 输出 `Run Path: RunBroker` + `SANDBOX=1`。CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`。
 
 > [!info] 2026-05-14 Run Broker jobs API 收口
-> `5d48dcd` 新增 `cron_api.py` 与 `/api/run-broker/jobs`，WebUI chat plane 的 job 创建、列表、修改、删除、暂停、恢复都进入本仓 sidecar，不再要求 `hermes-gateway@sunke.service` profile apiserver 常驻。生产验证时停止 `hermes-gateway@sunke.service`，WebUI BFF 仍能创建并删除 job `0dbd12ced3b1`。`a19f456` 是本 GUIDE 的 docs-only 同步。
+> `5d48dcd` 新增 `cron_api.py` 与 `/api/run-broker/jobs`，WebUI chat plane 的 job 创建、列表、修改、删除、暂停、恢复都进入本仓 sidecar，不再要求 `hermes-gateway@sunke.service` profile apiserver 常驻。生产验证时停止 `hermes-gateway@sunke.service`，WebUI BFF 仍能创建并删除 job `0dbd12ced3b1`。`a19f456` / `7d2cf1e` 是本 GUIDE 的 docs-only 同步。
 
 ---
 
