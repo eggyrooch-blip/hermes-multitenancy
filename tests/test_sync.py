@@ -564,6 +564,56 @@ def test_sync_profiles_pulls_feishu_uat_into_profile(tmp_path):
     assert not stranger.exists()
 
 
+def test_sync_profiles_mirrors_feishu_uat_into_credential_vault(monkeypatch, tmp_path):
+    """Org sync keeps the DB credential source aligned with refreshed UAT JSON."""
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "feishu_uat").mkdir()
+    (shared_home / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "alice-token-v1",
+            "refresh_token": "alice-refresh",
+            "user_open_id": "ou_alice",
+            "scope": "calendar:calendar im:message",
+            "expires_at": 4102444800000,
+        }),
+        encoding="utf-8",
+    )
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    store = CredentialStore(shared_home / "multitenancy.db", encryption_key="test-key")
+    try:
+        status = store.get_status(
+            profile_name="alice",
+            subject_id="ou_alice",
+            provider="feishu",
+            secret_kind="uat",
+        )
+        payload = store.get_secret_for_runtime(
+            profile_name="alice",
+            subject_id="ou_alice",
+            provider="feishu",
+            secret_kind="uat",
+        )
+    finally:
+        store.close()
+
+    assert status["status"] == "valid"
+    assert status["expires_at"] == 4102444800000
+    assert payload["access_token"] == "alice-token-v1"
+
+
 def test_sync_profiles_reapplies_chmod_on_drift(tmp_path):
     """If someone loosens a dir to 0755 externally, next sync re-tightens it."""
     import stat as stat_mod

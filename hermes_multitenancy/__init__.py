@@ -78,6 +78,16 @@ def register(ctx) -> None:
     (live LLM thin client) instead of the unit-test echo stub. Without this,
     Bot replies would be the echo string, not real model output.
     """
+    try:
+        from pathlib import Path as _P
+        _sentinel = _P.home() / ".hermes" / "logs" / "multitenancy-register-called.log"
+        _sentinel.parent.mkdir(parents=True, exist_ok=True)
+        _sentinel.write_text(
+            f"pid={os.getpid()} at={__import__('time').strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+    except Exception:
+        pass
+
     from .agent_real import real_run_agent
     from .credential_tool import register_credential_status_tool
     from .router import override_pool

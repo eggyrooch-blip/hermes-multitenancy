@@ -146,27 +146,23 @@ def test_local_file_enrichment_extracts_csv_and_xlsx(tmp_path):
     assert "HERMES_MT_XLSX_MARKER" in enriched
 
 
-@pytest.mark.asyncio
-async def test_enrich_via_hermes_pipeline_supplements_xlsx_when_native_skips(tmp_path):
-    """Keep Hermes native preprocessing first, then plugin-fallback missing tabular files."""
+def test_local_file_enrichment_handles_missing_media_types_and_skips_large_files(tmp_path):
+    """Attachment fallback should cover all media URLs and avoid parsing large payloads."""
     from hermes_multitenancy import router as router_mod
 
+    oversized = tmp_path / "huge.csv"
+    oversized.write_bytes(b"x" * (router_mod._MAX_LOCAL_ENRICH_FILE_BYTES + 1))
     xlsx_path = tmp_path / "sheet.xlsx"
     _write_minimal_xlsx(xlsx_path)
     event = SimpleNamespace(
-        text="please inspect",
-        media_urls=[str(xlsx_path)],
+        text="",
+        media_urls=[str(oversized), str(xlsx_path)],
         media_types=["application/octet-stream"],
-        source=SimpleNamespace(user_id="ou_test"),
     )
 
-    class Gateway:
-        async def _prepare_inbound_message_text(self, *, event, source, history):
-            return "please inspect"
+    enriched = router_mod._local_enrich_with_file_content(event)
 
-    enriched = await router_mod._enrich_via_hermes_pipeline(event, Gateway())
-
-    assert "please inspect" in enriched
+    assert "huge.csv" not in enriched
     assert "[Content of sheet.xlsx]" in enriched
     assert "HERMES_MT_XLSX_MARKER" in enriched
 
