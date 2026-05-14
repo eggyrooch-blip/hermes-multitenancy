@@ -228,11 +228,11 @@ def _run_request_for_routed_event(
     )
 
 
-def _make_routed_run_broker():
+def _make_routed_run_broker(*, dispatch_agent: Any = None):
     from .run_broker import RunBroker
 
     return RunBroker(
-        dispatch_agent=lambda _request: "",
+        dispatch_agent=dispatch_agent or (lambda _request: ""),
         mark_seen=_mark_run_request_seen,
         sandbox_available=_router_sandbox_available,
     )
@@ -747,7 +747,13 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 # Mock / minimal adapter — old non-stream path (send_typing + pool.dispatch + send)
                 if adapter is not None:
                     await _safe_call(adapter.send_typing, chat_id)
-                response_text = await _get_pool().dispatch(profile_name, profile_home, agent_event)
+                async def _dispatch_nonstream(_request):
+                    return await _get_pool().dispatch(profile_name, profile_home, agent_event)
+
+                run_result = await _make_routed_run_broker(
+                    dispatch_agent=_dispatch_nonstream,
+                ).run(run_request, admitted=True)
+                response_text = run_result.content
                 if adapter is not None:
                     await _safe_call(adapter.send, chat_id, response_text)
 

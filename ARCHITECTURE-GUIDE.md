@@ -28,7 +28,7 @@ sources:
 > 真实 Feishu DM canary 后发现：同一会话中旧长任务可能被 Feishu/WebSocket flush 或事件重投递再次送入 router，绕过仅内存态的 `_active_sessions` guard，重新启动 `bwrap -> aiagent_subprocess.py`。本仓新增 `multitenancy_processed_events` 表：优先按 Feishu `message_id` 做 24h 持久化去重；无稳定 `message_id` 时，对 40 字以上 normalized prompt 做 2h hash fallback。去重发生在 route 命中之后、in-flight cancellation 与 sandbox 子进程启动之前；slash command 不走这条去重。
 
 > [!info] 2026-05-14 Run Broker 目标态骨架
-> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；实际 Feishu streaming/card rendering、session history 和 agent dispatch 仍保留在 `router.py`，WebUI `chat-run` 与 cron worker 尚未迁入 broker。
+> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支已通过 `RunBroker.run(..., admitted=True)` 执行真实 `pool.dispatch`。CardKit streaming、session history 和 full Feishu renderer 仍保留在 `router.py`，WebUI `chat-run` 与 cron worker 尚未迁入 broker。
 
 ---
 
@@ -1052,7 +1052,7 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 3. 如果注入了 `mark_seen(request)`，在 dispatch 前做 idempotency；重复请求返回 `RunResult(duplicate=True)`，不调用 agent dispatcher。
 4. 调用注入的 `dispatch_agent(request)`，再输出 channel-neutral `RunEvent(content)` 和 `RunEvent(done)`。
 
-`RunBroker.admit(request)` 是迁移期接口：只执行 sandbox policy 与 idempotency，不 dispatch agent。`router.handle_async` 当前用它承接 Feishu 入站去重和 sandbox fail-closed；通过后继续走原有 Feishu dispatch 代码。
+`RunBroker.admit(request)` 是迁移期接口：只执行 sandbox policy 与 idempotency，不 dispatch agent。`router.handle_async` 当前用它承接 Feishu 入站去重和 sandbox fail-closed；minimal 非 streaming 分支通过 `RunBroker.run(request, admitted=True)` 执行 `pool.dispatch`，避免重复 idempotency 检查。
 
 这不是最终 broker。最终要把现有 `router.handle_async` 的 session history、Feishu renderer、`_stream_into_feishu`、approval bridge、`agent_real.stream_run_agent` 等逐步迁到这个 contract 后面。
 
@@ -1067,11 +1067,12 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 - idempotency 在 dispatch 前挡住重复 run；
 - `admit()` 可只做 policy/idempotency、不调用 dispatcher；
 - Feishu routed path 会构造 `RunRequest(channel="feishu")` 并提交 broker admission；
+- minimal 非 streaming Feishu dispatch 会进入 `RunBroker.run(..., admitted=True)`；
 - broker 输出 channel-neutral events。
 
 ### 10A.4 下一步
 
-下一批建议把 Feishu 的“实际执行”再往 broker 后面推进一层：把 minimal adapter path（非 full Feishu streaming 的 `send_typing -> pool.dispatch -> send`）包装成 `dispatch_agent(request)`，先不动 streaming card path。这样可以验证 broker 对真实 dispatch 的拥有权，同时把高风险的 CardKit streaming 迁移留到下一步。
+下一批建议迁 full Feishu streaming 的外层控制：先让 streaming path 也由 broker 持有 run lifecycle，但仍调用现有 `_stream_into_feishu(...)` 作为 renderer/dispatcher。这样可以继续避免直接重写 CardKit streaming internals。
 
 ### 10.3 router 里的命令分发
 
@@ -1637,6 +1638,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | `fc2c05e` | **feat(run broker)**: minimal 非 streaming Feishu adapter 分支通过 `RunBroker.run(..., admitted=True)` 执行真实 `pool.dispatch`；CardKit streaming 仍未迁 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `84dcfee` | **feat(run broker)**: Feishu routed path 构造 `RunRequest(channel="feishu")` 并进入 `RunBroker.admit()`；broker admission 接管 idempotency/sandbox policy，实际 streaming/dispatch 仍在 router | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `db45b28` | **feat(run broker)**: 新增 `RunRequest` / `RunEvent` / `RunBroker` 目标态骨架和测试；尚未接管 Feishu/WebUI/cron 生产路径 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A 新增 |
 | 2026-05-14 | `d15f8ae` | **feat(cron delivery)**: startup watcher + Feishu owner_open_id fallback + Feishu open_id send patch + delivery context mirror | `生产环境的实况.md` §13；本 GUIDE §15 v3 | §2.4 register 入口；§15 worker/delivery 语义；附录 E systemd 现状 |

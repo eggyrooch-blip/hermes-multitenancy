@@ -144,6 +144,41 @@ def test_run_broker_admit_runs_policy_and_dedupe_without_dispatch():
     assert calls == []
 
 
+def test_run_broker_run_can_skip_admission_after_prior_admit():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    calls = []
+
+    async def dispatch(request):
+        calls.append(("dispatch", request.content))
+        return "ok"
+
+    def mark_seen(_request):
+        raise AssertionError("admitted run should not repeat idempotency check")
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+
+    result = asyncio.run(broker.run(
+        RunRequest(
+            channel="feishu",
+            profile_name="sunke",
+            user_key="ou_1",
+            content="hi",
+            message_id="om_1",
+        ),
+        admitted=True,
+    ))
+
+    assert result.content == "ok"
+    assert result.duplicate is False
+    assert calls == [("dispatch", "hi")]
+
+
 def test_run_broker_emits_channel_neutral_events():
     from hermes_multitenancy.run_broker import RunBroker
     from hermes_multitenancy.run_models import RunEvent, RunRequest
