@@ -335,6 +335,7 @@ credentials:
     registered: list[list[str]] = []
     fake_env_passthrough = SimpleNamespace(
         register_env_passthrough=lambda names: registered.append(list(names)),
+        _config_passthrough=frozenset({"EXISTING_TOKEN"}),
     )
     tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
     tools_mod.env_passthrough = fake_env_passthrough
@@ -348,6 +349,9 @@ credentials:
     agent_real._install_credential_env_passthrough(profile_home)
 
     assert registered == [["GITLAB_TOKEN"]]
+    assert fake_env_passthrough._config_passthrough == frozenset(
+        {"EXISTING_TOKEN", "GITLAB_TOKEN"}
+    )
 
 
 @pytest.mark.asyncio
