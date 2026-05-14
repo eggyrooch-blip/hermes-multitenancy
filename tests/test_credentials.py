@@ -231,3 +231,71 @@ def test_feishu_uat_broker_prefers_db_payload_over_json(monkeypatch, tmp_path):
     loaded = fake_feishu._load_uat("ou_owner")
 
     assert loaded["access_token"] == "db-token"
+
+
+def test_feishu_app_broker_prefers_db_payload_without_env(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    profile.mkdir(parents=True)
+    CredentialStore(shared / "multitenancy.db", encryption_key="test-key").put_credential(
+        profile_name="__global__",
+        subject_id="feishu_app",
+        provider="feishu",
+        secret_kind="app",
+        payload={
+            "app_id": "cli_from_db",
+            "app_secret": "app-secret-from-db",
+            "domain": "feishu",
+        },
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+    monkeypatch.delenv("FEISHU_DOMAIN", raising=False)
+
+    def original_resolve():
+        raise AssertionError("env/.env fallback should not be used when DB app credential is valid")
+
+    fake_feishu = SimpleNamespace(
+        FEISHU_UAT_PATH=profile / "feishu_uat.json",
+        FEISHU_UAT_DIR=profile / "feishu_uat",
+        _load_uat=lambda open_id=None: {},
+        _resolve_feishu_credentials=original_resolve,
+    )
+
+    agent_real._configure_feishu_uat_home(fake_feishu, profile)
+
+    assert fake_feishu._resolve_feishu_credentials() == (
+        "cli_from_db",
+        "app-secret-from-db",
+        "feishu",
+    )
+
+
+def test_feishu_app_broker_falls_back_when_db_payload_missing(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    fake_feishu = SimpleNamespace(
+        FEISHU_UAT_PATH=profile / "feishu_uat.json",
+        FEISHU_UAT_DIR=profile / "feishu_uat",
+        _load_uat=lambda open_id=None: {},
+        _resolve_feishu_credentials=lambda: ("cli_fallback", "fallback-secret", "feishu"),
+    )
+
+    agent_real._configure_feishu_uat_home(fake_feishu, profile)
+
+    assert fake_feishu._resolve_feishu_credentials() == (
+        "cli_fallback",
+        "fallback-secret",
+        "feishu",
+    )
