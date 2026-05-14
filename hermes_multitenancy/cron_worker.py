@@ -29,8 +29,12 @@ import os
 import sqlite3
 import threading
 import uuid
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
+
+from .run_broker import RunBroker
+from .run_models import RunRequest
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,7 @@ def install_cron_runtime_patches() -> None:
     global _runtime_patches_installed
     if _runtime_patches_installed:
         return
+    _patch_cron_run_broker()
     _patch_scheduler_owner_open_id_delivery()
     _patch_cron_delivery_mirror()
     _patch_feishu_open_id_send()
@@ -202,6 +207,132 @@ def _patch_scheduler_owner_open_id_delivery() -> None:
     setattr(resolve_single_delivery_target, "_hermes_multitenancy_patched", True)
     scheduler._resolve_single_delivery_target = resolve_single_delivery_target
     logger.info("[multitenancy] patched cron delivery fallback to owner open_id")
+
+
+def _cron_run_broker_enabled() -> bool:
+    value = os.environ.get("HERMES_MULTITENANCY_CRON_RUN_BROKER", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _patch_cron_run_broker() -> None:
+    try:
+        import cron.scheduler as scheduler
+    except Exception:
+        logger.exception("[multitenancy] failed to patch cron run broker")
+        return
+
+    original = getattr(scheduler, "run_job", None)
+    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+        return
+
+    @functools.wraps(original)
+    def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+        if not _cron_run_broker_enabled():
+            return original(job)
+        return _run_job_through_broker(job, scheduler)
+
+    setattr(run_job, "_hermes_multitenancy_patched", True)
+    setattr(run_job, "_hermes_multitenancy_original", original)
+    scheduler.run_job = run_job
+    logger.info("[multitenancy] patched cron run_job with opt-in RunBroker path")
+
+
+def _current_profile_home() -> Path:
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    return Path(raw).expanduser().resolve() if raw else Path.home() / ".hermes"
+
+
+def _cron_user_key(job: dict, profile_name: str) -> str:
+    owner_open_id = str(job.get("owner_open_id") or "").strip()
+    if owner_open_id:
+        return owner_open_id
+    return str(job.get("owner_profile") or "").strip() or profile_name
+
+
+def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> RunRequest:
+    profile_name = str(job.get("owner_profile") or "").strip() or profile_home.name
+    user_key = _cron_user_key(job, profile_name)
+    job_id = str(job.get("id") or "").strip()
+    metadata = {
+        "job_id": job_id,
+        "job_name": str(job.get("name") or job_id or "scheduled task"),
+        "deliver": job.get("deliver"),
+        "model": job.get("model"),
+        "provider": job.get("provider"),
+        "base_url": job.get("base_url"),
+        "skills": job.get("skills"),
+        "workdir": job.get("workdir"),
+    }
+    return RunRequest(
+        channel="cron",
+        profile_name=profile_name,
+        user_key=user_key,
+        content=prompt,
+        session_id=f"cron:{job_id}" if job_id else None,
+        message_id=job_id or None,
+        delivery_mode=str(job.get("deliver") or "feishu"),
+        credential_subject=user_key,
+        requires_host_tools=True,
+        metadata={k: v for k, v in metadata.items() if v not in (None, "", [])},
+    )
+
+
+def _build_cron_event(request: RunRequest) -> Any:
+    return SimpleNamespace(
+        text=request.content,
+        message_id=request.message_id,
+        channel="cron",
+        source=SimpleNamespace(
+            user_id=request.user_key,
+            open_id=request.user_key,
+            user_id_alt=None,
+        ),
+        raw_event={
+            "channel": request.channel,
+            "session_id": request.session_id,
+            "metadata": dict(request.metadata or {}),
+        },
+    )
+
+
+async def _dispatch_cron_request(request: RunRequest, profile_home: Path) -> str:
+    from . import router
+
+    event = _build_cron_event(request)
+    return await router._get_pool().dispatch(request.profile_name, profile_home, event)
+
+
+def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, Optional[str]]:
+    profile_home = _current_profile_home()
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job_id or "scheduled task")
+    try:
+        build_prompt = getattr(scheduler, "_build_job_prompt")
+        prompt = build_prompt(job, prerun_script=None)
+        request = _build_cron_run_request(job, profile_home=profile_home, prompt=prompt)
+        broker = RunBroker(
+            dispatch_agent=lambda run_request: _dispatch_cron_request(run_request, profile_home),
+            sandbox_available=lambda: os.environ.get("HERMES_USE_SANDBOX", "").strip().lower()
+            in {"1", "true", "yes", "on"},
+        )
+        result = asyncio.run(broker.run(request))
+        final_response = result.content
+        output = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Path:** RunBroker\n\n"
+            f"{final_response}"
+        )
+        return True, output, final_response, None
+    except Exception as exc:
+        error = str(exc)
+        output = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Path:** RunBroker\n\n"
+            f"Error: {error}"
+        )
+        return False, output, "", error
 
 
 def _patch_cron_delivery_mirror() -> None:

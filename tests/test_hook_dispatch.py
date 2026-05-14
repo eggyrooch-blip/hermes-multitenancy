@@ -95,6 +95,71 @@ def test_cron_delivery_patch_resolves_owner_open_id(monkeypatch):
     }
 
 
+def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
+    """Opt-in cron run patch should execute due jobs through RunBroker."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    seen = []
+
+    def original_run_job(_job):
+        raise AssertionError("legacy cron run_job should not execute")
+
+    def build_prompt(job, prerun_script=None):
+        return f"cron prompt: {job['prompt']}"
+
+    scheduler.run_job = original_run_job
+    scheduler._build_job_prompt = build_prompt
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CRON_RUN_BROKER", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "sunke"))
+
+    class FakeBroker:
+        def __init__(self, dispatch_agent=None, **_kwargs):
+            self.dispatch_agent = dispatch_agent
+
+        async def run(self, request):
+            seen.append(request)
+            return types.SimpleNamespace(content="broker cron ok", duplicate=False, run_id="run_cron_1")
+
+    monkeypatch.setattr(cron_worker, "RunBroker", FakeBroker)
+    cron_worker._patch_cron_run_broker()
+
+    success, output, final_response, error = scheduler.run_job({
+        "id": "job123",
+        "name": "Daily summary",
+        "prompt": "summarize",
+        "deliver": "feishu",
+        "owner_open_id": "ou_owner",
+        "owner_profile": "sunke",
+        "model": "gpt-5.4",
+        "provider": "openai",
+    })
+
+    assert success is True
+    assert "broker cron ok" in output
+    assert final_response == "broker cron ok"
+    assert error is None
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.channel == "cron"
+    assert request.profile_name == "sunke"
+    assert request.user_key == "ou_owner"
+    assert request.content == "cron prompt: summarize"
+    assert request.session_id == "cron:job123"
+    assert request.credential_subject == "ou_owner"
+    assert request.requires_host_tools is True
+    assert request.metadata["job_id"] == "job123"
+    assert request.metadata["model"] == "gpt-5.4"
+    assert request.metadata["provider"] == "openai"
+
+
 def test_cron_delivery_mirror_persists_owner_context(tmp_path, monkeypatch):
     """Successful cron delivery is remembered for the owner's next Feishu turn."""
     from hermes_multitenancy import cron_worker

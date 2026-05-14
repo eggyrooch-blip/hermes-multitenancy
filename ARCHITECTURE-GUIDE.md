@@ -28,7 +28,7 @@ sources:
 > 真实 Feishu DM canary 后发现：同一会话中旧长任务可能被 Feishu/WebSocket flush 或事件重投递再次送入 router，绕过仅内存态的 `_active_sessions` guard，重新启动 `bwrap -> aiagent_subprocess.py`。本仓新增 `multitenancy_processed_events` 表：优先按 Feishu `message_id` 做 24h 持久化去重；无稳定 `message_id` 时，对 40 字以上 normalized prompt 做 2h hash fallback。去重发生在 route 命中之后、in-flight cancellation 与 sandbox 子进程启动之前；slash command 不走这条去重。
 
 > [!info] 2026-05-14 Run Broker 目标态骨架
-> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`，WebUI `chat-run` 与 cron worker 尚未迁入 broker。
+> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。WebUI 已有 opt-in HTTP/SSE sidecar endpoint；cron 已有 opt-in `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` run_job patch，会把 due job 构造成 `RunRequest(channel="cron")`。默认生产路径仍未切 WebUI/cron broker canary；CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`。
 
 ---
 
@@ -1023,7 +1023,7 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 
 ## §10A Run Broker 目标态骨架
 
-`run_models.py` 和 `run_broker.py` 是把 Feishu / WebUI / cron 收敛到同一执行控制面的第一步。当前 Feishu route 已接入 broker admission 和 `RunBroker.run(...)`；WebUI 已有 opt-in HTTP/SSE seam，cron 仍未接入。Feishu 的 CardKit renderer/session history/media delivery 还在 `router.py`。
+`run_models.py` 和 `run_broker.py` 是把 Feishu / WebUI / cron 收敛到同一执行控制面的第一步。当前 Feishu route 已接入 broker admission 和 `RunBroker.run(...)`；WebUI 已有 opt-in HTTP/SSE seam；cron 已有 opt-in run_job seam。Feishu 的 CardKit renderer/session history/media delivery 还在 `router.py`。
 
 ### 10A.1 Contract
 
@@ -1056,6 +1056,8 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 
 `webui_broker_server.py` 是 WebUI 迁移 seam：启用 `HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 后，router gateway 进程内会调度一个 localhost-only aiohttp sidecar，默认监听 `127.0.0.1:8766`，提供 `POST /api/run-broker/runs`。该 endpoint 接收 WebUI 构造的 `RunRequest(channel="webui")`，通过 `RunBroker.run()` 执行，返回 `text/event-stream` 格式的 channel-neutral events。若设置 `HERMES_MULTITENANCY_RUN_BROKER_KEY`，请求必须带 `Authorization: Bearer <key>`；WebUI 侧对应 `HERMES_RUN_BROKER_KEY`。
 
+cron 的 opt-in seam 在 `cron_worker._patch_cron_run_broker()`：plugin register 时 patch `cron.scheduler.run_job`，但只有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时才启用。启用后，due job 先复用 scheduler 的 `_build_job_prompt(job, prerun_script=None)` 得到最终 prompt，再构造 `RunRequest(channel="cron", profile_name, user_key, content, session_id="cron:<job_id>", message_id=<job_id>, credential_subject, requires_host_tools=True)`，通过 `RunBroker.run()` 调 profile runtime，最后返回原 scheduler 期待的 `(success, output_doc, final_response, error)`。`cron.scheduler.tick()` 仍负责 save output、Feishu delivery、mark_job_run 和 repeat/next_run_at 语义。
+
 这不是最终 broker。最终要把现有 `router.handle_async` 的 session history、Feishu renderer、`_stream_into_feishu`、approval bridge、`agent_real.stream_run_agent` 等逐步迁到这个 contract 后面。
 
 ### 10A.3 已有测试
@@ -1072,11 +1074,12 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 - minimal 非 streaming Feishu dispatch 会进入 `RunBroker.run(..., admitted=True)`；
 - full Feishu streaming dispatch 会进入 `RunBroker.run(..., admitted=True)`，内部仍复用 `_stream_into_feishu(...)`；
 - `tests/test_webui_broker_server.py` 覆盖 WebUI HTTP/SSE endpoint 可接收 `RunRequest(channel="webui")`、输出 `content/done` SSE，并在配置 broker key 时拒绝未授权请求；
+- `test_cron_run_broker_patch_submits_cron_run_request` 覆盖 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时 cron job 会构造成 `RunRequest(channel="cron")` 并通过 `RunBroker.run()` 执行；
 - broker 输出 channel-neutral events。
 
 ### 10A.4 下一步
 
-下一批建议做本地端到端 canary：启动 multitenancy broker sidecar + WebUI `HERMES_WEBUI_RUN_BROKER=1`，验证浏览器 chat-run 的请求能到 `/api/run-broker/runs`，同时确认 sidecar 里的 `RunBroker` 确实进入 bwrap sandbox。生产默认路径仍不要切，直到本地 WebUI canary、Feishu canary 和回滚开关都验证完成。
+下一批建议做本地端到端 canary：启动 multitenancy broker sidecar + WebUI `HERMES_WEBUI_RUN_BROKER=1`，验证浏览器 chat-run 的请求能到 `/api/run-broker/runs`，同时确认 sidecar 里的 `RunBroker` 确实进入 bwrap sandbox；再启用 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 跑一个一次性 cron canary。生产默认路径仍不要切，直到本地 WebUI/cron canary、Feishu canary 和回滚开关都验证完成。
 
 ### 10.3 router 里的命令分发
 
@@ -1404,6 +1407,7 @@ flowchart TB
 | 部件 | 文件 | 作用 |
 |---|---|---|
 | `install_cron_runtime_patches()` | `cron_worker.py` | 安装三类 runtime patch：`deliver=feishu` fallback 到 `owner_open_id`；delivery 成功后 mirror 到 owner session；Feishu `_send_raw_message` 支持 `ou_*` open_id target。只改进程内对象，不改 hermes core 文件。 |
+| `_patch_cron_run_broker()` | `cron_worker.py` | opt-in patch：`HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时替换 `cron.scheduler.run_job` 的执行体，把 due job prompt 转成 `RunRequest(channel="cron")` 并通过 `RunBroker.run()` 执行；flag 未开时回落原生 `run_job`。 |
 | `install_gateway_startup_watcher()` | `cron_worker.py` | 包装 `GatewayRunner._create_adapter`，在 gateway adapters ready 后调 `ensure_cron_worker_started(gateway)`。这是 v3 的主启动路径，避免没有 inbound 时 worker 不启动。 |
 | `ensure_cron_worker_started(gateway)` | `cron_worker.py` | Worker 启动入口。拿 `gateway.adapters` + `asyncio.get_running_loop()` + `<root>/profiles/` 路径，启 daemon thread。带四层 guard（HERMES_HOME 未设 / 非嵌套 / adapters 空 / 没有运行 loop），任一不满足直接 INFO log + return。 |
 | `_multiprofile_cron_worker(...)` | `cron_worker.py` | 主循环。每 `interval=60s` 一轮，遍历 `profiles_root.iterdir()`，对每个有 `cron/jobs.json` 的 profile 调 `_tick_one_profile`。`stop_event.wait(60)` 替代 sleep，便于退出。 |
@@ -1564,6 +1568,7 @@ v2 假设 job 的 `origin.chat_id` 已经可投递。v3 改成更适合 WebUI �
 | `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC` | unset | 允许 quick command `type=exec` 在 multitenancy 路径生效 | `_quick_exec_allowed` |
 | `HERMES_MULTITENANCY_APPROVAL_DIR` | unset → tempdir | 子进程 approval 决策文件目录 | `_run_aiagent_subprocess` env |
 | `HERMES_MULTITENANCY_APPROVAL_TIMEOUT` | `300` 或 `HERMES_APPROVAL_GATEWAY_TIMEOUT` | 子进程等待 approval 文件超时 | `_approval_bridge_timeout` |
+| `HERMES_MULTITENANCY_CRON_RUN_BROKER` | unset / off | opt-in：cron `run_job` 是否通过 `RunBroker.run()` 执行；生产 canary 前保持关闭 | `cron_worker._patch_cron_run_broker` |
 | `HERMES_AIAGENT_SUBPROCESS_TIMEOUT` | `300` | 子进程总超时 | `_run_aiagent_subprocess` |
 | `HERMES_AIAGENT_EVENT_STREAM` | unset | 子进程切 NDJSON 流式输出 | `_stream_aiagent_subprocess` env |
 | `HERMES_GATEWAY_SESSION` | `1`（子进程强制）| hermes 内部判定 gateway 模式 | 子进程 env |
@@ -1642,6 +1647,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | uncommitted | **feat(run broker)**: 新增 opt-in cron run broker seam；`HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时 due job 构造 `RunRequest(channel="cron")` 并通过 `RunBroker.run()` 执行 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A；§15 |
 | 2026-05-14 | `b9da974` | **feat(run broker)**: 新增 WebUI broker HTTP/SSE sidecar endpoint，`HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 时提供 `/api/run-broker/runs`，支持 Bearer shared secret | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | §10A |
 | 2026-05-14 | `efbd4f6` | **feat(run broker)**: full Feishu CardKit streaming 分支也通过 `RunBroker.run(..., admitted=True)` 持有 run lifecycle，内部仍复用 `_stream_into_feishu(...)` | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `fc2c05e` | **feat(run broker)**: minimal 非 streaming Feishu adapter 分支通过 `RunBroker.run(..., admitted=True)` 执行真实 `pool.dispatch`；CardKit streaming 仍未迁 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
