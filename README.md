@@ -99,7 +99,7 @@ If you are an agent taking over this repo, this is the main contract:
 
 | Role | Owns |
 |---|---|
-| Feishu admin | Creates or reuses one internal Feishu app, enables the bot/websocket/scopes, and keeps the shared `FEISHU_APP_ID` / `FEISHU_APP_SECRET` out of git. |
+| Feishu admin | Creates or reuses one internal Feishu app, enables the bot/websocket/scopes, and keeps the shared app credential out of git. Production stores it in `multitenancy_credentials` as the global Feishu app row. |
 | Platform operator | Installs hermes + this plugin, keeps the gateway running, manages routing rows and profile directories. |
 | End user | Authorizes once through the Feishu auth/UAT flow, then talks to the same bot. User tokens refresh offline from the shared Hermes home. |
 | Agent profile owner | Maintains each profile's `SOUL.md`, `config.yaml`, `.env`, tool policy, session DB, and model credentials. |
@@ -108,7 +108,7 @@ If you are an agent taking over this repo, this is the main contract:
 
 You do **not** need one Feishu app per user. Reuse one Feishu app/bot for all tenants:
 
-1. Put the shared Feishu app credentials only in the gateway/default Hermes config or environment.
+1. Store the shared Feishu app credential in the multitenancy credential vault (`profile_name=__global__`, `subject_id=feishu_app`, `provider=feishu`, `secret_kind=app`). Env/default Hermes config is only a migration or fallback source.
 2. Route by the real Feishu sender `open_id` (`ou_*`). The router can fall back to `union_id` (`on_*`) for migration/legacy rows, but new users should be keyed by `ou_*`.
 3. Per-user Feishu UAT tokens are first captured by OAuth into `~/.hermes/feishu_uat/<open_id>.json` (gateway-side, shared), then migrated to `~/.hermes/profiles/<profile>/feishu_uat/<open_id>.json` by the org-sync pass — that per-profile copy is what the AIAgent subprocess actually reads. Do not commit token files. See `docs/profile-isolation.md` §6.
 4. Keep per-profile model/tool credentials under `~/.hermes/profiles/<profile>/`. The Feishu app is shared; profile persona, memory, tools and LLM credentials stay isolated.
@@ -155,7 +155,7 @@ plugins:
 
 ### 3. Configure one shared Feishu bot
 
-Use your existing Hermes Feishu app credentials in the default gateway home. The exact surrounding Hermes config can vary by version; the important part is that all profiles reuse the same app credentials.
+Use your existing Hermes Feishu app credentials as a migration source, then store them in the multitenancy credential vault. The exact surrounding Hermes config can vary by version; the important part is that all profiles reuse one shared app credential while user UAT stays profile-scoped.
 
 ```yaml
 # ~/.hermes/config.yaml

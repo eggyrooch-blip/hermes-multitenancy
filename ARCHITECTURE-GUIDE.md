@@ -24,9 +24,7 @@ sources:
 > [!warning] 2026-05-14 credential vault
 > `51044dc` 新增 `hermes_multitenancy.credentials.CredentialStore` 与 `multitenancy_credentials` 表，用 dedicated credential rows 存 Feishu UAT / provider token metadata + encrypted payload，不把 token 混进 routing table。`credential_tool.py` 注册的是 status-only 诊断工具，只返回 provider、subject、scope、expires_at、status、storage，不返回 access_token/refresh_token/api_key。`agent_real._install_feishu_uat_db_broker()` 会优先从 DB 取当前 profile/open_id 的 Feishu UAT；缺失时兼容读取 profile-local JSON 并写入 DB。生产 router gateway 通过 systemd drop-in 提供 `HERMES_MULTITENANCY_CREDENTIAL_KEY`，该 key 只作为 AIAgent 子进程 plumbing 透传，terminal/code subprocess 仍按 secret-name 过滤。
 >
-> 追加本轮修复后，`agent_real._build_subprocess_env()` 明确把 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOMAIN` 作为 app-level plumbing 透传给 sandboxed AIAgent。原因是 Feishu tool client 需要 app 配置才能再按 profile/open_id 加载用户 UAT；这些值不是用户 UAT。`FEISHU_UAT_ACCESS_TOKEN` / `FEISHU_UAT_REFRESH_TOKEN` 仍不在 allowlist，必须留在 profile-local `feishu_uat` 或 credential vault。
->
-> `ae495ae` 进一步把缺省 domain 也收在 plugin 内：当 parent/systemd 提供 `FEISHU_APP_ID` + `FEISHU_APP_SECRET` 但没有 `FEISHU_DOMAIN` 时，sandboxed AIAgent env 默认补 `FEISHU_DOMAIN=feishu`。这样 Feishu tool client 不会为推断 domain 去读被 bwrap 遮蔽的 profile `.env`。`b2eeb1c` 同时让 `session.source` retag 在 `state.db` 还没有 `sessions` 表时静默跳过，避免 WebUI/Run Broker 工具生命周期反复刷 `sqlite3.OperationalError`。生产 `yaojunhua` docx canary 已验证 `feishu_docx_create/get_blocks/update` 走 credential vault UAT 且全部 `error=False`。
+> `fcd55ac` 把 Feishu app credential 也收进 vault：`_install_feishu_app_db_broker()` patch `tools.feishu_oapi_client._resolve_feishu_credentials()`，优先取全局行 `profile_name=__global__ / subject_id=feishu_app / provider=feishu / secret_kind=app`；用户 UAT 仍按 `profile_name + open_id + provider=feishu + secret_kind=uat` 精确过滤。`_build_subprocess_env()` 不再转发 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOMAIN`，profile `.env` 中这三项也会被过滤。生产 `yaojunhua` canary 已验证 app credential 与 UAT 均从 credential vault 加载，`feishu_get_my_user_info` `error=False`。
 
 > [!info] 2026-05-14 全员可进入目标态
 > 生产目标不是灰度 allowlist。Feishu org sync 负责为全员创建/更新 canonical routing/profile；用户自己完成 `feishu_auth` 后即可通过 Feishu bot / WebUI 消费工具。`HERMES_MULTITENANCY_AUTO_PROVISION=0` 只表示不为未知 open_id 创建临时 fallback profile，避免历史 `feishu_ou_*` 残留继续扩散；它不等于人工准入。未命中 routing/profile 时应优先排查 org sync 是否覆盖到该用户，而不是要求人工审批。
@@ -1647,6 +1645,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | `fcd55ac` | **fix(feishu vault)**: Feishu app credential 迁入 `multitenancy_credentials` 全局 app 行；AIAgent env 不再转发 app_id/app_secret/domain | `生产环境的实况.md` §22 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | `b2eeb1c` | **fix(feishu retag)**: Run Broker/WebUI profile `state.db` 尚无 `sessions` 表时，`session.source` retag 静默跳过，避免每个工具事件刷 `sqlite3.OperationalError` | `生产环境的实况.md` §21 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | `ae495ae` | **fix(feishu env)**: sandboxed AIAgent 在 app_id/app_secret 存在但缺 `FEISHU_DOMAIN` 时默认补 `feishu`，避免 Feishu tool client 读取被遮蔽的 profile `.env` | `生产环境的实况.md` §21 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | 本次提交 | **fix(feishu card)**: synthetic session guard 增加 ownership transfer；新消息打断旧 streaming 时，新 dispatch 接管 flush guard，旧任务 cleanup 不再拆掉新消息 guard | `ARCHITECTURE-GUIDE.md` / `生产环境的实况.md` | §12 |
@@ -1754,7 +1753,7 @@ WantedBy=default.target
 `hermes-web-ui.service` 关键字段：
 
 ```ini
-EnvironmentFile=/home/hermes/.hermes/.env                       # 共享 env（FEISHU_APP_ID/SECRET, GLM_API_KEY, ...）
+EnvironmentFile=/home/hermes/.hermes/.env                       # 共享 env（provider keys；Feishu app credential 仅作迁移/兼容 fallback）
 EnvironmentFile=/home/hermes/code/hermes-web-ui/.env            # webui 专属 env
 Environment=NODE_ENV=production
 ExecStart=/usr/bin/node /home/hermes/code/hermes-web-ui/dist/server/index.js
@@ -1767,8 +1766,8 @@ StandardError=append:/home/hermes/.hermes/profiles/multitenancy_router/logs/web-
 | Env | 值 | 来源 | 备注 |
 |---|---|---|---|
 | `HERMES_AUTH_MODE` | `feishu-oauth-dev` | webui .env | OAuth 模式 |
-| `FEISHU_APP_ID` | `cli_a97469ad7bfb9bec` | `~/.hermes/.env` | 飞书 app 凭据 |
-| `FEISHU_APP_SECRET` | (set) | `~/.hermes/.env` | 飞书 app secret |
+| `FEISHU_APP_ID` | `cli_a97469ad7bfb9bec` | `multitenancy_credentials` global app row；env 仅 fallback | 飞书 app id |
+| `FEISHU_APP_SECRET` | (set) | `multitenancy_credentials` global app row；env 仅 fallback | 飞书 app secret，AIAgent env 不转发 |
 | `FEISHU_REDIRECT_URI` | `https://hermes.gotokeep.com/api/auth/feishu/callback` | webui .env | **必须跟飞书 app 后台 callback 白名单完全一致** |
 | `FEISHU_SESSION_SECRET` | (32-byte hex) | webui .env | 签 OAuth state cookie；`openssl rand -hex 32` 生成 |
 | `FEISHU_CALLBACK_REDIRECT` | `/#/` | webui .env | OAuth 完成后跳到 webui 首页 |
