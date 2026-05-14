@@ -27,6 +27,9 @@ sources:
 > [!warning] 2026-05-14 Feishu inbound duplicate guard
 > 真实 Feishu DM canary 后发现：同一会话中旧长任务可能被 Feishu/WebSocket flush 或事件重投递再次送入 router，绕过仅内存态的 `_active_sessions` guard，重新启动 `bwrap -> aiagent_subprocess.py`。本仓新增 `multitenancy_processed_events` 表：优先按 Feishu `message_id` 做 24h 持久化去重；无稳定 `message_id` 时，对 40 字以上 normalized prompt 做 2h hash fallback。去重发生在 route 命中之后、in-flight cancellation 与 sandbox 子进程启动之前；slash command 不走这条去重。
 
+> [!info] 2026-05-14 Run Broker 目标态骨架
+> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()`。当前只是目标态骨架和回归测试，尚未把 Feishu `handle_async`、WebUI `chat-run` 或 cron worker 迁入 broker；现有生产路径不受影响。下一步应把 Feishu 路径改成 adapter → `RunRequest` → broker → Feishu renderer 的薄包装。
+
 ---
 
 ## §1 TL;DR
@@ -1016,6 +1019,56 @@ def parse_command(text: str) -> Optional[tuple[str, str]]:
 
 fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"。
 
+---
+
+## §10A Run Broker 目标态骨架
+
+`run_models.py` 和 `run_broker.py` 是把 Feishu / WebUI / cron 收敛到同一执行控制面的第一步。当前代码只建立契约和最小 policy，不接管生产流量。
+
+### 10A.1 Contract
+
+`RunRequest` 是所有 channel 的统一输入：
+
+| 字段 | 说明 |
+|---|---|
+| `channel` | `feishu` / `webui` / `cron` |
+| `profile_name` | 目标 tenant profile，例如 `sunke` |
+| `user_key` | canonical tenant user key，优先 Feishu `ou_*` |
+| `content` | 本轮用户/cron prompt |
+| `chat_id` / `session_id` | channel 回传和会话定位用 |
+| `message_id` / `idempotency_key` | 去重 key；显式 key > message_id > content hash |
+| `delivery_mode` | stream / final 等 channel 策略标签 |
+| `credential_subject` | credential vault subject；默认等于 `user_key` |
+| `requires_host_tools` | 需要 terminal/file/code/browser/delegation 等 host-capable tools 时必须走 sandbox |
+
+`RunEvent` 是 broker 对 channel renderer 输出的中立事件：`content`、`thinking`、`tool_started`、`tool_completed`、`approval_required`、`approval_resolved`、`done`、`error`。
+
+### 10A.2 当前 RunBroker 行为
+
+`RunBroker.run(request)` 现在做四件事：
+
+1. `RunRequest` 构造时校验 `channel/profile_name/user_key/content`。
+2. `requires_host_tools=True` 且 sandbox 不可用时，抛 `RunRejected("sandbox is required...")`。
+3. 如果注入了 `mark_seen(request)`，在 dispatch 前做 idempotency；重复请求返回 `RunResult(duplicate=True)`，不调用 agent dispatcher。
+4. 调用注入的 `dispatch_agent(request)`，再输出 channel-neutral `RunEvent(content)` 和 `RunEvent(done)`。
+
+这不是最终 broker。最终要把现有 `router.handle_async` 的 session history、Feishu renderer、`_stream_into_feishu`、approval bridge、`agent_real.stream_run_agent` 等逐步迁到这个 contract 后面。
+
+### 10A.3 已有测试
+
+`tests/test_run_broker.py` 覆盖：
+
+- 缺 `profile_name/user_key/content` 直接拒绝；
+- 未知 channel 拒绝；
+- `message_id` 生成稳定 idempotency key；
+- host-tool-capable run 在无 sandbox 时 fail-closed；
+- idempotency 在 dispatch 前挡住重复 run；
+- broker 输出 channel-neutral events。
+
+### 10A.4 下一步
+
+建议下一批只迁 Feishu 主路径的一小段：把 route 后的 `profile_name/user_key/text/message_id` 组装为 `RunRequest`，让 broker 承担 idempotency 与 sandbox policy；Feishu adapter rendering 仍留在 `router.py`。这样能保持生产行为一致，同时让 WebUI 后续有同一个 broker entrypoint 可接。
+
 ### 10.3 router 里的命令分发
 
 (`_handle_command` `router.py:640-722`)
@@ -1580,6 +1633,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | `799c26e` | **feat(run broker)**: 新增 `RunRequest` / `RunEvent` / `RunBroker` 目标态骨架和测试；尚未接管 Feishu/WebUI/cron 生产路径 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A 新增 |
 | 2026-05-14 | `d15f8ae` | **feat(cron delivery)**: startup watcher + Feishu owner_open_id fallback + Feishu open_id send patch + delivery context mirror | `生产环境的实况.md` §13；本 GUIDE §15 v3 | §2.4 register 入口；§15 worker/delivery 语义；附录 E systemd 现状 |
 | 2026-05-13 | — (运维变更，无代码，已被 2026-05-14 实况修正端口/profile 名) | **远端复制本机多租户模式**：新增 `hermes-gateway@.service` systemd template，per-profile gateway 各跑独立端口；当日记录曾写 `feishu_ou_75...→:8651` / `multitenancy_router→:8652` / `feishu_sunke→:8653`，当前生产以 `sunke→8655` 为准。webui 切 detect-only（`GATEWAY_AUTOSTART=none` + 清掉 `HERMES_PROFILE`/`UPSTREAM`/`HERMES_FORCE_RUN_MODE`）。team-rca 调研：`webui-profile-routing-rca` (worker-local + worker-remote) | `.omc/research/local-gateway-mode.md` + `.omc/research/spawn-race-rca.md` | 附录 E.3 systemd unit 拓扑（**改写**）/ E.5 OAuth 链路尾段 known-缺口 消除 |
 | 2026-05-13 | hermes-web-ui `a9ef54a` | **feat(gateway)**: `HERMES_FORCE_RUN_MODE` env override —— 让 GatewayManager 在 systemd 主机上跳过 service-mode 直接走 `gateway run --replace`（绕过 per-profile systemd unit 缺失问题）。但**实际生产路径选了"systemd template + detect-only"**，这个 env 保留为 fallback 路径 | — | 附录 E.4 webui env / source code |
