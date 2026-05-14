@@ -28,7 +28,7 @@ sources:
 > 真实 Feishu DM canary 后发现：同一会话中旧长任务可能被 Feishu/WebSocket flush 或事件重投递再次送入 router，绕过仅内存态的 `_active_sessions` guard，重新启动 `bwrap -> aiagent_subprocess.py`。本仓新增 `multitenancy_processed_events` 表：优先按 Feishu `message_id` 做 24h 持久化去重；无稳定 `message_id` 时，对 40 字以上 normalized prompt 做 2h hash fallback。去重发生在 route 命中之后、in-flight cancellation 与 sandbox 子进程启动之前；slash command 不走这条去重。
 
 > [!info] 2026-05-14 Run Broker 目标态骨架
-> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。WebUI 已有 opt-in HTTP/SSE sidecar endpoint；cron 已有 opt-in `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` run_job patch，会把 due job 构造成 `RunRequest(channel="cron")`。默认生产路径仍未切 WebUI/cron broker canary；CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`。
+> `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。WebUI 已有 HTTP/SSE sidecar endpoint；cron 已有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` run_job patch，会把 due job 构造成 `RunRequest(channel="cron")`。生产 66 已启用 WebUI/cron broker：`127.0.0.1:8766` sidecar active，WebUI Socket.IO canary 返回 `SANDBOX=1`，真实 router cron worker job `e79412276d8f` 输出 `Run Path: RunBroker` + `SANDBOX=1`。CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`。
 
 ---
 
@@ -1079,7 +1079,7 @@ cron 的 opt-in seam 在 `cron_worker._patch_cron_run_broker()`：plugin registe
 
 ### 10A.4 下一步
 
-下一批建议做本地端到端 canary：启动 multitenancy broker sidecar + WebUI `HERMES_WEBUI_RUN_BROKER=1`，验证浏览器 chat-run 的请求能到 `/api/run-broker/runs`，同时确认 sidecar 里的 `RunBroker` 确实进入 bwrap sandbox；再启用 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 跑一个一次性 cron canary。生产默认路径仍不要切，直到本地 WebUI/cron canary、Feishu canary 和回滚开关都验证完成。
+2026-05-14 生产验证：66 已拉取 `hermes-multitenancy@2a4d688` 并启用 `HERMES_MULTITENANCY_RUN_BROKER_SERVER=1`、`HERMES_MULTITENANCY_CRON_RUN_BROKER=1`。WebUI Socket.IO canary 通过 `POST /api/run-broker/runs` 进入 bwrap，terminal 输出 `SANDBOX=1`；profile-local one-shot cron job `e79412276d8f` 由真实 router worker 扫描执行，输出文件包含 `Run Path: RunBroker` 与 `SANDBOX=1`。回滚方式是关闭 WebUI/cron broker feature flag，但保留 host-tool sandbox guard。
 
 ### 10.3 router 里的命令分发
 
@@ -1568,7 +1568,7 @@ v2 假设 job 的 `origin.chat_id` 已经可投递。v3 改成更适合 WebUI �
 | `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC` | unset | 允许 quick command `type=exec` 在 multitenancy 路径生效 | `_quick_exec_allowed` |
 | `HERMES_MULTITENANCY_APPROVAL_DIR` | unset → tempdir | 子进程 approval 决策文件目录 | `_run_aiagent_subprocess` env |
 | `HERMES_MULTITENANCY_APPROVAL_TIMEOUT` | `300` 或 `HERMES_APPROVAL_GATEWAY_TIMEOUT` | 子进程等待 approval 文件超时 | `_approval_bridge_timeout` |
-| `HERMES_MULTITENANCY_CRON_RUN_BROKER` | unset / off | opt-in：cron `run_job` 是否通过 `RunBroker.run()` 执行；生产 canary 前保持关闭 | `cron_worker._patch_cron_run_broker` |
+| `HERMES_MULTITENANCY_CRON_RUN_BROKER` | production on / default unset | cron `run_job` 是否通过 `RunBroker.run()` 执行；66 已开启并通过真实 worker canary | `cron_worker._patch_cron_run_broker` |
 | `HERMES_AIAGENT_SUBPROCESS_TIMEOUT` | `300` | 子进程总超时 | `_run_aiagent_subprocess` |
 | `HERMES_AIAGENT_EVENT_STREAM` | unset | 子进程切 NDJSON 流式输出 | `_stream_aiagent_subprocess` env |
 | `HERMES_GATEWAY_SESSION` | `1`（子进程强制）| hermes 内部判定 gateway 模式 | 子进程 env |
