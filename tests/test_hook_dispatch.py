@@ -30,20 +30,22 @@ def _build_event(
 
 
 def test_profile_scoped_media_response_rewrites_temp_path_to_profile_artifact(tmp_path):
-    """External temp MEDIA tags may point to a profile-scoped browser/download artifact."""
+    """External temp MEDIA tags publish profile artifacts into the WebUI workspace."""
     from hermes_multitenancy import router as router_mod
 
     profile_home = tmp_path / "profiles" / "sunke"
-    artifact = profile_home / "home" / "Downloads" / "logo.png"
-    artifact.parent.mkdir(parents=True)
-    artifact.write_bytes(b"png")
+    source = profile_home / "home" / "Downloads" / "logo.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"png")
+    workspace_artifact = profile_home / "workspace" / "Downloads" / "logo.png"
 
     response = router_mod._profile_scoped_media_response(
         "created\nMEDIA:/tmp/logo/logo.png",
         profile_home,
     )
 
-    assert response == f"created\nMEDIA:{artifact.resolve()}"
+    assert response == f"created\nMEDIA:{workspace_artifact.resolve()}"
+    assert workspace_artifact.read_bytes() == b"png"
 
 
 def test_profile_scoped_media_response_blocks_temp_path_without_profile_artifact(tmp_path):
