@@ -30,6 +30,7 @@ import time
 import hashlib
 import tempfile
 import uuid
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -81,6 +82,7 @@ _FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FEISHU_UAT_ACCESS_TOKEN",
     "FEISHU_UAT_REFRESH_TOKEN",
 })
+_CREDENTIAL_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
 async def stream_run_agent(  # type: ignore[override]
@@ -926,6 +928,7 @@ def _build_subprocess_env(
 
     profile_home = profile_home.expanduser()
     env.update(_profile_env_for_aiagent(profile_home))
+    env.update(_credential_env_for_aiagent(profile_home))
 
     # OpenClaw-compatible token boundary: HOME and /workspace-style variables
     # point into the routed profile so unmodified token skills do not write to
@@ -1050,6 +1053,125 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         logger.debug("[multitenancy] failed to load profile auth env for subprocess", exc_info=True)
 
     return loaded
+
+
+def _credential_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Load configured profile credential env vars from the multitenancy vault.
+
+    ``credential-materialization.yaml`` can expose a credential as a file for
+    legacy tools and as an env var for skills that already expect conventional
+    names such as ``GITLAB_TOKEN``. The secret enters only the routed AIAgent
+    process; terminal/code subprocesses still require explicit passthrough
+    registration in the child runtime.
+    """
+    loaded: dict[str, str] = {}
+    try:
+        from .credential_materializer import (
+            DEFAULT_SHARED_PROFILE,
+            _payload_content,
+            _resolve_config_path,
+            _target_profiles,
+        )
+        from .credentials import CredentialStore
+
+        shared_home = _resolve_shared_hermes_home(profile_home)
+        config = _resolve_config_path(shared_home, None)
+        if config is None:
+            return loaded
+        import yaml
+
+        raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+        entries = raw.get("credentials") or []
+        if not isinstance(entries, list):
+            return loaded
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                env_name = str(entry.get("env") or entry.get("env_name") or "").strip()
+                if not env_name:
+                    continue
+                if not _CREDENTIAL_ENV_NAME_RE.match(env_name):
+                    logger.warning(
+                        "[multitenancy] skipped invalid credential env name %r",
+                        env_name,
+                    )
+                    continue
+                if profile_home.name not in _target_profiles(entry, shared_home=shared_home):
+                    continue
+                try:
+                    payload = store.get_secret_for_runtime(
+                        profile_name=str(entry.get("vault_profile") or DEFAULT_SHARED_PROFILE),
+                        subject_id=str(entry["subject_id"]),
+                        provider=str(entry["provider"]),
+                        secret_kind=str(entry.get("secret_kind") or "token"),
+                    )
+                except PermissionError:
+                    continue
+                loaded[env_name] = _payload_content(payload, entry.get("payload_key")).rstrip("\n")
+        finally:
+            store.close()
+    except Exception:
+        logger.debug("[multitenancy] failed to load credential env for subprocess", exc_info=True)
+    return loaded
+
+
+def _install_credential_env_passthrough(profile_home: Path) -> None:
+    """Allow configured credential env vars through terminal/code sandboxes."""
+    env_names = sorted(_credential_env_for_aiagent(profile_home))
+    if not env_names:
+        return
+    try:
+        from tools.env_passthrough import register_env_passthrough
+
+        register_env_passthrough(env_names)
+        logger.info(
+            "[multitenancy] registered credential env passthrough profile=%s count=%d",
+            profile_home.name,
+            len(env_names),
+        )
+    except Exception:
+        logger.debug("[multitenancy] credential env passthrough skipped", exc_info=True)
+
+
+def _install_skill_runtime_compat(profile_home: Path) -> None:
+    """Install profile-scoped skill template compatibility in the AIAgent child.
+
+    Some OpenClaw/ClawHub-style skills use ``{baseDir}`` to refer to the skill
+    root. Upstream hermes-agent uses ``${HERMES_SKILL_DIR}``. Keep this bridge
+    inside the multitenancy-routed runtime so shared skills and hermes-agent do
+    not need local compatibility patches.
+    """
+    try:
+        import agent.skill_preprocessing as skill_preprocessing
+    except Exception:
+        logger.debug("[multitenancy] skill runtime compat skipped", exc_info=True)
+        return
+
+    original = getattr(skill_preprocessing, "substitute_template_vars", None)
+    if not callable(original):
+        return
+    if getattr(original, "_hermes_multitenancy_base_dir_compat", False):
+        return
+
+    def _substitute_with_base_dir(content, skill_dir, session_id=None):
+        rendered = original(content, skill_dir, session_id)
+        if not isinstance(rendered, str) or "{baseDir}" not in rendered or not skill_dir:
+            return rendered
+        return rendered.replace("{baseDir}", str(Path(skill_dir).expanduser()))
+
+    _substitute_with_base_dir._hermes_multitenancy_base_dir_compat = True
+    skill_preprocessing.substitute_template_vars = _substitute_with_base_dir
+
+    skill_commands = sys.modules.get("agent.skill_commands")
+    if skill_commands is not None and hasattr(skill_commands, "_substitute_template_vars"):
+        skill_commands._substitute_template_vars = _substitute_with_base_dir
+
+    logger.info(
+        "[multitenancy] installed skill runtime compatibility for profile=%s",
+        profile_home.name,
+    )
 
 
 def _dotenv_values_for_aiagent(
@@ -2087,6 +2209,8 @@ def _run_with_aiagent(
     base_url = _resolve_base_url(provider, True, config, env_overrides)
 
     # 3) Lazy-import hermes core (only when this code path is hit).
+    _install_credential_env_passthrough(profile_home)
+    _install_skill_runtime_compat(profile_home)
     from run_agent import AIAgent
     from tools import feishu_oapi_client as feishu_oapi
     sender_open_id_scope = feishu_oapi.sender_open_id_scope

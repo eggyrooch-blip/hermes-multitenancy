@@ -89,6 +89,8 @@ def register(ctx) -> None:
     override_pool(_build_runtime_pool(_real_factory))
     install_cron_runtime_patches()
     install_gateway_startup_watcher()
+    from .group_inviter_hook import install_feishu_bot_added_hook
+    install_feishu_bot_added_hook()
     webui_broker_server.ensure_run_broker_server_started()
 
     register_credential_status_tool(ctx)

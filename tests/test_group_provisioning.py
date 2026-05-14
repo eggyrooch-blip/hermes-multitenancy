@@ -1,0 +1,485 @@
+"""Layer 2 tests — group route auto-provisioning + profile skeleton."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+# -- Pure helpers ------------------------------------------------------------
+
+
+def test_extract_chat_type_from_source():
+    from hermes_multitenancy.router import _extract_chat_type
+
+    event = SimpleNamespace(source=SimpleNamespace(chat_type="group"))
+    assert _extract_chat_type(event) == "group"
+
+
+def test_extract_chat_type_from_event_attr():
+    from hermes_multitenancy.router import _extract_chat_type
+
+    event = SimpleNamespace(chat_type="p2p", source=None)
+    assert _extract_chat_type(event) == "p2p"
+
+
+def test_extract_chat_type_missing_returns_empty():
+    from hermes_multitenancy.router import _extract_chat_type
+
+    event = SimpleNamespace(source=SimpleNamespace())
+    assert _extract_chat_type(event) == ""
+
+
+def test_is_group_chat_type_recognizes_known_values():
+    from hermes_multitenancy.router import _is_group_chat_type
+
+    assert _is_group_chat_type("group") is True
+    assert _is_group_chat_type("topic") is True
+    assert _is_group_chat_type("Group") is True  # case-insensitive
+    assert _is_group_chat_type("p2p") is False
+    assert _is_group_chat_type("") is False
+
+
+def test_extract_chat_id_prefers_source():
+    from hermes_multitenancy.router import _extract_chat_id
+
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="oc_abc"))
+    assert _extract_chat_id(event) == "oc_abc"
+
+
+def test_extract_chat_id_falls_back_to_event_attr():
+    from hermes_multitenancy.router import _extract_chat_id
+
+    event = SimpleNamespace(chat_id="oc_event", source=None)
+    assert _extract_chat_id(event) == "oc_event"
+
+
+def test_make_group_profile_name_is_deterministic():
+    from hermes_multitenancy.router import _make_group_profile_name
+
+    assert _make_group_profile_name("oc_abc123") == _make_group_profile_name("oc_abc123")
+    # Different chat_ids produce different profile names
+    assert _make_group_profile_name("oc_abc") != _make_group_profile_name("oc_def")
+
+
+def test_make_group_profile_name_prefix_filesystem_safe():
+    from hermes_multitenancy.router import _make_group_profile_name
+
+    name = _make_group_profile_name("oc_AbC123-:&^%")
+    assert name.startswith("feishu_group_")
+    # Profile name must not contain any unsafe filesystem characters.
+    for ch in name:
+        assert ch.isalnum() or ch in "_-"
+
+
+def test_is_group_profile_name():
+    from hermes_multitenancy.router import is_group_profile_name
+
+    assert is_group_profile_name("feishu_group_abc_1234") is True
+    assert is_group_profile_name("feishu_owner") is False
+    assert is_group_profile_name("") is False
+    assert is_group_profile_name(None) is False
+
+
+# -- register_chat_inviter --------------------------------------------------
+
+
+def test_register_chat_inviter_stores_entry():
+    from hermes_multitenancy import router as router_mod
+
+    router_mod._chat_inviter_cache.clear()
+    router_mod.register_chat_inviter(
+        "oc_x", "ou_inviter", chat_name="IT 组", inviter_display="owner"
+    )
+    entry = router_mod._chat_inviter_cache["oc_x"]
+    assert entry["inviter_open_id"] == "ou_inviter"
+    assert entry["chat_name"] == "IT 组"
+    assert entry["inviter_display"] == "owner"
+
+
+def test_register_chat_inviter_rejects_non_open_id():
+    from hermes_multitenancy import router as router_mod
+
+    router_mod._chat_inviter_cache.clear()
+    # tenant-local user_id format (no ou_ prefix) must be rejected
+    router_mod.register_chat_inviter("oc_x", "g41a5b5g")
+    assert "oc_x" not in router_mod._chat_inviter_cache
+
+
+def test_register_chat_inviter_rejects_empty_chat_id():
+    from hermes_multitenancy import router as router_mod
+
+    router_mod._chat_inviter_cache.clear()
+    router_mod.register_chat_inviter("", "ou_inviter")
+    assert router_mod._chat_inviter_cache == {}
+
+
+# -- _ensure_group_profile --------------------------------------------------
+
+
+def test_ensure_group_profile_writes_marker_and_soul(tmp_path):
+    from hermes_multitenancy.router import _ensure_group_profile
+
+    profile_home = tmp_path / "profiles" / "feishu_group_x"
+    _ensure_group_profile(
+        profile_name="feishu_group_x",
+        profile_home=profile_home,
+        chat_id="oc_abc",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT组",
+    )
+    # Profile dir exists with skeleton files
+    assert profile_home.is_dir()
+    assert (profile_home / "SOUL.md").exists()
+    soul_text = (profile_home / "SOUL.md").read_text(encoding="utf-8")
+    assert "oc_abc" in soul_text
+    assert "ou_inviter" in soul_text
+    assert "owner-IT组" in soul_text
+    # The group profile marker exists and forbids feishu_auth.
+    marker = json.loads((profile_home / "group_profile.json").read_text("utf-8"))
+    assert marker["kind"] == "group"
+    assert marker["chat_id"] == "oc_abc"
+    assert marker["owner_open_id"] == "ou_inviter"
+    assert marker["feishu_auth_disabled"] is True
+    # The feishu_uat/ directory exists but is empty (no per-user UAT here).
+    uat_dir = profile_home / "feishu_uat"
+    assert uat_dir.is_dir()
+    assert list(uat_dir.iterdir()) == []
+
+
+def test_ensure_group_profile_is_idempotent(tmp_path):
+    from hermes_multitenancy.router import _ensure_group_profile
+
+    profile_home = tmp_path / "profiles" / "feishu_group_x"
+    _ensure_group_profile(
+        profile_name="feishu_group_x",
+        profile_home=profile_home,
+        chat_id="oc_abc",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT组",
+    )
+    soul_before = (profile_home / "SOUL.md").read_text("utf-8")
+    # Calling again must not overwrite the SOUL or change the marker.
+    _ensure_group_profile(
+        profile_name="feishu_group_x",
+        profile_home=profile_home,
+        chat_id="oc_abc",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT组-renamed",
+    )
+    assert (profile_home / "SOUL.md").read_text("utf-8") == soul_before
+
+
+def test_ensure_group_profile_inherits_default_skills(tmp_path):
+    from hermes_multitenancy.router import _ensure_group_profile
+
+    shared_home = tmp_path
+    skill_source = shared_home / "skills" / "Keep" / "keep-record"
+    skill_source.mkdir(parents=True)
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        "skills:\n  - Keep/keep-record\n",
+        encoding="utf-8",
+    )
+    (skill_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    profile_home = shared_home / "profiles" / "feishu_group_x"
+
+    _ensure_group_profile(
+        profile_name="feishu_group_x",
+        profile_home=profile_home,
+        chat_id="oc_abc",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT组",
+    )
+
+    assert (profile_home / "skills" / "Keep" / "keep-record" / "SKILL.md").exists()
+
+
+# -- resolve_or_auto_provision_group_route ----------------------------------
+
+
+@pytest.fixture
+def isolated_router(tmp_path, monkeypatch):
+    from hermes_multitenancy import router as router_mod
+
+    router_mod._chat_inviter_cache.clear()
+    router_mod.override_routing_table(":memory:")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda name: tmp_path / "profiles" / name,
+    )
+    # Ensure auto-provision is enabled regardless of host env
+    monkeypatch.setenv("HERMES_MULTITENANCY_AUTO_PROVISION", "1")
+    yield router_mod, tmp_path
+    router_mod.override_routing_table(None)
+    router_mod._chat_inviter_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_resolve_returns_existing_group_route(isolated_router):
+    router_mod, tmp_path = isolated_router
+    table = router_mod._get_routing_table()
+    table.upsert_group(
+        chat_id="oc_existing",
+        profile_name="feishu_group_existing",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT",
+    )
+    profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_existing", gateway=None
+    )
+    assert profile_name == "feishu_group_existing"
+    assert profile_home == tmp_path / "profiles" / "feishu_group_existing"
+
+
+@pytest.mark.asyncio
+async def test_resolve_auto_provisions_when_cache_has_inviter(isolated_router):
+    router_mod, tmp_path = isolated_router
+    router_mod.register_chat_inviter(
+        "oc_new", "ou_inviter", chat_name="IT 组", inviter_display="owner"
+    )
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "ignored — cache wins"}
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_new", gateway=gateway,
+    )
+    assert profile_name is not None and profile_name.startswith("feishu_group_")
+    assert profile_home is not None and profile_home.is_dir()
+    # The routing row exists with the inviter as owner.
+    row = router_mod._get_routing_table().lookup_by_chat_id("oc_new")
+    assert row is not None
+    assert row.owner_open_id == "ou_inviter"
+    assert row.display_label == "owner-IT 组"
+    # Cache is evicted post-provision so a future re-add starts fresh.
+    assert "oc_new" not in router_mod._chat_inviter_cache
+
+
+@pytest.mark.asyncio
+async def test_resolve_refuses_when_no_inviter_cached(isolated_router):
+    """Per design: no implicit fallback to chat.owner_id. Refuse silently."""
+    router_mod, _ = isolated_router
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "IT 组", "owner_id": "ou_someone"}
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_never_added", gateway=gateway,
+    )
+    assert profile_name is None
+    assert profile_home is None
+    # No routing row was created.
+    assert router_mod._get_routing_table().lookup_by_chat_id("oc_never_added") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_refuses_when_auto_provision_disabled(isolated_router, monkeypatch):
+    router_mod, _ = isolated_router
+    monkeypatch.setenv("HERMES_MULTITENANCY_AUTO_PROVISION", "0")
+    router_mod.register_chat_inviter("oc_x", "ou_inviter")
+    profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_x", gateway=None,
+    )
+    assert profile_name is None
+    assert profile_home is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_fetches_chat_name_when_cache_missing_it(isolated_router):
+    router_mod, _ = isolated_router
+    router_mod.register_chat_inviter("oc_lookup", "ou_inviter")  # no chat_name/display
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "技术中台"}
+
+        async def get_user_name(self, open_id):
+            return "owner"
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    profile_name, _profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_lookup", gateway=gateway,
+    )
+    assert profile_name is not None
+    row = router_mod._get_routing_table().lookup_by_chat_id("oc_lookup")
+    assert row.display_label == "owner-技术中台"
+
+
+# -- handle_async group-chat integration ------------------------------------
+
+
+def _group_event(text: str = "@bot hi", chat_id: str = "oc_g1") -> SimpleNamespace:
+    return SimpleNamespace(
+        text=text,
+        source=SimpleNamespace(
+            chat_id=chat_id,
+            user_id="g_member",
+            user_id_alt=None,
+            user_name="member",
+            chat_type="group",
+            open_id="ou_member_who_at_mentioned",
+            platform=SimpleNamespace(value="feishu"),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_async_routes_group_to_group_profile(isolated_router, monkeypatch):
+    """A group-chat message must dispatch to the group profile, never to the
+    @-mentioning user's profile."""
+    router_mod, tmp_path = isolated_router
+
+    # Pre-provision the group route
+    router_mod.register_chat_inviter(
+        "oc_g1", "ou_inviter", chat_name="IT 组", inviter_display="owner"
+    )
+
+    captured_homes = []
+
+    async def capture_runner(event, home):
+        captured_homes.append(home)
+        return "ok"
+
+    from hermes_multitenancy import runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", capture_runner)
+
+    sends = []
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "IT 组"}
+        async def get_user_name(self, open_id):
+            return "owner"
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append((c, m))
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    await router_mod.handle_async(event=_group_event(), gateway=gateway)
+
+    assert captured_homes, "runner should have been called"
+    selected_home = captured_homes[0]
+    assert selected_home.name.startswith("feishu_group_"), (
+        f"expected group profile, got {selected_home.name}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_async_rejects_feishu_auth_in_group(isolated_router, monkeypatch):
+    router_mod, _ = isolated_router
+    router_mod.register_chat_inviter(
+        "oc_g_auth", "ou_inviter", chat_name="IT", inviter_display="owner"
+    )
+
+    runner_calls: list = []
+
+    async def runner(event, home):
+        runner_calls.append(home)
+        return "ok"
+
+    from hermes_multitenancy import runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", runner)
+
+    sends = []
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "IT"}
+        async def get_user_name(self, open_id):
+            return "owner"
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append((c, m))
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    evt = _group_event(text="/feishu_auth", chat_id="oc_g_auth")
+    await router_mod.handle_async(event=evt, gateway=gateway)
+
+    # Runner must NOT have been invoked — the auth command was intercepted.
+    assert runner_calls == []
+    # Adapter received a polite rejection mentioning the limitation.
+    assert any("群聊模式" in m for _c, m in sends), sends
+
+
+@pytest.mark.asyncio
+async def test_handle_async_group_without_inviter_sends_guidance(isolated_router, monkeypatch):
+    router_mod, _ = isolated_router
+    # No register_chat_inviter call — simulate restart-before-bot-added.
+
+    runner_calls: list = []
+
+    async def runner(event, home):
+        runner_calls.append(home)
+        return "ok"
+
+    from hermes_multitenancy import runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", runner)
+
+    sends = []
+
+    class _Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append((c, m))
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    await router_mod.handle_async(
+        event=_group_event(chat_id="oc_orphan"), gateway=gateway
+    )
+    assert runner_calls == []
+    assert any("移除我后" in m or "邀请人身份" in m for _c, m in sends), sends
+
+
+@pytest.mark.asyncio
+async def test_handle_async_p2p_unchanged_by_group_branch(isolated_router, monkeypatch):
+    """P2P (private) chats must NOT pick up the group code path."""
+    router_mod, tmp_path = isolated_router
+    table = router_mod._get_routing_table()
+    profile_dir = tmp_path / "profiles" / "feishu_solo"
+    profile_dir.mkdir(parents=True)
+    table.upsert(
+        user_id="solo_user",
+        profile_name="feishu_solo",
+        open_id="ou_solo",
+    )
+
+    captured = []
+
+    async def runner(event, home):
+        captured.append(home)
+        return "ok"
+
+    from hermes_multitenancy import runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", runner)
+
+    class _Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None): pass
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+
+    event = SimpleNamespace(
+        text="hi",
+        source=SimpleNamespace(
+            chat_id="p2p_chat",
+            user_id="solo_user",
+            user_id_alt=None,
+            user_name="solo",
+            chat_type="p2p",
+            open_id="ou_solo",
+            platform=SimpleNamespace(value="feishu"),
+        ),
+    )
+    await router_mod.handle_async(event=event, gateway=gateway)
+    assert captured == [profile_dir], (
+        f"expected p2p sender route, got {captured}"
+    )

@@ -42,6 +42,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="Never deactivate routes missing from this pull",
     )
+    p_pull.add_argument(
+        "--no-materialize-credentials",
+        dest="materialize_credentials",
+        action="store_false",
+        default=True,
+        help="Skip optional credential-materialization.yaml after profile sync",
+    )
+
+    p_materialize = sub.add_parser("materialize-credentials", help="Write vault credentials to profile-local compatibility files")
+    p_materialize.add_argument("--home", type=Path, default=None, help="Shared Hermes home (default: HERMES_HOME or ~/.hermes)")
+    p_materialize.add_argument("--profiles-root", type=Path, default=None, help="Profiles root (default: <home>/profiles)")
+    p_materialize.add_argument("--db", type=Path, default=None, help="Credential DB path (default: <home>/multitenancy.db)")
+    p_materialize.add_argument("--config", type=Path, default=None, help="Materialization config path")
+    p_materialize.add_argument("--dry-run", action="store_true", help="Plan writes without touching profile files")
 
     args = parser.parse_args(argv)
 
@@ -75,6 +89,24 @@ def main(argv: list[str] | None = None) -> int:
                 snapshot_out=args.snapshot_out,
                 api_delay=args.api_delay,
                 soft_delete_missing=args.soft_delete_missing,
+                materialize_credentials_after_sync=args.materialize_credentials,
+            )
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "materialize-credentials":
+        from hermes_multitenancy.credential_materializer import materialize_credentials
+
+        try:
+            stats = materialize_credentials(
+                shared_home=args.home,
+                profiles_root=args.profiles_root,
+                db_path=args.db,
+                config_path=args.config,
+                dry_run=args.dry_run,
             )
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)

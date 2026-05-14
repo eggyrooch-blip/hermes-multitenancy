@@ -212,6 +212,42 @@ def test_sync_profiles_manages_soul_block_without_overwriting_custom_text(tmp_pa
     assert "department: Sales (od_sales)" not in soul2
 
 
+def test_sync_profiles_copies_default_skills_without_secret_files(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    skill_source = shared_home / "skills" / "Keep" / "keep-record"
+    skill_source.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        """
+skills:
+  - Keep/keep-record
+""",
+        encoding="utf-8",
+    )
+    (skill_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    (skill_source / ".env").write_text("TOKEN=do-not-copy\n", encoding="utf-8")
+    (skill_source / "gitlab.token").write_text("do-not-copy\n", encoding="utf-8")
+    (skill_source / "scripts").mkdir()
+    (skill_source / "scripts" / "run.js").write_text("console.log('ok')\n", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    stats = sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    target = profiles_root / "alice" / "skills" / "Keep" / "keep-record"
+    assert stats["created"] == 1
+    assert (target / "SKILL.md").read_text(encoding="utf-8") == "# Keep Record\n"
+    assert (target / "scripts" / "run.js").exists()
+    assert not (target / ".env").exists()
+    assert not (target / "gitlab.token").exists()
+
+
 def test_sync_feishu_org_dry_run_does_not_write_profiles_or_db(tmp_path):
     from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.sync import Department, DepartmentUser, sync_feishu_org
@@ -384,7 +420,7 @@ def test_sync_profiles_creates_isolation_pivot_dirs(tmp_path):
     profile_home = profiles_root / "alice"
     # Every isolation pivot dir referenced by _build_subprocess_env must exist
     # so the first child spawn doesn't have to create them.
-    for sub in ("home", "cache", "config", "state", "data", "tmp"):
+    for sub in ("home", "workspace", "cache", "config", "state", "data", "tmp"):
         path = profile_home / sub
         assert path.is_dir(), f"{sub}/ missing — child subprocess would create it world-readable"
 

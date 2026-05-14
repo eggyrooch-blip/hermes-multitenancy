@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +80,95 @@ def test_profile_scoped_media_response_blocks_temp_path_without_profile_artifact
     )
 
     assert response == "created\n"
+
+
+def _write_minimal_xlsx(path: Path) -> None:
+    files = {
+        "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>""",
+        "_rels/.rels": """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+        "xl/workbook.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>""",
+        "xl/_rels/workbook.xml.rels": """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""",
+        "xl/sharedStrings.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="4" uniqueCount="4">
+  <si><t>marker</t></si>
+  <si><t>amount</t></si>
+  <si><t>HERMES_MT_XLSX_MARKER</t></si>
+  <si><t>42</t></si>
+</sst>""",
+        "xl/worksheets/sheet1.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+    <row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2" t="s"><v>3</v></c></row>
+  </sheetData>
+</worksheet>""",
+    }
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+
+
+def test_local_file_enrichment_extracts_csv_and_xlsx(tmp_path):
+    """Feishu document compatibility belongs in multitenancy, not Hermes-agent patches."""
+    from hermes_multitenancy import router as router_mod
+
+    csv_path = tmp_path / "table.csv"
+    csv_path.write_text("marker,amount\nHERMES_MT_CSV_MARKER,7\n", encoding="utf-8")
+    xlsx_path = tmp_path / "sheet.xlsx"
+    _write_minimal_xlsx(xlsx_path)
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(csv_path), str(xlsx_path)],
+        media_types=["application/octet-stream", "application/octet-stream"],
+    )
+
+    enriched = router_mod._local_enrich_with_file_content(event)
+
+    assert "[Content of table.csv]" in enriched
+    assert "HERMES_MT_CSV_MARKER" in enriched
+    assert "[Content of sheet.xlsx]" in enriched
+    assert "HERMES_MT_XLSX_MARKER" in enriched
+
+
+@pytest.mark.asyncio
+async def test_enrich_via_hermes_pipeline_supplements_xlsx_when_native_skips(tmp_path):
+    """Keep Hermes native preprocessing first, then plugin-fallback missing tabular files."""
+    from hermes_multitenancy import router as router_mod
+
+    xlsx_path = tmp_path / "sheet.xlsx"
+    _write_minimal_xlsx(xlsx_path)
+    event = SimpleNamespace(
+        text="please inspect",
+        media_urls=[str(xlsx_path)],
+        media_types=["application/octet-stream"],
+        source=SimpleNamespace(user_id="ou_test"),
+    )
+
+    class Gateway:
+        async def _prepare_inbound_message_text(self, *, event, source, history):
+            return "please inspect"
+
+    enriched = await router_mod._enrich_via_hermes_pipeline(event, Gateway())
+
+    assert "please inspect" in enriched
+    assert "[Content of sheet.xlsx]" in enriched
+    assert "HERMES_MT_XLSX_MARKER" in enriched
 
 
 @pytest.mark.asyncio
