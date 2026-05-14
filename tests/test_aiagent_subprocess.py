@@ -1459,3 +1459,28 @@ def test_bwrap_default_args_is_valid_syntax():
     assert "--die-with-parent" in tokens
     assert "--proc" in tokens
     assert "--chdir" in tokens
+
+
+def test_bwrap_default_args_does_not_bind_entire_shared_home():
+    """Linux sandbox must not expose sibling profile directories read-only."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/shared/profiles/alice",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+
+    triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    assert ("--ro-bind", "/probe/shared", "/probe/shared") not in triples
+    assert ("--dir", "/probe/shared/profiles", "--dir") in triples
+    assert (
+        "--bind",
+        "/probe/shared/profiles/alice",
+        "/probe/shared/profiles/alice",
+    ) in triples
