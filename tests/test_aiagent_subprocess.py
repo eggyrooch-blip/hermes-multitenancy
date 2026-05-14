@@ -980,8 +980,8 @@ def test_build_subprocess_env_drops_non_allowlisted_parent_env(monkeypatch, tmp_
     approval_dir.mkdir()
     env = agent_real._build_subprocess_env(tmp_path / "profile", approval_dir=approval_dir)
 
-    # Allowlisted keys carry over verbatim.
-    assert env["PATH"] == "/usr/bin:/bin"
+    # Allowlisted keys carry over, with shared Hermes-managed tool bin prepended.
+    assert env["PATH"].endswith("/usr/bin:/bin")
     assert env["PYTHONUNBUFFERED"] == "1"
 
     # Secret-ish env keys must be absent.
@@ -1196,12 +1196,14 @@ def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path:
     assert env["ANTHROPIC_API_KEY"] == "auth-token"
 
 
-def test_build_subprocess_env_pivots_xdg_and_tmpdir_into_profile(tmp_path: Path):
-    """XDG_* / TMPDIR redirect to per-profile dirs, isolating skill caches.
+def test_build_subprocess_env_pivots_home_workspace_and_token_compat_env(tmp_path: Path):
+    """Token-oriented skills should work unchanged inside a profile.
 
-    HOME is deliberately NOT pivoted — host CLI tools (kep-cli, aws, etc.)
-    rely on ``Path.home() / ".kep-cli"`` style paths to find their state, so
-    rebinding HOME would break them. See _build_subprocess_env docstring.
+    Existing OpenClaw-style skills and internal CLIs typically discover token
+    state through HOME, /workspace, or KEP_PROFILE.  Multitenancy owns the
+    routing, so the subprocess env must transparently redirect those anchors
+    to the routed profile instead of requiring each skill to call
+    hermes_multitenancy.skill_storage.
     """
     from hermes_multitenancy import agent_real
 
@@ -1215,29 +1217,17 @@ def test_build_subprocess_env_pivots_xdg_and_tmpdir_into_profile(tmp_path: Path)
     assert env["XDG_STATE_HOME"] == str(profile / "state")
     assert env["XDG_DATA_HOME"] == str(profile / "data")
     assert env["TMPDIR"] == str(profile / "tmp")
-
-    # HOME must NOT be pivoted to <profile>/home. Either it stays inherited
-    # from parent (PATH/etc. allowlist did not include HOME, so it should be
-    # absent unless added) or it's empty. The point is that Path.home() inside
-    # the child still resolves to the user's real home, so host-installed
-    # CLIs (kep-cli, aws) can find ~/.kep-cli, ~/.aws etc.
-    if "HOME" in env:
-        assert env["HOME"] != str(profile / "home"), (
-            "HOME must not pivot to profile — that would break host CLIs that "
-            "use Path.home() to locate their per-user state directories."
-        )
+    assert env["HOME"] == str(profile / "home")
+    assert env["WORKSPACE"] == str(profile / "workspace")
+    assert env["KEP_PROFILE"] == "alice"
+    assert env["HERMES_PROFILE"] == "alice"
 
     # XDG/TMPDIR pivot dirs must exist and be private (mode 0700).
-    for sub in ("cache", "config", "state", "data", "tmp"):
+    for sub in ("home", "workspace", "cache", "config", "state", "data", "tmp"):
         d = profile / sub
         assert d.is_dir(), f"{sub} not created"
         mode = d.stat().st_mode & 0o777
         assert mode == 0o700, f"{sub} mode is {oct(mode)}, expected 0o700"
-
-    # ``home/`` subdir is no longer created automatically by env build —
-    # provisioned by sync only if explicit (kept for tools that ask for a
-    # per-profile-home location, but it's not the HOME env target).
-    assert not (profile / "home").exists()
 
 
 def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
@@ -1259,6 +1249,22 @@ def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
         profile, approval_dir=approval_dir, event_stream=True
     )
     assert stream_env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
+
+
+def test_build_subprocess_env_prepends_shared_bin_to_path(monkeypatch, tmp_path: Path):
+    """Shared Hermes-managed CLI installs must be callable while token state stays profile-local."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["PATH"].split(":")[0] == str(shared_home / "bin")
+    assert env["PATH"].endswith("/usr/bin:/bin")
 
 
 def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
@@ -1306,11 +1312,10 @@ async def test_run_aiagent_subprocess_passes_sanitized_env_to_child(
 
     child_env = captured["env"]
     assert "OPENAI_API_KEY" not in child_env, "parent secret leaked to child"
-    # HOME is NOT pivoted to profile (would break host CLIs like kep-cli).
-    # If HOME survives the allowlist (it currently does not) it must not point
-    # at the profile.
-    if "HOME" in child_env:
-        assert child_env["HOME"] != str(profile / "home")
+    assert child_env["HOME"] == str(profile / "home")
+    assert child_env["WORKSPACE"] == str(profile / "workspace")
+    assert child_env["KEP_PROFILE"] == "isolated"
+    assert child_env["HERMES_PROFILE"] == "isolated"
     assert child_env["TMPDIR"] == str(profile / "tmp")
     assert child_env["HERMES_HOME"] == str(profile)
 
@@ -1661,6 +1666,26 @@ def test_bwrap_default_args_is_valid_syntax():
     assert "--die-with-parent" in tokens
     assert "--proc" in tokens
     assert "--chdir" in tokens
+
+
+def test_bwrap_default_args_provides_openclaw_workspace_and_shared_bin():
+    """Linux sandbox should expose profile workspace at /workspace and shared tool bin."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/shared/profiles/alice",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+
+    triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    assert ("--bind", "/probe/shared/profiles/alice/workspace", "/workspace") in triples
+    assert ("--ro-bind-try", "/probe/shared/bin", "/probe/shared/bin") in triples
 
 
 def test_bwrap_default_args_does_not_bind_entire_shared_home():

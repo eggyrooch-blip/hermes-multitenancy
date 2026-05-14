@@ -57,11 +57,12 @@
 # to /usr/bin/python3.11 instead, in which case --ro-bind-try is a no-op.
 --ro-bind-try ${USER_HOME}/.local/share/uv ${USER_HOME}/.local/share/uv
 
-# ── Host CLI dotdirs (read-only) ────────────────────────────────────
-# Mirrors profile-default.sb lines 105-110. .ssh / Keychains / .password-store
-# are deliberately NOT bound here; they don't exist in the namespace so the
-# sandboxed subprocess cannot reach host SSH keys or secret stores.
---ro-bind-try ${USER_HOME}/.kep-cli ${USER_HOME}/.kep-cli
+# ── Shared tool binaries + legacy host CLI dotdirs ──────────────────
+# Shared Hermes-managed binaries (kep-auth, hades-cli, keep-record wrappers,
+# etc.) are executable from ${SHARED_HOME}/bin. Token state should live under
+# the routed profile via HOME=/PROFILE_HOME/home or /workspace; the host
+# dotdirs below are read-only legacy compatibility only.
+--ro-bind-try ${SHARED_HOME}/bin ${SHARED_HOME}/bin
 --ro-bind-try ${USER_HOME}/.aws ${USER_HOME}/.aws
 --ro-bind-try ${USER_HOME}/.config/gh ${USER_HOME}/.config/gh
 --ro-bind-try ${USER_HOME}/.config/git ${USER_HOME}/.config/git
@@ -94,6 +95,11 @@
 # mount (bwrap evaluates --bind / --ro-bind in source order, with the
 # last operation winning at any given path).
 --bind ${PROFILE_HOME} ${PROFILE_HOME}
+
+# OpenClaw compatibility: many existing enterprise skills hardcode
+# /workspace/... for credentials and helper scripts. Bind the routed profile's
+# workspace there so those skills run unchanged while staying tenant-scoped.
+--bind ${PROFILE_HOME}/workspace /workspace
 
 # Secret files are deliberately masked from the tool-visible filesystem.
 # agent_real._build_subprocess_env loads required values into the AIAgent
