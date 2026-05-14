@@ -1023,6 +1023,66 @@ def test_build_subprocess_env_loads_profile_env_for_agent_only(monkeypatch, tmp_
     assert env["PUBLIC_RUNTIME_FLAG"] == "enabled"
 
 
+def test_build_subprocess_env_loads_shared_model_env_when_profile_env_is_empty(tmp_path: Path):
+    """Profiles may inherit shared model provider keys without exposing Feishu app secrets."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "sunke"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("", encoding="utf-8")
+    (shared_home / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=shared-model-key",
+                "ANTHROPIC_BASE_URL=https://tokenhub.example/v1",
+                "FEISHU_APP_ID=cli_test",
+                "FEISHU_APP_SECRET=feishu-secret",
+                "GITLAB_TOKEN=glpat-shared",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "shared-model-key"
+    assert env["ANTHROPIC_BASE_URL"] == "https://tokenhub.example/v1"
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "GITLAB_TOKEN" not in env
+
+
+def test_build_subprocess_env_filters_profile_env_symlinked_to_shared_home(tmp_path: Path):
+    """A profile .env symlink to shared .env is treated as shared config, not tenant env."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "zhanglina"
+    profile.mkdir(parents=True)
+    (shared_home / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=shared-model-key",
+                "GITLAB_TOKEN=glpat-shared",
+                "PUBLIC_RUNTIME_FLAG=shared-flag",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (profile / ".env").symlink_to(shared_home / ".env")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "shared-model-key"
+    assert "GITLAB_TOKEN" not in env
+    assert "PUBLIC_RUNTIME_FLAG" not in env
+
+
 def test_resolve_base_url_prefers_profile_env_for_primary_model(monkeypatch):
     """Sandboxed AIAgent must honor provider base URLs loaded from profile .env."""
     from hermes_multitenancy import agent_real

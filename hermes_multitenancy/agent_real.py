@@ -68,6 +68,20 @@ _PROVIDER_BASE_URL_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "deepseek": ("DEEPSEEK_BASE_URL",),
 }
 
+_MODEL_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    key
+    for names in (*_PROVIDER_ENV_KEYS.values(), *_PROVIDER_BASE_URL_ENV_KEYS.values())
+    for key in names
+)
+
+_FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_DOMAIN",
+    "FEISHU_UAT_ACCESS_TOKEN",
+    "FEISHU_UAT_REFRESH_TOKEN",
+})
+
 
 async def stream_run_agent(  # type: ignore[override]
     event: Any,
@@ -988,13 +1002,24 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     apply their own secret-name env filter before running model-generated code.
     """
     loaded: dict[str, str] = {}
+    profile_env = profile_home / ".env"
+    shared_env = _resolve_shared_hermes_home(profile_home) / ".env"
     try:
-        from dotenv import dotenv_values
-        for key, value in dotenv_values(profile_home / ".env").items():
-            if key and value is not None:
-                if str(key) in {"FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOMAIN"}:
-                    continue
-                loaded[str(key)] = str(value)
+        if shared_env.exists():
+            loaded.update(_dotenv_values_for_aiagent(shared_env, allowed_keys=_MODEL_ENV_ALLOWLIST))
+
+        profile_allowed_keys: Optional[frozenset[str]] = None
+        try:
+            if (
+                profile_env != shared_env
+                and profile_env.exists()
+                and shared_env.exists()
+                and profile_env.resolve() == shared_env.resolve()
+            ):
+                profile_allowed_keys = _MODEL_ENV_ALLOWLIST
+        except OSError:
+            pass
+        loaded.update(_dotenv_values_for_aiagent(profile_env, allowed_keys=profile_allowed_keys))
     except Exception:
         logger.debug("[multitenancy] failed to load profile .env for subprocess", exc_info=True)
 
@@ -1021,6 +1046,29 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         logger.debug("[multitenancy] failed to load profile auth env for subprocess", exc_info=True)
 
     return loaded
+
+
+def _dotenv_values_for_aiagent(
+    path: Path,
+    *,
+    allowed_keys: Optional[frozenset[str]] = None,
+) -> dict[str, str]:
+    """Read an env file for AIAgent-only injection with explicit secret filtering."""
+    values: dict[str, str] = {}
+    try:
+        from dotenv import dotenv_values
+        for key, value in dotenv_values(path).items():
+            if not key or value is None:
+                continue
+            key = str(key)
+            if key in _FEISHU_ENV_BLOCKLIST:
+                continue
+            if allowed_keys is not None and key not in allowed_keys:
+                continue
+            values[key] = str(value)
+    except Exception:
+        logger.debug("[multitenancy] failed to load env file for subprocess: %s", path, exc_info=True)
+    return values
 
 
 # ─────────────────────────────────────────────────────────────────────────
