@@ -1023,6 +1023,17 @@ def test_build_subprocess_env_loads_profile_env_for_agent_only(monkeypatch, tmp_
     assert env["PUBLIC_RUNTIME_FLAG"] == "enabled"
 
 
+def test_resolve_base_url_prefers_profile_env_for_primary_model(monkeypatch):
+    """Sandboxed AIAgent must honor provider base URLs loaded from profile .env."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://tokenhub.example")
+
+    base_url = agent_real._resolve_base_url("anthropic", True, {}, {})
+
+    assert base_url == "https://tokenhub.example"
+
+
 def test_build_subprocess_env_forwards_credential_vault_key_only(monkeypatch, tmp_path: Path):
     """Credential vault key is router plumbing; unrelated parent secrets still stay out."""
     from hermes_multitenancy import agent_real
