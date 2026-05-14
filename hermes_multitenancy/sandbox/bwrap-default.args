@@ -102,8 +102,6 @@
 --ro-bind-try /dev/null ${SHARED_HOME}/.env
 --ro-bind-try /dev/null ${SHARED_HOME}/auth.json
 --ro-bind-try /dev/null ${SHARED_HOME}/auth.lock
---ro-bind-try /dev/null ${PROFILE_HOME}/.env
---ro-bind-try /dev/null ${PROFILE_HOME}/auth.json
 
 # ── Cross-tenant deny by construction ───────────────────────────────
 # ${SHARED_HOME}/profiles exists only as an empty directory plus the current
