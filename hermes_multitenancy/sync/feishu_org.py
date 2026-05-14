@@ -65,6 +65,8 @@ _PROFILE_DIRS = [
 ]
 _SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
 _SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
+_SKILL_LINKED_DEP_DIRS = {"node_modules"}
+_SKILL_IGNORED_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -634,29 +636,61 @@ def _safe_skill_relative_path(value: Any) -> Optional[Path]:
 
 def _copy_skill_tree(src: Path, dst: Path) -> bool:
     changed = False
-    for item in src.rglob("*"):
-        if item.is_symlink():
-            continue
-        rel = item.relative_to(src)
-        target = dst / rel
-        if item.is_dir():
-            if not target.exists():
-                target.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(src):
+        root_path = Path(root)
+        root_rel = root_path.relative_to(src)
+        if root_rel.parts:
+            target_root = dst / root_rel
+            if not target_root.exists():
+                target_root.mkdir(parents=True, exist_ok=True)
                 changed = True
-            _tighten_dir_mode(target, 0o700)
-            continue
-        if _is_secret_skill_file(rel):
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists() or item.read_bytes() != target.read_bytes():
-            shutil.copy2(item, target)
-            changed = True
+            _tighten_dir_mode(target_root, 0o700)
+
+        keep_dirs: list[str] = []
+        for dirname in dirs:
+            item = root_path / dirname
+            rel = item.relative_to(src)
+            target = dst / rel
+            if item.is_symlink() or dirname in _SKILL_IGNORED_DIRS:
+                continue
+            if dirname in _SKILL_LINKED_DEP_DIRS:
+                if not _same_symlink(target, item):
+                    if target.exists() or target.is_symlink():
+                        shutil.rmtree(target) if target.is_dir() and not target.is_symlink() else target.unlink()
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(item, target_is_directory=True)
+                    changed = True
+                continue
+            keep_dirs.append(dirname)
+        dirs[:] = keep_dirs
+
+        for filename in files:
+            item = root_path / filename
+            if item.is_symlink():
+                continue
+            rel = item.relative_to(src)
+            if _is_secret_skill_file(rel):
+                continue
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or item.read_bytes() != target.read_bytes():
+                shutil.copy2(item, target)
+                changed = True
     if src.exists() and not dst.exists():
         dst.mkdir(parents=True, exist_ok=True)
         changed = True
     if dst.exists():
         _tighten_dir_mode(dst, 0o700)
     return changed
+
+
+def _same_symlink(path: Path, target: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        return path.resolve(strict=True) == target.resolve(strict=True)
+    except FileNotFoundError:
+        return False
 
 
 def _is_secret_skill_file(rel_path: Path) -> bool:
