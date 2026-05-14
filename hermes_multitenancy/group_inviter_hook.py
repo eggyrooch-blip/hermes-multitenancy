@@ -1,4 +1,4 @@
-"""Layer 4 — capture bot-added inviter into the in-process cache.
+"""Layer 4 — capture bot-added inviter + group-aware welcome via class-level patch.
 
 When the Feishu adapter receives an ``im.chat.member.bot.added_v1`` event,
 the bot has been pulled into a chat by some user. The operator_id on that
@@ -12,6 +12,11 @@ attribute after ``_create_adapter`` has returned therefore does nothing —
 the SDK already holds the unwrapped reference. We patch the *class*
 attribute at plugin-register time so every adapter instance picks up the
 wrapped method when it does ``self._on_bot_added_to_chat`` inside ``__init__``.
+
+The same module also replaces ``_send_chat_added_onboarding`` at class
+level so the welcome message can vary by chat_type (group vs p2p). This
+keeps all hermes-native files untouched while still surfacing the right
+message for group chats.
 """
 from __future__ import annotations
 
@@ -23,10 +28,11 @@ logger = logging.getLogger(__name__)
 
 _HOOK_INSTALLED = False
 _CLASS_PATCH_FLAG = "_hermes_multitenancy_bot_added_class_patched"
+_WELCOME_PATCH_FLAG = "_hermes_multitenancy_welcome_class_patched"
 
 
 def install_feishu_bot_added_hook() -> None:
-    """Idempotently wrap ``FeishuAdapter._on_bot_added_to_chat`` at class level.
+    """Idempotently wrap ``FeishuAdapter._on_bot_added_to_chat`` + welcome at class level.
 
     Safe to call before the adapter module is importable: the patch is
     skipped (with an info log) and the next plugin-register invocation can
@@ -44,6 +50,12 @@ def install_feishu_bot_added_hook() -> None:
         )
         return
 
+    _patch_bot_added(FeishuAdapter)
+    _patch_chat_added_welcome(FeishuAdapter)
+    _HOOK_INSTALLED = True
+
+
+def _patch_bot_added(FeishuAdapter: Any) -> None:
     original = getattr(FeishuAdapter, "_on_bot_added_to_chat", None)
     if original is None:
         logger.warning(
@@ -51,7 +63,6 @@ def install_feishu_bot_added_hook() -> None:
         )
         return
     if getattr(original, _CLASS_PATCH_FLAG, False):
-        _HOOK_INSTALLED = True
         return
 
     @functools.wraps(original)
@@ -66,8 +77,58 @@ def install_feishu_bot_added_hook() -> None:
 
     setattr(wrapped, _CLASS_PATCH_FLAG, True)
     FeishuAdapter._on_bot_added_to_chat = wrapped
-    _HOOK_INSTALLED = True
     logger.info("[multitenancy] installed bot-added inviter hook on FeishuAdapter class")
+
+
+def _patch_chat_added_welcome(FeishuAdapter: Any) -> None:
+    original = getattr(FeishuAdapter, "_send_chat_added_onboarding", None)
+    if original is None:
+        logger.info(
+            "[multitenancy] FeishuAdapter has no _send_chat_added_onboarding; welcome hook skipped"
+        )
+        return
+    if getattr(original, _WELCOME_PATCH_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    async def wrapped(self: Any, chat_id: str) -> Any:
+        chat_type = await _resolve_chat_type(self, chat_id)
+        if chat_type in ("group", "topic"):
+            try:
+                await self.send(
+                    chat_id,
+                    "👋 已加入此群。@我提问即可，群里不会以任何成员的身份调用飞书数据。"
+                    "如需以你本人身份调用飞书 API，请私聊我后发送 `/feishu_auth`。",
+                )
+            except Exception:
+                logger.debug(
+                    "[multitenancy] group welcome send failed for chat=%s", chat_id
+                )
+            return None
+        return await original(self, chat_id)
+
+    setattr(wrapped, _WELCOME_PATCH_FLAG, True)
+    FeishuAdapter._send_chat_added_onboarding = wrapped
+    logger.info("[multitenancy] installed group-aware welcome on FeishuAdapter class")
+
+
+async def _resolve_chat_type(adapter: Any, chat_id: str) -> str:
+    cache = getattr(adapter, "_chat_info_cache", None)
+    cached = cache.get(chat_id) if isinstance(cache, dict) else None
+    if isinstance(cached, dict):
+        value = str(cached.get("type") or "").strip().lower()
+        if value:
+            return value
+    getter = getattr(adapter, "get_chat_info", None)
+    if getter is None:
+        return ""
+    try:
+        info = await getter(chat_id)
+    except Exception:
+        return ""
+    if isinstance(info, dict):
+        return str(info.get("type") or "").strip().lower()
+    return ""
 
 
 def _capture_inviter_from_event(data: Any) -> None:
