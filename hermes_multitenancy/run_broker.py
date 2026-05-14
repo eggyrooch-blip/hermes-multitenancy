@@ -56,12 +56,13 @@ class RunBroker:
         self._sandbox_available = sandbox_available or _default_sandbox_available
         self._require_sandbox_for_host_tools = require_sandbox_for_host_tools
 
-    async def run(self, request: RunRequest) -> RunResult:
+    async def run(self, request: RunRequest, *, admitted: bool = False) -> RunResult:
         """Execute a request after policy and idempotency checks."""
-        admission = await self.admit(request)
-        if admission.duplicate:
-            await self._emit(RunEvent(kind="done"))
-            return admission
+        if not admitted:
+            admission = await self.admit(request)
+            if admission.duplicate:
+                await self._emit(RunEvent(kind="done"))
+                return admission
 
         response = await _maybe_await(self._dispatch_agent(request))
         content = str(response or "")

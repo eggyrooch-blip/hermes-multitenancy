@@ -336,12 +336,15 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
             admitted.append(request)
             return RunResult(content="", duplicate=False)
 
+        async def run(self, request, *, admitted=False):
+            return RunResult(content="ok", duplicate=False)
+
     class MockPool:
         async def dispatch(self, profile_name, profile_home, agent_event):
             dispatched.append((profile_name, agent_event.text))
             return "ok"
 
-    monkeypatch.setattr(router_mod, "_make_routed_run_broker", lambda: FakeBroker())
+    monkeypatch.setattr(router_mod, "_make_routed_run_broker", lambda **_kwargs: FakeBroker())
     monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
 
     event = _build_event(text="hello broker", user_id="ou_broker")
@@ -358,7 +361,55 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
     assert request.chat_id == "chat-123"
     assert request.message_id == "om_broker"
     assert request.credential_subject == "ou_broker"
-    assert dispatched == [("owner", "hello broker")]
+    clear_spike_routes()
+
+
+def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_path):
+    """Minimal Feishu adapter dispatch should be owned by RunBroker.run."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy.run_models import RunResult
+
+    clear_spike_routes()
+    profile_home = tmp_path / "owner"
+    profile_home.mkdir()
+    add_spike_route("ou_nonstream_broker", profile_home)
+
+    broker_calls = []
+    pool_calls = []
+
+    class FakeBroker:
+        async def admit(self, request):
+            broker_calls.append(("admit", request.content))
+            return RunResult(content="", duplicate=False)
+
+        async def run(self, request, *, admitted=False):
+            broker_calls.append(("run", request.content, admitted))
+            response = await router_mod._get_pool().dispatch(
+                request.profile_name,
+                profile_home,
+                SimpleNamespace(text=request.content),
+            )
+            return RunResult(content=response, duplicate=False)
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            pool_calls.append((profile_name, agent_event.text))
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_make_routed_run_broker", lambda **_kwargs: FakeBroker())
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    asyncio.run(router_mod.handle_async(
+        event=_build_event(text="hello nonstream broker", user_id="ou_nonstream_broker"),
+        gateway=SimpleNamespace(adapters={}),
+    ))
+
+    assert broker_calls == [
+        ("admit", "hello nonstream broker"),
+        ("run", "hello nonstream broker", True),
+    ]
+    assert pool_calls == [("owner", "hello nonstream broker")]
     clear_spike_routes()
 
 
