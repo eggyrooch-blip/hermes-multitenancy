@@ -130,6 +130,12 @@ def install_gateway_startup_watcher() -> None:
 
 
 def _schedule_startup_watch(gateway: Any) -> None:
+    try:
+        from .webui_broker_server import ensure_run_broker_server_started
+
+        ensure_run_broker_server_started()
+    except Exception:
+        logger.exception("[multitenancy] failed to schedule WebUI run broker sidecar")
     if getattr(gateway, _watcher_attr, False):
         return
     try:

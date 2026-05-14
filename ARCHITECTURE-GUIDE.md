@@ -1023,7 +1023,7 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 
 ## §10A Run Broker 目标态骨架
 
-`run_models.py` 和 `run_broker.py` 是把 Feishu / WebUI / cron 收敛到同一执行控制面的第一步。当前 Feishu route 已接入 broker admission；WebUI 和 cron 仍未接入，Feishu 的 streaming/card rendering 与实际 agent dispatch 也还在 `router.py`。
+`run_models.py` 和 `run_broker.py` 是把 Feishu / WebUI / cron 收敛到同一执行控制面的第一步。当前 Feishu route 已接入 broker admission 和 `RunBroker.run(...)`；WebUI 已有 opt-in HTTP/SSE seam，cron 仍未接入。Feishu 的 CardKit renderer/session history/media delivery 还在 `router.py`。
 
 ### 10A.1 Contract
 
@@ -1054,6 +1054,8 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 
 `RunBroker.admit(request)` 是迁移期接口：只执行 sandbox policy 与 idempotency，不 dispatch agent。`router.handle_async` 当前用它承接 Feishu 入站去重和 sandbox fail-closed；minimal 非 streaming 分支通过 `RunBroker.run(request, admitted=True)` 执行 `pool.dispatch`，full streaming 分支通过同一个入口调用现有 `_stream_into_feishu(...)`，避免重复 idempotency 检查。
 
+`webui_broker_server.py` 是 WebUI 迁移 seam：启用 `HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 后，router gateway 进程内会调度一个 localhost-only aiohttp sidecar，默认监听 `127.0.0.1:8766`，提供 `POST /api/run-broker/runs`。该 endpoint 接收 WebUI 构造的 `RunRequest(channel="webui")`，通过 `RunBroker.run()` 执行，返回 `text/event-stream` 格式的 channel-neutral events。若设置 `HERMES_MULTITENANCY_RUN_BROKER_KEY`，请求必须带 `Authorization: Bearer <key>`；WebUI 侧对应 `HERMES_RUN_BROKER_KEY`。
+
 这不是最终 broker。最终要把现有 `router.handle_async` 的 session history、Feishu renderer、`_stream_into_feishu`、approval bridge、`agent_real.stream_run_agent` 等逐步迁到这个 contract 后面。
 
 ### 10A.3 已有测试
@@ -1069,11 +1071,12 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 - Feishu routed path 会构造 `RunRequest(channel="feishu")` 并提交 broker admission；
 - minimal 非 streaming Feishu dispatch 会进入 `RunBroker.run(..., admitted=True)`；
 - full Feishu streaming dispatch 会进入 `RunBroker.run(..., admitted=True)`，内部仍复用 `_stream_into_feishu(...)`；
+- `tests/test_webui_broker_server.py` 覆盖 WebUI HTTP/SSE endpoint 可接收 `RunRequest(channel="webui")`、输出 `content/done` SSE，并在配置 broker key 时拒绝未授权请求；
 - broker 输出 channel-neutral events。
 
 ### 10A.4 下一步
 
-下一批建议开始 WebUI 迁移：先在 `hermes-web-ui` server 侧新增 broker client/feature flag，让 `chat-run-socket.ts` 可以构造同样的 `RunRequest`。第一步只做测试和 client seam，不直接切生产默认路径。
+下一批建议做本地端到端 canary：启动 multitenancy broker sidecar + WebUI `HERMES_WEBUI_RUN_BROKER=1`，验证浏览器 chat-run 的请求能到 `/api/run-broker/runs`，同时确认 sidecar 里的 `RunBroker` 确实进入 bwrap sandbox。生产默认路径仍不要切，直到本地 WebUI canary、Feishu canary 和回滚开关都验证完成。
 
 ### 10.3 router 里的命令分发
 
@@ -1639,6 +1642,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | uncommitted | **feat(run broker)**: 新增 WebUI broker HTTP/SSE sidecar endpoint，`HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 时提供 `/api/run-broker/runs`，支持 Bearer shared secret | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | §10A |
 | 2026-05-14 | `efbd4f6` | **feat(run broker)**: full Feishu CardKit streaming 分支也通过 `RunBroker.run(..., admitted=True)` 持有 run lifecycle，内部仍复用 `_stream_into_feishu(...)` | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `fc2c05e` | **feat(run broker)**: minimal 非 streaming Feishu adapter 分支通过 `RunBroker.run(..., admitted=True)` 执行真实 `pool.dispatch`；CardKit streaming 仍未迁 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
 | 2026-05-14 | `84dcfee` | **feat(run broker)**: Feishu routed path 构造 `RunRequest(channel="feishu")` 并进入 `RunBroker.admit()`；broker admission 接管 idempotency/sandbox policy，实际 streaming/dispatch 仍在 router | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
