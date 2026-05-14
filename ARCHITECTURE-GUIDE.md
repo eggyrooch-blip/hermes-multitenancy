@@ -25,6 +25,8 @@ sources:
 > `51044dc` 新增 `hermes_multitenancy.credentials.CredentialStore` 与 `multitenancy_credentials` 表，用 dedicated credential rows 存 Feishu UAT / provider token metadata + encrypted payload，不把 token 混进 routing table。`credential_tool.py` 注册的是 status-only 诊断工具，只返回 provider、subject、scope、expires_at、status、storage，不返回 access_token/refresh_token/api_key。`agent_real._install_feishu_uat_db_broker()` 会优先从 DB 取当前 profile/open_id 的 Feishu UAT；缺失时兼容读取 profile-local JSON 并写入 DB。生产 router gateway 通过 systemd drop-in 提供 `HERMES_MULTITENANCY_CREDENTIAL_KEY`，该 key 只作为 AIAgent 子进程 plumbing 透传，terminal/code subprocess 仍按 secret-name 过滤。
 >
 > `fcd55ac` 把 Feishu app credential 也收进 vault：`_install_feishu_app_db_broker()` patch `tools.feishu_oapi_client._resolve_feishu_credentials()`，优先取全局行 `profile_name=__global__ / subject_id=feishu_app / provider=feishu / secret_kind=app`；用户 UAT 仍按 `profile_name + open_id + provider=feishu + secret_kind=uat` 精确过滤。`_build_subprocess_env()` 不再转发 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOMAIN`，profile `.env` 中这三项也会被过滤。生产 `yaojunhua` canary 已验证 app credential 与 UAT 均从 credential vault 加载，`feishu_get_my_user_info` `error=False`。
+>
+> `91221d3` 修正 shared model env 继承边界：sandboxed AIAgent 在 bwrap 前会从 shared `~/.hermes/.env` 只继承 `_MODEL_ENV_ALLOWLIST` 中的 provider key/base URL（如 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`），profile-local `.env` 仍可覆盖；若 profile `.env` symlink 到 shared `.env`，同样按 shared allowlist 过滤，避免 `GITLAB_TOKEN` / `PUBLIC_RUNTIME_FLAG` 这类非模型配置进入租户 AIAgent env。Feishu app/UAT 继续由 credential vault 读取，不走 env。生产 `sunke` / `zhanglina` RunBroker canary 已验证 bwrap AIAgent 正常取到模型 key。
 
 > [!info] 2026-05-14 全员可进入目标态
 > 生产目标不是灰度 allowlist。Feishu org sync 负责为全员创建/更新 canonical routing/profile；用户自己完成 `feishu_auth` 后即可通过 Feishu bot / WebUI 消费工具。`HERMES_MULTITENANCY_AUTO_PROVISION=0` 只表示不为未知 open_id 创建临时 fallback profile，避免历史 `feishu_ou_*` 残留继续扩散；它不等于人工准入。未命中 routing/profile 时应优先排查 org sync 是否覆盖到该用户，而不是要求人工审批。
@@ -1578,7 +1580,7 @@ WebUI 创建/管理任务也已收敛到 router API 面。`webui_broker_server.p
 | `HERMES_MAX_ITERATIONS` | `30` | AIAgent.max_iterations | `agent_kwargs` |
 | `HERMES_SESSION_KEY` | gateway_session_key | hermes 内部 session contextvar 兜底 | `_configure_gateway_approval_bridge` |
 | `PYTEST_CURRENT_TEST` | unset | hook 在 no-loop 时切 `asyncio.run(...)` 单测路径 | pytest 自动设 |
-| `<PROVIDER>_API_KEY` | env | `GLM_API_KEY`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 等，见 §8.10 | profile `.env` 或 process env |
+| `<PROVIDER>_API_KEY` | env | `GLM_API_KEY`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 等，见 §8.10 | profile `.env`；缺失时从 shared `.env` 的模型 allowlist 继承 |
 
 ---
 
@@ -1649,6 +1651,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | `91221d3` | **fix(model env)**: sandboxed AIAgent 从 shared `.env` 只继承模型 provider allowlist，profile `.env` 可覆盖；Feishu app/UAT 与其他 shared token 不进入 env | `生产环境的实况.md` §8 | 顶部 credential vault；§10A/§13 |
 | 2026-05-14 | `114fd3e` | **fix(cron)**: `/api/run-broker/jobs` 未传 `deliver` 时默认 `feishu`；WebUI cron 不再静默落成本地 output-only job | `生产环境的实况.md` §23 | 顶部 Run Broker jobs；§10A |
 | 2026-05-14 | `fcd55ac` | **fix(feishu vault)**: Feishu app credential 迁入 `multitenancy_credentials` 全局 app 行；AIAgent env 不再转发 app_id/app_secret/domain | `生产环境的实况.md` §22 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | `b2eeb1c` | **fix(feishu retag)**: Run Broker/WebUI profile `state.db` 尚无 `sessions` 表时，`session.source` retag 静默跳过，避免每个工具事件刷 `sqlite3.OperationalError` | `生产环境的实况.md` §21 | 顶部 credential vault；§10A/Run Broker |
