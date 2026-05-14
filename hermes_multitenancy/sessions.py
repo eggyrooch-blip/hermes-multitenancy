@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS multitenancy_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_profile_user
     ON multitenancy_sessions(profile_name, user_key, ts);
+
+CREATE TABLE IF NOT EXISTS multitenancy_processed_events (
+    event_key    TEXT PRIMARY KEY,
+    profile_name TEXT NOT NULL,
+    user_key     TEXT NOT NULL,
+    message_id   TEXT,
+    content_hash TEXT,
+    ts           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_processed_events_profile_user
+    ON multitenancy_processed_events(profile_name, user_key, ts);
 """
 
 
@@ -90,6 +101,41 @@ class SessionStore:
             (profile_name, user_key),
         )
         return int(cur.fetchone()[0])
+
+    def mark_event_processed(
+        self,
+        event_key: str,
+        *,
+        profile_name: str,
+        user_key: str,
+        message_id: Optional[str],
+        content_hash: Optional[str],
+        ttl_seconds: int,
+    ) -> bool:
+        """Record an inbound event key, returning False for a recent duplicate."""
+        now = int(time.time())
+        ttl = max(0, int(ttl_seconds))
+        cutoff = now - ttl
+        cur = self._conn.execute(
+            "SELECT ts FROM multitenancy_processed_events WHERE event_key = ?",
+            (event_key,),
+        )
+        row = cur.fetchone()
+        if row is not None and int(row["ts"]) >= cutoff:
+            return False
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO multitenancy_processed_events"
+            " (event_key, profile_name, user_key, message_id, content_hash, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (event_key, profile_name, user_key, message_id, content_hash, now),
+        )
+        self._conn.execute(
+            "DELETE FROM multitenancy_processed_events WHERE ts < ?",
+            (now - max(ttl, 86400),),
+        )
+        self._conn.commit()
+        return True
 
     def close(self) -> None:
         self._conn.close()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,9 @@ _user_inflight_tasks: dict[str, asyncio.Task] = {}
 # helpers only; using them as the memory key can merge distinct users that share
 # a stale or tenant-global alias.
 _SESSION_HISTORY_MAX = 20  # keep last N messages (user + assistant alternating)
+_DEDUPE_MESSAGE_TTL_SECONDS = 24 * 60 * 60
+_DEDUPE_CONTENT_TTL_SECONDS = 2 * 60 * 60
+_DEDUPE_CONTENT_MIN_CHARS = 40
 _session_history: dict[tuple[str, str], list[dict]] = {}
 # Tracks which (profile, user_key) pairs we've lazy-loaded from SessionStore
 # so we only hit SQLite once per pair per process lifetime.
@@ -109,6 +113,100 @@ def _clear_history(key: tuple[str, str]) -> bool:
         logger.debug("multitenancy: SessionStore.clear failed (%s)", exc)
         rows = 0
     return had_cache or rows > 0
+
+
+def _dedupe_env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)).strip()))
+    except Exception:
+        return default
+
+
+def _event_message_id(event: Any) -> Optional[str]:
+    source = getattr(event, "source", None)
+    candidates = [
+        getattr(event, "message_id", None),
+        getattr(source, "message_id", None) if source is not None else None,
+    ]
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        message = (raw_event.get("event") or {}).get("message") or {}
+        candidates.append(message.get("message_id"))
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _normalize_dedupe_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _event_dedupe_record(
+    *,
+    event: Any,
+    profile_name: str,
+    user_key: str,
+    text: str,
+) -> Optional[tuple[str, Optional[str], Optional[str], int]]:
+    message_id = _event_message_id(event)
+    if message_id:
+        ttl = _dedupe_env_int(
+            "HERMES_MULTITENANCY_EVENT_DEDUPE_TTL_SECONDS",
+            _DEDUPE_MESSAGE_TTL_SECONDS,
+        )
+        return (f"msg:{profile_name}:{user_key}:{message_id}", message_id, None, ttl)
+
+    normalized = _normalize_dedupe_text(text)
+    min_chars = _dedupe_env_int(
+        "HERMES_MULTITENANCY_CONTENT_DEDUPE_MIN_CHARS",
+        _DEDUPE_CONTENT_MIN_CHARS,
+    )
+    if len(normalized) < min_chars:
+        return None
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    ttl = _dedupe_env_int(
+        "HERMES_MULTITENANCY_CONTENT_DEDUPE_TTL_SECONDS",
+        _DEDUPE_CONTENT_TTL_SECONDS,
+    )
+    return (f"content:{profile_name}:{user_key}:{digest}", None, digest, ttl)
+
+
+def _mark_routed_event_seen(
+    *,
+    event: Any,
+    profile_name: str,
+    sender: str,
+    sender_alt: Optional[str],
+    text: str,
+) -> bool:
+    """Return False when this routed inbound event was processed recently."""
+    store = _get_session_store()
+    if store is None:
+        return True
+    user_key = _tenant_user_key(sender, sender_alt)
+    record = _event_dedupe_record(
+        event=event,
+        profile_name=profile_name,
+        user_key=user_key,
+        text=text,
+    )
+    if record is None:
+        return True
+    event_key, message_id, content_hash, ttl = record
+    try:
+        return bool(store.mark_event_processed(
+            event_key,
+            profile_name=profile_name,
+            user_key=user_key,
+            message_id=message_id,
+            content_hash=content_hash,
+            ttl_seconds=ttl,
+        ))
+    except Exception as exc:
+        logger.debug("multitenancy: event dedupe check failed (%s)", exc)
+        return True
 
 
 def _build_user_message(event: Any, *, text_override: Optional[str] = None) -> dict:
@@ -520,14 +618,6 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             logger.info("multitenancy: no route for sender=%s, ignoring", sender)
             return
 
-        # Register self in the user's in-flight slot (replace previous)
-        current = asyncio.current_task()
-        prev = _user_inflight_tasks.get(sender)
-        if prev is not None and not prev.done() and prev is not current:
-            prev.cancel()
-        if current is not None:
-            _user_inflight_tasks[sender] = current
-
         adapter = _get_feishu_adapter(gateway)
         # Detect whether adapter supports the streaming/reaction APIs we use.
         # Real FeishuAdapter does; unit-test mocks typically don't.
@@ -537,6 +627,39 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             and hasattr(adapter, "on_processing_start")
             and hasattr(adapter, "on_processing_complete")
         )
+
+        if not _mark_routed_event_seen(
+            event=event,
+            profile_name=profile_name,
+            sender=sender,
+            sender_alt=sender_alt,
+            text=text,
+        ):
+            logger.info(
+                "multitenancy: duplicate inbound event skipped profile=%s sender=%s message_id=%s",
+                profile_name,
+                sender,
+                _event_message_id(event) or "",
+            )
+            if feishu_full:
+                try:
+                    out = _processing_outcome(failed=False)
+                    complete_deferred = getattr(adapter, "complete_deferred_processing", None)
+                    if callable(complete_deferred):
+                        await complete_deferred(event, out)
+                    else:
+                        await adapter.on_processing_complete(event, out)
+                except Exception as exc:
+                    logger.debug("multitenancy: duplicate processing_complete failed: %s", exc)
+            return
+
+        # Register self in the user's in-flight slot (replace previous)
+        current = asyncio.current_task()
+        prev = _user_inflight_tasks.get(sender)
+        if prev is not None and not prev.done() and prev is not current:
+            prev.cancel()
+        if current is not None:
+            _user_inflight_tasks[sender] = current
 
         outcome_failed = False
         if feishu_full:

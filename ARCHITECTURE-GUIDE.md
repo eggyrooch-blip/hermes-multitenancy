@@ -1,6 +1,6 @@
 ---
 title: hermes-multitenancy 架构指南
-updated: 2026-05-11
+updated: 2026-05-14
 status: living
 scope: /Users/kite/code/hermes-multitenancy（plugin 真源；通过 ~/.hermes/plugins/multitenancy symlink 被 hermes-agent 加载）
 audience: 后续 Claude / 用户本人；改这个仓前必读
@@ -16,7 +16,16 @@ sources:
 
 > 本 GUIDE 是 hermes-multitenancy 仓的"内部地图"。每个章节都是为"下一次改它的人"写的——着重锚点、契约、陷阱，而不是教科书介绍。
 >
-> 上游主仓 `hermes-feishu-uat` 的 GUIDE 把"飞书 inbound → adapter → hook"那段讲完了。**本 GUIDE 从 hook 被触发开始**：从 `pre_gateway_dispatch` 接管，到子进程 `AIAgent` 把字节流回吐回 streaming card，再到落历史，全链路在这。
+> 上游主仓 `hermes-feishu-uat` 的 GUIDE 把"飞书 inbound → adapter → hook"那段讲完了。**本 GUIDE 重点从 multitenancy plugin 被加载/触发开始**：inbound 由 `pre_gateway_dispatch` 接管；cron delivery 则由 gateway startup watcher 启动 multi-profile worker，不再依赖先有一条 inbound 消息。
+
+> [!warning] 2026-05-14 cron/sandbox 修正
+> multi-profile cron worker 在存在 `multitenancy.db` 时只扫描 `active=1` 的 routed profile，避免 inactive 历史 profile（例如旧 `feishu_ou_*`）继续执行遗留 job。Linux bwrap policy 也不再把整个 shared `~/.hermes` 只读挂入 profile subprocess；它只创建 shared 目录骨架，并挂载当前 `PROFILE_HOME` 与明确允许的 shared 文件/目录，从而避免 agent 枚举 sibling profiles。追加部署 `726c79c` / `af285d4` 后，profile `.env/auth.json` 在 bwrap 启动前由父进程读取并转换为 AIAgent env，bwrap 内 shared `.env/auth.json/auth.lock` 用 `/dev/null` 遮蔽；profile `.env` 若是 shared symlink 不直接 bind 遮蔽，避免 bwrap spawn 失败，读取面由 hermes-agent 的 file tool 拒绝与 terminal hardline 兜底。
+
+> [!warning] 2026-05-14 credential vault
+> `51044dc` 新增 `hermes_multitenancy.credentials.CredentialStore` 与 `multitenancy_credentials` 表，用 dedicated credential rows 存 Feishu UAT / provider token metadata + encrypted payload，不把 token 混进 routing table。`credential_tool.py` 注册的是 status-only 诊断工具，只返回 provider、subject、scope、expires_at、status、storage，不返回 access_token/refresh_token/api_key。`agent_real._install_feishu_uat_db_broker()` 会优先从 DB 取当前 profile/open_id 的 Feishu UAT；缺失时兼容读取 profile-local JSON 并写入 DB。生产 router gateway 通过 systemd drop-in 提供 `HERMES_MULTITENANCY_CREDENTIAL_KEY`，该 key 只作为 AIAgent 子进程 plumbing 透传，terminal/code subprocess 仍按 secret-name 过滤。
+
+> [!warning] 2026-05-14 Feishu inbound duplicate guard
+> 真实 Feishu DM canary 后发现：同一会话中旧长任务可能被 Feishu/WebSocket flush 或事件重投递再次送入 router，绕过仅内存态的 `_active_sessions` guard，重新启动 `bwrap -> aiagent_subprocess.py`。本仓新增 `multitenancy_processed_events` 表：优先按 Feishu `message_id` 做 24h 持久化去重；无稳定 `message_id` 时，对 40 字以上 normalized prompt 做 2h hash fallback。去重发生在 route 命中之后、in-flight cancellation 与 sandbox 子进程启动之前；slash command 不走这条去重。
 
 ---
 
@@ -68,14 +77,14 @@ sources:
 
 ### 1.2 一段话
 
-multitenancy 是 hermes-agent 的**进程内插件**。它在 `pre_gateway_dispatch` 钩子里**接管**飞书 inbound，做三件事：(1) 把 `sender_open_id` 路由到一个独立 `profile_home` 目录（`~/.hermes/profiles/<name>/`）；(2) 在 LRU `RuntimePool` 里维护 per-profile 的 `ProfileRuntime`；(3) 用 `asyncio.create_subprocess_exec` 起一个 `aiagent_subprocess.py` 子进程，把 `AIAgent` 跑在那里——通过 NDJSON 协议把 `content/thinking/tool_started/tool_completed/approval_required/approval_resolved/done` 事件流回父进程，父进程再喂给 `GatewayStreamConsumer` 走飞书 streaming card 更新。**"One Feishu bot, N users, N profiles"** 这一行宣传的实现就在这。
+multitenancy 是 hermes-agent 的**进程内插件**。它在 `pre_gateway_dispatch` 钩子里**接管**飞书 inbound，做三件事：(1) 把 `sender_open_id` 路由到一个独立 `profile_home` 目录（`~/.hermes/profiles/<name>/`）；(2) 在 LRU `RuntimePool` 里维护 per-profile 的 `ProfileRuntime`；(3) 用 `asyncio.create_subprocess_exec` 起一个 `aiagent_subprocess.py` 子进程，把 `AIAgent` 跑在那里——通过 NDJSON 协议把 `content/thinking/tool_started/tool_completed/approval_required/approval_resolved/done` 事件流回父进程，父进程再喂给 `GatewayStreamConsumer` 走飞书 streaming card 更新。cron 场景下，它还在 router gateway 中启动 multi-profile worker，扫描各 profile 的 `cron/jobs.json`，用 live Feishu adapter 投递给 owner，并 mirror 到 `multitenancy_sessions`。**"One Feishu bot, N users, N profiles"** 这一行宣传的实现就在这。
 
 ### 1.3 它不做什么
 
 - **不**自己跟飞书 OpenAPI 直接说话——adapter 是 hermes-agent 的 `FeishuAdapter`，token/OAuth/Device Flow 全在 `hermes-feishu-uat` 那边
 - **不**写飞书 token 文件——`~/.hermes/feishu_uat/<ou_*>.json` 是 `hermes-feishu-uat` 的产物
 - **不**起 launchd/supervisor——`hermes_multitenancy` 是 plugin，跟 gateway 同进程
-- **不**直接 import hermes-agent 的私有路径——所有跨仓 import 都 `try/except` 兜底（router.py 里有一票 `from hermes_cli.commands import ...` / `from gateway.stream_consumer import ...` / `from agent.skill_commands import ...` 的优雅降级）
+- **不**修改 hermes-agent core 文件来完成多租户投递。少数 integration seam 会在 plugin runtime 内做有边界的 patch（如 `GatewayRunner._create_adapter`、`cron.scheduler` delivery、Feishu open_id send），目标是复用 hermes-agent adapter/scheduler，不把 core fork 继续扩散
 
 ---
 
@@ -154,6 +163,7 @@ __all__ = ["register", "on_pre_gateway_dispatch"]
 ```python
 def register(ctx) -> None:
     from .agent_real import real_run_agent
+    from .cron_worker import install_cron_runtime_patches, install_gateway_startup_watcher
     from .pool import RuntimePool
     from .router import override_pool
     from .runtime import ProfileRuntime
@@ -162,13 +172,16 @@ def register(ctx) -> None:
         return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
 
     override_pool(RuntimePool(runtime_factory=_real_factory))
-    ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+    install_cron_runtime_patches()
+    install_gateway_startup_watcher()
+    ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
 ```
 
-做两件事，**顺序很重要**：
+做三件事，**顺序很重要**：
 
-1. **`override_pool(RuntimePool(...))`** — 用 `real_run_agent` 把 `pool.py:_default_factory` / `runtime.py:_default_run_agent` echo stub 全替掉。这一步发生在 hook 注册之前，确保插件 enable 后**第一条消息**就走真 LLM，不会先 echo 一发。
-2. **`ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)`** — `ctx` 是 hermes-agent 的 `hermes_cli.plugins.PluginContext`，`register_hook` 是它的标准方法。
+1. **`install_cron_runtime_patches()` / `install_gateway_startup_watcher()`** — 在 plugin runtime 内接管 gateway adapter 创建后的时机，启动 multi-profile cron watcher，并修正 cron delivery 对 Feishu owner/open_id 的投递语义。
+2. **`override_pool(RuntimePool(...))`** — 用 `real_run_agent` 把 `pool.py:_default_factory` / `runtime.py:_default_run_agent` echo stub 全替掉。这一步发生在 hook 注册之前，确保插件 enable 后**第一条消息**就走真 LLM，不会先 echo 一发。
+3. **`ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)`** — `ctx` 是 hermes-agent 的 `hermes_cli.plugins.PluginContext`，`register_hook` 是它的标准方法。pre-dispatch 仍是 inbound 主入口，也保留 worker 启动 fallback。
 
 `override_pool` 在 `router.py:1605-1612` 实现，写入 `_GLOBAL_POOL` singleton；后续 `_get_pool()` 读这个 singleton（router.py:1614-1622）。
 
@@ -245,15 +258,21 @@ if cmd:
 profile_name, profile_home = _resolve_or_auto_provision_route(sender, alt_id=sender_alt)
 if profile_home is None: return                # 无路由,丢
 
+# ── 适配器探测 ────────────────────────────────────
+adapter      = _get_feishu_adapter(gateway)
+feishu_full  = adapter has edit_message + on_processing_start + on_processing_complete
+
+# ── 入站去重（持久化）────────────────────────────
+if not _mark_routed_event_seen(event, profile_name, sender, sender_alt, text):
+    if feishu_full:
+        await adapter.complete_deferred_processing(event, SUCCESS)
+    return
+
 # ── 槽位（per-sender in-flight task）─────────────
 prev = _user_inflight_tasks.get(sender)
 if prev and not prev.done() and prev != current:
     prev.cancel()
 _user_inflight_tasks[sender] = current_task
-
-# ── 适配器探测 ────────────────────────────────────
-adapter      = _get_feishu_adapter(gateway)
-feishu_full  = adapter has edit_message + on_processing_start + on_processing_complete
 
 if feishu_full: await adapter.on_processing_start(event)
 
@@ -333,10 +352,12 @@ if _user_inflight_tasks.get(sender) is current:
 DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
 ```
 
-**独立**于 `~/.hermes/state.db`（注释明说为了不跟 gateway 的 sessions/pairing/cron 抢 WAL）。同一个 `.db` 文件里有两张表：
+**独立**于 `~/.hermes/state.db`（注释明说为了不跟 gateway 的 sessions/pairing/cron 抢 WAL）。同一个 `.db` 文件里至少有这些 multitenancy 表：
 
 - `multitenancy_routing` — `RoutingTable` 用
 - `multitenancy_sessions` — `SessionStore` 用（§9）
+- `multitenancy_processed_events` — Feishu inbound 去重用（§9.4）
+- `multitenancy_credentials` — credential vault 用（credential vault 章节）
 
 两个 class 各开一个 `sqlite3.connect(..., check_same_thread=False)`，共享 WAL。
 
@@ -808,10 +829,10 @@ def main():
     - `feishu_oapi.FEISHU_UAT_DIR  = shared_home / "feishu_uat"`
     - `shared_home` = `HERMES_SHARED_HOME` env > `profile_home.parent.parent`（如 profile 在 `profiles/xxx`）> profile_home
     - **关键**：UAT token 物理只一份在 shared `~/.hermes/feishu_uat/`，不是 per-profile 副本
-8. **`_configure_cron_home(shared_home)`**（`agent_real.py:420-470`）：
-    - `cron.jobs.JOBS_FILE = shared_home/cron/jobs.json`
-    - patch `tools.cronjob_tools._validate_cron_script_path` 强制脚本必须在 `shared_home/scripts/` 内（防穿越，用 `tools.path_security.validate_within_dir`）
-    - **Why**：gateway 的 cron ticker 只看 shared home，profile-local cron 永远不被 tick
+8. **`_configure_cron_home(shared_home)`**（`agent_real.py:445-510`）：
+    - **多租户嵌套布局（`HERMES_HOME=<root>/profiles/<name>`）下为 no-op**：cron 写入沿用 agent 默认 `<target_profile>/cron/jobs.json`，由 §15 的 multi-profile worker 在 gateway 进程内做 tick 与回程 delivery。
+    - **Legacy / 单 profile 布局**保留原 v1 行为：重绑 `cron.jobs.JOBS_FILE = shared_home/cron/jobs.json` + patch `tools.cronjob_tools._validate_cron_script_path` 强制脚本必须在 `shared_home/scripts/` 内（防穿越，用 `tools.path_security.validate_within_dir`）。
+    - **Why**：multitenancy 插件的本分是转发与路由，不应该越界做存储层重绑。v1 的 shared 重绑造成 gateway ticker 在 router profile 路径下空 tick + 写入端 jobs 永远 `state=scheduled`，新版让两端都走 agent 默认即可对齐。详见 commit `1e4c6f6`、笔记 `修复 — Hermes 多租户 cron 双管齐下 2026-05-12.md` 与附录 D。
 9. **`_resolve_enabled_toolsets(config, "feishu", ...)`**（`agent_real.py:1384-1448`）：
     - 默认 = **merge default**（把 `platform_toolsets.feishu` 跟 hermes feishu 默认 toolsets 取并集）
     - 设 `HERMES_MULTITENANCY_TOOLSETS_MODE=explicit/strict/replace` 或 `config.multitenancy.toolsets_mode=...` 才走严格替换
@@ -915,6 +936,7 @@ CREATE INDEX idx_sessions_profile_user
 | `load_recent(profile_name, user_key, limit)` | 64-74 | `ORDER BY ts DESC LIMIT N` 然后 `rows.reverse()` 还原 oldest-first |
 | `clear(profile_name, user_key) -> int` | 76-83 | DELETE rowcount |
 | `count(profile_name, user_key) -> int` | 85-92 | 诊断 |
+| `mark_event_processed(event_key, ...) -> bool` | sessions.py | Feishu inbound 持久化去重：第一次 True，TTL 内重复 False |
 
 ### 9.3 router 的两层 cache
 
@@ -937,6 +959,28 @@ _SESSION_HISTORY_MAX = 20    # 最多保留 20 条 message(user+assistant 交替
 `_history_key(profile, sender, sender_alt) = (profile, _tenant_user_key(sender, sender_alt))`，其中 `_tenant_user_key` 优先 sender 非空非 unknown，否则 sender_alt。
 
 > **注意**：历史 key 不带 alt_id 双通道。意味着同一物理用户的 sender 表示形式变化（例如从 tenant 短 ID 切到真 `ou_*`）会**切割历史**。union_id fallback 修复减小了这种概率，但没根治。
+
+### 9.4 processed_events 入站去重
+
+`multitenancy_processed_events` 跟 `multitenancy_sessions` 共用 `SessionStore` / `multitenancy.db`。它不是对话历史，而是“这条入站事件近期是否已经触发过 agent run”的防重表：
+
+```sql
+CREATE TABLE multitenancy_processed_events (
+    event_key    TEXT PRIMARY KEY,
+    profile_name TEXT NOT NULL,
+    user_key     TEXT NOT NULL,
+    message_id   TEXT,
+    content_hash TEXT,
+    ts           INTEGER NOT NULL
+);
+```
+
+router 在 profile route 命中后调用 `_mark_routed_event_seen(...)`：
+
+- 有 Feishu `message_id`：`event_key = msg:<profile>:<user_key>:<message_id>`，默认 TTL 24h，可用 `HERMES_MULTITENANCY_EVENT_DEDUPE_TTL_SECONDS` 调整。
+- 无稳定 `message_id` 且 normalized text 长度 >= 40：`event_key = content:<profile>:<user_key>:sha256(text)`，默认 TTL 2h，可用 `HERMES_MULTITENANCY_CONTENT_DEDUPE_TTL_SECONDS` 和 `HERMES_MULTITENANCY_CONTENT_DEDUPE_MIN_CHARS` 调整。
+- 命中重复时不会注册 `_user_inflight_tasks`、不会取消当前任务、不会启动 sandbox 子进程；如果 Feishu adapter 已经 defer 了 processing complete，会立即以 success 关闭这次重复事件的 lifecycle。
+- slash command 在去重之前已短路，允许用户重复 `/status`、`/stop`、`/new` 等命令。
 
 ---
 
@@ -1255,6 +1299,123 @@ multitenancy 消费 UAT 但**不**实现 UAT。
 
 ---
 
+## §15 Multi-profile cron worker（v3，commit `d15f8ae`）
+
+multitenancy 模式下，gateway 主进程跑 `HERMES_HOME=<root>/profiles/multitenancy_router`，其内置 `_start_cron_ticker`（`hermes-agent/gateway/run.py:11264-11272`）只 tick 自己 profile 的 `cron/jobs.json`。但每个用户的 reminder/cron 应该写到 **各自 profile 的** `cron/jobs.json`（agent 默认策略，避免 multitenancy 在写入端做越界 patch）。
+
+为了让 N 个 profile 的 cron job 都能按时触发，plugin 内自带一个独立 worker：扫所有 `<root>/profiles/*/cron/jobs.json`，临时 monkey-patch `cron.jobs` 模块常量后调原生 `cron.scheduler.tick(adapters, loop)`，复用 hermes-agent 的 scheduler 与 adapter 回程链路。v3 的关键变化是：worker 不再只靠首次 inbound lazy-start，而是由 plugin runtime 包装 `GatewayRunner._create_adapter`，在 gateway adapters ready 后自动启动；pre-dispatch lazy-start 只保留为 fallback。
+
+本次业务语义也调整为 **Feishu 是 WebUI cron 的主投递场景**：当 job `deliver=feishu` 但 origin 没有可用 chat target 时，plugin 会 fallback 到 `owner_open_id`；Feishu adapter 发送 `ou_*` open_id 时由 plugin runtime patch 转换为可投递目标。delivery 成功后，plugin 会把一条 assistant mirror 写入 `multitenancy_sessions(profile=<owner_profile>, user_key=<owner_open_id>)`，让用户基于推送继续对话时带上定时任务上下文。
+
+```mermaid
+flowchart TB
+    subgraph Gateway["gateway 主进程 PID 42712 — HERMES_HOME=profiles/multitenancy_router"]
+        Hook["pre_gateway_dispatch hook<br/>_dispatch_with_worker_init fallback"]
+        Startup["GatewayRunner._create_adapter wrap<br/>startup watcher"]
+        BuiltinTick["内置 cron-ticker thread<br/>tick &lt;router&gt;/cron/jobs.json (空)"]
+        Worker["multi-profile cron worker thread<br/>每 60s 扫 profiles/*"]
+        Adapters[("runner.adapters<br/>feishu / api_server / ...")]
+    end
+    subgraph Subprocess["AIAgent subprocess<br/>HERMES_HOME=profiles/&lt;target&gt;"]
+        CronTool["cron.create tool<br/>(agent 默认路径)"]
+    end
+    subgraph Filesystem["filesystem"]
+        P1["profiles/feishu_ou_xxx/<br/>cron/jobs.json"]
+        P2["profiles/sunke/<br/>cron/jobs.json"]
+        P3["profiles/multitenancy_router/<br/>cron/jobs.json (空)"]
+    end
+    Feishu(["飞书 chat"]) -->|incoming| Hook
+    Startup -->|adapters ready 后启动| Worker
+    Hook -->|fallback lazy ensure| Worker
+    Hook -->|spawn| Subprocess
+    CronTool -->|写| P1
+    Worker -.->|monkey-patch JOBS_FILE 后<br/>cron.scheduler.tick| P1
+    Worker -.->|monkey-patch JOBS_FILE 后<br/>cron.scheduler.tick| P2
+    Worker -->|deliver=feishu → owner_open_id| Adapters
+    Worker -->|成功后 mirror assistant| Session[("multitenancy_sessions")]
+    BuiltinTick -.->|空 tick, 无 due jobs| P3
+    Adapters -->|feishu_oapi.send_message| Feishu
+```
+
+### 15.1 组成
+
+| 部件 | 文件 | 作用 |
+|---|---|---|
+| `install_cron_runtime_patches()` | `cron_worker.py` | 安装三类 runtime patch：`deliver=feishu` fallback 到 `owner_open_id`；delivery 成功后 mirror 到 owner session；Feishu `_send_raw_message` 支持 `ou_*` open_id target。只改进程内对象，不改 hermes core 文件。 |
+| `install_gateway_startup_watcher()` | `cron_worker.py` | 包装 `GatewayRunner._create_adapter`，在 gateway adapters ready 后调 `ensure_cron_worker_started(gateway)`。这是 v3 的主启动路径，避免没有 inbound 时 worker 不启动。 |
+| `ensure_cron_worker_started(gateway)` | `cron_worker.py` | Worker 启动入口。拿 `gateway.adapters` + `asyncio.get_running_loop()` + `<root>/profiles/` 路径，启 daemon thread。带四层 guard（HERMES_HOME 未设 / 非嵌套 / adapters 空 / 没有运行 loop），任一不满足直接 INFO log + return。 |
+| `_multiprofile_cron_worker(...)` | `cron_worker.py` | 主循环。每 `interval=60s` 一轮，遍历 `profiles_root.iterdir()`，对每个有 `cron/jobs.json` 的 profile 调 `_tick_one_profile`。`stop_event.wait(60)` 替代 sleep，便于退出。 |
+| `_tick_one_profile(...)` | `cron_worker.py` | 在 `patch_lock` 保护下保存 + 重设 `cron.jobs.{HERMES_DIR, CRON_DIR, JOBS_FILE, OUTPUT_DIR}` 四个常量，调 `cron_tick(verbose=False, adapters=adapters, loop=loop)`，`finally` 恢复。 |
+| wrap hook | `__init__.py:_dispatch_with_worker_init` | pre-dispatch fallback。每次 inbound 仍调一次 `ensure_cron_worker_started(gateway)`，靠 lock + 全局 flag 保证仅启动一次。 |
+
+### 15.2 启动时序 + 端到端 reminder 触发
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Lark as 飞书 chat
+    participant GW as gateway 主进程
+    participant Startup as startup watcher
+    participant Hook as _dispatch_with_<br/>worker_init fallback
+    participant Worker as multitenancy-<br/>cron-worker
+    participant Sub as AIAgent subprocess<br/>(HERMES_HOME=target)
+    participant FS as &lt;target_profile&gt;/<br/>cron/jobs.json
+    participant Feishu as feishu adapter
+
+    Note over GW: discover_plugins() at run.py:2029<br/>install runtime patches + startup watcher<br/>register_hook(pre_gateway_dispatch, wrap)
+    Note over GW: 内置 cron-ticker thread 起来 at run.py:11264<br/>(只 tick router profile, 跑空)
+    GW->>Startup: GatewayRunner._create_adapter()
+    Startup->>Worker: adapters ready 后 ensure_cron_worker_started(gateway)
+    Lark->>GW: "1 分钟后提醒喝水"
+    GW->>Hook: pre_gateway_dispatch(event, gateway, ...)
+    Hook->>Worker: fallback ensure_cron_worker_started(gateway)
+    Note over Worker: 已启动则 _worker_started short-circuit
+    Hook->>Sub: spawn (HERMES_HOME=feishu_ou_xxx)
+    Sub->>Sub: LLM 调 cronjob.create<br/>(走 agent 默认 — 不被 plugin patch)
+    Sub->>FS: 写 jobs.json (state=scheduled, run_at=T+60)
+    Note over Worker: t+60s 内 tick 一轮
+    Worker->>Worker: patch_lock 内<br/>monkey-patch cron.jobs.JOBS_FILE = FS
+    Worker->>Worker: cron.scheduler.tick(adapters, loop)
+    Worker->>FS: 读 due job, mark state=running
+    Worker->>Feishu: asyncio.run_coroutine_threadsafe<br/>(adapter.send(owner_open_id, "喝水时间到啦"), loop)
+    Feishu->>Lark: 推送 reminder 文本
+    Worker->>Worker: mirror assistant 到 multitenancy_sessions<br/>(profile, owner_open_id)
+    Worker->>FS: 写回 state=completed + last_run_at
+    Worker->>Worker: finally: 还原 cron.jobs 四常量
+```
+
+`register()` 本身不能直接启动 worker，因为那时 `runner.adapters` 还是空 dict、asyncio loop 尚未 running。v3 用 startup watcher 等 adapters ready；pre-dispatch fallback 只负责兜底。
+
+### 15.3 Race 与 file lock
+
+主 ticker 与 worker 共享同一个全局 `cron.jobs.JOBS_FILE`。worker 在 patch 窗口里改了常量，主 ticker 在那段时间内 tick 时可能读到错的 file。
+
+缓解：
+- **worker 内**的 `patch_lock` 保证多 profile 顺序处理（不会自我交叉）
+- **`cron.scheduler.tick()` 内部**用 file lock（key 是 jobs path），同一 jobs.json 不会被并发 tick；即使主 ticker 在 race 时落到 target profile 的 file 上，也只是 sequential 处理，不会重复执行 due job
+
+> 真要彻底无 race，可以让主 ticker 也跳过 multitenancy_router profile 的 cron（让 worker 独占），但代价是改 hermes-agent 主仓，违反"插件内即插即用"原则。当前 race 窗口几十毫秒内无 due job 概率近 1。
+
+### 15.4 Delivery 回程
+
+`cron.scheduler.tick()` 收到 due job 后调 `_deliver_result(job, content, adapters=adapters, loop=loop)`。adapters dict 来自 worker 启动时拿到的 `gateway.adapters`，里面有 `feishu` adapter；delivery 通过 `asyncio.run_coroutine_threadsafe(adapter.send(...), loop)` 把回程消息发回 Feishu。
+
+v2 假设 job 的 `origin.chat_id` 已经可投递。v3 改成更适合 WebUI 多租户的语义：WebUI 创建的 job 可以把 `deliver=feishu` 与 `owner_open_id` 作为主投递目标；当 upstream scheduler 解析不到 origin target 时，plugin fallback 到 `owner_open_id`，再由 Feishu send patch 处理 `ou_*` open_id。投递成功后才 mirror 到 owner session；如果 upstream delivery 返回 error，则不写 mirror，避免把未投递内容伪造成已送达上下文。
+
+### 15.5 Profile apiserver 解耦
+
+已有 job 的执行和投递依赖 `hermes-gateway.service` 里的 router worker，不依赖 `hermes-gateway@<profile>.service` 常驻。2026-05-14 生产实测停止 `hermes-gateway@sunke.service` 后，job `f956dab900b3` 仍由 router 执行、写 output，并 mirror 到 `multitenancy_sessions`。
+
+但 WebUI 创建/管理任务仍需要 API 面。当前生产 API 面仍是 `hermes-gateway@sunke.service`；若后续要完全去掉 profile apiserver，应新增 router/profile-aware cron management API，而不是让 WebUI 直接写文件。
+
+### 15.6 Mirror schema lazy init（v2 同步修复）
+
+`_StateDbMirror.ensure_session`（`agent_real.py:1218+`）在写 sessions/messages 行前调 `SessionDB(state_db_path).close()` 触发 core 的 `_init_schema` + 全部 migration（v9）。`SessionDB.__init__` 是 idempotent（`CREATE TABLE IF NOT EXISTS` + schema_version 检查），重复调用安全。
+
+修复前 profile state.db 一直是 0 字节，每条消息触发 5 条 `sqlite3.OperationalError: no such table: sessions / messages`。修复后 state.db 自动到 v9 schema、错误清零。
+
+---
+
 ## 附录 A：file:line 锚点速查
 
 | 概念 | 文件 | 行 |
@@ -1410,3 +1571,206 @@ sqlite3 ~/.hermes/multitenancy.db \
 ```
 
 > 字段里 user_id / open_id / union_id 实际值是飞书发的稳定 token，**对外分享时一律 `***REDACTED***`**。schema 本身不敏感。
+
+---
+
+## 附录 D：Changelog
+
+按"commit / 笔记 / 影响章节"三栏索引。最新在最上。
+
+| 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
+|---|---|---|---|---|
+| 2026-05-14 | `d15f8ae` | **feat(cron delivery)**: startup watcher + Feishu owner_open_id fallback + Feishu open_id send patch + delivery context mirror | `生产环境的实况.md` §13；本 GUIDE §15 v3 | §2.4 register 入口；§15 worker/delivery 语义；附录 E systemd 现状 |
+| 2026-05-13 | — (运维变更，无代码，已被 2026-05-14 实况修正端口/profile 名) | **远端复制本机多租户模式**：新增 `hermes-gateway@.service` systemd template，per-profile gateway 各跑独立端口；当日记录曾写 `feishu_ou_75...→:8651` / `multitenancy_router→:8652` / `feishu_sunke→:8653`，当前生产以 `sunke→8655` 为准。webui 切 detect-only（`GATEWAY_AUTOSTART=none` + 清掉 `HERMES_PROFILE`/`UPSTREAM`/`HERMES_FORCE_RUN_MODE`）。team-rca 调研：`webui-profile-routing-rca` (worker-local + worker-remote) | `.omc/research/local-gateway-mode.md` + `.omc/research/spawn-race-rca.md` | 附录 E.3 systemd unit 拓扑（**改写**）/ E.5 OAuth 链路尾段 known-缺口 消除 |
+| 2026-05-13 | hermes-web-ui `a9ef54a` | **feat(gateway)**: `HERMES_FORCE_RUN_MODE` env override —— 让 GatewayManager 在 systemd 主机上跳过 service-mode 直接走 `gateway run --replace`（绕过 per-profile systemd unit 缺失问题）。但**实际生产路径选了"systemd template + detect-only"**，这个 env 保留为 fallback 路径 | — | 附录 E.4 webui env / source code |
+| 2026-05-13 | hermes-web-ui `f23ab8e` + `017acdd` | **chore: 远端 webui 从 v0.5.15 合并到 v0.5.16**（19 commit `merge --no-ff chore/merge-upstream-20260511 into main`，含 sidebar profile name 显示、v0.5.16 Responses API 迁移、voice playback、base64 image upload、plugins page 等）+ **feat(ui): 移除 Node.js 版本升级 warning bar**（运行时已在 data layer 强制 Node ≥ 22.5，UI 上的 nag 多余）| — | 附录 E.4 webui env / E.6 路径清单 |
+| 2026-05-13 | — (运维变更，无代码) | 远端 10.250.1.66 上线 HTTPS：Caddy + GlobalSign OV `*.gotokeep.com` 证书 + split-DNS hermes.gotokeep.com + 飞书 OAuth redirect 切换到 https | 无（落到 ARCHITECTURE-GUIDE 附录 E） | **附录 E 新增**（远端环境快照） |
+| 2026-05-12 | hermes-web-ui `3e2391c` | **docs(env)**: 加 `.env.example` 入仓（覆盖三种 auth mode、GatewayManager 三档 autostart、short-circuit 警示） | — | 附录 E 引用 |
+| 2026-05-12 | `1e4c6f6` | **feat(cron)**: per-profile cron + multi-profile worker; fix mirror schema | `修复 — Hermes 多租户 cron 双管齐下 2026-05-12.md` | §8.7 第 8 项（行为变更）；**§15 新增**；`cron_worker.py` 全新 |
+| 2026-05-12 | `765aae8` (hermes-agent fork) | **fix(feishu_auth)**: 动态发现 app 真实开通的 user scope | `修复 — Hermes 飞书 UAT 默认 scope 动态读取 2026-05-12.md` | §13（OAuth 契约层；UAT 授权时拿到的 scope 不再被 hardcoded 14 项限制） |
+| 2026-04 | — (router 决策评审) | Phase 1 spike：plugin contract + RuntimePool + pre_gateway_dispatch hook 落地 | `方案 — Hermes Multitenancy Router 决策评审 v2 2026-04.md` | §2 §3 §7 |
+
+### 怎么把一个 commit/笔记加进这张表
+
+1. 改完代码 commit（不一定 push）
+2. 在 `<obsidian-vault>/hermes/` 写一篇 `修复/方案/部署 — <主题> <日期>.md`，frontmatter 含 `commit: <短哈希>`
+3. 编辑 `ARCHITECTURE-GUIDE.md` 受影响章节、引用笔记和 commit
+4. 在本附录加一行
+5. `My-Second-Brain/log.md` 追加 `YYYY-MM-DD HH:MM | 动作 | [[笔记名]] | 一句话`
+
+### 与 git 关系
+
+- ARCHITECTURE-GUIDE.md 附录 D 只挑**有架构影响**的 commit（行为变更 / 新组件 / 契约变更）；纯 bugfix / 文案改动归 `git log` 不上这表
+- Obsidian 笔记 frontmatter `commit:` 字段是这条行的反向锚（看笔记 → 找 commit）
+- 不维护中心化 `CHANGELOG.md`，避免双写漂移
+
+---
+
+## 附录 E：远端环境快照（`10.250.1.66`，2026-05-13）
+
+这台 host 是办公网生产，承载飞书 bot + WebUI 两个入口。下次会话拿到这一节即可快速 pick up 全貌。
+
+### E.1 主机基线
+
+| 项 | 值 |
+|---|---|
+| 主机名 | `hermes-1` |
+| 网段 | 10.250.1.66（公司内网私有 IP，公网不可达） |
+| OS | CentOS Stream 9 |
+| SELinux | **enforcing**（搬文件进 `/etc/caddy/certs/` 后必须 `restorecon -Rv` 否则 caddy 读不到） |
+| Firewalld | `public` zone，已放行 `ssh / cockpit / dhcpv6-client / http / https` |
+| 运行用户 | 服务进程跑在 `hermes` 用户（uid 1000）；systemd user services 通过 `XDG_RUNTIME_DIR=/run/user/1000` 操作 |
+
+### E.2 域名 + TLS
+
+| 项 | 值 |
+|---|---|
+| 对外域名 | `hermes.gotokeep.com` |
+| DNS 模式 | **split-DNS**：公司内网 DNS 单独解析 `hermes.gotokeep.com → 10.250.1.66`；公网保留腾讯云 WAF 通配（`*.gotokeep.com → anycast-waf`，跟这台 host 无关） |
+| 反向代理 | **Caddy v2.6.4**（dnf install caddy --enablerepo=epel） |
+| 配置文件 | `/etc/caddy/Caddyfile`（`hermes.gotokeep.com {{ tls .../gotokeep.com.crt .../gotokeep.com.key; encode gzip; reverse_proxy 127.0.0.1:8648 {{ flush_interval -1 }} }}`） |
+| 证书 | GlobalSign OV SSL CA 2018 签发 `*.gotokeep.com` wildcard，SAN 含 `gotokeep.com` |
+| 证书路径 | `/etc/caddy/certs/gotokeep.com.{crt,key}`（644 / 600，owner `caddy:caddy`，SELinux context `httpd_config_t`） |
+| 证书有效期 | 2026-04-21 → **2026-11-06** |
+| 续期 | 半年一次手工：IT 重新签发 → `scp` 覆盖两个文件 → `restorecon -Rv /etc/caddy/certs/` → `systemctl reload caddy` |
+| Caddy admin API | 默认开（`localhost:2019`）。**不要加 `admin off`**——会让 `systemctl reload caddy` 走不通 |
+
+### E.3 systemd unit 拓扑（2026-05-14 实况）
+
+| Unit | 类型 | 作用 |
+|---|---|---|
+| `caddy.service` | system-wide | 反向代理 :443 / :80 → :8648 |
+| `hermes-gateway.service` | hermes user | 跑 `--profile multitenancy_router`，监听 api_server `127.0.0.1:8652`；启动飞书 long-lived websocket adapter + 内置 cron-ticker + multitenancy cron_worker（§15）。这是飞书 bot 入口的 gateway |
+| `hermes-gateway@sunke.service` | hermes user | 孙可 profile API/runtime gateway，当前监听 `127.0.0.1:8655`。旧 2026-05-13 设计曾写 `feishu_sunke→8653`，但 2026-05-14 生产 `ss -ltnp` 实况是 `sunke→8655` |
+| `hermes-web-ui.service` | hermes user | Node Koa BFF，监听 `0.0.0.0:8648`；`After=hermes-gateway.service network-online.target`；**`.env` 内 `GATEWAY_AUTOSTART=none` 让它走 detect-only 模式** —— 启动时 `GatewayManager.detectAllOnStartup()` 只注册已存在 gateway，**不 spawn 任何 gateway**（避开 v0.5.16 并发 spawn race） |
+
+`hermes-gateway@.service` template 全文：
+
+```ini
+[Unit]
+Description=Hermes Gateway for profile %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/.hermes/hermes-agent
+EnvironmentFile=/home/hermes/.hermes/.env
+Environment=HERMES_HOME=/home/hermes/.hermes/profiles/%i
+Environment=PATH=/home/hermes/.local/bin:/home/hermes/.local/share/pnpm/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/hermes/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main --profile %i gateway run --replace
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/home/hermes/.hermes/profiles/%i/logs/gateway.log
+StandardError=append:/home/hermes/.hermes/profiles/%i/logs/gateway.err.log
+
+[Install]
+WantedBy=default.target
+```
+
+**为什么这种拓扑能 work（解决 webui v0.5.16 并发 spawn race）**：
+- webui `GatewayManager.startAll()` 并发 spawn 多 profile gateway 时撞 race（hermes-agent 的 lock 是 per-profile 本身安全，但 webui spawn 的 fork 时序在 CentOS 9 上撞到 TOCTOU 窗口，三个 profile 同时启动有概率 fail）
+- systemctl 启动 service 是**串行**的（systemd 顺序处理 enable + start），完全避开并发 timing
+- webui detect-only 模式让 webui 只读 PID 文件 / 健康检查，不参与 gateway 生命周期
+- 本机 macOS 上同样模式 = launchd 顺序启动 N 个 plist + webui detect ✓ 验证过可工作
+
+`hermes-web-ui.service` 关键字段：
+
+```ini
+EnvironmentFile=/home/hermes/.hermes/.env                       # 共享 env（FEISHU_APP_ID/SECRET, GLM_API_KEY, ...）
+EnvironmentFile=/home/hermes/code/hermes-web-ui/.env            # webui 专属 env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /home/hermes/code/hermes-web-ui/dist/server/index.js
+StandardOutput=append:/home/hermes/.hermes/profiles/multitenancy_router/logs/web-ui.log
+StandardError=append:/home/hermes/.hermes/profiles/multitenancy_router/logs/web-ui.error.log
+```
+
+### E.4 hermes-web-ui 关键 env（2026-05-13 实测）
+
+| Env | 值 | 来源 | 备注 |
+|---|---|---|---|
+| `HERMES_AUTH_MODE` | `feishu-oauth-dev` | webui .env | OAuth 模式 |
+| `FEISHU_APP_ID` | `cli_a97469ad7bfb9bec` | `~/.hermes/.env` | 飞书 app 凭据 |
+| `FEISHU_APP_SECRET` | (set) | `~/.hermes/.env` | 飞书 app secret |
+| `FEISHU_REDIRECT_URI` | `https://hermes.gotokeep.com/api/auth/feishu/callback` | webui .env | **必须跟飞书 app 后台 callback 白名单完全一致** |
+| `FEISHU_SESSION_SECRET` | (32-byte hex) | webui .env | 签 OAuth state cookie；`openssl rand -hex 32` 生成 |
+| `FEISHU_CALLBACK_REDIRECT` | `/#/` | webui .env | OAuth 完成后跳到 webui 首页 |
+| `HERMES_PROFILE` | `multitenancy_router` | webui .env | ⚠️ **遗留 quick-fix**：让所有 WebUI 用户共用此 profile，破坏多租户隔离。生产应删除 |
+| `UPSTREAM` | `http://127.0.0.1:8652` | webui .env | ⚠️ 同上，绕过 GatewayManager。生产应删除 |
+| `HERMES_MULTITENANCY_DB` | `/home/hermes/.hermes/multitenancy.db` | webui .env | open_id → profile_name 路由表 |
+| `API_SERVER_KEY` | (set) | webui .env | proxy 到 :8652 时的 Bearer token |
+| `GATEWAY_AUTOSTART` | (unset) | — | 生产应设 `all` 启用 per-profile gateway，跟本机 dev 对齐 |
+| `HERMES_USE_SANDBOX` | `1` | 注入 env | bwrap subprocess sandbox 启用 |
+
+完整可选 env 见 `hermes-web-ui/.env.example`（commit `3e2391c`）。
+
+### E.5 OAuth 端到端链路（2026-05-13 全通）
+
+```
+浏览器 https://hermes.gotokeep.com/
+  ↓ split-DNS → 10.250.1.66
+  ↓ TLS (GlobalSign OV *.gotokeep.com)
+Caddy :443 reverse_proxy → :8648
+  ↓
+WebUI Node /api/auth/feishu/login
+  ↓ HTTP 302
+  redirect_uri = https://hermes.gotokeep.com/api/auth/feishu/callback
+  Set-Cookie: hermes_feishu_state=...; httponly; samesite=lax
+  ↓
+飞书扫码授权 → 回到 https://hermes.gotokeep.com/api/auth/feishu/callback?code=...&state=...
+  ↓ Caddy → :8648
+WebUI /api/auth/feishu/callback
+  ↓ exchangeFeishuCode(code) 拿 access_token + open_id
+  ↓ resolveProfileForOpenId(open_id) 查 multitenancy_routing 表
+  ↓ 设 signed session cookie 含 profile_name
+浏览器进入 WebUI（chat plane 模式下绑定到对应 profile）
+```
+
+**已知缺口（runtime 隔离尚未启用）**：当前 `HERMES_PROFILE=multitenancy_router` + `UPSTREAM=:8652` 两条 hardcoded 让所有用户 LLM 调用都打到 `multitenancy_router` profile 的 api_server。要让"每员工跑自己 profile runtime"，需要：
+
+1. 删 webui `.env` 里的 `HERMES_PROFILE` 和 `UPSTREAM`
+2. 加 `GATEWAY_AUTOSTART=all`
+3. `systemctl --user restart hermes-web-ui`
+4. 验证：`ps aux | grep "hermes.*gateway run"` 应该多个进程并存
+
+参考本机配置 + `修复 — Hermes 多租户 cron 双管齐下 2026-05-12.md` 笔记。
+
+### E.6 关键路径 + 文件清单
+
+| 路径 | 用途 |
+|---|---|
+| `/etc/caddy/Caddyfile` | 反向代理配置 |
+| `/etc/caddy/certs/gotokeep.com.{crt,key}` | TLS 证书（644/600, `httpd_config_t`） |
+| `/home/hermes/.config/systemd/user/hermes-web-ui.service` | WebUI systemd unit |
+| `/home/hermes/.config/systemd/user/hermes-gateway.service` | hermes-agent gateway systemd unit |
+| `/home/hermes/.hermes/.env` | shared env（FEISHU_APP_ID/SECRET, GLM_API_KEY 等） |
+| `/home/hermes/code/hermes-web-ui/.env` | webui 专属 env（含 OAuth callback / SESSION_SECRET） |
+| `/home/hermes/.hermes/multitenancy.db` | open_id → profile_name 路由表 + multitenancy_sessions（飞书 bot 对话历史） |
+| `/home/hermes/.hermes-web-ui/hermes-web-ui.db` | webui 本地 sessions/messages 表（跟 multitenancy_sessions 不互通——已知断点 §15.X）|
+| `/home/hermes/.hermes/profiles/<name>/` | 每用户 profile 工作目录树（SOUL.md / config.yaml / state.db / cron / sessions / feishu_uat ...）|
+| `/home/hermes/code/hermes-multitenancy/` | multitenancy plugin 源码（symlink 自 `~/.hermes/plugins/multitenancy`，所以 git pull 重启 service 即生效）|
+| `/home/hermes/code/hermes-web-ui/` | WebUI 源码 |
+| `/home/hermes/.hermes/hermes-agent/` | hermes-agent 0.11.0 venv + 源码 |
+| `/home/hermes/.hermes/profiles/multitenancy_router/logs/{agent,gateway,errors,web-ui}.log` | 所有日志写到这一处（systemd unit 的 StandardOutput=append） |
+
+### E.7 排障速查
+
+| 现象 | 第一步 |
+|---|---|
+| 浏览器证书警告 | 检查证书 SAN 是否含 `hermes.gotokeep.com`（wildcard `*.gotokeep.com` ✓）；检查 split-DNS 是否生效 `dig hermes.gotokeep.com` |
+| 浏览器 `ERR_CONNECTION_REFUSED` | `systemctl is-active caddy` + `ss -ltnp \| grep :443` |
+| Caddy 502 Bad Gateway | webui 没起或 :8648 不通：`ss -ltnp \| grep :8648` + `tail /home/hermes/.hermes/profiles/multitenancy_router/logs/web-ui.log` |
+| Caddy `permission denied` 读 cert | 文件 SELinux context 不对：`restorecon -Rv /etc/caddy/certs/`（修 `user_tmp_t` → `httpd_config_t`） |
+| Caddy reload 失败 | 检查 Caddyfile 是否含 `admin off`（必须去掉）；改用 `systemctl restart caddy` 作为兜底 |
+| OAuth login HTTP 500 | webui 缺 `FEISHU_REDIRECT_URI` / `FEISHU_SESSION_SECRET`：`sudo tr '\0' '\n' < /proc/$(pgrep -f "web-ui.*index.js")/environ \| grep FEISHU` 看实际注入了什么 |
+| 飞书扫码后 callback 失败 | 飞书 app 后台「重定向 URL」白名单是否含 `https://hermes.gotokeep.com/api/auth/feishu/callback`（必须完全一致） |
+| reminder/cron 不触发 | 见 §15 + `修复 — Hermes 多租户 cron 双管齐下 2026-05-12` |
+| mirror schema 报 "no such table" | profile state.db 未 init，理论上 `_StateDbMirror.ensure_session` lazy 触发，但首次会报一次；重启 webui 后正常 |
+
+### E.8 灾难恢复要点
+
+- **multitenancy.db 重建**：`python -m hermes_multitenancy.sync pull-feishu --soft-delete-missing`（从飞书 contact 重新拉一遍）
+- **某员工 profile 损坏**：`rm -rf ~/.hermes/profiles/<name>/` + 让用户重新发飞书消息触发 auto_provision
+- **Caddy 证书过期前**：`certutil`/openssl 验证新证书 SAN + key 匹配，然后 cp + restorecon + reload
+- **全栈重启顺序**：`hermes-gateway.service` 先起 → `hermes-web-ui.service` 再起 → `caddy.service` 最后
+- **数据备份位置**：`~/.hermes/multitenancy.db`（routing + sessions）+ `~/.hermes/profiles/*/state.db`（per-profile sessions/messages）+ `~/.hermes/feishu_uat/*.json`（UAT tokens）
