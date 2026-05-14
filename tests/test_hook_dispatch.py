@@ -413,6 +413,80 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     clear_spike_routes()
 
 
+def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_path):
+    """Full Feishu streaming dispatch should be owned by RunBroker.run."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy.run_models import RunResult
+
+    clear_spike_routes()
+    profile_home = tmp_path / "owner"
+    profile_home.mkdir()
+    add_spike_route("ou_stream_broker", profile_home)
+
+    broker_calls = []
+    stream_calls = []
+    media_calls = []
+    lifecycle = []
+
+    class FakeBroker:
+        def __init__(self, dispatch_agent=None):
+            self.dispatch_agent = dispatch_agent
+
+        async def admit(self, request):
+            broker_calls.append(("admit", request.content))
+            return RunResult(content="", duplicate=False)
+
+        async def run(self, request, *, admitted=False):
+            broker_calls.append(("run", request.content, admitted))
+            response = await self.dispatch_agent(request)
+            return RunResult(content=response, duplicate=False)
+
+    class FullAdapter:
+        async def edit_message(self, *args, **kwargs):
+            return None
+
+        async def on_processing_start(self, event):
+            lifecycle.append(("start", getattr(event, "message_id", None)))
+
+        async def on_processing_complete(self, event, outcome):
+            lifecycle.append(("complete", getattr(event, "message_id", None), str(outcome)))
+
+    async def fake_stream(adapter, chat_id, profile_name, profile_home, agent_event, *, messages):
+        stream_calls.append((chat_id, profile_name, profile_home.name, agent_event.text, len(messages)))
+        return "stream ok"
+
+    async def fake_media(gateway, response_text, agent_event, adapter, profile_home):
+        media_calls.append((response_text, agent_event.text, profile_home.name))
+
+    monkeypatch.setattr(
+        router_mod,
+        "_make_routed_run_broker",
+        lambda **kwargs: FakeBroker(kwargs.get("dispatch_agent")),
+    )
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+    monkeypatch.setattr(router_mod, "_deliver_media_from_stream_response", fake_media)
+
+    event = _build_event(text="hello streaming broker", user_id="ou_stream_broker")
+    event.message_id = "om_stream_broker"
+    asyncio.run(router_mod.handle_async(
+        event=event,
+        gateway=SimpleNamespace(adapters={"feishu": FullAdapter()}),
+    ))
+
+    assert broker_calls == [
+        ("admit", "hello streaming broker"),
+        ("run", "hello streaming broker", True),
+    ]
+    assert stream_calls == [("chat-123", "owner", "owner", "hello streaming broker", 1)]
+    assert media_calls == [("stream ok", "hello streaming broker", "owner")]
+    assert lifecycle == [
+        ("start", "om_stream_broker"),
+        ("complete", "om_stream_broker", "ProcessingOutcome.SUCCESS"),
+    ]
+    clear_spike_routes()
+
+
 def test_handle_async_skips_duplicate_long_content_without_message_id(monkeypatch, tmp_path):
     """Fallback dedupe catches Feishu retries that arrive without a stable message_id."""
     from hermes_multitenancy import router as router_mod

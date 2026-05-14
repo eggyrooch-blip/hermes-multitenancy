@@ -735,14 +735,21 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         try:
             if feishu_full:
                 # Streaming path — card stream when available; text edit fallback.
-                response_text = await _stream_into_feishu(
-                    adapter, chat_id, profile_name, profile_home, agent_event,
-                    messages=conversation,
-                )
-                if response_text:
-                    await _deliver_media_from_stream_response(
-                        gateway, response_text, agent_event, adapter, profile_home
+                async def _dispatch_streaming(_request):
+                    stream_response = await _stream_into_feishu(
+                        adapter, chat_id, profile_name, profile_home, agent_event,
+                        messages=conversation,
                     )
+                    if stream_response:
+                        await _deliver_media_from_stream_response(
+                            gateway, stream_response, agent_event, adapter, profile_home
+                        )
+                    return stream_response
+
+                run_result = await _make_routed_run_broker(
+                    dispatch_agent=_dispatch_streaming,
+                ).run(run_request, admitted=True)
+                response_text = run_result.content
             else:
                 # Mock / minimal adapter — old non-stream path (send_typing + pool.dispatch + send)
                 if adapter is not None:
