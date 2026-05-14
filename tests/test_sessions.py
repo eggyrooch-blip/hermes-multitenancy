@@ -52,3 +52,23 @@ def test_count_diagnostic(store):
     store.append("p", "u", "user", "1")
     store.append("p", "u", "user", "2")
     assert store.count("p", "u") == 2
+
+
+def test_mark_event_processed_rejects_duplicate_within_ttl(store):
+    assert store.mark_event_processed(
+        "msg:p:u:om_1",
+        profile_name="p",
+        user_key="u",
+        message_id="om_1",
+        content_hash=None,
+        ttl_seconds=3600,
+    ) is True
+
+    assert store.mark_event_processed(
+        "msg:p:u:om_1",
+        profile_name="p",
+        user_key="u",
+        message_id="om_1",
+        content_hash=None,
+        ttl_seconds=3600,
+    ) is False

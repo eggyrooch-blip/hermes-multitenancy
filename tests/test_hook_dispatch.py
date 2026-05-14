@@ -285,6 +285,122 @@ async def test_handle_async_uses_real_open_id_for_explicit_profile_route(monkeyp
     router_mod.override_routing_table(None)
 
 
+def test_handle_async_skips_duplicate_feishu_message_id(monkeypatch, tmp_path):
+    """A redelivered Feishu event must not start a second agent run."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "owner"
+    profile_home.mkdir()
+    add_spike_route("ou_duplicate", profile_home)
+
+    calls = []
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            calls.append((profile_name, agent_event.text))
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    gateway = SimpleNamespace(adapters={})
+    event_a = _build_event(text="check yesterday IT&Sec messages", user_id="ou_duplicate")
+    event_a.message_id = "om_same"
+    event_b = _build_event(text="check yesterday IT&Sec messages", user_id="ou_duplicate")
+    event_b.message_id = "om_same"
+
+    asyncio.run(router_mod.handle_async(event=event_a, gateway=gateway))
+    asyncio.run(router_mod.handle_async(event=event_b, gateway=gateway))
+
+    assert calls == [("owner", "check yesterday IT&Sec messages")]
+    clear_spike_routes()
+
+
+def test_handle_async_skips_duplicate_long_content_without_message_id(monkeypatch, tmp_path):
+    """Fallback dedupe catches Feishu retries that arrive without a stable message_id."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "owner"
+    profile_home.mkdir()
+    add_spike_route("ou_duplicate_long", profile_home)
+
+    calls = []
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            calls.append((profile_name, agent_event.text))
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    text = (
+        "检索下昨天it&sec群聊，owner的所有群聊会话，专项诊断下智慧芽、公安相关字样的事件全貌。"
+        "更新这篇复盘文档，并给出后续可靠方案。"
+    )
+    gateway = SimpleNamespace(adapters={})
+
+    asyncio.run(router_mod.handle_async(
+        event=_build_event(text=text, user_id="ou_duplicate_long"),
+        gateway=gateway,
+    ))
+    asyncio.run(router_mod.handle_async(
+        event=_build_event(text=text, user_id="ou_duplicate_long"),
+        gateway=gateway,
+    ))
+
+    assert calls == [("owner", text)]
+    clear_spike_routes()
+
+
+def test_handle_async_completes_deferred_processing_for_duplicate(monkeypatch, tmp_path):
+    """A duplicate full-Feishu event should close the adapter lifecycle promptly."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "owner"
+    profile_home.mkdir()
+    add_spike_route("ou_duplicate_full", profile_home)
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    event_a = _build_event(text="check yesterday IT&Sec messages", user_id="ou_duplicate_full")
+    event_a.message_id = "om_full_same"
+    asyncio.run(router_mod.handle_async(event=event_a, gateway=SimpleNamespace(adapters={})))
+
+    calls = []
+
+    class FullAdapter:
+        async def edit_message(self, *args, **kwargs):
+            raise AssertionError("duplicate should not stream")
+
+        async def on_processing_start(self, event):
+            calls.append(("start", event.message_id))
+
+        async def on_processing_complete(self, event, outcome):
+            calls.append(("complete", event.message_id, str(outcome)))
+
+        async def complete_deferred_processing(self, event, outcome):
+            calls.append(("complete_deferred", event.message_id, str(outcome)))
+
+    event_b = _build_event(text="check yesterday IT&Sec messages", user_id="ou_duplicate_full")
+    event_b.message_id = "om_full_same"
+    asyncio.run(router_mod.handle_async(
+        event=event_b,
+        gateway=SimpleNamespace(adapters={"feishu": FullAdapter()}),
+    ))
+
+    assert calls == [("complete_deferred", "om_full_same", "ProcessingOutcome.SUCCESS")]
+    clear_spike_routes()
+
+
 @pytest.mark.asyncio
 async def test_handle_async_auto_provisions_new_user_to_distinct_profile(monkeypatch, tmp_path):
     """An unseen Feishu sender must get a dedicated profile and continue dispatching."""
