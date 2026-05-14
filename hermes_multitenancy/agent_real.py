@@ -1123,9 +1123,16 @@ def _install_credential_env_passthrough(profile_home: Path) -> None:
     if not env_names:
         return
     try:
-        from tools.env_passthrough import register_env_passthrough
+        from tools import env_passthrough as env_passthrough_mod
 
-        register_env_passthrough(env_names)
+        env_passthrough_mod.register_env_passthrough(env_names)
+        # Hermes' passthrough registry is ContextVar-backed. Tool execution can
+        # hop into worker threads, where that context is not always inherited, so
+        # credential env vars also need a process-level allowlist entry.
+        config_passthrough = getattr(env_passthrough_mod, "_config_passthrough", None)
+        merged = set(config_passthrough or ())
+        merged.update(env_names)
+        setattr(env_passthrough_mod, "_config_passthrough", frozenset(merged))
         logger.info(
             "[multitenancy] registered credential env passthrough profile=%s count=%d",
             profile_home.name,
