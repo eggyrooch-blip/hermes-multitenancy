@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - allows plugin unit tests without gateway
 
 # Per-user in-flight dispatch tasks — used by /stop to cancel the right task.
 _user_inflight_tasks: dict[str, asyncio.Task] = {}
+_synthetic_session_guards: dict[str, Any] = {}
 
 # Multi-turn session memory: maps (profile_name, user_key) → list of messages.
 # user_key is the canonical sender chosen by routing. Alternate IDs are lookup
@@ -498,16 +499,21 @@ def _register_session_guard_for_dispatch(event: Any, gateway: Any, task: Any) ->
             group_sessions_per_user=bool(extra.get("group_sessions_per_user", True)),
             thread_sessions_per_user=bool(extra.get("thread_sessions_per_user", False)),
         )
-        if not session_key or session_key in active:
+        if not session_key:
             return
         import asyncio as _asyncio
         guard = _asyncio.Event()
+        existing = active.get(session_key)
+        if existing is not None and _synthetic_session_guards.get(session_key) is not existing:
+            return
         active[session_key] = guard
+        _synthetic_session_guards[session_key] = guard
 
         def _cleanup(_t: Any) -> None:
             try:
-                if active.get(session_key) is guard:
+                if active.get(session_key) is guard and _synthetic_session_guards.get(session_key) is guard:
                     active.pop(session_key, None)
+                    _synthetic_session_guards.pop(session_key, None)
             except Exception:
                 pass
 

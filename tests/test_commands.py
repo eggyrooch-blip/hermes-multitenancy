@@ -16,8 +16,10 @@ def _build_event(text: str, user_id: str = "ou_cmd", chat_id: str = "chat-cmd"):
         source=SimpleNamespace(
             chat_id=chat_id,
             user_id=user_id,
+            user_id_alt=None,
             user_name="cmd-user",
             chat_type="dm",
+            thread_id=None,
             platform=SimpleNamespace(value="feishu"),
         ),
     )
@@ -738,3 +740,53 @@ async def test_second_message_cancels_first(monkeypatch):
         await second
 
     clear_spike_routes()
+
+
+def test_session_guard_transfers_to_replacement_dispatch(monkeypatch):
+    """A cancelled prior dispatch must not remove the newer flush guard."""
+    import sys
+    from hermes_multitenancy.router import _register_session_guard_for_dispatch
+
+    fake_session = SimpleNamespace(
+        build_session_key=lambda source, **_kwargs: f"{source.chat_id}:{source.user_id}",
+    )
+    monkeypatch.setitem(sys.modules, "gateway.session", fake_session)
+
+    class FakeTask:
+        def __init__(self):
+            self.callbacks = []
+
+        def add_done_callback(self, callback):
+            self.callbacks.append(callback)
+
+        def complete(self):
+            for callback in list(self.callbacks):
+                callback(self)
+
+    adapter = SimpleNamespace(
+        _active_sessions={},
+        config=SimpleNamespace(extra={}),
+    )
+    gateway = SimpleNamespace(adapters={"feishu": adapter})
+    event = _build_event("first", user_id="ou_replace_guard", chat_id="chat-guard")
+
+    first = FakeTask()
+    second = FakeTask()
+    _register_session_guard_for_dispatch(event, gateway, first)
+    session_key = next(iter(adapter._active_sessions))
+    first_guard = adapter._active_sessions[session_key]
+
+    _register_session_guard_for_dispatch(
+        _build_event("second", user_id="ou_replace_guard", chat_id="chat-guard"),
+        gateway,
+        second,
+    )
+    second_guard = adapter._active_sessions[session_key]
+
+    assert second_guard is not first_guard
+
+    first.complete()
+    assert adapter._active_sessions.get(session_key) is second_guard
+
+    second.complete()
+    assert session_key not in adapter._active_sessions

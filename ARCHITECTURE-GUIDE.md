@@ -1243,6 +1243,8 @@ return {departments, employees, missing_user_id, leaders,
 
 multitenancy 不实现 streaming card 协议——**消费** `hermes-feishu-uat` adapter 提供的 `StreamingCardController` 接口。
 
+2026-05-14 生产排障补充：Feishu adapter 的文本 batch flush 会在 WS dispatch 后约 0.6s 再调用一次 `handle_message`。multitenancy 的 `on_pre_gateway_dispatch` 因此会在 `adapter._active_sessions` 写 synthetic guard，防止 flush 把同一条消息重新路由并创建第二张 CardKit 卡片。若用户在上一轮仍 streaming 时又发送新消息，`handle_async` 会取消旧任务；新 dispatch 必须接管该 synthetic guard，否则旧任务 cleanup 会拆掉新消息的防重入保护，flush 随后再次进入 hook 并造成"一条消息两张卡 / 来回刷打字流"。当前实现用 `_synthetic_session_guards[session_key]` 记录 plugin 自己安装的 guard，只允许替换自己拥有的 guard，不覆盖 Hermes adapter 原生 active session。
+
 ### 12.1 双路径
 
 (`_stream_into_feishu` `router.py:2142-2506`)
@@ -1643,6 +1645,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
+| 2026-05-14 | 本次提交 | **fix(feishu card)**: synthetic session guard 增加 ownership transfer；新消息打断旧 streaming 时，新 dispatch 接管 flush guard，旧任务 cleanup 不再拆掉新消息 guard | `ARCHITECTURE-GUIDE.md` / `生产环境的实况.md` | §12 |
 | 2026-05-14 | `0d2504d` | **feat(run broker)**: 新增 opt-in cron run broker seam；`HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时 due job 构造 `RunRequest(channel="cron")` 并通过 `RunBroker.run()` 执行 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A；§15 |
 | 2026-05-14 | `b9da974` | **feat(run broker)**: 新增 WebUI broker HTTP/SSE sidecar endpoint，`HERMES_MULTITENANCY_RUN_BROKER_SERVER=1` 时提供 `/api/run-broker/runs`，支持 Bearer shared secret | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | §10A |
 | 2026-05-14 | `efbd4f6` | **feat(run broker)**: full Feishu CardKit streaming 分支也通过 `RunBroker.run(..., admitted=True)` 持有 run lifecycle，内部仍复用 `_stream_into_feishu(...)` | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A |
