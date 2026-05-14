@@ -1019,7 +1019,7 @@ def test_build_subprocess_env_loads_profile_env_for_agent_only(monkeypatch, tmp_
 
     assert env["ANTHROPIC_API_KEY"] == "profile-key"
     assert env["ANTHROPIC_BASE_URL"] == "https://tokenhub.example/v1"
-    assert env["FEISHU_APP_SECRET"] == "feishu-secret"
+    assert "FEISHU_APP_SECRET" not in env
     assert env["PUBLIC_RUNTIME_FLAG"] == "enabled"
 
 
@@ -1055,8 +1055,8 @@ def test_build_subprocess_env_forwards_credential_vault_key_only(monkeypatch, tm
     assert "OPENAI_API_KEY" not in env
 
 
-def test_build_subprocess_env_forwards_feishu_app_plumbing(monkeypatch, tmp_path: Path):
-    """Feishu tools need app config in sandbox; user UAT tokens must not leak."""
+def test_build_subprocess_env_does_not_forward_feishu_app_or_user_tokens(monkeypatch, tmp_path: Path):
+    """Feishu app and user tokens come from credential vault, not subprocess env."""
     from hermes_multitenancy import agent_real
 
     profile = tmp_path / "profile"
@@ -1071,15 +1071,15 @@ def test_build_subprocess_env_forwards_feishu_app_plumbing(monkeypatch, tmp_path
 
     env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
 
-    assert env["FEISHU_APP_ID"] == "cli_test"
-    assert env["FEISHU_APP_SECRET"] == "app-secret"
-    assert env["FEISHU_DOMAIN"] == "feishu"
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_DOMAIN" not in env
     assert "FEISHU_UAT_ACCESS_TOKEN" not in env
     assert "FEISHU_UAT_REFRESH_TOKEN" not in env
 
 
-def test_build_subprocess_env_defaults_feishu_domain_for_app_plumbing(monkeypatch, tmp_path: Path):
-    """Sandboxed Feishu tools must not read masked .env just to infer the default domain."""
+def test_build_subprocess_env_does_not_default_feishu_domain_without_app_env(monkeypatch, tmp_path: Path):
+    """Default domain is resolved by the credential broker, not ambient env."""
     from hermes_multitenancy import agent_real
 
     profile = tmp_path / "profile"
@@ -1094,9 +1094,9 @@ def test_build_subprocess_env_defaults_feishu_domain_for_app_plumbing(monkeypatc
 
     env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
 
-    assert env["FEISHU_APP_ID"] == "cli_test"
-    assert env["FEISHU_APP_SECRET"] == "app-secret"
-    assert env["FEISHU_DOMAIN"] == "feishu"
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_DOMAIN" not in env
     assert "FEISHU_UAT_ACCESS_TOKEN" not in env
     assert "FEISHU_UAT_REFRESH_TOKEN" not in env
 

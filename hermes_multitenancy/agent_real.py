@@ -457,8 +457,53 @@ def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> P
     profile_uat_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     feishu_oapi_module.FEISHU_UAT_PATH = profile_home / "feishu_uat.json"
     feishu_oapi_module.FEISHU_UAT_DIR = profile_uat_dir
+    _install_feishu_app_db_broker(feishu_oapi_module, shared_home)
     _install_feishu_uat_db_broker(feishu_oapi_module, profile_home, shared_home)
     return shared_home
+
+
+def _install_feishu_app_db_broker(feishu_oapi_module: Any, shared_home: Path) -> None:
+    """Patch Feishu app credential resolution to prefer the credential vault."""
+    original = getattr(feishu_oapi_module, "_hermes_mt_original_resolve_feishu_credentials", None)
+    if original is None:
+        original = getattr(feishu_oapi_module, "_resolve_feishu_credentials", None)
+        if original is None:
+            return
+        setattr(feishu_oapi_module, "_hermes_mt_original_resolve_feishu_credentials", original)
+
+    def _resolve_feishu_credentials_with_broker() -> tuple[str, str, str]:
+        from .credentials import CredentialStore
+
+        store = None
+        try:
+            store = CredentialStore(shared_home / "multitenancy.db")
+            status = store.get_status(
+                profile_name=_FEISHU_APP_CREDENTIAL_PROFILE,
+                subject_id=_FEISHU_APP_CREDENTIAL_SUBJECT,
+                provider="feishu",
+                secret_kind="app",
+            )
+            if status.get("status") == "valid":
+                payload = store.get_secret_for_runtime(
+                    profile_name=_FEISHU_APP_CREDENTIAL_PROFILE,
+                    subject_id=_FEISHU_APP_CREDENTIAL_SUBJECT,
+                    provider="feishu",
+                    secret_kind="app",
+                )
+                app_id = str(payload.get("app_id") or payload.get("FEISHU_APP_ID") or "").strip()
+                app_secret = str(payload.get("app_secret") or payload.get("FEISHU_APP_SECRET") or "").strip()
+                domain = str(payload.get("domain") or payload.get("FEISHU_DOMAIN") or "feishu").strip().lower()
+                if app_id and app_secret:
+                    logger.info("[multitenancy] loaded Feishu app credential from credential vault")
+                    return app_id, app_secret, domain or "feishu"
+        except Exception:
+            logger.debug("[multitenancy] Feishu app credential vault lookup skipped", exc_info=True)
+        finally:
+            if store is not None:
+                store.close()
+        return original()
+
+    feishu_oapi_module._resolve_feishu_credentials = _resolve_feishu_credentials_with_broker
 
 
 def _install_feishu_uat_db_broker(feishu_oapi_module: Any, profile_home: Path, shared_home: Path) -> None:
@@ -797,9 +842,6 @@ def _event_to_subprocess_payload(
 # its own DB credential row; terminal/code subprocesses apply secret-name env
 # filtering before executing model-generated commands.
 #
-# Feishu app credentials are app-level plumbing, not per-user UAT. They are
-# required by Feishu tool clients before loading the user's profile-scoped UAT.
-# User access/refresh tokens remain profile-local or credential-vault backed.
 _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     # POSIX basics
     "PATH", "USER", "LOGNAME", "SHELL", "TERM",
@@ -820,11 +862,10 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MULTITENANCY_CREDENTIAL_KEY",
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
-    # Feishu app-level plumbing for sandboxed Feishu tools.
-    "FEISHU_APP_ID",
-    "FEISHU_APP_SECRET",
-    "FEISHU_DOMAIN",
 })
+
+_FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
+_FEISHU_APP_CREDENTIAL_SUBJECT = "feishu_app"
 
 
 def _build_subprocess_env(
@@ -879,8 +920,6 @@ def _build_subprocess_env(
 
     profile_home = profile_home.expanduser()
     env.update(_profile_env_for_aiagent(profile_home))
-    if env.get("FEISHU_APP_ID") and env.get("FEISHU_APP_SECRET") and not env.get("FEISHU_DOMAIN"):
-        env["FEISHU_DOMAIN"] = "feishu"
 
     # HOME is NOT pivoted (see docstring). Only XDG/TMPDIR redirect.
     pivot = {
@@ -953,6 +992,8 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         from dotenv import dotenv_values
         for key, value in dotenv_values(profile_home / ".env").items():
             if key and value is not None:
+                if str(key) in {"FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_DOMAIN"}:
+                    continue
                 loaded[str(key)] = str(value)
     except Exception:
         logger.debug("[multitenancy] failed to load profile .env for subprocess", exc_info=True)
