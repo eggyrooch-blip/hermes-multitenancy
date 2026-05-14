@@ -928,7 +928,9 @@ def _build_subprocess_env(
 
     profile_home = profile_home.expanduser()
     env.update(_profile_env_for_aiagent(profile_home))
-    env.update(_credential_env_for_aiagent(profile_home))
+    credential_env = _credential_env_for_aiagent(profile_home)
+    env.update(credential_env)
+    env.update(_force_env_for_terminal_passthrough(credential_env))
 
     # OpenClaw-compatible token boundary: HOME and /workspace-style variables
     # point into the routed profile so unmodified token skills do not write to
@@ -1117,6 +1119,18 @@ def _credential_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     return loaded
 
 
+def _force_env_for_terminal_passthrough(env: dict[str, str]) -> dict[str, str]:
+    """Mirror credential env through Hermes' subprocess force-prefix channel.
+
+    Terminal/code tools apply a second secret-name scrub before spawning model
+    generated commands.  The force-prefix is consumed by Hermes' local
+    environment builder and emitted only as the real key name in the child
+    process, so the `_HERMES_FORCE_*` plumbing variable is not visible to the
+    shell command.
+    """
+    return {f"_HERMES_FORCE_{key}": value for key, value in env.items()}
+
+
 def _install_credential_env_passthrough(profile_home: Path) -> None:
     """Allow configured credential env vars through terminal/code sandboxes."""
     env_names = sorted(_credential_env_for_aiagent(profile_home))
@@ -1145,7 +1159,9 @@ def _install_credential_env_passthrough(profile_home: Path) -> None:
 def _apply_runtime_env_for_aiagent(profile_home: Path):
     """Temporarily expose profile/credential env for in-process AIAgent runs."""
     runtime_env = _profile_env_for_aiagent(profile_home)
-    runtime_env.update(_credential_env_for_aiagent(profile_home))
+    credential_env = _credential_env_for_aiagent(profile_home)
+    runtime_env.update(credential_env)
+    runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
     if not runtime_env:
         return lambda: None
     old_env = {key: os.environ.get(key) for key in runtime_env}
