@@ -2442,8 +2442,9 @@ def _run_with_aiagent(
             str(gateway_session_key),
         )
         runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
-        agent = AIAgent(**agent_kwargs)
+        agent = None
         try:
+            agent = AIAgent(**agent_kwargs)
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,
                 "task_id": str(session_id),
@@ -2459,15 +2460,16 @@ def _run_with_aiagent(
             runtime_env_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)
-            try:
-                close_agent = getattr(agent, "close", None)
-                cleanup_agent = getattr(agent, "cleanup", None)
-                if callable(close_agent):
-                    close_agent()
-                elif callable(cleanup_agent):
-                    cleanup_agent()
-            except Exception:
-                pass
+            if agent is not None:
+                try:
+                    close_agent = getattr(agent, "close", None)
+                    cleanup_agent = getattr(agent, "cleanup", None)
+                    if callable(close_agent):
+                        close_agent()
+                    elif callable(cleanup_agent):
+                        cleanup_agent()
+                except Exception:
+                    pass
             _retag_source_now("finally-post-close")
 
     return (result or {}).get("final_response", "") or ""
