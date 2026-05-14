@@ -994,6 +994,57 @@ def test_build_subprocess_env_drops_non_allowlisted_parent_env(monkeypatch, tmp_
         assert leaked not in env, f"{leaked} leaked into subprocess env"
 
 
+def test_build_subprocess_env_loads_profile_env_for_agent_only(monkeypatch, tmp_path: Path):
+    """Profile .env secrets are passed to the AIAgent process, not inherited from parent."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=profile-key",
+                "ANTHROPIC_BASE_URL=https://tokenhub.example/v1",
+                "FEISHU_APP_SECRET=feishu-secret",
+                "PUBLIC_RUNTIME_FLAG=enabled",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-key")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "profile-key"
+    assert env["ANTHROPIC_BASE_URL"] == "https://tokenhub.example/v1"
+    assert env["FEISHU_APP_SECRET"] == "feishu-secret"
+    assert env["PUBLIC_RUNTIME_FLAG"] == "enabled"
+
+
+def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path: Path):
+    """Auth-only profiles still work when auth.json is masked inside bwrap."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "config.yaml").write_text(
+        "model:\n  default: anthropic/custom-model-a3\n",
+        encoding="utf-8",
+    )
+    (profile / "auth.json").write_text(
+        '{"credential_pool":{"anthropic":[{"access_token":"auth-token"}]}}',
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["ANTHROPIC_API_KEY"] == "auth-token"
+
+
 def test_build_subprocess_env_pivots_xdg_and_tmpdir_into_profile(tmp_path: Path):
     """XDG_* / TMPDIR redirect to per-profile dirs, isolating skill caches.
 
@@ -1484,3 +1535,28 @@ def test_bwrap_default_args_does_not_bind_entire_shared_home():
         "/probe/shared/profiles/alice",
         "/probe/shared/profiles/alice",
     ) in triples
+
+
+def test_bwrap_default_args_masks_profile_and_shared_secret_files():
+    """The sandbox may use env-loaded secrets, but tools must not read secret files."""
+    from hermes_multitenancy import agent_real
+
+    args_file = agent_real._BWRAP_ARGS_FILE
+    tokens = agent_real._render_bwrap_args(args_file.read_text(), {
+        "PROFILE_HOME": "/probe/shared/profiles/alice",
+        "SHARED_HOME": "/probe/shared",
+        "USER_HOME": "/probe/user",
+        "HERMES_VENV": "/probe/venv",
+        "HERMES_AGENT_INSTALL": "/probe/install",
+        "HERMES_AGENT_REPO": "/probe/agent-repo",
+        "HERMES_MT_REPO": "/probe/mt-repo",
+    })
+
+    triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    for secret_path in (
+        "/probe/shared/.env",
+        "/probe/shared/auth.json",
+        "/probe/shared/profiles/alice/.env",
+        "/probe/shared/profiles/alice/auth.json",
+    ):
+        assert ("--ro-bind-try", "/dev/null", secret_path) in triples

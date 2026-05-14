@@ -95,6 +95,16 @@
 # last operation winning at any given path).
 --bind ${PROFILE_HOME} ${PROFILE_HOME}
 
+# Secret files are deliberately masked from the tool-visible filesystem.
+# agent_real._build_subprocess_env loads required values into the AIAgent
+# process env before bwrap starts; terminal/code subprocesses then strip
+# secret-like env names before executing model-generated commands.
+--ro-bind-try /dev/null ${SHARED_HOME}/.env
+--ro-bind-try /dev/null ${SHARED_HOME}/auth.json
+--ro-bind-try /dev/null ${SHARED_HOME}/auth.lock
+--ro-bind-try /dev/null ${PROFILE_HOME}/.env
+--ro-bind-try /dev/null ${PROFILE_HOME}/auth.json
+
 # ── Cross-tenant deny by construction ───────────────────────────────
 # ${SHARED_HOME}/profiles exists only as an empty directory plus the current
 # PROFILE_HOME bind. Sibling tenants are not mounted into this namespace, so
