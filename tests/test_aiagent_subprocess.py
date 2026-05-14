@@ -387,10 +387,53 @@ credentials:
         store.close()
 
     monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_GITLAB_TOKEN", raising=False)
     cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
     assert os.environ["GITLAB_TOKEN"] == "glpat-test"
+    assert os.environ["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
     cleanup()
     assert "GITLAB_TOKEN" not in os.environ
+    assert "_HERMES_FORCE_GITLAB_TOKEN" not in os.environ
+
+
+def test_build_subprocess_env_forces_credential_env_through_terminal_scrub(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [alice]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-test"},
+        )
+    finally:
+        store.close()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env["GITLAB_TOKEN"] == "glpat-test"
+    assert env["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
 
 
 @pytest.mark.asyncio
