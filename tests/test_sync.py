@@ -231,6 +231,11 @@ skills:
     (skill_source / "gitlab.token").write_text("do-not-copy\n", encoding="utf-8")
     (skill_source / "scripts").mkdir()
     (skill_source / "scripts" / "run.js").write_text("console.log('ok')\n", encoding="utf-8")
+    (skill_source / "node_modules" / "@keepclaw" / "skill-sdk").mkdir(parents=True)
+    (skill_source / "node_modules" / "@keepclaw" / "skill-sdk" / "index.js").write_text(
+        "module.exports = {}\n",
+        encoding="utf-8",
+    )
 
     profiles_root = tmp_path / "profiles"
     snapshot = build_org_snapshot(
@@ -244,6 +249,8 @@ skills:
     assert stats["created"] == 1
     assert (target / "SKILL.md").read_text(encoding="utf-8") == "# Keep Record\n"
     assert (target / "scripts" / "run.js").exists()
+    assert (target / "node_modules").is_symlink()
+    assert (target / "node_modules").resolve() == (skill_source / "node_modules").resolve()
     assert not (target / ".env").exists()
     assert not (target / "gitlab.token").exists()
 
