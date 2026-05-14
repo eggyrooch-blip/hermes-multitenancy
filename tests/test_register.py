@@ -55,6 +55,28 @@ def test_register_calls_register_hook_once():
     assert callable(cb)
 
 
+def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch):
+    """The WebUI broker sidecar is opt-in but wired during plugin register."""
+    import hermes_multitenancy
+
+    calls = []
+
+    class FakeCtx:
+        def register_hook(self, name, cb):
+            calls.append((name, cb))
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        hermes_multitenancy.webui_broker_server,
+        "ensure_run_broker_server_started",
+        lambda: calls.append(("run_broker_server", None)),
+    )
+
+    hermes_multitenancy.register(FakeCtx())
+
+    assert ("run_broker_server", None) in calls
+
+
 def test_runtime_pool_settings_can_be_overridden_from_env(monkeypatch):
     """Production can relax runtime cache/timeout without code changes."""
     monkeypatch.setenv("HERMES_MULTITENANCY_MAX_LOADED_RUNTIMES", "12")

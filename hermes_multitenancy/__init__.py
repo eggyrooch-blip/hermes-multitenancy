@@ -23,6 +23,7 @@ from .cron_worker import (
     install_gateway_startup_watcher,
 )
 from .router import on_pre_gateway_dispatch
+from . import webui_broker_server
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ def register(ctx) -> None:
     override_pool(_build_runtime_pool(_real_factory))
     install_cron_runtime_patches()
     install_gateway_startup_watcher()
+    webui_broker_server.ensure_run_broker_server_started()
 
     register_credential_status_tool(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
@@ -95,6 +97,7 @@ def register(ctx) -> None:
 
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
+    webui_broker_server.ensure_run_broker_server_started()
     gateway = kwargs.get("gateway")
     if gateway is not None:
         try:
