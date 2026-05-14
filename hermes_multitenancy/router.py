@@ -861,7 +861,11 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # know which profile's history to inspect). When _resolve_route signals
         # a miss with profile_home=None, surface profile_name=None so command
         # handlers reply "未路由" instead of leaking the sender id.
-        cmd_pair = parse_command(text)
+        # Group messages start with leading @_all / @_user_N tokens that
+        # Feishu prepends; strip them before delegating to parse_command so
+        # ``@bot /feishu_auth`` is recognised as a slash command.
+        command_source_text = _strip_leading_at_mentions(text) if is_group_chat else text
+        cmd_pair = parse_command(command_source_text)
         if cmd_pair is not None:
             # Group profiles do not own any UAT — /feishu_auth is hard-rejected
             # so a curious member can't trigger an OAuth dance that would
@@ -1953,6 +1957,30 @@ def _extract_chat_id(event: Any) -> str:
 
 def _is_group_chat_type(chat_type: str) -> bool:
     return chat_type.lower() in _GROUP_CHAT_TYPES
+
+
+_LEADING_MENTIONED_PREFIX_RE = re.compile(
+    r"^\s*\[Mentioned:[^\]]*\]\s*",
+)
+_LEADING_AT_MENTION_RE = re.compile(
+    r"^(?:\s*@\S+\s+)+",
+)
+
+
+def _strip_leading_at_mentions(text: str) -> str:
+    """Strip leading Feishu @-mentions so slash commands are still parseable.
+
+    The hermes-agent Feishu adapter normalises group messages into a form
+    like ``[Mentioned: @all]\\n\\n@all /feishu_auth``. ``parse_command``
+    requires the slash to be the first character, so for group messages
+    we peel both the ``[Mentioned: …]`` prefix and the @-token tail off
+    the front and hand the result to the parser.
+    """
+    if not text:
+        return text
+    text = _LEADING_MENTIONED_PREFIX_RE.sub("", text)
+    text = _LEADING_AT_MENTION_RE.sub("", text)
+    return text
 
 
 def _short_chat_id(chat_id: str) -> str:
