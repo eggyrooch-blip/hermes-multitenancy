@@ -27,6 +27,8 @@ sources:
 > `fcd55ac` 把 Feishu app credential 也收进 vault：`_install_feishu_app_db_broker()` patch `tools.feishu_oapi_client._resolve_feishu_credentials()`，优先取全局行 `profile_name=__global__ / subject_id=feishu_app / provider=feishu / secret_kind=app`；用户 UAT 仍按 `profile_name + open_id + provider=feishu + secret_kind=uat` 精确过滤。`_build_subprocess_env()` 不再转发 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOMAIN`，profile `.env` 中这三项也会被过滤。生产 `yaojunhua` canary 已验证 app credential 与 UAT 均从 credential vault 加载，`feishu_get_my_user_info` `error=False`。
 >
 > `91221d3` 修正 shared model env 继承边界：sandboxed AIAgent 在 bwrap 前会从 shared `~/.hermes/.env` 只继承 `_MODEL_ENV_ALLOWLIST` 中的 provider key/base URL（如 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`），profile-local `.env` 仍可覆盖；若 profile `.env` symlink 到 shared `.env`，同样按 shared allowlist 过滤，避免 `GITLAB_TOKEN` / `PUBLIC_RUNTIME_FLAG` 这类非模型配置进入租户 AIAgent env。Feishu app/UAT 继续由 credential vault 读取，不走 env。生产 `sunke` / `zhanglina` RunBroker canary 已验证 bwrap AIAgent 正常取到模型 key。
+>
+> `69fe59a` 修正 sandbox media 投递兜底：AIAgent/浏览器类工具可能把真实文件保存到 `PROFILE_HOME/home/Downloads/logo.png`，但模型回复仍写 `MEDIA:/tmp/logo/logo.png`。router 仍禁止投递 profile 外路径；只有当同名文件存在于当前 profile 的固定产物目录（`home/Downloads`、`cache/images`、`tmp`、`data`）时，才把 `MEDIA:` 改写为 profile 内真实文件。没有 profile 内产物时继续拦截，避免 host `/tmp` 或其他租户文件泄露。
 
 > [!info] 2026-05-14 全员可进入目标态
 > 生产目标不是灰度 allowlist。Feishu org sync 负责为全员创建/更新 canonical routing/profile；用户自己完成 `feishu_auth` 后即可通过 Feishu bot / WebUI 消费工具。`HERMES_MULTITENANCY_AUTO_PROVISION=0` 只表示不为未知 open_id 创建临时 fallback profile，避免历史 `feishu_ou_*` 残留继续扩散；它不等于人工准入。未命中 routing/profile 时应优先排查 org sync 是否覆盖到该用户，而不是要求人工审批。
@@ -1652,6 +1654,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
 | 2026-05-14 | `91221d3` | **fix(model env)**: sandboxed AIAgent 从 shared `.env` 只继承模型 provider allowlist，profile `.env` 可覆盖；Feishu app/UAT 与其他 shared token 不进入 env | `生产环境的实况.md` §8 | 顶部 credential vault；§10A/§13 |
+| 2026-05-14 | `69fe59a` | **fix(media)**: `MEDIA:/tmp/...` 只有在当前 profile 固定产物目录存在同名文件时才改写投递，否则继续拦截 | `生产环境的实况.md` §8 | 顶部 credential vault；§12 media |
 | 2026-05-14 | `114fd3e` | **fix(cron)**: `/api/run-broker/jobs` 未传 `deliver` 时默认 `feishu`；WebUI cron 不再静默落成本地 output-only job | `生产环境的实况.md` §23 | 顶部 Run Broker jobs；§10A |
 | 2026-05-14 | `fcd55ac` | **fix(feishu vault)**: Feishu app credential 迁入 `multitenancy_credentials` 全局 app 行；AIAgent env 不再转发 app_id/app_secret/domain | `生产环境的实况.md` §22 | 顶部 credential vault；§10A/Run Broker |
 | 2026-05-14 | `b2eeb1c` | **fix(feishu retag)**: Run Broker/WebUI profile `state.db` 尚无 `sessions` 表时，`session.source` retag 静默跳过，避免每个工具事件刷 `sqlite3.OperationalError` | `生产环境的实况.md` §21 | 顶部 credential vault；§10A/Run Broker |
