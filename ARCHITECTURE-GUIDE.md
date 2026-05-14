@@ -1633,7 +1633,7 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 | 日期 | commit | 主题 | 笔记（Obsidian） | 影响章节 |
 |---|---|---|---|---|
-| 2026-05-14 | `799c26e` | **feat(run broker)**: 新增 `RunRequest` / `RunEvent` / `RunBroker` 目标态骨架和测试；尚未接管 Feishu/WebUI/cron 生产路径 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A 新增 |
+| 2026-05-14 | `db45b28` | **feat(run broker)**: 新增 `RunRequest` / `RunEvent` / `RunBroker` 目标态骨架和测试；尚未接管 Feishu/WebUI/cron 生产路径 | `docs/plans/2026-05-14-hermes-run-broker-target-state.md` | 顶部 info；§10A 新增 |
 | 2026-05-14 | `d15f8ae` | **feat(cron delivery)**: startup watcher + Feishu owner_open_id fallback + Feishu open_id send patch + delivery context mirror | `生产环境的实况.md` §13；本 GUIDE §15 v3 | §2.4 register 入口；§15 worker/delivery 语义；附录 E systemd 现状 |
 | 2026-05-13 | — (运维变更，无代码，已被 2026-05-14 实况修正端口/profile 名) | **远端复制本机多租户模式**：新增 `hermes-gateway@.service` systemd template，per-profile gateway 各跑独立端口；当日记录曾写 `feishu_ou_75...→:8651` / `multitenancy_router→:8652` / `feishu_sunke→:8653`，当前生产以 `sunke→8655` 为准。webui 切 detect-only（`GATEWAY_AUTOSTART=none` + 清掉 `HERMES_PROFILE`/`UPSTREAM`/`HERMES_FORCE_RUN_MODE`）。team-rca 调研：`webui-profile-routing-rca` (worker-local + worker-remote) | `.omc/research/local-gateway-mode.md` + `.omc/research/spawn-race-rca.md` | 附录 E.3 systemd unit 拓扑（**改写**）/ E.5 OAuth 链路尾段 known-缺口 消除 |
 | 2026-05-13 | hermes-web-ui `a9ef54a` | **feat(gateway)**: `HERMES_FORCE_RUN_MODE` env override —— 让 GatewayManager 在 systemd 主机上跳过 service-mode 直接走 `gateway run --replace`（绕过 per-profile systemd unit 缺失问题）。但**实际生产路径选了"systemd template + detect-only"**，这个 env 保留为 fallback 路径 | — | 附录 E.4 webui env / source code |
