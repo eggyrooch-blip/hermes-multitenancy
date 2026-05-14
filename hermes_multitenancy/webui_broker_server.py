@@ -14,6 +14,7 @@ import os
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
+from . import cron_api
 from .run_broker import RunBroker, RunRejected
 from .run_models import RunEvent, RunRequest
 
@@ -63,6 +64,23 @@ def _authorized(request: Any) -> bool:
 def _default_sandbox_available() -> bool:
     value = os.environ.get("HERMES_USE_SANDBOX", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _tenant_from_request(request: Any, payload: Optional[dict[str, Any]] = None) -> tuple[str, str]:
+    payload = payload or {}
+    profile_name = (
+        request.headers.get("X-Hermes-Profile")
+        or payload.get("profile_name")
+        or payload.get("profile")
+        or ""
+    )
+    user_key = (
+        request.headers.get("X-Hermes-User-Key")
+        or payload.get("user_key")
+        or payload.get("user")
+        or ""
+    )
+    return cron_api.validate_profile_name(str(profile_name)), str(user_key or "").strip()
 
 
 async def _maybe_await(value):
@@ -171,8 +189,109 @@ def create_run_broker_app(
         body = "".join(_event_to_sse(event) for event in events)
         return web.Response(text=body, content_type="text/event-stream")
 
+    async def handle_list_jobs(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
+            jobs = cron_api.list_jobs(profile_name, include_disabled=include_disabled)
+            return web.json_response({"jobs": jobs})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron list failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_create_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+            profile_name, user_key = _tenant_from_request(request, payload)
+            job = cron_api.create_job(profile_name, user_key, payload)
+            return web.json_response({"job": job})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron create failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_get_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            job = cron_api.get_job(profile_name, request.match_info["job_id"])
+            return web.json_response({"job": job})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron get failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_update_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+            profile_name, _user_key = _tenant_from_request(request, payload)
+            job = cron_api.update_job(profile_name, request.match_info["job_id"], payload)
+            return web.json_response({"job": job})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron update failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_delete_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            cron_api.delete_job(profile_name, request.match_info["job_id"])
+            return web.json_response({"ok": True})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron delete failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_pause_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            job = cron_api.pause_job(profile_name, request.match_info["job_id"])
+            return web.json_response({"job": job})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron pause failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_resume_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            job = cron_api.resume_job(profile_name, request.match_info["job_id"])
+            return web.json_response({"job": job})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron resume failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     app = web.Application()
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_get("/api/run-broker/jobs", handle_list_jobs)
+    app.router.add_post("/api/run-broker/jobs", handle_create_job)
+    app.router.add_get("/api/run-broker/jobs/{job_id}", handle_get_job)
+    app.router.add_patch("/api/run-broker/jobs/{job_id}", handle_update_job)
+    app.router.add_delete("/api/run-broker/jobs/{job_id}", handle_delete_job)
+    app.router.add_post("/api/run-broker/jobs/{job_id}/pause", handle_pause_job)
+    app.router.add_post("/api/run-broker/jobs/{job_id}/resume", handle_resume_job)
     return app
 
 

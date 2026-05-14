@@ -42,6 +42,7 @@ _worker_lock = threading.Lock()
 _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop: Optional[threading.Event] = None
+_cron_module_patch_lock = threading.Lock()
 _runtime_patches_installed = False
 _gateway_watcher_installed = False
 _watcher_attr = "_hermes_multitenancy_cron_watch_scheduled"
@@ -496,7 +497,6 @@ def _multiprofile_cron_worker(
         logger.exception("[multitenancy] cron modules not importable; worker aborted")
         return
 
-    patch_lock = threading.Lock()
     while not stop_event.is_set():
         try:
             active_profiles = _active_cron_profiles(profiles_root)
@@ -515,7 +515,7 @@ def _multiprofile_cron_worker(
                     jobs_file,
                     adapters,
                     loop,
-                    patch_lock,
+                    _cron_module_patch_lock,
                 )
         except Exception:
             logger.exception("[multitenancy] cron worker scan error")
