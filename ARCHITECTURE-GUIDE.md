@@ -30,52 +30,43 @@ sources:
 > [!info] 2026-05-14 Run Broker 目标态骨架
 > `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。WebUI 已有 HTTP/SSE sidecar endpoint；cron 已有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` run_job patch，会把 due job 构造成 `RunRequest(channel="cron")`。生产 66 已启用 WebUI/cron broker：`127.0.0.1:8766` sidecar active，WebUI Socket.IO canary 返回 `SANDBOX=1`，真实 router cron worker job `e79412276d8f` 输出 `Run Path: RunBroker` + `SANDBOX=1`。CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`。
 
+> [!info] 2026-05-14 Run Broker jobs API 收口
+> `5d48dcd` 新增 `cron_api.py` 与 `/api/run-broker/jobs`，WebUI chat plane 的 job 创建、列表、修改、删除、暂停、恢复都进入本仓 sidecar，不再要求 `hermes-gateway@sunke.service` profile apiserver 常驻。生产验证时停止 `hermes-gateway@sunke.service`，WebUI BFF 仍能创建并删除 job `0dbd12ced3b1`。`a19f456` 是本 GUIDE 的 docs-only 同步。
+
 ---
 
 ## §1 TL;DR
 
 ### 1.1 一图
 
-```
-飞书 inbound (MessageEvent)
-   │
-   │  hermes-agent gateway pre-dispatch
-   ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ hermes-multitenancy plugin (本仓, in-process)                        │
-│                                                                      │
-│  on_pre_gateway_dispatch (sync hook)  ── return {"action":"skip"}    │
-│       │ asyncio.create_task                                          │
-│       ▼                                                              │
-│  handle_async                                                        │
-│     ├─ _resolve_sender_for_routing (ou_*/on_*/fallback 7 层)         │
-│     ├─ parse_command  → /stop|/status|/new|/approve|/deny|...        │
-│     ├─ _resolve_or_auto_provision_route                              │
-│     │     SQLite RoutingTable.lookup_by_open_id (主)                 │
-│     │   + lookup_by_union_id  (5/11 dirty 修, alt 是 on_* 时)        │
-│     │   + spike _SPIKE_ROUTING  (Phase 1/tests fallback)             │
-│     │   + auto-provision (默认开)                                    │
-│     ├─ _enrich_via_hermes_pipeline (vision/STT/file/reply 复用主线)  │
-│     ├─ _load_history (cache miss → SessionStore.load_recent)         │
-│     └─ RuntimePool.dispatch(profile_name, profile_home, event)       │
-│           ├─ LRU OrderedDict, max=50, idle_evict=300s                │
-│           ├─ cold-start Semaphore(8)                                 │
-│           └─ ProfileRuntime.dispatch                                 │
-│                 ├─ ContextVar(_PROFILE_HOME_VAR) ← 真相               │
-│                 ├─ os.environ[HERMES_HOME] (env lock, legacy)        │
-│                 └─ real_run_agent / stream_run_agent                  │
-│                       └─ asyncio.create_subprocess_exec              │
-│                             aiagent_subprocess.py                    │
-│                             │ stdin: JSON event+messages+profile     │
-│                             │ stdout: NDJSON 流 (content/thinking/   │
-│                             │         tool_*/approval_*/done)        │
-│                             ▼                                        │
-│                          AIAgent.run_conversation (同步, 子进程)     │
-└──────────────────────────────────────────────────────────────────────┘
-   │
-   │  父进程消费 NDJSON → GatewayStreamConsumer
-   ▼
-飞书 streaming card (update_streaming_card / _edit_message 节流回写)
+```mermaid
+flowchart TB
+    Feishu["Feishu inbound event"] --> Hook["pre_gateway_dispatch<br/>return action skip"]
+    WebUIRun["WebUI /chat-run"] --> Sidecar["webui_broker_server :8766"]
+    WebUIJobs["WebUI /api/hermes/jobs"] --> Sidecar
+    Cron["multi-profile cron worker"] --> Broker["RunBroker"]
+    Sidecar --> Broker
+    Hook --> Route["router.handle_async<br/>resolve sender -> profile"]
+    Route --> Broker
+    WebUIJobs --> JobsAPI["cron_api.py<br/>profile scoped cron.jobs"]
+    JobsAPI --> JobsFile["profiles/sunke/cron/jobs.json"]
+    Cron --> JobsFile
+    Broker --> Policy["admission<br/>profile + user_key<br/>dedupe + sandbox required"]
+    Policy --> Pool["RuntimePool / ProfileRuntime"]
+    Pool --> Bwrap["Linux bwrap<br/>current PROFILE_HOME only"]
+    Bwrap --> Subprocess["aiagent_subprocess.py<br/>AIAgent"]
+    Subprocess --> Events["RunEvent / NDJSON<br/>content, tool, done"]
+    Events --> FeishuOut["Feishu streaming card"]
+    Events --> WebUIOut["Socket.IO stream"]
+    Events --> Output["cron output + session mirror"]
+    Broker --> Creds[("multitenancy.db<br/>routing + credentials<br/>processed events")]
+
+    classDef main fill:#e8f5e9,stroke:#16a34a,color:#111
+    classDef input fill:#e3f2fd,stroke:#2563eb,color:#111
+    classDef data fill:#f3e8ff,stroke:#7c3aed,color:#111
+    class Broker,Policy,Pool,Bwrap,Subprocess,Sidecar,JobsAPI main
+    class Feishu,WebUIRun,WebUIJobs,Cron input
+    class JobsFile,Creds,Output data
 ```
 
 ### 1.2 一段话
