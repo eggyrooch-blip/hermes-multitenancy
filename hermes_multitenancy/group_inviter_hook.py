@@ -26,9 +26,37 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+import threading as _threading
+from collections import OrderedDict as _OrderedDict
+
 _HOOK_INSTALLED = False
 _CLASS_PATCH_FLAG = "_hermes_multitenancy_bot_added_class_patched"
 _WELCOME_PATCH_FLAG = "_hermes_multitenancy_welcome_class_patched"
+
+# Feishu delivers im.chat.member.bot.added_v1 at-least-once, so the same
+# chat can fire the welcome path several times. Track recently-welcomed
+# chat_ids (bounded LRU) to suppress duplicate group welcomes within the
+# process lifetime. Lock-guarded: the welcome runs on the SDK callback
+# thread, not the asyncio loop thread.
+_WELCOMED_CHATS_MAX = 512
+_welcomed_chats: "_OrderedDict[str, bool]" = _OrderedDict()
+_welcomed_chats_lock = _threading.Lock()
+
+
+def _mark_and_check_welcomed(chat_id: str) -> bool:
+    """Return True if this chat was already welcomed (and should be skipped).
+
+    Atomically records the chat as welcomed and reports the prior state, so
+    only the first caller for a given chat_id sends the message.
+    """
+    with _welcomed_chats_lock:
+        if chat_id in _welcomed_chats:
+            _welcomed_chats.move_to_end(chat_id)
+            return True
+        _welcomed_chats[chat_id] = True
+        while len(_welcomed_chats) > _WELCOMED_CHATS_MAX:
+            _welcomed_chats.popitem(last=False)
+        return False
 
 
 def install_feishu_bot_added_hook() -> None:
@@ -94,6 +122,9 @@ def _patch_chat_added_welcome(FeishuAdapter: Any) -> None:
     async def wrapped(self: Any, chat_id: str) -> Any:
         chat_type = await _resolve_chat_type(self, chat_id)
         if chat_type in ("group", "topic"):
+            if _mark_and_check_welcomed(chat_id):
+                # Duplicate bot-added redelivery — already welcomed.
+                return None
             try:
                 await self.send(
                     chat_id,

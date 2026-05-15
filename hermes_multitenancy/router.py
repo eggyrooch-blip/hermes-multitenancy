@@ -2514,12 +2514,26 @@ def _ensure_group_profile(
 
 
 def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str) -> None:
-    """Materialize <profile>/.env inheriting shared values + FEISHU_HOME_CHANNEL.
+    """Materialize <profile>/.env with ONLY model keys + FEISHU_HOME_CHANNEL.
 
-    Group profiles preempt the gateway's home-channel onboarding prompt by
-    declaring the group chat itself as the home channel. Re-runs are
-    idempotent and overwrite a stale FEISHU_HOME_CHANNEL line.
+    The subprocess env is whitelisted (``_SUBPROCESS_ENV_ALLOWLIST``) and
+    does NOT pass model provider API keys, so the AIAgent child reads them
+    from ``<profile>/.env`` via its own dotenv path. But the previous
+    "copy every shared line" approach also duplicated the credential-vault
+    master key, gateway config, and unrelated tool tokens into every group
+    profile dir — secret sprawl flagged in code review. We now copy only
+    the model provider key/base-url names (``_MODEL_ENV_ALLOWLIST``, the
+    same source of truth the model resolver uses) plus the per-group
+    FEISHU_HOME_CHANNEL override. ``HERMES_MULTITENANCY_CREDENTIAL_KEY``
+    already flows through the allowlisted subprocess env, so it never
+    needs to land on disk in a tenant dir.
+
+    Group profiles also preempt the gateway's home-channel onboarding
+    prompt by declaring the group chat itself as the home channel. Re-runs
+    are idempotent.
     """
+    from .agent_real import _MODEL_ENV_ALLOWLIST
+
     shared_env = shared_home / ".env"
     target = profile_home / ".env"
     base_lines: list[str] = []
@@ -2532,11 +2546,13 @@ def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str
                 exc,
             )
             shared_text = ""
-        base_lines = [
-            line
-            for line in shared_text.splitlines()
-            if not line.lstrip().startswith("FEISHU_HOME_CHANNEL=")
-        ]
+        for line in shared_text.splitlines():
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in _MODEL_ENV_ALLOWLIST:
+                base_lines.append(line)
     base_lines.append(f"FEISHU_HOME_CHANNEL={chat_id}")
     # Atomic write: a crash between unlink() and write_text() used to leave
     # the profile with NO .env (all inherited creds gone until reprovision).
