@@ -178,13 +178,16 @@ def test_ensure_group_profile_inherits_default_skills(tmp_path):
     from hermes_multitenancy.router import _ensure_group_profile
 
     shared_home = tmp_path
-    skill_source = shared_home / "skills" / "Keep" / "keep-record"
-    skill_source.mkdir(parents=True)
+    keep_source = shared_home / "skills" / "Keep" / "keep-record"
+    lark_source = shared_home / "skills" / "lark-base"
+    keep_source.mkdir(parents=True)
+    lark_source.mkdir(parents=True)
     (shared_home / "profile-skill-defaults.yaml").write_text(
-        "skills:\n  - Keep/keep-record\n",
+        "skills:\n  - Keep/keep-record\n  - lark-base\n",
         encoding="utf-8",
     )
-    (skill_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    (keep_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    (lark_source / "SKILL.md").write_text("# Lark Base\n", encoding="utf-8")
     profile_home = shared_home / "profiles" / "feishu_group_x"
 
     _ensure_group_profile(
@@ -196,6 +199,9 @@ def test_ensure_group_profile_inherits_default_skills(tmp_path):
     )
 
     assert (profile_home / "skills" / "Keep" / "keep-record" / "SKILL.md").exists()
+    lark_target = profile_home / "skills" / "lark-base"
+    assert lark_target.is_symlink()
+    assert lark_target.resolve() == lark_source.resolve()
 
 
 # -- resolve_or_auto_provision_group_route ----------------------------------

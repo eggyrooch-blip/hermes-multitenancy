@@ -1029,7 +1029,7 @@ def _lark_cli_sidecar_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         "LARKSUITE_CLI_PROXY_KEY": key,
         "LARKSUITE_CLI_APP_ID": app_id,
         "LARKSUITE_CLI_BRAND": str(parent.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
-        "LARKSUITE_CLI_DEFAULT_AS": str(parent.get("HERMES_LARK_CLI_DEFAULT_AS") or "user").strip() or "user",
+        "LARKSUITE_CLI_DEFAULT_AS": _lark_cli_default_identity(profile_home, ""),
         "LARKSUITE_CLI_STRICT_MODE": str(parent.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
     }
 
@@ -1088,6 +1088,82 @@ def _resolve_lark_cli_app_id_from_profile_uat(profile_home: Path) -> str:
     return ""
 
 
+def _is_group_profile_home(profile_home: Path) -> bool:
+    profile_home = Path(profile_home).expanduser()
+    if profile_home.name.startswith("feishu_group_"):
+        return True
+    marker = profile_home / "group_profile.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return str(payload.get("kind") or "").strip().lower() == "group"
+
+
+def _payload_has_live_access_token(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    token = str(payload.get("access_token") or payload.get("user_access_token") or payload.get("token") or "").strip()
+    if not token:
+        return False
+    expires_raw = payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at")
+    try:
+        expires = int(expires_raw or 0)
+    except (TypeError, ValueError):
+        return True
+    if expires <= 0:
+        return True
+    now_ms = int(time.time() * 1000)
+    expires_ms = expires if expires > 10_000_000_000 else expires * 1000
+    return expires_ms > now_ms + 60_000
+
+
+def _profile_has_lark_cli_user_credential(profile_home: Path, open_id: str) -> bool:
+    open_id = str(open_id or "").strip()
+    if not open_id or _is_group_profile_home(profile_home):
+        return False
+
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    try:
+        data = json.loads((Path(profile_home).expanduser() / "feishu_uat" / f"{open_id}.json").read_text(encoding="utf-8"))
+        if _payload_has_live_access_token(data):
+            return True
+    except Exception:
+        pass
+
+    try:
+        from .credentials import CredentialStore
+
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name=Path(profile_home).name,
+                subject_id=open_id,
+                provider="feishu",
+                secret_kind="uat",
+            )
+        finally:
+            store.close()
+        return _payload_has_live_access_token(payload)
+    except Exception:
+        return False
+
+
+def _lark_cli_default_identity(profile_home: Path, open_id: str) -> str:
+    """Return the identity lark-cli should use when a tool call says auto.
+
+    Group profiles never load member UAT, so they default to bot identity.
+    Personal profiles use user identity only when a live UAT exists for the
+    current sender; otherwise they fall back to bot identity.
+    """
+    explicit = str(os.environ.get("HERMES_LARK_CLI_DEFAULT_AS") or "").strip().lower()
+    if explicit in {"user", "bot"}:
+        return explicit
+    if _profile_has_lark_cli_user_credential(profile_home, open_id):
+        return "user"
+    return "bot"
+
+
 @contextmanager
 def _lark_cli_auth_broker_scope(
     profile_home: Path,
@@ -1112,13 +1188,14 @@ def _lark_cli_auth_broker_scope(
         )
     )
     try:
+        default_as = _lark_cli_default_identity(profile_home, sender_open_id)
         yield {
             "HERMES_LARK_CLI_BIN": str(binary),
             "LARKSUITE_CLI_AUTH_PROXY": server.url,
             "LARKSUITE_CLI_PROXY_KEY": key,
             "LARKSUITE_CLI_APP_ID": app_id,
             "LARKSUITE_CLI_BRAND": str(os.environ.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
-            "LARKSUITE_CLI_DEFAULT_AS": str(os.environ.get("HERMES_LARK_CLI_DEFAULT_AS") or "user").strip() or "user",
+            "LARKSUITE_CLI_DEFAULT_AS": default_as,
             "LARKSUITE_CLI_STRICT_MODE": str(os.environ.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
         }
     finally:
