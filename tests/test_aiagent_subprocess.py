@@ -1449,6 +1449,161 @@ def test_build_subprocess_env_prepends_shared_bin_to_path(monkeypatch, tmp_path:
     assert env["PATH"].endswith("/usr/bin:/bin")
 
 
+def test_build_subprocess_env_wires_lark_cli_sidecar_without_tokens(monkeypatch, tmp_path: Path):
+    """lark-cli gets only the sidecar key/proxy, never raw Feishu credentials."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_LARK_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("HERMES_LARK_CLI_PROXY_KEY", "short-lived-key")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "uat-secret")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+    assert env["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:16384"
+    assert env["LARKSUITE_CLI_PROXY_KEY"] == "short-lived-key"
+    assert env["LARKSUITE_CLI_APP_ID"] == "cli_public"
+    assert env["LARKSUITE_CLI_BRAND"] == "feishu"
+    assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+    assert env["LARKSUITE_CLI_STRICT_MODE"] == "user"
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+
+
+def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch, tmp_path: Path):
+    """Each AIAgent run gets a short-lived sidecar key and localhost broker."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setenv("FEISHU_UAT_ACCESS_TOKEN", "uat-secret")
+    seen: dict[str, object] = {}
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            seen["closed"] = True
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        context = seen["context"]
+        assert context.profile_name == "alice"
+        assert context.user_open_id == "ou_alice"
+        assert context.hmac_key
+        assert extra["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+        assert extra["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
+        assert extra["LARKSUITE_CLI_PROXY_KEY"] == context.hmac_key
+        assert extra["LARKSUITE_CLI_APP_ID"] == "cli_public"
+        assert extra["LARKSUITE_CLI_STRICT_MODE"] == "user"
+        assert "FEISHU_APP_SECRET" not in extra
+        assert "FEISHU_UAT_ACCESS_TOKEN" not in extra
+
+    assert seen["closed"] is True
+
+
+def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_vault(monkeypatch, tmp_path: Path):
+    """Production should not need to duplicate app_id in process env."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+    store = CredentialStore(shared_home / "multitenancy.db", encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="__global__",
+            subject_id="feishu_app",
+            provider="feishu",
+            secret_kind="app",
+            payload={"app_id": "cli_from_vault", "app_secret": "secret"},
+        )
+    finally:
+        store.close()
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["LARKSUITE_CLI_APP_ID"] == "cli_from_vault"
+
+
+def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatch, tmp_path: Path):
+    """The actual spawn path should get per-run broker env overrides."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    event = _event()
+    seen: dict[str, object] = {}
+
+    @contextmanager
+    def fake_scope(profile_home, sender_open_id):
+        seen["profile_home"] = profile_home
+        seen["sender_open_id"] = sender_open_id
+        yield {
+            "HERMES_LARK_CLI_BIN": "/tmp/lark-cli-authsidecar",
+            "LARKSUITE_CLI_AUTH_PROXY": "http://127.0.0.1:19090",
+            "LARKSUITE_CLI_PROXY_KEY": "short-lived",
+            "LARKSUITE_CLI_APP_ID": "cli_public",
+        }
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+        event_stream=True,
+    ) as env:
+        assert seen["profile_home"] == profile
+        assert seen["sender_open_id"] == "ou_test"
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_test"
+        assert env["HERMES_LARK_CLI_BIN"] == "/tmp/lark-cli-authsidecar"
+        assert env["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
+        assert env["LARKSUITE_CLI_PROXY_KEY"] == "short-lived"
+        assert env["LARKSUITE_CLI_APP_ID"] == "cli_public"
+        assert env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
+
+
 def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
     """`extra` parameter wins over defaults so callers can override per-spawn."""
     from hermes_multitenancy import agent_real
