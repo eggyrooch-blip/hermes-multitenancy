@@ -23,6 +23,10 @@ from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
+_SKILL_SLASH_ALIASES = {
+    "hades": "kep-hades-cli",
+}
+
 try:  # Shared Hermes Feishu card/typewriter transport.
     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig  # type: ignore
 except Exception:  # pragma: no cover - allows plugin unit tests without gateway on path
@@ -1280,6 +1284,10 @@ def _maybe_rewrite_skill_slash_command(
 
         skill_cmds = get_skill_commands()
         cmd_key = resolve_skill_command_key(cmd)
+        if cmd_key is None:
+            alias = _SKILL_SLASH_ALIASES.get(cmd.replace("_", "-"))
+            if alias:
+                cmd_key = resolve_skill_command_key(alias)
         if cmd_key is None:
             return False, None
 
