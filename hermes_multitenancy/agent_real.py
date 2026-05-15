@@ -31,8 +31,15 @@ import hashlib
 import tempfile
 import uuid
 import re
+import secrets
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+from .lark_cli_auth_broker import (
+    LarkCliAuthBrokerContext,
+    start_lark_cli_auth_broker_server,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -955,6 +962,7 @@ def _build_subprocess_env(
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    env.update(_lark_cli_sidecar_env_for_aiagent(profile_home))
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
 
@@ -1000,6 +1008,123 @@ def _build_subprocess_env(
         except Exception:
             pass
     return env
+
+
+def _lark_cli_sidecar_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Expose lark-cli authsidecar plumbing without exposing Feishu tokens."""
+    parent = os.environ
+    proxy = str(parent.get("HERMES_LARK_CLI_AUTH_PROXY") or "").strip()
+    key = str(parent.get("HERMES_LARK_CLI_PROXY_KEY") or "").strip()
+    app_id = _resolve_lark_cli_app_id(profile_home)
+    if not (proxy and key and app_id):
+        return {}
+
+    binary = _resolve_lark_cli_authsidecar_binary(profile_home)
+    if not binary.exists():
+        return {}
+
+    return {
+        "HERMES_LARK_CLI_BIN": str(binary),
+        "LARKSUITE_CLI_AUTH_PROXY": proxy,
+        "LARKSUITE_CLI_PROXY_KEY": key,
+        "LARKSUITE_CLI_APP_ID": app_id,
+        "LARKSUITE_CLI_BRAND": str(parent.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
+        "LARKSUITE_CLI_DEFAULT_AS": str(parent.get("HERMES_LARK_CLI_DEFAULT_AS") or "user").strip() or "user",
+        "LARKSUITE_CLI_STRICT_MODE": str(parent.get("HERMES_LARK_CLI_STRICT_MODE") or "user").strip() or "user",
+    }
+
+
+def _resolve_lark_cli_authsidecar_binary(profile_home: Path) -> Path:
+    configured_bin = str(os.environ.get("HERMES_LARK_CLI_BIN") or "").strip()
+    if configured_bin:
+        return Path(configured_bin).expanduser()
+    return _resolve_shared_hermes_home(profile_home) / "bin" / "lark-cli-authsidecar"
+
+
+def _resolve_lark_cli_app_id(profile_home: Path) -> str:
+    app_id = str(os.environ.get("HERMES_LARK_CLI_APP_ID") or "").strip()
+    if app_id:
+        return app_id
+    try:
+        from .credentials import CredentialStore
+
+        store = CredentialStore(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name=_FEISHU_APP_CREDENTIAL_PROFILE,
+                subject_id=_FEISHU_APP_CREDENTIAL_SUBJECT,
+                provider="feishu",
+                secret_kind="app",
+            )
+        finally:
+            store.close()
+        return str(payload.get("app_id") or payload.get("FEISHU_APP_ID") or "").strip()
+    except Exception:
+        return ""
+
+
+@contextmanager
+def _lark_cli_auth_broker_scope(
+    profile_home: Path,
+    sender_open_id: str,
+) -> Iterator[dict[str, str]]:
+    """Start a per-run lark-cli auth broker and return child env overrides."""
+    app_id = _resolve_lark_cli_app_id(profile_home)
+    sender_open_id = str(sender_open_id or "").strip()
+    binary = _resolve_lark_cli_authsidecar_binary(profile_home)
+    if not (app_id and sender_open_id and binary.exists()):
+        yield {}
+        return
+
+    key = secrets.token_urlsafe(32)
+    server = start_lark_cli_auth_broker_server(
+        LarkCliAuthBrokerContext(
+            shared_home=_resolve_shared_hermes_home(profile_home),
+            profile_name=profile_home.name,
+            user_open_id=sender_open_id,
+            hmac_key=key,
+            allowed_identities=frozenset({"user"}),
+        )
+    )
+    try:
+        yield {
+            "HERMES_LARK_CLI_BIN": str(binary),
+            "LARKSUITE_CLI_AUTH_PROXY": server.url,
+            "LARKSUITE_CLI_PROXY_KEY": key,
+            "LARKSUITE_CLI_APP_ID": app_id,
+            "LARKSUITE_CLI_BRAND": str(os.environ.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
+            "LARKSUITE_CLI_DEFAULT_AS": str(os.environ.get("HERMES_LARK_CLI_DEFAULT_AS") or "user").strip() or "user",
+            "LARKSUITE_CLI_STRICT_MODE": str(os.environ.get("HERMES_LARK_CLI_STRICT_MODE") or "user").strip() or "user",
+        }
+    finally:
+        server.close()
+
+
+@contextmanager
+def _aiagent_subprocess_env_scope(
+    event: Any,
+    profile_home: Path,
+    *,
+    approval_dir: Path,
+    event_stream: bool = False,
+    extra: Optional[dict[str, str]] = None,
+) -> Iterator[dict[str, str]]:
+    """Build child env while keeping per-run broker lifetime scoped to spawn."""
+    sender_open_id = _resolve_sender_open_id(event)
+    merged_extra = dict(extra or {})
+    if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
+        merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
+    with _lark_cli_auth_broker_scope(
+        profile_home,
+        str(merged_extra.get("HERMES_FEISHU_USER_OPEN_ID") or sender_open_id),
+    ) as lark_cli_env:
+        merged_extra.update(lark_cli_env)
+        yield _build_subprocess_env(
+            profile_home,
+            approval_dir=approval_dir,
+            event_stream=event_stream,
+            extra=merged_extra,
+        )
 
 
 def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
@@ -1470,9 +1595,10 @@ async def _run_aiagent_subprocess(
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    _sender_oid = _resolve_sender_open_id(event)
-    _extra_env = {"HERMES_FEISHU_USER_OPEN_ID": _sender_oid} if _sender_oid else None
-    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, extra=_extra_env)
+    env_scope = _aiagent_subprocess_env_scope(event, profile_home, approval_dir=approval_dir)
+    env_scope_entered = False
+    env = env_scope.__enter__()
+    env_scope_entered = True
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
     # The plugin is typically loaded via a profile-local symlink
     # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
@@ -1503,6 +1629,8 @@ async def _run_aiagent_subprocess(
             await proc.wait()
         raise
     finally:
+        if env_scope_entered:
+            env_scope.__exit__(*sys.exc_info())
         try:
             import shutil
 
@@ -1776,9 +1904,15 @@ async def _stream_aiagent_subprocess(
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    _sender_oid = _resolve_sender_open_id(event)
-    _extra_env = {"HERMES_FEISHU_USER_OPEN_ID": _sender_oid} if _sender_oid else None
-    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True, extra=_extra_env)
+    env_scope = _aiagent_subprocess_env_scope(
+        event,
+        profile_home,
+        approval_dir=approval_dir,
+        event_stream=True,
+    )
+    env_scope_entered = False
+    env = env_scope.__enter__()
+    env_scope_entered = True
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
     # The plugin is typically loaded via a profile-local symlink
     # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
@@ -1789,27 +1923,29 @@ async def _stream_aiagent_subprocess(
     cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     started_at = time.monotonic()
-    logger.info(
-        "[multitenancy] AIAgent subprocess spawning profile_home=%s timeout=%.1fs",
-        profile_home,
-        timeout_s,
-    )
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    logger.info(
-        "[multitenancy] AIAgent subprocess spawned pid=%s elapsed=%.3fs",
-        proc.pid,
-        time.monotonic() - started_at,
-    )
-    stderr_task = asyncio.create_task(proc.stderr.read())
+    proc = None
+    stderr_task = None
     saw_done = False
     first_event_logged = False
     try:
+        logger.info(
+            "[multitenancy] AIAgent subprocess spawning profile_home=%s timeout=%.1fs",
+            profile_home,
+            timeout_s,
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        logger.info(
+            "[multitenancy] AIAgent subprocess spawned pid=%s elapsed=%.3fs",
+            proc.pid,
+            time.monotonic() - started_at,
+        )
+        stderr_task = asyncio.create_task(proc.stderr.read())
         assert proc.stdin is not None
         proc.stdin.write(payload)
         await proc.stdin.drain()
@@ -1904,19 +2040,22 @@ async def _stream_aiagent_subprocess(
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
     except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
         raise
     except Exception:
-        if proc.returncode is None:
+        if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
         raise
     finally:
-        if proc.returncode is None:
+        if env_scope_entered:
+            env_scope.__exit__(*sys.exc_info())
+        if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
-        if not stderr_task.done():
+        if stderr_task is not None and not stderr_task.done():
             stderr_task.cancel()
         try:
             import shutil
