@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 import asyncio
 import contextvars
 import types
@@ -1504,7 +1505,7 @@ def test_build_subprocess_env_wires_lark_cli_sidecar_without_tokens(monkeypatch,
     assert env["LARKSUITE_CLI_PROXY_KEY"] == "short-lived-key"
     assert env["LARKSUITE_CLI_APP_ID"] == "cli_public"
     assert env["LARKSUITE_CLI_BRAND"] == "feishu"
-    assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+    assert env["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
     assert env["LARKSUITE_CLI_STRICT_MODE"] == "off"
     assert "FEISHU_APP_SECRET" not in env
     assert "FEISHU_UAT_ACCESS_TOKEN" not in env
@@ -1548,12 +1549,82 @@ def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch
         assert extra["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
         assert extra["LARKSUITE_CLI_PROXY_KEY"] == context.hmac_key
         assert extra["LARKSUITE_CLI_APP_ID"] == "cli_public"
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
         assert extra["LARKSUITE_CLI_STRICT_MODE"] == "off"
         assert context.allowed_identities == frozenset({"user", "bot"})
         assert "FEISHU_APP_SECRET" not in extra
         assert "FEISHU_UAT_ACCESS_TOKEN" not in extra
 
     assert seen["closed"] is True
+
+
+def test_lark_cli_auth_broker_scope_defaults_to_user_when_profile_has_uat(monkeypatch, tmp_path: Path):
+    """Auto identity uses user only when the routed profile has a live sender UAT."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+
+
+def test_lark_cli_auth_broker_scope_forces_bot_for_group_profile(monkeypatch, tmp_path: Path):
+    """Group profiles must not default to a member's user identity."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
 
 
 def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_vault(monkeypatch, tmp_path: Path):

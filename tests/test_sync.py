@@ -255,6 +255,43 @@ skills:
     assert not (target / "gitlab.token").exists()
 
 
+def test_sync_profiles_symlinks_shared_lark_skills(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    keep_source = shared_home / "skills" / "Keep" / "keep-record"
+    lark_source = shared_home / "skills" / "lark-base"
+    keep_source.mkdir(parents=True)
+    lark_source.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        """
+skills:
+  - Keep/keep-record
+  - lark-base
+""",
+        encoding="utf-8",
+    )
+    (keep_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    (lark_source / "SKILL.md").write_text("# Lark Base\n", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    profile_skills = profiles_root / "alice" / "skills"
+    keep_target = profile_skills / "Keep" / "keep-record"
+    lark_target = profile_skills / "lark-base"
+    assert keep_target.exists()
+    assert not keep_target.is_symlink()
+    assert lark_target.is_symlink()
+    assert lark_target.resolve() == lark_source.resolve()
+
+
 def test_sync_feishu_org_dry_run_does_not_write_profiles_or_db(tmp_path):
     from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.sync import Department, DepartmentUser, sync_feishu_org
