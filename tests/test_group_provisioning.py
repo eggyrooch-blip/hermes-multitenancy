@@ -483,3 +483,75 @@ async def test_handle_async_p2p_unchanged_by_group_branch(isolated_router, monke
     assert captured == [profile_dir], (
         f"expected p2p sender route, got {captured}"
     )
+
+
+# -- Adversarial coverage (independent code-review follow-ups) --------------
+
+def test_blocked_group_command_normalizes_bypasses():
+    """/feishu_auth gate must survive @bot suffix and zero-width padding."""
+    from hermes_multitenancy.router import _is_blocked_group_command
+
+    assert _is_blocked_group_command("feishu_auth") is True
+    assert _is_blocked_group_command("feishu_auth@2号BOT_A") is True
+    assert _is_blocked_group_command("FEISHU_AUTH") is True
+    assert _is_blocked_group_command("feishu_auth​") is True  # zero-width
+    assert _is_blocked_group_command("  feishu_auth  ") is True
+    assert _is_blocked_group_command("feishu_logout") is True
+    assert _is_blocked_group_command("feishu_reauth") is True
+    # Non-auth commands stay allowed
+    assert _is_blocked_group_command("status") is False
+    assert _is_blocked_group_command("new") is False
+    assert _is_blocked_group_command("") is False
+
+
+def test_short_chat_id_collision_resistance():
+    """Two chat_ids sharing the 12-char cosmetic prefix must still map to
+    distinct profile names via the 64-bit sha1 suffix."""
+    from hermes_multitenancy.router import _short_chat_id, _make_group_profile_name
+
+    a = "oc_samprefix000000000000000000aaaa"
+    b = "oc_samprefix000000000000000000bbbb"
+    # Same 12-char alnum prefix after stripping 'oc'
+    assert _short_chat_id(a)[:12] == _short_chat_id(b)[:12]
+    # But distinct overall (suffix differs) → distinct profiles
+    assert _short_chat_id(a) != _short_chat_id(b)
+    assert _make_group_profile_name(a) != _make_group_profile_name(b)
+    # 16 hex chars of sha1 in the suffix
+    assert len(_short_chat_id(a).split("_")[-1]) == 16
+
+
+def test_chat_inviter_cache_is_bounded():
+    """Spamming bot-add across throwaway chats must not grow the cache
+    without bound."""
+    from hermes_multitenancy import router as router_mod
+
+    with router_mod._chat_inviter_cache_lock:
+        router_mod._chat_inviter_cache.clear()
+    cap = router_mod._CHAT_INVITER_CACHE_MAX
+    for i in range(cap + 50):
+        router_mod.register_chat_inviter(f"oc_spam_{i}", f"ou_{i:040d}")
+    with router_mod._chat_inviter_cache_lock:
+        size = len(router_mod._chat_inviter_cache)
+    assert size <= cap, f"cache grew past cap: {size} > {cap}"
+    with router_mod._chat_inviter_cache_lock:
+        router_mod._chat_inviter_cache.clear()
+
+
+def test_chat_inviter_cache_ttl_expiry(monkeypatch):
+    """Entries older than the TTL must not resolve."""
+    from hermes_multitenancy import router as router_mod
+
+    with router_mod._chat_inviter_cache_lock:
+        router_mod._chat_inviter_cache.clear()
+    router_mod.register_chat_inviter("oc_ttl", "ou_" + "a" * 40)
+    assert router_mod._resolve_group_inviter_from_cache("oc_ttl") is not None
+    # Jump time past the TTL
+    real_time = router_mod.time.time
+    monkeypatch.setattr(
+        router_mod.time,
+        "time",
+        lambda: real_time() + router_mod._CHAT_INVITER_CACHE_TTL_S + 10,
+    )
+    assert router_mod._resolve_group_inviter_from_cache("oc_ttl") is None
+    with router_mod._chat_inviter_cache_lock:
+        router_mod._chat_inviter_cache.clear()

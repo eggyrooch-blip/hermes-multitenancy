@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import zipfile
 from contextlib import asynccontextmanager
 from itertools import zip_longest
@@ -37,11 +38,22 @@ except Exception:  # pragma: no cover - allows plugin unit tests without gateway
 _user_inflight_tasks: dict[str, asyncio.Task] = {}
 _synthetic_session_guards: dict[str, Any] = {}
 
-# Group-chat profile state. Populated by the bot_added hook (Layer 4) and
-# consumed by the auto-provision path. Persistent state lives in the SQLite
-# routing table; this dict only covers the (typically <5s) window between
-# bot_added and the first @mention from the inviter.
-_chat_inviter_cache: dict[str, dict[str, Any]] = {}
+# Group-chat profile state. Populated by the bot_added hook (Layer 4, runs
+# on the Lark SDK thread) and consumed by the auto-provision path (asyncio
+# loop thread). Persistent state lives in the SQLite routing table; this
+# only covers the window between bot_added and the first @mention.
+#
+# Bounded + TTL'd + lock-guarded: an attacker spamming bot add/remove across
+# throwaway chats would otherwise grow this dict without bound, and the
+# SDK-thread writer can race the loop-thread reader/popper. OrderedDict +
+# lock keeps eviction and the register/pop pair consistent across threads.
+import threading as _threading
+from collections import OrderedDict as _OrderedDict
+
+_CHAT_INVITER_CACHE_MAX = 512
+_CHAT_INVITER_CACHE_TTL_S = 3600  # bot_added → first @; generous for restarts
+_chat_inviter_cache: "_OrderedDict[str, dict[str, Any]]" = _OrderedDict()
+_chat_inviter_cache_lock = _threading.Lock()
 _GROUP_PROFILE_PREFIX = "feishu_group_"
 _GROUP_CHAT_TYPES: frozenset[str] = frozenset({"group", "topic"})
 
@@ -1012,7 +1024,7 @@ def _should_defer_gateway_processing_complete(event: Any) -> bool:
         return (
             _auto_provision_enabled()
             and table is not None
-            and chat_id in _chat_inviter_cache
+            and _has_cached_chat_inviter(chat_id)
         )
 
     _profile_name, profile_home = _resolve_route(sender, alt_id=sender_alt)
@@ -1080,10 +1092,14 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         command_source_text = _strip_leading_at_mentions(text) if is_group_chat else text
         cmd_pair = parse_command(command_source_text)
         if cmd_pair is not None:
-            # Group profiles do not own any UAT — /feishu_auth is hard-rejected
-            # so a curious member can't trigger an OAuth dance that would
-            # store a per-user token under the group's profile_home.
-            if is_group_chat and cmd_pair[0] == "feishu_auth":
+            # Group profiles do not own any UAT — the whole auth command
+            # family is hard-rejected so a curious member can't trigger an
+            # OAuth dance that would store a per-user token under the
+            # group's profile_home. Normalise first: Feishu lets users send
+            # `/feishu_auth@bot` or sneak zero-width chars, and an exact
+            # string-equality gate would let those through the day
+            # feishu_auth becomes gateway-dispatchable.
+            if is_group_chat and _is_blocked_group_command(cmd_pair[0]):
                 adapter = _get_feishu_adapter(gateway)
                 if adapter is not None:
                     await _safe_call(
@@ -2186,6 +2202,34 @@ def _is_group_chat_type(chat_type: str) -> bool:
     return chat_type.lower() in _GROUP_CHAT_TYPES
 
 
+# Commands that bind/replace a per-user Feishu identity. None of them make
+# sense in a group profile (it owns no UAT), so all are hard-rejected.
+_GROUP_BLOCKED_COMMANDS: frozenset[str] = frozenset(
+    {"feishu_auth", "feishu_logout", "feishu_reauth"}
+)
+# Zero-width / bidi chars Feishu clients occasionally inject; stripped before
+# the command-name membership check so they can't smuggle a blocked command
+# past an exact-match gate.
+_INVISIBLE_CHARS = str.maketrans(
+    "", "", "​‌‍‎‏﻿"
+)
+
+
+def _is_blocked_group_command(command: str) -> bool:
+    """True when ``command`` is an auth-family command barred inside groups.
+
+    Normalises before comparing: lowercase, strip a ``@bot`` suffix Feishu
+    appends to at-mentioned commands, and drop zero-width characters. An
+    exact ``== "feishu_auth"`` check let ``/feishu_auth@bot`` and
+    zero-width-padded variants slip through.
+    """
+    if not command:
+        return False
+    normalized = command.translate(_INVISIBLE_CHARS).strip().lower()
+    normalized = normalized.split("@", 1)[0]
+    return normalized in _GROUP_BLOCKED_COMMANDS
+
+
 _LEADING_MENTIONED_PREFIX_RE = re.compile(
     r"^\s*\[Mentioned:[^\]]*\]\s*",
 )
@@ -2213,15 +2257,19 @@ def _strip_leading_at_mentions(text: str) -> str:
 def _short_chat_id(chat_id: str) -> str:
     """Return a deterministic short tag for a chat_id, safe in profile names.
 
-    Use a 12-char alnum prefix (after stripping the ``oc_``) plus a 4-char
-    sha1 suffix to keep total length ≤ 22 chars while preserving uniqueness
-    against ~16M chat_ids before collision risk becomes meaningful.
+    The 12-char prefix is cosmetic only — Feishu ``oc_`` ids are not
+    uniform in their leading bytes, so similar-vintage ids share prefixes.
+    Uniqueness rests entirely on a 16-hex (64-bit) sha1 suffix: collision
+    probability stays below ~N²/2^65, negligible even for millions of
+    chats. (The previous 4-hex/16-bit suffix collided at ~1/65536 per
+    shared prefix, which would silently route two groups to one profile —
+    the exact isolation this feature promises.)
     """
     raw = re.sub(r"[^A-Za-z0-9]+", "", str(chat_id or ""))
     if raw.lower().startswith("oc"):
         raw = raw[2:]
     prefix = raw[:12] or "noid"
-    suffix = hashlib.sha1(str(chat_id).encode("utf-8")).hexdigest()[:4]
+    suffix = hashlib.sha1(str(chat_id).encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{suffix}"
 
 
@@ -2248,15 +2296,44 @@ def register_chat_inviter(
     """
     if not chat_id or not _is_feishu_open_id(inviter_open_id):
         return
-    _chat_inviter_cache[chat_id] = {
-        "inviter_open_id": inviter_open_id,
-        "chat_name": chat_name,
-        "inviter_display": inviter_display,
-    }
+    now = time.time()
+    with _chat_inviter_cache_lock:
+        _chat_inviter_cache[chat_id] = {
+            "inviter_open_id": inviter_open_id,
+            "chat_name": chat_name,
+            "inviter_display": inviter_display,
+            "_ts": now,
+        }
+        _chat_inviter_cache.move_to_end(chat_id)
+        # Drop expired entries, then trim oldest if still over the cap.
+        for cid in [
+            c
+            for c, e in _chat_inviter_cache.items()
+            if now - e.get("_ts", 0) > _CHAT_INVITER_CACHE_TTL_S
+        ]:
+            _chat_inviter_cache.pop(cid, None)
+        while len(_chat_inviter_cache) > _CHAT_INVITER_CACHE_MAX:
+            _chat_inviter_cache.popitem(last=False)
 
 
 def _resolve_group_inviter_from_cache(chat_id: str) -> Optional[dict[str, Any]]:
-    return _chat_inviter_cache.get(chat_id)
+    with _chat_inviter_cache_lock:
+        entry = _chat_inviter_cache.get(chat_id)
+        if entry is None:
+            return None
+        if time.time() - entry.get("_ts", 0) > _CHAT_INVITER_CACHE_TTL_S:
+            _chat_inviter_cache.pop(chat_id, None)
+            return None
+        return dict(entry)
+
+
+def _pop_chat_inviter(chat_id: str) -> None:
+    with _chat_inviter_cache_lock:
+        _chat_inviter_cache.pop(chat_id, None)
+
+
+def _has_cached_chat_inviter(chat_id: str) -> bool:
+    return _resolve_group_inviter_from_cache(chat_id) is not None
 
 
 async def resolve_or_auto_provision_group_route(
@@ -2354,7 +2431,7 @@ async def _provision_group_route(
     )
     # Eagerly evict the cache entry so a later bot-removal + re-add cycle
     # repopulates from the fresh event rather than reusing stale chat_name.
-    _chat_inviter_cache.pop(chat_id, None)
+    _pop_chat_inviter(chat_id)
     return profile_name, profile_home
 
 
@@ -2461,9 +2538,16 @@ def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str
             if not line.lstrip().startswith("FEISHU_HOME_CHANNEL=")
         ]
     base_lines.append(f"FEISHU_HOME_CHANNEL={chat_id}")
-    if target.is_symlink() or target.exists():
+    # Atomic write: a crash between unlink() and write_text() used to leave
+    # the profile with NO .env (all inherited creds gone until reprovision).
+    # Write a sibling temp file then os.replace() — the rename is atomic on
+    # POSIX and also transparently replaces a stale symlink without ever
+    # following it into the shared .env.
+    if target.is_symlink():
         target.unlink()
-    target.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+    os.replace(tmp, target)
 
 
 async def _fetch_chat_name(chat_id: str, gateway: Any) -> Optional[str]:

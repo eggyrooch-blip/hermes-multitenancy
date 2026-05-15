@@ -329,3 +329,54 @@ def test_migration_drops_legacy_open_id_index(tmp_path):
         assert t.count_active(kind="group") == 2
     finally:
         t.close()
+
+
+# -- Adversarial coverage (independent code-review follow-ups) --------------
+
+def test_upsert_group_atomic_owner_immutable_on_resurrect(table):
+    """ON CONFLICT path must preserve the original owner even when a later
+    upsert passes a different owner_open_id (e.g. a non-inviter races in)."""
+    table.upsert_group(chat_id="oc_imm", profile_name="g1", owner_open_id="ou_original")
+    table.soft_delete_group("oc_imm")
+    # Resurrect with a hostile/different owner — must NOT take effect.
+    table.upsert_group(chat_id="oc_imm", profile_name="g2", owner_open_id="ou_attacker")
+    row = table.lookup_by_chat_id("oc_imm")
+    assert row.owner_open_id == "ou_original"
+    assert row.profile_name == "g2"  # profile_name is mutable
+    assert row.active is True
+
+
+def test_upsert_group_repeated_calls_do_not_raise_integrity_error(table):
+    """The atomic upsert must absorb a repeated insert for the same chat_id
+    instead of surfacing the IntegrityError the two-step version raised."""
+    import sqlite3
+    table.upsert_group(chat_id="oc_dup2", profile_name="p1", owner_open_id="ou_o")
+    # Second identical call: previously a latent IntegrityError under the
+    # SELECT-then-INSERT race; now a clean version bump.
+    table.upsert_group(chat_id="oc_dup2", profile_name="p2", owner_open_id="ou_o")
+    row = table.lookup_by_chat_id("oc_dup2")
+    assert row.version == 2
+    assert row.profile_name == "p2"
+    assert table.count_active(kind="group") == 1
+
+
+def test_upsert_group_display_label_preserved_when_none(table):
+    table.upsert_group(
+        chat_id="oc_lbl", profile_name="p", owner_open_id="ou_o",
+        display_label="sunke-原始",
+    )
+    # Re-upsert without a label (auto-provision path passes None) — keep old.
+    table.upsert_group(chat_id="oc_lbl", profile_name="p", owner_open_id="ou_o")
+    assert table.lookup_by_chat_id("oc_lbl").display_label == "sunke-原始"
+
+
+def test_busy_timeout_pragma_set(tmp_path):
+    """Multi-process contention guard: busy_timeout must be non-zero."""
+    from hermes_multitenancy.routing import RoutingTable
+    db = tmp_path / "bt.db"
+    t = RoutingTable(db)
+    try:
+        cur = t._conn.execute("PRAGMA busy_timeout")
+        assert int(cur.fetchone()[0]) >= 5000
+    finally:
+        t.close()
