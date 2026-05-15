@@ -1030,16 +1030,25 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             else:
                 cmd_profile_name, cmd_profile_home = _resolve_route(sender, alt_id=sender_alt)
             cmd_profile = cmd_profile_name if cmd_profile_home is not None else None
-            skill_handled, skill_reply = _maybe_rewrite_skill_slash_command(
-                cmd_pair,
-                event,
+            async with _profile_gateway_context(
                 gateway,
+                event,
                 sender=sender,
                 sender_alt=sender_alt,
                 profile_name=cmd_profile,
                 profile_home=cmd_profile_home,
                 chat_id=chat_id,
-            )
+            ):
+                skill_handled, skill_reply = _maybe_rewrite_skill_slash_command(
+                    cmd_pair,
+                    event,
+                    gateway,
+                    sender=sender,
+                    sender_alt=sender_alt,
+                    profile_name=cmd_profile,
+                    profile_home=cmd_profile_home,
+                    chat_id=chat_id,
+                )
             if skill_handled:
                 if skill_reply:
                     adapter = _get_feishu_adapter(gateway)
