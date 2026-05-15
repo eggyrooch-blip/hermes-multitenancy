@@ -128,6 +128,12 @@ class RoutingTable:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript("PRAGMA journal_mode=WAL;")
+        # lark-bridge fans one Feishu WS out to multiple gateway processes,
+        # so several RoutingTable connections can write this DB concurrently
+        # (touch_active_group fires on every group message). Default
+        # busy_timeout is 0 → an instant SQLITE_BUSY under contention. Block
+        # up to 5s for the writer lock instead of erroring out.
+        self._conn.executescript("PRAGMA busy_timeout=5000;")
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -295,64 +301,52 @@ class RoutingTable:
             raise ValueError("owner_open_id is required for group routing rows")
         synthetic_user_id = f"group:{chat_id}"
         now = _now()
-        # Two-step: first SELECT to preserve owner_open_id on resurrect; then
-        # INSERT or UPDATE.
-        cur = self._conn.execute(
-            "SELECT owner_open_id, profile_name FROM multitenancy_routing "
-            "WHERE user_id = ? LIMIT 1",
-            (synthetic_user_id,),
+        # Atomic upsert mirroring the user `upsert` above. The two-step
+        # SELECT-then-(INSERT|UPDATE) it replaced raced two concurrent
+        # first-provisions into a lost-message DoS (one INSERT won the
+        # chat_id unique index, the other raised IntegrityError that the
+        # caller swallowed into a "no profile" reply). owner_open_id stays
+        # immutable: ON CONFLICT keeps the stored owner whenever it is
+        # already a non-empty value, only adopting the proposed owner when
+        # the row was never owned. display_label keeps its old value when
+        # the caller passes None (excluded.display_label IS NULL).
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_routing
+                (user_id, profile_name, open_id, union_id, active,
+                 synced_at, version, created_at, updated_at,
+                 kind, chat_id, owner_open_id, display_label)
+            VALUES (?, ?, '', NULL, 1, ?, 1, ?, ?,
+                    'group', ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                profile_name  = excluded.profile_name,
+                chat_id       = excluded.chat_id,
+                owner_open_id = COALESCE(
+                    NULLIF(owner_open_id, ''), excluded.owner_open_id
+                ),
+                display_label = COALESCE(
+                    excluded.display_label, display_label
+                ),
+                active        = 1,
+                deleted_at    = NULL,
+                synced_at     = excluded.synced_at,
+                version       = version + 1,
+                updated_at    = excluded.updated_at,
+                kind          = 'group',
+                open_id       = '',
+                union_id      = NULL
+            """,
+            (
+                synthetic_user_id,
+                profile_name,
+                now,
+                now,
+                now,
+                chat_id,
+                owner_open_id,
+                display_label,
+            ),
         )
-        existing = cur.fetchone()
-        if existing is not None:
-            preserved_owner = existing["owner_open_id"] or owner_open_id
-            self._conn.execute(
-                """
-                UPDATE multitenancy_routing SET
-                    profile_name  = ?,
-                    chat_id       = ?,
-                    owner_open_id = ?,
-                    display_label = COALESCE(?, display_label),
-                    active        = 1,
-                    deleted_at    = NULL,
-                    synced_at     = ?,
-                    version       = version + 1,
-                    updated_at    = ?,
-                    kind          = 'group',
-                    open_id       = '',
-                    union_id      = NULL
-                WHERE user_id = ?
-                """,
-                (
-                    profile_name,
-                    chat_id,
-                    preserved_owner,
-                    display_label,
-                    now,
-                    now,
-                    synthetic_user_id,
-                ),
-            )
-        else:
-            self._conn.execute(
-                """
-                INSERT INTO multitenancy_routing
-                    (user_id, profile_name, open_id, union_id, active,
-                     synced_at, version, created_at, updated_at,
-                     kind, chat_id, owner_open_id, display_label)
-                VALUES (?, ?, '', NULL, 1, ?, 1, ?, ?,
-                        'group', ?, ?, ?)
-                """,
-                (
-                    synthetic_user_id,
-                    profile_name,
-                    now,
-                    now,
-                    now,
-                    chat_id,
-                    owner_open_id,
-                    display_label,
-                ),
-            )
         self._conn.commit()
         return synthetic_user_id
 
