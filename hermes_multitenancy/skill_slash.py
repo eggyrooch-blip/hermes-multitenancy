@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .commands import normalize_command_name
+
 
 SKILL_SLASH_ALIASES = {
     "hades": "kep-hades-cli",
@@ -25,7 +27,7 @@ def rewrite_skill_slash_text(
     if not raw_text.startswith("/"):
         return None
     parts = raw_text.split(maxsplit=1)
-    raw_cmd = parts[0][1:].lower()
+    raw_cmd = normalize_command_name(parts[0][1:])
     args = parts[1] if len(parts) > 1 else ""
     if not raw_cmd or "/" in raw_cmd:
         return None
