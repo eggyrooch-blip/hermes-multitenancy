@@ -555,3 +555,56 @@ def test_chat_inviter_cache_ttl_expiry(monkeypatch):
     assert router_mod._resolve_group_inviter_from_cache("oc_ttl") is None
     with router_mod._chat_inviter_cache_lock:
         router_mod._chat_inviter_cache.clear()
+
+
+def test_group_env_excludes_non_model_secrets(tmp_path):
+    """Group .env must carry only model provider keys + FEISHU_HOME_CHANNEL,
+    never the credential-vault master key / gateway config / tool tokens."""
+    from hermes_multitenancy.router import _write_group_profile_env
+
+    shared = tmp_path
+    (shared / ".env").write_text(
+        "GLM_API_KEY=model-key-keep\n"
+        "GLM_BASE_URL=https://api.example/keep\n"
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY=VAULT-MASTER-MUST-NOT-LEAK\n"
+        "API_SERVER_PORT=8643\n"
+        "PLOTLAKE_TOKEN=tool-token-must-not-leak\n"
+        "GATEWAY_ALLOW_ALL_USERS=1\n"
+        "# a comment line\n"
+        "\n",
+        encoding="utf-8",
+    )
+    profile_home = shared / "profiles" / "feishu_group_x"
+    profile_home.mkdir(parents=True)
+
+    _write_group_profile_env(profile_home, shared, "oc_secret_test")
+
+    env_text = (profile_home / ".env").read_text(encoding="utf-8")
+    # Model keys preserved
+    assert "GLM_API_KEY=model-key-keep" in env_text
+    assert "GLM_BASE_URL=https://api.example/keep" in env_text
+    # Home channel override present
+    assert "FEISHU_HOME_CHANNEL=oc_secret_test" in env_text
+    # Sensitive / irrelevant lines must NOT be duplicated into the tenant dir
+    assert "VAULT-MASTER-MUST-NOT-LEAK" not in env_text
+    assert "HERMES_MULTITENANCY_CREDENTIAL_KEY" not in env_text
+    assert "PLOTLAKE_TOKEN" not in env_text
+    assert "API_SERVER_PORT" not in env_text
+    assert "GATEWAY_ALLOW_ALL_USERS" not in env_text
+
+
+def test_group_env_atomic_no_tmp_left_behind(tmp_path):
+    """The atomic write must leave the final .env and no .env.tmp residue."""
+    from hermes_multitenancy.router import _write_group_profile_env
+
+    shared = tmp_path
+    (shared / ".env").write_text("GLM_API_KEY=k\n", encoding="utf-8")
+    profile_home = shared / "profiles" / "feishu_group_y"
+    profile_home.mkdir(parents=True)
+    _write_group_profile_env(profile_home, shared, "oc_atomic")
+    assert (profile_home / ".env").exists()
+    assert not (profile_home / ".env.tmp").exists()
+    # Re-run is idempotent (replaces, doesn't append/dup)
+    _write_group_profile_env(profile_home, shared, "oc_atomic")
+    txt = (profile_home / ".env").read_text(encoding="utf-8")
+    assert txt.count("FEISHU_HOME_CHANNEL=oc_atomic") == 1

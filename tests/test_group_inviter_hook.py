@@ -336,3 +336,73 @@ def test_install_hook_skips_when_module_not_importable():
         for name, mod in saved_modules.items():
             sys.modules[name] = mod
         group_inviter_hook._HOOK_INSTALLED = False
+
+
+def test_group_welcome_deduplicated_on_redelivery():
+    """Feishu redelivers bot-added at-least-once; the group welcome must
+    fire only once per chat within the process."""
+    import asyncio, sys, types
+    from hermes_multitenancy import group_inviter_hook
+
+    sent = []
+
+    class FakeFeishuAdapter:
+        def __init__(self):
+            self._chat_info_cache = {"oc_dedup": {"type": "group"}}
+        async def get_chat_info(self, chat_id):
+            return {"type": "group"}
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+        async def _on_bot_added_to_chat(self, data):
+            return None
+        async def _send_chat_added_onboarding(self, chat_id):
+            await self.send(chat_id, "ORIG")
+
+    fake_module = types.ModuleType("gateway.platforms.feishu")
+    fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
+    parents = ("gateway", "gateway.platforms")
+    saved_parents = {n: sys.modules.get(n) for n in parents}
+    saved_module = sys.modules.get("gateway.platforms.feishu")
+    for n in parents:
+        sys.modules.setdefault(n, types.ModuleType(n))
+    sys.modules["gateway.platforms.feishu"] = fake_module
+    group_inviter_hook._HOOK_INSTALLED = False
+    with group_inviter_hook._welcomed_chats_lock:
+        group_inviter_hook._welcomed_chats.clear()
+    orig = FakeFeishuAdapter._send_chat_added_onboarding
+    try:
+        group_inviter_hook.install_feishu_bot_added_hook()
+        a = FakeFeishuAdapter()
+        asyncio.run(a._send_chat_added_onboarding("oc_dedup"))
+        asyncio.run(a._send_chat_added_onboarding("oc_dedup"))  # redelivery
+        asyncio.run(a._send_chat_added_onboarding("oc_dedup"))  # redelivery
+        group_welcomes = [m for _c, m in sent if "群" in m]
+        assert len(group_welcomes) == 1, f"expected 1 welcome, got {len(group_welcomes)}"
+    finally:
+        FakeFeishuAdapter._send_chat_added_onboarding = orig
+        if saved_module is None:
+            sys.modules.pop("gateway.platforms.feishu", None)
+        else:
+            sys.modules["gateway.platforms.feishu"] = saved_module
+        for n, m in saved_parents.items():
+            if m is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = m
+        group_inviter_hook._HOOK_INSTALLED = False
+        with group_inviter_hook._welcomed_chats_lock:
+            group_inviter_hook._welcomed_chats.clear()
+
+
+def test_welcomed_chats_set_is_bounded():
+    from hermes_multitenancy import group_inviter_hook
+    with group_inviter_hook._welcomed_chats_lock:
+        group_inviter_hook._welcomed_chats.clear()
+    cap = group_inviter_hook._WELCOMED_CHATS_MAX
+    for i in range(cap + 40):
+        group_inviter_hook._mark_and_check_welcomed(f"oc_w_{i}")
+    with group_inviter_hook._welcomed_chats_lock:
+        size = len(group_inviter_hook._welcomed_chats)
+    assert size <= cap
+    with group_inviter_hook._welcomed_chats_lock:
+        group_inviter_hook._welcomed_chats.clear()
