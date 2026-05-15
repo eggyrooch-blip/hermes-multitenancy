@@ -82,6 +82,30 @@ def test_profile_scoped_media_response_blocks_temp_path_without_profile_artifact
     assert response == "created\n"
 
 
+def test_materialize_inbound_media_copies_router_cache_into_profile(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    router_cache = tmp_path / "profiles" / "multitenancy_router" / "cache" / "images"
+    router_cache.mkdir(parents=True)
+    source = router_cache / "img_abc.jpg"
+    source.write_bytes(b"jpg")
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    event = SimpleNamespace(
+        text=f"/keep\\-record\n[Image] {source}",
+        media_urls=[str(source)],
+        media_types=["image/jpeg"],
+    )
+
+    router_mod._materialize_inbound_media_for_profile(event, profile_home)
+
+    target = profile_home / "cache" / "images" / "img_abc.jpg"
+    assert target.read_bytes() == b"jpg"
+    assert event.media_urls == [str(target.resolve(strict=False))]
+    assert str(source) not in event.text
+    assert str(target.resolve(strict=False)) in event.text
+
+
 def _write_minimal_xlsx(path: Path) -> None:
     files = {
         "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
