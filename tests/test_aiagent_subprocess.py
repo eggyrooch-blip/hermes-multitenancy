@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import asyncio
 import contextvars
@@ -252,6 +253,34 @@ def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Pa
         {"event": "content", "text": "done"},
         {"event": "done", "result": "done", "error": None},
     ]
+
+
+def test_aiagent_subprocess_script_loader_adds_repo_root_for_relative_imports():
+    """The child script is executed by file path, so sys.path starts at package dir."""
+    script = Path(__file__).resolve().parents[1] / "hermes_multitenancy" / "aiagent_subprocess.py"
+    repo_root = script.parents[1]
+    code = f"""
+import importlib.util
+import sys
+from pathlib import Path
+script = Path({str(script)!r})
+repo_root = Path({str(repo_root)!r})
+sys.path = [str(script.parent)] + [p for p in sys.path if p and Path(p).resolve() != repo_root]
+spec = importlib.util.spec_from_file_location("aiagent_subprocess", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+run = module._load_run_with_aiagent()
+print(run.__module__)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "hermes_multitenancy.agent_real"
 
 
 def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypatch, tmp_path: Path):
@@ -1476,7 +1505,7 @@ def test_build_subprocess_env_wires_lark_cli_sidecar_without_tokens(monkeypatch,
     assert env["LARKSUITE_CLI_APP_ID"] == "cli_public"
     assert env["LARKSUITE_CLI_BRAND"] == "feishu"
     assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
-    assert env["LARKSUITE_CLI_STRICT_MODE"] == "user"
+    assert env["LARKSUITE_CLI_STRICT_MODE"] == "off"
     assert "FEISHU_APP_SECRET" not in env
     assert "FEISHU_UAT_ACCESS_TOKEN" not in env
 
@@ -1519,7 +1548,8 @@ def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch
         assert extra["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
         assert extra["LARKSUITE_CLI_PROXY_KEY"] == context.hmac_key
         assert extra["LARKSUITE_CLI_APP_ID"] == "cli_public"
-        assert extra["LARKSUITE_CLI_STRICT_MODE"] == "user"
+        assert extra["LARKSUITE_CLI_STRICT_MODE"] == "off"
+        assert context.allowed_identities == frozenset({"user", "bot"})
         assert "FEISHU_APP_SECRET" not in extra
         assert "FEISHU_UAT_ACCESS_TOKEN" not in extra
 
@@ -1563,6 +1593,39 @@ def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_vault(monkeypatc
 
     with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
         assert extra["LARKSUITE_CLI_APP_ID"] == "cli_from_vault"
+
+
+def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_profile_uat(monkeypatch, tmp_path: Path):
+    """A local UAT file is enough to start sidecar plumbing when vault key is absent."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    uat_dir = profile / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    (uat_dir / "ou_alice.json").write_text(
+        json.dumps({"app_id": "cli_from_json", "access_token": "secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        assert extra["HERMES_LARK_CLI_BIN"] == str(lark_cli)
+        assert extra["LARKSUITE_CLI_APP_ID"] == "cli_from_json"
 
 
 def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatch, tmp_path: Path):
