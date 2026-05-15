@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -210,4 +212,44 @@ def test_run_broker_emits_channel_neutral_events():
     assert events == [
         ("content", "hello"),
         ("done", ""),
+    ]
+
+
+def test_run_broker_rewrites_hades_alias_before_dispatch(monkeypatch):
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    fake_skill_commands = SimpleNamespace(
+        get_skill_commands=lambda: {"/kep-hades-cli": {"name": "kep-hades-cli"}},
+        resolve_skill_command_key=lambda command: "/kep-hades-cli"
+        if command.replace("_", "-") == "kep-hades-cli"
+        else None,
+        build_skill_invocation_message=lambda cmd_key, user_instruction, task_id=None: (
+            f"[skill:{cmd_key} task:{task_id}] {user_instruction}"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "agent", ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request.content)
+        return "ok"
+
+    broker = RunBroker(dispatch_agent=dispatch, sandbox_available=lambda: True)
+
+    result = asyncio.run(broker.run(
+        RunRequest(
+            channel="webui",
+            profile_name="sunke",
+            user_key="sunke",
+            session_id="webui-session-1",
+            content="/hades get 69df030c1f01cb45ba7ff585",
+        )
+    ))
+
+    assert result.content == "ok"
+    assert seen == [
+        "[skill:/kep-hades-cli task:webui-session-1] get 69df030c1f01cb45ba7ff585"
     ]

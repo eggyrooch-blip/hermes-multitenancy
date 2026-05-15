@@ -6,11 +6,13 @@ rendering ``RunEvent`` objects back to their clients.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import inspect
 import os
 from typing import Awaitable, Callable, Optional
 
 from .run_models import RunEvent, RunRequest, RunResult
+from .skill_slash import rewrite_skill_slash_text
 
 
 class RunRejected(RuntimeError):
@@ -58,6 +60,7 @@ class RunBroker:
 
     async def run(self, request: RunRequest, *, admitted: bool = False) -> RunResult:
         """Execute a request after policy and idempotency checks."""
+        request = _rewrite_skill_slash_request(request)
         if not admitted:
             admission = await self.admit(request)
             if admission.duplicate:
@@ -73,6 +76,7 @@ class RunBroker:
 
     async def admit(self, request: RunRequest) -> RunResult:
         """Run policy/idempotency checks without dispatching the agent."""
+        request = _rewrite_skill_slash_request(request)
         if (
             request.requires_host_tools
             and self._require_sandbox_for_host_tools
@@ -89,3 +93,16 @@ class RunBroker:
         if self._emit_event is None:
             return
         await _maybe_await(self._emit_event(event))
+
+
+def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
+    task_id = (
+        request.session_id
+        or f"multitenancy:{request.channel}:{request.profile_name}:"
+        f"{request.chat_id or 'run-broker'}:{request.user_key}"
+    )
+    platform = request.channel if request.channel == "feishu" else None
+    rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
+    if not rewritten or rewritten == request.content:
+        return request
+    return replace(request, content=rewritten)
