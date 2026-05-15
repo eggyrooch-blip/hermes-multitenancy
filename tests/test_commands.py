@@ -47,6 +47,15 @@ def test_parse_unknown_slash_is_still_handled():
     assert parse_command("/") is None
 
 
+def test_parse_unescapes_feishu_markdown_command_name():
+    from hermes_multitenancy.commands import parse_command, unknown_command_message
+
+    assert parse_command("/keep\\-record") == ("keep-record", "")
+    assert parse_command("/reload\\_mcp") == ("reload-mcp", "")
+    assert "keep-record" in unknown_command_message("keep\\-record")
+    assert "keep\\-record" not in unknown_command_message("keep\\-record")
+
+
 def test_parse_rejects_paths():
     from hermes_multitenancy.commands import parse_command
     assert parse_command("/some/path") is None

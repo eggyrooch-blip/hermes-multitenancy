@@ -61,6 +61,16 @@ _FALLBACK_GATEWAY_COMMANDS = frozenset(
 )
 
 
+def normalize_command_name(name: str) -> str:
+    """Normalize command names received from chat markdown surfaces."""
+    raw = str(name or "").lower().lstrip("/")
+    return (
+        raw.replace("\\-", "-")
+        .replace("\\_", "_")
+        .replace("\\.", ".")
+    )
+
+
 def parse_command(text: str) -> Optional[tuple[str, str]]:
     """Parse a slash command. Returns ``(canonical_command, args)`` or ``None``.
 
@@ -71,7 +81,7 @@ def parse_command(text: str) -> Optional[tuple[str, str]]:
     if not text or not text.startswith("/"):
         return None
     parts = text.split(maxsplit=1)
-    raw = parts[0][1:].lower()
+    raw = normalize_command_name(parts[0][1:])
     args = parts[1] if len(parts) > 1 else ""
     # Reject paths and known-bad shapes
     if "/" in raw or not raw:
@@ -82,7 +92,7 @@ def parse_command(text: str) -> Optional[tuple[str, str]]:
 
 def resolve_command_name(name: str) -> Optional[str]:
     """Return Hermes' canonical command name when ``name`` is gateway-known."""
-    raw = name.lower().lstrip("/")
+    raw = normalize_command_name(name)
     hyphenated = raw.replace("_", "-")
     try:
         from hermes_cli.commands import (  # type: ignore
@@ -115,7 +125,7 @@ def is_known_command(name: str) -> bool:
 
 def unknown_command_message(command: str) -> str:
     """Match Hermes' gateway wording for unknown slash commands."""
-    raw = command.lower().lstrip("/")
+    raw = normalize_command_name(command)
     return (
         f"Unknown command `/{raw}`. "
         "Type /commands to see what's available, "
