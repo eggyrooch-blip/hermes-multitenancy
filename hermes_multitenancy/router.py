@@ -615,6 +615,76 @@ def _publish_profile_media_artifact(source: Path, profile_home: Path) -> Optiona
         return None
 
 
+_IMAGE_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"}
+
+
+def _materialize_inbound_media_for_profile(event: Any, profile_home: Path) -> None:
+    """Copy gateway-cached inbound media into the routed profile boundary."""
+    media_urls = getattr(event, "media_urls", None) or []
+    if not media_urls:
+        return
+    media_types = getattr(event, "media_types", None) or []
+    root = profile_home.resolve(strict=False)
+    rewritten: list[str] = []
+    replacements: dict[str, str] = {}
+    changed = False
+
+    for raw_path, raw_mtype in zip_longest(media_urls, media_types, fillvalue=""):
+        raw = str(raw_path or "")
+        if not raw or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+            rewritten.append(raw)
+            continue
+        source = Path(raw).expanduser().resolve(strict=False)
+        if not (source.exists() and source.is_file()):
+            rewritten.append(raw)
+            continue
+        if source == root or root in source.parents:
+            rewritten.append(str(source))
+            continue
+
+        suffix = source.suffix.lower()
+        media_type = str(raw_mtype or "").lower()
+        target_dir = root / "cache" / "images" if (
+            media_type.startswith("image") or suffix in _IMAGE_FILE_EXTENSIONS
+        ) else root / "uploads"
+        target = (target_dir / source.name).resolve(strict=False)
+        if target.exists() and target.resolve(strict=False) != source:
+            digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:10]
+            target = (target_dir / f"{source.stem}-{digest}{source.suffix}").resolve(strict=False)
+        if not (target == root or root in target.parents):
+            rewritten.append(raw)
+            continue
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if target.resolve(strict=False) != source:
+                shutil.copy2(source, target)
+            rewritten_path = str(target)
+            rewritten.append(rewritten_path)
+            replacements[raw] = rewritten_path
+            changed = True
+            logger.info(
+                "multitenancy: materialized inbound media for profile source=%s target=%s",
+                source,
+                target,
+            )
+        except Exception as exc:
+            logger.warning(
+                "multitenancy: failed to materialize inbound media source=%s profile_home=%s error=%s",
+                source,
+                root,
+                exc,
+            )
+            rewritten.append(raw)
+
+    if changed:
+        setattr(event, "media_urls", rewritten)
+        text = getattr(event, "text", None)
+        if isinstance(text, str):
+            for old, new in replacements.items():
+                text = text.replace(old, new)
+            setattr(event, "text", text)
+
+
 async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]:
     """Delegate inbound preprocessing to hermes' ``_prepare_inbound_message_text``.
 
@@ -1106,6 +1176,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # Multi-modal enrichment must happen before RunRequest admission because
         # file-only Feishu events have empty event.text.  The enriched content is
         # the real prompt and the dedupe/admission key should reflect it.
+        _materialize_inbound_media_for_profile(event, profile_home)
         enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
         run_content = enriched_text or text
         if not run_content and getattr(event, "media_urls", None):
