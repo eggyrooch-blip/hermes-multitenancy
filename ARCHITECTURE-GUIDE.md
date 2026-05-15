@@ -54,6 +54,11 @@ sources:
 > [!info] 2026-05-14 Run Broker 目标态骨架
 > `run_models.py` / `run_broker.py` 已新增 channel-neutral contract：`RunRequest(channel, profile_name, user_key, content, message_id/idempotency_key, credential_subject, requires_host_tools, ...)`、`RunEvent(kind, text, payload)`、`RunResult(content, duplicate, run_id)` 与最小 `RunBroker.run()` / `RunBroker.admit()`。Feishu `handle_async` route 命中后已构造 `RunRequest(channel="feishu")` 并通过 broker admission 执行 sandbox policy + idempotency；minimal 非 streaming adapter 分支和 full CardKit streaming 分支都已通过 `RunBroker.run(..., admitted=True)` 执行。WebUI 已有 HTTP/SSE sidecar endpoint；cron 已有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` run_job patch，会把 due job 构造成 `RunRequest(channel="cron")`。生产 66 已启用 WebUI/cron broker：`127.0.0.1:8766` sidecar active，WebUI Socket.IO canary 返回 `SANDBOX=1`，真实 router cron worker job `e79412276d8f` 输出 `Run Path: RunBroker` + `SANDBOX=1`。CardKit 具体 renderer、session history 和 media delivery 仍保留在 `router.py`。
 
+> [!info] 2026-05-15 WebUI Feishu UAT ensure
+> `feishu_uat_auth.py` 在 Run Broker sidecar 内提供 WebUI 专用的 UAT 状态检查与 device-flow 授权会话。新增接口：`GET /api/run-broker/credentials/feishu/uat/status`、`POST /api/run-broker/feishu-auth/sessions`、`GET /api/run-broker/feishu-auth/sessions/{session_id}`、`DELETE /api/run-broker/feishu-auth/sessions/{session_id}`。这些接口只接受 broker Bearer key 保护下的 `profile_name + user_key(open_id)`，并先用 `multitenancy_routing` 校验该 open_id 是否仍 active 绑定到该 profile。
+>
+> 授权开始/轮询阶段复用 `hermes_cli.feishu_auth` 的 device-flow helper，不把 device_code、access_token、refresh_token 回传给 WebUI。授权完成后会校验 Feishu 返回的 `open_id` 与 WebUI session open_id 一致，再写入 `multitenancy_credentials(profile_name, open_id, feishu, uat)`，并同步写一份 profile-local `profiles/<profile>/feishu_uat/<open_id>.json` 作为 Hermes tool 兼容路径。WebUI 只获得 `missing/expired/scope_missing/valid/pending/success/error` 等状态与授权 URL/user code。
+
 > [!info] 2026-05-14 Run Broker jobs API 收口
 > `5d48dcd` 新增 `cron_api.py` 与 `/api/run-broker/jobs`，WebUI chat plane 的 job 创建、列表、修改、删除、暂停、恢复都进入本仓 sidecar，不再要求 `hermes-gateway@sunke.service` profile apiserver 常驻。生产验证时停止 `hermes-gateway@sunke.service`，WebUI BFF 仍能创建并删除 job `0dbd12ced3b1`。`a19f456` / `7d2cf1e` 是本 GUIDE 的 docs-only 同步。
 >
@@ -70,6 +75,7 @@ flowchart TB
     Feishu["Feishu inbound event"] --> Hook["pre_gateway_dispatch<br/>return action skip"]
     WebUIRun["WebUI /chat-run"] --> Sidecar["webui_broker_server :8766"]
     WebUIJobs["WebUI /api/hermes/jobs"] --> Sidecar
+    WebUIUAT["WebUI /api/auth/feishu/uat/*"] --> Sidecar
     Cron["multi-profile cron worker"] --> Broker["RunBroker"]
     Sidecar --> Broker
     Hook --> Route["router.handle_async<br/>resolve sender -> profile"]
@@ -85,13 +91,15 @@ flowchart TB
     Events --> FeishuOut["Feishu streaming card"]
     Events --> WebUIOut["Socket.IO stream"]
     Events --> Output["cron output + session mirror"]
+    Sidecar --> UATAuth["feishu_uat_auth.py<br/>status + device-flow session"]
+    UATAuth --> Creds
     Broker --> Creds[("multitenancy.db<br/>routing + credentials<br/>processed events")]
 
     classDef main fill:#e8f5e9,stroke:#16a34a,color:#111
     classDef input fill:#e3f2fd,stroke:#2563eb,color:#111
     classDef data fill:#f3e8ff,stroke:#7c3aed,color:#111
     class Broker,Policy,Pool,Bwrap,Subprocess,Sidecar,JobsAPI main
-    class Feishu,WebUIRun,WebUIJobs,Cron input
+    class Feishu,WebUIRun,WebUIJobs,WebUIUAT,Cron input
     class JobsFile,Creds,Output data
 ```
 
@@ -101,7 +109,7 @@ multitenancy 是 hermes-agent 的**进程内插件**。它在 `pre_gateway_dispa
 
 ### 1.3 它不做什么
 
-- **不**自己跟飞书 OpenAPI 直接说话——adapter 是 hermes-agent 的 `FeishuAdapter`，token/OAuth/Device Flow 全在 `hermes-feishu-uat` 那边
+- **不**自己跟飞书业务 OpenAPI 直接说话——adapter 是 hermes-agent 的 `FeishuAdapter`，工具调用仍由 hermes-agent / hermes-feishu-uat 完成。WebUI UAT ensure 只在 sidecar 内复用 `hermes_cli.feishu_auth` 的 device-flow helper 启动/轮询授权，并把结果落到 credential vault。
 - **不**写飞书 token 文件——`~/.hermes/feishu_uat/<ou_*>.json` 是 `hermes-feishu-uat` 的产物
 - **不**起 launchd/supervisor——`hermes_multitenancy` 是 plugin，跟 gateway 同进程
 - **不**修改 hermes-agent core 文件来完成多租户投递。少数 integration seam 会在 plugin runtime 内做有边界的 patch（如 `GatewayRunner._create_adapter`、`cron.scheduler` delivery、Feishu open_id send），目标是复用 hermes-agent adapter/scheduler，不把 core fork 继续扩散
@@ -1080,6 +1088,8 @@ fallback dict 的存在是为了"插件可以脱离 hermes checkout 跑测试"�
 
 同一 sidecar 的 `/api/run-broker/jobs` 是 profile-aware cron management API。创建 job 时会强制覆盖 `owner_open_id=user_key` 与 `owner_profile=profile_name`，防止前端伪造 owner；如果请求没传 `deliver`，服务端默认写入 `deliver=feishu`。这是 WebUI cron 的主路径语义：提醒/定时任务默认回投给 Feishu 用户，`local` 只能显式指定。
 
+同一 sidecar 还提供 WebUI UAT ensure API：`/api/run-broker/credentials/feishu/uat/status` 做 credential vault/profile-local JSON 的 redacted 状态检查，`/api/run-broker/feishu-auth/sessions` 创建 device-flow 会话，`/api/run-broker/feishu-auth/sessions/{session_id}` 轮询 token 结果并在 open_id 匹配后写 vault + profile-local JSON，`DELETE` 用于取消未完成会话。这个 API 是 WebUI 进入 chat 前的授权补齐面，等价于用户在飞书里发 `/feishu_auth`，但身份来自 WebUI BFF 的 server-side session，不信任浏览器传入的 profile/open_id。
+
 cron 的 opt-in seam 在 `cron_worker._patch_cron_run_broker()`：plugin register 时 patch `cron.scheduler.run_job`，但只有 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时才启用。启用后，due job 先复用 scheduler 的 `_build_job_prompt(job, prerun_script=None)` 得到最终 prompt，再构造 `RunRequest(channel="cron", profile_name, user_key, content, session_id="cron:<job_id>", message_id=<job_id>, credential_subject, requires_host_tools=True)`，通过 `RunBroker.run()` 调 profile runtime，最后返回原 scheduler 期待的 `(success, output_doc, final_response, error)`。`cron.scheduler.tick()` 仍负责 save output、Feishu delivery、mark_job_run 和 repeat/next_run_at 语义。
 
 这不是最终 broker。最终要把现有 `router.handle_async` 的 session history、Feishu renderer、`_stream_into_feishu`、approval bridge、`agent_real.stream_run_agent` 等逐步迁到这个 contract 后面。
@@ -1098,6 +1108,7 @@ cron 的 opt-in seam 在 `cron_worker._patch_cron_run_broker()`：plugin registe
 - minimal 非 streaming Feishu dispatch 会进入 `RunBroker.run(..., admitted=True)`；
 - full Feishu streaming dispatch 会进入 `RunBroker.run(..., admitted=True)`，内部仍复用 `_stream_into_feishu(...)`；
 - `tests/test_webui_broker_server.py` 覆盖 WebUI HTTP/SSE endpoint 可接收 `RunRequest(channel="webui")`、输出 `content/done` SSE，并在配置 broker key 时拒绝未授权请求；
+- `tests/test_webui_feishu_uat_auth.py` 覆盖 UAT status redaction、route-scope 校验、device-flow poll 成功写 vault/profile-local JSON、open_id mismatch fail-closed；
 - `test_cron_run_broker_patch_submits_cron_run_request` 覆盖 `HERMES_MULTITENANCY_CRON_RUN_BROKER=1` 时 cron job 会构造成 `RunRequest(channel="cron")` 并通过 `RunBroker.run()` 执行；
 - broker 输出 channel-neutral events。
 

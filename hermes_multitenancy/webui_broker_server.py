@@ -83,6 +83,13 @@ def _tenant_from_request(request: Any, payload: Optional[dict[str, Any]] = None)
     return cron_api.validate_profile_name(str(profile_name)), str(user_key or "").strip()
 
 
+def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
+    return {
+        "profile_name": request.query.get("profile_name") or request.query.get("profile"),
+        "user_key": request.query.get("user_key") or request.query.get("user"),
+    }
+
+
 async def _maybe_await(value):
     if hasattr(value, "__await__"):
         return await value
@@ -283,8 +290,98 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI cron resume failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_feishu_uat_status(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import feishu_uat_auth
+
+        try:
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            status = feishu_uat_auth.credential_status(
+                profile_name=profile_name,
+                open_id=user_key,
+                required_scopes=request.query.get("required_scopes"),
+            )
+            return web.json_response(status)
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Feishu UAT status failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_feishu_auth_start(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import feishu_uat_auth
+
+        try:
+            payload = await request.json()
+            profile_name, user_key = _tenant_from_request(request, payload)
+            body = feishu_uat_auth.start_session(
+                profile_name=profile_name,
+                open_id=user_key,
+                scope=payload.get("scope"),
+            )
+            return web.json_response(body)
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Feishu auth start failed")
+            return web.json_response({"error": str(exc), "status": "error"}, status=500)
+
+    async def handle_feishu_auth_poll(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import feishu_uat_auth
+
+        try:
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            body = feishu_uat_auth.poll_session(
+                session_id=request.match_info["session_id"],
+                profile_name=profile_name,
+                open_id=user_key,
+            )
+            status = 200 if body.get("status") != "error" else 400
+            return web.json_response(body, status=status)
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Feishu auth poll failed")
+            return web.json_response({"error": str(exc), "status": "error"}, status=500)
+
+    async def handle_feishu_auth_cancel(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import feishu_uat_auth
+
+        try:
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            body = feishu_uat_auth.cancel_session(
+                session_id=request.match_info["session_id"],
+                profile_name=profile_name,
+                open_id=user_key,
+            )
+            return web.json_response(body)
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Feishu auth cancel failed")
+            return web.json_response({"error": str(exc), "status": "error"}, status=500)
+
     app = web.Application()
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
+    app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
+    app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
+    app.router.add_delete("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_cancel)
     app.router.add_get("/api/run-broker/jobs", handle_list_jobs)
     app.router.add_post("/api/run-broker/jobs", handle_create_job)
     app.router.add_get("/api/run-broker/jobs/{job_id}", handle_get_job)
