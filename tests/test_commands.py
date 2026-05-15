@@ -70,6 +70,80 @@ def test_parse_command_reads_hermes_registry_dynamically(monkeypatch):
     assert parse_command("/fresh_alias arg") == ("fresh", "arg")
 
 
+def test_skill_slash_uses_routed_profile_home(monkeypatch, tmp_path):
+    """Router profile may not have tenant default skills; target profile does."""
+    import sys
+    from types import ModuleType
+
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    router_home = tmp_path / "multitenancy_router"
+    profile_home = tmp_path / "sunke"
+    router_home.mkdir()
+    profile_home.mkdir()
+    add_spike_route("ou_hades_profile", profile_home)
+    monkeypatch.setenv("HERMES_HOME", str(router_home))
+
+    def resolve_skill_command_key(command):
+        if os.environ.get("HERMES_HOME") != str(profile_home):
+            return None
+        return "/kep-hades-cli" if command.replace("_", "-") == "kep-hades-cli" else None
+
+    fake_skill_commands = SimpleNamespace(
+        get_skill_commands=lambda: {"/kep-hades-cli": {"name": "kep-hades-cli"}}
+        if os.environ.get("HERMES_HOME") == str(profile_home)
+        else {},
+        resolve_skill_command_key=resolve_skill_command_key,
+        build_skill_invocation_message=lambda cmd_key, user_instruction, task_id=None: (
+            f"[skill:{cmd_key} task:{task_id}] {user_instruction}"
+        ),
+    )
+    fake_skill_utils = SimpleNamespace(get_disabled_skill_names=lambda platform=None: set())
+    monkeypatch.setitem(sys.modules, "agent", ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+    monkeypatch.setitem(sys.modules, "agent.skill_utils", fake_skill_utils)
+
+    seen = {}
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            seen["profile_name"] = profile_name
+            seen["home"] = home
+            seen["text"] = event.text
+            return "agent ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: Pool())
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    asyncio.run(handle_async(
+        event=_build_event("/hades get 69df030c1f01cb45ba7ff585", user_id="ou_hades_profile"),
+        gateway=gateway,
+    ))
+
+    assert seen == {
+        "profile_name": "sunke",
+        "home": profile_home,
+        "text": (
+            "[skill:/kep-hades-cli task:multitenancy:feishu:sunke:chat-cmd:ou_hades_profile] "
+            "get 69df030c1f01cb45ba7ff585"
+        ),
+    }
+    assert sends == ["agent ok"]
+    assert os.environ.get("HERMES_HOME") == str(router_home)
+    clear_spike_routes()
+
+
 # -- /stop ------------------------------------------------------------------
 
 @pytest.mark.asyncio
