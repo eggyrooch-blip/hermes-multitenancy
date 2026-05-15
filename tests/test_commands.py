@@ -516,6 +516,66 @@ async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_hades_slash_alias_invokes_kep_hades_skill(monkeypatch, tmp_path):
+    """Keep's historical /hades shorthand should load kep-hades-cli."""
+    import sys
+    from types import ModuleType
+
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "coder"
+    profile_home.mkdir()
+    add_spike_route("ou_hades", profile_home)
+
+    fake_skill_commands = SimpleNamespace(
+        get_skill_commands=lambda: {"/kep-hades-cli": {"name": "kep-hades-cli"}},
+        resolve_skill_command_key=lambda command: "/kep-hades-cli"
+        if command.replace("_", "-") == "kep-hades-cli"
+        else None,
+        build_skill_invocation_message=lambda cmd_key, user_instruction, task_id=None: (
+            f"[skill:{cmd_key} task:{task_id}] {user_instruction}"
+        ),
+    )
+    fake_skill_utils = SimpleNamespace(get_disabled_skill_names=lambda platform=None: set())
+    monkeypatch.setitem(sys.modules, "agent", ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+    monkeypatch.setitem(sys.modules, "agent.skill_utils", fake_skill_utils)
+
+    seen = {}
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            seen["text"] = event.text
+            return "agent ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: Pool())
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(
+        event=_build_event("/hades get 69df030c1f01cb45ba7ff585", user_id="ou_hades"),
+        gateway=gateway,
+    )
+
+    assert seen["text"] == (
+        "[skill:/kep-hades-cli task:multitenancy:feishu:coder:chat-cmd:ou_hades] "
+        "get 69df030c1f01cb45ba7ff585"
+    )
+    assert sends == ["agent ok"]
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
 async def test_plugin_slash_command_uses_hermes_plugin_handler(monkeypatch, tmp_path, caplog):
     """Plugin-registered slash commands should be delegated before unknown handling."""
     import sys
