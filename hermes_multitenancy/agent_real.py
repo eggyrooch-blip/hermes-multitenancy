@@ -1030,7 +1030,7 @@ def _lark_cli_sidecar_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         "LARKSUITE_CLI_APP_ID": app_id,
         "LARKSUITE_CLI_BRAND": str(parent.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
         "LARKSUITE_CLI_DEFAULT_AS": str(parent.get("HERMES_LARK_CLI_DEFAULT_AS") or "user").strip() or "user",
-        "LARKSUITE_CLI_STRICT_MODE": str(parent.get("HERMES_LARK_CLI_STRICT_MODE") or "user").strip() or "user",
+        "LARKSUITE_CLI_STRICT_MODE": str(parent.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
     }
 
 
@@ -1043,6 +1043,9 @@ def _resolve_lark_cli_authsidecar_binary(profile_home: Path) -> Path:
 
 def _resolve_lark_cli_app_id(profile_home: Path) -> str:
     app_id = str(os.environ.get("HERMES_LARK_CLI_APP_ID") or "").strip()
+    if app_id:
+        return app_id
+    app_id = _resolve_lark_cli_app_id_from_profile_uat(profile_home)
     if app_id:
         return app_id
     try:
@@ -1061,6 +1064,28 @@ def _resolve_lark_cli_app_id(profile_home: Path) -> str:
         return str(payload.get("app_id") or payload.get("FEISHU_APP_ID") or "").strip()
     except Exception:
         return ""
+
+
+def _resolve_lark_cli_app_id_from_profile_uat(profile_home: Path) -> str:
+    """Read the public app_id from the current profile's UAT JSON if present."""
+    uat_dir = Path(profile_home).expanduser() / "feishu_uat"
+    try:
+        candidates = sorted(
+            (path for path in uat_dir.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return ""
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        app_id = str(payload.get("app_id") or payload.get("client_id") or "").strip()
+        if app_id:
+            return app_id
+    return ""
 
 
 @contextmanager
@@ -1083,7 +1108,7 @@ def _lark_cli_auth_broker_scope(
             profile_name=profile_home.name,
             user_open_id=sender_open_id,
             hmac_key=key,
-            allowed_identities=frozenset({"user"}),
+            allowed_identities=frozenset({"user", "bot"}),
         )
     )
     try:
@@ -1094,7 +1119,7 @@ def _lark_cli_auth_broker_scope(
             "LARKSUITE_CLI_APP_ID": app_id,
             "LARKSUITE_CLI_BRAND": str(os.environ.get("HERMES_LARK_CLI_BRAND") or "feishu").strip() or "feishu",
             "LARKSUITE_CLI_DEFAULT_AS": str(os.environ.get("HERMES_LARK_CLI_DEFAULT_AS") or "user").strip() or "user",
-            "LARKSUITE_CLI_STRICT_MODE": str(os.environ.get("HERMES_LARK_CLI_STRICT_MODE") or "user").strip() or "user",
+            "LARKSUITE_CLI_STRICT_MODE": str(os.environ.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
         }
     finally:
         server.close()

@@ -44,6 +44,9 @@ class _ReplayedEvent:
 
 def _load_run_with_aiagent():
     """Load sibling agent_real regardless of package name used by Hermes."""
+    package_root = Path(__file__).resolve().parents[1]
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
     try:
         from hermes_multitenancy.agent_real import _run_with_aiagent
         return _run_with_aiagent
