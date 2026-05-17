@@ -58,7 +58,11 @@
     ;; "Operation not permitted" on execvp() (gateway 13:59-14:12 logs).
     (subpath (string-append (param "USER_HOME") "/.local/share/uv")))
 
-(allow signal (target self))
+;; The agent must be able to terminate child tools it spawned when a
+;; subprocess timeout fires (for example lark-cli-authsidecar). Limiting this
+;; to self blocked subprocess.run(..., timeout=...) cleanup on macOS because
+;; the timed-out child is a separate target.
+(allow signal (target children))
 (allow mach-lookup)
 (allow ipc-posix-shm)
 
@@ -212,6 +216,7 @@
 ;; Allow local UNIX sockets — needed for asyncio internals, mDNS,
 ;; potentially launchctl IPC if a tool legitimately introspects launchd.
 (allow network-outbound (remote unix-socket))
+(allow network-outbound (remote tcp "localhost:*"))
 (allow network-bind (local unix-socket))
 (allow network-bind (local tcp "localhost:*"))
 (allow network-bind (local udp "localhost:*"))

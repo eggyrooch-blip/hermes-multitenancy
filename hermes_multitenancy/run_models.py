@@ -46,6 +46,7 @@ class RunRequest:
     credential_subject: Optional[str] = None
     requires_host_tools: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         channel = _clean(self.channel)
@@ -65,6 +66,11 @@ class RunRequest:
         object.__setattr__(self, "user_key", user_key)
         object.__setattr__(self, "content", content)
         object.__setattr__(self, "delivery_mode", _clean(self.delivery_mode) or "stream")
+        object.__setattr__(
+            self,
+            "messages",
+            [dict(message) for message in self.messages if isinstance(message, dict)],
+        )
         if self.credential_subject is None:
             object.__setattr__(self, "credential_subject", user_key)
 
