@@ -126,8 +126,8 @@ def _desired_and_current(table, users: Iterable[UserSpec]) -> tuple[dict[str, Us
     # Snapshot current active rows so we can detect deletes.
     cur = table._conn.execute(
         "SELECT user_id, profile_name, open_id, union_id"
-        " FROM multitenancy_routing WHERE active = 1 AND kind = ?",
-        (KIND_USER,),
+        " FROM multitenancy_routing WHERE active = 1 AND kind = ? AND provenance = ?",
+        (KIND_USER, "sync"),
     )
     current = {r["user_id"]: dict(r) for r in cur.fetchall()}
     return desired, current
