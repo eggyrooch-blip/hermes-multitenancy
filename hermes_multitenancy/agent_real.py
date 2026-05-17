@@ -32,7 +32,7 @@ import tempfile
 import uuid
 import re
 import secrets
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -144,6 +144,27 @@ async def stream_run_agent(  # type: ignore[override]
         yield kind, text
 
 
+def _normalize_reasoning_compare(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _reasoning_for_state_db(
+    content: str,
+    reasoning: str,
+    *,
+    preserve_reasoning: bool = True,
+) -> str | None:
+    """Return reasoning safe to persist for WebUI history rendering."""
+    reasoning_text = str(reasoning or "")
+    if not preserve_reasoning or not reasoning_text.strip():
+        return None
+    content_norm = _normalize_reasoning_compare(content)
+    reasoning_norm = _normalize_reasoning_compare(reasoning_text)
+    if content_norm and content_norm == reasoning_norm:
+        return None
+    return reasoning_text
+
+
 async def _stream_loop(
     event: Any,
     profile_home: Path,
@@ -173,7 +194,7 @@ async def _stream_loop(
     from openai import AsyncOpenAI
     from dotenv import dotenv_values
 
-    config = _load_yaml(profile_home / "config.yaml")
+    config = _load_profile_config(profile_home)
     auth = _load_json(profile_home / "auth.json")
     env_overrides = (
         dotenv_values(profile_home / ".env") if (profile_home / ".env").exists() else {}
@@ -293,7 +314,7 @@ async def _legacy_real_run_agent(
     from openai import AsyncOpenAI
     from dotenv import dotenv_values
 
-    config = _load_yaml(profile_home / "config.yaml")
+    config = _load_profile_config(profile_home)
     auth = _load_json(profile_home / "auth.json")
     env_overrides = dotenv_values(profile_home / ".env") if (profile_home / ".env").exists() else {}
 
@@ -418,6 +439,25 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return {}
     import yaml
     return yaml.safe_load(path.read_text()) or {}
+
+
+def _merge_profile_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge shared Hermes config with profile-local overrides."""
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_profile_config(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_profile_config(profile_home: Path) -> dict[str, Any]:
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    shared = _load_yaml(shared_home / "config.yaml")
+    profile = _load_yaml(profile_home / "config.yaml")
+    return _merge_profile_config(shared, profile)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -1042,6 +1082,7 @@ def _resolve_lark_cli_authsidecar_binary(profile_home: Path) -> Path:
 
 
 def _resolve_lark_cli_app_id(profile_home: Path) -> str:
+    _load_lark_cli_shared_env(profile_home)
     app_id = str(os.environ.get("HERMES_LARK_CLI_APP_ID") or "").strip()
     if app_id:
         return app_id
@@ -1098,6 +1139,43 @@ def _is_group_profile_home(profile_home: Path) -> bool:
     except Exception:
         return False
     return str(payload.get("kind") or "").strip().lower() == "group"
+
+
+_LARK_CLI_SHARED_ENV_KEYS = frozenset(
+    {
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+        "HERMES_CREDENTIAL_KEY",
+        "HERMES_LARK_CLI_APP_ID",
+        "HERMES_LARK_CLI_BRAND",
+        "HERMES_LARK_CLI_DEFAULT_AS",
+        "HERMES_LARK_CLI_STRICT_MODE",
+    }
+)
+
+
+def _load_lark_cli_shared_env(profile_home: Path) -> dict[str, str]:
+    """Load only lark-cli broker control-plane env from the shared .env file."""
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    env_path = shared_home / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    parsed: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if key not in _LARK_CLI_SHARED_ENV_KEYS or os.environ.get(key):
+            continue
+        value = value.strip().strip("'\"")
+        if value:
+            os.environ[key] = value
+            parsed[key] = value
+    return parsed
 
 
 def _payload_has_live_access_token(payload: dict | None) -> bool:
@@ -1173,7 +1251,8 @@ def _lark_cli_auth_broker_scope(
     app_id = _resolve_lark_cli_app_id(profile_home)
     sender_open_id = str(sender_open_id or "").strip()
     binary = _resolve_lark_cli_authsidecar_binary(profile_home)
-    if not (app_id and sender_open_id and binary.exists()):
+    is_group_profile = _is_group_profile_home(profile_home)
+    if not (app_id and binary.exists() and (sender_open_id or is_group_profile)):
         yield {}
         return
 
@@ -1677,6 +1756,13 @@ def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
     return wrapped
 
 
+def _aiagent_subprocess_cwd(profile_home: Path) -> str:
+    """Start child processes from the routed workspace so sandbox getcwd is allowed."""
+    workspace = profile_home.expanduser() / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return str(workspace)
+
+
 async def _run_aiagent_subprocess(
     event: Any,
     profile_home: Path,
@@ -1718,6 +1804,7 @@ async def _run_aiagent_subprocess(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=_aiagent_subprocess_cwd(profile_home),
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout_s)
     except asyncio.TimeoutError as exc:
@@ -1798,6 +1885,8 @@ async def _stream_aiagent_subprocess(
     _canonical_session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
     user_text = getattr(event, "text", "") or ""
     _state_db_path = profile_home / "state.db"
+    _source_for_display = getattr(event, "source", None)
+    _preserve_reasoning_in_state = _resolve_platform_value(_source_for_display) != "webui"
 
     # ── Session-boundary epoch ────────────────────────────────────────────
     # The canonical session_id is keyed only by (chat_id, user_id), so it
@@ -1888,7 +1977,7 @@ async def _stream_aiagent_subprocess(
             except Exception:
                 logger.exception("[multitenancy] mirror schema init failed")
             try:
-                with self._conn() as conn:
+                with closing(self._conn()) as conn, conn:
                     conn.execute(
                         "INSERT OR IGNORE INTO sessions (id, source, started_at) "
                         "VALUES (?, 'feishu', ?)",
@@ -1903,7 +1992,7 @@ async def _stream_aiagent_subprocess(
                 return
             self.ensure_session()
             try:
-                with self._conn() as conn:
+                with closing(self._conn()) as conn, conn:
                     conn.execute(
                         "INSERT INTO messages (session_id, role, content, timestamp) "
                         "VALUES (?, 'user', ?, ?)",
@@ -1922,7 +2011,7 @@ async def _stream_aiagent_subprocess(
                 return
             self.ensure_session()
             try:
-                with self._conn() as conn:
+                with closing(self._conn()) as conn, conn:
                     if self.active_assistant_id is None:
                         cur = conn.execute(
                             "INSERT INTO messages (session_id, role, content, reasoning, timestamp) "
@@ -1930,7 +2019,11 @@ async def _stream_aiagent_subprocess(
                             (
                                 str(session_id),
                                 self.assistant_content,
-                                self.assistant_reasoning or None,
+                                _reasoning_for_state_db(
+                                    self.assistant_content,
+                                    self.assistant_reasoning,
+                                    preserve_reasoning=_preserve_reasoning_in_state,
+                                ),
                                 _time.time(),
                             ),
                         )
@@ -1940,7 +2033,11 @@ async def _stream_aiagent_subprocess(
                             "UPDATE messages SET content=?, reasoning=? WHERE id=?",
                             (
                                 self.assistant_content,
-                                self.assistant_reasoning or None,
+                                _reasoning_for_state_db(
+                                    self.assistant_content,
+                                    self.assistant_reasoning,
+                                    preserve_reasoning=_preserve_reasoning_in_state,
+                                ),
                                 self.active_assistant_id,
                             ),
                         )
@@ -1965,7 +2062,7 @@ async def _stream_aiagent_subprocess(
             except Exception:
                 payload = None
             try:
-                with self._conn() as conn:
+                with closing(self._conn()) as conn, conn:
                     conn.execute(
                         "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
                         "VALUES (?, 'assistant', '', ?, ?, ?)",
@@ -1985,7 +2082,7 @@ async def _stream_aiagent_subprocess(
 
         def dedupe(self) -> None:
             try:
-                with self._conn() as conn:
+                with closing(self._conn()) as conn, conn:
                     conn.execute(
                         "DELETE FROM messages WHERE session_id = ? AND id NOT IN ("
                         "SELECT MIN(id) FROM messages WHERE session_id = ? "
@@ -2041,6 +2138,7 @@ async def _stream_aiagent_subprocess(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=_aiagent_subprocess_cwd(profile_home),
         )
         logger.info(
             "[multitenancy] AIAgent subprocess spawned pid=%s elapsed=%.3fs",
@@ -2058,8 +2156,38 @@ async def _stream_aiagent_subprocess(
             pass
 
         assert proc.stdout is not None
+        first_heartbeat_s = float(os.getenv("HERMES_AIAGENT_FIRST_EVENT_HEARTBEAT_SECONDS", "1"))
+        heartbeat_s = float(os.getenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "15"))
+        heartbeat_count = 0
         while True:
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout_s)
+            read_started = time.monotonic()
+            read_task = asyncio.create_task(proc.stdout.readline())
+            try:
+                while not read_task.done():
+                    elapsed = time.monotonic() - read_started
+                    remaining = timeout_s - elapsed
+                    if remaining <= 0:
+                        read_task.cancel()
+                        try:
+                            await read_task
+                        except Exception:
+                            pass
+                        raise asyncio.TimeoutError()
+                    next_heartbeat_s = first_heartbeat_s if heartbeat_count == 0 and not first_event_logged else heartbeat_s
+                    wait_seconds = min(next_heartbeat_s, remaining) if next_heartbeat_s > 0 else remaining
+                    done, _pending = await asyncio.wait({read_task}, timeout=wait_seconds)
+                    if done:
+                        break
+                    heartbeat_count += 1
+                    logger.info(
+                        "[multitenancy] waiting for AIAgent subprocess first event elapsed=%.3fs heartbeat=%s",
+                        time.monotonic() - started_at,
+                        heartbeat_count,
+                    )
+                line = read_task.result()
+            finally:
+                if not read_task.done():
+                    read_task.cancel()
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").strip()
@@ -2220,6 +2348,22 @@ def _resolve_aiagent_session_id(
     cross-user history bleed when multiple Feishu users hit the same bot.
     """
     source = getattr(event, "source", None)
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        channel = str(raw_event.get("channel") or "").strip()
+        webui_session_id = str(raw_event.get("session_id") or "").strip()
+        if channel == "webui" and webui_session_id:
+            parts = [
+                "agent",
+                "profile",
+                profile_home.name,
+                "platform",
+                "webui",
+                "session",
+                webui_session_id,
+            ]
+            return ":".join(_session_part(part) for part in parts)
+
     platform = _resolve_platform_value(source)
     chat_type = getattr(source, "chat_type", "") if source else ""
     chat_id = (
@@ -2470,7 +2614,7 @@ def _run_with_aiagent(
     os.environ["HERMES_HOME"] = str(profile_home)
 
     # 2) Read profile LLM config + credentials (mirrors the spike loader).
-    config = _load_yaml(profile_home / "config.yaml")
+    config = _load_profile_config(profile_home)
     auth = _load_json(profile_home / "auth.json")
     from dotenv import dotenv_values
     env_overrides = dict(
@@ -2511,7 +2655,7 @@ def _run_with_aiagent(
         _get_platform_tools = None  # graceful: fall back to None toolsets
 
     # 4) Resolve toolsets enabled for this platform on this profile.
-    platform_key = "feishu"
+    platform_key = _resolve_platform_value(getattr(event, "source", None))
     enabled_toolsets = _resolve_enabled_toolsets(
         config,
         platform_key,
@@ -2601,7 +2745,18 @@ def _run_with_aiagent(
         def _retag_source_now(reason: str) -> None:
             try:
                 _mark_session_source_feishu(profile_home, str(session_id))
-            except Exception:
+            except Exception as exc:
+                # In sandboxed subprocesses PROFILE_HOME/state.db may be visible
+                # but sqlite cannot open the WAL files. The parent streaming
+                # mirror has the authoritative retag path; keep this best-effort
+                # child-side attempt from polluting user-visible error logs.
+                if exc.__class__.__name__ == "OperationalError" and "unable to open database file" in str(exc):
+                    logger.debug(
+                        "[multitenancy] skipped child-side session.source retag (reason=%s): %s",
+                        reason,
+                        exc,
+                    )
+                    return
                 logger.exception(
                     "[multitenancy] failed to rewrite session.source -> feishu (reason=%s)",
                     reason,
@@ -2634,6 +2789,7 @@ def _run_with_aiagent(
                     "tool_started",
                     name=str(tool_name or ""),
                     preview=str(preview or "") if preview is not None else None,
+                    args=args,
                 )
             elif event_type == "tool.completed":
                 _emit(
@@ -2642,10 +2798,17 @@ def _run_with_aiagent(
                     duration=float(kwargs.get("duration") or 0.0),
                     is_error=bool(kwargs.get("is_error")),
                 )
-            elif event_type in {"reasoning.available", "_thinking"}:
+            elif event_type == "_thinking":
                 text = str(preview or tool_name or "")
                 if text:
                     _emit("thinking", text=text)
+            elif event_type == "reasoning.available":
+                # Hermes upstream uses reasoning.available as a coarse preview
+                # signal and often passes visible answer text in `preview`.
+                # WebUI already treats this event as "thinking ended", not as
+                # reasoning content. Do not turn it into a thinking delta here,
+                # otherwise the UI shows duplicated/extra reasoning bubbles.
+                return
 
         def _stream_delta_event_callback(text: Any) -> None:
             if text is None:
@@ -2787,7 +2950,7 @@ def _resolve_enabled_toolsets(
     """
     explicit = (config.get("platform_toolsets") or {}).get(platform_key)
     explicit_toolsets = _normalize_toolset_list(explicit)
-    mode = _toolsets_mode(config)
+    mode = _toolsets_mode(config, platform_key)
 
     if explicit_toolsets and mode in {"explicit", "strict", "replace"}:
         logger.info(
@@ -2797,6 +2960,7 @@ def _resolve_enabled_toolsets(
         return explicit_toolsets
 
     default_toolsets: list[str] = []
+    resolver_platform_key = "api_server" if platform_key == "webui" else platform_key
     if platform_tools_resolver is not None:
         resolver_config = config
         if explicit_toolsets:
@@ -2806,15 +2970,17 @@ def _resolve_enabled_toolsets(
             platform_toolsets = resolver_config.get("platform_toolsets")
             if isinstance(platform_toolsets, dict):
                 platform_toolsets.pop(platform_key, None)
+                if resolver_platform_key != platform_key:
+                    platform_toolsets.pop(resolver_platform_key, None)
         try:
             try:
                 resolved = platform_tools_resolver(
                     resolver_config,
-                    platform_key,
+                    resolver_platform_key,
                     include_default_mcp_servers=("no_mcp" not in explicit_toolsets),
                 )
             except TypeError:
-                resolved = platform_tools_resolver(resolver_config, platform_key)
+                resolved = platform_tools_resolver(resolver_config, resolver_platform_key)
             default_toolsets = _normalize_toolset_list(resolved)
         except Exception as exc:
             logger.warning(
@@ -2846,13 +3012,19 @@ def _normalize_toolset_list(value: Any) -> list[str]:
     return sorted({str(item).strip() for item in items if str(item).strip()})
 
 
-def _toolsets_mode(config: dict[str, Any]) -> str:
+def _toolsets_mode(config: dict[str, Any], platform_key: str | None = None) -> str:
     """Return multitenancy toolset resolution mode."""
     env_mode = os.getenv("HERMES_MULTITENANCY_TOOLSETS_MODE")
     if env_mode:
         return env_mode.strip().lower()
     plugin_cfg = config.get("multitenancy") or {}
     if isinstance(plugin_cfg, dict):
+        if platform_key:
+            platform_modes = plugin_cfg.get("platform_toolsets_mode")
+            if isinstance(platform_modes, dict):
+                mode = platform_modes.get(platform_key)
+                if mode:
+                    return str(mode).strip().lower()
         mode = plugin_cfg.get("toolsets_mode")
         if mode:
             return str(mode).strip().lower()

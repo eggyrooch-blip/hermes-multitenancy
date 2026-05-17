@@ -139,6 +139,14 @@ def test_ensure_group_profile_writes_marker_and_soul(tmp_path):
     assert "oc_abc" in soul_text
     assert "ou_inviter" in soul_text
     assert "sunke-IT组" in soul_text
+    assert "lark_cli" in soul_text
+    assert "bot identity" in soul_text
+    config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
+    assert "lark-cli" in config_text
+    assert "toolsets_mode: explicit" in config_text
+    assert "api_server:" in config_text
+    assert "terminal" not in config_text
+    assert "feishu_docx" not in config_text
     # The group profile marker exists and forbids feishu_auth.
     marker = json.loads((profile_home / "group_profile.json").read_text("utf-8"))
     assert marker["kind"] == "group"
@@ -171,7 +179,99 @@ def test_ensure_group_profile_is_idempotent(tmp_path):
         owner_open_id="ou_inviter",
         display_label="sunke-IT组-renamed",
     )
-    assert (profile_home / "SOUL.md").read_text("utf-8") == soul_before
+    soul_after = (profile_home / "SOUL.md").read_text("utf-8")
+    assert soul_after == soul_before
+    assert soul_after.count("Feishu/Lark capability rules:") == 1
+
+
+def test_ensure_group_profile_extends_existing_lark_guidance_without_duplicate_heading(tmp_path):
+    from hermes_multitenancy.router import _ensure_group_profile
+
+    profile_home = tmp_path / "profiles" / "feishu_group_existing"
+    profile_home.mkdir(parents=True)
+    (profile_home / "SOUL.md").write_text(
+        "\n".join(
+            [
+                "# Existing",
+                "",
+                "Feishu/Lark capability rules:",
+                "- 飞书/Lark 的读写、导出和长尾 OpenAPI 能力优先通过 `lark_cli` 工具完成。",
+                "- 如果需要调用飞书能力，必须等待真实工具结果；不要编造 message_id、文档链接或调用结果。",
+                "- `lark_cli` 的 identity 使用 auto，profile runtime 会按个人/群聊边界选择 user 或 bot。",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _ensure_group_profile(
+        profile_name="feishu_group_existing",
+        profile_home=profile_home,
+        chat_id="oc_existing",
+        owner_open_id="ou_inviter",
+        display_label="existing",
+    )
+
+    soul_text = (profile_home / "SOUL.md").read_text("utf-8")
+    assert soul_text.count("Feishu/Lark capability rules:") == 1
+    assert "credential unavailable" in soul_text
+    assert "terminal" in soul_text
+    assert "npx" in soul_text
+
+
+def test_lark_cli_defaults_cover_webui_api_server_platform():
+    from hermes_multitenancy.router import _apply_lark_cli_profile_defaults
+
+    config = {"model": {"default": "openai/test"}}
+
+    _apply_lark_cli_profile_defaults(config)
+
+    assert config["platform_toolsets"]["feishu"] == ["lark-cli"]
+    assert config["platform_toolsets"]["api_server"] == ["lark-cli"]
+    assert config["platform_toolsets"]["webui"] == ["lark-cli"]
+    assert "terminal" not in config["platform_toolsets"]["api_server"]
+    assert config["multitenancy"]["toolsets_mode"] == "explicit"
+    # feishu is merge_default (not explicit): explicit dropped the `skills`
+    # toolset so lark-* skills never reached the agent manifest.
+    assert config["multitenancy"]["platform_toolsets_mode"] == {
+        "feishu": "merge_default",
+        "api_server": "merge_default",
+        "webui": "merge_default",
+    }
+
+
+def test_feishu_profile_keeps_skills_toolset_after_lark_cli_defaults(monkeypatch):
+    """Regression: feishu pinned to ``explicit`` returned only ["lark-cli"]
+    and silently dropped the ``skills`` toolset, so lark-* skill bodies
+    symlinked into the profile never appeared in the agent manifest
+    (user report: 技能里看不到 lark skills). With ``merge_default`` the
+    profile keeps both lark-cli and the default ``skills`` capability.
+
+    Fails if ``_apply_lark_cli_profile_defaults`` sets feishu mode back to
+    ``explicit`` (the pre-fix behavior).
+    """
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.router import _apply_lark_cli_profile_defaults
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_TOOLSETS_MODE", raising=False)
+
+    config = {"model": {"default": "openai/test"}}
+    _apply_lark_cli_profile_defaults(config)
+
+    def fake_get_platform_tools(cfg, platform, *, include_default_mcp_servers=True):
+        # Real feishu/api_server platform defaults include the `skills`
+        # capability that surfaces the profile's skills/ directory.
+        return {"skills", "file", "web"}
+
+    resolved = agent_real._resolve_enabled_toolsets(
+        config,
+        "feishu",
+        platform_tools_resolver=fake_get_platform_tools,
+    )
+
+    assert resolved is not None
+    assert "lark-cli" in resolved
+    assert "skills" in resolved  # dropped pre-fix under explicit mode
 
 
 def test_ensure_group_profile_inherits_default_skills(tmp_path):
