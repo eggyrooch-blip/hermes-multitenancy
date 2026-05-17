@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import types
+from pathlib import Path
 
 
 def test_webui_run_broker_endpoint_streams_channel_neutral_events():
@@ -55,6 +57,235 @@ def test_webui_run_broker_endpoint_streams_channel_neutral_events():
     asyncio.run(runner())
 
 
+def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "owner"
+        assert event.raw_event["session_id"] == "session-webui"
+        yield "tool_started", {"name": "lark_cli", "preview": "contact --help"}
+        yield "tool_completed", {"name": "lark_cli", "duration": 0.12, "is_error": False}
+        yield "content", "tool-backed answer"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "tool_started"' in body
+        assert '"name": "lark_cli"' in body
+        assert '"kind": "tool_completed"' in body
+        assert '"kind": "content"' in body
+        assert '"text": "tool-backed answer"' in body
+        assert '"kind": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    release = asyncio.Event()
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "owner"
+        yield "thinking", "正在连接模型和工具运行环境..."
+        await release.wait()
+        yield "content", "done"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        response = None
+        try:
+            post_task = asyncio.create_task(client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            }))
+            response = await asyncio.wait_for(post_task, timeout=0.2)
+            first_line = await asyncio.wait_for(response.content.readline(), timeout=0.2)
+            assert b'"kind": "thinking"' in first_line
+            assert "正在连接模型".encode("utf-8") in first_line
+            release.set()
+            body = await response.text()
+        finally:
+            release.set()
+            if response is not None:
+                response.close()
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert '"text": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_passes_messages_to_aiagent(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    expected_messages = [
+        {"role": "user", "content": "查看下明天的天气"},
+        {"role": "assistant", "content": "你在哪个城市？"},
+        {"role": "user", "content": "北京"},
+    ]
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert messages == expected_messages
+        yield "content", "北京明天的天气..."
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "北京",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+                "messages": expected_messages,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert '"text": "北京明天的天气..."' in body
+        assert '"kind": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_streams_thinking_separately(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "thinking", "The user wants me to call lark_cli first."
+        yield "tool_started", {"name": "lark_cli", "preview": "calendar --help"}
+        yield "tool_completed", {"name": "lark_cli", "duration": 0.12, "is_error": False}
+        yield "content", "日历已创建成功。"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "帮我创建一个日历",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "thinking"' in body
+        assert "The user wants me to call lark_cli first." in body
+        assert body.count('"kind": "content"') == 1
+        assert '"kind": "done"' in body
+        assert '"kind": "done", "text": ""' in body
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_endpoint_rejects_missing_bearer_key(monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -91,6 +322,85 @@ def test_webui_run_broker_endpoint_rejects_missing_bearer_key(monkeypatch):
         assert authorized.status == 200
 
     asyncio.run(runner())
+
+
+def test_webui_run_broker_event_preserves_webui_session_boundary():
+    from hermes_multitenancy.agent_real import _resolve_aiagent_session_id
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+    from hermes_multitenancy.run_models import RunRequest
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="feishu_group_dfe8bc83167b_e18e",
+        user_key="ou_webui",
+        content="hello",
+        session_id="matrix_t1_group_webui_doc_123",
+    )
+
+    event = _build_webui_event(request)
+    session_id = _resolve_aiagent_session_id(
+        event,
+        profile_home=types.SimpleNamespace(name=request.profile_name),
+        sender_open_id=request.user_key,
+    )
+
+    assert event.source.platform.value == "webui"
+    assert event.raw_event["session_id"] == "matrix_t1_group_webui_doc_123"
+    assert "platform:webui" in session_id
+    assert "session:matrix_t1_group_webui_doc_123" in session_id
+    assert "platform:feishu" not in session_id
+
+
+def test_run_broker_loads_only_shared_runtime_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "HERMES_MULTITENANCY_CREDENTIAL_KEY=vault-key",
+                "HERMES_LARK_CLI_APP_ID=cli_public",
+                "FEISHU_APP_SECRET=must-not-load",
+                "ANTHROPIC_API_KEY=model-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(shared))
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    loaded = load_run_broker_shared_env()
+
+    assert loaded == {
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY": "vault-key",
+        "HERMES_LARK_CLI_APP_ID": "cli_public",
+    }
+    assert os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "vault-key"
+    assert os.environ["HERMES_LARK_CLI_APP_ID"] == "cli_public"
+    assert "FEISHU_APP_SECRET" not in os.environ
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_run_broker_shared_env_does_not_override_existing_secret(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / ".env").write_text(
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY=file-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(shared))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "process-key")
+
+    loaded = load_run_broker_shared_env()
+
+    assert loaded == {}
+    assert os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] == "process-key"
 
 
 def _install_fake_cron(monkeypatch):
