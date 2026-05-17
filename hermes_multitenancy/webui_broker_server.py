@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
@@ -21,12 +22,75 @@ from .run_models import RunEvent, RunRequest
 logger = logging.getLogger(__name__)
 
 DispatchAgent = Callable[[RunRequest], Awaitable[str] | str]
+EmitRunEvent = Callable[[RunEvent], Awaitable[None] | None]
 MarkSeen = Callable[[RunRequest], bool]
 SandboxAvailable = Callable[[], bool]
 
 _runner: Any = None
 _site: Any = None
 _server_task: Optional[asyncio.Task] = None
+
+_RUN_BROKER_SHARED_ENV_KEYS = frozenset(
+    {
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+        "HERMES_CREDENTIAL_KEY",
+        "HERMES_LARK_CLI_APP_ID",
+        "HERMES_LARK_CLI_BRAND",
+        "HERMES_LARK_CLI_DEFAULT_AS",
+        "HERMES_LARK_CLI_STRICT_MODE",
+    }
+)
+
+
+def _shared_home_from_env() -> Path:
+    configured = os.environ.get("HERMES_SHARED_HOME") or os.environ.get("HERMES_HOME")
+    return Path(configured or (Path.home() / ".hermes")).expanduser()
+
+
+def _dotenv_values(path: Path) -> dict[str, str]:
+    try:
+        from dotenv import dotenv_values
+
+        return {
+            str(key): str(value)
+            for key, value in dotenv_values(path).items()
+            if key and value is not None
+        }
+    except Exception:
+        values: dict[str, str] = {}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return values
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key:
+                values[key] = value
+        return values
+
+
+def load_run_broker_shared_env(shared_home: Path | None = None) -> dict[str, str]:
+    """Load only Run Broker control-plane env from shared ``.env``.
+
+    A standalone local Run Broker may be started by launchd without the parent
+    gateway's vault env. It still needs the credential-vault key to mint bot
+    tokens through the lark-cli auth broker, but it must not import broad model
+    keys or raw Feishu app secrets into process env.
+    """
+    env_path = (shared_home or _shared_home_from_env()) / ".env"
+    values = _dotenv_values(env_path)
+    loaded: dict[str, str] = {}
+    for key in sorted(_RUN_BROKER_SHARED_ENV_KEYS):
+        value = str(values.get(key) or "").strip()
+        if value and not os.environ.get(key):
+            os.environ[key] = value
+            loaded[key] = value
+    return loaded
 
 
 def _truthy_env(name: str) -> bool:
@@ -113,9 +177,13 @@ def _build_webui_event(request: RunRequest) -> Any:
         message_id=request.message_id,
         channel="webui",
         source=SimpleNamespace(
+            platform=SimpleNamespace(value=request.channel),
             user_id=request.user_key,
             open_id=request.user_key,
             user_id_alt=None,
+            chat_id=request.chat_id or "",
+            chat_type="webui",
+            message_id=request.message_id or "",
         ),
         raw_event={
             "channel": request.channel,
@@ -125,12 +193,98 @@ def _build_webui_event(request: RunRequest) -> Any:
     )
 
 
-async def _default_dispatch_agent(request: RunRequest) -> str:
+async def _default_dispatch_agent(
+    request: RunRequest,
+    *,
+    emit_event: Optional[EmitRunEvent] = None,
+) -> str:
+    # Plan-A surgical fix (user-approved 2026-05-17). Keeps the streaming path
+    # so tool_started/tool_completed/thinking frames reach the WebUI (the
+    # tool-call panel beside the avatar) — those emit paths were already
+    # correct. The ONLY defect was: content frames were merely accumulated and
+    # then RETURNED, so RunBroker.run re-emitted the whole answer a second time
+    # (duplicated answer + reasoning leaking into content). Fix: emit each
+    # content delta as a content frame (single delivery), and return "" so
+    # RunBroker.run's `if content:` is skipped and never re-emits. Only when
+    # nothing streamed at all do we fall back to a one-shot run (emitted once
+    # by RunBroker, no duplication possible since no frames were sent).
     from . import router as router_mod
+    from .agent_real import real_run_agent, stream_run_agent
+    from .runtime import _PROFILE_HOME_VAR
 
     profile_home = router_mod._profile_name_to_home(request.profile_name)
     event = _build_webui_event(request)
-    return await router_mod._get_pool().dispatch(request.profile_name, profile_home, event)
+    if emit_event is None:
+        return await router_mod._get_pool().dispatch(request.profile_name, profile_home, event)
+
+    content_parts: list[str] = []
+    token = _PROFILE_HOME_VAR.set(profile_home)
+    try:
+        messages = request.messages or None
+        async for kind, payload in stream_run_agent(event, profile_home, messages=messages):
+            if kind == "content":
+                text = str(payload or "")
+                if text:
+                    content_parts.append(text)
+                    await _maybe_await(
+                        emit_event(
+                            RunEvent(
+                                kind="content",
+                                text=text,
+                                payload={"text": text},
+                            )
+                        )
+                    )
+                continue
+            if kind == "thinking":
+                text = str(payload or "")
+                if text:
+                    await _maybe_await(
+                        emit_event(
+                            RunEvent(
+                                kind="thinking",
+                                text=text,
+                                payload={"text": text},
+                            )
+                        )
+                    )
+                continue
+            if kind == "tool_started":
+                tool_payload = dict(payload or {}) if isinstance(payload, dict) else {"preview": payload}
+                await _maybe_await(
+                    emit_event(
+                        RunEvent(
+                            kind="tool_started",
+                            name=str(tool_payload.get("name") or ""),
+                            payload=tool_payload,
+                        )
+                    )
+                )
+                continue
+            if kind == "tool_completed":
+                tool_payload = dict(payload or {}) if isinstance(payload, dict) else {"output": payload}
+                await _maybe_await(
+                    emit_event(
+                        RunEvent(
+                            kind="tool_completed",
+                            name=str(tool_payload.get("name") or ""),
+                            payload=tool_payload,
+                        )
+                    )
+                )
+                continue
+            if kind in {"approval_required", "approval_resolved"}:
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
+                await _maybe_await(emit_event(RunEvent(kind=kind, payload=event_payload)))
+
+        if "".join(content_parts).strip():
+            # Answer already delivered via streamed content frames above.
+            # Return "" so RunBroker.run does NOT emit it a second time.
+            return ""
+        # Nothing streamed — fall back to one-shot; RunBroker emits it once.
+        return await real_run_agent(event, profile_home, messages=messages)
+    finally:
+        _PROFILE_HOME_VAR.reset(token)
 
 
 def _default_mark_seen(request: RunRequest) -> bool:
@@ -169,32 +323,57 @@ def create_run_broker_app(
                 credential_subject=payload.get("credential_subject"),
                 requires_host_tools=bool(payload.get("requires_host_tools")),
                 metadata=payload.get("metadata") or {},
+                messages=payload.get("messages") or [],
             )
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
-        events: list[RunEvent] = []
+        try:
+            admission_broker = RunBroker(
+                dispatch_agent=lambda _req: "",
+                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+                sandbox_available=sandbox_available or _default_sandbox_available,
+            )
+            admission = await admission_broker.admit(run_request)
+        except RunRejected as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+            },
+        )
+        await response.prepare(request)
 
         async def emit_event(event: RunEvent) -> None:
-            events.append(event)
+            await response.write(_event_to_sse(event).encode("utf-8"))
+
+        if admission.duplicate:
+            await emit_event(RunEvent(kind="done"))
+            await response.write_eof()
+            return response
+
+        broker_dispatch = dispatch_agent or (
+            lambda req: _default_dispatch_agent(req, emit_event=emit_event)
+        )
 
         broker = RunBroker(
-            dispatch_agent=dispatch_agent or _default_dispatch_agent,
+            dispatch_agent=broker_dispatch,
             emit_event=emit_event,
             mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
         )
 
         try:
-            await broker.run(run_request)
-        except RunRejected as exc:
-            return web.json_response({"error": str(exc)}, status=403)
+            await broker.run(run_request, admitted=True)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
-            events.append(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
-
-        body = "".join(_event_to_sse(event) for event in events)
-        return web.Response(text=body, content_type="text/event-stream")
+            await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
+        finally:
+            await response.write_eof()
+        return response
 
     async def handle_list_jobs(request):
         if not _authorized(request):
