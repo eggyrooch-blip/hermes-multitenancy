@@ -1,6 +1,6 @@
 ---
 title: hermes-multitenancy 架构指南
-updated: 2026-05-15
+updated: 2026-05-17
 status: living
 scope: /Users/kite/code/hermes-multitenancy（plugin 真源；通过 ~/.hermes/plugins/multitenancy symlink 被 hermes-agent 加载）
 audience: 后续 Claude / 用户本人；改这个仓前必读
@@ -17,6 +17,13 @@ sources:
 > 本 GUIDE 是 hermes-multitenancy 仓的"内部地图"。每个章节都是为"下一次改它的人"写的——着重锚点、契约、陷阱，而不是教科书介绍。
 >
 > 上游主仓 `hermes-feishu-uat` 的 GUIDE 把"飞书 inbound → adapter → hook"那段讲完了。**本 GUIDE 重点从 multitenancy plugin 被加载/触发开始**：inbound 由 `pre_gateway_dispatch` 接管；cron delivery 则由 gateway startup watcher 启动 multi-profile worker，不再依赖先有一条 inbound 消息。
+
+> [!warning] 2026-05-17 WebUI/API Server toolset resolution
+> `agent_real._run_with_aiagent()` 现在按事件来源解析平台：WebUI broker 事件使用 `platform_key="webui"`，不再硬编码成 Feishu。Hermes core 没有原生 `webui` 平台默认工具，因此 `webui` 在解析默认工具时复用 `api_server` 的默认工具集。生成/归一化 profile 时仍让 `platform_toolsets.feishu=["lark-cli"]` 且 `toolsets_mode=explicit`，但新增 `multitenancy.platform_toolsets_mode`：`feishu=explicit`、`api_server/webui=merge_default`。这样 Feishu 入口继续只把长尾 OAPI 收敛到 `lark_cli`，WebUI/API Server 则恢复 `terminal/file/web/browser/skills/session_search/todo/...` 等核心能力并额外保留 `lark-cli`。`coder` 这类薄 profile 还会从 shared `~/.hermes/config.yaml` 继承 `model.default`，避免 WebUI Run Broker 子进程报 `profile config missing model.default`。
+>
+> 同日续修 WebUI 多轮上下文：`RunRequest` contract 新增 `messages: list[dict]`，`webui_broker_server.handle_run()` 从 WebUI BFF 接收历史消息并传给 `_default_dispatch_agent()`；默认 dispatch 再把 `messages` 传入 `stream_run_agent(..., messages=...)` / `real_run_agent(..., messages=...)`。这样 WebUI Run Broker 不再只把当前用户输入交给 AIAgent，后续追问可以读取前一轮工具结果和回答。这个字段是 channel-neutral contract 的一部分，Feishu/cron 未传时保持空列表兼容。
+>
+> 2026-05-17 18:00 追加 fallback 配置继承修正：前一轮只保证 `_run_with_aiagent()` 使用 `_load_profile_config()`，但 `stream_run_agent()` 的 legacy stream fallback 和 `_legacy_real_run_agent()` 仍直接读 profile-local `config.yaml`。当 WebUI Run Broker 走 thin profile（例如 `coder`）且本地 config 不含 `model.default` 时，主 AIAgent subprocess 与 fallback 行为会分裂，日志出现 `profile config missing model.default` 或 `streaming exhausted`。现在两个 fallback 入口都改为 `_load_profile_config(profile_home)`，继承 shared `~/.hermes/config.yaml` 的模型配置；新增 `test_stream_run_agent_inherits_shared_model_config` 与 `test_legacy_real_run_agent_inherits_shared_model_config` 覆盖。验证：`tests/test_webui_broker_server.py tests/test_aiagent_subprocess.py` 为 92 passed。
 
 > [!warning] 2026-05-14 cron/sandbox 修正
 > multi-profile cron worker 在存在 `multitenancy.db` 时只扫描 `active=1` 的 routed profile，避免 inactive 历史 profile（例如旧 `feishu_ou_*`）继续执行遗留 job。Linux bwrap policy 也不再把整个 shared `~/.hermes` 只读挂入 profile subprocess；它只创建 shared 目录骨架，并挂载当前 `PROFILE_HOME` 与明确允许的 shared 文件/目录，从而避免 agent 枚举 sibling profiles。追加部署 `726c79c` / `af285d4` 后，profile `.env/auth.json` 在 bwrap 启动前由父进程读取并转换为 AIAgent env，bwrap 内 shared `.env/auth.json/auth.lock` 用 `/dev/null` 遮蔽；profile `.env` 若是 shared symlink 不直接 bind 遮蔽，避免 bwrap spawn 失败，读取面由 hermes-agent 的 file tool 拒绝与 terminal hardline 兜底。
@@ -1910,3 +1917,43 @@ WebUI /api/auth/feishu/callback
 - **Caddy 证书过期前**：`certutil`/openssl 验证新证书 SAN + key 匹配，然后 cp + restorecon + reload
 - **全栈重启顺序**：`hermes-gateway.service` 先起 → `hermes-web-ui.service` 再起 → `caddy.service` 最后
 - **数据备份位置**：`~/.hermes/multitenancy.db`（routing + sessions）+ `~/.hermes/profiles/*/state.db`（per-profile sessions/messages）+ `~/.hermes/feishu_uat/*.json`（UAT tokens）
+
+### E.9 本机 lark-cli 薄接入验证（2026-05-16）
+
+本机 `hermes-multitenancy` 的 Feishu profile 默认只暴露 `lark-cli` 工具集；不再把 `skills`、`session_search`、`todo` 放进 Feishu/Lark 能力主路径，避免自然语言请求绕去技能/历史/计划工具后误判 `lark_cli` 不可用。群 profile 使用 `lark_cli` 时默认 bot identity，个人 profile 由 runtime 自动选择 user/bot。AIAgent 子进程固定从 `<profile>/workspace` 启动，避免 sandbox 下继承仓库 cwd 后 `os.getcwd()` 被拒；macOS sandbox 允许访问 localhost auth broker，并只允许 signal 自己派生的 children 来清理超时子进程。
+
+Run Broker / AIAgent 只从 shared `.env` 读取 lark-cli 控制面 allowlist：`HERMES_MULTITENANCY_CREDENTIAL_KEY`、`HERMES_CREDENTIAL_KEY`、`HERMES_LARK_CLI_APP_ID`、`HERMES_LARK_CLI_BRAND`、`HERMES_LARK_CLI_DEFAULT_AS`、`HERMES_LARK_CLI_STRICT_MODE`；不会把 `FEISHU_APP_SECRET` 或模型 API key 注入 profile runtime。若 `lark_cli` 返回 credential unavailable、validation、unsupported 或权限错误，profile SOUL 要求停止重试并如实反馈，不再循环试探命令。
+
+本机验证矩阵（2026-05-16 05:45）：
+
+| 场景 | 覆盖 | 结果 |
+|---|---:|---|
+| T1 群 profile WebUI → 群 bot lark-cli | 25 能力 x 3 消息 = 75 行 | ✅ 67 pass / 8 blocked / 0 fail；blocked 均为 user-only 或群 bot 前置条件，如 `task +get-my-tasks` 仅支持 user |
+| T2 群 profile 飞书真机 → 群 bot lark-cli | 25 能力 x 3 消息 = 75 行 | ✅ 66 pass / 9 blocked / 0 fail；真机创建文档 `YoKqdGHzfoJi2MxVf5Nc6pIln1e`，群搜索命中 `oc_dfe8bc83167b092e138e4b4e6ac9ade5` |
+| T3 `sunke` profile WebUI → user lark-cli | 25 能力 x 3 消息 = 75 行 | ✅ 72 pass / 3 blocked / 0 fail；真创建 Base/Doc/Markdown/Sheet/Slides，standup 工作流返回 3 日程 + 3 任务 |
+| T4 `sunke` profile 飞书 UAT → user lark-cli | 25 能力 x 3 消息 = 75 行 | ✅ 72 pass / 3 blocked / 0 fail；真机创建文档 `UHPadVNMKot3mrx19cqc2Z0nnrc`，standup 工作流返回 3 日程 + 3 任务 |
+
+总计 300 行：277 pass / 23 blocked / 0 fail / 0 missing。blocked 均为明确身份、scope 或产品前置条件：群 bot 不能替代用户 UAT 访问用户私有任务/会议/联系人；`sunke` 的 `drive +search` 缺 `search:docs:read`；`mail +triage` 受邮箱未绑定/未启用影响；`auth status` 在 Hermes 外部注入 credential 模式下不能做交互式管理枚举。
+
+2026-05-16 19:55 追加展示层修正：WebUI/API Server 的 run-broker 不能丢弃 AIAgent `thinking`，也不能把它当普通 content；正确边界是 multitenancy 继续输出 `RunEvent(kind="thinking")`，WebUI adapter 再映射成 upstream 前端原生支持的 `reasoning.delta`。这样小姑娘/思考区仍按上游 MessageList/MessageItem 展示，最终回答只来自 `content`，不会把 thinking 拼进 `run.completed.output`。对应回归：`tests/test_webui_broker_server.py::test_webui_run_broker_default_dispatch_streams_thinking_separately` 和 WebUI `tests/server/chat-run-socket.test.ts`。
+
+证据文件：`docs/lark-cli-capability-matrix-20260516.md`、`/tmp/hermes-lark-cli-matrix/t1-known-fails-rerun-20260516-0408.jsonl`、`t2-full-batch-a-20260516-0410.jsonl`、`t2-full-batch-b-20260516-0415.jsonl`、`t2-full-batch-c-20260516-0435.jsonl`、`t2-shared3-final2-20260516-0545.jsonl`、`t3-webui-full-fixed-20260516.jsonl`、`t3-tail-fixed-20260516-040306.jsonl`、`t4-full-batch-a-20260516-0448.jsonl`、`t4-full-batch-b-20260516-0455.jsonl`、`t4-full-batch-c-20260516-0504.jsonl`、`t4-final-cleanup-20260516-0535.jsonl`、`t4-slides3-final-20260516-0542.jsonl`。验证口径：群聊普通消息未 @bot 不会触发 bot 事件；带 @bot 的 lark-cli 用户消息可以进入飞书事件网关，可作为本机自动化真机回归。launchd 运行边界：启用 `ai.hermes.gateway-multitenancy_router`；裸 `ai.hermes.gateway` 需要保持禁用，否则两个 gateway 会通过 `gateway run --replace` 互相抢全局 gateway 进程。
+
+### E.10 WebUI Run Broker 实时展示修复（2026-05-17 本机）
+
+本机 `hermes-multitenancy` 的 WebUI Run Broker `/api/run-broker/runs` 必须边跑边 flush SSE，不能等 `RunBroker.run()` 完成后一次性返回 body。否则 WebUI 在模型或工具结束前看不到 thinking/tool 状态，表现为小姑娘动图旁边没有 terminal/lark-cli panel，或完成后才跳到错误位置。
+
+实现边界：
+
+- `webui_broker_server.create_run_broker_app()` 先做 admission，再创建 `aiohttp.web.StreamResponse`，`emit_event()` 直接 `response.write(_event_to_sse(event))`。
+- duplicate admission 只流式发 `done` 后结束；正常路径用 `broker.run(..., admitted=True)`，避免重复 admission。
+- `_default_dispatch_agent()` 对 `stream_run_agent()` 的 `content` frame 直接转成 `RunEvent(kind="content")` 发给 WebUI，并返回空字符串，避免 RunBroker 再把完整 answer 追加一遍。
+- `_stream_aiagent_subprocess()` 在子进程首个 stdout 事件前只写服务端等待日志，不再把 `正在连接模型和工具运行环境...` / `仍在等待模型或工具返回...` 当作 `thinking` 下发。等待心跳不是模型 reasoning；发给 WebUI 会被 upstream 原生 `reasoning.delta` 渲染成多条“思考过程”。
+- `_tool_event_callback()` 只把真实 `_thinking` 流映射为 `thinking`；Hermes core 的 `reasoning.available` 是可见答案预览，不是私有 reasoning，本机 WebUI 路径忽略它，避免工具调用后把最终答复复制成第二段 thinking。
+
+回归：
+
+- `/Users/kite/.hermes/hermes-feishu-uat/venv/bin/python -m pytest -q tests/test_aiagent_subprocess.py tests/test_webui_broker_server.py`：95 passed。
+- 本机 Chrome fresh session 通过 WebUI 发送 `printf FRESH_TOOL_PANEL_OK`，terminal card 在 thinking gif 右侧实时出现，完成后只保留一张 tool card 并接最终回复。
+- 2026-05-17 夜间追加：等待 heartbeat 不再落成 reasoning，`reasoning.available` 预览不再作为 thinking 发给 WebUI；WebUI 侧同步回归验证工具流应为一个 thinking、工具卡、一个结果消息。
+- 同轮追加 WebUI 第三刀：Run Broker 可能先发 `tool_started preview="generating arguments"`，再用同一个 `tool_call_id` 发真实 `args`；WebUI BFF 现在会用后续真实参数更新已有 assistant tool-call envelope，前端只把 `running` 工具保留在 gif 旁 active panel，`done/error` 工具立即进入消息流内完成态 panel，避免最终答案 streaming 时底部残留第二个 terminal。WebUI focused 回归 `27 passed`，build 成功；本机 DB canary `STREAM_FINAL_OK` 已确认参数持久化为真实 command。临时 Chrome/CDP 复核 `STREAM_CHROME_AUDIT_OK` 完成态无 streaming indicator；慢工具 `STREAM_SLOW_START; sleep 5; STREAM_SLOW_DONE` 运行中 terminal item 位于 active streaming panel，完成后迁移到 transcript trace。
