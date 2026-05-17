@@ -47,6 +47,37 @@ def test_apply_soft_deletes_missing(table):
     assert table.count_active() == 1
 
 
+def test_apply_soft_delete_missing_keeps_group_rows_active(table):
+    """US-02 regression: soft_delete_missing must not delete kind='group' rows.
+
+    A full org sync (soft_delete_missing=True) reconciles only user rows;
+    group profiles must survive even though they are absent from the desired
+    Feishu employee list. Without the kind-scoped snapshot in
+    ``_desired_and_current`` the group row is soft-deleted (data loss).
+    """
+    from hermes_multitenancy.sync import UserSpec, apply_users
+
+    table.upsert(user_id="u1", profile_name="alice", open_id="ou_1")
+    group_user_id = table.upsert_group(
+        chat_id="oc_grp1",
+        profile_name="feishu_group_oc_grp1",
+        owner_open_id="ou_owner",
+        display_label="owner-IT组",
+    )
+    assert group_user_id == "group:oc_grp1"
+
+    apply_users(
+        table,
+        [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")],
+        soft_delete_missing=True,
+    )
+
+    assert table.lookup_by_chat_id("oc_grp1") is not None
+    assert table.count_active(kind="group") == 1
+    assert table.lookup_by_open_id("ou_1") is not None
+    assert table.count_active(kind="user") == 1
+
+
 def test_apply_upserts_when_profile_changes(table):
     from hermes_multitenancy.sync import UserSpec, apply_users
     apply_users(table, [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")])
@@ -68,6 +99,21 @@ def test_apply_replaces_auto_provision_open_id_route_with_user_id_route(table):
     assert row.user_id == "alice"
     assert row.profile_name == "alice"
     assert table.count_active() == 1
+
+
+def test_apply_users_creates_sync_root_resolvable_by_open_id(table):
+    from hermes_multitenancy.sync import UserSpec, apply_users
+
+    stats = apply_users(
+        table,
+        [UserSpec(user_id="alice", profile_name="alice", open_id="ou_alice")],
+    )
+
+    assert stats == {"upserted": 1, "soft_deleted": 0, "kept": 0}
+    row = table.resolve_owner_root("ou_alice")
+    assert row is not None
+    assert row.user_id == "alice"
+    assert row.profile_name == "alice"
 
 
 def test_plan_users_is_dry_run(table):

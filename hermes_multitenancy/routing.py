@@ -59,19 +59,23 @@ _NEW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("chat_id", "TEXT"),
     ("owner_open_id", "TEXT"),
     ("display_label", "TEXT"),
+    ("agent_id", "TEXT"),
+    ("upstream_profile", "TEXT"),
+    ("provenance", "TEXT NOT NULL DEFAULT 'auto'"),
 )
 
 # Old (pre-group) index name to drop before recreating a kind-aware version.
 _LEGACY_OPEN_ID_INDEX = "idx_routing_open_id_active"
 
-_NEW_INDEXES = (
-    # User rows: at most one active row per open_id. Group rows are exempt so
-    # multiple group profiles can share NULL/empty open_id.
+_NEW_INDEXES: tuple[tuple[str, str], ...] = (
+    # Sync-root user rows: at most one active row per open_id. Auto/group rows
+    # are exempt so one owner can accumulate multiple owned agents.
     (
         "idx_routing_open_id_active_user",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_open_id_active_user "
         "ON multitenancy_routing(open_id) "
-        "WHERE active = 1 AND kind = 'user' AND open_id IS NOT NULL",
+        "WHERE active = 1 AND kind = 'user' AND provenance = 'sync' "
+        "AND open_id IS NOT NULL",
     ),
     # Group rows: at most one active row per chat_id. User rows are exempt.
     (
@@ -90,6 +94,22 @@ _NEW_INDEXES = (
         "CREATE INDEX IF NOT EXISTS idx_routing_owner_open_id "
         "ON multitenancy_routing(owner_open_id, kind) "
         "WHERE active = 1 AND owner_open_id IS NOT NULL",
+    ),
+    # Agent selection uses agent_id as the stable handle, so active rows must
+    # stay globally unique when agent_id is populated by migration/backfill.
+    (
+        "idx_routing_agent_id_active",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_agent_id_active "
+        "ON multitenancy_routing(agent_id) "
+        "WHERE active = 1 AND agent_id IS NOT NULL",
+    ),
+    # Group/user agent listings derive the immediate upstream profile through
+    # this column, so keep active non-NULL values cheaply queryable.
+    (
+        "idx_routing_upstream",
+        "CREATE INDEX IF NOT EXISTS idx_routing_upstream "
+        "ON multitenancy_routing(upstream_profile) "
+        "WHERE active = 1 AND upstream_profile IS NOT NULL",
     ),
 )
 
@@ -153,8 +173,54 @@ class RoutingTable:
         # The replacement (idx_routing_open_id_active_user) keeps user-row
         # uniqueness while leaving group rows free.
         self._conn.execute(f"DROP INDEX IF EXISTS {_LEGACY_OPEN_ID_INDEX}")
+        self._conn.execute("DROP INDEX IF EXISTS idx_routing_open_id_active_user")
         for _name, sql in _NEW_INDEXES:
             self._conn.execute(sql)
+
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM multitenancy_routing "
+            "WHERE active = 1 AND agent_id IS NULL"
+        )
+        needs_backfill = int(cur.fetchone()[0]) > 0
+        if needs_backfill:
+            # Provenance must be derived from stable columns, not profile-name
+            # shape: router auto-provision writes user_id == open_id, while
+            # Feishu sync writes distinct user_id/open_id pairs; sync profile
+            # names only sometimes keep a `feishu_` prefix, so that string
+            # shape is a weak signal and not deterministic enough for migration.
+            self._conn.execute(
+                """
+                UPDATE multitenancy_routing
+                SET agent_id = user_id,
+                    owner_open_id = CASE
+                        WHEN kind = 'user' THEN COALESCE(owner_open_id, open_id)
+                        ELSE owner_open_id
+                    END,
+                    provenance = CASE
+                        WHEN kind = 'group' THEN 'group'
+                        WHEN kind = 'user' AND user_id = open_id THEN 'auto'
+                        ELSE 'sync'
+                    END
+                WHERE active = 1 AND agent_id IS NULL
+                """
+            )
+            self._conn.execute(
+                """
+                UPDATE multitenancy_routing
+                SET upstream_profile = (
+                    SELECT u.profile_name
+                    FROM multitenancy_routing AS u
+                    WHERE u.open_id = multitenancy_routing.owner_open_id
+                      AND u.active = 1
+                      AND u.kind = 'user'
+                    LIMIT 1
+                )
+                WHERE active = 1
+                  AND kind = 'group'
+                  AND upstream_profile IS NULL
+                  AND agent_id IS NOT NULL
+                """
+            )
 
     # -- read path (router) -----------------------------------------------
 
@@ -198,6 +264,20 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    def lookup_agent(self, agent_id: str) -> Optional[RoutingRow]:
+        """Return the active row for a stable agent_id, or None if missing.
+
+        Agent selection is owner-scoped at higher layers, but the lookup key
+        itself must resolve to exactly one active row across all route kinds.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE agent_id = ? AND active = 1 LIMIT 1",
+            (agent_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
     def lookup_by_chat_id(self, chat_id: str) -> Optional[RoutingRow]:
         """Return the active group row for chat_id, or None if missing.
 
@@ -212,20 +292,48 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
-    def list_by_owner(self, owner_open_id: str, *, kind: str = KIND_GROUP) -> list[RoutingRow]:
-        """Return all active rows belonging to ``owner_open_id``.
+    def resolve_owner_root(self, open_id: str) -> Optional[RoutingRow]:
+        """Return the deterministic sync-root user row for a login open_id.
 
-        Used by the Web UI to render the set of group profiles a given user
-        (the inviter) is permitted to operate. The owner_open_id is set when
-        a group route is provisioned and is immutable thereafter.
+        Login resolution must target the single sync-owned root, not any
+        auto-provisioned sibling rows that may share the same open_id.
         """
         cur = self._conn.execute(
             "SELECT * FROM multitenancy_routing "
-            "WHERE owner_open_id = ? AND active = 1 AND kind = ? "
-            "ORDER BY created_at ASC",
-            (owner_open_id, kind),
+            "WHERE open_id = ? AND active = 1 "
+            "AND kind = 'user' AND provenance = 'sync' LIMIT 1",
+            (open_id,),
         )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
+    def list_by_owner(
+        self, owner_open_id: str, *, kind: str | None = None
+    ) -> list[RoutingRow]:
+        """Return all active rows belonging to ``owner_open_id``.
+
+        Owner-scoped surfaces need the full active route set for a user, with
+        the sync root first and optional kind narrowing for legacy callers.
+        """
+        sql = (
+            "SELECT * FROM multitenancy_routing "
+            "WHERE owner_open_id = ? AND active = 1"
+        )
+        params: list[str] = [owner_open_id]
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY (provenance = 'sync') DESC, created_at ASC"
+        cur = self._conn.execute(sql, params)
         return [_row_to_dataclass(row) for row in cur.fetchall()]
+
+    def list_agents_for_owner(self, open_id: str) -> list[RoutingRow]:
+        """Return every active agent owned by ``open_id``.
+
+        This named wrapper makes owner-wide agent enumeration explicit for
+        login-resolution and Web UI call sites that should not imply groups-only.
+        """
+        return self.list_by_owner(open_id, kind=None)
 
     def touch_active(self, open_id: str) -> None:
         """Update last_active_at — router-only, does NOT bump version."""
@@ -254,6 +362,7 @@ class RoutingTable:
         profile_name: str,
         open_id: str,
         union_id: Optional[str] = None,
+        provenance: str = "auto",
     ) -> None:
         """Insert or refresh a USER route. Bumps version, sets synced_at to now."""
         now = _now()
@@ -261,8 +370,8 @@ class RoutingTable:
             """
             INSERT INTO multitenancy_routing
                 (user_id, profile_name, open_id, union_id, active,
-                 synced_at, version, created_at, updated_at, kind)
-            VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?, 'user')
+                 synced_at, version, created_at, updated_at, kind, provenance)
+            VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?, 'user', ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 profile_name = excluded.profile_name,
                 open_id      = excluded.open_id,
@@ -272,9 +381,10 @@ class RoutingTable:
                 synced_at    = excluded.synced_at,
                 version      = version + 1,
                 updated_at   = excluded.updated_at,
-                kind         = 'user'
+                kind         = 'user',
+                provenance   = excluded.provenance
             """,
-            (user_id, profile_name, open_id, union_id, now, now, now),
+            (user_id, profile_name, open_id, union_id, now, now, now, provenance),
         )
         self._conn.commit()
 
