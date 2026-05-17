@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from hermes_multitenancy.routing import KIND_GROUP
 
 
 @pytest.fixture
@@ -169,9 +170,9 @@ def test_list_by_owner_returns_only_owned_groups(table):
         owner_open_id="ou_alice",
         display_label="alice-C",
     )
-    sunke_groups = table.list_by_owner("ou_sunke")
+    sunke_groups = table.list_by_owner("ou_sunke", kind=KIND_GROUP)
     assert {r.chat_id for r in sunke_groups} == {"oc_a", "oc_b"}
-    alice_groups = table.list_by_owner("ou_alice")
+    alice_groups = table.list_by_owner("ou_alice", kind=KIND_GROUP)
     assert {r.chat_id for r in alice_groups} == {"oc_c"}
 
 
@@ -187,7 +188,7 @@ def test_list_by_owner_skips_soft_deleted(table):
         owner_open_id="ou_sunke",
     )
     table.soft_delete_group("oc_a")
-    assert {r.chat_id for r in table.list_by_owner("ou_sunke")} == {"oc_b"}
+    assert {r.chat_id for r in table.list_by_owner("ou_sunke", kind=KIND_GROUP)} == {"oc_b"}
 
 
 def test_touch_active_group_updates_timestamp(table):
