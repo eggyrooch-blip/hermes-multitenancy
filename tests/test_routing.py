@@ -80,6 +80,49 @@ def test_touch_active_does_not_bump_version(table):
     assert row.version == 1, "router-side touch must not bump sync version"
 
 
+def test_pending_inviter_put_get_clear_round_trip(table):
+    table.put_pending_inviter("oc_pending", "ou_pending")
+
+    assert table.get_pending_inviter("oc_pending") == "ou_pending"
+
+    table.clear_pending_inviter("oc_pending")
+    assert table.get_pending_inviter("oc_pending") is None
+
+
+def test_pending_inviter_prune_is_explicit_and_deterministic(table):
+    table.put_pending_inviter("oc_expired", "ou_expired")
+    table.put_pending_inviter("oc_fresh", "ou_fresh")
+    table._conn.execute(
+        "UPDATE multitenancy_pending_group_inviter SET created_at = ? WHERE chat_id = ?",
+        (10, "oc_expired"),
+    )
+    table._conn.execute(
+        "UPDATE multitenancy_pending_group_inviter SET created_at = ? WHERE chat_id = ?",
+        (200, "oc_fresh"),
+    )
+    table._conn.commit()
+
+    # get_pending_inviter returns the raw stored value; TTL is enforced only
+    # when callers explicitly prune.
+    assert table.get_pending_inviter("oc_expired") == "ou_expired"
+
+    deleted = table.prune_pending_inviters(now=120, ttl_seconds=100)
+
+    assert deleted == 1
+    assert table.get_pending_inviter("oc_expired") is None
+    assert table.get_pending_inviter("oc_fresh") == "ou_fresh"
+
+
+def test_put_pending_inviter_ignores_empty_inputs(table):
+    table.put_pending_inviter("", "ou_pending")
+    table.put_pending_inviter("oc_pending", "")
+
+    cur = table._conn.execute(
+        "SELECT COUNT(*) FROM multitenancy_pending_group_inviter"
+    )
+    assert int(cur.fetchone()[0]) == 0
+
+
 def test_unique_sync_root_among_active(table):
     """US-04 narrowed invariant: at most one active *sync-root* user row per
     open_id. The unique index is intentionally narrowed to

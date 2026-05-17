@@ -2329,6 +2329,22 @@ def register_chat_inviter(
             _chat_inviter_cache.pop(cid, None)
         while len(_chat_inviter_cache) > _CHAT_INVITER_CACHE_MAX:
             _chat_inviter_cache.popitem(last=False)
+    try:
+        table = _get_routing_table()
+        if table is None:
+            logger.debug(
+                "multitenancy: pending inviter store unavailable for chat_id=%s",
+                chat_id,
+            )
+            return
+        table.put_pending_inviter(chat_id, inviter_open_id)
+        table.prune_pending_inviters(int(now), _CHAT_INVITER_CACHE_TTL_S)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: failed to persist pending inviter chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
 
 
 def _resolve_group_inviter_from_cache(chat_id: str) -> Optional[dict[str, Any]]:
@@ -2393,18 +2409,37 @@ async def _provision_group_route(
     table = _get_routing_table()
     if table is None:
         return None, None
-    cached = _resolve_group_inviter_from_cache(chat_id)
-    if not cached or not _is_feishu_open_id(cached.get("inviter_open_id")):
+    inviter_open_id: Optional[str] = None
+    chat_name: Optional[str] = None
+    inviter_display: Optional[str] = None
+    try:
+        table.prune_pending_inviters(
+            int(time.time()),
+            _CHAT_INVITER_CACHE_TTL_S,
+        )
+        pending_inviter = table.get_pending_inviter(chat_id)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: pending inviter lookup failed chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
+        pending_inviter = None
+    if _is_feishu_open_id(pending_inviter):
+        inviter_open_id = str(pending_inviter)
+    else:
+        cached = _resolve_group_inviter_from_cache(chat_id)
+        if cached and _is_feishu_open_id(cached.get("inviter_open_id")):
+            inviter_open_id = cached["inviter_open_id"]
+            chat_name = cached.get("chat_name")
+            inviter_display = cached.get("inviter_display")
+    if not inviter_open_id:
         logger.warning(
             "multitenancy: cannot auto-provision group route chat_id=%s "
             "(bot_added inviter not captured — re-add the bot to retry)",
             chat_id,
         )
         return None, None
-
-    inviter_open_id: str = cached["inviter_open_id"]
-    chat_name: Optional[str] = cached.get("chat_name")
-    inviter_display: Optional[str] = cached.get("inviter_display")
 
     if not chat_name:
         chat_name = await _fetch_chat_name(chat_id, gateway) or chat_id
@@ -2447,6 +2482,14 @@ async def _provision_group_route(
     # Eagerly evict the cache entry so a later bot-removal + re-add cycle
     # repopulates from the fresh event rather than reusing stale chat_name.
     _pop_chat_inviter(chat_id)
+    try:
+        table.clear_pending_inviter(chat_id)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: failed to clear pending inviter chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
     return profile_name, profile_home
 
 

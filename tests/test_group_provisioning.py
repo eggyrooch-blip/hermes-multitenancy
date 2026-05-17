@@ -351,7 +351,10 @@ async def test_resolve_auto_provisions_when_cache_has_inviter(isolated_router):
 
     class _Adapter:
         async def get_chat_info(self, chat_id):
-            return {"name": "ignored — cache wins"}
+            return {"name": "IT 组"}
+
+        async def get_user_name(self, open_id):
+            return "sunke"
 
     gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
     profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
@@ -366,6 +369,103 @@ async def test_resolve_auto_provisions_when_cache_has_inviter(isolated_router):
     assert row.display_label == "sunke-IT 组"
     # Cache is evicted post-provision so a future re-add starts fresh.
     assert "oc_new" not in router_mod._chat_inviter_cache
+
+
+@pytest.mark.asyncio
+async def test_provision_survives_router_restart_via_db_pending_inviter(isolated_router):
+    router_mod, _ = isolated_router
+    router_mod.register_chat_inviter(
+        "oc_restart", "ou_inviter", chat_name="IT", inviter_display="sunke"
+    )
+    router_mod._chat_inviter_cache.clear()
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "IT"}
+
+        async def get_user_name(self, open_id):
+            return "sunke"
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    profile_name, _profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_restart", gateway=gateway,
+    )
+
+    assert profile_name is not None
+    row = router_mod._get_routing_table().lookup_by_chat_id("oc_restart")
+    assert row is not None
+    assert row.owner_open_id == "ou_inviter"
+
+
+@pytest.mark.asyncio
+async def test_provision_prefers_db_inviter_over_empty_cache(isolated_router):
+    router_mod, _ = isolated_router
+    table = router_mod._get_routing_table()
+    table.put_pending_inviter("oc_dbonly", "ou_A")
+    router_mod._chat_inviter_cache.clear()
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "DB Only"}
+
+        async def get_user_name(self, open_id):
+            return "Owner A"
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    profile_name, _profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_dbonly", gateway=gateway,
+    )
+
+    assert profile_name is not None
+    row = router_mod._get_routing_table().lookup_by_chat_id("oc_dbonly")
+    assert row is not None
+    assert row.owner_open_id == "ou_A"
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_inviter_is_pruned_and_not_used_as_owner(isolated_router):
+    router_mod, _ = isolated_router
+    table = router_mod._get_routing_table()
+    table.put_pending_inviter("oc_expired", "ou_expired")
+    table._conn.execute(
+        "UPDATE multitenancy_pending_group_inviter SET created_at = ? WHERE chat_id = ?",
+        (1, "oc_expired"),
+    )
+    table._conn.commit()
+    deleted = table.prune_pending_inviters(
+        now=router_mod._CHAT_INVITER_CACHE_TTL_S + 2,
+        ttl_seconds=router_mod._CHAT_INVITER_CACHE_TTL_S,
+    )
+    router_mod._chat_inviter_cache.clear()
+
+    class _Adapter:
+        async def get_chat_info(self, chat_id):
+            return {"name": "Expired"}
+
+        async def get_user_name(self, open_id):
+            return "Expired Owner"
+
+    gateway = SimpleNamespace(adapters={"feishu": _Adapter()})
+    profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_expired", gateway=gateway,
+    )
+
+    assert deleted == 1
+    assert table.get_pending_inviter("oc_expired") is None
+    assert profile_name is None
+    assert profile_home is None
+    assert router_mod._get_routing_table().lookup_by_chat_id("oc_expired") is None
+
+
+def test_register_chat_inviter_survives_unavailable_pending_store(monkeypatch):
+    from hermes_multitenancy import router as router_mod
+
+    router_mod._chat_inviter_cache.clear()
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: None)
+
+    router_mod.register_chat_inviter("oc_x", "ou_inviter")
+
+    assert "oc_x" in router_mod._chat_inviter_cache
 
 
 @pytest.mark.asyncio

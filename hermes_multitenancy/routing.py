@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS multitenancy_routing (
     owner_open_id  TEXT,
     display_label  TEXT
 );
+
+-- Pending inviter capture closes the restart / multi-worker hazard between
+-- Feishu bot.added and the first @mention. It lives on the same SQLite
+-- connection as the main routing table so WAL, busy_timeout, and :memory:
+-- tests all observe one shared durable hand-off surface.
+CREATE TABLE IF NOT EXISTS multitenancy_pending_group_inviter (
+    chat_id          TEXT PRIMARY KEY NOT NULL,
+    inviter_open_id  TEXT NOT NULL,
+    created_at       INTEGER NOT NULL
+);
 """
 
 # Idempotent migrations for databases created by an earlier schema. SQLite
@@ -352,6 +362,61 @@ class RoutingTable:
             (_now(), chat_id),
         )
         self._conn.commit()
+
+    def put_pending_inviter(self, chat_id: str, inviter_open_id: str) -> None:
+        """Upsert the latest pending inviter hand-off for a group chat.
+
+        Empty ``chat_id`` / ``inviter_open_id`` are ignored so the Feishu
+        ``bot.added`` hook can stay best-effort and never crash callers.
+        """
+        if not chat_id or not inviter_open_id:
+            return
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_pending_group_inviter
+                (chat_id, inviter_open_id, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                inviter_open_id = excluded.inviter_open_id,
+                created_at = excluded.created_at
+            """,
+            (chat_id, inviter_open_id, now),
+        )
+        self._conn.commit()
+
+    def get_pending_inviter(self, chat_id: str) -> Optional[str]:
+        """Return the raw stored inviter_open_id for ``chat_id``, if any.
+
+        This getter intentionally applies no TTL logic: callers must prune
+        explicitly via ``prune_pending_inviters`` at their natural boundaries
+        so expiry stays visible, testable, and deterministic.
+        """
+        cur = self._conn.execute(
+            "SELECT inviter_open_id FROM multitenancy_pending_group_inviter "
+            "WHERE chat_id = ? LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        return str(row["inviter_open_id"]) if row is not None else None
+
+    def clear_pending_inviter(self, chat_id: str) -> None:
+        """Delete a pending inviter hand-off row for ``chat_id`` if present."""
+        self._conn.execute(
+            "DELETE FROM multitenancy_pending_group_inviter WHERE chat_id = ?",
+            (chat_id,),
+        )
+        self._conn.commit()
+
+    def prune_pending_inviters(self, now: int, ttl_seconds: int) -> int:
+        """Delete expired pending inviter rows and return how many were removed."""
+        cur = self._conn.execute(
+            "DELETE FROM multitenancy_pending_group_inviter "
+            "WHERE created_at < ?",
+            (now - ttl_seconds,),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     # -- write path (feishu-sync) ----------------------------------------
 
