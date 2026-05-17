@@ -78,6 +78,48 @@ def test_apply_soft_delete_missing_keeps_group_rows_active(table):
     assert table.count_active(kind="user") == 1
 
 
+def test_apply_soft_delete_missing_keeps_non_sync_agent_rows_active(table):
+    """US-05 regression: full sync must soft-delete only sync-origin user rows.
+
+    Auto-provisioned user rows and future self-built agent rows are outside the
+    Feishu org snapshot ownership boundary, so a full org sync must keep them
+    active even when they are absent from the desired employee list.
+    """
+    from hermes_multitenancy.sync import UserSpec, apply_users
+
+    apply_users(table, [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")])
+    table.upsert(user_id="ou_auto", profile_name="ou_auto", open_id="ou_auto")
+    table.upsert_group(
+        chat_id="oc_grp1",
+        profile_name="feishu_group_oc_grp1",
+        owner_open_id="ou_owner",
+        display_label="sunke-IT组",
+    )
+
+    auto_row = table._conn.execute(
+        "SELECT provenance FROM multitenancy_routing WHERE user_id = ?",
+        ("ou_auto",),
+    ).fetchone()
+    assert auto_row["provenance"] == "auto"
+
+    apply_users(
+        table,
+        [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")],
+        soft_delete_missing=True,
+    )
+
+    auto_row_after = table._conn.execute(
+        "SELECT active, provenance FROM multitenancy_routing WHERE user_id = ?",
+        ("ou_auto",),
+    ).fetchone()
+    assert auto_row_after["active"] == 1
+    assert auto_row_after["provenance"] == "auto"
+    assert table.lookup_by_open_id("ou_auto") is not None
+    assert table.lookup_by_chat_id("oc_grp1") is not None
+    assert table.count_active(kind="group") == 1
+    assert table.lookup_by_open_id("ou_1") is not None
+
+
 def test_apply_upserts_when_profile_changes(table):
     from hermes_multitenancy.sync import UserSpec, apply_users
     apply_users(table, [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")])
