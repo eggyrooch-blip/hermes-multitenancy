@@ -607,3 +607,241 @@ def test_webui_run_broker_jobs_reject_invalid_profile(monkeypatch, tmp_path):
         assert body == {"error": "invalid profile_name"}
 
     asyncio.run(runner())
+
+
+def test_webui_run_broker_owner_header_agent_id_resolves_owned_profile(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    # An owned non-root agent has its own open_id (router auto-provision writes
+    # user_id == open_id) and an owner_open_id pointing back at the owner — the
+    # production-equivalent state the routing backfill / self-agent provisioning
+    # produces. Sharing the owner's open_id here would make the backfill rewrite
+    # both rows to provenance='sync', tripping the one-sync-root-per-open_id
+    # unique index — an invalid topology, not a real ownership case.
+    seeded.upsert(
+        user_id="agent-owned",
+        profile_name="owned_agent_profile",
+        open_id="agent-owned",
+        provenance="auto",
+    )
+    seeded._conn.execute(
+        "UPDATE multitenancy_routing SET owner_open_id = 'ou_owner' "
+        "WHERE user_id = 'agent-owned'"
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            table = router_mod._get_routing_table()
+            assert table is not None
+            owned = table.lookup_agent("agent-owned")
+            assert owned is not None
+            assert owned.owner_open_id == "ou_owner"
+
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                    "X-Hermes-Agent-Id": " agent-owned ",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "user_key": "ou_webui",
+                    "content": "hello owner gate",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owned_agent_profile"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_owner_header_rejects_cross_owner_agent_id(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-agent",
+        profile_name="other_agent_profile",
+        open_id="ou_other",
+        provenance="auto",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            table = router_mod._get_routing_table()
+            assert table is not None
+            assert table.lookup_agent("other-agent") is not None
+
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "agent_id": "other-agent",
+                    "user_key": "ou_webui",
+                    "content": "hello owner gate",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "does not belong" in body
+        assert seen == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_owner_header_without_agent_id_resolves_sync_root(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "user_key": "ou_webui",
+                    "content": "hello owner root",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owner_sync_profile"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_without_owner_header_keeps_legacy_profile_resolution():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "legacy_client_profile",
+                "agent_id": "ignored-without-owner-header",
+                "user_key": "ou_webui",
+                "content": "hello legacy path",
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "legacy_client_profile"
+
+    asyncio.run(runner())

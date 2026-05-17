@@ -26,6 +26,9 @@ EmitRunEvent = Callable[[RunEvent], Awaitable[None] | None]
 MarkSeen = Callable[[RunRequest], bool]
 SandboxAvailable = Callable[[], bool]
 
+_OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
+_AGENT_ID_HEADER = "X-Hermes-Agent-Id"
+
 _runner: Any = None
 _site: Any = None
 _server_task: Optional[asyncio.Task] = None
@@ -152,6 +155,62 @@ def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
         "profile_name": request.query.get("profile_name") or request.query.get("profile"),
         "user_key": request.query.get("user_key") or request.query.get("user"),
     }
+
+
+def _resolve_owner_scoped_profile(
+    request: Any,
+    payload: dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve broker profile_name from a server-asserted owner boundary.
+
+    `X-Hermes-Owner-Open-Id` is trusted only when it arrives as a request
+    header. The WebUI BFF HMAC-verifies Feishu identity in
+    `hermes-web-ui/packages/server/src/services/request-context.ts:41-69`
+    (`verifyTrustedFeishuHeaders`), derives `WebUser.openid`, and forwards the
+    verified owner to this localhost-only broker on the same trust basis as the
+    shared bearer checked by `_authorized`. This mirrors the existing
+    server-stamped-owner pattern in
+    `hermes-web-ui/packages/server/src/controllers/hermes/jobs.ts:73-99`
+    (`normalizeChatPlaneJobBody`): client owner fields are stripped and the
+    verified openid is re-injected server-side. Client-supplied `profile_name`
+    remains a compatibility field, but it is never trusted for ownership when
+    the trusted owner header is present.
+    """
+    trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+    if not trusted_owner:
+        return None, None
+
+    from . import router as router_mod
+
+    table = router_mod._get_routing_table()
+    if table is None:
+        # Fail closed: a trusted owner assertion without routing state cannot be
+        # verified safely, so never fall back to client-supplied profile_name.
+        return None, "trusted owner header requires routing table verification"
+
+    agent_id = str(
+        request.headers.get(_AGENT_ID_HEADER)
+        or payload.get("agent_id")
+        or ""
+    ).strip()
+    owner_root = table.resolve_owner_root(trusted_owner)
+
+    if agent_id:
+        row = table.lookup_agent(agent_id)
+        if row is None or not row.active:
+            return None, f"agent_id '{agent_id}' is not accessible for asserted owner"
+        matches_owner_root = (
+            owner_root is not None
+            and row.user_id == owner_root.user_id
+            and row.profile_name == owner_root.profile_name
+        )
+        if row.owner_open_id != trusted_owner and not matches_owner_root:
+            return None, f"agent_id '{agent_id}' does not belong to asserted owner"
+        return row.profile_name, None
+
+    if owner_root is None:
+        return None, f"asserted owner '{trusted_owner}' has no sync-root profile"
+    return owner_root.profile_name, None
 
 
 async def _maybe_await(value):
@@ -310,9 +369,12 @@ def create_run_broker_app(
 
         try:
             payload = await request.json()
+            resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+            if resolution_error is not None:
+                return web.json_response({"error": resolution_error}, status=403)
             run_request = RunRequest(
                 channel=payload.get("channel"),
-                profile_name=payload.get("profile_name") or payload.get("profile"),
+                profile_name=resolved_profile_name or payload.get("profile_name") or payload.get("profile"),
                 user_key=payload.get("user_key") or payload.get("user"),
                 content=payload.get("content"),
                 chat_id=payload.get("chat_id"),
