@@ -1,8 +1,249 @@
-# US-07 group-chat owner isolation — hermes-web-ui patch
-# Generated 2026-05-17T18:52:05Z from branch chore/merge-upstream-20260511
+# US-07 + US-08 multi-user isolation — hermes-web-ui patch
+# Generated 2026-05-17T19:12:37Z from branch chore/merge-upstream-20260511
 # Apply from hermes-web-ui repo root: git apply <this file>
-# Scope: 3 modified + 2 new files (group-chat isolation only)
-# ---- MODIFIED FILES ----
+# US-07: group-chat owner isolation. US-08: kanban BFF owner gating.
+# ---- MODIFIED ----
+diff --git a/packages/server/src/controllers/hermes/kanban.ts b/packages/server/src/controllers/hermes/kanban.ts
+index 185a5ec..1206325 100644
+--- a/packages/server/src/controllers/hermes/kanban.ts
++++ b/packages/server/src/controllers/hermes/kanban.ts
+@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises'
+ import { resolve, normalize } from 'path'
+ import { homedir } from 'os'
+ import * as kanbanCli from '../../services/hermes/hermes-kanban'
++import { ownerOwnsProfile } from '../../services/hermes/agent-ownership'
+ import {
+   searchSessionSummariesWithProfile,
+   getSessionDetailFromDbWithProfile,
+@@ -18,6 +19,39 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
+   return Array.isArray(value) ? value[0] : value
+ }
+ 
++function requireOpenId(ctx: Context): string | null {
++  const user = ctx.state.user as { openid?: string } | undefined
++  if (!user?.openid) {
++    ctx.status = 401
++    ctx.body = { error: 'Unauthorized' }
++    return null
++  }
++  return user.openid
++}
++
++// Per-request memoized ownership check so a multi-task list opens the
++// multitenancy DB at most once per distinct profile, not once per task.
++function makeOwnershipCache(openid: string): (profile: string | null | undefined) => boolean {
++  const cache = new Map<string, boolean>()
++  return (profile) => {
++    if (!profile || !profile.trim()) return false
++    const key = profile.trim()
++    const cached = cache.get(key)
++    if (cached !== undefined) return cached
++    const owned = ownerOwnsProfile(openid, key)
++    cache.set(key, owned)
++    return owned
++  }
++}
++
++// A task is visible to openid when it owns the agent profile that the task
++// is attributed to. Prefer the stronger created_by signal when the CLI
++// populated it; otherwise fall back to the assignee↔owned-agent mapping.
++function taskOwnedBy(task: { assignee: string | null; created_by?: string | null }, isOwned: (p: string | null | undefined) => boolean): boolean {
++  if (task.created_by && task.created_by.trim()) return isOwned(task.created_by)
++  return isOwned(task.assignee)
++}
++
+ function requestBoard(ctx: Context): string | null {
+   try {
+     return kanbanCli.normalizeBoardSlug(firstQueryValue(ctx.query.board as string | string[] | undefined))
+@@ -29,6 +63,8 @@ function requestBoard(ctx: Context): string | null {
+ }
+ 
+ export async function listBoards(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const includeArchived = firstQueryValue(ctx.query.includeArchived as string | string[] | undefined) === 'true'
+   try {
+     const boards = await kanbanCli.listBoards({ includeArchived })
+@@ -40,6 +76,8 @@ export async function listBoards(ctx: Context) {
+ }
+ 
+ export async function createBoard(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { slug, name, description, icon, color, switchCurrent } = ctx.request.body as {
+     slug?: string
+     name?: string
+@@ -63,6 +101,8 @@ export async function createBoard(ctx: Context) {
+ }
+ 
+ export async function archiveBoard(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const slug = ctx.params.slug
+   if (!slug?.trim()) {
+     ctx.status = 400
+@@ -79,6 +119,8 @@ export async function archiveBoard(ctx: Context) {
+ }
+ 
+ export async function capabilities(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   try {
+     const capabilities = await kanbanCli.getCapabilities()
+     ctx.body = { capabilities }
+@@ -89,12 +131,15 @@ export async function capabilities(ctx: Context) {
+ }
+ 
+ export async function list(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { status, assignee, tenant } = ctx.query as Record<string, string | undefined>
+   const board = requestBoard(ctx)
+   if (!board) return
+   try {
+     const tasks = await kanbanCli.listTasks({ board, status, assignee, tenant })
+-    ctx.body = { tasks }
++    const isOwned = makeOwnershipCache(openid)
++    ctx.body = { tasks: tasks.filter(task => taskOwnedBy(task, isOwned)) }
+   } catch (err: any) {
+     ctx.status = 500
+     ctx.body = { error: err.message }
+@@ -102,6 +147,8 @@ export async function list(ctx: Context) {
+ }
+ 
+ export async function get(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const board = requestBoard(ctx)
+   if (!board) return
+   try {
+@@ -111,6 +158,12 @@ export async function get(ctx: Context) {
+       ctx.body = { error: 'Task not found' }
+       return
+     }
++    const isOwned = makeOwnershipCache(openid)
++    if (!taskOwnedBy(detail.task, isOwned)) {
++      ctx.status = 404
++      ctx.body = { error: 'Task not found' }
++      return
++    }
+ 
+     // For completed tasks, find related session from the worker's profile DB
+     if (detail.task.status === 'done' && detail.runs.length > 0) {
+@@ -163,6 +216,8 @@ export async function get(ctx: Context) {
+ }
+ 
+ export async function create(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { title, body, assignee, priority, tenant } = ctx.request.body as {
+     title?: string
+     body?: string
+@@ -178,7 +233,8 @@ export async function create(ctx: Context) {
+   const board = requestBoard(ctx)
+   if (!board) return
+   try {
+-    const task = await kanbanCli.createTask(title, { board, body, assignee, priority, tenant })
++    const effectiveTenant = tenant ?? openid
++    const task = await kanbanCli.createTask(title, { board, body, assignee, priority, tenant: effectiveTenant })
+     ctx.body = { task }
+   } catch (err: any) {
+     ctx.status = 500
+@@ -187,6 +243,8 @@ export async function create(ctx: Context) {
+ }
+ 
+ export async function complete(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { task_ids, summary } = ctx.request.body as {
+     task_ids?: string[]
+     summary?: string
+@@ -208,6 +266,8 @@ export async function complete(ctx: Context) {
+ }
+ 
+ export async function block(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { reason } = ctx.request.body as { reason?: string }
+   if (!reason) {
+     ctx.status = 400
+@@ -226,6 +286,8 @@ export async function block(ctx: Context) {
+ }
+ 
+ export async function unblock(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { task_ids } = ctx.request.body as { task_ids?: string[] }
+   if (!task_ids?.length) {
+     ctx.status = 400
+@@ -244,12 +306,19 @@ export async function unblock(ctx: Context) {
+ }
+ 
+ export async function assign(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { profile } = ctx.request.body as { profile?: string }
+   if (!profile) {
+     ctx.status = 400
+     ctx.body = { error: 'profile is required' }
+     return
+   }
++  if (!ownerOwnsProfile(openid, profile)) {
++    ctx.status = 403
++    ctx.body = { error: 'You do not own this agent profile' }
++    return
++  }
+   const board = requestBoard(ctx)
+   if (!board) return
+   try {
+@@ -262,6 +331,8 @@ export async function assign(ctx: Context) {
+ }
+ 
+ export async function stats(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const board = requestBoard(ctx)
+   if (!board) return
+   try {
+@@ -274,6 +345,8 @@ export async function stats(ctx: Context) {
+ }
+ 
+ export async function assignees(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const board = requestBoard(ctx)
+   if (!board) return
+   try {
+@@ -286,6 +359,8 @@ export async function assignees(ctx: Context) {
+ }
+ 
+ export async function readArtifact(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const filePath = ctx.query.path as string | undefined
+   if (!filePath) {
+     ctx.status = 400
+@@ -317,6 +392,8 @@ export async function readArtifact(ctx: Context) {
+ }
+ 
+ export async function searchSessions(ctx: Context) {
++  const openid = requireOpenId(ctx)
++  if (!openid) return
+   const { task_id, profile, q } = ctx.query as {
+     task_id?: string
+     profile?: string
+@@ -327,6 +404,11 @@ export async function searchSessions(ctx: Context) {
+     ctx.body = { error: 'task_id and profile are required' }
+     return
+   }
++  if (!ownerOwnsProfile(openid, profile)) {
++    ctx.status = 403
++    ctx.body = { error: 'You do not own this agent profile' }
++    return
++  }
+   try {
+     if (!q) {
+       const exactSessionId = await findLatestExactSessionIdWithProfile(task_id, profile)
 diff --git a/packages/server/src/db/hermes/schemas.ts b/packages/server/src/db/hermes/schemas.ts
 index 97fb5e6..272da52 100644
 --- a/packages/server/src/db/hermes/schemas.ts
@@ -322,7 +563,72 @@ index 4eb0897..665a45e 100644
          }
  
          // Persist member to SQLite
-# ---- NEW FILE: agent-ownership.ts ----
+diff --git a/tests/server/kanban-controller.test.ts b/tests/server/kanban-controller.test.ts
+index 3cfca03..864a604 100644
+--- a/tests/server/kanban-controller.test.ts
++++ b/tests/server/kanban-controller.test.ts
+@@ -55,10 +55,15 @@ vi.mock('../../packages/server/src/db/hermes/sessions-db', () => ({
+   findLatestExactSessionIdWithProfile: mockFindLatestExactSessionId,
+ }))
+ 
++vi.mock('../../packages/server/src/services/hermes/agent-ownership', () => ({
++  ownerOwnsProfile: () => true,
++}))
++
+ import * as ctrl from '../../packages/server/src/controllers/hermes/kanban'
+ 
+ function ctx(overrides: Record<string, any> = {}) {
+   return {
++    state: { user: { openid: 'ouX', profile: 'p' } },
+     query: {},
+     params: {},
+     request: { body: {} },
+@@ -75,7 +80,7 @@ describe('kanban controller', () => {
+ 
+   it('lists boards and tasks with explicit/default board context', async () => {
+     mockListBoards.mockResolvedValue([{ slug: 'default' }])
+-    mockListTasks.mockResolvedValue([{ id: 'task-1' }])
++    mockListTasks.mockResolvedValue([{ id: 'task-1', assignee: 'alice', created_by: null }])
+ 
+     const boardsCtx = ctx({ query: { includeArchived: 'true' } })
+     await ctrl.listBoards(boardsCtx)
+@@ -85,7 +90,7 @@ describe('kanban controller', () => {
+     const c = ctx({ query: { board: 'project-a', status: 'todo', assignee: 'alice', tenant: 'ops' } })
+     await ctrl.list(c)
+     expect(mockListTasks).toHaveBeenCalledWith({ board: 'project-a', status: 'todo', assignee: 'alice', tenant: 'ops' })
+-    expect(c.body).toEqual({ tasks: [{ id: 'task-1' }] })
++    expect(c.body).toEqual({ tasks: [{ id: 'task-1', assignee: 'alice', created_by: null }] })
+ 
+     mockCreateBoard.mockResolvedValue({ slug: 'project-b' })
+     const createBoardCtx = ctx({ request: { body: { slug: 'project-b', name: 'Project B', switchCurrent: false } } })
+@@ -111,7 +116,7 @@ describe('kanban controller', () => {
+ 
+   it('enriches completed task details using the latest run profile', async () => {
+     mockGetTask.mockResolvedValue({
+-      task: { id: 'task-1', status: 'done' },
++      task: { id: 'task-1', status: 'done', assignee: 'fresh', created_by: null },
+       runs: [{ profile: 'stale' }, { profile: 'fresh' }],
+       comments: [],
+       events: [],
+@@ -136,7 +141,7 @@ describe('kanban controller', () => {
+ 
+   it('prefers exact kanban-task session matches over later sessions that merely reference the task id', async () => {
+     mockGetTask.mockResolvedValue({
+-      task: { id: 't_348bfaaf', status: 'done' },
++      task: { id: 't_348bfaaf', status: 'done', assignee: 'default', created_by: null },
+       runs: [{ profile: 'default' }],
+       comments: [],
+       events: [],
+@@ -219,7 +224,7 @@ describe('kanban controller', () => {
+ 
+     const createCtx = ctx({ query: { board: 'project-a' }, request: { body: { title: 'Ship', body: 'x' } } })
+     await ctrl.create(createCtx)
+-    expect(mockCreateTask).toHaveBeenCalledWith('Ship', { board: 'project-a', body: 'x', assignee: undefined, priority: undefined, tenant: undefined })
++    expect(mockCreateTask).toHaveBeenCalledWith('Ship', { board: 'project-a', body: 'x', assignee: undefined, priority: undefined, tenant: 'ouX' })
+     expect(createCtx.body).toEqual({ task: { id: 'task-2' } })
+ 
+     const completeCtx = ctx({ query: { board: 'project-a' }, request: { body: { task_ids: ['task-1'], summary: 'done' } } })
+# ---- NEW: packages/server/src/services/hermes/agent-ownership.ts ----
 diff --git a/packages/server/src/services/hermes/agent-ownership.ts b/packages/server/src/services/hermes/agent-ownership.ts
 new file mode 100644
 index 0000000..4b9d8fb
@@ -405,7 +711,7 @@ index 0000000..4b9d8fb
 +
 +    return false
 +}
-# ---- NEW FILE: group-chat-isolation.test.ts ----
+# ---- NEW: tests/server/group-chat-isolation.test.ts ----
 diff --git a/tests/server/group-chat-isolation.test.ts b/tests/server/group-chat-isolation.test.ts
 new file mode 100644
 index 0000000..de7a244
@@ -879,5 +1185,260 @@ index 0000000..de7a244
 +    expect(nonOwnerCtx.body).toEqual({ error: 'Room not found' })
 +
 +    rmSync(join(multitenancyDbPath, '..'), { recursive: true, force: true })
++  })
++})
+# ---- NEW: tests/server/kanban-isolation.test.ts ----
+diff --git a/tests/server/kanban-isolation.test.ts b/tests/server/kanban-isolation.test.ts
+new file mode 100644
+index 0000000..eb3362b
+--- /dev/null
++++ b/tests/server/kanban-isolation.test.ts
+@@ -0,0 +1,248 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { DatabaseSync } from 'node:sqlite'
++import { mkdtempSync, rmSync } from 'fs'
++import { join } from 'path'
++import { tmpdir } from 'os'
++
++const mockListTasks = vi.hoisted(() => vi.fn())
++const mockGetTask = vi.hoisted(() => vi.fn())
++const mockCreateTask = vi.hoisted(() => vi.fn())
++const mockAssignTask = vi.hoisted(() => vi.fn())
++const mockSearchSessions = vi.hoisted(() => vi.fn())
++const mockGetSessionDetail = vi.hoisted(() => vi.fn())
++const mockGetExactSessionDetail = vi.hoisted(() => vi.fn())
++const mockFindLatestExactSessionId = vi.hoisted(() => vi.fn())
++
++vi.mock('../../packages/server/src/services/hermes/hermes-kanban', () => ({
++  normalizeBoardSlug: (board?: string | null) => {
++    const value = board?.trim() || 'default'
++    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(value)) throw new Error('Invalid kanban board slug')
++    return value
++  },
++  listTasks: mockListTasks,
++  getTask: mockGetTask,
++  createTask: mockCreateTask,
++  assignTask: mockAssignTask,
++}))
++
++vi.mock('../../packages/server/src/db/hermes/sessions-db', () => ({
++  searchSessionSummariesWithProfile: mockSearchSessions,
++  getSessionDetailFromDbWithProfile: mockGetSessionDetail,
++  getExactSessionDetailFromDbWithProfile: mockGetExactSessionDetail,
++  findLatestExactSessionIdWithProfile: mockFindLatestExactSessionId,
++}))
++
++const originalEnv = process.env
++
++function createRoutingDb() {
++  const dir = mkdtempSync(join(tmpdir(), 'kanban-isolation-'))
++  const dbPath = join(dir, 'multitenancy.db')
++  const db = new DatabaseSync(dbPath)
++
++  try {
++    db.exec(`
++      CREATE TABLE multitenancy_routing (
++        user_id TEXT PRIMARY KEY,
++        profile_name TEXT NOT NULL,
++        open_id TEXT NOT NULL,
++        owner_open_id TEXT,
++        provenance TEXT,
++        active INTEGER NOT NULL DEFAULT 1
++      )
++    `)
++
++    db.prepare(`
++      INSERT INTO multitenancy_routing (user_id, profile_name, open_id, owner_open_id, provenance, active)
++      VALUES (?, ?, ?, ?, ?, ?)
++    `).run('user-ouA', 'profA', 'ouA', 'ouA', 'sync', 1)
++  } finally {
++    db.close()
++  }
++
++  return { dir, dbPath }
++}
++
++function ctx({
++  openid,
++  query = {},
++  params = {},
++  body = {},
++}: {
++  openid?: string
++  query?: Record<string, any>
++  params?: Record<string, any>
++  body?: Record<string, any>
++} = {}) {
++  return {
++    state: openid ? { user: { openid } } : {},
++    query,
++    params,
++    request: { body },
++    status: 200,
++    body: null,
++  } as any
++}
++
++async function loadController(multitenancyDbPath: string) {
++  vi.resetModules()
++  process.env = { ...originalEnv, HERMES_MULTITENANCY_DB: multitenancyDbPath }
++  return import('../../packages/server/src/controllers/hermes/kanban')
++}
++
++describe('kanban owner isolation', () => {
++  let dbDir = ''
++  let dbPath = ''
++
++  beforeEach(() => {
++    vi.clearAllMocks()
++    const db = createRoutingDb()
++    dbDir = db.dir
++    dbPath = db.dbPath
++  })
++
++  afterEach(() => {
++    process.env = originalEnv
++    if (dbDir) {
++      rmSync(dbDir, { recursive: true, force: true })
++      dbDir = ''
++      dbPath = ''
++    }
++    vi.clearAllMocks()
++  })
++
++  it('filters task list by owned assignee and excludes null assignee tasks', async () => {
++    mockListTasks.mockResolvedValue([
++      { id: 't1', assignee: 'profA', created_by: null },
++      { id: 't2', assignee: 'profB', created_by: null },
++      { id: 't3', assignee: null, created_by: null },
++    ])
++    const ctrl = await loadController(dbPath)
++
++    const c = ctx({ openid: 'ouA' })
++    await ctrl.list(c)
++
++    expect(c.status).toBe(200)
++    expect(c.body.tasks).toEqual([{ id: 't1', assignee: 'profA', created_by: null }])
++  })
++
++  it('enforces ownership on assign and allows owned profile assignment', async () => {
++    mockAssignTask.mockResolvedValue(undefined)
++    const ctrl = await loadController(dbPath)
++
++    const denied = ctx({ openid: 'ouA', params: { id: 't1' }, body: { profile: 'profB' } })
++    await ctrl.assign(denied)
++    expect(denied.status).toBe(403)
++    expect(denied.body).toEqual({ error: 'You do not own this agent profile' })
++    expect(mockAssignTask).not.toHaveBeenCalled()
++
++    const allowed = ctx({ openid: 'ouA', params: { id: 't1' }, body: { profile: 'profA' } })
++    await ctrl.assign(allowed)
++    expect(allowed.status).toBe(200)
++    expect(allowed.body).toEqual({ ok: true })
++    expect(mockAssignTask).toHaveBeenCalledWith('t1', 'profA', { board: 'default' })
++  })
++
++  it('rejects searchSessions for an unowned profile', async () => {
++    const ctrl = await loadController(dbPath)
++
++    const c = ctx({ openid: 'ouA', query: { task_id: 't1', profile: 'profB' } })
++    await ctrl.searchSessions(c)
++
++    expect(c.status).toBe(403)
++    expect(c.body).toEqual({ error: 'You do not own this agent profile' })
++    expect(mockFindLatestExactSessionId).not.toHaveBeenCalled()
++    expect(mockSearchSessions).not.toHaveBeenCalled()
++  })
++
++  it('returns 401 for unauthenticated list, assign, get, searchSessions, and create requests', async () => {
++    const ctrl = await loadController(dbPath)
++
++    const listCtx = ctx()
++    await ctrl.list(listCtx)
++    expect(listCtx.status).toBe(401)
++    expect(listCtx.body).toEqual({ error: 'Unauthorized' })
++
++    const assignCtx = ctx({ params: { id: 't1' }, body: { profile: 'profA' } })
++    await ctrl.assign(assignCtx)
++    expect(assignCtx.status).toBe(401)
++    expect(assignCtx.body).toEqual({ error: 'Unauthorized' })
++
++    const getCtx = ctx({ params: { id: 't9' } })
++    await ctrl.get(getCtx)
++    expect(getCtx.status).toBe(401)
++    expect(getCtx.body).toEqual({ error: 'Unauthorized' })
++
++    const searchCtx = ctx({ query: { task_id: 't1', profile: 'profA' } })
++    await ctrl.searchSessions(searchCtx)
++    expect(searchCtx.status).toBe(401)
++    expect(searchCtx.body).toEqual({ error: 'Unauthorized' })
++
++    const createCtx = ctx({ body: { title: 'Ship' } })
++    await ctrl.create(createCtx)
++    expect(createCtx.status).toBe(401)
++    expect(createCtx.body).toEqual({ error: 'Unauthorized' })
++
++    expect(mockListTasks).not.toHaveBeenCalled()
++    expect(mockAssignTask).not.toHaveBeenCalled()
++    expect(mockGetTask).not.toHaveBeenCalled()
++    expect(mockFindLatestExactSessionId).not.toHaveBeenCalled()
++    expect(mockSearchSessions).not.toHaveBeenCalled()
++    expect(mockCreateTask).not.toHaveBeenCalled()
++  })
++
++  it('hides unowned task details and returns owned task details', async () => {
++    mockGetTask
++      .mockResolvedValueOnce({
++        task: { id: 't9', status: 'todo', assignee: 'profB', created_by: null },
++        runs: [],
++        comments: [],
++        events: [],
++      })
++      .mockResolvedValueOnce({
++        task: { id: 't9', status: 'todo', assignee: 'profA', created_by: null },
++        runs: [],
++        comments: [],
++        events: [],
++      })
++    const ctrl = await loadController(dbPath)
++
++    const denied = ctx({ openid: 'ouA', params: { id: 't9' } })
++    await ctrl.get(denied)
++    expect(denied.status).toBe(404)
++    expect(denied.body).toEqual({ error: 'Task not found' })
++
++    const allowed = ctx({ openid: 'ouA', params: { id: 't9' } })
++    await ctrl.get(allowed)
++    expect(allowed.status).toBe(200)
++    expect(allowed.body.task.id).toBe('t9')
++  })
++
++  it('prefers created_by ownership over assignee ownership in list results', async () => {
++    mockListTasks.mockResolvedValue([
++      { id: 'tc', assignee: 'profB', created_by: 'profA' },
++    ])
++    const ctrl = await loadController(dbPath)
++
++    const c = ctx({ openid: 'ouA' })
++    await ctrl.list(c)
++
++    expect(c.body.tasks).toEqual([{ id: 'tc', assignee: 'profB', created_by: 'profA' }])
++  })
++
++  it('uses the same assign handler to allow owned profiles and deny unowned profiles', async () => {
++    mockAssignTask.mockResolvedValue(undefined)
++    const ctrl = await loadController(dbPath)
++
++    const allowed = ctx({ openid: 'ouA', params: { id: 't1' }, body: { profile: 'profA' } })
++    await ctrl.assign(allowed)
++    expect(allowed.status).toBe(200)
++    expect(allowed.body).toEqual({ ok: true })
++    expect(mockAssignTask).toHaveBeenCalledTimes(1)
++
++    const denied = ctx({ openid: 'ouA', params: { id: 't1' }, body: { profile: 'profB' } })
++    await ctrl.assign(denied)
++    expect(denied.status).toBe(403)
++    expect(denied.body).toEqual({ error: 'You do not own this agent profile' })
++    expect(mockAssignTask).toHaveBeenCalledTimes(1)
 +  })
 +})

@@ -87,3 +87,11 @@
 - **TDD**：每个行为变更先写一个**没有修复就失败**的回归测试，实证 fail-without 再 pass-with。
 - **生产安全**：迁移幂等；US-02 必须先于 US-03 的 backfill；不碰远端 `10.2.14.249`。
 - **仓库边界诚实**：kanban tasks 表 schema 属 hermes CLI，BFF 层尽力 + 残留缺口明确标注，不过度承诺。
+
+## 6. US-08 看板隔离 — BFF 强制 vs 残留缺口（实现后确认）
+
+> 环境实测：本环境安装的 `hermes` CLI（`/Users/kite/.local/bin/hermes`）**没有 `kanban` 子命令**（子命令为 chat/model/gateway/cron/… 无 kanban）。因此 per-owner 任务隔离**无法在 DB/schema 层**实现——那属于本仓库集合之外的上游 hermes CLI。US-08 因此是 BFF（server controller）层的尽力边界，不是完整 DB 隔离。
+
+**BFF 层已强制**：每个 kanban 端点要求已验证的飞书 `openid`（否则 HTTP 401）；`assign`/`searchSessions` 拒绝调用者不拥有的 client 提供的 agent `profile`（HTTP 403）；`list` 只返回 `created_by`（CLI 填充时优先）或 `assignee` agent 为调用者拥有的任务；`get` 对非拥有任务返回 HTTP 404 使 task id 不可枚举；归属检查 fail-closed —— multitenancy routing DB 不可用时拒绝。
+
+**残留缺口**：真正的 per-owner 任务隔离与权威 create 归属需要上游 `hermes kanban` schema 支持（kanban tasks 表上的 owner 列），本环境不存在。因此：拥有共享 agent 的用户仍会看到分配给该 agent 的所有任务（无论谁创建）；`create` 只能在 client 未自带 tenant 时把已验证 openid 尽力写入 CLI `tenant` 字段——不是加密级 owner 绑定。闭合残留需上游 CLI 工作，超出本仓库集合范围。
