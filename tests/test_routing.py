@@ -778,6 +778,99 @@ def test_us03_backfill_provenance_and_owner(tmp_path):
     assert by_user_id["group:oc_x"]["upstream_profile"] == "psync"
 
 
+def test_us03_backfill_rolls_back_on_failure_and_recovers(monkeypatch, tmp_path):
+    import hermes_multitenancy.routing as routing_mod
+
+    db_path = tmp_path / "us03-rollback.db"
+    _create_legacy_db(db_path)
+    _insert_legacy_row(
+        db_path,
+        user_id="u_sync",
+        profile_name="psync",
+        open_id="ou_sync",
+        synced_at=100,
+        created_at=100,
+        updated_at=200,
+        kind="user",
+    )
+    _insert_legacy_row(
+        db_path,
+        user_id="group:oc_x",
+        profile_name="feishu_group_x",
+        open_id="",
+        synced_at=102,
+        created_at=102,
+        updated_at=202,
+        kind="group",
+        chat_id="oc_x",
+        owner_open_id="ou_sync",
+        display_label="IT Group",
+    )
+
+    original_connect = routing_mod.sqlite3.connect
+    failing_connections = []
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            object.__setattr__(self, "_real_conn", real_conn)
+            object.__setattr__(self, "rollback_calls", 0)
+
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+        def __setattr__(self, name, value):
+            if name in {"_real_conn", "rollback_calls"}:
+                object.__setattr__(self, name, value)
+                return
+            setattr(self._real_conn, name, value)
+
+        def execute(self, sql, params=()):
+            if "SET upstream_profile" in sql:
+                raise sqlite3.OperationalError("forced upstream backfill failure")
+            return self._real_conn.execute(sql, params)
+
+        def rollback(self):
+            self.rollback_calls += 1
+            return self._real_conn.rollback()
+
+    def failing_connect(*args, **kwargs):
+        conn = FailingConnection(original_connect(*args, **kwargs))
+        failing_connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(routing_mod.sqlite3, "connect", failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="forced upstream backfill failure"):
+        routing_mod.RoutingTable(db_path)
+
+    assert len(failing_connections) == 1
+    assert failing_connections[0].rollback_calls == 1
+    failing_connections[0].close()
+
+    monkeypatch.setattr(routing_mod.sqlite3, "connect", original_connect)
+    recovered = routing_mod.RoutingTable(db_path)
+    recovered.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = list(
+        conn.execute(
+            "SELECT user_id, agent_id, owner_open_id, provenance, upstream_profile "
+            "FROM multitenancy_routing WHERE active = 1 ORDER BY user_id"
+        ).fetchall()
+    )
+    conn.close()
+
+    by_user_id = {row["user_id"]: row for row in rows}
+    assert by_user_id["u_sync"]["agent_id"] == "u_sync"
+    assert by_user_id["u_sync"]["owner_open_id"] == "ou_sync"
+    assert by_user_id["u_sync"]["provenance"] == "sync"
+    assert by_user_id["group:oc_x"]["agent_id"] == "group:oc_x"
+    assert by_user_id["group:oc_x"]["owner_open_id"] == "ou_sync"
+    assert by_user_id["group:oc_x"]["provenance"] == "group"
+    assert by_user_id["group:oc_x"]["upstream_profile"] == "psync"
+
+
 def test_us03_scale_idempotency_1300_rows(tmp_path):
     from hermes_multitenancy.routing import RoutingTable
 

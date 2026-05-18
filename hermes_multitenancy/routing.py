@@ -199,44 +199,50 @@ class RoutingTable:
         )
         needs_backfill = int(cur.fetchone()[0]) > 0
         if needs_backfill:
-            # Provenance must be derived from stable columns, not profile-name
-            # shape: router auto-provision writes user_id == open_id, while
-            # Feishu sync writes distinct user_id/open_id pairs; sync profile
-            # names only sometimes keep a `feishu_` prefix, so that string
-            # shape is a weak signal and not deterministic enough for migration.
-            self._conn.execute(
-                """
-                UPDATE multitenancy_routing
-                SET agent_id = user_id,
-                    owner_open_id = CASE
-                        WHEN kind = 'user' THEN COALESCE(owner_open_id, open_id)
-                        ELSE owner_open_id
-                    END,
-                    provenance = CASE
-                        WHEN kind = 'group' THEN 'group'
-                        WHEN kind = 'user' AND user_id = open_id THEN 'auto'
-                        ELSE 'sync'
-                    END
-                WHERE active = 1 AND agent_id IS NULL
-                """
-            )
-            self._conn.execute(
-                """
-                UPDATE multitenancy_routing
-                SET upstream_profile = (
-                    SELECT u.profile_name
-                    FROM multitenancy_routing AS u
-                    WHERE u.open_id = multitenancy_routing.owner_open_id
-                      AND u.active = 1
-                      AND u.kind = 'user'
-                    LIMIT 1
+            self._conn.execute("BEGIN")
+            try:
+                # Provenance must be derived from stable columns, not profile-name
+                # shape: router auto-provision writes user_id == open_id, while
+                # Feishu sync writes distinct user_id/open_id pairs; sync profile
+                # names only sometimes keep a `feishu_` prefix, so that string
+                # shape is a weak signal and not deterministic enough for migration.
+                self._conn.execute(
+                    """
+                    UPDATE multitenancy_routing
+                    SET agent_id = user_id,
+                        owner_open_id = CASE
+                            WHEN kind = 'user' THEN COALESCE(owner_open_id, open_id)
+                            ELSE owner_open_id
+                        END,
+                        provenance = CASE
+                            WHEN kind = 'group' THEN 'group'
+                            WHEN kind = 'user' AND user_id = open_id THEN 'auto'
+                            ELSE 'sync'
+                        END
+                    WHERE active = 1 AND agent_id IS NULL
+                    """
                 )
-                WHERE active = 1
-                  AND kind = 'group'
-                  AND upstream_profile IS NULL
-                  AND agent_id IS NOT NULL
-                """
-            )
+                self._conn.execute(
+                    """
+                    UPDATE multitenancy_routing
+                    SET upstream_profile = (
+                        SELECT u.profile_name
+                        FROM multitenancy_routing AS u
+                        WHERE u.open_id = multitenancy_routing.owner_open_id
+                          AND u.active = 1
+                          AND u.kind = 'user'
+                        LIMIT 1
+                    )
+                    WHERE active = 1
+                      AND kind = 'group'
+                      AND upstream_profile IS NULL
+                      AND agent_id IS NOT NULL
+                    """
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     # -- read path (router) -----------------------------------------------
 

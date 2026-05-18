@@ -117,6 +117,10 @@ def _run_broker_key() -> str:
     return os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_KEY", "").strip()
 
 
+def _owner_enforcement_enabled() -> bool:
+    return _truthy_env("HERMES_MULTITENANCY_RUN_BROKER_SERVER")
+
+
 def _authorized(request: Any) -> bool:
     expected = _run_broker_key()
     if not expected:
@@ -178,6 +182,8 @@ def _resolve_owner_scoped_profile(
     """
     trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
     if not trusted_owner:
+        if _owner_enforcement_enabled():
+            return None, "owner identity required (X-Hermes-Owner-Open-Id)"
         return None, None
 
     from . import router as router_mod
@@ -636,6 +642,14 @@ def create_run_broker_app(
 async def start_run_broker_server() -> None:
     """Start the localhost broker sidecar in the current event loop."""
     global _runner, _site
+    if _truthy_env("HERMES_MULTITENANCY_RUN_BROKER_SERVER") and not _run_broker_key():
+        logger.critical(
+            "[multitenancy] WebUI run broker is enabled "
+            "(HERMES_MULTITENANCY_RUN_BROKER_SERVER) but "
+            "HERMES_MULTITENANCY_RUN_BROKER_KEY is empty; refusing to start an "
+            "unauthenticated multi-user broker"
+        )
+        raise SystemExit(1)
     if _runner is not None:
         return
 
