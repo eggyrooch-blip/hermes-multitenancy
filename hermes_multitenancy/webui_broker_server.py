@@ -378,17 +378,18 @@ def create_run_broker_app(
             resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
             if resolution_error is not None:
                 return web.json_response({"error": resolution_error}, status=403)
+            trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
             run_request = RunRequest(
                 channel=payload.get("channel"),
                 profile_name=resolved_profile_name or payload.get("profile_name") or payload.get("profile"),
-                user_key=payload.get("user_key") or payload.get("user"),
+                user_key=trusted_owner or payload.get("user_key") or payload.get("user"),
                 content=payload.get("content"),
                 chat_id=payload.get("chat_id"),
                 session_id=payload.get("session_id"),
                 message_id=payload.get("message_id"),
                 idempotency_key=payload.get("idempotency_key"),
                 delivery_mode=payload.get("delivery_mode") or "socket",
-                credential_subject=payload.get("credential_subject"),
+                credential_subject=trusted_owner or payload.get("credential_subject"),
                 requires_host_tools=bool(payload.get("requires_host_tools")),
                 metadata=payload.get("metadata") or {},
                 messages=payload.get("messages") or [],

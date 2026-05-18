@@ -9,7 +9,7 @@ description = "Multi-tenant Feishu routing for hermes-agent — one bot, N users
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [{name = "Hermes Multitenancy Contributors"}]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["hermes", "feishu", "lark", "multi-tenant", "agent", "plugin"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -18,7 +18,6 @@ classifiers = [
     "Operating System :: POSIX",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Communications :: Chat",
@@ -26,9 +25,10 @@ classifiers = [
 ]
 dependencies = [
     # hermes-agent provides the plugin host (PluginContext / pre_gateway_dispatch hook)
-    # plus all the FeishuAdapter/MessageEvent/RoutingTable types we extend. Pin
-    # narrowly: this plugin tracks hermes-agent's plugin contract closely.
-    "hermes-agent>=1.0",
+    # plus all the FeishuAdapter/MessageEvent/RoutingTable types we extend. Keep
+    # this aligned with the published Hermes Agent line; 0.14.0 is the current
+    # upgrade target, while 1.x has not been published yet.
+    "hermes-agent>=0.14,<1.0",
     "openai>=1.0",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",

@@ -330,6 +330,55 @@ def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypat
     ]
 
 
+def test_load_feishu_oapi_runtime_patches_legacy_uat_refresh_to_multitenancy(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+
+    refresh_calls: list[dict[str, object]] = []
+
+    def fake_refresh_uat_for_user(**kwargs):
+        refresh_calls.append(kwargs)
+        return {"access_token": "new-access"}
+
+    fake_feishu_uat_auth = types.ModuleType("hermes_multitenancy.feishu_uat_auth")
+    fake_feishu_uat_auth.refresh_uat_for_user = fake_refresh_uat_for_user
+    monkeypatch.setitem(sys.modules, "hermes_multitenancy.feishu_uat_auth", fake_feishu_uat_auth)
+
+    fake_feishu_auth = types.ModuleType("hermes_cli.feishu_auth")
+
+    def old_refresh_uat_for_user(*_args, **_kwargs):
+        raise AssertionError("old refresh implementation must not be called")
+
+    fake_feishu_auth.refresh_uat_for_user = old_refresh_uat_for_user
+    monkeypatch.setitem(sys.modules, "hermes_cli.feishu_auth", fake_feishu_auth)
+
+    fake_feishu_oapi = types.ModuleType("tools.feishu_oapi_client")
+    fake_feishu_oapi.sender_open_id_scope = agent_real._missing_sender_open_id_scope
+    fake_feishu_oapi.current_sender_open_id = agent_real._MissingCurrentSenderOpenId()
+    fake_feishu_oapi._resolve_feishu_credentials = lambda: ("cli", "secret", "feishu")
+    fake_feishu_oapi._load_uat = lambda _open_id=None: {}
+    fake_tools = types.ModuleType("tools")
+    fake_tools.feishu_oapi_client = fake_feishu_oapi
+    monkeypatch.setitem(sys.modules, "tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "tools.feishu_oapi_client", fake_feishu_oapi)
+
+    agent_real._load_feishu_oapi_runtime(profile_home)
+
+    result = fake_feishu_auth.refresh_uat_for_user("ou_owner", "legacy-client", "legacy-secret")
+
+    assert result == {"access_token": "new-access"}
+    assert refresh_calls == [{
+        "open_id": "ou_owner",
+        "client_id": "legacy-client",
+        "client_secret": "legacy-secret",
+        "shared_home": shared_home,
+        "force": True,
+    }]
+
+
 def test_credential_env_runtime_compat_loads_env_and_registers_passthrough(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy.credentials import CredentialStore
@@ -1009,6 +1058,16 @@ def test_resolve_enabled_toolsets_merges_webui_lark_cli_with_api_server_defaults
     }
 
 
+def test_resolve_enabled_toolsets_preserves_webui_core_tools_without_resolver():
+    from hermes_multitenancy import agent_real
+
+    assert agent_real._resolve_enabled_toolsets(
+        {"platform_toolsets": {"webui": ["lark-cli"]}},
+        "webui",
+        platform_tools_resolver=None,
+    ) == ["file", "lark-cli", "terminal", "web"]
+
+
 def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -1048,6 +1107,45 @@ def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp
     }
 
 
+def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "tools.feishu_oapi_client", raising=False)
+    tools_mod = types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            seen["user_message"] = user_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "lark-cli" in (seen["enabled_toolsets"] or [])
+    assert "terminal" in (seen["enabled_toolsets"] or [])
+    assert "file" in (seen["enabled_toolsets"] or [])
+    assert seen["user_message"] == "hello"
+
+
 def test_run_with_aiagent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -1085,6 +1183,48 @@ def test_run_with_aiagent_inherits_shared_model_config(monkeypatch, tmp_path: Pa
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert captured["model"] == "test-model"
+
+
+def test_run_with_aiagent_uses_webui_session_model_metadata(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/profile-default\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "profile-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "session-key")
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {
+        "metadata": {
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+        }
+    }
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured["model"] == "claude-sonnet-4-5"
+    assert captured["provider"] == "anthropic"
+    assert captured["api_key"] == "session-key"
 
 
 @pytest.mark.asyncio
