@@ -95,3 +95,13 @@
 **BFF 层已强制**：每个 kanban 端点要求已验证的飞书 `openid`（否则 HTTP 401）；`assign`/`searchSessions` 拒绝调用者不拥有的 client 提供的 agent `profile`（HTTP 403）；`list` 只返回 `created_by`（CLI 填充时优先）或 `assignee` agent 为调用者拥有的任务；`get` 对非拥有任务返回 HTTP 404 使 task id 不可枚举；归属检查 fail-closed —— multitenancy routing DB 不可用时拒绝。
 
 **残留缺口**：真正的 per-owner 任务隔离与权威 create 归属需要上游 `hermes kanban` schema 支持（kanban tasks 表上的 owner 列），本环境不存在。因此：拥有共享 agent 的用户仍会看到分配给该 agent 的所有任务（无论谁创建）；`create` 只能在 client 未自带 tenant 时把已验证 openid 尽力写入 CLI `tenant` 字段——不是加密级 owner 绑定。闭合残留需上游 CLI 工作，超出本仓库集合范围。
+
+## 7. 独立 branch review 后修订（M1 / M2 / 次要项）
+
+跨模型独立 critic review 抓到两个 §1.2/US-06/US-08 表述与实现不符之处,已修正:
+
+**M1 — P0-1 的真实封堵条件(修正 §1.2/US-06 的「已封堵」表述)**:US-06 的 owner 校验原本是 opt-in——无 `X-Hermes-Owner-Open-Id` 头时 broker 回退信任前端 `profile_name`,即原 P0-1 越权仍在。已改 fail-closed:`HERMES_MULTITENANCY_RUN_BROKER_SERVER` 启用时(生产),无可信 owner 头一律 403,绝不回退前端 profile;未启用时(默认,单元测试直接构造 app)保持 legacy 字节级不变(零回归)。并加启动卫:server 启用但 `HERMES_MULTITENANCY_RUN_BROKER_KEY` 为空 → 拒绝启动(空 key 会让 `_authorized` 对所有人放行)。**结论:P0-1 在生产配置(RUN_BROKER_SERVER 启用 + 必须有 KEY + fail-closed)下真正封堵;非生产/旧单租户调用方走 legacy。** 部署硬要求:多用户生产必须设 `HERMES_MULTITENANCY_RUN_BROKER_SERVER` 且 BFF run 路径转发已验证 openid 头。
+
+**M2 — 看板写动作按 id 跨 owner(补 §6 残留中遗漏的写穿透)**:`complete`/`block`/`unblock` 原仅校验登录、不校验任务归属,任何已登录员工可按 task-id 改别人任务。已加 `requireOwnedTasks`(复用与 list/get 同一 `created_by` 优先、`assignee` 兜底的 BFF 尽力归属信号),整批 all-or-nothing fail-closed:任一请求任务非己有 → 403,不部分执行。仍是 BFF 尽力(非 DB 级,需上游 CLI),但写穿透已堵且不再是未披露残留。
+
+**次要**:`_migrate` US-03 backfill 已包 BEGIN/try/rollback(幂等与二次 no-op 不变);backfill provenance 启发式(`user_id==open_id→auto`)对生产数据形态正确,极端边界下次全量 `pull-feishu` 自愈(建议迁移后立即手动跑一次兜底);沙箱 `localhost:*` 出站因 auth-sidecar 用临时端口无法静态收窄,属已知接受项;`readArtifact` 路径包含检查经独立调试确认 fail-closed 无误(此前一个失败是测试对 `os.homedir` mock 泄漏脆弱,已 pin 修复,实现未动)。预存红点 `test_lark_cli_canary_preflight::test_preflight_reports_missing_vault_key_without_traceback` 在改动前后全套跑均红、单跑绿,系无关测试污染,非本次引入——`ftask ship` 测试门会因它误红,勿误判。
