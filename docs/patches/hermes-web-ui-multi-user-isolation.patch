@@ -1769,3 +1769,22 @@ index 0000000..4787202
 +    expect(mockReadFile).not.toHaveBeenCalled()
 +  })
 +})
+
+# ---- M1 BFF run-path: forward verified owner openid to fail-closed broker ----
+# COORDINATION NOTE: chat-run-socket.ts has concurrent third-party uncommitted
+# WIP (~600 lines, not ours). This 2-line hunk is generated against clean HEAD
+# and is NOT committed in hermes-web-ui to avoid entangling/corrupting that WIP.
+# Apply after that WIP lands, OR the BFF author threads X-Hermes-Owner-Open-Id
+# (= socket.data.user.openid, HMAC-verified) onto the /api/run-broker/runs POST.
+# Without it, the now-fail-closed broker 403s WebUI runs in multi-user prod.
+--- a/packages/server/src/services/hermes/chat-run-socket.ts
++++ b/packages/server/src/services/hermes/chat-run-socket.ts
+@@ -1703,6 +1703,8 @@
+     try {
+       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+       if (config.runBrokerKey) headers.Authorization = `Bearer ${config.runBrokerKey}`
++      const ownerOpenId = (socket.data?.user?.openid as string | undefined)?.trim()
++      if (ownerOpenId) headers['X-Hermes-Owner-Open-Id'] = ownerOpenId
+       const res = await fetch(`${brokerUrl}/api/run-broker/runs`, {
+         method: 'POST',
+         headers,
