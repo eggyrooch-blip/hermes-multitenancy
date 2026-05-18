@@ -78,6 +78,30 @@ def test_webui_feishu_uat_status_is_route_scoped_and_redacted(tmp_path, monkeypa
     asyncio.run(runner())
 
 
+def test_feishu_uat_status_reports_lark_cli_bot_fallback(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    shared_bin = shared / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    status = feishu_uat_auth.credential_status(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert status["status"] == "missing"
+    assert status["lark_cli"] == {
+        "available": True,
+        "default_identity": "bot",
+    }
+
+
 def test_webui_feishu_auth_session_polls_success_and_saves_vault(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 
