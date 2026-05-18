@@ -1131,25 +1131,28 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             else:
                 cmd_profile_name, cmd_profile_home = _resolve_route(sender, alt_id=sender_alt)
             cmd_profile = cmd_profile_name if cmd_profile_home is not None else None
-            async with _profile_gateway_context(
-                gateway,
-                event,
-                sender=sender,
-                sender_alt=sender_alt,
-                profile_name=cmd_profile,
-                profile_home=cmd_profile_home,
-                chat_id=chat_id,
-            ):
-                skill_handled, skill_reply = _maybe_rewrite_skill_slash_command(
-                    cmd_pair,
-                    event,
+            if _should_check_skill_slash_command(cmd_pair[0], gateway):
+                async with _profile_gateway_context(
                     gateway,
+                    event,
                     sender=sender,
                     sender_alt=sender_alt,
                     profile_name=cmd_profile,
                     profile_home=cmd_profile_home,
                     chat_id=chat_id,
-                )
+                ):
+                    skill_handled, skill_reply = _maybe_rewrite_skill_slash_command(
+                        cmd_pair,
+                        event,
+                        gateway,
+                        sender=sender,
+                        sender_alt=sender_alt,
+                        profile_name=cmd_profile,
+                        profile_home=cmd_profile_home,
+                        chat_id=chat_id,
+                    )
+            else:
+                skill_handled, skill_reply = False, None
             if skill_handled:
                 if skill_reply:
                     adapter = _get_feishu_adapter(gateway)
@@ -1436,6 +1439,24 @@ def _maybe_rewrite_skill_slash_command(
     except Exception as exc:
         logger.debug("multitenancy: skill command passthrough failed (%s)", exc)
         return False, None
+
+
+def _should_check_skill_slash_command(cmd: str, gateway: Any) -> bool:
+    """Return True only for slash commands that might be native skill aliases."""
+    try:
+        from .commands import is_known_command
+
+        if is_known_command(cmd):
+            return False
+    except Exception:
+        pass
+    if _gateway_handler_for_command(gateway, cmd) is not None:
+        return False
+    if _get_quick_command(gateway, cmd) is not None:
+        return False
+    if _get_plugin_command_handler(cmd) is not None:
+        return False
+    return True
 
 
 async def _handle_command(

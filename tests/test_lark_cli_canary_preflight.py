@@ -74,9 +74,10 @@ def test_preflight_ready_when_binary_app_and_uat_exist(monkeypatch, tmp_path: Pa
     assert "secret" not in str(result).replace("secret_free", "")
 
 
-def test_preflight_reports_missing_vault_key_without_traceback(tmp_path: Path):
+def test_preflight_reports_missing_vault_key_without_traceback(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
 
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
     shared = tmp_path / ".hermes"
     shared.mkdir()
     sqlite3.connect(shared / "multitenancy.db").close()
