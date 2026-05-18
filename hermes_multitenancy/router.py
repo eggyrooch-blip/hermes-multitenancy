@@ -2395,10 +2395,13 @@ async def resolve_or_auto_provision_group_route(
 ) -> tuple[Optional[str], Optional[Path]]:
     """Resolve a group route by chat_id, auto-provisioning on first use.
 
-    Honors ``HERMES_MULTITENANCY_AUTO_PROVISION`` (same toggle as user routes).
-    Returns ``(profile_name, profile_home)`` on success, ``(None, None)`` if
-    no route exists and provisioning is disabled, or if no inviter was
-    captured for this chat. Inviter identity MUST come from the
+    Group provisioning is intentionally independent from the unknown-user
+    auto-provision toggle: a group route can only be created after a trusted
+    ``bot_added`` event captures the inviter, so it does not open the same
+    attack surface as creating user profiles for arbitrary senders. Returns
+    ``(profile_name, profile_home)`` on success, ``(None, None)`` if no route
+    exists and no inviter was captured for this chat. Inviter identity MUST
+    come from the
     ``im.chat.member.bot.added_v1.operator_id`` cache entry (see
     ``register_chat_inviter``); we never fall back to the group's current
     owner_id because that is not the same person who added the bot.
@@ -2411,8 +2414,6 @@ async def resolve_or_auto_provision_group_route(
     row = table.lookup_by_chat_id(chat_id)
     if row is not None:
         return row.profile_name, _profile_name_to_home(row.profile_name)
-    if not _auto_provision_enabled():
-        return None, None
     return await _provision_group_route(chat_id=chat_id, gateway=gateway)
 
 

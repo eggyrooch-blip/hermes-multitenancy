@@ -488,15 +488,20 @@ async def test_resolve_refuses_when_no_inviter_cached(isolated_router):
 
 
 @pytest.mark.asyncio
-async def test_resolve_refuses_when_auto_provision_disabled(isolated_router, monkeypatch):
+async def test_resolve_provisions_group_with_inviter_when_user_auto_provision_disabled(
+    isolated_router, monkeypatch
+):
     router_mod, _ = isolated_router
     monkeypatch.setenv("HERMES_MULTITENANCY_AUTO_PROVISION", "0")
     router_mod.register_chat_inviter("oc_x", "ou_inviter")
     profile_name, profile_home = await router_mod.resolve_or_auto_provision_group_route(
         chat_id="oc_x", gateway=None,
     )
-    assert profile_name is None
-    assert profile_home is None
+    assert profile_name is not None and profile_name.startswith("feishu_group_")
+    assert profile_home is not None
+    row = router_mod._get_routing_table().lookup_by_chat_id("oc_x")
+    assert row is not None
+    assert row.owner_open_id == "ou_inviter"
 
 
 @pytest.mark.asyncio

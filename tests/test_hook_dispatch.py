@@ -887,6 +887,48 @@ async def test_handle_async_auto_provisions_new_user_to_distinct_profile(monkeyp
     router_mod.override_routing_table(None)
 
 
+@pytest.mark.asyncio
+async def test_handle_async_does_not_auto_provision_unknown_user_when_disabled(
+    monkeypatch, tmp_path
+):
+    """Disabling user auto-provision still blocks unknown personal fallback profiles."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.runtime import clear_spike_routes
+
+    clear_spike_routes()
+    db_path = tmp_path / "routing.db"
+    router_mod.override_routing_table(db_path)
+    monkeypatch.setenv("HERMES_MULTITENANCY_AUTO_PROVISION", "0")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    dispatched = []
+
+    class MockPool:
+        async def dispatch(self, profile_name, profile_home, agent_event):
+            dispatched.append((profile_name, profile_home))
+            return "ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: MockPool())
+
+    await router_mod.handle_async(
+        event=_build_event(user_id="ou_unknown_personal"),
+        gateway=SimpleNamespace(adapters={}),
+    )
+
+    table = RoutingTable(db_path)
+    assert table.lookup_by_open_id("ou_unknown_personal") is None
+    assert not (tmp_path / "profiles" / "feishu_ou_unknown_personal").exists()
+    assert dispatched == []
+
+    table.close()
+    router_mod.override_routing_table(None)
+
+
 def test_auto_profile_config_does_not_invent_default_model():
     from hermes_multitenancy.router import _normalize_profile_config
 
