@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import http.server
 import hmac
+import json
 import threading
 import time
 import urllib.error
@@ -176,15 +177,25 @@ class LarkCliAuthBroker:
     def _resolve_token(self, identity: str) -> str:
         from .credentials import CredentialStore
 
-        store = CredentialStore(self.context.shared_home / "multitenancy.db")
+        json_payload = (
+            _load_profile_uat_json(
+                self.context.shared_home,
+                self.context.profile_name,
+                self.context.user_open_id,
+            )
+            if identity == "user"
+            else {}
+        )
+        try:
+            store = CredentialStore(self.context.shared_home / "multitenancy.db")
+        except Exception:
+            if identity == "user" and json_payload:
+                return _first_token(json_payload, ("access_token", "user_access_token", "token"))
+            raise PermissionError("credential unavailable")
+
         try:
             if identity == "user":
-                payload = store.get_secret_for_runtime(
-                    profile_name=self.context.profile_name,
-                    subject_id=self.context.user_open_id,
-                    provider="feishu",
-                    secret_kind="uat",
-                )
+                payload = self._resolve_user_payload(store, json_payload=json_payload)
                 return _first_token(payload, ("access_token", "user_access_token", "token"))
             payload = store.get_secret_for_runtime(
                 profile_name="__global__",
@@ -192,9 +203,31 @@ class LarkCliAuthBroker:
                 provider="feishu",
                 secret_kind="app",
             )
-            return _first_token(payload, ("tenant_access_token", "app_access_token", "token"))
+            try:
+                return _first_token(payload, ("tenant_access_token", "app_access_token", "token"))
+            except PermissionError:
+                return _mint_tenant_access_token(payload, timeout=self.context.request_timeout_seconds)
         finally:
             store.close()
+
+    def _resolve_user_payload(self, store: object, *, json_payload: dict | None = None) -> dict:
+        json_payload = json_payload or {}
+        try:
+            vault_payload = store.get_secret_for_runtime(
+                profile_name=self.context.profile_name,
+                subject_id=self.context.user_open_id,
+                provider="feishu",
+                secret_kind="uat",
+            )
+        except Exception:
+            if json_payload:
+                return json_payload
+            raise
+        if not json_payload:
+            return vault_payload
+        if _payload_freshness(json_payload) > _payload_freshness(vault_payload):
+            return json_payload
+        return vault_payload
 
 
 class RunningLarkCliAuthBrokerServer:
@@ -270,6 +303,59 @@ def _first_token(payload: Mapping[str, object], keys: tuple[str, ...]) -> str:
         if value:
             return value
     raise PermissionError("credential payload does not contain a usable token")
+
+
+def _mint_tenant_access_token(payload: Mapping[str, object], *, timeout: float) -> str:
+    app_id = str(payload.get("app_id") or payload.get("FEISHU_APP_ID") or "").strip()
+    app_secret = str(payload.get("app_secret") or payload.get("FEISHU_APP_SECRET") or "").strip()
+    if not (app_id and app_secret):
+        raise PermissionError("app credential missing")
+    domain = str(payload.get("domain") or payload.get("FEISHU_DOMAIN") or "feishu").strip().lower()
+    host = "open.larksuite.com" if domain == "larksuite" else "open.feishu.cn"
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://{host}/open-apis/auth/v3/tenant_access_token/internal",
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - host is fixed above.
+        raw = response.read()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise PermissionError("tenant token response invalid") from exc
+    if int(data.get("code") or 0) != 0:
+        raise PermissionError("tenant token request rejected")
+    return _first_token(data, ("tenant_access_token", "app_access_token", "token"))
+
+
+def _load_profile_uat_json(shared_home: Path, profile_name: str, open_id: str) -> dict | None:
+    path = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        _first_token(data, ("access_token", "user_access_token", "token"))
+    except PermissionError:
+        return None
+    return data
+
+
+def _payload_freshness(payload: Mapping[str, object]) -> tuple[int, int]:
+    def _as_int(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return (
+        _as_int(payload.get("granted_at") or payload.get("updated_at")),
+        _as_int(payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at")),
+    )
 
 
 def _parse_target(target: str) -> tuple[str, str | None]:

@@ -67,6 +67,7 @@ _SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json
 _SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
 _SKILL_LINKED_DEP_DIRS = {"node_modules"}
 _SKILL_IGNORED_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
+_SHARED_SKILL_SYMLINK_PREFIXES = ("lark-",)
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -604,6 +605,9 @@ def _sync_default_profile_skills(profile_home: Path, shared_home: Path) -> bool:
         if not src.is_dir():
             continue
         dst = profile_home / "skills" / rel_path
+        if _should_symlink_shared_skill(rel_path):
+            changed = _link_shared_skill_tree(src, dst) or changed
+            continue
         changed = _copy_skill_tree(src, dst) or changed
     return changed
 
@@ -682,6 +686,20 @@ def _copy_skill_tree(src: Path, dst: Path) -> bool:
     if dst.exists():
         _tighten_dir_mode(dst, 0o700)
     return changed
+
+
+def _should_symlink_shared_skill(rel_path: Path) -> bool:
+    return len(rel_path.parts) == 1 and rel_path.name.startswith(_SHARED_SKILL_SYMLINK_PREFIXES)
+
+
+def _link_shared_skill_tree(src: Path, dst: Path) -> bool:
+    if _same_symlink(dst, src):
+        return False
+    if dst.exists() or dst.is_symlink():
+        shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.symlink_to(src, target_is_directory=True)
+    return True
 
 
 def _same_symlink(path: Path, target: Path) -> bool:

@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from ..routing import KIND_USER
+
 
 @dataclass(frozen=True)
 class UserSpec:
@@ -71,6 +73,7 @@ def apply_users(
             profile_name=u.profile_name,
             open_id=u.open_id,
             union_id=u.union_id,
+            provenance="sync",
         )
         upserted += 1
 
@@ -123,7 +126,8 @@ def _desired_and_current(table, users: Iterable[UserSpec]) -> tuple[dict[str, Us
     # Snapshot current active rows so we can detect deletes.
     cur = table._conn.execute(
         "SELECT user_id, profile_name, open_id, union_id"
-        " FROM multitenancy_routing WHERE active = 1"
+        " FROM multitenancy_routing WHERE active = 1 AND kind = ? AND provenance = ?",
+        (KIND_USER, "sync"),
     )
     current = {r["user_id"]: dict(r) for r in cur.fetchall()}
     return desired, current

@@ -47,6 +47,79 @@ def test_apply_soft_deletes_missing(table):
     assert table.count_active() == 1
 
 
+def test_apply_soft_delete_missing_keeps_group_rows_active(table):
+    """US-02 regression: soft_delete_missing must not delete kind='group' rows.
+
+    A full org sync (soft_delete_missing=True) reconciles only user rows;
+    group profiles must survive even though they are absent from the desired
+    Feishu employee list. Without the kind-scoped snapshot in
+    ``_desired_and_current`` the group row is soft-deleted (data loss).
+    """
+    from hermes_multitenancy.sync import UserSpec, apply_users
+
+    table.upsert(user_id="u1", profile_name="alice", open_id="ou_1")
+    group_user_id = table.upsert_group(
+        chat_id="oc_grp1",
+        profile_name="feishu_group_oc_grp1",
+        owner_open_id="ou_owner",
+        display_label="owner-IT组",
+    )
+    assert group_user_id == "group:oc_grp1"
+
+    apply_users(
+        table,
+        [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")],
+        soft_delete_missing=True,
+    )
+
+    assert table.lookup_by_chat_id("oc_grp1") is not None
+    assert table.count_active(kind="group") == 1
+    assert table.lookup_by_open_id("ou_1") is not None
+    assert table.count_active(kind="user") == 1
+
+
+def test_apply_soft_delete_missing_keeps_non_sync_agent_rows_active(table):
+    """US-05 regression: full sync must soft-delete only sync-origin user rows.
+
+    Auto-provisioned user rows and future self-built agent rows are outside the
+    Feishu org snapshot ownership boundary, so a full org sync must keep them
+    active even when they are absent from the desired employee list.
+    """
+    from hermes_multitenancy.sync import UserSpec, apply_users
+
+    apply_users(table, [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")])
+    table.upsert(user_id="ou_auto", profile_name="ou_auto", open_id="ou_auto")
+    table.upsert_group(
+        chat_id="oc_grp1",
+        profile_name="feishu_group_oc_grp1",
+        owner_open_id="ou_owner",
+        display_label="owner-IT组",
+    )
+
+    auto_row = table._conn.execute(
+        "SELECT provenance FROM multitenancy_routing WHERE user_id = ?",
+        ("ou_auto",),
+    ).fetchone()
+    assert auto_row["provenance"] == "auto"
+
+    apply_users(
+        table,
+        [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")],
+        soft_delete_missing=True,
+    )
+
+    auto_row_after = table._conn.execute(
+        "SELECT active, provenance FROM multitenancy_routing WHERE user_id = ?",
+        ("ou_auto",),
+    ).fetchone()
+    assert auto_row_after["active"] == 1
+    assert auto_row_after["provenance"] == "auto"
+    assert table.lookup_by_open_id("ou_auto") is not None
+    assert table.lookup_by_chat_id("oc_grp1") is not None
+    assert table.count_active(kind="group") == 1
+    assert table.lookup_by_open_id("ou_1") is not None
+
+
 def test_apply_upserts_when_profile_changes(table):
     from hermes_multitenancy.sync import UserSpec, apply_users
     apply_users(table, [UserSpec(user_id="u1", profile_name="alice", open_id="ou_1")])
@@ -68,6 +141,21 @@ def test_apply_replaces_auto_provision_open_id_route_with_user_id_route(table):
     assert row.user_id == "alice"
     assert row.profile_name == "alice"
     assert table.count_active() == 1
+
+
+def test_apply_users_creates_sync_root_resolvable_by_open_id(table):
+    from hermes_multitenancy.sync import UserSpec, apply_users
+
+    stats = apply_users(
+        table,
+        [UserSpec(user_id="alice", profile_name="alice", open_id="ou_alice")],
+    )
+
+    assert stats == {"upserted": 1, "soft_deleted": 0, "kept": 0}
+    row = table.resolve_owner_root("ou_alice")
+    assert row is not None
+    assert row.user_id == "alice"
+    assert row.profile_name == "alice"
 
 
 def test_plan_users_is_dry_run(table):
@@ -253,6 +341,43 @@ skills:
     assert (target / "node_modules").resolve() == (skill_source / "node_modules").resolve()
     assert not (target / ".env").exists()
     assert not (target / "gitlab.token").exists()
+
+
+def test_sync_profiles_symlinks_shared_lark_skills(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    keep_source = shared_home / "skills" / "Keep" / "keep-record"
+    lark_source = shared_home / "skills" / "lark-base"
+    keep_source.mkdir(parents=True)
+    lark_source.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        """
+skills:
+  - Keep/keep-record
+  - lark-base
+""",
+        encoding="utf-8",
+    )
+    (keep_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    (lark_source / "SKILL.md").write_text("# Lark Base\n", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    profile_skills = profiles_root / "alice" / "skills"
+    keep_target = profile_skills / "Keep" / "keep-record"
+    lark_target = profile_skills / "lark-base"
+    assert keep_target.exists()
+    assert not keep_target.is_symlink()
+    assert lark_target.is_symlink()
+    assert lark_target.resolve() == lark_source.resolve()
 
 
 def test_sync_feishu_org_dry_run_does_not_write_profiles_or_db(tmp_path):

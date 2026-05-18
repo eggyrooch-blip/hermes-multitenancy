@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import http.client
 import time
 import urllib.parse
@@ -85,6 +86,186 @@ def _store_uat(shared: Path) -> None:
         )
     finally:
         store.close()
+
+
+def _store_app_credential(shared: Path) -> None:
+    from hermes_multitenancy.credentials import CredentialStore
+
+    store = CredentialStore(shared / "multitenancy.db", encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="__global__",
+            subject_id="feishu_app",
+            provider="feishu",
+            secret_kind="app",
+            payload={"app_id": "cli_app", "app_secret": "app-secret", "domain": "feishu"},
+        )
+    finally:
+        store.close()
+
+
+def test_broker_mints_tenant_token_for_bot_identity(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_app_credential(shared)
+    captured: dict[str, object] = {}
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"code":0,"tenant_access_token":"tat-secret"}'
+
+    def fake_urlopen(request, timeout):
+        captured["token_url"] = request.full_url
+        captured["token_body"] = json.loads(request.data.decode("utf-8"))
+        captured["token_timeout"] = timeout
+        return FakeHTTPResponse()
+
+    def fake_forward(_method, _url, headers, _body, _timeout):
+        captured["authorization"] = headers.get("Authorization")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker.urllib.request.urlopen", fake_urlopen)
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/contact/v3/scopes",
+        headers=_headers(
+            "proxy-key",
+            identity="bot",
+            path_and_query="/open-apis/contact/v3/scopes",
+        ),
+        body=b"",
+    )
+
+    assert response.status == 200
+    assert captured["token_url"] == "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    assert captured["token_body"] == {"app_id": "cli_app", "app_secret": "app-secret"}
+    assert captured["authorization"] == "Bearer tat-secret"
+
+
+def test_broker_prefers_newer_profile_local_uat_json_over_stale_vault(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_uat(shared)
+    profile_dir = shared / "profiles" / "alice" / "feishu_uat"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ou_alice.json").write_text(
+        json.dumps(
+            {
+                "user_open_id": "ou_alice",
+                "access_token": "fresh-json-uat",
+                "refresh_token": "fresh-refresh",
+                "granted_at": int(time.time() * 1000) + 1000,
+                "expires_at": int(time.time() * 1000) + 7200_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_forward(_method, _url, headers, _body, _timeout):
+        captured["authorization"] = headers.get("Authorization")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 200
+    assert captured["authorization"] == "Bearer fresh-json-uat"
+
+
+def test_broker_can_use_profile_local_uat_json_without_vault_key(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "alice" / "feishu_uat"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ou_alice.json").write_text(
+        json.dumps(
+            {
+                "user_open_id": "ou_alice",
+                "app_id": "cli_public",
+                "access_token": "json-only-uat",
+                "expires_at": int(time.time() * 1000) + 7200_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_forward(_method, _url, headers, _body, _timeout):
+        captured["authorization"] = headers.get("Authorization")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 200
+    assert captured["authorization"] == "Bearer json-only-uat"
 
 
 def test_broker_injects_user_uat_and_strips_client_auth_headers(monkeypatch, tmp_path: Path):

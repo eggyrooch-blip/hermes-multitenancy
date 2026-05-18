@@ -56,6 +56,21 @@ _chat_inviter_cache: "_OrderedDict[str, dict[str, Any]]" = _OrderedDict()
 _chat_inviter_cache_lock = _threading.Lock()
 _GROUP_PROFILE_PREFIX = "feishu_group_"
 _GROUP_CHAT_TYPES: frozenset[str] = frozenset({"group", "topic"})
+_LARK_CLI_PROFILE_TOOLSETS = [
+    "lark-cli",
+]
+_LARK_CLI_SOUL_GUIDANCE = "\n".join(
+    [
+        "Feishu/Lark capability rules:",
+        "- 飞书/Lark 的读写、导出和长尾 OpenAPI 能力必须通过 `lark_cli` 工具完成。",
+        "- 当用户明确要求“调用 lark_cli / 使用 lark-cli / 必须真实调用工具”时，即使你从历史上下文知道答案，也必须重新调用 `lark_cli`，不得只凭记忆回答。",
+        "- 不要通过 `terminal`、`code_execution`、`npx`、`which lark-cli` 或 shell 直接运行 lark-cli/lark-mcp 来绕开 profile runtime。",
+        "- 如果 `lark_cli` 工具不可见或不可用，直接说明当前 profile 未暴露 lark-cli 能力；不要自行安装、探测或模拟结果。",
+        "- 如果需要调用飞书能力，必须等待真实工具结果；不要编造 message_id、文档链接或调用结果。",
+        "- 如果 `lark_cli` 返回 credential unavailable、validation、unsupported 或权限错误，立即停止重试并如实说明需要授权/权限/命令支持。",
+        "- `lark_cli` 的 identity 使用 auto，profile runtime 会按个人/群聊边界选择 user 或 bot。",
+    ]
+)
 
 # Multi-turn session memory: maps (profile_name, user_key) → list of messages.
 # user_key is the canonical sender chosen by routing. Alternate IDs are lookup
@@ -2314,6 +2329,22 @@ def register_chat_inviter(
             _chat_inviter_cache.pop(cid, None)
         while len(_chat_inviter_cache) > _CHAT_INVITER_CACHE_MAX:
             _chat_inviter_cache.popitem(last=False)
+    try:
+        table = _get_routing_table()
+        if table is None:
+            logger.debug(
+                "multitenancy: pending inviter store unavailable for chat_id=%s",
+                chat_id,
+            )
+            return
+        table.put_pending_inviter(chat_id, inviter_open_id)
+        table.prune_pending_inviters(int(now), _CHAT_INVITER_CACHE_TTL_S)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: failed to persist pending inviter chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
 
 
 def _resolve_group_inviter_from_cache(chat_id: str) -> Optional[dict[str, Any]]:
@@ -2378,18 +2409,37 @@ async def _provision_group_route(
     table = _get_routing_table()
     if table is None:
         return None, None
-    cached = _resolve_group_inviter_from_cache(chat_id)
-    if not cached or not _is_feishu_open_id(cached.get("inviter_open_id")):
+    inviter_open_id: Optional[str] = None
+    chat_name: Optional[str] = None
+    inviter_display: Optional[str] = None
+    try:
+        table.prune_pending_inviters(
+            int(time.time()),
+            _CHAT_INVITER_CACHE_TTL_S,
+        )
+        pending_inviter = table.get_pending_inviter(chat_id)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: pending inviter lookup failed chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
+        pending_inviter = None
+    if _is_feishu_open_id(pending_inviter):
+        inviter_open_id = str(pending_inviter)
+    else:
+        cached = _resolve_group_inviter_from_cache(chat_id)
+        if cached and _is_feishu_open_id(cached.get("inviter_open_id")):
+            inviter_open_id = cached["inviter_open_id"]
+            chat_name = cached.get("chat_name")
+            inviter_display = cached.get("inviter_display")
+    if not inviter_open_id:
         logger.warning(
             "multitenancy: cannot auto-provision group route chat_id=%s "
             "(bot_added inviter not captured — re-add the bot to retry)",
             chat_id,
         )
         return None, None
-
-    inviter_open_id: str = cached["inviter_open_id"]
-    chat_name: Optional[str] = cached.get("chat_name")
-    inviter_display: Optional[str] = cached.get("inviter_display")
 
     if not chat_name:
         chat_name = await _fetch_chat_name(chat_id, gateway) or chat_id
@@ -2432,6 +2482,14 @@ async def _provision_group_route(
     # Eagerly evict the cache entry so a later bot-removal + re-add cycle
     # repopulates from the fresh event rather than reusing stale chat_name.
     _pop_chat_inviter(chat_id)
+    try:
+        table.clear_pending_inviter(chat_id)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: failed to clear pending inviter chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
     return profile_name, profile_home
 
 
@@ -2474,13 +2532,18 @@ def _ensure_group_profile(
                     "Identity rules (strict):",
                     "- 你不能以群成员任何一个个人的身份操作飞书数据。",
                     "- /feishu_auth 在群聊模式下被禁用，任何用户的 UAT 不会被加载。",
+                    "- 该群 profile 使用 `lark_cli` 时默认走 bot identity。",
                     "- 仅响应被 @ 的消息；群里的旁白不要回复。",
                     "- 该群的对话和记忆与其它群、与个人私聊完全隔离。",
+                    "",
+                    _LARK_CLI_SOUL_GUIDANCE,
                     "",
                 ]
             ),
             encoding="utf-8",
         )
+    else:
+        _ensure_soul_guidance(soul_path, _LARK_CLI_SOUL_GUIDANCE)
 
     # Group profiles get an empty feishu_uat/ directory but no per-user JSON;
     # the marker file below tells UAT helpers to refuse to load user tokens.
@@ -2643,10 +2706,14 @@ def _ensure_auto_profile(
                     "Keep tools, files, memory, and responses isolated to this profile.",
                     "Do not claim to be another Hermes profile.",
                     "",
+                    _LARK_CLI_SOUL_GUIDANCE,
+                    "",
                 ]
             ),
             encoding="utf-8",
         )
+    else:
+        _ensure_soul_guidance(soul_path, _LARK_CLI_SOUL_GUIDANCE)
 
     for name in ("auth.json", ".env"):
         _ensure_shared_profile_file(profile_home, shared_home, name)
@@ -2689,6 +2756,7 @@ def _profile_config_from_shared_home(shared_home: Path) -> dict[str, Any]:
         except Exception as exc:
             logger.debug("multitenancy: failed to read shared config %s: %s", shared_config, exc)
 
+    _apply_lark_cli_profile_defaults(config)
     return _normalize_profile_config(config)
 
 
@@ -2714,10 +2782,49 @@ def _normalize_profile_config_file(config_path: Path, *, shared_home: Path) -> N
         return
     before = json.dumps(loaded, sort_keys=True, ensure_ascii=True)
     _merge_shared_feishu_platform(loaded, shared_home)
+    _apply_lark_cli_profile_defaults(loaded)
     normalized = _normalize_profile_config(loaded)
     after = json.dumps(normalized, sort_keys=True, ensure_ascii=True)
     if after != before:
         config_path.write_text(_dump_profile_config(normalized), encoding="utf-8")
+
+
+def _apply_lark_cli_profile_defaults(config: dict[str, Any]) -> None:
+    """Keep generated Feishu profiles thin: identity/display in Hermes, OAPI in lark-cli."""
+    platform_toolsets = config.setdefault("platform_toolsets", {})
+    if isinstance(platform_toolsets, dict):
+        for platform_key in ("feishu", "api_server", "webui"):
+            platform_toolsets[platform_key] = list(_LARK_CLI_PROFILE_TOOLSETS)
+    multitenancy = config.setdefault("multitenancy", {})
+    if isinstance(multitenancy, dict):
+        multitenancy.setdefault("toolsets_mode", "explicit")
+        platform_modes = multitenancy.setdefault("platform_toolsets_mode", {})
+        if isinstance(platform_modes, dict):
+            # feishu must merge (not replace) the platform default toolset.
+            # `explicit` returned only ["lark-cli"] and silently dropped the
+            # `skills` toolset, so lark-* skill bodies symlinked into the
+            # profile never surfaced in the agent manifest (user report:
+            # 技能里看不到 lark skills). Keep aligned with api_server/webui.
+            platform_modes.setdefault("feishu", "merge_default")
+            platform_modes.setdefault("api_server", "merge_default")
+            platform_modes.setdefault("webui", "merge_default")
+
+
+def _ensure_soul_guidance(soul_path: Path, guidance: str) -> None:
+    try:
+        text = soul_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    guidance_lines = guidance.splitlines()
+    missing_lines = [line for line in guidance_lines if line and line not in text]
+    if not missing_lines:
+        return
+    if guidance_lines and guidance_lines[0] in text:
+        suffix = "" if text.endswith("\n") else "\n"
+        soul_path.write_text(f"{text}{suffix}" + "\n".join(missing_lines) + "\n", encoding="utf-8")
+        return
+    suffix = "" if text.endswith("\n") else "\n"
+    soul_path.write_text(f"{text}{suffix}\n{guidance}\n", encoding="utf-8")
 
 
 def _merge_shared_feishu_platform(config: dict[str, Any], shared_home: Path) -> None:
