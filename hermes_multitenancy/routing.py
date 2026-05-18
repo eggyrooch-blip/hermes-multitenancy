@@ -138,6 +138,12 @@ class RoutingRow:
     chat_id: Optional[str] = None
     owner_open_id: Optional[str] = None
     display_label: Optional[str] = None
+    # Multi-user/multi-agent columns (US-03/US-04). Defaulted + Optional so
+    # callers and column-list SELECTs that predate them keep working; SELECT *
+    # lookups (e.g. lookup_agent) populate them from the row.
+    agent_id: Optional[str] = None
+    provenance: Optional[str] = None
+    upstream_profile: Optional[str] = None
 
 
 class RoutingTable:
@@ -590,6 +596,9 @@ def _row_to_dataclass(row: sqlite3.Row) -> RoutingRow:
         chat_id=row["chat_id"] if "chat_id" in row.keys() else None,
         owner_open_id=row["owner_open_id"] if "owner_open_id" in row.keys() else None,
         display_label=row["display_label"] if "display_label" in row.keys() else None,
+        agent_id=row["agent_id"] if "agent_id" in row.keys() else None,
+        provenance=row["provenance"] if "provenance" in row.keys() else None,
+        upstream_profile=row["upstream_profile"] if "upstream_profile" in row.keys() else None,
     )
 
 

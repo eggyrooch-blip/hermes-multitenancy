@@ -261,6 +261,40 @@ def test_lookup_agent_returns_row_by_agent_id(table):
     assert table.lookup_agent("agent-sync-1") is None
 
 
+def test_routing_row_exposes_multi_user_columns(table):
+    """RoutingRow must expose agent_id/provenance/upstream_profile so callers
+    can read them off the dataclass instead of querying SQL directly (closes
+    the latent AttributeError footgun flagged in cross-model review)."""
+    from hermes_multitenancy.routing import RoutingRow
+
+    table.upsert(user_id="u_root", profile_name="feishu_u_root", open_id="ou_root")
+    table._conn.execute(
+        """
+        UPDATE multitenancy_routing
+        SET agent_id = ?, provenance = ?, upstream_profile = ?, owner_open_id = ?
+        WHERE user_id = ?
+        """,
+        ("agent-root", "sync", None, "ou_root", "u_root"),
+    )
+    table._conn.commit()
+
+    # lookup_agent uses SELECT * -> the new columns are populated
+    row = table.lookup_agent("agent-root")
+    assert row is not None
+    assert row.agent_id == "agent-root"
+    assert row.provenance == "sync"
+    assert row.upstream_profile is None
+    # Attributes always exist on the dataclass (no AttributeError) even for
+    # a row constructed without them.
+    bare = RoutingRow(
+        user_id="x", profile_name="p", open_id=None, union_id=None,
+        active=True, last_active_at=None, synced_at=0, version=1,
+    )
+    assert bare.agent_id is None
+    assert bare.provenance is None
+    assert bare.upstream_profile is None
+
+
 def test_list_agents_for_owner_cross_owner_isolation(table):
     table.upsert(user_id="u_sync_a", profile_name="pa", open_id="ou_a")
     table.upsert_group(
