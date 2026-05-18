@@ -686,6 +686,8 @@ def test_webui_run_broker_owner_header_agent_id_resolves_owned_profile(tmp_path)
         assert '"kind": "content"' in body
         assert len(seen) == 1
         assert seen[0].profile_name == "owned_agent_profile"
+        assert seen[0].user_key == "ou_owner"
+        assert seen[0].credential_subject == "ou_owner"
 
     asyncio.run(runner())
 
@@ -806,6 +808,8 @@ def test_webui_run_broker_owner_header_without_agent_id_resolves_sync_root(tmp_p
         assert '"kind": "content"' in body
         assert len(seen) == 1
         assert seen[0].profile_name == "owner_sync_profile"
+        assert seen[0].user_key == "ou_owner"
+        assert seen[0].credential_subject == "ou_owner"
 
     asyncio.run(runner())
 

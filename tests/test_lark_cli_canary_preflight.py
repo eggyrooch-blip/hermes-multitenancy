@@ -81,6 +81,8 @@ def test_preflight_reports_missing_vault_key_without_traceback(monkeypatch, tmp_
     shared = tmp_path / ".hermes"
     shared.mkdir()
     sqlite3.connect(shared / "multitenancy.db").close()
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
 
     result = lark_cli_canary_preflight(
         shared_home=shared,

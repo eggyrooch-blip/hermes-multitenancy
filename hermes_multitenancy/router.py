@@ -1442,7 +1442,12 @@ def _maybe_rewrite_skill_slash_command(
 
 
 def _should_check_skill_slash_command(cmd: str, gateway: Any) -> bool:
-    """Return True only for slash commands that might be native skill aliases."""
+    """Only unknown slash commands need profile-scoped skill alias lookup.
+
+    Known Hermes commands such as ``/stop`` must not wait on the profile env
+    lock; that lock may be held by the very in-flight run the command is trying
+    to cancel.
+    """
     try:
         from .commands import is_known_command
 
@@ -2034,6 +2039,8 @@ def _gateway_help_text() -> str:
 
         lines = gateway_help_lines()
         if lines:
+            if not any("/help" in line for line in lines):
+                lines = ["`/help` -- 显示这条帮助", *lines]
             return "📖 可用命令\n" + "\n".join(lines[:30])
     except Exception:
         pass

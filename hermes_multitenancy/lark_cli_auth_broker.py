@@ -177,6 +177,12 @@ class LarkCliAuthBroker:
     def _resolve_token(self, identity: str) -> str:
         from .credentials import CredentialStore
 
+        if identity == "user":
+            _refresh_profile_uat_if_needed(
+                self.context.shared_home,
+                self.context.profile_name,
+                self.context.user_open_id,
+            )
         json_payload = (
             _load_profile_uat_json(
                 self.context.shared_home,
@@ -221,13 +227,21 @@ class LarkCliAuthBroker:
             )
         except Exception:
             if json_payload:
+                if _payload_is_expired(json_payload):
+                    raise PermissionError("credential expired")
                 return json_payload
             raise
         if not json_payload:
+            if _payload_is_expired(vault_payload):
+                raise PermissionError("credential expired")
             return vault_payload
         if _payload_freshness(json_payload) > _payload_freshness(vault_payload):
-            return json_payload
-        return vault_payload
+            selected = json_payload
+        else:
+            selected = vault_payload
+        if _payload_is_expired(selected):
+            raise PermissionError("credential expired")
+        return selected
 
 
 class RunningLarkCliAuthBrokerServer:
@@ -356,6 +370,33 @@ def _payload_freshness(payload: Mapping[str, object]) -> tuple[int, int]:
         _as_int(payload.get("granted_at") or payload.get("updated_at")),
         _as_int(payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at")),
     )
+
+
+def _payload_is_expired(payload: Mapping[str, object]) -> bool:
+    try:
+        expires_at = int(
+            payload.get("expires_at")
+            or payload.get("expire_at")
+            or payload.get("access_token_expires_at")
+            or 0
+        )
+    except (TypeError, ValueError):
+        expires_at = 0
+    return bool(expires_at and expires_at <= int(time.time() * 1000))
+
+
+def _refresh_profile_uat_if_needed(shared_home: Path, profile_name: str, open_id: str) -> None:
+    try:
+        from .feishu_uat_auth import refresh_uat_if_needed
+
+        refresh_uat_if_needed(
+            profile_name=profile_name,
+            open_id=open_id,
+            shared_home=shared_home,
+            headroom_seconds=300,
+        )
+    except Exception:
+        return
 
 
 def _parse_target(target: str) -> tuple[str, str | None]:

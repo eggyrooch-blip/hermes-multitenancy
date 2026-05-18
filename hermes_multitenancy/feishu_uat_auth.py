@@ -12,6 +12,8 @@ import os
 import secrets
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -45,6 +47,76 @@ class FeishuAuthSession:
 
 _sessions: dict[str, FeishuAuthSession] = {}
 
+FEISHU_ACCOUNTS_BASE_URL = os.environ.get(
+    "FEISHU_ACCOUNTS_BASE_URL", "https://accounts.feishu.cn"
+).rstrip("/")
+FEISHU_OPEN_BASE_URL = os.environ.get(
+    "FEISHU_OPEN_BASE_URL", "https://open.feishu.cn"
+).rstrip("/")
+
+FEISHU_DEFAULT_SCOPE = " ".join(
+    dict.fromkeys(
+        """
+        approval:instance:read approval:instance:write approval:task:read approval:task:write
+        attendance:task:readonly auth:user.id:read
+        base:app:create base:app:read base:app:copy base:app:update
+        base:table:read base:table:create base:table:update base:table:delete
+        base:field:read base:field:create base:field:update base:field:delete
+        base:view:read base:view:write_only
+        base:record:read base:record:create base:record:update base:record:delete
+        base:dashboard:create base:dashboard:delete base:dashboard:read base:dashboard:update
+        base:form:create base:form:delete base:form:read base:form:update
+        base:history:read base:role:create base:role:delete base:role:read base:role:update
+        base:workflow:create base:workflow:read base:workflow:update
+        bitable:app
+        board:whiteboard:node:create board:whiteboard:node:delete board:whiteboard:node:read board:whiteboard:node:update
+        calendar:calendar calendar:calendar:create calendar:calendar:read calendar:calendar:readonly calendar:calendar:update
+        calendar:calendar.event:create calendar:calendar.event:read calendar:calendar.event:reply calendar:calendar.event:update
+        calendar:calendar.free_busy:read
+        contact:contact.base:readonly contact:user.base:readonly contact:user.basic_profile:readonly contact:user:search
+        docs:document.content:read docs:document:export docs:document:import docs:document:copy
+        docs:document.comment:create docs:document.comment:read docs:document.comment:update docs:document.comment:write_only
+        docs:document.media:download docs:document.media:upload
+        docs:permission.member:apply docs:permission.member:auth docs:permission.member:create docs:permission.member:transfer
+        docs:permission.setting:read docs:permission.setting:write_only
+        docx:document:create docx:document:readonly docx:document:write_only
+        drive:drive drive:drive.metadata:readonly drive:drive:readonly drive:export:readonly
+        drive:file:download drive:file:upload drive:file:view_record:readonly
+        im:chat im:chat:create im:chat:create_by_user im:chat:read im:chat:readonly im:chat:update
+        im:chat.members:read im:chat.members:write_only
+        im:feed.flag:read im:feed.flag:write
+        im:message im:message.group_msg im:message.group_msg:get_as_user
+        im:message.p2p_msg:readonly im:message.p2p_msg:get_as_user
+        im:message.reactions:read im:message.reactions:write_only
+        im:message.send_as_user im:message:send_as_bot im:message:readonly
+        im:message.pins:read im:message.pins:write_only im:resource
+        mail:event mail:user_mailbox:readonly mail:user_mailbox.folder:read mail:user_mailbox.folder:write
+        mail:user_mailbox.mail_contact:read mail:user_mailbox.mail_contact:write
+        mail:user_mailbox.message.address:read mail:user_mailbox.message.body:read
+        mail:user_mailbox.message.subject:read mail:user_mailbox.message:modify
+        mail:user_mailbox.message:readonly mail:user_mailbox.message:send
+        mail:user_mailbox.rule:read mail:user_mailbox.rule:write mail:user_mailbox.event.mail_address:read
+        minutes:minutes.search:read minutes:minutes.media:export minutes:minutes:readonly
+        minutes:minutes.artifacts:read minutes:minutes.transcript:export minutes:minutes.upload:write
+        okr:okr.content:readonly okr:okr.content:writeonly okr:okr.period:readonly okr:okr.setting:read
+        okr:okr.progress.file:upload okr:okr.progress:delete okr:okr.progress:readonly okr:okr.progress:writeonly
+        search:search search:message search:docs:read
+        sheets:spreadsheet sheets:spreadsheet:create sheets:spreadsheet.meta:read
+        sheets:spreadsheet.meta:write_only sheets:spreadsheet:read sheets:spreadsheet:readonly sheets:spreadsheet:write_only
+        slides:presentation:create slides:presentation:read slides:presentation:update slides:presentation:write_only
+        space:document:delete space:document:move space:document:retrieve space:document:shortcut space:folder:create
+        task:task task:task:write task:task:read task:tasklist:write task:tasklist:read
+        task:section:write task:section:read task:comment:write task:custom_field:write task:custom_field:read
+        task:attachment:write
+        vc:meeting.bot.join:write vc:meeting.meetingevent:read vc:meeting.search:read vc:note:read vc:record:readonly
+        wiki:wiki wiki:wiki:readonly wiki:space:read wiki:space:retrieve wiki:space:write_only
+        wiki:node:copy wiki:node:create wiki:node:move wiki:node:read wiki:node:retrieve
+        wiki:member:create wiki:member:retrieve wiki:member:update
+        offline_access
+        """.split()
+    )
+)
+
 
 def resolve_shared_home() -> Path:
     configured = os.environ.get("HERMES_SHARED_HOME", "").strip()
@@ -76,6 +148,16 @@ def credential_status(
 ) -> dict[str, Any]:
     shared = shared_home or resolve_shared_home()
     _assert_route(shared, profile_name, open_id)
+    refresh_error = ""
+    try:
+        refresh_uat_if_needed(
+            profile_name=profile_name,
+            open_id=open_id,
+            shared_home=shared,
+            headroom_seconds=300,
+        )
+    except FeishuUatAuthError as exc:
+        refresh_error = exc.message
     store = CredentialStore(shared / "multitenancy.db")
     try:
         status = store.get_status(
@@ -85,10 +167,111 @@ def credential_status(
             secret_kind="uat",
             required_scopes=parse_scopes(required_scopes),
         )
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name=profile_name,
+                subject_id=open_id,
+                provider="feishu",
+                secret_kind="uat",
+            )
+        except Exception:
+            payload = {}
     finally:
         store.close()
+    refresh_expires_at = _as_int((payload or {}).get("refresh_expires_at"))
+    if refresh_expires_at:
+        status["refresh_expires_at"] = refresh_expires_at
+    if refresh_error:
+        status["needs_reauth"] = status.get("status") == "expired"
+        status["refresh_error"] = refresh_error
     status["lark_cli"] = _lark_cli_status(shared, profile_name, open_id)
     return status
+
+
+def refresh_uat_if_needed(
+    *,
+    profile_name: str,
+    open_id: str,
+    shared_home: Optional[Path] = None,
+    force: bool = False,
+    headroom_seconds: int = 300,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+) -> dict[str, Any] | None:
+    """Refresh one user's Feishu UAT if it is expired or near expiry.
+
+    The multitenancy credential vault is the canonical store, but legacy
+    Hermes paths still read ``profiles/<profile>/feishu_uat/<open_id>.json``.
+    A successful refresh must update both in one place to avoid token skew.
+    """
+    shared = shared_home or resolve_shared_home()
+    _assert_route(shared, profile_name, open_id)
+    payload = _load_best_uat_payload(shared, profile_name, open_id)
+    if not payload:
+        return None
+    if not force and not _payload_needs_refresh(payload, headroom_seconds=headroom_seconds):
+        return payload
+
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    if not refresh_token:
+        raise FeishuUatAuthError("stored Feishu UAT has no refresh_token", status=401)
+    refresh_expires_at = _as_int(payload.get("refresh_expires_at"))
+    if refresh_expires_at and refresh_expires_at <= _now_ms():
+        raise FeishuUatAuthError("Feishu UAT refresh_token is expired", status=401)
+
+    client_id = str(client_id or "").strip()
+    client_secret = str(client_secret or "").strip()
+    if not (client_id and client_secret):
+        client_id, client_secret = _feishu_app_credentials(shared)
+    result = _refresh_uat_token(refresh_token, client_id, client_secret)
+    refreshed = _token_payload(
+        {
+            **result,
+            "refresh_token": result.get("refresh_token") or refresh_token,
+            "scope": result.get("scope") or payload.get("scope") or "",
+        },
+        open_id=open_id,
+        app_id=str(payload.get("app_id") or client_id),
+        scope=str(payload.get("scope") or ""),
+    )
+    if (
+        "refresh_token_expires_in" not in result
+        and "refresh_expires_in" not in result
+        and payload.get("refresh_expires_at")
+    ):
+        refreshed["refresh_expires_at"] = int(payload["refresh_expires_at"])
+    _store_uat(shared, profile_name, open_id, refreshed)
+    return refreshed
+
+
+def refresh_uat_for_user(
+    open_id: str,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    *,
+    shared_home: Optional[Path] = None,
+    profile_name: str | None = None,
+    force: bool = True,
+    headroom_seconds: int = 300,
+) -> dict[str, Any] | None:
+    """Legacy-compatible UAT refresh entrypoint backed by multitenancy.
+
+    Older Hermes fork code calls ``hermes_cli.feishu_auth.refresh_uat_for_user``
+    with only an ``open_id`` plus app credentials.  In multitenancy, an open_id
+    must first resolve to an active routed profile; the credential vault is the
+    canonical store and the profile-local JSON is only the compatibility mirror.
+    """
+    shared = shared_home or resolve_shared_home()
+    routed_profile = profile_name or _profile_name_for_open_id(shared, open_id)
+    return refresh_uat_if_needed(
+        profile_name=routed_profile,
+        open_id=open_id,
+        shared_home=shared,
+        force=force,
+        headroom_seconds=headroom_seconds,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
 
 
 def _lark_cli_status(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any]:
@@ -198,6 +381,13 @@ def cancel_session(*, session_id: str, profile_name: str, open_id: str) -> dict[
 def _assert_route(shared_home: Path, profile_name: str, open_id: str) -> None:
     profile_name = _clean_id("profile_name", profile_name)
     open_id = _clean_id("open_id", open_id)
+    routed_profile = _profile_name_for_open_id(shared_home, open_id)
+    if routed_profile != profile_name:
+        raise FeishuUatAuthError("Feishu user is not bound to this Hermes profile", status=403)
+
+
+def _profile_name_for_open_id(shared_home: Path, open_id: str) -> str:
+    open_id = _clean_id("open_id", open_id)
     db_path = shared_home / "multitenancy.db"
     if not db_path.is_file():
         raise FeishuUatAuthError("multitenancy routing DB is missing", status=503)
@@ -210,8 +400,9 @@ def _assert_route(shared_home: Path, profile_name: str, open_id: str) -> None:
             ).fetchone()
     except sqlite3.Error as exc:
         raise FeishuUatAuthError(f"routing lookup failed: {exc}", status=503) from exc
-    if not row or row[0] != profile_name:
+    if not row:
         raise FeishuUatAuthError("Feishu user is not bound to this Hermes profile", status=403)
+    return str(row[0])
 
 
 def _clean_id(name: str, value: str) -> str:
@@ -293,6 +484,64 @@ def _store_uat(shared_home: Path, profile_name: str, open_id: str, payload: dict
     _atomic_write_json(target, payload)
 
 
+def _load_best_uat_payload(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any] | None:
+    vault_payload = _load_vault_uat_payload(shared_home, profile_name, open_id)
+    json_payload = _load_profile_uat_payload(shared_home, profile_name, open_id)
+    candidates = [payload for payload in (vault_payload, json_payload) if payload]
+    if not candidates:
+        return None
+    return max(candidates, key=_payload_freshness)
+
+
+def _load_vault_uat_payload(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any] | None:
+    store = CredentialStore(shared_home / "multitenancy.db")
+    try:
+        return store.get_secret_for_runtime(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+        )
+    except Exception:
+        return None
+    finally:
+        store.close()
+
+
+def _load_profile_uat_payload(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any] | None:
+    path = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _payload_needs_refresh(payload: dict[str, Any], *, headroom_seconds: int = 300) -> bool:
+    expires_at = _as_int(payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at"))
+    if not expires_at:
+        return False
+    return _now_ms() >= expires_at - int(headroom_seconds) * 1000
+
+
+def _payload_freshness(payload: dict[str, Any]) -> tuple[int, int]:
+    return (
+        _as_int(payload.get("granted_at") or payload.get("updated_at")),
+        _as_int(payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at")),
+    )
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
@@ -323,18 +572,193 @@ def _session_public(session: FeishuAuthSession) -> dict[str, Any]:
 
 
 def _begin_device_authorization(client_id: str, scope: str | None, client_secret: str) -> dict[str, Any]:
-    from hermes_cli.feishu_auth import begin_device_authorization
+    try:
+        from hermes_cli.feishu_auth import begin_device_authorization
 
-    return begin_device_authorization(client_id, scope, client_secret)
+        return begin_device_authorization(client_id, scope, client_secret)
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli.feishu_auth":
+            raise
+    return _begin_device_authorization_local(client_id, scope, client_secret)
 
 
 def _poll_device_token(device_code: str, client_id: str, client_secret: str) -> dict[str, Any]:
-    from hermes_cli.feishu_auth import poll_device_token
+    try:
+        from hermes_cli.feishu_auth import poll_device_token
 
-    return poll_device_token(device_code, client_id, client_secret)
+        return poll_device_token(device_code, client_id, client_secret)
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli.feishu_auth":
+            raise
+    return _poll_device_token_local(device_code, client_id, client_secret)
+
+
+def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -> dict[str, Any]:
+    data = _api_post(
+        "/open-apis/authen/v2/oauth/token",
+        FEISHU_OPEN_BASE_URL,
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    )
+    return _normalise_refresh_response(data)
+
+
+def _normalise_refresh_response(data: dict[str, Any]) -> dict[str, Any]:
+    access_token = str(data.get("access_token") or "").strip()
+    if not access_token:
+        raise FeishuUatAuthError("Feishu refresh response missing access_token", status=502)
+    return {
+        "access_token": access_token,
+        "refresh_token": str(data.get("refresh_token") or "").strip() or None,
+        "expires_in": int(data.get("expires_in") or 7200),
+        "refresh_expires_in": _refresh_token_expires_in(data),
+        "scope": str(data.get("scope") or "").strip(),
+        "token_type": str(data.get("token_type", "Bearer")).strip(),
+    }
 
 
 def _fetch_user_info(access_token: str) -> dict[str, Any]:
-    from hermes_cli.feishu_auth import fetch_user_info
+    try:
+        from hermes_cli.feishu_auth import fetch_user_info
 
-    return fetch_user_info(access_token)
+        return fetch_user_info(access_token)
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli.feishu_auth":
+            raise
+    return _fetch_user_info_local(access_token)
+
+
+def _scope_with_offline_access(scope: str | None) -> str:
+    parts = parse_scopes(scope or FEISHU_DEFAULT_SCOPE)
+    if "offline_access" not in parts:
+        parts.append("offline_access")
+    return " ".join(dict.fromkeys(parts))
+
+
+def _api_post(path: str, base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    url = f"{base_url}{path}"
+    try:
+        data = _http_json("POST", url, payload=payload)
+    except OSError as exc:
+        raise FeishuUatAuthError(f"Network error calling {url}: {exc}", status=503) from exc
+    if not isinstance(data, dict):
+        raise FeishuUatAuthError(f"Unexpected response from {url}", status=502)
+    error_code = data.get("error") or data.get("error_code")
+    if error_code and error_code not in {"authorization_pending", "slow_down"}:
+        description = data.get("error_description") or data.get("msg") or "unknown error"
+        raise FeishuUatAuthError(f"Feishu OAuth error: {description}", status=502)
+    return data
+
+
+def _begin_device_authorization_local(
+    client_id: str,
+    scope: str | None,
+    client_secret: str,
+) -> dict[str, Any]:
+    data = _api_post(
+        "/oauth/v1/device_authorization",
+        FEISHU_ACCOUNTS_BASE_URL,
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": _scope_with_offline_access(scope),
+        },
+    )
+    required = {"device_code", "user_code", "verification_uri_complete"}
+    missing = sorted(required - set(data))
+    if missing:
+        raise FeishuUatAuthError(
+            f"device authorization response missing fields: {', '.join(missing)}",
+            status=502,
+        )
+    return {
+        "device_code": str(data["device_code"]).strip(),
+        "user_code": str(data["user_code"]).strip(),
+        "verification_uri": str(data.get("verification_uri") or "").strip(),
+        "verification_uri_complete": str(data["verification_uri_complete"]).strip(),
+        "expires_in": int(data.get("expires_in", 1800)),
+        "interval": max(int(data.get("interval", 3)), 1),
+    }
+
+
+def _refresh_token_expires_in(data: dict[str, Any], default: int = 30 * 24 * 3600) -> int:
+    raw = data.get("refresh_token_expires_in")
+    if raw is None:
+        raw = data.get("refresh_expires_in", default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _poll_device_token_local(device_code: str, client_id: str, client_secret: str) -> dict[str, Any]:
+    data = _api_post(
+        "/open-apis/authen/v2/oauth/token",
+        FEISHU_OPEN_BASE_URL,
+        {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "device_code": device_code,
+        },
+    )
+    return {
+        "access_token": str(data.get("access_token", "")).strip() or None,
+        "refresh_token": str(data.get("refresh_token", "")).strip() or None,
+        "open_id": str(data.get("open_id", "")).strip() or None,
+        "expires_in": int(data.get("expires_in", 7200)),
+        "refresh_expires_in": _refresh_token_expires_in(data),
+        "token_type": str(data.get("token_type", "Bearer")).strip(),
+        "scope": str(data.get("scope", "")).strip(),
+        "error": str(data.get("error") or data.get("error_code") or "").strip() or None,
+        "error_description": str(data.get("error_description") or "").strip() or None,
+    }
+
+
+def _fetch_user_info_local(access_token: str) -> dict[str, Any]:
+    url = f"{FEISHU_OPEN_BASE_URL}/open-apis/authen/v1/user_info"
+    try:
+        body = _http_json("GET", url, headers={"Authorization": f"Bearer {access_token}"})
+    except OSError as exc:
+        raise FeishuUatAuthError(f"Network error calling {url}: {exc}", status=503) from exc
+    data = (body or {}).get("data") or {}
+    if (body or {}).get("code") != 0 or not data:
+        raise FeishuUatAuthError(
+            f"user_info failed: code={(body or {}).get('code')} msg={(body or {}).get('msg') or 'unknown'}",
+            status=502,
+        )
+    return {
+        "open_id": str(data.get("open_id") or "").strip(),
+        "union_id": str(data.get("union_id") or "").strip() or None,
+        "user_id": str(data.get("user_id") or "").strip() or None,
+        "name": str(data.get("name") or "").strip() or None,
+    }
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    body = None
+    request_headers = dict(headers or {})
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=body, method=method, headers=request_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        preview = raw[:200].decode("utf-8", errors="replace") if raw else ""
+        raise FeishuUatAuthError(f"Non-JSON response from {url}: {preview}", status=502) from exc

@@ -32,6 +32,7 @@ import tempfile
 import uuid
 import re
 import secrets
+import importlib
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -40,6 +41,7 @@ from .lark_cli_auth_broker import (
     LarkCliAuthBrokerContext,
     start_lark_cli_auth_broker_server,
 )
+from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +395,29 @@ def _split_model_spec(spec: str) -> tuple[str, str]:
     return provider.strip().lower(), name.strip()
 
 
+def _event_metadata(event: Any) -> dict[str, Any]:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return {}
+    metadata = raw_event.get("metadata")
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _model_spec_for_event(default_spec: str, event: Any) -> str:
+    """Return per-run model override from WebUI broker metadata when present."""
+    metadata = _event_metadata(event)
+    model = str(metadata.get("model") or "").strip()
+    if not model:
+        return default_spec
+    if "/" in model:
+        return model
+    provider = str(metadata.get("provider") or "").strip()
+    if provider:
+        return f"{provider}/{model}"
+    default_provider, _default_model = _split_model_spec(default_spec)
+    return f"{default_provider}/{model}"
+
+
 def _resolve_api_key(
     provider: str,
     env_overrides: dict[str, Any],
@@ -523,6 +548,79 @@ def _configure_feishu_uat_home(feishu_oapi_module: Any, profile_home: Path) -> P
     _install_feishu_app_db_broker(feishu_oapi_module, shared_home)
     _install_feishu_uat_db_broker(feishu_oapi_module, profile_home, shared_home)
     return shared_home
+
+
+class _MissingCurrentSenderOpenId:
+    def get(self) -> str:
+        return ""
+
+
+@contextmanager
+def _missing_sender_open_id_scope(_value: Optional[str]) -> Iterator[None]:
+    yield
+
+
+def _load_feishu_oapi_runtime(profile_home: Path) -> tuple[Any, Any, Path]:
+    """Load legacy Feishu OAPI context when Hermes still provides it.
+
+    Hermes v0.14 upstream no longer carries the local fork's
+    ``tools.feishu_oapi_client`` module. WebUI/API Run Broker traffic can still
+    run with core tools and lark-cli, so missing legacy OAPI support should not
+    abort AIAgent startup.
+    """
+    shared_home = _resolve_shared_hermes_home(profile_home)
+    try:
+        from tools import feishu_oapi_client as feishu_oapi
+    except Exception as exc:
+        logger.info("[multitenancy] legacy Feishu OAPI client unavailable; skipping OAPI credential patch: %s", exc)
+        _configure_cron_home(shared_home)
+        return _missing_sender_open_id_scope, _MissingCurrentSenderOpenId(), shared_home
+
+    sender_open_id_scope = feishu_oapi.sender_open_id_scope
+    current_sender_open_id = feishu_oapi.current_sender_open_id
+    shared_home = _configure_feishu_uat_home(feishu_oapi, profile_home)
+    _install_legacy_feishu_refresh_bridge(shared_home)
+    _configure_cron_home(shared_home)
+    return sender_open_id_scope, current_sender_open_id, shared_home
+
+
+def _install_legacy_feishu_refresh_bridge(shared_home: Path) -> None:
+    """Route old Hermes UAT refresh calls through multitenancy.
+
+    Legacy fork modules refresh per-user UAT by calling
+    ``hermes_cli.feishu_auth.refresh_uat_for_user(open_id, app_id, app_secret)``.
+    In the multitenancy target state, that function must not own token
+    lifecycle.  Patch it to resolve the routed profile and delegate to
+    ``feishu_uat_auth.refresh_uat_for_user`` instead.
+    """
+    try:
+        feishu_auth = importlib.import_module("hermes_cli.feishu_auth")
+    except Exception:
+        return
+
+    if getattr(feishu_auth, "_hermes_mt_refresh_bridge_installed", False):
+        return
+    original = getattr(feishu_auth, "refresh_uat_for_user", None)
+    if original is None:
+        return
+    setattr(feishu_auth, "_hermes_mt_original_refresh_uat_for_user", original)
+
+    def _refresh_uat_for_user_via_multitenancy(
+        open_id: str,
+        app_id: str | None = None,
+        app_secret: str | None = None,
+    ) -> dict[str, Any] | None:
+        refresh_mod = importlib.import_module("hermes_multitenancy.feishu_uat_auth")
+        return refresh_mod.refresh_uat_for_user(
+            open_id=str(open_id),
+            client_id=app_id,
+            client_secret=app_secret,
+            shared_home=shared_home,
+            force=True,
+        )
+
+    feishu_auth.refresh_uat_for_user = _refresh_uat_for_user_via_multitenancy
+    feishu_auth._hermes_mt_refresh_bridge_installed = True
 
 
 def _install_feishu_app_db_broker(feishu_oapi_module: Any, shared_home: Path) -> None:
@@ -2648,6 +2746,7 @@ def _run_with_aiagent(
     primary = (config.get("model") or {}).get("default")
     if not primary:
         raise RuntimeError("profile config missing model.default")
+    primary = _model_spec_for_event(str(primary), event)
     fallback_models = config.get("fallback") or []
 
     provider, model_only = _split_model_spec(primary)
@@ -2661,11 +2760,7 @@ def _run_with_aiagent(
     _install_credential_env_passthrough(profile_home)
     _install_skill_runtime_compat(profile_home)
     from run_agent import AIAgent
-    from tools import feishu_oapi_client as feishu_oapi
-    sender_open_id_scope = feishu_oapi.sender_open_id_scope
-    current_sender_open_id = feishu_oapi.current_sender_open_id
-    shared_hermes_home = _configure_feishu_uat_home(feishu_oapi, profile_home)
-    _configure_cron_home(shared_hermes_home)
+    sender_open_id_scope, current_sender_open_id, shared_hermes_home = _load_feishu_oapi_runtime(profile_home)
     try:
         from hermes_cli.tools_config import _get_platform_tools
     except Exception:
@@ -3005,6 +3100,9 @@ def _resolve_enabled_toolsets(
                 platform_key, exc,
             )
 
+    if explicit_toolsets and not default_toolsets:
+        default_toolsets = _fallback_default_toolsets(platform_key)
+
     if explicit_toolsets:
         merged = sorted(set(default_toolsets) | set(explicit_toolsets))
         logger.info(
@@ -3014,6 +3112,13 @@ def _resolve_enabled_toolsets(
         return merged
 
     return default_toolsets or None
+
+
+def _fallback_default_toolsets(platform_key: str) -> list[str]:
+    """Core toolsets to preserve when Hermes' platform resolver is unavailable."""
+    if platform_key in {"api_server", "webui"}:
+        return ["file", "terminal", "web"]
+    return []
 
 
 def _normalize_toolset_list(value: Any) -> list[str]:
