@@ -1242,6 +1242,28 @@ def _lark_cli_default_identity(profile_home: Path, open_id: str) -> str:
     return "bot"
 
 
+def _log_feishu_identity_context(
+    *,
+    profile_home: Path,
+    shared_home: Path,
+    sender_open_id: str,
+) -> None:
+    """Log Feishu token lookup paths without implying group profiles use member UAT."""
+    profile_home = Path(profile_home).expanduser()
+    shared_home = Path(shared_home).expanduser()
+    logger.info(
+        "[multitenancy] Feishu identity context sender=%s profile=%s "
+        "profile_uat_dir=%s legacy Feishu UAT compatibility dir=%s "
+        "lark_cli_default_identity=%s group_profile=%s",
+        sender_open_id,
+        profile_home.name,
+        profile_home / "feishu_uat",
+        shared_home / "feishu_uat",
+        _lark_cli_default_identity(profile_home, sender_open_id),
+        _is_group_profile_home(profile_home),
+    )
+
+
 @contextmanager
 def _lark_cli_auth_broker_scope(
     profile_home: Path,
@@ -2644,11 +2666,6 @@ def _run_with_aiagent(
     current_sender_open_id = feishu_oapi.current_sender_open_id
     shared_hermes_home = _configure_feishu_uat_home(feishu_oapi, profile_home)
     _configure_cron_home(shared_hermes_home)
-    if shared_hermes_home != profile_home:
-        logger.info(
-            "[multitenancy] using shared Feishu UAT dir: %s",
-            shared_hermes_home / "feishu_uat",
-        )
     try:
         from hermes_cli.tools_config import _get_platform_tools
     except Exception:
@@ -2694,17 +2711,17 @@ def _run_with_aiagent(
 
     fallback_model = fallback_models[0] if fallback_models else None
 
-    # 7) Wrap the agent run in sender_open_id_scope so per-user UAT tools
-    #    pick up the right token from ~/.hermes/feishu_uat/<open_id>.json.
+    # 7) Wrap the agent run in sender_open_id_scope so legacy Feishu tools
+    #    pick up the right token from the profile-local UAT directory.
     logger.info(
         "[multitenancy] running AIAgent for sender=%s profile=%s toolsets=%s",
         sender_open_id, profile_home.name,
         enabled_toolsets if enabled_toolsets is not None else "<default>",
     )
-    logger.info(
-        "[multitenancy] Feishu UAT lookup sender=%s dir=%s",
-        sender_open_id,
-        shared_hermes_home / "feishu_uat",
+    _log_feishu_identity_context(
+        profile_home=profile_home,
+        shared_home=shared_hermes_home,
+        sender_open_id=sender_open_id,
     )
     with sender_open_id_scope(sender_open_id or None):
         try:

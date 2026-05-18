@@ -2124,6 +2124,30 @@ def test_lark_cli_auth_broker_scope_can_read_public_app_id_from_profile_uat(monk
         assert extra["LARKSUITE_CLI_APP_ID"] == "cli_from_json"
 
 
+def test_feishu_identity_context_log_distinguishes_legacy_uat_and_lark_cli_identity(
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "feishu_group_abc"
+    profile.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="hermes_multitenancy.agent_real"):
+        agent_real._log_feishu_identity_context(
+            profile_home=profile,
+            shared_home=shared_home,
+            sender_open_id="ou_sender",
+        )
+
+    assert "using shared Feishu UAT dir" not in caplog.text
+    assert "legacy Feishu UAT compatibility dir" in caplog.text
+    assert f"profile_uat_dir={profile / 'feishu_uat'}" in caplog.text
+    assert "lark_cli_default_identity=bot" in caplog.text
+
+
 def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatch, tmp_path: Path):
     """The actual spawn path should get per-run broker env overrides."""
     from hermes_multitenancy import agent_real

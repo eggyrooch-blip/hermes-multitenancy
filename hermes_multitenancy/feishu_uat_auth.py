@@ -78,7 +78,7 @@ def credential_status(
     _assert_route(shared, profile_name, open_id)
     store = CredentialStore(shared / "multitenancy.db")
     try:
-        return store.get_status(
+        status = store.get_status(
             profile_name=profile_name,
             subject_id=open_id,
             provider="feishu",
@@ -87,6 +87,26 @@ def credential_status(
         )
     finally:
         store.close()
+    status["lark_cli"] = _lark_cli_status(shared, profile_name, open_id)
+    return status
+
+
+def _lark_cli_status(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any]:
+    try:
+        from . import agent_real
+
+        profile_home = shared_home / "profiles" / profile_name
+        binary = agent_real._resolve_lark_cli_authsidecar_binary(profile_home)
+        app_id = agent_real._resolve_lark_cli_app_id(profile_home)
+        return {
+            "available": bool(binary.exists() and app_id),
+            "default_identity": agent_real._lark_cli_default_identity(profile_home, open_id),
+        }
+    except Exception:
+        return {
+            "available": False,
+            "default_identity": "bot",
+        }
 
 
 def start_session(

@@ -1,6 +1,6 @@
 ---
 title: hermes-multitenancy 架构指南
-updated: 2026-05-17
+updated: 2026-05-18
 status: living
 scope: /Users/kite/code/hermes-multitenancy（plugin 真源；通过 ~/.hermes/plugins/multitenancy symlink 被 hermes-agent 加载）
 audience: 后续 Claude / 用户本人；改这个仓前必读
@@ -61,6 +61,8 @@ sources:
 > 2026-05-15 21:20 追加：`lark_cli_auth_broker` 的 user token 读取不再只信 credential vault，而是 vault + profile-local `feishu_uat/<open_id>.json` 双源取较新 payload。原因是 `/feishu_auth` 与原生 Feishu 工具会优先刷新 profile-local JSON，vault 回写可能滞后，authsidecar 若只读 vault 会继续用旧 UAT 并触发 Feishu `20005 invalid access token`。新增测试覆盖 profile-local JSON 新于 vault 时 broker 注入 JSON token；本机 `tests/test_aiagent_subprocess.py tests/test_lark_cli_auth_broker.py tests/test_lark_cli_canary_preflight.py` 为 `78 passed, 6 skipped`。本机 gateway 重启后 `lark_cli GET /open-apis/authen/v1/user_info` 返回 `approval_required=false / exit_code=0 / code=0`。仍未发布生产。
 >
 > 2026-05-15 23:35 追加：官方 `lark-cli` 支持 `--as user|bot`，不是只能用用户身份。multitenancy broker 的自动身份策略是：个人 profile 且当前 sender 有未过期 UAT 时 `LARKSUITE_CLI_DEFAULT_AS=user`；否则默认 `bot`；群 profile 由 `group_profile.json(kind=group)` 或 `feishu_group_*` 名称识别，永远不读取成员 UAT，强制默认 `bot`。同时 `LARKSUITE_CLI_STRICT_MODE=off`，显式 `identity=user|bot` 仍可由工具层传给支持 `--as` 的官方命令。bot identity 使用全局 app credential 在父进程内向 `/open-apis/auth/v3/tenant_access_token/internal` 换取 tenant token，再注入给 lark-cli，不把 app_secret 下发到 AIAgent。测试覆盖 bot identity 从 app credential mint TAT、per-run broker 允许 `{"user","bot"}`、个人 UAT 自动 user、群 profile 强制 bot。产品边界：user identity 用于访问/创建用户私有资源；bot/app identity 用于机器人、租户级或应用可见资源，不能替代用户授权访问用户私有云文档/日历。
+>
+> 2026-05-18 追加：AIAgent 启动日志不再打印容易误读的 `using shared Feishu UAT dir`。现在统一输出 `Feishu identity context`，同时列出 `profile_uat_dir`、`legacy Feishu UAT compatibility dir`、`lark_cli_default_identity` 与 `group_profile`。这样排查新群 profile 时能直接看到群聊 `lark-cli` 默认 `bot`，而 shared `feishu_uat/` 只作为 legacy OAuth/迁移兼容目录，不表示正在读取群成员个人 UAT。
 >
 > 2026-05-15 23:10 追加本机 Feishu 私聊可见 canary：profile `feishu_g41a5b5g` / open_id `ou_cf23e7c262afa4b7a006baa75f863ed5` 重新授权完整 lark-cli scope（请求 183 项，token 回传 180 项）后，authsidecar broker 通过用户身份完成 `im +messages-send --as user`，并由 `im +chat-messages-list` 反查为 `sender_type=user`。同一 UAT 又完成 Base `AuditResults` 字段/记录写入，以及 docx 内 whiteboard 新增和 Mermaid 写入。注意：这些是本机 profile sandbox + authsidecar broker 真机证据，仍未发布生产。
 >
