@@ -206,6 +206,19 @@ def _base_evidence(tmp_path: Path) -> object:
                     "我得说点啥，才能让他继续",
                 ],
             })
+        if name == "offline_midrun_exception_preserves_recovery_context":
+            case.update({
+                "followup_text": "刚刚那个执行到一半没了，接着来",
+                "failed_request_visible_to_followup": True,
+                "failure_marker_visible_to_followup": True,
+                "followup_used_failed_request": True,
+                "followup_response": "resumed-after-midrun-failure",
+                "followup_history_before_response": [
+                    "帮我生成天气 skill 半路失败报告，执行到一半模拟异常",
+                    "上一个任务在完成前执行失败或中断；如果用户要求继续，请根据上一条用户请求继续推进，不要丢失上下文。",
+                    "刚刚那个执行到一半没了，接着来",
+                ],
+            })
         if name == "offline_hermes_loader_discovers_symlinked_skills":
             case.update({
                 "loader_checked": True,
@@ -1408,7 +1421,7 @@ def test_completion_audit_accepts_required_dialogue_and_write_identity_coverage(
 
     assert report["failed"] == 0
     assert report["blocked"] == 3
-    assert report["covered"] == 24
+    assert report["covered"] == 25
     assert report["evidence_ok"] is True
     assert report["completion_state"] == "incomplete"
 
@@ -1436,7 +1449,7 @@ def test_completion_audit_treats_missing_credential_key_real_cases_as_blocked_no
     assert "blocked_failures" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 23
+    assert report["covered"] == 24
     assert report["evidence_ok"] is True
 
 
@@ -1463,7 +1476,7 @@ def test_completion_audit_treats_expired_real_user_uat_as_blocked_not_failed(tmp
     assert "real_feishu_uat_user_info" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 23
+    assert report["covered"] == 24
     assert report["evidence_ok"] is True
 
 
@@ -1496,7 +1509,7 @@ def test_completion_audit_treats_scope_inventory_without_valid_user_uat_as_block
     assert scope_item["status"] == "blocked"
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 23
+    assert report["covered"] == 24
     assert report["evidence_ok"] is True
 
 

@@ -176,6 +176,18 @@ def test_production_feedback_interruption_quote_maps_to_executable_uat(tmp_path:
     assert result["feedback_phrase_coverage"]["才能让他继续"] is True
 
 
+def test_midrun_exception_keeps_recoverable_context_for_followup(tmp_path: Path):
+    matrix_mod = _load_matrix_module()
+
+    result = matrix_mod.case_midrun_exception_preserves_recovery_context(tmp_path)
+
+    assert result["followup_text"] == "刚刚那个执行到一半没了，接着来"
+    assert result["failed_request_visible_to_followup"] is True
+    assert result["failure_marker_visible_to_followup"] is True
+    assert result["followup_used_failed_request"] is True
+    assert result["followup_response"] == "resumed-after-midrun-failure"
+
+
 def test_persistent_event_dedupe_skips_feishu_redelivery(tmp_path: Path):
     matrix_mod = _load_matrix_module()
 

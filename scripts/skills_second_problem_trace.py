@@ -12,6 +12,9 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
+import subprocess
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -53,6 +56,11 @@ EXCLUDED_TEXT_FILENAMES = {
     "second-problem-trace-with-agent-history.json",
     "skills-uat-latest.json",
 }
+EXCLUDED_TEXT_NAME_PREFIXES = (
+    "completion-audit",
+    "review-completion-audit",
+    "skills-uat.stdout",
+)
 TEXT_SUFFIXES = {
     "",
     ".html",
@@ -75,6 +83,7 @@ ARTIFACT_SUFFIXES = {
     ".webp",
 }
 IMAGE_ARTIFACT_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+LARGE_TEXT_FILE_BYTES = 2_000_000
 CANDIDATE_CLASSES = [
     {
         "name": "vision_or_screenshot_failure",
@@ -92,6 +101,25 @@ CANDIDATE_CLASSES = [
         "name": "slow_model_idle_wait",
         "patterns": [r"沉默", r"慢模型", r"得.*追问", r"继续追问", r"突然就没", r"执行一半"],
     },
+]
+PREFILTER_LITERAL_NEEDLES = [
+    "[Image:",
+    "截图",
+    "图片",
+    "视觉",
+    "上下文割裂",
+    "丢失历史",
+    "丢历史",
+    "context fragmentation",
+    "重复 dispatch",
+    "两张 Card",
+    "重复 Card",
+    "duplicate card",
+    "沉默",
+    "慢模型",
+    "继续追问",
+    "突然就没",
+    "执行一半",
 ]
 SELF_REFERENCE_EXACT_SUFFIXES = {
     "docs/plans/2026-05-19-skills-unified-management-uat-matrix.md",
@@ -118,6 +146,7 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"不能标\s*complete", re.IGNORECASE),
     re.compile(r"no issue text", re.IGNORECASE),
     re.compile(r"\bis still absent\b", re.IGNORECASE),
+    re.compile(r"\bbody absent\b", re.IGNORECASE),
 ]
 IMAGE_SOURCE_PATTERN = re.compile(r"\[Image:\s*source:\s*([^\]\n]+)\]")
 INTERNAL_CONTEXT_PREFIXES = (
@@ -159,6 +188,8 @@ def _iter_text_files(roots: Iterable[Path]) -> Iterable[Path]:
         if root.is_file():
             if root.name in EXCLUDED_TEXT_FILENAMES:
                 continue
+            if root.name.startswith(EXCLUDED_TEXT_NAME_PREFIXES):
+                continue
             if root.suffix in TEXT_SUFFIXES:
                 key = str(root.resolve(strict=False))
                 if key not in yielded:
@@ -169,6 +200,8 @@ def _iter_text_files(roots: Iterable[Path]) -> Iterable[Path]:
             if any(part in EXCLUDED_DIRS for part in path.parts):
                 continue
             if path.name in EXCLUDED_TEXT_FILENAMES:
+                continue
+            if path.name.startswith(EXCLUDED_TEXT_NAME_PREFIXES):
                 continue
             if path.is_file() and path.suffix in TEXT_SUFFIXES:
                 key = str(path.resolve(strict=False))
@@ -182,6 +215,122 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return ""
+
+
+def _read_matching_text_window(path: Path, needles: list[str], needle_pattern: re.Pattern[str] | None) -> str:
+    try:
+        if path.stat().st_size <= LARGE_TEXT_FILE_BYTES:
+            return _read_text(path)
+    except OSError:
+        return ""
+    if not needles or needle_pattern is None:
+        return _read_text(path)
+
+    selected: list[str] = []
+    seen_lines: set[int] = set()
+    previous: deque[tuple[int, str]] = deque(maxlen=5)
+    carry = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                matched = needle_pattern.search(line) is not None
+                if matched:
+                    for previous_line_number, previous_line in previous:
+                        if previous_line_number not in seen_lines:
+                            selected.append(previous_line)
+                            seen_lines.add(previous_line_number)
+                    if line_number not in seen_lines:
+                        selected.append(line)
+                        seen_lines.add(line_number)
+                    carry = 5
+                elif carry > 0:
+                    if line_number not in seen_lines:
+                        selected.append(line)
+                        seen_lines.add(line_number)
+                    carry -= 1
+                previous.append((line_number, line))
+    except OSError:
+        return ""
+    return "".join(selected)
+
+
+def _prefilter_needles(
+    exact_phrases: list[str],
+    referenced_artifacts: list[str],
+    current_feedback_phrases: list[str],
+) -> list[str]:
+    seen: set[str] = set()
+    needles: list[str] = []
+    for value in [
+        *exact_phrases,
+        *referenced_artifacts,
+        *current_feedback_phrases,
+        *PREFILTER_LITERAL_NEEDLES,
+    ]:
+        if value and value not in seen:
+            seen.add(value)
+            needles.append(value)
+    return needles
+
+
+def _rg_matching_text_files(
+    roots: list[Path],
+    all_text_files: list[Path],
+    *,
+    needles: list[str],
+) -> list[Path]:
+    """Use ripgrep as a fast native prefilter, falling back to Python scanning."""
+    if not needles or shutil.which("rg") is None:
+        return all_text_files
+
+    path_by_key = {str(path.resolve(strict=False)): path for path in all_text_files}
+    cmd = [
+        "rg",
+        "--fixed-strings",
+        "--files-with-matches",
+        "--no-messages",
+        "--color",
+        "never",
+        "--hidden",
+    ]
+    for dirname in sorted(EXCLUDED_DIRS):
+        cmd.extend(["--glob", f"!**/{dirname}/**"])
+    for filename in sorted(EXCLUDED_TEXT_FILENAMES):
+        cmd.extend(["--glob", f"!**/{filename}"])
+    for prefix in EXCLUDED_TEXT_NAME_PREFIXES:
+        cmd.extend(["--glob", f"!**/{prefix}*"])
+    for needle in needles:
+        cmd.extend(["-e", needle])
+    cmd.extend(str(path) for path in roots if path.exists())
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return all_text_files
+
+    if completed.returncode not in {0, 1}:
+        return all_text_files
+    if completed.returncode == 1:
+        return []
+
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for line in completed.stdout.splitlines():
+        path = Path(line).expanduser()
+        key = str(path.resolve(strict=False))
+        original = path_by_key.get(key)
+        if original is None or key in seen:
+            continue
+        seen.add(key)
+        matches.append(original)
+    return matches
 
 
 def _structured_user_message(line: str) -> dict[str, Any] | None:
@@ -654,7 +803,19 @@ def build_trace(
     search_roots = _unique_paths([*roots, *artifact_roots])
     raw_image_candidates = _raw_image_artifact_candidates(referenced_artifacts, search_roots)
     searched_raw_image_files = _count_raw_image_files(search_roots)
-    searched_files = 0
+    prefilter_needles = _prefilter_needles(exact_phrases, referenced_artifacts, current_feedback_phrases)
+    prefilter_pattern = (
+        re.compile("|".join(re.escape(needle) for needle in prefilter_needles))
+        if prefilter_needles
+        else None
+    )
+    all_text_files = list(_iter_text_files(search_roots))
+    searched_files = len(all_text_files)
+    matching_text_files = _rg_matching_text_files(
+        search_roots,
+        all_text_files,
+        needles=prefilter_needles,
+    )
     exact_phrase_matches: list[dict[str, Any]] = []
     exact_issue_matches: list[dict[str, Any]] = []
     placeholder_matches: list[dict[str, Any]] = []
@@ -668,9 +829,8 @@ def build_trace(
         for item in CANDIDATE_CLASSES
     ]
 
-    for path in _iter_text_files(search_roots):
-        searched_files += 1
-        text = _read_text(path)
+    for path in matching_text_files:
+        text = _read_matching_text_window(path, prefilter_needles, prefilter_pattern)
         if not text:
             continue
         structured_feedback_payload_matches.extend(

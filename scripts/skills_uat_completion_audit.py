@@ -31,6 +31,7 @@ REQUIRED_MATRIX_CASES = {
     "offline_continue_turn_reconstructs_interrupted_request",
     "offline_interruption_arbitrary_followup_resume_context",
     "offline_production_feedback_interruption_quote_resume",
+    "offline_midrun_exception_preserves_recovery_context",
     "offline_persistent_event_dedupe_skips_redelivery",
     "offline_slow_model_idle_feedback_heartbeat",
     "offline_vision_failure_surfaces_recovery_context",
@@ -761,6 +762,38 @@ def _production_feedback_interruption_quote_ok(case: dict[str, Any]) -> tuple[bo
     return ok, note
 
 
+def _midrun_exception_recovery_ok(case: dict[str, Any]) -> tuple[bool, str]:
+    history_before = case.get("followup_history_before_response")
+    if not isinstance(history_before, list):
+        history_before = []
+    failed_request_visible = case.get("failed_request_visible_to_followup") is True
+    failure_marker_visible = case.get("failure_marker_visible_to_followup") is True
+    used_failed_request = case.get("followup_used_failed_request") is True
+    followup_text = str(case.get("followup_text") or "")
+    response = str(case.get("followup_response") or "")
+    saw_failed_request = any("天气 skill 半路失败报告" in str(content) for content in history_before)
+    saw_failure_marker = any("执行失败或中断" in str(content) for content in history_before)
+    ok = (
+        case.get("ok") is True
+        and failed_request_visible
+        and failure_marker_visible
+        and used_failed_request
+        and followup_text == "刚刚那个执行到一半没了，接着来"
+        and response == "resumed-after-midrun-failure"
+        and saw_failed_request
+        and saw_failure_marker
+    )
+    note = (
+        f"ok={case.get('ok') is True}; followup_text={followup_text}; "
+        f"failed_request_visible_to_followup={failed_request_visible}; "
+        f"failure_marker_visible_to_followup={failure_marker_visible}; "
+        f"followup_used_failed_request={used_failed_request}; "
+        f"followup_response={response}; saw_failed_request={saw_failed_request}; "
+        f"saw_failure_marker={saw_failure_marker}; history_before_count={len(history_before)}"
+    )
+    return ok, note
+
+
 def _persistent_event_dedupe_ok(case: dict[str, Any]) -> tuple[bool, str]:
     same_dispatch_count = int(case.get("same_message_id_dispatch_count") or 0)
     same_suppressed = case.get("same_message_id_duplicate_suppressed") is True
@@ -1032,6 +1065,14 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         "covered" if production_feedback_ok else "failed",
         str(matrix_path),
         production_feedback_note,
+    ))
+    midrun_case = cases.get("offline_midrun_exception_preserves_recovery_context") or {}
+    midrun_ok, midrun_note = _midrun_exception_recovery_ok(midrun_case)
+    items.append(_item(
+        "Validate mid-run agent exceptions persist a recovery marker so arbitrary follow-up can resume context.",
+        "covered" if midrun_ok else "failed",
+        str(matrix_path),
+        midrun_note,
     ))
     persistent_dedupe_case = cases.get("offline_persistent_event_dedupe_skips_redelivery") or {}
     persistent_dedupe_ok, persistent_dedupe_note = _persistent_event_dedupe_ok(persistent_dedupe_case)

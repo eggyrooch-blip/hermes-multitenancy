@@ -1137,6 +1137,109 @@ def case_production_feedback_interruption_quote_resume(_tmp_root: Path) -> dict[
     return result
 
 
+async def _midrun_exception_recovery_probe() -> dict[str, Any]:
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import runtime as runtime_mod
+    from hermes_multitenancy.router import handle_async
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    previous_default_run_agent = runtime_mod._default_run_agent
+    previous_pool = router_mod._pool
+    previous_logger_disabled = router_mod.logger.disabled
+    clear_spike_routes()
+    router_mod.override_pool(None)
+    router_mod._user_inflight_tasks.clear()
+    router_mod._user_inflight_history_keys.clear()
+    router_mod._suppress_interruption_marker_tasks.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
+
+    user_id = "ou_midrun_failure_uat"
+    chat_id = "chat-midrun-failure"
+    followup_text = "刚刚那个执行到一半没了，接着来"
+    state: dict[str, Any] = {}
+
+    async def runner(event, home):
+        text = getattr(event, "text", "")
+        history_key = (home.name, user_id)
+        if "半路失败" in text:
+            raise RuntimeError("simulated mid-run worker failure")
+        if text == followup_text:
+            history_before = router_mod._session_history.get(history_key, [])
+            contents = [str(item.get("content") or "") for item in history_before]
+            failed_request_visible = any("天气 skill 半路失败报告" in content for content in contents)
+            failure_marker_visible = any("执行失败或中断" in content for content in contents)
+            used_failed_request = failed_request_visible and failure_marker_visible
+            response = "resumed-after-midrun-failure" if used_failed_request else "missing-midrun-failure-context"
+            state.update({
+                "followup_text": followup_text,
+                "failed_request_visible_to_followup": failed_request_visible,
+                "failure_marker_visible_to_followup": failure_marker_visible,
+                "followup_used_failed_request": used_failed_request,
+                "followup_response": response,
+                "followup_history_before_response": contents,
+            })
+            return response
+        return "unexpected"
+
+    runtime_mod._default_run_agent = runner
+    router_mod.logger.disabled = True
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-midrun-failure-") as tmp:
+            home = Path(tmp) / "midrun_failure_profile"
+            home.mkdir()
+            add_spike_route(user_id, home)
+
+            class Adapter:
+                async def send_typing(self, _chat): pass
+                async def send(self, _chat, _msg, *, reply_to=None, metadata=None): pass
+
+            gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+            event1 = SimpleNamespace(
+                text="帮我生成天气 skill 半路失败报告，执行到一半模拟异常",
+                message_id="om_midrun_failure_first",
+                source=SimpleNamespace(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_id_alt=None,
+                    chat_type="dm",
+                    message_id="om_midrun_failure_first",
+                ),
+            )
+            event2 = SimpleNamespace(
+                text=followup_text,
+                message_id="om_midrun_failure_followup",
+                source=SimpleNamespace(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_id_alt=None,
+                    chat_type="dm",
+                    message_id="om_midrun_failure_followup",
+                ),
+            )
+            await handle_async(event=event1, gateway=gateway)
+            await handle_async(event=event2, gateway=gateway)
+            state["final_history"] = router_mod._session_history[(home.name, user_id)]
+    finally:
+        runtime_mod._default_run_agent = previous_default_run_agent
+        router_mod.logger.disabled = previous_logger_disabled
+        router_mod.override_pool(previous_pool)
+        clear_spike_routes()
+        router_mod.override_session_store(None)
+
+    return state
+
+
+def case_midrun_exception_preserves_recovery_context(_tmp_root: Path) -> dict[str, Any]:
+    result = asyncio.run(_midrun_exception_recovery_probe())
+    _assert(result.get("failed_request_visible_to_followup") is True, "failed request missing from follow-up context")
+    _assert(result.get("failure_marker_visible_to_followup") is True, "failure marker missing from follow-up context")
+    _assert(result.get("followup_used_failed_request") is True, "follow-up did not use failed request context")
+    _assert(result.get("followup_response") == "resumed-after-midrun-failure", "follow-up did not resume failed request")
+    return result
+
+
 async def _slow_model_idle_feedback_probe(tmp_root: Path) -> dict[str, Any]:
     from hermes_multitenancy import agent_real
     from hermes_multitenancy import router as router_mod
@@ -2110,6 +2213,7 @@ def main(argv: list[str] | None = None) -> int:
         cases.append(_run_case("offline_continue_turn_reconstructs_interrupted_request", lambda: case_continue_turn_reconstructs_interrupted_request(tmp_root / "case7a")))
         cases.append(_run_case("offline_interruption_arbitrary_followup_resume_context", lambda: case_interruption_arbitrary_followup_context(tmp_root / "case7b")))
         cases.append(_run_case("offline_production_feedback_interruption_quote_resume", lambda: case_production_feedback_interruption_quote_resume(tmp_root / "case7bb")))
+        cases.append(_run_case("offline_midrun_exception_preserves_recovery_context", lambda: case_midrun_exception_preserves_recovery_context(tmp_root / "case7bbb")))
         cases.append(_run_case("offline_slow_model_idle_feedback_heartbeat", lambda: case_slow_model_idle_feedback(tmp_root / "case7c")))
         cases.append(_run_case("offline_vision_failure_surfaces_recovery_context", case_vision_failure_surfaces_recovery_context))
         cases.append(_run_case("offline_context_continuity_private_and_group", lambda: case_context_continuity_private_and_group(tmp_root / "case8")))

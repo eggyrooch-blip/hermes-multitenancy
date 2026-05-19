@@ -221,6 +221,9 @@ def _persist_assistant_message(key: tuple[str, str], assistant_text: str) -> Non
 _INTERRUPTED_TASK_MESSAGE = (
     "上一个任务在完成前被中断或取消；如果用户要求继续，请根据上一条用户请求继续推进，不要丢失上下文。"
 )
+_FAILED_TASK_MESSAGE = (
+    "上一个任务在完成前执行失败或中断；如果用户要求继续，请根据上一条用户请求继续推进，不要丢失上下文。"
+)
 
 
 def _persist_interruption_marker(key: tuple[str, str]) -> None:
@@ -229,6 +232,14 @@ def _persist_interruption_marker(key: tuple[str, str]) -> None:
     if history and history[-1].get("role") == "assistant" and history[-1].get("content") == _INTERRUPTED_TASK_MESSAGE:
         return
     _persist_assistant_message(key, _INTERRUPTED_TASK_MESSAGE)
+
+
+def _persist_failure_marker(key: tuple[str, str]) -> None:
+    """Persist a resumable failure marker without exposing exception details."""
+    history = _session_history.get(key, [])
+    if history and history[-1].get("role") == "assistant" and history[-1].get("content") == _FAILED_TASK_MESSAGE:
+        return
+    _persist_assistant_message(key, _FAILED_TASK_MESSAGE)
 
 
 def _cancel_inflight_task(key: tuple[str, str, str], *, preserve_resume_marker: bool) -> Optional[asyncio.Task]:
@@ -1824,6 +1835,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             raise
         except Exception:
             outcome_failed = True
+            _persist_failure_marker(hist_key)
             raise
         finally:
             if feishu_full:
