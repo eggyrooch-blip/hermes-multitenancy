@@ -424,3 +424,131 @@ def test_second_problem_trace_marks_phrase_absent_separately_from_blank_body(tmp
     assert report["exact_text_found"] is False
     assert report["exact_phrase_match_count"] == 0
     assert report["exact_issue_text_absent_reason"] == "exact_phrase_not_found"
+
+
+def test_second_problem_trace_counts_structured_user_image_payloads_for_feedback_message(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "rollout.jsonl").write_text(
+        trace_mod.json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "[Image #1] [Image #2]\n然后第二个问题 是卡片重复出现",
+                    "images": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,BBBB"},
+                    ],
+                    "local_images": [],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [sessions],
+        exact_phrases=["然后第二个问题"],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["structured_feedback_message_count"] == 1
+    assert report["structured_feedback_image_payload_count"] == 2
+    assert report["structured_feedback_local_image_payload_count"] == 0
+    assert report["structured_feedback_payload_matches"] == [
+        {
+            "path": str(sessions / "rollout.jsonl"),
+            "line": 1,
+            "image_payload_count": 2,
+            "local_image_payload_count": 0,
+            "sample": "[Image #1] [Image #2]\n然后第二个问题 是卡片重复出现",
+        }
+    ]
+
+
+def test_second_problem_trace_records_structured_feedback_text_when_no_image_payloads(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "rollout.jsonl").write_text(
+        trace_mod.json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "[Image #1] [Image #2]\n然后第二个问题\n\n这个是用户在生产环境中的反馈",
+                    "images": [],
+                    "local_images": [],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [sessions],
+        exact_phrases=["然后第二个问题"],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["exact_text_found"] is False
+    assert report["structured_feedback_message_count"] == 1
+    assert report["structured_feedback_image_payload_count"] == 0
+    assert report["structured_feedback_local_image_payload_count"] == 0
+
+
+def test_second_problem_trace_counts_current_feedback_structured_payloads_separately(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    historical_line = trace_mod.json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "[Image #1] 旧会话里的无关截图",
+                "images": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+                "local_images": [],
+            },
+        },
+        ensure_ascii=False,
+    )
+    current_line = trace_mod.json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了。",
+                "images": [],
+                "local_images": [],
+            },
+        },
+        ensure_ascii=False,
+    )
+    (sessions / "rollout.jsonl").write_text(f"{historical_line}\n{current_line}\n", encoding="utf-8")
+
+    report = trace_mod.build_trace(
+        [sessions],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["structured_feedback_message_count"] == 1
+    assert report["structured_feedback_image_payload_count"] == 1
+    assert report["current_feedback_structured_message_count"] == 1
+    assert report["current_feedback_structured_image_payload_count"] == 0
+    assert report["current_feedback_structured_local_image_payload_count"] == 0
+    assert report["current_feedback_structured_payload_matches"] == [
+        {
+            "path": str(sessions / "rollout.jsonl"),
+            "line": 2,
+            "image_payload_count": 0,
+            "local_image_payload_count": 0,
+            "sample": "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了。",
+        }
+    ]

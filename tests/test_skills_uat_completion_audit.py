@@ -835,6 +835,10 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     assert artifact_item["status"] == "blocked"
     assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
     assert "raw_image_candidates={'Image #1': [], 'Image #2': []}" in artifact_item["note"]
+    assert "structured_feedback_image_payload_count=0" in artifact_item["note"]
+    assert "structured_feedback_local_image_payload_count=0" in artifact_item["note"]
+    assert "current_feedback_structured_image_payload_count=0" in artifact_item["note"]
+    assert "current_feedback_structured_local_image_payload_count=0" in artifact_item["note"]
     assert "searched_raw_image_files=0" in artifact_item["note"]
     assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in artifact_item["note"]
     second_problem = next(
@@ -932,6 +936,64 @@ def test_completion_audit_surfaces_historical_image_review_rejections(tmp_path: 
     assert "lark_group_invite_qr_not_feedback_screenshot" in artifact_item["note"]
     assert "abc123" in artifact_item["note"]
     assert "1372x1488" in artifact_item["note"]
+
+
+def test_completion_audit_surfaces_unreviewed_historical_image_candidates(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_complete_second_problem_trace(tmp_path, artifact_kind="text")
+    trace_path = tmp_path / "second-problem-trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    reviewed_source = tmp_path / "reviewed-qr.png"
+    unreviewed_source = tmp_path / "unreviewed-candidate.png"
+    reviewed_source.write_bytes(b"\x89PNG\r\n\x1a\n")
+    unreviewed_source.write_bytes(b"\x89PNG\r\n\x1a\n")
+    trace["historical_image_references"] = [
+        {
+            "path": str(tmp_path / "agent-session.jsonl"),
+            "source": str(reviewed_source),
+            "labels": ["Image #1"],
+        },
+        {
+            "path": str(tmp_path / "agent-session.jsonl"),
+            "source": str(unreviewed_source),
+            "labels": ["Image #1"],
+        },
+    ]
+    trace["historical_image_reference_count"] = 2
+    _write_json(trace_path, trace)
+    _write_json(
+        tmp_path / "historical-image-reviews.json",
+        {
+            "reviews": [
+                {
+                    "source": str(reviewed_source),
+                    "labels": ["Image #1"],
+                    "verdict": "rejected",
+                    "reason": "lark_group_invite_qr_not_feedback_screenshot",
+                    "md5": "abc123",
+                    "pixel_width": 1372,
+                    "pixel_height": 1488,
+                }
+            ]
+        },
+    )
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    artifact_item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Verify referenced production feedback screenshots")
+    )
+    assert artifact_item["status"] == "blocked"
+    assert "historical_image_unreviewed_candidates=" in artifact_item["note"]
+    assert str(unreviewed_source) in artifact_item["note"]
+    assert str(reviewed_source) not in artifact_item["note"].split("historical_image_unreviewed_candidates=")[1]
 
 
 def test_completion_audit_accepts_exact_second_problem_text_mapped_to_green_uat(tmp_path: Path):

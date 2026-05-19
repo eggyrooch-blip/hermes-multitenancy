@@ -322,6 +322,29 @@ def _historical_image_review_rejections(path: Path) -> list[str]:
     return sorted(rows)
 
 
+def _historical_image_unreviewed_candidates(candidates: dict[str, list[str]], path: Path) -> dict[str, list[str]]:
+    payload = _load_optional_json(path)
+    reviewed: set[tuple[str, str]] = set()
+    if isinstance(payload, dict):
+        reviews = payload.get("reviews")
+        if isinstance(reviews, list):
+            for review in reviews:
+                if not isinstance(review, dict):
+                    continue
+                source = str(review.get("source") or "")
+                if not source:
+                    continue
+                for label in review.get("labels") or []:
+                    if isinstance(label, str) and label:
+                        reviewed.add((label, source))
+    rows: dict[str, list[str]] = {}
+    for label, sources in candidates.items():
+        unreviewed = sorted(source for source in sources if (label, source) not in reviewed)
+        if unreviewed:
+            rows[label] = unreviewed
+    return {label: rows[label] for label in sorted(rows)}
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -355,11 +378,30 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     raw_image_candidates = _raw_image_artifact_candidates(trace)
     raw_image_search_roots = _raw_image_search_roots(trace)
     searched_raw_image_files = int(trace.get("searched_raw_image_files") or 0)
+    structured_feedback_message_count = int(trace.get("structured_feedback_message_count") or 0)
+    structured_feedback_image_payload_count = int(trace.get("structured_feedback_image_payload_count") or 0)
+    structured_feedback_local_image_payload_count = int(
+        trace.get("structured_feedback_local_image_payload_count") or 0
+    )
+    current_feedback_structured_message_count = int(
+        trace.get("current_feedback_structured_message_count") or 0
+    )
+    current_feedback_structured_image_payload_count = int(
+        trace.get("current_feedback_structured_image_payload_count") or 0
+    )
+    current_feedback_structured_local_image_payload_count = int(
+        trace.get("current_feedback_structured_local_image_payload_count") or 0
+    )
     historical_image_candidates = _historical_image_candidates(trace)
     historical_image_reference_count = int(trace.get("historical_image_reference_count") or 0)
     historical_image_candidate_policy = "diagnostic_only_not_current_feedback_artifact"
+    historical_image_review_path = trace_path.parent / "historical-image-reviews.json"
     historical_image_review_rejections = _historical_image_review_rejections(
-        trace_path.parent / "historical-image-reviews.json"
+        historical_image_review_path
+    )
+    historical_image_unreviewed_candidates = _historical_image_unreviewed_candidates(
+        historical_image_candidates,
+        historical_image_review_path,
     )
     if unmapped_artifacts:
         return _item(
@@ -379,6 +421,14 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"historical_image_reference_count={historical_image_reference_count}; "
             f"historical_image_candidate_policy={historical_image_candidate_policy}; "
             f"historical_image_review_rejections={historical_image_review_rejections}; "
+            f"historical_image_unreviewed_candidates={historical_image_unreviewed_candidates}; "
+            f"structured_feedback_message_count={structured_feedback_message_count}; "
+            f"structured_feedback_image_payload_count={structured_feedback_image_payload_count}; "
+            f"structured_feedback_local_image_payload_count={structured_feedback_local_image_payload_count}; "
+            f"current_feedback_structured_message_count={current_feedback_structured_message_count}; "
+            f"current_feedback_structured_image_payload_count={current_feedback_structured_image_payload_count}; "
+            f"current_feedback_structured_local_image_payload_count="
+            f"{current_feedback_structured_local_image_payload_count}; "
             f"artifact_kinds={artifact_kinds}",
         )
     if non_image_artifacts:
@@ -392,6 +442,14 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"historical_image_reference_count={historical_image_reference_count}; "
             f"historical_image_candidate_policy={historical_image_candidate_policy}; "
             f"historical_image_review_rejections={historical_image_review_rejections}; "
+            f"historical_image_unreviewed_candidates={historical_image_unreviewed_candidates}; "
+            f"structured_feedback_message_count={structured_feedback_message_count}; "
+            f"structured_feedback_image_payload_count={structured_feedback_image_payload_count}; "
+            f"structured_feedback_local_image_payload_count={structured_feedback_local_image_payload_count}; "
+            f"current_feedback_structured_message_count={current_feedback_structured_message_count}; "
+            f"current_feedback_structured_image_payload_count={current_feedback_structured_image_payload_count}; "
+            f"current_feedback_structured_local_image_payload_count="
+            f"{current_feedback_structured_local_image_payload_count}; "
             f"searched_raw_image_files={searched_raw_image_files}; "
             f"raw_image_search_roots={raw_image_search_roots}; artifact_kinds={artifact_kinds}",
         )

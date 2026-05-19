@@ -17,6 +17,12 @@ from typing import Any, Iterable
 
 DEFAULT_EXACT_PHRASES = ["然后第二个问题"]
 DEFAULT_REFERENCED_ARTIFACTS = ["Image #1", "Image #2"]
+DEFAULT_CURRENT_FEEDBACK_PHRASES = [
+    "可以可以，我正在体验 Hermes",
+    "先报个问题，我遇到两次了",
+    "我得说点啥，才能让他继续",
+    "这个是用户在生产环境中的反馈",
+]
 DEFAULT_ARTIFACT_MANIFEST_NAMES = {"feedback-artifacts.json", "feedback-artifacts.jsonl"}
 DEFAULT_FEEDBACK_TRANSCRIPT_NAME = "current-production-feedback.txt"
 DEFAULT_ROOTS = [
@@ -169,6 +175,76 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return ""
+
+
+def _structured_user_message(line: str) -> dict[str, Any] | None:
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    role = str(payload.get("role") or "")
+    payload_type = str(payload.get("type") or "")
+    row_type = str(row.get("type") or "")
+    is_user_message = (
+        (row_type == "event_msg" and payload_type == "user_message")
+        or (payload_type == "message" and role == "user")
+    )
+    if not is_user_message:
+        return None
+
+    parts = [str(payload.get("message") or payload.get("text") or "")]
+    images = list(payload.get("images") or [])
+    local_images = list(payload.get("local_images") or [])
+    content = payload.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            parts.append(str(item.get("text") or item.get("input_text") or ""))
+            if item.get("type") in {"input_image", "image"} or item.get("image_url"):
+                images.append(item)
+    message = "\n".join(part for part in parts if part)
+    return {
+        "message": message,
+        "image_payload_count": len(images),
+        "local_image_payload_count": len(local_images),
+    }
+
+
+def _structured_feedback_payload_matches(
+    path: Path,
+    text: str,
+    *,
+    text_phrases: list[str],
+    referenced_artifacts: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    referenced_artifacts = referenced_artifacts or []
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        structured = _structured_user_message(line)
+        if structured is None:
+            continue
+        message = str(structured.get("message") or "")
+        if not message:
+            continue
+        if not any(phrase in message for phrase in text_phrases) and not any(
+            label in message for label in referenced_artifacts
+        ):
+            continue
+        rows.append({
+            "path": str(path),
+            "line": line_number,
+            "image_payload_count": int(structured.get("image_payload_count") or 0),
+            "local_image_payload_count": int(structured.get("local_image_payload_count") or 0),
+            "sample": message[:240],
+        })
+    return rows
 
 
 def _sample_line(text: str, pattern: str) -> str:
@@ -481,9 +557,11 @@ def build_trace(
     exact_phrases: list[str] | None = None,
     referenced_artifacts: list[str] | None = None,
     artifact_roots: list[Path] | None = None,
+    current_feedback_phrases: list[str] | None = None,
 ) -> dict[str, Any]:
     exact_phrases = exact_phrases or DEFAULT_EXACT_PHRASES
     referenced_artifacts = referenced_artifacts or DEFAULT_REFERENCED_ARTIFACTS
+    current_feedback_phrases = current_feedback_phrases or DEFAULT_CURRENT_FEEDBACK_PHRASES
     artifact_roots = artifact_roots or []
     artifact_manifest = _load_artifact_manifest(artifact_roots)
     artifact_rows = _artifact_rows(referenced_artifacts, artifact_roots, artifact_manifest)
@@ -497,6 +575,8 @@ def build_trace(
     placeholder_matches: list[dict[str, Any]] = []
     historical_image_references: list[dict[str, Any]] = []
     historical_image_keys: set[tuple[str, str]] = set()
+    structured_feedback_payload_matches: list[dict[str, Any]] = []
+    current_feedback_structured_payload_matches: list[dict[str, Any]] = []
     candidate_classes: list[dict[str, Any]] = [
         {"name": item["name"], "match_count": 0, "evidence_files": []}
         for item in CANDIDATE_CLASSES
@@ -507,6 +587,21 @@ def build_trace(
         text = _read_text(path)
         if not text:
             continue
+        structured_feedback_payload_matches.extend(
+            _structured_feedback_payload_matches(
+                path,
+                text,
+                text_phrases=exact_phrases,
+                referenced_artifacts=referenced_artifacts,
+            )
+        )
+        current_feedback_structured_payload_matches.extend(
+            _structured_feedback_payload_matches(
+                path,
+                text,
+                text_phrases=current_feedback_phrases,
+            )
+        )
         if not _is_self_reference_exact_path(path):
             for reference in _historical_image_references(path, text, referenced_artifacts):
                 key = (reference["path"], reference["source"])
@@ -569,6 +664,24 @@ def build_trace(
         "placeholder_matches": placeholder_matches[:20],
         "referenced_artifacts": artifact_rows,
         "raw_image_artifact_candidates": raw_image_candidates,
+        "structured_feedback_message_count": len(structured_feedback_payload_matches),
+        "structured_feedback_image_payload_count": sum(
+            int(match.get("image_payload_count") or 0) for match in structured_feedback_payload_matches
+        ),
+        "structured_feedback_local_image_payload_count": sum(
+            int(match.get("local_image_payload_count") or 0) for match in structured_feedback_payload_matches
+        ),
+        "structured_feedback_payload_matches": structured_feedback_payload_matches[:20],
+        "current_feedback_phrases": current_feedback_phrases,
+        "current_feedback_structured_message_count": len(current_feedback_structured_payload_matches),
+        "current_feedback_structured_image_payload_count": sum(
+            int(match.get("image_payload_count") or 0) for match in current_feedback_structured_payload_matches
+        ),
+        "current_feedback_structured_local_image_payload_count": sum(
+            int(match.get("local_image_payload_count") or 0)
+            for match in current_feedback_structured_payload_matches
+        ),
+        "current_feedback_structured_payload_matches": current_feedback_structured_payload_matches[:20],
         "historical_image_reference_count": len(historical_image_references),
         "historical_image_references": historical_image_references[:20],
         "candidate_classes": candidate_classes,
