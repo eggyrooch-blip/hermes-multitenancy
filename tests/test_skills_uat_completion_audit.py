@@ -356,6 +356,64 @@ def _write_passing_group_write_evidence(path: Path) -> None:
     )
 
 
+def _write_complete_second_problem_trace(path: Path) -> None:
+    transcript = path / "Image #1.txt"
+    transcript.write_text("然后第二个问题 是卡片重复出现\n", encoding="utf-8")
+    _write_json(
+        path / "second-problem-trace.json",
+        {
+            "ok": True,
+            "exact_text_found": True,
+            "exact_match_count": 1,
+            "exact_issue_text_absent_reason": "",
+            "searched_files": 42,
+            "searched_roots": [str(ROOT)],
+            "exact_matches": [
+                {
+                    "path": str(transcript),
+                    "phrase": "然后第二个问题",
+                    "sample": "然后第二个问题 是卡片重复出现",
+                    "followup_text": "是卡片重复出现",
+                    "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
+                }
+            ],
+            "referenced_artifacts": [
+                {
+                    "label": "Image #1",
+                    "content_available": True,
+                    "evidence_path": str(transcript),
+                    "content_kind": "text",
+                    "extracted_text": "然后第二个问题 是卡片重复出现\n",
+                    "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
+                },
+                {
+                    "label": "Image #2",
+                    "content_available": True,
+                    "evidence_path": str(transcript),
+                    "content_kind": "text",
+                    "extracted_text": "然后第二个问题 是卡片重复出现\n",
+                    "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
+                },
+            ],
+            "candidate_classes": [],
+        },
+    )
+
+
+def _write_exact_branch_gateway_evidence(path: Path, *, worktree: Path, link: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(worktree, target_is_directory=True)
+    group_evidence = path / "lark-group-write-rerun-current-gateway.jsonl"
+    os.utime(link, (2_000, 2_000), follow_symlinks=False)
+    os.utime(group_evidence, (2_020, 2_020))
+    _write_gateway_process_evidence(
+        path,
+        expected_worktree=worktree,
+        live_plugin_target=worktree,
+        process_start_epoch=2_010,
+    )
+
+
 def test_completion_audit_rejects_dialogue_rows_without_required_identity_coverage(tmp_path: Path):
     audit_mod = _base_evidence(tmp_path)
     _write_jsonl(
@@ -1241,3 +1299,64 @@ def test_completion_audit_resolves_relative_gateway_symlink(tmp_path: Path):
 
     live_branch = next(item for item in report["items"] if item["requirement"].startswith("Prove the running Feishu gateway"))
     assert live_branch["status"] == "covered"
+
+
+def test_completion_audit_require_complete_returns_nonzero_for_incomplete_evidence(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    link = tmp_path / "plugins" / "multitenancy"
+    _write_exact_branch_gateway_evidence(tmp_path, worktree=worktree, link=link)
+    output = tmp_path / "audit.json"
+
+    exit_code = audit_mod.main([
+        "--evidence-dir",
+        str(tmp_path),
+        "--worktree",
+        str(worktree),
+        "--gateway-plugin-link",
+        str(link),
+        "--output",
+        str(output),
+        "--require-complete",
+    ])
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert report["evidence_ok"] is True
+    assert report["completion_state"] == "incomplete"
+    assert report["blocked"] > 0
+
+
+def test_completion_audit_require_complete_returns_zero_for_complete_evidence(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    _write_complete_second_problem_trace(tmp_path)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    link = tmp_path / "plugins" / "multitenancy"
+    _write_exact_branch_gateway_evidence(tmp_path, worktree=worktree, link=link)
+    output = tmp_path / "audit.json"
+
+    exit_code = audit_mod.main([
+        "--evidence-dir",
+        str(tmp_path),
+        "--worktree",
+        str(worktree),
+        "--gateway-plugin-link",
+        str(link),
+        "--output",
+        str(output),
+        "--require-complete",
+    ])
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["evidence_ok"] is True
+    assert report["completion_state"] == "complete"
+    assert report["blocked"] == 0

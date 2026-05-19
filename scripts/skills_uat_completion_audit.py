@@ -908,12 +908,19 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path.home() / ".hermes" / "profiles" / "multitenancy_router" / "plugins" / "multitenancy",
     )
+    parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="Exit non-zero when evidence is parseable but the objective still has blocked items.",
+    )
     args = parser.parse_args(argv)
 
     report = audit(args.evidence_dir, worktree=args.worktree, gateway_plugin_link=args.gateway_plugin_link)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    if args.require_complete and report["completion_state"] != "complete":
+        return 2
     return 0 if report["evidence_ok"] else 1
 
 

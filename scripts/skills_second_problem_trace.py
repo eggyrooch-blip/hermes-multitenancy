@@ -102,6 +102,9 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"说明占位"),
     re.compile(r"没有问题正文"),
     re.compile(r"没有第二问题正文"),
+    re.compile(r"实际正文"),
+    re.compile(r"未给出.*实际正文"),
+    re.compile(r"唯一\s*blocker.*实际正文", re.IGNORECASE),
     re.compile(r"no issue text", re.IGNORECASE),
 ]
 

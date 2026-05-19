@@ -81,6 +81,23 @@ def test_second_problem_trace_treats_documented_absence_as_placeholder_not_issue
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
+def test_second_problem_trace_treats_state_journal_missing_body_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "STATE.md").write_text(
+        "唯一 blocker 是用户未给出“然后第二个问题”的实际正文。验证：make test 566 passed。\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_match_count"] == 0
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
 def test_second_problem_trace_records_referenced_feedback_artifacts_as_unavailable(tmp_path: Path):
     trace_mod = _load_trace_module()
     docs = tmp_path / "docs"
