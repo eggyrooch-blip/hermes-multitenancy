@@ -1,6 +1,10 @@
 # OMC working state — internal PRD, drafts, sessions
 .omc/
 
+# Local agent/tooling state
+.claude/
+uv.lock
+
 # Python
 __pycache__/
 *.py[cod]

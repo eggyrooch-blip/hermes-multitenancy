@@ -577,7 +577,7 @@ def _begin_device_authorization(client_id: str, scope: str | None, client_secret
 
         return begin_device_authorization(client_id, scope, client_secret)
     except ModuleNotFoundError as exc:
-        if exc.name != "hermes_cli.feishu_auth":
+        if not _is_missing_legacy_feishu_auth(exc):
             raise
     return _begin_device_authorization_local(client_id, scope, client_secret)
 
@@ -588,7 +588,7 @@ def _poll_device_token(device_code: str, client_id: str, client_secret: str) -> 
 
         return poll_device_token(device_code, client_id, client_secret)
     except ModuleNotFoundError as exc:
-        if exc.name != "hermes_cli.feishu_auth":
+        if not _is_missing_legacy_feishu_auth(exc):
             raise
     return _poll_device_token_local(device_code, client_id, client_secret)
 
@@ -627,9 +627,13 @@ def _fetch_user_info(access_token: str) -> dict[str, Any]:
 
         return fetch_user_info(access_token)
     except ModuleNotFoundError as exc:
-        if exc.name != "hermes_cli.feishu_auth":
+        if not _is_missing_legacy_feishu_auth(exc):
             raise
     return _fetch_user_info_local(access_token)
+
+
+def _is_missing_legacy_feishu_auth(exc: ModuleNotFoundError) -> bool:
+    return exc.name in {"hermes_cli", "hermes_cli.feishu_auth"}
 
 
 def _scope_with_offline_access(scope: str | None) -> str:
