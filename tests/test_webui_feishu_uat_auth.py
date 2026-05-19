@@ -488,6 +488,31 @@ def test_feishu_uat_auth_has_local_device_flow_fallback_when_hermes_helper_missi
     assert "uat-access" not in str(started)
 
 
+def test_feishu_uat_auth_fallback_when_hermes_cli_package_missing(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+    monkeypatch.delitem(sys.modules, "hermes_cli.feishu_auth", raising=False)
+
+    def fake_http_json(method, url, *, payload=None, headers=None):
+        assert method == "POST"
+        assert url.endswith("/oauth/v1/device_authorization")
+        return {
+            "device_code": "device-no-package",
+            "user_code": "NO-PKG",
+            "verification_uri_complete": "https://accounts.feishu.cn/device?user_code=NO-PKG",
+            "expires_in": 600,
+            "interval": 2,
+        }
+
+    monkeypatch.setattr(feishu_uat_auth, "_http_json", fake_http_json)
+
+    started = feishu_uat_auth._begin_device_authorization("cli_test", "offline_access", "secret")
+
+    assert started["device_code"] == "device-no-package"
+    assert started["user_code"] == "NO-PKG"
+
+
 def test_webui_feishu_auth_session_rejects_mismatched_authorized_open_id(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 
