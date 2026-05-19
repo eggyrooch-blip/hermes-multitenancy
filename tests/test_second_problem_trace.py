@@ -61,6 +61,8 @@ def test_second_problem_trace_distinguishes_placeholder_phrase_without_issue_tex
     assert report["exact_issue_text_found"] is False
     assert report["exact_text_found"] is False
     assert report["placeholder_match_count"] == 1
+    assert report["exact_phrase_source_counts"] == {"current_feedback_transcript_placeholder": 1}
+    assert report["placeholder_source_counts"] == {"current_feedback_transcript_placeholder": 1}
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
@@ -78,6 +80,7 @@ def test_second_problem_trace_treats_documented_absence_as_placeholder_not_issue
     assert report["exact_text_found"] is False
     assert report["exact_match_count"] == 0
     assert report["placeholder_match_count"] == 1
+    assert report["exact_phrase_source_counts"] == {"state_journal_documented_absence": 1}
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
@@ -95,6 +98,7 @@ def test_second_problem_trace_treats_state_journal_missing_body_as_placeholder(t
     assert report["exact_text_found"] is False
     assert report["exact_match_count"] == 0
     assert report["placeholder_match_count"] == 1
+    assert report["exact_phrase_source_counts"] == {"state_journal_documented_absence": 1}
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
@@ -112,7 +116,44 @@ def test_second_problem_trace_treats_state_journal_missing_exact_body_as_placeho
     assert report["exact_text_found"] is False
     assert report["exact_match_count"] == 0
     assert report["placeholder_match_count"] == 1
+    assert report["exact_phrase_source_counts"] == {"state_journal_documented_absence": 1}
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
+def test_second_problem_trace_classifies_current_transcript_and_agent_goal_context_placeholders(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    artifact = tmp_path / "current-production-feedback.txt"
+    sessions = tmp_path / ".codex" / "sessions"
+    sessions.mkdir(parents=True)
+    artifact.write_text("然后第二个问题\n这个是用户在生产环境中的反馈\n", encoding="utf-8")
+    (sessions / "rollout.jsonl").write_text(
+        trace_mod.json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<goal_context>\n然后第二个问题\n</goal_context>"}],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([artifact, sessions], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_phrase_source_counts"] == {
+        "agent_history_goal_context": 1,
+        "current_feedback_transcript_placeholder": 1,
+    }
+    assert report["placeholder_source_counts"] == {
+        "agent_history_goal_context": 1,
+        "current_feedback_transcript_placeholder": 1,
+    }
+    assert report["exact_issue_source_counts"] == {}
 
 
 def test_second_problem_trace_treats_english_state_absence_note_as_placeholder(tmp_path: Path):

@@ -684,6 +684,9 @@ def test_completion_audit_blocks_when_second_problem_trace_has_no_exact_text(tmp
     assert "exact_match_count=0" in second_problem["note"]
     assert "exact_phrase_match_count=0" in second_problem["note"]
     assert "placeholder_match_count=0" in second_problem["note"]
+    assert "exact_phrase_source_counts={}" in second_problem["note"]
+    assert "placeholder_source_counts={}" in second_problem["note"]
+    assert "exact_issue_source_counts={}" in second_problem["note"]
     assert "absent_reason=exact_phrase_not_found" in second_problem["note"]
     assert "missing_artifacts=['Image #1', 'Image #2']" in second_problem["note"]
     assert report["evidence_ok"] is True

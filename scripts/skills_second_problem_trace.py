@@ -102,6 +102,7 @@ SELF_REFERENCE_EXACT_SUFFIXES = {
 PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"这个是用户在生产环境中的反馈"),
     re.compile(r"你也需要枚举一些测试场景"),
+    re.compile(r"</?goal_context>"),
     re.compile(r"</?objective>"),
     re.compile(r"Continuation behavior"),
     re.compile(r"without the actual problem text", re.IGNORECASE),
@@ -365,6 +366,34 @@ def _exact_issue_text_absent_reason(
     if placeholder_matches and len(placeholder_matches) == len(exact_phrase_matches):
         return "phrase_present_but_only_placeholder_followup"
     return ""
+
+
+def _exact_phrase_source(path: Path, sample: str, followup_text: str) -> str:
+    normalized_path = str(path).replace("\\", "/")
+    combined = f"{sample}\n{followup_text}"
+    if path.name == DEFAULT_FEEDBACK_TRANSCRIPT_NAME or "这个是用户在生产环境中的反馈" in combined:
+        return "current_feedback_transcript_placeholder"
+    if ".codex/sessions" in normalized_path or ".claude/projects" in normalized_path:
+        if "<goal_context>" in combined or "Continuation behavior" in combined:
+            return "agent_history_goal_context"
+        if "Search the repo" in combined or "without the actual problem text" in combined:
+            return "agent_history_investigation_instruction"
+        return "agent_history_other"
+    if "/AgentOS/" in normalized_path or path.name.upper() == "STATE.MD":
+        return "state_journal_documented_absence"
+    if "ARCHITECTURE-GUIDE.md" in normalized_path or "/docs/plans/" in normalized_path:
+        return "documentation_documented_absence"
+    if "没有问题正文" in combined or "缺精确正文" in combined or "is still absent" in combined:
+        return "documented_absence_note"
+    return "unclassified_phrase_match"
+
+
+def _source_counts(matches: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for match in matches:
+        source = str(match.get("source") or "unknown")
+        counts[source] = counts.get(source, 0) + 1
+    return {source: counts[source] for source in sorted(counts)}
 
 
 def _artifact_key(value: str) -> str:
@@ -677,11 +706,13 @@ def build_trace(
         for phrase in exact_phrases:
             if phrase in text and not _is_self_reference_exact_path(path):
                 followup_text = _line_after_phrase(text, phrase)
+                sample = _sample_line(text, re.escape(phrase))
                 match = {
                     "path": str(path),
                     "phrase": phrase,
-                    "sample": _sample_line(text, re.escape(phrase)),
+                    "sample": sample,
                     "followup_text": followup_text,
+                    "source": _exact_phrase_source(path, sample, followup_text),
                 }
                 mapped_scenarios = artifact_mapping.get(str(path.resolve(strict=False)))
                 if mapped_scenarios:
@@ -724,6 +755,9 @@ def build_trace(
         "exact_match_count": len(exact_issue_matches),
         "exact_phrase_match_count": len(exact_phrase_matches),
         "placeholder_match_count": len(placeholder_matches),
+        "exact_phrase_source_counts": _source_counts(exact_phrase_matches),
+        "placeholder_source_counts": _source_counts(placeholder_matches),
+        "exact_issue_source_counts": _source_counts(exact_issue_matches),
         "exact_issue_text_absent_reason": _exact_issue_text_absent_reason(
             exact_phrase_matches,
             placeholder_matches,
