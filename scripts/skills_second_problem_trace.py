@@ -18,6 +18,7 @@ from typing import Any, Iterable
 DEFAULT_EXACT_PHRASES = ["然后第二个问题"]
 DEFAULT_REFERENCED_ARTIFACTS = ["Image #1", "Image #2"]
 DEFAULT_ARTIFACT_MANIFEST_NAMES = {"feedback-artifacts.json", "feedback-artifacts.jsonl"}
+DEFAULT_FEEDBACK_TRANSCRIPT_NAME = "current-production-feedback.txt"
 DEFAULT_ROOTS = [
     Path(__file__).resolve().parents[1],
     Path("/Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"),
@@ -41,6 +42,7 @@ EXCLUDED_DIRS = {
 EXCLUDED_TEXT_FILENAMES = {
     "completion-audit-latest.json",
     "second-problem-trace.json",
+    "second-problem-trace.stdout.json",
     "second-problem-trace-with-agent-history.json",
     "skills-uat-latest.json",
 }
@@ -97,6 +99,10 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"Continuation behavior"),
     re.compile(r"without the actual problem text", re.IGNORECASE),
     re.compile(r"Search the repo", re.IGNORECASE),
+    re.compile(r"说明占位"),
+    re.compile(r"没有问题正文"),
+    re.compile(r"没有第二问题正文"),
+    re.compile(r"no issue text", re.IGNORECASE),
 ]
 
 
@@ -323,6 +329,48 @@ def _artifact_mapping_by_path(rows: list[dict[str, Any]]) -> dict[str, list[str]
     return mapping
 
 
+def _read_manifest_items(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    payloads = raw.get("artifacts", raw) if isinstance(raw, dict) else raw
+    if isinstance(payloads, dict):
+        payloads = [payloads]
+    if not isinstance(payloads, list):
+        return []
+    return [item for item in payloads if isinstance(item, dict)]
+
+
+def materialize_feedback_transcript(
+    *,
+    source: Path,
+    output_dir: Path,
+    labels: list[str],
+    mapped_uat_scenarios: list[str],
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    transcript = output_dir / DEFAULT_FEEDBACK_TRANSCRIPT_NAME
+    transcript.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    manifest = output_dir / "feedback-artifacts.json"
+    existing_items = _read_manifest_items(manifest)
+    materialized_labels = set(labels)
+    retained_items = [item for item in existing_items if str(item.get("label") or "") not in materialized_labels]
+    for label in labels:
+        retained_items.append({
+            "label": label,
+            "path": transcript.name,
+            "content_kind": "text",
+            "mapped_uat_scenarios": mapped_uat_scenarios,
+        })
+    manifest.write_text(
+        json.dumps({"artifacts": retained_items}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return transcript
+
+
 def build_trace(
     roots: list[Path],
     *,
@@ -414,11 +462,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exact-phrase", action="append", dest="exact_phrases")
     parser.add_argument("--referenced-artifact", action="append", dest="referenced_artifacts")
     parser.add_argument("--artifact-root", action="append", type=Path, dest="artifact_roots")
+    parser.add_argument("--feedback-transcript-file", type=Path)
+    parser.add_argument("--feedback-artifact-label", action="append", dest="feedback_artifact_labels")
+    parser.add_argument("--feedback-artifact-scenario", action="append", dest="feedback_artifact_scenarios")
     parser.add_argument("--output", type=Path, default=Path("/tmp/hermes-skills-uat/second-problem-trace.json"))
     args = parser.parse_args(argv)
 
     roots = args.roots or DEFAULT_ROOTS
     artifact_roots = args.artifact_roots or [args.output.parent]
+    if args.feedback_transcript_file:
+        materialize_feedback_transcript(
+            source=args.feedback_transcript_file,
+            output_dir=args.output.parent,
+            labels=args.feedback_artifact_labels or ["Image #1"],
+            mapped_uat_scenarios=args.feedback_artifact_scenarios or [],
+        )
+        artifact_roots = _unique_paths([*artifact_roots, args.output.parent])
     if args.include_agent_history:
         roots = [*roots, *AGENT_HISTORY_ROOTS]
     report = build_trace(

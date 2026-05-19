@@ -13,6 +13,7 @@ import secrets
 import sqlite3
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -576,6 +577,25 @@ def _as_int(value: Any) -> int:
         return 0
 
 
+def _refresh_access_token(client_id: str, client_secret: str, refresh_token: str, *, timeout: int = 10) -> dict[str, Any]:
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{FEISHU_OPEN_BASE_URL}/open-apis/authen/v2/oauth/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed Feishu host.
+        return json.loads(response.read().decode("utf-8"))
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
@@ -628,15 +648,12 @@ def _poll_device_token(device_code: str, client_id: str, client_secret: str) -> 
 
 
 def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -> dict[str, Any]:
-    data = _api_post(
-        f"{FEISHU_OPEN_BASE_URL}/open-apis/authen/v2/oauth/token",
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-    )
+    data = _refresh_access_token(client_id, client_secret, refresh_token)
+    if int(data.get("code") or 0) != 0:
+        msg = str(data.get("msg") or data.get("message") or "refresh rejected").strip()
+        raise FeishuUatAuthError(f"Feishu UAT refresh failed: code={data.get('code')} msg={msg}", status=401)
+    if isinstance(data.get("data"), dict):
+        data = data["data"]
     return _normalise_refresh_response(data)
 
 

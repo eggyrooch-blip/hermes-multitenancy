@@ -64,6 +64,23 @@ def test_second_problem_trace_distinguishes_placeholder_phrase_without_issue_tex
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
+def test_second_problem_trace_treats_documented_absence_as_placeholder_not_issue_text(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "state.md").write_text(
+        "当前反馈中“然后第二个问题”后只有说明占位、没有问题正文。\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_match_count"] == 0
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
 def test_second_problem_trace_records_referenced_feedback_artifacts_as_unavailable(tmp_path: Path):
     trace_mod = _load_trace_module()
     docs = tmp_path / "docs"
@@ -184,6 +201,49 @@ def test_second_problem_trace_uses_feedback_artifact_manifest_for_paths_and_uat_
     ]
 
 
+def test_second_problem_trace_cli_materializes_feedback_transcript_manifest(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    output = tmp_path / "evidence" / "second-problem-trace.json"
+    source_transcript = tmp_path / "production-feedback.txt"
+    docs.mkdir()
+    source_transcript.write_text("然后第二个问题\n这个是用户在生产环境中的反馈\n", encoding="utf-8")
+
+    exit_code = trace_mod.main([
+        "--root",
+        str(docs),
+        "--output",
+        str(output),
+        "--feedback-transcript-file",
+        str(source_transcript),
+        "--feedback-artifact-label",
+        "Image #1",
+        "--feedback-artifact-label",
+        "Image #2",
+        "--feedback-artifact-scenario",
+        "offline_session_guard_replacement_no_duplicate_dispatch",
+    ])
+
+    materialized = output.parent / "current-production-feedback.txt"
+    manifest = output.parent / "feedback-artifacts.json"
+    assert exit_code == 0
+    assert materialized.read_text(encoding="utf-8") == source_transcript.read_text(encoding="utf-8")
+    assert manifest.exists()
+    report = trace_mod.json.loads(output.read_text(encoding="utf-8"))
+    assert report["referenced_artifacts"][0]["content_available"] is True
+    assert report["referenced_artifacts"][0]["evidence_path"] == str(materialized)
+    assert report["referenced_artifacts"][0]["mapped_uat_scenarios"] == [
+        "offline_session_guard_replacement_no_duplicate_dispatch"
+    ]
+    assert report["referenced_artifacts"][1]["content_available"] is True
+    assert report["referenced_artifacts"][1]["evidence_path"] == str(materialized)
+    assert report["referenced_artifacts"][1]["mapped_uat_scenarios"] == [
+        "offline_session_guard_replacement_no_duplicate_dispatch"
+    ]
+    assert report["exact_text_found"] is False
+    assert report["placeholder_match_count"] == 1
+
+
 def test_second_problem_trace_ignores_self_reference_exact_phrase_matches(tmp_path: Path):
     trace_mod = _load_trace_module()
     repo_like = tmp_path / "repo"
@@ -198,6 +258,10 @@ def test_second_problem_trace_ignores_self_reference_exact_phrase_matches(tmp_pa
         encoding="utf-8",
     )
     (tmp_evidence / "second-problem-trace-with-agent-history.json").write_text(
+        '"phrase": "然后第二个问题",\n',
+        encoding="utf-8",
+    )
+    (tmp_evidence / "second-problem-trace.stdout.json").write_text(
         '"phrase": "然后第二个问题",\n',
         encoding="utf-8",
     )

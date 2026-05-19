@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import sys
 import time
 import urllib.error
+import urllib.parse
 
 
 def _prepare_shared_home(tmp_path, monkeypatch):
@@ -128,6 +130,56 @@ def test_feishu_uat_auth_loads_shared_env_for_router_process(tmp_path, monkeypat
     )
 
     assert feishu_uat_auth._feishu_app_credentials(shared) == ("cli_from_env", "secret_from_env")
+
+
+def test_refresh_access_token_uses_v2_oauth_endpoint_without_tenant_token(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    def fail_tat(*_args, **_kwargs):
+        raise AssertionError("refresh_token flow must not mint a tenant access token")
+
+    monkeypatch.setattr(feishu_uat_auth, "_mint_tenant_access_token", fail_tat)
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "access_token": "fresh-access",
+                    "refresh_token": "fresh-refresh",
+                    "expires_in": 7200,
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout=10):
+        seen["url"] = request.full_url
+        seen["timeout"] = timeout
+        seen["method"] = request.get_method()
+        seen["headers"] = dict(request.header_items())
+        seen["body"] = urllib.parse.parse_qs(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(feishu_uat_auth.urllib.request, "urlopen", fake_urlopen)
+
+    result = feishu_uat_auth._refresh_access_token("cli_test", "app-secret", "old-refresh", timeout=7)
+
+    assert seen["url"] == "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
+    assert seen["timeout"] == 7
+    assert seen["method"] == "POST"
+    assert seen["body"] == {
+        "grant_type": ["refresh_token"],
+        "refresh_token": ["old-refresh"],
+        "client_id": ["cli_test"],
+        "client_secret": ["app-secret"],
+    }
+    assert "Authorization" not in seen["headers"]
+    assert result["access_token"] == "fresh-access"
 
 
 def test_feishu_uat_status_refreshes_expired_token_and_mirrors_json(tmp_path, monkeypatch):
