@@ -283,6 +283,21 @@ def _raw_image_search_roots(trace: dict[str, Any]) -> list[str]:
     return sorted(str(value) for value in trace.get("raw_image_search_roots") or [] if value)
 
 
+def _historical_image_candidates(trace: dict[str, Any]) -> dict[str, list[str]]:
+    rows: dict[str, set[str]] = {}
+    for reference in trace.get("historical_image_references") or []:
+        if not isinstance(reference, dict):
+            continue
+        source = str(reference.get("source") or "")
+        if not source:
+            continue
+        for label in reference.get("labels") or []:
+            if not isinstance(label, str) or not label:
+                continue
+            rows.setdefault(label, set()).add(source)
+    return {label: sorted(values) for label, values in sorted(rows.items())}
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -316,6 +331,8 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     raw_image_candidates = _raw_image_artifact_candidates(trace)
     raw_image_search_roots = _raw_image_search_roots(trace)
     searched_raw_image_files = int(trace.get("searched_raw_image_files") or 0)
+    historical_image_candidates = _historical_image_candidates(trace)
+    historical_image_reference_count = int(trace.get("historical_image_reference_count") or 0)
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -330,6 +347,8 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             "blocked",
             str(trace_path),
             f"mapped_artifacts={mapped_artifacts}; missing_artifacts={missing_artifacts}; "
+            f"historical_image_candidates={historical_image_candidates}; "
+            f"historical_image_reference_count={historical_image_reference_count}; "
             f"artifact_kinds={artifact_kinds}",
         )
     if non_image_artifacts:
@@ -339,6 +358,8 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             str(trace_path),
             f"mapped_artifacts={mapped_artifacts}; non_image_artifacts={non_image_artifacts}; "
             f"raw_image_candidates={raw_image_candidates}; "
+            f"historical_image_candidates={historical_image_candidates}; "
+            f"historical_image_reference_count={historical_image_reference_count}; "
             f"searched_raw_image_files={searched_raw_image_files}; "
             f"raw_image_search_roots={raw_image_search_roots}; artifact_kinds={artifact_kinds}",
         )
