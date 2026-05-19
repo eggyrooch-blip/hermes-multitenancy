@@ -243,6 +243,43 @@ def test_second_problem_trace_treats_english_state_absent_suffix_as_placeholder(
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
+def test_second_problem_trace_treats_generated_test_fixture_followup_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / ".codex" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "rollout.jsonl").write_text(
+        "然后第二个问题 是卡片重复出现\\\" if exact_found else \\\"截图内容已落盘\\\", "
+        "\\\"mapped_uat_scenarios\\\": mapped_uat_scenarios\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([sessions], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_issue_text_found"] is False
+    assert report["exact_match_count"] == 0
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
+def test_second_problem_trace_treats_trace_json_phrase_field_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "debug.json").write_text(
+        '{\n  "phrase": "然后第二个问题",\n  "sample": "trace self-reference"\n}\n',
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([artifacts], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_issue_text_found"] is False
+    assert report["exact_match_count"] == 0
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
 def test_second_problem_trace_records_referenced_feedback_artifacts_as_unavailable(tmp_path: Path):
     trace_mod = _load_trace_module()
     docs = tmp_path / "docs"

@@ -537,6 +537,101 @@ def case_webui_child_agent_inherits_skills_not_tokens(tmp_root: Path) -> dict[st
     }
 
 
+def case_group_child_inherits_upstream_skill_version_updates_one_way(tmp_root: Path) -> dict[str, Any]:
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _ensure_group_profile
+    from hermes_multitenancy.skill_registry import install_shared_skill_for_profile
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared, ids = _build_offline_home(tmp_root)
+    owner = shared / "profiles" / ids["owner"]
+    owner.joinpath("tokens").mkdir(parents=True, exist_ok=True)
+    owner.joinpath("tokens", "owner-only.token").write_text("do-not-copy", encoding="utf-8")
+    group_name = "feishu_group_weather_versions"
+
+    def sync_group() -> Path:
+        router_mod.override_routing_table(":memory:")
+        try:
+            table = router_mod._get_routing_table()
+            _assert(table is not None, "routing table unavailable")
+            table.upsert(
+                user_id=ids["owner"],
+                profile_name=ids["owner"],
+                open_id=ids["owner_open_id"],
+                provenance="sync",
+            )
+            group_home = shared / "profiles" / group_name
+            _ensure_group_profile(
+                profile_name=group_name,
+                profile_home=group_home,
+                chat_id="oc_weather_versions",
+                owner_open_id=ids["owner_open_id"],
+                display_label="Weather Versions",
+            )
+            return group_home
+        finally:
+            router_mod.override_routing_table(None)
+
+    group = sync_group()
+    group_weather = group / "skills" / "weather" / "shared"
+    initial_manifest = json.loads((group / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
+    _assert(group_weather.is_symlink(), "group did not inherit weather/shared")
+    _assert(initial_manifest["weather/shared"]["version"] == "v1", "group initial inherited weather version is not v1")
+    _assert(initial_manifest["weather/shared"]["inherited_from"] == ids["owner"], "group manifest lost upstream profile")
+    _assert(not list((group / "tokens").glob("*")), "group copied owner tokens")
+
+    group_only_source = shared / "skills" / "group-local" / "meeting-weather"
+    _write_skill(group_only_source, "meeting-weather")
+    install_shared_skill_for_profile(
+        shared_home=shared,
+        profile_home=group,
+        skill_path="group-local/meeting-weather",
+    )
+    _assert((group / "skills" / "group-local" / "meeting-weather").is_symlink(), "group-local install missing")
+
+    (shared / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: weather/shared
+    source: skill-releases/weather/v2
+    version: v2
+    audience: all
+    requires_token: false
+  - path: lark-calendar
+    audience: all
+    token_policy: brokered
+""",
+        encoding="utf-8",
+    )
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_finance", name="Finance", leader_user_id="alice")],
+        {"od_finance": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=shared / "profiles", source_home=shared)
+    group = sync_group()
+    updated_manifest = json.loads((group / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
+
+    _assert(group_weather.is_symlink(), "group weather skill missing after owner update")
+    _assert(group_weather.resolve() == (shared / "skill-releases" / "weather" / "v2").resolve(), "group weather did not inherit v2")
+    _assert(updated_manifest["weather/shared"]["version"] == "v2", "group manifest did not update to v2")
+    _assert(updated_manifest["weather/shared"]["inherited_from"] == ids["owner"], "group manifest lost inherited_from after update")
+    _assert(not (owner / "skills" / "group-local" / "meeting-weather").exists(), "group-local install synced back to owner")
+    _assert((group / "skills" / "group-local" / "meeting-weather").is_symlink(), "group-local install was pruned by inheritance resync")
+    _assert(not list((group / "tokens").glob("*")), "group tokens appeared after inheritance resync")
+
+    return {
+        "group_profile": group_name,
+        "initial_weather_version": initial_manifest["weather/shared"]["version"],
+        "updated_weather_version": updated_manifest["weather/shared"]["version"],
+        "stable_group_skill_path": str(group_weather.relative_to(group / "skills")),
+        "group_weather_target_after_update": str(group_weather.resolve()),
+        "inherited_from": updated_manifest["weather/shared"].get("inherited_from"),
+        "owner_received_group_install": (owner / "skills" / "group-local" / "meeting-weather").exists(),
+        "group_personal_install_preserved": (group / "skills" / "group-local" / "meeting-weather").is_symlink(),
+        "group_token_files": len(list((group / "tokens").glob("*"))),
+    }
+
+
 def case_child_install_does_not_sync_back_to_parent(tmp_root: Path) -> dict[str, Any]:
     from hermes_multitenancy import router as router_mod
     from hermes_multitenancy.router import _ensure_group_profile
@@ -2395,6 +2490,7 @@ def main(argv: list[str] | None = None) -> int:
         cases.append(_run_case("offline_new_hire_sync_auto_installs_managed_skills", lambda: case_new_hire_sync_auto_installs_managed_skills(tmp_root / "case1a")))
         cases.append(_run_case("offline_child_agent_inherits_skills_not_tokens", lambda: case_child_inherits_skills_not_tokens(tmp_root / "case2")))
         cases.append(_run_case("offline_webui_child_agent_inherits_skills_not_tokens", lambda: case_webui_child_agent_inherits_skills_not_tokens(tmp_root / "case2_webui")))
+        cases.append(_run_case("offline_group_child_inherits_upstream_skill_version_updates_one_way", lambda: case_group_child_inherits_upstream_skill_version_updates_one_way(tmp_root / "case2_group_versions")))
         cases.append(_run_case("offline_child_install_does_not_sync_back_to_parent", lambda: case_child_install_does_not_sync_back_to_parent(tmp_root / "case3")))
         cases.append(_run_case("offline_shared_token_materialization_is_scoped", lambda: case_shared_token_materialization_is_scoped(tmp_root / "case4")))
         cases.append(_run_case("offline_wildcard_shared_token_skips_group_profiles", lambda: case_wildcard_shared_token_skips_group_profiles(tmp_root / "case4_wildcard")))

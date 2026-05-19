@@ -159,6 +159,18 @@ def _base_evidence(tmp_path: Path) -> object:
                 "token_files": 0,
                 "uat_files": 0,
             })
+        if name == "offline_group_child_inherits_upstream_skill_version_updates_one_way":
+            case.update({
+                "group_profile": "feishu_group_weather_versions",
+                "initial_weather_version": "v1",
+                "updated_weather_version": "v2",
+                "stable_group_skill_path": "weather/shared",
+                "group_weather_target_after_update": "/tmp/shared/skill-releases/weather/v2",
+                "inherited_from": "alice",
+                "owner_received_group_install": False,
+                "group_personal_install_preserved": True,
+                "group_token_files": 0,
+            })
         if name == "offline_continue_turn_reconstructs_interrupted_request":
             case.update({
                 "continue_used_previous_request": True,
@@ -727,6 +739,61 @@ def test_completion_audit_fails_when_webui_child_inheritance_uat_is_missing(tmp_
         item
         for item in report["items"]
         if item["requirement"].startswith("Validate WebUI child profile")
+    )
+    assert item["status"] == "failed"
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_requires_group_child_version_update_one_way_uat(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    skills_path = tmp_path / "skills-uat-latest.json"
+    payload = json.loads(skills_path.read_text(encoding="utf-8"))
+    payload["cases"] = [
+        case
+        for case in payload["cases"]
+        if case.get("name") != "offline_group_child_inherits_upstream_skill_version_updates_one_way"
+    ]
+    skills_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Validate group child profiles inherit upstream shared skill version")
+    )
+    assert item["status"] == "failed"
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_requires_group_child_version_case_to_track_upstream_owner(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    skills_path = tmp_path / "skills-uat-latest.json"
+    payload = json.loads(skills_path.read_text(encoding="utf-8"))
+    case = next(
+        case
+        for case in payload["cases"]
+        if case.get("name") == "offline_group_child_inherits_upstream_skill_version_updates_one_way"
+    )
+    case["inherited_from"] = "wrong-owner"
+    skills_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Validate group child profiles inherit upstream shared skill version")
     )
     assert item["status"] == "failed"
     assert report["evidence_ok"] is False
@@ -1456,7 +1523,7 @@ def test_completion_audit_accepts_required_dialogue_and_write_identity_coverage(
 
     assert report["failed"] == 0
     assert report["blocked"] == 3
-    assert report["covered"] == 25
+    assert report["covered"] == 26
     assert report["evidence_ok"] is True
     assert report["completion_state"] == "incomplete"
 
@@ -1484,7 +1551,7 @@ def test_completion_audit_treats_missing_credential_key_real_cases_as_blocked_no
     assert "blocked_failures" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 24
+    assert report["covered"] == 25
     assert report["evidence_ok"] is True
 
 
@@ -1511,7 +1578,7 @@ def test_completion_audit_treats_expired_real_user_uat_as_blocked_not_failed(tmp
     assert "real_feishu_uat_user_info" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 24
+    assert report["covered"] == 25
     assert report["evidence_ok"] is True
 
 
@@ -1544,7 +1611,7 @@ def test_completion_audit_treats_scope_inventory_without_valid_user_uat_as_block
     assert scope_item["status"] == "blocked"
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 24
+    assert report["covered"] == 25
     assert report["evidence_ok"] is True
 
 

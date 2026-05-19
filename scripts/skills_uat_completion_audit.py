@@ -24,6 +24,7 @@ REQUIRED_MATRIX_CASES = {
     "offline_new_hire_sync_auto_installs_managed_skills",
     "offline_child_agent_inherits_skills_not_tokens",
     "offline_webui_child_agent_inherits_skills_not_tokens",
+    "offline_group_child_inherits_upstream_skill_version_updates_one_way",
     "offline_child_install_does_not_sync_back_to_parent",
     "offline_shared_token_materialization_is_scoped",
     "offline_wildcard_shared_token_skips_group_profiles",
@@ -1048,6 +1049,33 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         f"personal_oauth_skill={webui_child_case.get('personal_oauth_skill')}; "
         f"token_files={webui_child_case.get('token_files')}; "
         f"uat_files={webui_child_case.get('uat_files')}",
+    ))
+    group_child_version_case = cases.get("offline_group_child_inherits_upstream_skill_version_updates_one_way") or {}
+    group_child_version_ok = (
+        group_child_version_case.get("ok") is True
+        and group_child_version_case.get("initial_weather_version") == "v1"
+        and group_child_version_case.get("updated_weather_version") == "v2"
+        and group_child_version_case.get("stable_group_skill_path") == "weather/shared"
+        and str(group_child_version_case.get("group_weather_target_after_update") or "").endswith("skill-releases/weather/v2")
+        and group_child_version_case.get("inherited_from") == "alice"
+        and group_child_version_case.get("owner_received_group_install") is False
+        and group_child_version_case.get("group_personal_install_preserved") is True
+        and group_child_version_case.get("group_token_files") == 0
+    )
+    items.append(_item(
+        "Validate group child profiles inherit upstream shared skill version updates one-way without syncing tokens or group-local installs back to the owner.",
+        "covered" if group_child_version_ok else "failed",
+        str(matrix_path),
+        "group_profile="
+        f"{group_child_version_case.get('group_profile', '')}; "
+        f"initial_weather_version={group_child_version_case.get('initial_weather_version', '')}; "
+        f"updated_weather_version={group_child_version_case.get('updated_weather_version', '')}; "
+        f"stable_group_skill_path={group_child_version_case.get('stable_group_skill_path', '')}; "
+        f"group_weather_target_after_update={group_child_version_case.get('group_weather_target_after_update', '')}; "
+        f"inherited_from={group_child_version_case.get('inherited_from', '')}; "
+        f"owner_received_group_install={group_child_version_case.get('owner_received_group_install')}; "
+        f"group_personal_install_preserved={group_child_version_case.get('group_personal_install_preserved')}; "
+        f"group_token_files={group_child_version_case.get('group_token_files')}",
     ))
     context_case = cases.get("offline_context_continuity_private_and_group") or {}
     items.append(_item(

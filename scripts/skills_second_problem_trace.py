@@ -151,6 +151,9 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"\bstill absent\b", re.IGNORECASE),
     re.compile(r"\bbody absent\b", re.IGNORECASE),
     re.compile(r"\babsent\b.*\bProduction\b", re.IGNORECASE),
+    re.compile(r"\bmapped_uat_scenarios\b"),
+    re.compile(r"\bif\s+exact_found\s+else\b"),
+    re.compile(r'"phrase"\s*:\s*"'),
 ]
 IMAGE_SOURCE_PATTERN = re.compile(r"\[Image:\s*source:\s*([^\]\n]+)\]")
 INTERNAL_CONTEXT_PREFIXES = (
@@ -932,7 +935,7 @@ def build_trace(
                 if mapped_scenarios:
                     match["mapped_uat_scenarios"] = mapped_scenarios
                 exact_phrase_matches.append(match)
-                if _looks_like_placeholder_followup(followup_text):
+                if _looks_like_placeholder_followup(f"{sample}\n{followup_text}"):
                     placeholder_matches.append(match)
                 else:
                     exact_issue_matches.append(match)

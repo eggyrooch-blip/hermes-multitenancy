@@ -93,6 +93,20 @@ def test_webui_child_agent_inherits_shareable_skills_not_tokens(tmp_path: Path):
     assert result["uat_files"] == 0
 
 
+def test_group_child_inherits_upstream_skill_version_updates_one_way(tmp_path: Path):
+    matrix_mod = _load_matrix_module()
+
+    result = matrix_mod.case_group_child_inherits_upstream_skill_version_updates_one_way(tmp_path)
+
+    assert result["group_profile"] == "feishu_group_weather_versions"
+    assert result["initial_weather_version"] == "v1"
+    assert result["updated_weather_version"] == "v2"
+    assert result["stable_group_skill_path"] == "weather/shared"
+    assert result["group_weather_target_after_update"].endswith("skill-releases/weather/v2")
+    assert result["owner_received_group_install"] is False
+    assert result["group_token_files"] == 0
+
+
 def test_registry_audit_uat_collects_all_profile_skill_sources(tmp_path: Path):
     matrix_mod = _load_matrix_module()
 
