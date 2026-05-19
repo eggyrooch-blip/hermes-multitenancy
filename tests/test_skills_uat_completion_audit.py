@@ -839,6 +839,8 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     assert "structured_feedback_local_image_payload_count=0" in artifact_item["note"]
     assert "current_feedback_structured_image_payload_count=0" in artifact_item["note"]
     assert "current_feedback_structured_local_image_payload_count=0" in artifact_item["note"]
+    assert "current_feedback_goal_context_match_count=0" in artifact_item["note"]
+    assert "current_feedback_goal_context_image_placeholder_count=0" in artifact_item["note"]
     assert "searched_raw_image_files=0" in artifact_item["note"]
     assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in artifact_item["note"]
     second_problem = next(
@@ -849,6 +851,41 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     assert "available_artifacts=['Image #1', 'Image #2']" in second_problem["note"]
     assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in second_problem["note"]
     assert report["evidence_ok"] is True
+
+
+def test_completion_audit_surfaces_text_only_goal_context_feedback_without_accepting_screenshots(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_complete_second_problem_trace(tmp_path, artifact_kind="text")
+    trace_path = tmp_path / "second-problem-trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["current_feedback_goal_context_match_count"] = 1
+    trace["current_feedback_goal_context_image_placeholder_count"] = 2
+    trace["current_feedback_goal_context_matches"] = [
+        {
+            "path": str(tmp_path / "rollout.jsonl"),
+            "line": 7,
+            "image_placeholder_count": 2,
+            "sample": "[Image #1] [Image #2] 可以可以，我正在体验 Hermes",
+        }
+    ]
+    _write_json(trace_path, trace)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    artifact_item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Verify referenced production feedback screenshots")
+    )
+    assert artifact_item["status"] == "blocked"
+    assert "current_feedback_goal_context_match_count=1" in artifact_item["note"]
+    assert "current_feedback_goal_context_image_placeholder_count=2" in artifact_item["note"]
+    assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
 
 
 def test_completion_audit_surfaces_historical_image_candidates_for_text_only_screenshots(tmp_path: Path):

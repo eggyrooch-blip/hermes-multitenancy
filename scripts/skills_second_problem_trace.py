@@ -117,6 +117,10 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"no issue text", re.IGNORECASE),
 ]
 IMAGE_SOURCE_PATTERN = re.compile(r"\[Image:\s*source:\s*([^\]\n]+)\]")
+INTERNAL_CONTEXT_PREFIXES = (
+    "<goal_context>",
+    "<subagent_notification>",
+)
 
 
 def _valid_historical_image_source(raw_source: str) -> str:
@@ -210,6 +214,8 @@ def _structured_user_message(line: str) -> dict[str, Any] | None:
             if item.get("type") in {"input_image", "image"} or item.get("image_url"):
                 images.append(item)
     message = "\n".join(part for part in parts if part)
+    if message.lstrip().startswith(INTERNAL_CONTEXT_PREFIXES):
+        return None
     return {
         "message": message,
         "image_payload_count": len(images),
@@ -243,6 +249,43 @@ def _structured_feedback_payload_matches(
             "image_payload_count": int(structured.get("image_payload_count") or 0),
             "local_image_payload_count": int(structured.get("local_image_payload_count") or 0),
             "sample": message[:240],
+        })
+    return rows
+
+
+def _thread_goal_feedback_matches(
+    path: Path,
+    text: str,
+    *,
+    text_phrases: list[str],
+    referenced_artifacts: list[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_objectives: set[str] = set()
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "thread_goal_updated":
+            continue
+        goal = payload.get("goal")
+        if not isinstance(goal, dict):
+            continue
+        objective = str(goal.get("objective") or "")
+        if not objective or objective in seen_objectives:
+            continue
+        if not any(phrase in objective for phrase in text_phrases):
+            continue
+        seen_objectives.add(objective)
+        rows.append({
+            "path": str(path),
+            "line": line_number,
+            "image_placeholder_count": sum(objective.count(label) for label in referenced_artifacts),
+            "sample": objective[:240],
         })
     return rows
 
@@ -577,6 +620,7 @@ def build_trace(
     historical_image_keys: set[tuple[str, str]] = set()
     structured_feedback_payload_matches: list[dict[str, Any]] = []
     current_feedback_structured_payload_matches: list[dict[str, Any]] = []
+    current_feedback_goal_context_matches: list[dict[str, Any]] = []
     candidate_classes: list[dict[str, Any]] = [
         {"name": item["name"], "match_count": 0, "evidence_files": []}
         for item in CANDIDATE_CLASSES
@@ -600,6 +644,14 @@ def build_trace(
                 path,
                 text,
                 text_phrases=current_feedback_phrases,
+            )
+        )
+        current_feedback_goal_context_matches.extend(
+            _thread_goal_feedback_matches(
+                path,
+                text,
+                text_phrases=current_feedback_phrases,
+                referenced_artifacts=referenced_artifacts,
             )
         )
         if not _is_self_reference_exact_path(path):
@@ -682,6 +734,11 @@ def build_trace(
             for match in current_feedback_structured_payload_matches
         ),
         "current_feedback_structured_payload_matches": current_feedback_structured_payload_matches[:20],
+        "current_feedback_goal_context_match_count": len(current_feedback_goal_context_matches),
+        "current_feedback_goal_context_image_placeholder_count": sum(
+            int(match.get("image_placeholder_count") or 0) for match in current_feedback_goal_context_matches
+        ),
+        "current_feedback_goal_context_matches": current_feedback_goal_context_matches[:20],
         "historical_image_reference_count": len(historical_image_references),
         "historical_image_references": historical_image_references[:20],
         "candidate_classes": candidate_classes,

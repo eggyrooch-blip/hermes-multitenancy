@@ -552,3 +552,98 @@ def test_second_problem_trace_counts_current_feedback_structured_payloads_separa
             "sample": "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了。",
         }
     ]
+
+
+def test_second_problem_trace_separates_goal_context_from_recoverable_image_payloads(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    goal_context_line = trace_mod.json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "<goal_context>\n"
+                            "<objective>\n"
+                            "[Image #1] [Image #2] 可以可以，我正在体验 Hermes\n"
+                            "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了\n"
+                            "然后第二个问题\n"
+                            "</objective>\n"
+                        ),
+                    }
+                ],
+            },
+        },
+        ensure_ascii=False,
+    )
+    thread_goal_line = trace_mod.json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_updated",
+                "goal": {
+                    "objective": (
+                        "[Image #1] [Image #2] 可以可以，我正在体验 Hermes\n"
+                        "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了\n"
+                        "然后第二个问题\n"
+                        "这个是用户在生产环境中的反馈"
+                    )
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+    subagent_notification_line = trace_mod.json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "<subagent_notification>\n"
+                            "Subagent summary mentions 可以可以，我正在体验 Hermes and [Image #1].\n"
+                            "</subagent_notification>"
+                        ),
+                    }
+                ],
+            },
+        },
+        ensure_ascii=False,
+    )
+    (sessions / "rollout.jsonl").write_text(
+        f"{goal_context_line}\n{thread_goal_line}\n{subagent_notification_line}\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [sessions],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["structured_feedback_message_count"] == 0
+    assert report["structured_feedback_image_payload_count"] == 0
+    assert report["current_feedback_structured_message_count"] == 0
+    assert report["current_feedback_structured_image_payload_count"] == 0
+    assert report["current_feedback_goal_context_match_count"] == 1
+    assert report["current_feedback_goal_context_image_placeholder_count"] == 2
+    assert report["current_feedback_goal_context_matches"] == [
+        {
+            "path": str(sessions / "rollout.jsonl"),
+            "line": 2,
+            "image_placeholder_count": 2,
+            "sample": (
+                "[Image #1] [Image #2] 可以可以，我正在体验 Hermes\n"
+                "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了\n"
+                "然后第二个问题\n"
+                "这个是用户在生产环境中的反馈"
+            ),
+        }
+    ]

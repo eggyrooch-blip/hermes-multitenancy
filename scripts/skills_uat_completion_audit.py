@@ -392,6 +392,12 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     current_feedback_structured_local_image_payload_count = int(
         trace.get("current_feedback_structured_local_image_payload_count") or 0
     )
+    current_feedback_goal_context_match_count = int(
+        trace.get("current_feedback_goal_context_match_count") or 0
+    )
+    current_feedback_goal_context_image_placeholder_count = int(
+        trace.get("current_feedback_goal_context_image_placeholder_count") or 0
+    )
     historical_image_candidates = _historical_image_candidates(trace)
     historical_image_reference_count = int(trace.get("historical_image_reference_count") or 0)
     historical_image_candidate_policy = "diagnostic_only_not_current_feedback_artifact"
@@ -429,6 +435,9 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"current_feedback_structured_image_payload_count={current_feedback_structured_image_payload_count}; "
             f"current_feedback_structured_local_image_payload_count="
             f"{current_feedback_structured_local_image_payload_count}; "
+            f"current_feedback_goal_context_match_count={current_feedback_goal_context_match_count}; "
+            f"current_feedback_goal_context_image_placeholder_count="
+            f"{current_feedback_goal_context_image_placeholder_count}; "
             f"artifact_kinds={artifact_kinds}",
         )
     if non_image_artifacts:
@@ -450,6 +459,9 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"current_feedback_structured_image_payload_count={current_feedback_structured_image_payload_count}; "
             f"current_feedback_structured_local_image_payload_count="
             f"{current_feedback_structured_local_image_payload_count}; "
+            f"current_feedback_goal_context_match_count={current_feedback_goal_context_match_count}; "
+            f"current_feedback_goal_context_image_placeholder_count="
+            f"{current_feedback_goal_context_image_placeholder_count}; "
             f"searched_raw_image_files={searched_raw_image_files}; "
             f"raw_image_search_roots={raw_image_search_roots}; artifact_kinds={artifact_kinds}",
         )
