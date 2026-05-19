@@ -879,6 +879,7 @@ def test_completion_audit_surfaces_historical_image_candidates_for_text_only_scr
     assert artifact_item["status"] == "blocked"
     assert f"historical_image_candidates={{'Image #1': ['{historical_source}']}}" in artifact_item["note"]
     assert "historical_image_reference_count=1" in artifact_item["note"]
+    assert "historical_image_candidate_policy=diagnostic_only_not_current_feedback_artifact" in artifact_item["note"]
 
 
 def test_completion_audit_accepts_exact_second_problem_text_mapped_to_green_uat(tmp_path: Path):

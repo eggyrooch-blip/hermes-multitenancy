@@ -333,6 +333,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     searched_raw_image_files = int(trace.get("searched_raw_image_files") or 0)
     historical_image_candidates = _historical_image_candidates(trace)
     historical_image_reference_count = int(trace.get("historical_image_reference_count") or 0)
+    historical_image_candidate_policy = "diagnostic_only_not_current_feedback_artifact"
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -349,6 +350,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"mapped_artifacts={mapped_artifacts}; missing_artifacts={missing_artifacts}; "
             f"historical_image_candidates={historical_image_candidates}; "
             f"historical_image_reference_count={historical_image_reference_count}; "
+            f"historical_image_candidate_policy={historical_image_candidate_policy}; "
             f"artifact_kinds={artifact_kinds}",
         )
     if non_image_artifacts:
@@ -360,6 +362,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"raw_image_candidates={raw_image_candidates}; "
             f"historical_image_candidates={historical_image_candidates}; "
             f"historical_image_reference_count={historical_image_reference_count}; "
+            f"historical_image_candidate_policy={historical_image_candidate_policy}; "
             f"searched_raw_image_files={searched_raw_image_files}; "
             f"raw_image_search_roots={raw_image_search_roots}; artifact_kinds={artifact_kinds}",
         )
