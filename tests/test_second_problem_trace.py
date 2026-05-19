@@ -173,6 +173,28 @@ def test_second_problem_trace_marks_referenced_artifacts_available_from_artifact
     }
 
 
+def test_second_problem_trace_searches_roots_for_raw_image_candidates(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    image_one = docs / "Image #1.png"
+    image_two = docs / "image-2.jpg"
+    image_one.write_bytes(b"\x89PNG\r\n\x1a\n")
+    image_two.write_bytes(b"\xff\xd8\xff")
+
+    report = trace_mod.build_trace(
+        [docs],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["raw_image_search_roots"] == [str(docs)]
+    assert report["searched_raw_image_files"] == 2
+    assert report["raw_image_artifact_candidates"] == {
+        "Image #1": [str(image_one)],
+        "Image #2": [str(image_two)],
+    }
+
+
 def test_second_problem_trace_ingests_text_feedback_artifacts_for_exact_second_problem(tmp_path: Path):
     trace_mod = _load_trace_module()
     docs = tmp_path / "docs"
@@ -238,6 +260,78 @@ def test_second_problem_trace_uses_feedback_artifact_manifest_for_paths_and_uat_
         "offline_session_guard_replacement_no_duplicate_dispatch"
     ]
     assert report["raw_image_artifact_candidates"] == {"Image #1": [], "Image #2": []}
+
+
+def test_second_problem_trace_records_historical_image_references_without_accepting_them(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    stale_image = tmp_path / "clipboard-old.png"
+    stale_image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    (sessions / "rollout.jsonl").write_text(
+        f"USER: 参照大纲，[Image #2] goods 部门。\n"
+        f"USER: [Image: source: {stale_image}]\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [sessions],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["referenced_artifacts"] == [
+        {"label": "Image #1", "content_available": False, "evidence_path": ""},
+        {"label": "Image #2", "content_available": False, "evidence_path": ""},
+    ]
+    assert report["raw_image_artifact_candidates"] == {"Image #1": [], "Image #2": []}
+    assert report["historical_image_reference_count"] == 1
+    assert report["historical_image_references"] == [
+        {
+            "path": str(sessions / "rollout.jsonl"),
+            "source": str(stale_image),
+            "labels": ["Image #2"],
+        }
+    ]
+
+
+def test_second_problem_trace_ignores_self_reference_historical_image_references(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    repo_like = tmp_path / "repo"
+    tests = repo_like / "tests"
+    tests.mkdir(parents=True)
+    (tests / "test_second_problem_trace.py").write_text(
+        "USER: 参照大纲，[Image #2] goods 部门。\n"
+        "USER: [Image: source: /tmp/stale-self-reference.png]\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [repo_like],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["historical_image_reference_count"] == 0
+    assert report["historical_image_references"] == []
+
+
+def test_second_problem_trace_ignores_missing_historical_image_sources(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "rollout.jsonl").write_text(
+        "USER: 参照大纲，[Image #2] goods 部门。\n"
+        "USER: [Image: source: /tmp/stale-self-reference.png]\n"
+        "USER: [Image: source: ...]\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [sessions],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["historical_image_reference_count"] == 0
+    assert report["historical_image_references"] == []
 
 
 def test_second_problem_trace_cli_materializes_feedback_transcript_manifest(tmp_path: Path):

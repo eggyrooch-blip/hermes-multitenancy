@@ -279,6 +279,10 @@ def _raw_image_artifact_candidates(trace: dict[str, Any]) -> dict[str, list[str]
     return {label: rows[label] for label in sorted(rows)}
 
 
+def _raw_image_search_roots(trace: dict[str, Any]) -> list[str]:
+    return sorted(str(value) for value in trace.get("raw_image_search_roots") or [] if value)
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -310,6 +314,8 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     artifact_kinds = _feedback_artifact_kinds(trace)
     non_image_artifacts = _non_image_referenced_artifacts(trace)
     raw_image_candidates = _raw_image_artifact_candidates(trace)
+    raw_image_search_roots = _raw_image_search_roots(trace)
+    searched_raw_image_files = int(trace.get("searched_raw_image_files") or 0)
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -332,7 +338,9 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             "blocked",
             str(trace_path),
             f"mapped_artifacts={mapped_artifacts}; non_image_artifacts={non_image_artifacts}; "
-            f"raw_image_candidates={raw_image_candidates}; artifact_kinds={artifact_kinds}",
+            f"raw_image_candidates={raw_image_candidates}; "
+            f"searched_raw_image_files={searched_raw_image_files}; "
+            f"raw_image_search_roots={raw_image_search_roots}; artifact_kinds={artifact_kinds}",
         )
     return _item(
         requirement,

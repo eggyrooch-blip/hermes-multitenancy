@@ -110,6 +110,19 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"不能标\s*complete", re.IGNORECASE),
     re.compile(r"no issue text", re.IGNORECASE),
 ]
+IMAGE_SOURCE_PATTERN = re.compile(r"\[Image:\s*source:\s*([^\]\n]+)\]")
+
+
+def _valid_historical_image_source(raw_source: str) -> str:
+    source = raw_source.strip().replace("\\/", "/")
+    if not source or source == "..." or any(marker in source for marker in ('"', "{", "}", "\n", "…")):
+        return ""
+    path = Path(source)
+    if not path.is_absolute() or path.suffix.lower() not in IMAGE_ARTIFACT_SUFFIXES:
+        return ""
+    if not path.exists() or not path.is_file():
+        return ""
+    return str(path)
 
 
 def _unique_paths(paths: Iterable[Path]) -> list[Path]:
@@ -184,6 +197,26 @@ def _looks_like_placeholder_followup(text: str) -> bool:
     if not text:
         return True
     return any(pattern.search(text) for pattern in PLACEHOLDER_FOLLOWUP_PATTERNS)
+
+
+def _historical_image_references(
+    path: Path,
+    text: str,
+    referenced_artifacts: list[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for match in IMAGE_SOURCE_PATTERN.finditer(text):
+        source = _valid_historical_image_source(match.group(1))
+        if not source:
+            continue
+        context = text[max(0, match.start() - 500) : match.end() + 200]
+        labels = sorted(label for label in referenced_artifacts if label in context)
+        rows.append({
+            "path": str(path),
+            "source": source,
+            "labels": labels,
+        })
+    return rows
 
 
 def _is_self_reference_exact_path(path: Path) -> bool:
@@ -289,18 +322,22 @@ def _find_artifact(label: str, artifact_roots: Iterable[Path], manifest: dict[st
 
 def _find_label_artifact_candidates(
     label: str,
-    artifact_roots: Iterable[Path],
+    roots: Iterable[Path],
     *,
     suffixes: set[str],
 ) -> list[Path]:
     variants = _artifact_label_variants(label)
     matches: list[Path] = []
     seen: set[str] = set()
-    for root in artifact_roots:
+    for root in roots:
         root = root.expanduser()
         if not root.exists():
             continue
-        candidates = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        candidates = [root] if root.is_file() else sorted(
+            path
+            for path in root.rglob("*")
+            if path.is_file() and not any(part in EXCLUDED_DIRS for part in path.parts)
+        )
         for path in candidates:
             if path.suffix.lower() not in suffixes:
                 continue
@@ -316,13 +353,31 @@ def _find_label_artifact_candidates(
     return matches
 
 
-def _raw_image_artifact_candidates(labels: list[str], artifact_roots: Iterable[Path]) -> dict[str, list[str]]:
+def _count_raw_image_files(roots: Iterable[Path]) -> int:
+    seen: set[str] = set()
+    for root in roots:
+        root = root.expanduser()
+        if not root.exists():
+            continue
+        candidates = [root] if root.is_file() else (
+            path
+            for path in root.rglob("*")
+            if path.is_file() and not any(part in EXCLUDED_DIRS for part in path.parts)
+        )
+        for path in candidates:
+            if path.suffix.lower() not in IMAGE_ARTIFACT_SUFFIXES:
+                continue
+            seen.add(str(path.resolve(strict=False)))
+    return len(seen)
+
+
+def _raw_image_artifact_candidates(labels: list[str], roots: Iterable[Path]) -> dict[str, list[str]]:
     return {
         label: [
             str(path)
             for path in _find_label_artifact_candidates(
                 label,
-                artifact_roots,
+                roots,
                 suffixes=IMAGE_ARTIFACT_SUFFIXES,
             )
         ]
@@ -432,13 +487,16 @@ def build_trace(
     artifact_roots = artifact_roots or []
     artifact_manifest = _load_artifact_manifest(artifact_roots)
     artifact_rows = _artifact_rows(referenced_artifacts, artifact_roots, artifact_manifest)
-    raw_image_candidates = _raw_image_artifact_candidates(referenced_artifacts, artifact_roots)
     artifact_mapping = _artifact_mapping_by_path(artifact_rows)
     search_roots = _unique_paths([*roots, *artifact_roots])
+    raw_image_candidates = _raw_image_artifact_candidates(referenced_artifacts, search_roots)
+    searched_raw_image_files = _count_raw_image_files(search_roots)
     searched_files = 0
     exact_phrase_matches: list[dict[str, Any]] = []
     exact_issue_matches: list[dict[str, Any]] = []
     placeholder_matches: list[dict[str, Any]] = []
+    historical_image_references: list[dict[str, Any]] = []
+    historical_image_keys: set[tuple[str, str]] = set()
     candidate_classes: list[dict[str, Any]] = [
         {"name": item["name"], "match_count": 0, "evidence_files": []}
         for item in CANDIDATE_CLASSES
@@ -449,6 +507,13 @@ def build_trace(
         text = _read_text(path)
         if not text:
             continue
+        if not _is_self_reference_exact_path(path):
+            for reference in _historical_image_references(path, text, referenced_artifacts):
+                key = (reference["path"], reference["source"])
+                if key in historical_image_keys:
+                    continue
+                historical_image_keys.add(key)
+                historical_image_references.append(reference)
         for phrase in exact_phrases:
             if phrase in text and not _is_self_reference_exact_path(path):
                 followup_text = _line_after_phrase(text, phrase)
@@ -487,6 +552,8 @@ def build_trace(
         "searched_roots": [str(path) for path in search_roots],
         "artifact_roots": [str(path) for path in artifact_roots],
         "searched_files": searched_files,
+        "raw_image_search_roots": [str(path) for path in search_roots],
+        "searched_raw_image_files": searched_raw_image_files,
         "exact_phrases": exact_phrases,
         "exact_text_found": bool(exact_issue_matches),
         "exact_issue_text_found": bool(exact_issue_matches),
@@ -502,6 +569,8 @@ def build_trace(
         "placeholder_matches": placeholder_matches[:20],
         "referenced_artifacts": artifact_rows,
         "raw_image_artifact_candidates": raw_image_candidates,
+        "historical_image_reference_count": len(historical_image_references),
+        "historical_image_references": historical_image_references[:20],
         "candidate_classes": candidate_classes,
     }
 

@@ -416,6 +416,8 @@ def _write_complete_second_problem_trace(path: Path, *, artifact_kind: str = "im
                 "Image #1": [] if artifact_kind != "image" else [str(transcript)],
                 "Image #2": [] if artifact_kind != "image" else [str(transcript)],
             },
+            "raw_image_search_roots": [str(path)],
+            "searched_raw_image_files": 0 if artifact_kind != "image" else 1,
             "candidate_classes": [],
         },
     )
@@ -833,6 +835,7 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     assert artifact_item["status"] == "blocked"
     assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
     assert "raw_image_candidates={'Image #1': [], 'Image #2': []}" in artifact_item["note"]
+    assert "searched_raw_image_files=0" in artifact_item["note"]
     assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in artifact_item["note"]
     second_problem = next(
         item
