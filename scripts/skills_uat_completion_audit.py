@@ -220,6 +220,19 @@ def _feedback_artifact_kinds(trace: dict[str, Any]) -> dict[str, str]:
     return {label: rows[label] for label in sorted(rows)}
 
 
+def _non_image_referenced_artifacts(trace: dict[str, Any]) -> list[str]:
+    rows: list[str] = []
+    for artifact in trace.get("referenced_artifacts") or []:
+        if artifact.get("content_available") is not True:
+            continue
+        label = str(artifact.get("label") or "")
+        if not label:
+            continue
+        if str(artifact.get("content_kind") or "unknown") != "image":
+            rows.append(label)
+    return sorted(rows)
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -249,6 +262,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     missing_artifacts = _missing_referenced_artifacts(trace)
     mapped_artifacts, unmapped_artifacts = _feedback_artifact_mapping(trace, cases)
     artifact_kinds = _feedback_artifact_kinds(trace)
+    non_image_artifacts = _non_image_referenced_artifacts(trace)
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -263,6 +277,14 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             "blocked",
             str(trace_path),
             f"mapped_artifacts={mapped_artifacts}; missing_artifacts={missing_artifacts}; "
+            f"artifact_kinds={artifact_kinds}",
+        )
+    if non_image_artifacts:
+        return _item(
+            requirement,
+            "blocked",
+            str(trace_path),
+            f"mapped_artifacts={mapped_artifacts}; non_image_artifacts={non_image_artifacts}; "
             f"artifact_kinds={artifact_kinds}",
         )
     return _item(

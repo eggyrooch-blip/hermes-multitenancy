@@ -372,8 +372,9 @@ def _write_passing_group_write_evidence(path: Path) -> None:
     )
 
 
-def _write_complete_second_problem_trace(path: Path) -> None:
-    transcript = path / "Image #1.txt"
+def _write_complete_second_problem_trace(path: Path, *, artifact_kind: str = "image") -> None:
+    suffix = "png" if artifact_kind == "image" else "txt"
+    transcript = path / f"Image #1.{suffix}"
     transcript.write_text("然后第二个问题 是卡片重复出现\n", encoding="utf-8")
     _write_json(
         path / "second-problem-trace.json",
@@ -398,7 +399,7 @@ def _write_complete_second_problem_trace(path: Path) -> None:
                     "label": "Image #1",
                     "content_available": True,
                     "evidence_path": str(transcript),
-                    "content_kind": "text",
+                    "content_kind": artifact_kind,
                     "extracted_text": "然后第二个问题 是卡片重复出现\n",
                     "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
                 },
@@ -406,7 +407,7 @@ def _write_complete_second_problem_trace(path: Path) -> None:
                     "label": "Image #2",
                     "content_available": True,
                     "evidence_path": str(transcript),
-                    "content_kind": "text",
+                    "content_kind": artifact_kind,
                     "extracted_text": "然后第二个问题 是卡片重复出现\n",
                     "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
                 },
@@ -806,6 +807,28 @@ def test_completion_audit_accepts_available_feedback_artifact_mapped_to_green_ua
     assert "mapped_artifacts=['Image #1']" in artifact_item["note"]
     assert "missing_artifacts=['Image #2']" in artifact_item["note"]
     assert "artifact_kinds={'Image #1': 'text'}" in artifact_item["note"]
+    assert report["evidence_ok"] is True
+
+
+def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcripts(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_complete_second_problem_trace(tmp_path, artifact_kind="text")
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    artifact_item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Verify referenced production feedback screenshots")
+    )
+    assert artifact_item["status"] == "blocked"
+    assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
+    assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in artifact_item["note"]
     assert report["evidence_ok"] is True
 
 
