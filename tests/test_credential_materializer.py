@@ -53,7 +53,7 @@ credentials:
         assert token_file.stat().st_mode & 0o777 == 0o600
 
 
-def test_materialize_wildcard_profiles_targets_active_routes(monkeypatch, tmp_path: Path):
+def test_materialize_wildcard_profiles_targets_active_user_routes_not_group_children(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.credential_materializer import materialize_credentials
     from hermes_multitenancy.credentials import CredentialStore
     from hermes_multitenancy.routing import RoutingTable
@@ -100,12 +100,13 @@ credentials:
 
     stats = materialize_credentials(shared_home=shared)
 
-    assert stats["profiles_targeted"] == 3
-    assert stats["written"] == 3
-    for name in ("alice", "bob", "group_chat"):
+    assert stats["profiles_targeted"] == 2
+    assert stats["written"] == 2
+    for name in ("alice", "bob"):
         assert (profiles / name / "workspace" / "credentials" / "gitlab.token").read_text(encoding="utf-8") == (
             "opaque-gitlab-token\n"
         )
+    assert not (profiles / "group_chat" / "workspace" / "credentials" / "gitlab.token").exists()
     assert not (profiles / "inactive" / "workspace" / "credentials" / "gitlab.token").exists()
 
 

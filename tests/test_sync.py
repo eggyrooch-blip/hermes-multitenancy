@@ -429,6 +429,57 @@ skills:
     assert not (bob_skills / "internal" / "finance-cli").exists()
 
 
+def test_sync_profiles_distributes_shared_skills_by_profile_and_user_audience(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    profile_source = shared_home / "skills" / "internal" / "profile-only-cli"
+    user_source = shared_home / "skills" / "internal" / "user-only-cli"
+    profile_source.mkdir(parents=True)
+    user_source.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: internal/profile-only-cli
+    install_mode: symlink
+    audience:
+      profiles: [alice]
+  - path: internal/user-only-cli
+    install_mode: symlink
+    audience:
+      users: [bob]
+""",
+        encoding="utf-8",
+    )
+    (profile_source / "SKILL.md").write_text("# Profile Only\n", encoding="utf-8")
+    (user_source / "SKILL.md").write_text("# User Only\n", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {
+            "od_ops": [
+                DepartmentUser(open_id="ou_alice", user_id="alice"),
+                DepartmentUser(open_id="ou_bob", user_id="bob"),
+                DepartmentUser(open_id="ou_carol", user_id="carol"),
+            ]
+        },
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    alice_skills = profiles_root / "alice" / "skills"
+    bob_skills = profiles_root / "bob" / "skills"
+    carol_skills = profiles_root / "carol" / "skills"
+    assert (alice_skills / "internal" / "profile-only-cli").is_symlink()
+    assert not (bob_skills / "internal" / "profile-only-cli").exists()
+    assert not (carol_skills / "internal" / "profile-only-cli").exists()
+    assert (bob_skills / "internal" / "user-only-cli").is_symlink()
+    assert not (alice_skills / "internal" / "user-only-cli").exists()
+    assert not (carol_skills / "internal" / "user-only-cli").exists()
+
+
 def test_sync_profiles_prunes_removed_managed_skill_but_preserves_self_installed(tmp_path):
     from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
 

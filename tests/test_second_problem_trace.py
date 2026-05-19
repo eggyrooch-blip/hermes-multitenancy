@@ -192,6 +192,57 @@ def test_second_problem_trace_treats_english_state_body_absent_note_as_placehold
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
+def test_second_problem_trace_treats_english_state_still_absent_note_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "STATE.md").write_text(
+        "Remaining blockers: exact '然后第二个问题' still absent. Production unchanged.\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_issue_text_found"] is False
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
+def test_second_problem_trace_treats_english_state_absent_production_note_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "STATE.md").write_text(
+        "Latest verified evidence remains green; exact '然后第二个问题' absent. Production unchanged.\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_issue_text_found"] is False
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
+def test_second_problem_trace_treats_english_state_absent_suffix_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "STATE.md").write_text(
+        "Remaining blockers: exact '然后第二个问题' absent. Production unchanged.\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_issue_text_found"] is False
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
 def test_second_problem_trace_records_referenced_feedback_artifacts_as_unavailable(tmp_path: Path):
     trace_mod = _load_trace_module()
     docs = tmp_path / "docs"
@@ -667,6 +718,47 @@ def test_second_problem_trace_counts_current_feedback_structured_payloads_separa
             "sample": "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了。",
         }
     ]
+
+
+def test_second_problem_trace_counts_content_local_image_payloads_for_current_feedback(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "rollout.jsonl").write_text(
+        trace_mod.json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "local_image", "path": "/tmp/current-feedback-image.png"},
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "[Image #1] [Image #2] 可以可以，我正在体验 Hermes\n"
+                                "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了"
+                            ),
+                        },
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [sessions],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["structured_feedback_message_count"] == 1
+    assert report["structured_feedback_local_image_payload_count"] == 1
+    assert report["current_feedback_structured_message_count"] == 1
+    assert report["current_feedback_structured_local_image_payload_count"] == 1
+    assert report["current_feedback_structured_payload_matches"][0]["local_image_payload_count"] == 1
 
 
 def test_second_problem_trace_separates_goal_context_from_recoverable_image_payloads(tmp_path: Path):

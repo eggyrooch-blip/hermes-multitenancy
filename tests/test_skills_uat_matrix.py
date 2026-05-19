@@ -38,6 +38,16 @@ def test_distribution_uat_proves_brokered_lark_skill_is_create_ready(tmp_path: P
     assert result["lark_calendar_share_with_children"] is True
 
 
+def test_profile_user_audience_distribution_uat(tmp_path: Path):
+    matrix_mod = _load_matrix_module()
+
+    result = matrix_mod.case_profile_user_audience_distribution(tmp_path)
+
+    assert result["profile_audience_profile"] == "alice"
+    assert result["user_audience_user"] == "bob"
+    assert result["carol_received_targeted_skill"] is False
+
+
 def test_hermes_loader_uat_discovers_symlinked_weather_and_lark_skills(tmp_path: Path):
     matrix_mod = _load_matrix_module()
 
@@ -212,6 +222,33 @@ def test_skillhub_clean_personal_install_uses_symlink_and_audit_source(tmp_path:
     assert result["listed_source"] == "personal"
     assert result["audit_source"] == "personal"
     assert result["audit_token_files_present"] is False
+
+
+def test_wildcard_shared_token_materialization_skips_group_profiles(tmp_path: Path):
+    matrix_mod = _load_matrix_module()
+
+    result = matrix_mod.case_wildcard_shared_token_skips_group_profiles(tmp_path)
+
+    assert result["profiles_targeted"] == 2
+    assert result["written"] == 2
+    assert result["alice_has_token"] is True
+    assert result["bob_has_token"] is True
+    assert result["group_has_token"] is False
+    assert result["inactive_has_token"] is False
+
+
+def test_webui_skillhub_owner_scoped_install_and_audit_uat(tmp_path: Path):
+    matrix_mod = _load_matrix_module()
+
+    result = matrix_mod.case_webui_skillhub_owner_scoped_install_and_audit(tmp_path)
+
+    assert result["status"] == 200
+    assert result["profile_name"] == "owner_sync_profile"
+    assert result["install_mode"] == "symlink"
+    assert result["target_is_symlink"] is True
+    assert result["spoofed_profile_created"] is False
+    assert result["audit_status"] == 200
+    assert result["audit_profiles"] == ["owner_sync_profile"]
 
 
 def test_real_uat_scope_inventory_is_secret_free(monkeypatch, tmp_path: Path):

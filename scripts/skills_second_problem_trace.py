@@ -148,7 +148,9 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"不能标\s*complete", re.IGNORECASE),
     re.compile(r"no issue text", re.IGNORECASE),
     re.compile(r"\bis still absent\b", re.IGNORECASE),
+    re.compile(r"\bstill absent\b", re.IGNORECASE),
     re.compile(r"\bbody absent\b", re.IGNORECASE),
+    re.compile(r"\babsent\b.*\bProduction\b", re.IGNORECASE),
 ]
 IMAGE_SOURCE_PATTERN = re.compile(r"\[Image:\s*source:\s*([^\]\n]+)\]")
 INTERNAL_CONTEXT_PREFIXES = (
@@ -367,6 +369,8 @@ def _structured_user_message(line: str) -> dict[str, Any] | None:
             parts.append(str(item.get("text") or item.get("input_text") or ""))
             if item.get("type") in {"input_image", "image"} or item.get("image_url"):
                 images.append(item)
+            if item.get("type") in {"local_image", "input_file"}:
+                local_images.append(item)
     message = "\n".join(part for part in parts if part)
     if message.lstrip().startswith(INTERNAL_CONTEXT_PREFIXES):
         return None

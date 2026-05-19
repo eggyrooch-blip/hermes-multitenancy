@@ -267,6 +267,55 @@ skills:
     }
 
 
+def case_profile_user_audience_distribution(tmp_root: Path) -> dict[str, Any]:
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared = tmp_root / "shared"
+    profile_source = shared / "skills" / "internal" / "profile-only-cli"
+    user_source = shared / "skills" / "internal" / "user-only-cli"
+    _write_skill(profile_source, "profile-only-cli")
+    _write_skill(user_source, "user-only-cli")
+    (shared / "config.yaml").write_text("model:\n  default: test/model\n", encoding="utf-8")
+    (shared / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: internal/profile-only-cli
+    audience:
+      profiles: [alice]
+  - path: internal/user-only-cli
+    audience:
+      users: [bob]
+""",
+        encoding="utf-8",
+    )
+
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {
+            "od_ops": [
+                DepartmentUser(open_id="ou_alice", user_id="alice"),
+                DepartmentUser(open_id="ou_bob", user_id="bob"),
+                DepartmentUser(open_id="ou_carol", user_id="carol"),
+            ]
+        },
+    )
+    sync_profiles(snapshot, profiles_root=shared / "profiles", source_home=shared)
+    alice = shared / "profiles" / "alice" / "skills"
+    bob = shared / "profiles" / "bob" / "skills"
+    carol = shared / "profiles" / "carol" / "skills"
+    _assert((alice / "internal" / "profile-only-cli").is_symlink(), "profile audience skill missing for alice")
+    _assert(not (bob / "internal" / "profile-only-cli").exists(), "profile audience skill leaked to bob")
+    _assert(not (carol / "internal" / "profile-only-cli").exists(), "profile audience skill leaked to carol")
+    _assert((bob / "internal" / "user-only-cli").is_symlink(), "user audience skill missing for bob")
+    _assert(not (alice / "internal" / "user-only-cli").exists(), "user audience skill leaked to alice")
+    _assert(not (carol / "internal" / "user-only-cli").exists(), "user audience skill leaked to carol")
+    return {
+        "profile_audience_profile": "alice",
+        "user_audience_user": "bob",
+        "carol_received_targeted_skill": False,
+    }
+
+
 def case_hermes_loader_discovers_symlinked_skills(tmp_root: Path) -> dict[str, Any]:
     from agent import skill_utils
 
@@ -583,6 +632,71 @@ credentials:
         "alice_token_mode": oct(alice_token.stat().st_mode & 0o777),
         "bob_has_token": False,
         "group_has_token": False,
+    }
+
+
+def case_wildcard_shared_token_skips_group_profiles(tmp_root: Path) -> dict[str, Any]:
+    from hermes_multitenancy.credential_materializer import materialize_credentials
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.routing import RoutingTable
+
+    old_key = os.environ.get("HERMES_MULTITENANCY_CREDENTIAL_KEY")
+    os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] = "skills-uat-test-key"
+    try:
+        shared = tmp_root / "shared"
+        profiles = shared / "profiles"
+        for name in ("alice", "bob", "feishu_group_shared", "inactive"):
+            (profiles / name).mkdir(parents=True, exist_ok=True)
+        table = RoutingTable(shared / "multitenancy.db")
+        try:
+            table.upsert(user_id="alice", profile_name="alice", open_id="ou_alice", provenance="sync")
+            table.upsert(user_id="bob", profile_name="bob", open_id="ou_bob", provenance="sync")
+            table.upsert_group(chat_id="oc_shared", profile_name="feishu_group_shared", owner_open_id="ou_alice", upstream_profile="alice")
+            table.upsert(user_id="inactive", profile_name="inactive", open_id="ou_inactive", provenance="sync")
+            table.soft_delete("inactive")
+        finally:
+            table.close()
+        (shared / "credential-materialization.yaml").write_text(
+            """
+credentials:
+  - subject_id: kep-prd-analysis
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    profiles: ["*"]
+""",
+            encoding="utf-8",
+        )
+        store = CredentialStore(shared / "multitenancy.db")
+        try:
+            store.put_credential(
+                profile_name="__shared__",
+                subject_id="kep-prd-analysis",
+                provider="gitlab",
+                secret_kind="token",
+                payload={"token": "shared-token-secret"},
+            )
+        finally:
+            store.close()
+        stats = materialize_credentials(shared_home=shared)
+    finally:
+        if old_key is None:
+            os.environ.pop("HERMES_MULTITENANCY_CREDENTIAL_KEY", None)
+        else:
+            os.environ["HERMES_MULTITENANCY_CREDENTIAL_KEY"] = old_key
+
+    token_rel = Path("workspace") / "credentials" / "gitlab.token"
+    _assert((profiles / "alice" / token_rel).exists(), "wildcard token missing for active user alice")
+    _assert((profiles / "bob" / token_rel).exists(), "wildcard token missing for active user bob")
+    _assert(not (profiles / "feishu_group_shared" / token_rel).exists(), "wildcard token leaked to group profile")
+    _assert(not (profiles / "inactive" / token_rel).exists(), "wildcard token leaked to inactive user")
+    return {
+        "profiles_targeted": stats["profiles_targeted"],
+        "written": stats["written"],
+        "alice_has_token": True,
+        "bob_has_token": True,
+        "group_has_token": False,
+        "inactive_has_token": False,
     }
 
 
@@ -2186,6 +2300,81 @@ def case_personal_skillhub_clean_install_symlink(tmp_root: Path) -> dict[str, An
     }
 
 
+async def _webui_skillhub_owner_scoped_install_probe(tmp_root: Path) -> dict[str, Any]:
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_root / ".hermes"
+    source = shared / "skills" / "hub" / "clean-weather"
+    profile = shared / "profiles" / "owner_sync_profile"
+    _write_skill(source, "clean-weather")
+    profile.mkdir(parents=True)
+    old_shared = os.environ.get("HERMES_SHARED_HOME")
+    os.environ["HERMES_SHARED_HOME"] = str(shared)
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    try:
+        seeded.upsert(user_id="root-owner", profile_name=profile.name, open_id="ou_owner", provenance="sync")
+    finally:
+        seeded.close()
+
+    router_mod.override_routing_table(db_path)
+    try:
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/skills/install",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "profile_name": "spoofed_profile",
+                    "skill_path": "hub/clean-weather",
+                    "version": "2026.05.20",
+                },
+            )
+            body = await response.json()
+            audit_response = await client.get("/api/run-broker/skills/audit")
+            audit = await audit_response.json()
+        finally:
+            await client.close()
+    finally:
+        router_mod.override_routing_table(None)
+        if old_shared is None:
+            os.environ.pop("HERMES_SHARED_HOME", None)
+        else:
+            os.environ["HERMES_SHARED_HOME"] = old_shared
+
+    target = profile / "skills" / "hub" / "clean-weather"
+    _assert(response.status == 200, f"SkillHub install endpoint failed status={response.status}")
+    _assert(body["profile_name"] == profile.name, "SkillHub endpoint trusted client-spoofed profile")
+    _assert(body["install"]["install_mode"] == "symlink", "SkillHub endpoint did not symlink clean skill")
+    _assert(target.is_symlink(), "SkillHub endpoint target is not symlinked")
+    _assert(not (shared / "profiles" / "spoofed_profile").exists(), "SkillHub endpoint created spoofed profile")
+    _assert(audit_response.status == 200, f"Skill audit endpoint failed status={audit_response.status}")
+    _assert(profile.name in audit["profiles"], "skill audit endpoint did not include owner profile")
+    return {
+        "status": response.status,
+        "profile_name": body["profile_name"],
+        "install_mode": body["install"]["install_mode"],
+        "target_is_symlink": target.is_symlink(),
+        "spoofed_profile_created": False,
+        "audit_status": audit_response.status,
+        "audit_profiles": sorted(audit["profiles"]),
+    }
+
+
+def case_webui_skillhub_owner_scoped_install_and_audit(tmp_root: Path) -> dict[str, Any]:
+    return asyncio.run(_webui_skillhub_owner_scoped_install_probe(tmp_root))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="skills-uat-matrix")
     parser.add_argument("--real-home", type=Path, default=Path("~/.hermes"))
@@ -2201,12 +2390,14 @@ def main(argv: list[str] | None = None) -> int:
         tmp_root = Path(tmp)
         cases.append(_run_case("offline_keep_four_skill_policy_model", lambda: case_keep_four_skill_policy_model(tmp_root / "case0")))
         cases.append(_run_case("offline_distribution_audience_symlink_version_self_install", lambda: case_distribution_and_versions(tmp_root / "case1")))
+        cases.append(_run_case("offline_profile_user_audience_distribution", lambda: case_profile_user_audience_distribution(tmp_root / "case1_profile_user")))
         cases.append(_run_case("offline_hermes_loader_discovers_symlinked_skills", lambda: case_hermes_loader_discovers_symlinked_skills(tmp_root / "case1_loader")))
         cases.append(_run_case("offline_new_hire_sync_auto_installs_managed_skills", lambda: case_new_hire_sync_auto_installs_managed_skills(tmp_root / "case1a")))
         cases.append(_run_case("offline_child_agent_inherits_skills_not_tokens", lambda: case_child_inherits_skills_not_tokens(tmp_root / "case2")))
         cases.append(_run_case("offline_webui_child_agent_inherits_skills_not_tokens", lambda: case_webui_child_agent_inherits_skills_not_tokens(tmp_root / "case2_webui")))
         cases.append(_run_case("offline_child_install_does_not_sync_back_to_parent", lambda: case_child_install_does_not_sync_back_to_parent(tmp_root / "case3")))
         cases.append(_run_case("offline_shared_token_materialization_is_scoped", lambda: case_shared_token_materialization_is_scoped(tmp_root / "case4")))
+        cases.append(_run_case("offline_wildcard_shared_token_skips_group_profiles", lambda: case_wildcard_shared_token_skips_group_profiles(tmp_root / "case4_wildcard")))
         cases.append(_run_case("offline_personal_token_stays_profile_local", lambda: case_personal_token_stays_profile_local(tmp_root / "case5")))
         cases.append(_run_case("offline_registry_audit_personal_managed_loop_guard", lambda: case_registry_audit_and_loop_guard(tmp_root / "case6")))
         cases.append(_run_case("offline_interruption_resume_context", lambda: case_interruption_resume_context(tmp_root / "case7")))
@@ -2222,6 +2413,7 @@ def main(argv: list[str] | None = None) -> int:
         cases.append(_run_case("offline_persistent_event_dedupe_skips_redelivery", lambda: case_persistent_event_dedupe_skips_redelivery(tmp_root / "case9a")))
         cases.append(_run_case("offline_personal_skillhub_install_secret_guard", lambda: case_personal_skillhub_install_secret_guard(tmp_root / "case10")))
         cases.append(_run_case("offline_personal_skillhub_clean_install_symlink", lambda: case_personal_skillhub_clean_install_symlink(tmp_root / "case11")))
+        cases.append(_run_case("offline_webui_skillhub_owner_scoped_install_and_audit", lambda: case_webui_skillhub_owner_scoped_install_and_audit(tmp_root / "case12")))
     cases.append(_run_case("real_home_secret_free_routes_uat_readiness", lambda: case_real_home_secret_free(real_home)))
     cases.append(_run_case("real_home_skill_inventory_secret_free", lambda: case_real_home_skill_inventory(real_home)))
     cases.append(_run_case("real_group_replacement_race_replay", lambda: case_real_group_replacement_replay(real_home)))

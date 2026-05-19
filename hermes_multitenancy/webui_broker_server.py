@@ -624,12 +624,66 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI Feishu auth cancel failed")
             return web.json_response({"error": str(exc), "status": "error"}, status=500)
 
+    async def handle_skillhub_install(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import skill_registry
+
+        try:
+            payload = await request.json()
+            resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+            if resolution_error is not None:
+                return web.json_response({"error": resolution_error}, status=403)
+            if not resolved_profile_name:
+                return web.json_response({
+                    "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+                }, status=403)
+            profile_name = resolved_profile_name
+            shared_home = _shared_home_from_env()
+            install = skill_registry.install_shared_skill_for_profile(
+                shared_home=shared_home,
+                profile_home=shared_home / "profiles" / profile_name,
+                skill_path=str(payload.get("skill_path") or payload.get("path") or ""),
+                source=payload.get("source"),
+                version=payload.get("version"),
+            )
+            installed = skill_registry.list_installed_skills(
+                profile_home=shared_home / "profiles" / profile_name
+            )
+            return web.json_response({
+                "profile_name": profile_name,
+                "install": install,
+                "installed_skills": installed,
+            })
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except FileNotFoundError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI SkillHub install failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_skill_audit(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import skill_registry
+
+        try:
+            shared_home = _shared_home_from_env()
+            report = skill_registry.audit_installed_skills(shared_home=shared_home)
+            return web.json_response(report)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI skill audit failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     app = web.Application()
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
     app.router.add_delete("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_cancel)
+    app.router.add_post("/api/run-broker/skills/install", handle_skillhub_install)
+    app.router.add_get("/api/run-broker/skills/audit", handle_skill_audit)
     app.router.add_get("/api/run-broker/jobs", handle_list_jobs)
     app.router.add_post("/api/run-broker/jobs", handle_create_job)
     app.router.add_get("/api/run-broker/jobs/{job_id}", handle_get_job)

@@ -178,7 +178,7 @@ def _active_route_profiles(shared_home: Path) -> list[str]:
     try:
         cur = conn.execute(
             "SELECT DISTINCT profile_name FROM multitenancy_routing "
-            "WHERE active = 1 AND profile_name IS NOT NULL AND profile_name != ''"
+            "WHERE active = 1 AND kind = 'user' AND profile_name IS NOT NULL AND profile_name != ''"
         )
         return [
             cleaned
