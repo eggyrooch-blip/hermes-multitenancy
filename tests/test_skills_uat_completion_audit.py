@@ -882,6 +882,58 @@ def test_completion_audit_surfaces_historical_image_candidates_for_text_only_scr
     assert "historical_image_candidate_policy=diagnostic_only_not_current_feedback_artifact" in artifact_item["note"]
 
 
+def test_completion_audit_surfaces_historical_image_review_rejections(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_complete_second_problem_trace(tmp_path, artifact_kind="text")
+    trace_path = tmp_path / "second-problem-trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    historical_source = tmp_path / "qr-invite.png"
+    historical_source.write_bytes(b"\x89PNG\r\n\x1a\n")
+    trace["historical_image_references"] = [
+        {
+            "path": str(tmp_path / "agent-session.jsonl"),
+            "source": str(historical_source),
+            "labels": ["Image #1"],
+        },
+    ]
+    trace["historical_image_reference_count"] = 1
+    _write_json(trace_path, trace)
+    _write_json(
+        tmp_path / "historical-image-reviews.json",
+        {
+            "reviews": [
+                {
+                    "source": str(historical_source),
+                    "labels": ["Image #1"],
+                    "verdict": "rejected",
+                    "reason": "lark_group_invite_qr_not_feedback_screenshot",
+                    "md5": "abc123",
+                    "pixel_width": 1372,
+                    "pixel_height": 1488,
+                }
+            ]
+        },
+    )
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    artifact_item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Verify referenced production feedback screenshots")
+    )
+    assert artifact_item["status"] == "blocked"
+    assert "historical_image_review_rejections=" in artifact_item["note"]
+    assert "lark_group_invite_qr_not_feedback_screenshot" in artifact_item["note"]
+    assert "abc123" in artifact_item["note"]
+    assert "1372x1488" in artifact_item["note"]
+
+
 def test_completion_audit_accepts_exact_second_problem_text_mapped_to_green_uat(tmp_path: Path):
     audit_mod = _base_evidence(tmp_path)
     _write_second_problem_trace_with_available_artifact(

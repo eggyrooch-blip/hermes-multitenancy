@@ -298,6 +298,30 @@ def _historical_image_candidates(trace: dict[str, Any]) -> dict[str, list[str]]:
     return {label: sorted(values) for label, values in sorted(rows.items())}
 
 
+def _historical_image_review_rejections(path: Path) -> list[str]:
+    payload = _load_optional_json(path)
+    if payload is None:
+        return []
+    reviews = payload.get("reviews")
+    if not isinstance(reviews, list):
+        return []
+    rows: list[str] = []
+    for review in reviews:
+        if not isinstance(review, dict) or str(review.get("verdict") or "") != "rejected":
+            continue
+        labels = ",".join(str(label) for label in review.get("labels") or [] if isinstance(label, str))
+        reason = str(review.get("reason") or "")
+        source = str(review.get("source") or "")
+        md5 = str(review.get("md5") or "")
+        width = int(review.get("pixel_width") or 0)
+        height = int(review.get("pixel_height") or 0)
+        dimensions = f"{width}x{height}" if width and height else ""
+        rows.append(
+            f"source={source},labels={labels},reason={reason},md5={md5},dimensions={dimensions}"
+        )
+    return sorted(rows)
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -334,6 +358,9 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     historical_image_candidates = _historical_image_candidates(trace)
     historical_image_reference_count = int(trace.get("historical_image_reference_count") or 0)
     historical_image_candidate_policy = "diagnostic_only_not_current_feedback_artifact"
+    historical_image_review_rejections = _historical_image_review_rejections(
+        trace_path.parent / "historical-image-reviews.json"
+    )
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -351,6 +378,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"historical_image_candidates={historical_image_candidates}; "
             f"historical_image_reference_count={historical_image_reference_count}; "
             f"historical_image_candidate_policy={historical_image_candidate_policy}; "
+            f"historical_image_review_rejections={historical_image_review_rejections}; "
             f"artifact_kinds={artifact_kinds}",
         )
     if non_image_artifacts:
@@ -363,6 +391,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"historical_image_candidates={historical_image_candidates}; "
             f"historical_image_reference_count={historical_image_reference_count}; "
             f"historical_image_candidate_policy={historical_image_candidate_policy}; "
+            f"historical_image_review_rejections={historical_image_review_rejections}; "
             f"searched_raw_image_files={searched_raw_image_files}; "
             f"raw_image_search_roots={raw_image_search_roots}; artifact_kinds={artifact_kinds}",
         )

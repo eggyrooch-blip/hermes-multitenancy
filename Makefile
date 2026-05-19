@@ -4,6 +4,9 @@ HERMES_SKILLS_UAT_EVIDENCE_DIR ?= /tmp/hermes-skills-uat
 HERMES_REAL_HOME ?= /Users/kite/.hermes
 HERMES_OBSIDIAN_VAULT ?= /Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain
 HERMES_FEEDBACK_TRANSCRIPT ?= $(HERMES_SKILLS_UAT_EVIDENCE_DIR)/current-production-feedback.txt
+HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_SOURCE ?=
+HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_LABEL ?= Image \#1
+HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_REASON ?= lark_group_invite_qr_not_feedback_screenshot
 
 test:
 	uv run --extra test pytest -q
@@ -31,6 +34,13 @@ skills-uat:
 		--feedback-artifact-label "Image #2" \
 		--feedback-artifact-scenario offline_production_feedback_interruption_quote_resume \
 		--output "$(HERMES_SKILLS_UAT_EVIDENCE_DIR)/second-problem-trace.json"; \
+	if [ -n "$(HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_SOURCE)" ]; then \
+		uv run --extra test python scripts/historical_feedback_image_review.py \
+			--source "$(HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_SOURCE)" \
+			--label "$(HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_LABEL)" \
+			--reason "$(HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_REASON)" \
+			--output "$(HERMES_SKILLS_UAT_EVIDENCE_DIR)/historical-image-reviews.json"; \
+	fi; \
 	uv run --extra test python scripts/gateway_process_evidence.py \
 		--worktree "$(CURDIR)" \
 		--output "$(HERMES_SKILLS_UAT_EVIDENCE_DIR)/gateway-process-evidence.json" || true; \

@@ -14,10 +14,14 @@ def test_makefile_exposes_skills_uat_targets_with_strict_completion_gate():
     assert "skills-uat-strict" in makefile
     assert "scripts/skills_uat_matrix.py" in makefile
     assert "scripts/skills_second_problem_trace.py" in makefile
+    assert "scripts/historical_feedback_image_review.py" in makefile
     assert "scripts/gateway_process_evidence.py" in makefile
     assert "scripts/skills_uat_completion_audit.py" in makefile
     assert "--feedback-artifact-label" in makefile
     assert "--feedback-artifact-scenario" in makefile
+    assert "HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_SOURCE" in makefile
+    assert "HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_LABEL ?= Image \\#1" in makefile
+    assert "historical-image-reviews.json" in makefile
     assert "--require-complete" in makefile
 
 
