@@ -805,6 +805,7 @@ def test_completion_audit_accepts_available_feedback_artifact_mapped_to_green_ua
     assert artifact_item["status"] == "blocked"
     assert "mapped_artifacts=['Image #1']" in artifact_item["note"]
     assert "missing_artifacts=['Image #2']" in artifact_item["note"]
+    assert "artifact_kinds={'Image #1': 'text'}" in artifact_item["note"]
     assert report["evidence_ok"] is True
 
 

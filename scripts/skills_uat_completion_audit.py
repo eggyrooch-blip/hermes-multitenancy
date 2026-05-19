@@ -208,6 +208,18 @@ def _feedback_artifact_mapping(trace: dict[str, Any], cases: dict[Any, dict[str,
     return sorted(mapped), sorted(unmapped)
 
 
+def _feedback_artifact_kinds(trace: dict[str, Any]) -> dict[str, str]:
+    rows: dict[str, str] = {}
+    for artifact in trace.get("referenced_artifacts") or []:
+        if artifact.get("content_available") is not True:
+            continue
+        label = str(artifact.get("label") or "")
+        if not label:
+            continue
+        rows[label] = str(artifact.get("content_kind") or "unknown")
+    return {label: rows[label] for label in sorted(rows)}
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -236,25 +248,29 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
 
     missing_artifacts = _missing_referenced_artifacts(trace)
     mapped_artifacts, unmapped_artifacts = _feedback_artifact_mapping(trace, cases)
+    artifact_kinds = _feedback_artifact_kinds(trace)
     if unmapped_artifacts:
         return _item(
             requirement,
             "failed",
             str(trace_path),
-            f"unmapped_artifacts={unmapped_artifacts}; missing_artifacts={missing_artifacts}",
+            f"unmapped_artifacts={unmapped_artifacts}; missing_artifacts={missing_artifacts}; "
+            f"artifact_kinds={artifact_kinds}",
         )
     if missing_artifacts:
         return _item(
             requirement,
             "blocked",
             str(trace_path),
-            f"mapped_artifacts={mapped_artifacts}; missing_artifacts={missing_artifacts}",
+            f"mapped_artifacts={mapped_artifacts}; missing_artifacts={missing_artifacts}; "
+            f"artifact_kinds={artifact_kinds}",
         )
     return _item(
         requirement,
         "covered",
         str(trace_path),
-        f"all referenced feedback screenshots have available content; mapped_artifacts={mapped_artifacts}.",
+        "all referenced feedback screenshots have available content; "
+        f"mapped_artifacts={mapped_artifacts}; artifact_kinds={artifact_kinds}.",
     )
 
 
