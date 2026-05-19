@@ -102,6 +102,25 @@ def _has_docs_create_result(row: dict[str, Any]) -> bool:
     return has_create_command and has_doc_id
 
 
+def _group_permission_grant_skipped(evidence: dict[str, Any]) -> bool:
+    raw = evidence.get("stdout_excerpt")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return False
+    permission_grant = data.get("permission_grant")
+    if not isinstance(permission_grant, dict):
+        return False
+    return permission_grant.get("status") == "skipped"
+
+
 def _coverage_by_label(
     rows: list[dict[str, Any]],
     required_labels: set[str],
@@ -849,23 +868,31 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         str(current_gateway_group_path),
         f"{len(current_group_rows)} rows; label_counts={current_group_counts}; missing_labels={missing_group_labels}",
     ))
+    direct_group_permission_skipped = _group_permission_grant_skipped(direct_group)
     items.append(_item(
         "Validate current branch group profile lark-cli bot write path without switching the running gateway symlink.",
-        "covered" if direct_group.get("ok") is True and direct_group.get("identity_bot") is True and direct_group.get("document_id") else "failed",
+        "covered" if (
+            direct_group.get("ok") is True
+            and direct_group.get("identity_bot") is True
+            and direct_group_permission_skipped
+            and direct_group.get("document_id")
+        ) else "failed",
         str(direct_group_path),
-        f"document_id={direct_group.get('document_id', '')}",
+        f"document_id={direct_group.get('document_id', '')}; permission_grant_skipped={direct_group_permission_skipped}",
     ))
+    router_group_permission_skipped = _group_permission_grant_skipped(router_group)
     items.append(_item(
         "Validate current branch group router message path can route to the real group profile and create a Feishu doc as bot.",
         "covered" if (
             router_group.get("ok") is True
             and router_group.get("identity_bot") is True
+            and router_group_permission_skipped
             and router_group.get("document_id")
             and router_group.get("router_profile") == ((router_group.get("route") or {}).get("group_profile"))
             and router_group.get("router_chat_id") == ((router_group.get("route") or {}).get("chat_id"))
         ) else "failed",
         str(router_group_path),
-        f"document_id={router_group.get('document_id', '')}; router_profile={router_group.get('router_profile', '')}",
+        f"document_id={router_group.get('document_id', '')}; router_profile={router_group.get('router_profile', '')}; permission_grant_skipped={router_group_permission_skipped}",
     ))
 
     items.append(_item(

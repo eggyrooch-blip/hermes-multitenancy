@@ -285,7 +285,12 @@ def _base_evidence(tmp_path: Path) -> object:
     )
     _write_json(
         tmp_path / "direct-group-lark-cli-write.json",
-        {"ok": True, "identity_bot": True, "document_id": "doc_123"},
+        {
+            "ok": True,
+            "identity_bot": True,
+            "document_id": "doc_123",
+            "stdout_excerpt": json.dumps({"ok": True, "data": {"permission_grant": {"status": "skipped"}}}),
+        },
     )
     _write_json(
         tmp_path / "router-group-lark-cli-write.json",
@@ -293,6 +298,7 @@ def _base_evidence(tmp_path: Path) -> object:
             "ok": True,
             "identity_bot": True,
             "document_id": "doc_456",
+            "stdout_excerpt": json.dumps({"ok": True, "data": {"permission_grant": {"status": "skipped"}}}),
             "router_profile": "feishu_group_ctx",
             "router_chat_id": "oc_ctx",
             "route": {"group_profile": "feishu_group_ctx", "chat_id": "oc_ctx"},
@@ -784,6 +790,46 @@ def test_completion_audit_accepts_exact_second_problem_text_mapped_to_green_uat(
     assert second_problem["status"] == "covered"
     assert "mapped_exact_matches=1" in second_problem["note"]
     assert report["evidence_ok"] is True
+
+
+def test_completion_audit_fails_direct_group_write_when_permission_grant_is_not_skipped(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    direct_path = tmp_path / "direct-group-lark-cli-write.json"
+    direct = json.loads(direct_path.read_text(encoding="utf-8"))
+    direct["stdout_excerpt"] = json.dumps({"ok": True, "data": {"permission_grant": {"status": "granted"}}})
+    direct_path.write_text(json.dumps(direct, ensure_ascii=False), encoding="utf-8")
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(item for item in report["items"] if item["requirement"].startswith("Validate current branch group profile"))
+    assert item["status"] == "failed"
+    assert "permission_grant_skipped=False" in item["note"]
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_fails_router_group_write_when_permission_grant_is_not_skipped(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    router_path = tmp_path / "router-group-lark-cli-write.json"
+    router = json.loads(router_path.read_text(encoding="utf-8"))
+    router["stdout_excerpt"] = json.dumps({"ok": True, "data": {"permission_grant": {"status": "granted"}}})
+    router_path.write_text(json.dumps(router, ensure_ascii=False), encoding="utf-8")
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(item for item in report["items"] if item["requirement"].startswith("Validate current branch group router"))
+    assert item["status"] == "failed"
+    assert "permission_grant_skipped=False" in item["note"]
+    assert report["evidence_ok"] is False
 
 
 def test_completion_audit_fails_explicit_inflight_scope_item_when_case_is_red(tmp_path: Path):
