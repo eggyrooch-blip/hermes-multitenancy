@@ -287,6 +287,49 @@ def _find_artifact(label: str, artifact_roots: Iterable[Path], manifest: dict[st
     return None
 
 
+def _find_label_artifact_candidates(
+    label: str,
+    artifact_roots: Iterable[Path],
+    *,
+    suffixes: set[str],
+) -> list[Path]:
+    variants = _artifact_label_variants(label)
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for root in artifact_roots:
+        root = root.expanduser()
+        if not root.exists():
+            continue
+        candidates = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        for path in candidates:
+            if path.suffix.lower() not in suffixes:
+                continue
+            stem_key = _artifact_key(path.stem)
+            name_key = _artifact_key(path.name)
+            if stem_key not in variants and name_key not in variants:
+                continue
+            key = str(path.resolve(strict=False))
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(path)
+    return matches
+
+
+def _raw_image_artifact_candidates(labels: list[str], artifact_roots: Iterable[Path]) -> dict[str, list[str]]:
+    return {
+        label: [
+            str(path)
+            for path in _find_label_artifact_candidates(
+                label,
+                artifact_roots,
+                suffixes=IMAGE_ARTIFACT_SUFFIXES,
+            )
+        ]
+        for label in labels
+    }
+
+
 def _artifact_rows(
     labels: list[str],
     artifact_roots: Iterable[Path] = (),
@@ -389,6 +432,7 @@ def build_trace(
     artifact_roots = artifact_roots or []
     artifact_manifest = _load_artifact_manifest(artifact_roots)
     artifact_rows = _artifact_rows(referenced_artifacts, artifact_roots, artifact_manifest)
+    raw_image_candidates = _raw_image_artifact_candidates(referenced_artifacts, artifact_roots)
     artifact_mapping = _artifact_mapping_by_path(artifact_rows)
     search_roots = _unique_paths([*roots, *artifact_roots])
     searched_files = 0
@@ -457,6 +501,7 @@ def build_trace(
         "exact_phrase_matches": exact_phrase_matches[:20],
         "placeholder_matches": placeholder_matches[:20],
         "referenced_artifacts": artifact_rows,
+        "raw_image_artifact_candidates": raw_image_candidates,
         "candidate_classes": candidate_classes,
     }
 

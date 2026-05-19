@@ -57,6 +57,7 @@ KNOWN_BLOCKED_MATRIX_FAILURES = {
     ),
     "real_feishu_tat_bot_token": ("credential encryption key is required",),
 }
+IMAGE_ARTIFACT_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -220,6 +221,14 @@ def _feedback_artifact_kinds(trace: dict[str, Any]) -> dict[str, str]:
     return {label: rows[label] for label in sorted(rows)}
 
 
+def _available_referenced_artifacts(trace: dict[str, Any]) -> list[str]:
+    return sorted(
+        str(artifact.get("label"))
+        for artifact in trace.get("referenced_artifacts") or []
+        if artifact.get("label") and artifact.get("content_available") is True
+    )
+
+
 def _non_image_referenced_artifacts(trace: dict[str, Any]) -> list[str]:
     rows: list[str] = []
     for artifact in trace.get("referenced_artifacts") or []:
@@ -231,6 +240,43 @@ def _non_image_referenced_artifacts(trace: dict[str, Any]) -> list[str]:
         if str(artifact.get("content_kind") or "unknown") != "image":
             rows.append(label)
     return sorted(rows)
+
+
+def _raw_image_artifact_candidates(trace: dict[str, Any]) -> dict[str, list[str]]:
+    rows: dict[str, list[str]] = {}
+    artifact_roots = [Path(root) for root in trace.get("artifact_roots") or [] if root]
+    for artifact in trace.get("referenced_artifacts") or []:
+        if artifact.get("content_available") is not True:
+            continue
+        label = str(artifact.get("label") or "")
+        if not label or str(artifact.get("content_kind") or "unknown") == "image":
+            continue
+        candidates: set[str] = set()
+        evidence_path = Path(str(artifact.get("evidence_path") or ""))
+        search_dirs: list[Path] = []
+        if evidence_path.name and evidence_path.parent != Path("."):
+            search_dirs.append(evidence_path.parent)
+        search_dirs.extend(artifact_roots)
+        stems = {evidence_path.stem, label}
+        for directory in search_dirs:
+            for stem in stems:
+                for suffix in IMAGE_ARTIFACT_SUFFIXES:
+                    candidate = directory / f"{stem}{suffix}"
+                    if candidate.exists():
+                        candidates.add(str(candidate))
+        rows[label] = sorted(candidates)
+
+    raw = trace.get("raw_image_artifact_candidates")
+    if isinstance(raw, dict):
+        for label, values in raw.items():
+            if not isinstance(label, str):
+                continue
+            if not isinstance(values, list):
+                continue
+            existing = set(rows.get(label, []))
+            existing.update(str(value) for value in values if isinstance(value, str))
+            rows[label] = sorted(existing)
+    return {label: rows[label] for label in sorted(rows)}
 
 
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
@@ -263,6 +309,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
     mapped_artifacts, unmapped_artifacts = _feedback_artifact_mapping(trace, cases)
     artifact_kinds = _feedback_artifact_kinds(trace)
     non_image_artifacts = _non_image_referenced_artifacts(trace)
+    raw_image_candidates = _raw_image_artifact_candidates(trace)
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -285,7 +332,7 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             "blocked",
             str(trace_path),
             f"mapped_artifacts={mapped_artifacts}; non_image_artifacts={non_image_artifacts}; "
-            f"artifact_kinds={artifact_kinds}",
+            f"raw_image_candidates={raw_image_candidates}; artifact_kinds={artifact_kinds}",
         )
     return _item(
         requirement,
@@ -319,14 +366,18 @@ def _second_problem_trace_item(trace_path: Path, cases: dict[Any, dict[str, Any]
         for candidate in trace.get("candidate_classes") or []
         if candidate.get("match_count")
     ]
-    referenced_artifacts = _missing_referenced_artifacts(trace)
+    missing_artifacts = _missing_referenced_artifacts(trace)
+    available_artifacts = _available_referenced_artifacts(trace)
+    artifact_kinds = _feedback_artifact_kinds(trace)
     note = (
         f"searched_files={trace.get('searched_files', 0)}; "
         f"exact_match_count={trace.get('exact_match_count', 0)}; "
         f"exact_phrase_match_count={trace.get('exact_phrase_match_count', 0)}; "
         f"placeholder_match_count={trace.get('placeholder_match_count', 0)}; "
         f"absent_reason={trace.get('exact_issue_text_absent_reason', '')}; "
-        f"referenced_artifacts={referenced_artifacts}; "
+        f"missing_artifacts={missing_artifacts}; "
+        f"available_artifacts={available_artifacts}; "
+        f"artifact_kinds={artifact_kinds}; "
         f"candidate_classes={candidate_classes}"
     )
     if trace.get("exact_text_found") is True:

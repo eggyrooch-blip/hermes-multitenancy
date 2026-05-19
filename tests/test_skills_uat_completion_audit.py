@@ -412,6 +412,10 @@ def _write_complete_second_problem_trace(path: Path, *, artifact_kind: str = "im
                     "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
                 },
             ],
+            "raw_image_artifact_candidates": {
+                "Image #1": [] if artifact_kind != "image" else [str(transcript)],
+                "Image #2": [] if artifact_kind != "image" else [str(transcript)],
+            },
             "candidate_classes": [],
         },
     )
@@ -679,7 +683,7 @@ def test_completion_audit_blocks_when_second_problem_trace_has_no_exact_text(tmp
     assert "exact_phrase_match_count=0" in second_problem["note"]
     assert "placeholder_match_count=0" in second_problem["note"]
     assert "absent_reason=exact_phrase_not_found" in second_problem["note"]
-    assert "referenced_artifacts=['Image #1', 'Image #2']" in second_problem["note"]
+    assert "missing_artifacts=['Image #1', 'Image #2']" in second_problem["note"]
     assert report["evidence_ok"] is True
 
 
@@ -828,7 +832,15 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     )
     assert artifact_item["status"] == "blocked"
     assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
+    assert "raw_image_candidates={'Image #1': [], 'Image #2': []}" in artifact_item["note"]
     assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in artifact_item["note"]
+    second_problem = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Prove coverage for the user's omitted")
+    )
+    assert "available_artifacts=['Image #1', 'Image #2']" in second_problem["note"]
+    assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in second_problem["note"]
     assert report["evidence_ok"] is True
 
 

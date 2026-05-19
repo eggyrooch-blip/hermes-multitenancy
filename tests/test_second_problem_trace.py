@@ -167,6 +167,10 @@ def test_second_problem_trace_marks_referenced_artifacts_available_from_artifact
             "mapped_uat_scenarios": [],
         },
     ]
+    assert report["raw_image_artifact_candidates"] == {
+        "Image #1": [str(image_one)],
+        "Image #2": [str(image_two)],
+    }
 
 
 def test_second_problem_trace_ingests_text_feedback_artifacts_for_exact_second_problem(tmp_path: Path):
@@ -233,6 +237,7 @@ def test_second_problem_trace_uses_feedback_artifact_manifest_for_paths_and_uat_
     assert report["exact_matches"][0]["mapped_uat_scenarios"] == [
         "offline_session_guard_replacement_no_duplicate_dispatch"
     ]
+    assert report["raw_image_artifact_candidates"] == {"Image #1": [], "Image #2": []}
 
 
 def test_second_problem_trace_cli_materializes_feedback_transcript_manifest(tmp_path: Path):
