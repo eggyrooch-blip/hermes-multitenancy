@@ -69,6 +69,20 @@ def test_new_hire_sync_auto_installs_managed_skills_and_preserves_personal_insta
     assert result["new_hire_personal_install_preserved_after_resync"] is True
 
 
+def test_webui_child_agent_inherits_shareable_skills_not_tokens(tmp_path: Path):
+    matrix_mod = _load_matrix_module()
+
+    result = matrix_mod.case_webui_child_agent_inherits_skills_not_tokens(tmp_path)
+
+    assert result["webui_child_profile"] == "webui_child_research"
+    assert result["inherited_from"] == "alice"
+    assert result["weather_skill"] is True
+    assert result["lark_calendar_skill"] is True
+    assert result["personal_oauth_skill"] is False
+    assert result["token_files"] == 0
+    assert result["uat_files"] == 0
+
+
 def test_registry_audit_uat_collects_all_profile_skill_sources(tmp_path: Path):
     matrix_mod = _load_matrix_module()
 

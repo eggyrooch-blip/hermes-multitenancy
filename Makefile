@@ -13,7 +13,8 @@ skills-uat:
 	@if [ ! -f "$(HERMES_FEEDBACK_TRANSCRIPT)" ]; then \
 		printf '%s\n' '未提供第二问题正文' > "$(HERMES_FEEDBACK_TRANSCRIPT)"; \
 	fi
-	@set -a; \
+	@set -e; \
+	set -a; \
 	if [ -f "$(HERMES_REAL_HOME)/.env" ]; then . "$(HERMES_REAL_HOME)/.env"; fi; \
 	set +a; \
 	uv run --extra test python scripts/skills_uat_matrix.py \

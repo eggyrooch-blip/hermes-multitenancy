@@ -444,6 +444,50 @@ def case_child_inherits_skills_not_tokens(tmp_root: Path) -> dict[str, Any]:
     }
 
 
+def case_webui_child_agent_inherits_skills_not_tokens(tmp_root: Path) -> dict[str, Any]:
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared, ids = _build_offline_home(tmp_root)
+    owner = shared / "profiles" / ids["owner"]
+    owner.joinpath("tokens").mkdir(parents=True, exist_ok=True)
+    owner.joinpath("tokens", "personal-oauth.json").write_text("do-not-copy", encoding="utf-8")
+    owner.joinpath("feishu_uat").mkdir(exist_ok=True)
+    owner.joinpath("feishu_uat", f"{ids['owner_open_id']}.json").write_text("do-not-copy", encoding="utf-8")
+
+    webui_child = shared / "profiles" / "webui_child_research"
+    webui_child.mkdir(parents=True)
+    changed = _sync_default_profile_skills(
+        webui_child,
+        shared,
+        upstream_profile_home=owner,
+    )
+
+    manifest = json.loads((webui_child / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
+    weather_manifest = manifest["weather/shared"]
+    lark_manifest = manifest["lark-calendar"]
+    _assert(changed is True, "webui child sync did not create inherited skills")
+    _assert((webui_child / "skills" / "weather" / "shared").is_symlink(), "webui child did not inherit tokenless weather skill")
+    _assert((webui_child / "skills" / "lark-calendar").is_symlink(), "webui child did not inherit brokered lark skill")
+    _assert(not (webui_child / "skills" / "internal" / "personal-oauth").exists(), "webui child inherited user_oauth skill")
+    _assert(not list((webui_child / "tokens").glob("*")), "webui child copied owner token files")
+    _assert(not list((webui_child / "feishu_uat").glob("*.json")), "webui child copied owner Feishu UAT")
+    _assert(weather_manifest["inherited_from"] == ids["owner"], "webui child weather manifest lost upstream profile")
+    _assert(lark_manifest["inherited_from"] == ids["owner"], "webui child lark manifest lost upstream profile")
+    return {
+        "webui_child_profile": webui_child.name,
+        "inherited_from": weather_manifest["inherited_from"],
+        "weather_skill": True,
+        "weather_install_mode": weather_manifest["install_mode"],
+        "weather_token_policy": weather_manifest["token_policy"],
+        "lark_calendar_skill": True,
+        "lark_calendar_install_mode": lark_manifest["install_mode"],
+        "lark_calendar_token_policy": lark_manifest["token_policy"],
+        "personal_oauth_skill": False,
+        "token_files": 0,
+        "uat_files": 0,
+    }
+
+
 def case_child_install_does_not_sync_back_to_parent(tmp_root: Path) -> dict[str, Any]:
     from hermes_multitenancy import router as router_mod
     from hermes_multitenancy.router import _ensure_group_profile
@@ -2057,6 +2101,7 @@ def main(argv: list[str] | None = None) -> int:
         cases.append(_run_case("offline_hermes_loader_discovers_symlinked_skills", lambda: case_hermes_loader_discovers_symlinked_skills(tmp_root / "case1_loader")))
         cases.append(_run_case("offline_new_hire_sync_auto_installs_managed_skills", lambda: case_new_hire_sync_auto_installs_managed_skills(tmp_root / "case1a")))
         cases.append(_run_case("offline_child_agent_inherits_skills_not_tokens", lambda: case_child_inherits_skills_not_tokens(tmp_root / "case2")))
+        cases.append(_run_case("offline_webui_child_agent_inherits_skills_not_tokens", lambda: case_webui_child_agent_inherits_skills_not_tokens(tmp_root / "case2_webui")))
         cases.append(_run_case("offline_child_install_does_not_sync_back_to_parent", lambda: case_child_install_does_not_sync_back_to_parent(tmp_root / "case3")))
         cases.append(_run_case("offline_shared_token_materialization_is_scoped", lambda: case_shared_token_materialization_is_scoped(tmp_root / "case4")))
         cases.append(_run_case("offline_personal_token_stays_profile_local", lambda: case_personal_token_stays_profile_local(tmp_root / "case5")))

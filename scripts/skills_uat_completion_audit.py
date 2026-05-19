@@ -22,6 +22,7 @@ REQUIRED_MATRIX_CASES = {
     "offline_hermes_loader_discovers_symlinked_skills",
     "offline_new_hire_sync_auto_installs_managed_skills",
     "offline_child_agent_inherits_skills_not_tokens",
+    "offline_webui_child_agent_inherits_skills_not_tokens",
     "offline_child_install_does_not_sync_back_to_parent",
     "offline_shared_token_materialization_is_scoped",
     "offline_personal_token_stays_profile_local",
@@ -737,6 +738,29 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         "covered" if real_inventory_ok else "failed",
         str(matrix_path),
         real_inventory_note,
+    ))
+    webui_child_case = cases.get("offline_webui_child_agent_inherits_skills_not_tokens") or {}
+    webui_child_ok = (
+        webui_child_case.get("ok") is True
+        and webui_child_case.get("weather_skill") is True
+        and webui_child_case.get("lark_calendar_skill") is True
+        and webui_child_case.get("personal_oauth_skill") is False
+        and webui_child_case.get("token_files") == 0
+        and webui_child_case.get("uat_files") == 0
+        and bool(webui_child_case.get("inherited_from"))
+    )
+    items.append(_item(
+        "Validate WebUI child profile inheritance uses the same skills-not-tokens rule as group child profiles.",
+        "covered" if webui_child_ok else "failed",
+        str(matrix_path),
+        "webui_child_profile="
+        f"{webui_child_case.get('webui_child_profile', '')}; "
+        f"inherited_from={webui_child_case.get('inherited_from', '')}; "
+        f"weather_skill={webui_child_case.get('weather_skill')}; "
+        f"lark_calendar_skill={webui_child_case.get('lark_calendar_skill')}; "
+        f"personal_oauth_skill={webui_child_case.get('personal_oauth_skill')}; "
+        f"token_files={webui_child_case.get('token_files')}; "
+        f"uat_files={webui_child_case.get('uat_files')}",
     ))
     context_case = cases.get("offline_context_continuity_private_and_group") or {}
     items.append(_item(
