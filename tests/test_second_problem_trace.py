@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 
@@ -269,6 +270,44 @@ def test_second_problem_trace_searches_roots_for_raw_image_candidates(tmp_path: 
         "Image #1": [str(image_one)],
         "Image #2": [str(image_two)],
     }
+
+
+def test_second_problem_trace_records_unlinked_codex_clipboard_images_as_diagnostics(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    clipboard = tmp_path / "clipboard"
+    docs.mkdir()
+    clipboard.mkdir()
+    image = clipboard / "codex-clipboard-current.png"
+    image.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        + (11).to_bytes(4, "big")
+        + (22).to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    os.utime(image, (1_779_204_999, 1_779_204_999))
+
+    report = trace_mod.build_trace(
+        [docs],
+        referenced_artifacts=["Image #1", "Image #2"],
+        clipboard_roots=[clipboard],
+    )
+
+    assert report["raw_image_artifact_candidates"] == {"Image #1": [], "Image #2": []}
+    assert report["current_feedback_unlinked_clipboard_image_candidate_count"] == 1
+    assert report["current_feedback_unlinked_clipboard_image_candidates"] == [
+            {
+                "source": str(image),
+                "md5": "721d7a3e6dbd08265614017dae1edee2",
+            "mtime_epoch": 1_779_204_999,
+            "pixel_width": 11,
+            "pixel_height": 22,
+            "size_bytes": 33,
+            "reason_not_accepted": "unlinked_to_current_feedback_artifact",
+        }
+    ]
 
 
 def test_second_problem_trace_ingests_text_feedback_artifacts_for_exact_second_problem(tmp_path: Path):

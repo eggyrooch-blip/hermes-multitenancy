@@ -346,6 +346,13 @@ def _historical_image_unreviewed_candidates(candidates: dict[str, list[str]], pa
     return {label: rows[label] for label in sorted(rows)}
 
 
+def _unlinked_clipboard_image_candidates(trace: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = trace.get("current_feedback_unlinked_clipboard_image_candidates")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def _mapped_exact_match_count(trace: dict[str, Any], cases: dict[Any, dict[str, Any]]) -> int:
     count = 0
     for match in trace.get("exact_matches") or []:
@@ -416,6 +423,11 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
         historical_image_candidates,
         historical_image_review_path,
     )
+    unlinked_clipboard_image_candidates = _unlinked_clipboard_image_candidates(trace)
+    unlinked_clipboard_image_candidate_count = int(
+        trace.get("current_feedback_unlinked_clipboard_image_candidate_count")
+        or len(unlinked_clipboard_image_candidates)
+    )
     if unmapped_artifacts:
         return _item(
             requirement,
@@ -435,6 +447,9 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"historical_image_candidate_policy={historical_image_candidate_policy}; "
             f"historical_image_review_rejections={historical_image_review_rejections}; "
             f"historical_image_unreviewed_candidates={historical_image_unreviewed_candidates}; "
+            f"current_feedback_unlinked_clipboard_image_candidate_count="
+            f"{unlinked_clipboard_image_candidate_count}; "
+            f"current_feedback_unlinked_clipboard_image_candidates={unlinked_clipboard_image_candidates[:5]}; "
             f"structured_feedback_message_count={structured_feedback_message_count}; "
             f"structured_feedback_image_payload_count={structured_feedback_image_payload_count}; "
             f"structured_feedback_local_image_payload_count={structured_feedback_local_image_payload_count}; "
@@ -461,6 +476,9 @@ def _feedback_artifacts_item(trace_path: Path, cases: dict[Any, dict[str, Any]])
             f"historical_image_candidate_policy={historical_image_candidate_policy}; "
             f"historical_image_review_rejections={historical_image_review_rejections}; "
             f"historical_image_unreviewed_candidates={historical_image_unreviewed_candidates}; "
+            f"current_feedback_unlinked_clipboard_image_candidate_count="
+            f"{unlinked_clipboard_image_candidate_count}; "
+            f"current_feedback_unlinked_clipboard_image_candidates={unlinked_clipboard_image_candidates[:5]}; "
             f"structured_feedback_message_count={structured_feedback_message_count}; "
             f"structured_feedback_image_payload_count={structured_feedback_image_payload_count}; "
             f"structured_feedback_local_image_payload_count={structured_feedback_local_image_payload_count}; "

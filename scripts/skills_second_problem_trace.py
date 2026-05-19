@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
+import struct
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
@@ -695,6 +697,52 @@ def _raw_image_artifact_candidates(labels: list[str], roots: Iterable[Path]) -> 
     }
 
 
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return 0, 0
+    if len(data) < 24 or data[12:16] != b"IHDR":
+        return 0, 0
+    return struct.unpack(">II", data[16:24])
+
+
+def _default_clipboard_roots() -> list[Path]:
+    tmpdir = os.environ.get("TMPDIR")
+    return [Path(tmpdir)] if tmpdir else []
+
+
+def _unlinked_clipboard_image_candidates(roots: Iterable[Path], *, limit: int = 20) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        root = root.expanduser()
+        if not root.exists() or not root.is_dir():
+            continue
+        for path in sorted(root.glob("codex-clipboard-*.png")):
+            if not path.is_file():
+                continue
+            key = str(path.resolve(strict=False))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                data = path.read_bytes()
+                stat = path.stat()
+            except OSError:
+                continue
+            width, height = _png_dimensions(data)
+            rows.append({
+                "source": str(path),
+                "md5": hashlib.md5(data).hexdigest(),
+                "mtime_epoch": int(stat.st_mtime),
+                "pixel_width": width,
+                "pixel_height": height,
+                "size_bytes": stat.st_size,
+                "reason_not_accepted": "unlinked_to_current_feedback_artifact",
+            })
+    rows.sort(key=lambda item: (int(item["mtime_epoch"]), str(item["source"])), reverse=True)
+    return rows[:limit]
+
+
 def _artifact_rows(
     labels: list[str],
     artifact_roots: Iterable[Path] = (),
@@ -792,11 +840,13 @@ def build_trace(
     referenced_artifacts: list[str] | None = None,
     artifact_roots: list[Path] | None = None,
     current_feedback_phrases: list[str] | None = None,
+    clipboard_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     exact_phrases = exact_phrases or DEFAULT_EXACT_PHRASES
     referenced_artifacts = referenced_artifacts or DEFAULT_REFERENCED_ARTIFACTS
     current_feedback_phrases = current_feedback_phrases or DEFAULT_CURRENT_FEEDBACK_PHRASES
     artifact_roots = artifact_roots or []
+    clipboard_roots = clipboard_roots if clipboard_roots is not None else _default_clipboard_roots()
     artifact_manifest = _load_artifact_manifest(artifact_roots)
     artifact_rows = _artifact_rows(referenced_artifacts, artifact_roots, artifact_manifest)
     artifact_mapping = _artifact_mapping_by_path(artifact_rows)
@@ -901,6 +951,7 @@ def build_trace(
     current_feedback_goal_context_matches = _unique_goal_context_matches(
         current_feedback_goal_context_snapshots
     )
+    unlinked_clipboard_images = _unlinked_clipboard_image_candidates(clipboard_roots)
 
     return {
         "ok": True,
@@ -909,6 +960,9 @@ def build_trace(
         "searched_files": searched_files,
         "raw_image_search_roots": [str(path) for path in search_roots],
         "searched_raw_image_files": searched_raw_image_files,
+        "current_feedback_unlinked_clipboard_image_roots": [str(path) for path in clipboard_roots],
+        "current_feedback_unlinked_clipboard_image_candidate_count": len(unlinked_clipboard_images),
+        "current_feedback_unlinked_clipboard_image_candidates": unlinked_clipboard_images,
         "exact_phrases": exact_phrases,
         "exact_text_found": bool(exact_issue_matches),
         "exact_issue_text_found": bool(exact_issue_matches),

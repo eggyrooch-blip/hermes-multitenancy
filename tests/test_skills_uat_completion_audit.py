@@ -871,6 +871,41 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     assert report["evidence_ok"] is True
 
 
+def test_completion_audit_surfaces_unlinked_clipboard_images_without_accepting_screenshots(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_complete_second_problem_trace(tmp_path, artifact_kind="text")
+    trace_path = tmp_path / "second-problem-trace.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["current_feedback_unlinked_clipboard_image_candidate_count"] = 1
+    trace["current_feedback_unlinked_clipboard_image_candidates"] = [
+        {
+            "source": str(tmp_path / "codex-clipboard-current.png"),
+            "reason_not_accepted": "unlinked_to_current_feedback_artifact",
+            "pixel_width": 710,
+            "pixel_height": 470,
+        }
+    ]
+    _write_json(trace_path, trace)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    artifact_item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Verify referenced production feedback screenshots")
+    )
+    assert artifact_item["status"] == "blocked"
+    assert "current_feedback_unlinked_clipboard_image_candidate_count=1" in artifact_item["note"]
+    assert "unlinked_to_current_feedback_artifact" in artifact_item["note"]
+    assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
+    assert report["evidence_ok"] is True
+
+
 def test_completion_audit_surfaces_text_only_goal_context_feedback_without_accepting_screenshots(tmp_path: Path):
     audit_mod = _base_evidence(tmp_path)
     _write_complete_second_problem_trace(tmp_path, artifact_kind="text")
