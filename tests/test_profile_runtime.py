@@ -1,6 +1,7 @@
 """US-003 verification: ProfileRuntime monkey-patches HERMES_HOME during dispatch."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -15,6 +16,37 @@ def _force_reload_hermes_constants():
     # We don't actually need to evict — get_hermes_home() reads env on every call.
     # This helper exists to make the contract explicit in tests.
     pass
+
+
+def test_dispatch_cancellation_does_not_wait_for_runner_cleanup():
+    asyncio.run(_run_dispatch_cancellation_does_not_wait_for_runner_cleanup())
+
+
+async def _run_dispatch_cancellation_does_not_wait_for_runner_cleanup():
+    from hermes_multitenancy.runtime import ProfileRuntime
+
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_home = Path(tmp)
+        started = asyncio.Event()
+        cancel_seen = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def runner(event, home):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancel_seen.set()
+                await release_cleanup.wait()
+                raise
+
+        task = asyncio.create_task(ProfileRuntime(profile_home=profile_home, run_agent_fn=runner).dispatch(None))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(cancel_seen.wait(), timeout=1.0)
+        release_cleanup.set()
 
 
 @pytest.mark.asyncio

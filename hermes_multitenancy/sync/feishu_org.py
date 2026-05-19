@@ -30,6 +30,11 @@ DEFAULT_PROFILE_SKILL_CONFIG_NAMES = (
     "profile-skill-defaults.yaml",
     "profile-skill-defaults.yml",
 )
+SKILL_DISTRIBUTION_CONFIG_NAMES = (
+    "skill-distribution.yaml",
+    "skill-distribution.yml",
+)
+MANAGED_SKILL_MANIFEST = ".hermes-managed.json"
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # Subdirectories created inside every profile home. Order is not significant.
@@ -68,6 +73,15 @@ _SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd
 _SKILL_LINKED_DEP_DIRS = {"node_modules"}
 _SKILL_IGNORED_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
 _SHARED_SKILL_SYMLINK_PREFIXES = ("lark-",)
+_CHILD_SHAREABLE_TOKEN_POLICIES = {
+    "none",
+    "no-token",
+    "no_token",
+    "tokenless",
+    "broker",
+    "brokered",
+    "bot",
+}
 _RESERVED_PROFILE_NAMES = {
     "hermes", "default", "test", "tmp", "root", "sudo",
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -591,25 +605,252 @@ def _sync_one_profile(
     # subprocess for a freshly-synced profile would not find the token even
     # though OAuth had captured it under the shared path.
     _migrate_feishu_uat_for_employee(profile_home, shared_home, employee.open_id)
-    skills_changed = _sync_default_profile_skills(profile_home, shared_home)
+    skills_changed = _sync_default_profile_skills(profile_home, shared_home, employee)
 
     if not existed:
         return "created"
     return "updated" if soul_changed or config_changed or skills_changed else "kept"
 
 
-def _sync_default_profile_skills(profile_home: Path, shared_home: Path) -> bool:
+def _sync_default_profile_skills(
+    profile_home: Path,
+    shared_home: Path,
+    employee: Employee | None = None,
+    upstream_profile_home: Path | None = None,
+) -> bool:
+    child_only = upstream_profile_home is not None and employee is None
+    if employee is None:
+        employee = Employee(
+            open_id="",
+            user_id=profile_home.name,
+            agent_id=profile_home.name,
+            profile_name=profile_home.name,
+            name=profile_home.name,
+            dept_id="",
+            dept_name="",
+            leader_user_id=None,
+        )
     changed = False
-    for rel_path in _default_profile_skill_paths(shared_home):
-        src = shared_home / "skills" / rel_path
+    desired: dict[str, dict[str, Any]] = {}
+    specs_by_path: dict[str, dict[str, Any]] = {}
+    for spec in _child_profile_skill_specs_from_upstream(
+        upstream_profile_home, shared_home=shared_home
+    ):
+        specs_by_path[str(spec["path"])] = spec
+    if not child_only:
+        for spec in _default_profile_skill_specs(shared_home, employee):
+            # Direct profile audience always wins over child inheritance for the
+            # same visible skill path.
+            specs_by_path[str(spec["path"])] = spec
+
+    for spec in sorted(specs_by_path.values(), key=lambda item: str(item["path"])):
+        rel_path = spec["path"]
+        install_mode = spec["install_mode"]
+        src = spec.get("source_path") or (shared_home / "skills" / rel_path)
         if not src.is_dir():
             continue
         dst = profile_home / "skills" / rel_path
-        if _should_symlink_shared_skill(rel_path):
-            changed = _link_shared_skill_tree(src, dst) or changed
-            continue
-        changed = _copy_skill_tree(src, dst) or changed
+        actual_install_mode = install_mode
+        secret_guard = None
+        if install_mode == "symlink":
+            if _skill_tree_has_secret_files(src):
+                actual_install_mode = "copy"
+                secret_guard = "copy_filtered"
+                changed = _copy_skill_tree(src, dst) or changed
+            else:
+                changed = _link_shared_skill_tree(src, dst) or changed
+        else:
+            changed = _copy_skill_tree(src, dst) or changed
+        desired[str(rel_path)] = {
+            "source": str(src),
+            "install_mode": actual_install_mode,
+        }
+        if actual_install_mode != install_mode:
+            desired[str(rel_path)]["requested_install_mode"] = install_mode
+        if secret_guard is not None:
+            desired[str(rel_path)]["secret_guard"] = secret_guard
+        for key in (
+            "version",
+            "token_policy",
+            "requires_token",
+            "share_with_children",
+            "inherited_from",
+        ):
+            if spec.get(key) is not None:
+                desired[str(rel_path)][key] = spec[key]
+    changed = _prune_removed_managed_skills(profile_home, desired) or changed
+    changed = _write_managed_skill_manifest(profile_home, desired) or changed
     return changed
+
+
+def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[dict[str, Any]]:
+    distribution = _skill_distribution_config_path(shared_home)
+    if distribution is not None:
+        raw = yaml.safe_load(distribution.read_text(encoding="utf-8")) or {}
+        items = raw.get("skills") or []
+        if not isinstance(items, list):
+            raise ValueError("skill distribution config must contain skills: []")
+        specs: list[dict[str, Any]] = []
+        for item in items:
+            spec = _coerce_skill_distribution_entry(item, employee, shared_home=shared_home)
+            if spec is not None:
+                specs.append(spec)
+        return sorted(specs, key=lambda item: str(item["path"]))
+
+    return [
+        {
+            "path": rel_path,
+            "install_mode": "symlink" if _should_symlink_shared_skill(rel_path) else "copy",
+            "share_with_children": False,
+        }
+        for rel_path in _default_profile_skill_paths(shared_home)
+    ]
+
+
+def _child_profile_skill_specs_from_upstream(
+    upstream_profile_home: Path | None,
+    *,
+    shared_home: Path,
+) -> list[dict[str, Any]]:
+    if upstream_profile_home is None:
+        return []
+    upstream_manifest = _read_managed_skill_manifest(upstream_profile_home)
+    specs: list[dict[str, Any]] = []
+    for rel_raw, metadata in upstream_manifest.items():
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("share_with_children") is not True:
+            continue
+        rel_path = _safe_skill_relative_path(rel_raw)
+        if rel_path is None:
+            continue
+        install_mode = str(metadata.get("install_mode") or "symlink").strip().lower()
+        if install_mode not in {"symlink", "copy"}:
+            continue
+        source_path = _safe_skill_source_path(metadata.get("source"), shared_home=shared_home)
+        spec: dict[str, Any] = {
+            "path": rel_path,
+            "install_mode": install_mode,
+            "inherited_from": upstream_profile_home.name,
+            "share_with_children": True,
+        }
+        if source_path is not None:
+            spec["source_path"] = source_path
+        for key in ("version", "token_policy", "requires_token"):
+            if metadata.get(key) is not None:
+                spec[key] = metadata[key]
+        specs.append(spec)
+    return specs
+
+
+def _skill_distribution_config_path(shared_home: Path) -> Optional[Path]:
+    return next((shared_home / name for name in SKILL_DISTRIBUTION_CONFIG_NAMES if (shared_home / name).exists()), None)
+
+
+def _coerce_skill_distribution_entry(
+    item: Any,
+    employee: Employee,
+    *,
+    shared_home: Path,
+) -> Optional[dict[str, Any]]:
+    if isinstance(item, str):
+        rel_path = _safe_skill_relative_path(item)
+        install_mode = "symlink"
+        audience: Any = "all"
+        source = None
+        version = None
+        token_policy = "unspecified"
+        requires_token = None
+        share_with_children = False
+    elif isinstance(item, dict):
+        rel_path = _safe_skill_relative_path(item.get("path") or item.get("skill"))
+        install_mode = str(item.get("install_mode") or "symlink").strip().lower()
+        audience = item.get("audience", "all")
+        source = item.get("source") or item.get("src")
+        version = item.get("version")
+        requires_token = item.get("requires_token")
+        token_policy = str(
+            item.get("token_policy")
+            or ("none" if requires_token is False else "unspecified")
+        ).strip().lower()
+        share_with_children = item.get("share_with_children")
+        if share_with_children is None:
+            share_with_children = _skill_is_child_shareable(token_policy, requires_token)
+        else:
+            share_with_children = bool(share_with_children)
+    else:
+        return None
+    if rel_path is None:
+        return None
+    if install_mode not in {"symlink", "copy"}:
+        raise ValueError(f"unsupported skill install_mode={install_mode!r}")
+    if not _skill_audience_matches(audience, employee):
+        return None
+    spec: dict[str, Any] = {
+        "path": rel_path,
+        "install_mode": install_mode,
+        "share_with_children": bool(share_with_children),
+    }
+    source_path = _safe_skill_source_path(source, shared_home=shared_home) if source else None
+    if source_path is not None:
+        spec["source_path"] = source_path
+    if version is not None:
+        spec["version"] = str(version)
+    if token_policy != "unspecified":
+        spec["token_policy"] = token_policy
+    if requires_token is not None:
+        spec["requires_token"] = bool(requires_token)
+    return spec
+
+
+def _skill_is_child_shareable(token_policy: str, requires_token: Any) -> bool:
+    if requires_token is False:
+        return True
+    return token_policy in _CHILD_SHAREABLE_TOKEN_POLICIES
+
+
+def _safe_skill_source_path(value: Any, *, shared_home: Path) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if any(part in ("", ".", "..") or part.startswith(".") for part in path.parts):
+        return None
+    return shared_home / path
+
+
+def _skill_audience_matches(audience: Any, employee: Employee) -> bool:
+    if audience is None:
+        return True
+    if isinstance(audience, str):
+        return audience.strip().lower() in {"all", "*", "everyone", "__all__"}
+    if isinstance(audience, list):
+        return employee.profile_name in {str(item).strip() for item in audience}
+    if not isinstance(audience, dict):
+        return False
+
+    profiles = _as_string_set(audience.get("profiles") or audience.get("profile"))
+    if profiles and employee.profile_name in profiles:
+        return True
+    users = _as_string_set(audience.get("users") or audience.get("user_ids") or audience.get("user_id"))
+    if users and employee.user_id and employee.user_id in users:
+        return True
+    departments = _as_string_set(audience.get("departments") or audience.get("department_ids") or audience.get("dept_ids"))
+    if departments and (employee.dept_id in departments or employee.dept_name in departments):
+        return True
+    return False
+
+
+def _as_string_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return set()
+    return {str(item).strip() for item in value if str(item).strip()}
 
 
 def _default_profile_skill_paths(shared_home: Path) -> list[Path]:
@@ -640,6 +881,9 @@ def _safe_skill_relative_path(value: Any) -> Optional[Path]:
 
 def _copy_skill_tree(src: Path, dst: Path) -> bool:
     changed = False
+    if dst.is_symlink() or (dst.exists() and not dst.is_dir()):
+        dst.unlink()
+        changed = True
     for root, dirs, files in os.walk(src):
         root_path = Path(root)
         root_rel = root_path.relative_to(src)
@@ -688,6 +932,25 @@ def _copy_skill_tree(src: Path, dst: Path) -> bool:
     return changed
 
 
+def _skill_tree_has_secret_files(src: Path) -> bool:
+    for root, dirs, files in os.walk(src):
+        root_path = Path(root)
+        keep_dirs: list[str] = []
+        for dirname in dirs:
+            item = root_path / dirname
+            if item.is_symlink() or dirname in _SKILL_IGNORED_DIRS:
+                continue
+            keep_dirs.append(dirname)
+        dirs[:] = keep_dirs
+        for filename in files:
+            item = root_path / filename
+            if item.is_symlink():
+                continue
+            if _is_secret_skill_file(item.relative_to(src)):
+                return True
+    return False
+
+
 def _should_symlink_shared_skill(rel_path: Path) -> bool:
     return len(rel_path.parts) == 1 and rel_path.name.startswith(_SHARED_SKILL_SYMLINK_PREFIXES)
 
@@ -699,6 +962,49 @@ def _link_shared_skill_tree(src: Path, dst: Path) -> bool:
         shutil.rmtree(dst) if dst.is_dir() and not dst.is_symlink() else dst.unlink()
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.symlink_to(src, target_is_directory=True)
+    return True
+
+
+def _prune_removed_managed_skills(profile_home: Path, desired: dict[str, dict[str, Any]]) -> bool:
+    changed = False
+    previous = _read_managed_skill_manifest(profile_home)
+    for rel_raw in sorted(set(previous) - set(desired)):
+        rel_path = _safe_skill_relative_path(rel_raw)
+        if rel_path is None:
+            continue
+        target = profile_home / "skills" / rel_path
+        if target.exists() or target.is_symlink():
+            shutil.rmtree(target) if target.is_dir() and not target.is_symlink() else target.unlink()
+            changed = True
+    return changed
+
+
+def _read_managed_skill_manifest(profile_home: Path) -> dict[str, Any]:
+    path = profile_home / "skills" / MANAGED_SKILL_MANIFEST
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    skills = raw.get("skills") if isinstance(raw, dict) else None
+    return skills if isinstance(skills, dict) else {}
+
+
+def _write_managed_skill_manifest(profile_home: Path, desired: dict[str, dict[str, Any]]) -> bool:
+    path = profile_home / "skills" / MANAGED_SKILL_MANIFEST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(
+        {
+            "version": 1,
+            "skills": desired,
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    before = path.read_text(encoding="utf-8") if path.exists() else None
+    if before == content:
+        return False
+    path.write_text(content, encoding="utf-8")
     return True
 
 

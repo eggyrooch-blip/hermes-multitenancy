@@ -32,6 +32,8 @@ def test_upsert_group_creates_row(table):
     assert row.chat_id == "oc_abc"
     assert row.owner_open_id == "ou_inviter"
     assert row.display_label == "owner-IT组"
+    assert row.agent_id == "group:oc_abc"
+    assert row.provenance == "group"
     assert row.active is True
     assert row.version == 1
 
@@ -76,6 +78,24 @@ def test_two_groups_same_owner_get_distinct_rows(table):
     assert table.count_active(kind="group") == 2
     assert table.lookup_by_chat_id("oc_one").display_label == "owner-IT组"
     assert table.lookup_by_chat_id("oc_two").display_label == "owner-财务组"
+
+
+def test_upsert_group_derives_upstream_profile_from_owner_sync_root(table):
+    table.upsert(
+        user_id="alice",
+        profile_name="feishu_alice",
+        open_id="ou_alice",
+        provenance="sync",
+    )
+    table.upsert_group(
+        chat_id="oc_sales",
+        profile_name="feishu_group_sales",
+        owner_open_id="ou_alice",
+    )
+
+    row = table.lookup_by_chat_id("oc_sales")
+    assert row is not None
+    assert row.upstream_profile == "feishu_alice"
 
 
 def test_chat_id_uniqueness_among_active_groups(table):

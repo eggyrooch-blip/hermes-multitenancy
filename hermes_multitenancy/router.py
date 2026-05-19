@@ -36,8 +36,12 @@ except Exception:  # pragma: no cover - allows plugin unit tests without gateway
     GatewayStreamConsumer = None  # type: ignore
     StreamConsumerConfig = None  # type: ignore
 
-# Per-user in-flight dispatch tasks — used by /stop to cancel the right task.
-_user_inflight_tasks: dict[str, asyncio.Task] = {}
+# Per-context in-flight dispatch tasks — used by /stop and replacement turns to
+# cancel only the matching profile/chat task while preserving enough history to
+# resume.
+_user_inflight_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
+_user_inflight_history_keys: dict[tuple[str, str, str], tuple[str, str]] = {}
+_suppress_interruption_marker_tasks: set[asyncio.Task] = set()
 _synthetic_session_guards: dict[str, Any] = {}
 
 # Group-chat profile state. Populated by the bot_added hook (Layer 4, runs
@@ -110,6 +114,18 @@ def _history_key(profile_name: str, sender: str, sender_alt: Optional[str]) -> t
     return (profile_name, _tenant_user_key(sender, sender_alt))
 
 
+def _inflight_key(
+    profile_name: Optional[str],
+    sender: str,
+    sender_alt: Optional[str],
+    chat_id: str,
+) -> tuple[str, str, str]:
+    """Return the profile/chat/user scoped key for replace, /stop, and /status."""
+    profile_key = str(profile_name or "").strip() or "_unrouted"
+    chat_key = str(chat_id or "").strip() or "unknown"
+    return (profile_key, chat_key, _tenant_user_key(sender, sender_alt))
+
+
 def _tenant_user_key(sender: str, sender_alt: Optional[str]) -> str:
     """Return the canonical per-user key for memory/session scoping."""
     sender_key = str(sender or "").strip()
@@ -167,23 +183,65 @@ def _load_history(key: tuple[str, str]) -> list[dict]:
     return _sanitize_history_messages(list(_session_history.get(key, [])))
 
 
-def _persist_turn(key: tuple[str, str], user_msg: dict, assistant_text: str) -> None:
-    """Append a (user, assistant) turn to both in-memory cache and SessionStore."""
-    assistant_text = _strip_wrong_lark_cli_bot_identity_note(assistant_text)
-    new_history = _session_history.get(key, []) + [
-        user_msg,
-        {"role": "assistant", "content": assistant_text},
-    ]
+def _persist_history_message(key: tuple[str, str], message: dict) -> None:
+    """Append one user/assistant message to cache and SessionStore."""
+    role = str(message.get("role") or "").strip()
+    content = str(message.get("content") or "")
+    if role not in {"user", "assistant"} or not content:
+        return
+    if role == "assistant":
+        content = _strip_wrong_lark_cli_bot_identity_note(content)
+    new_history = _session_history.get(key, []) + [{"role": role, "content": content}]
     _session_history[key] = _trim_history(new_history)
     store = _get_session_store()
     if store is None:
         return
     try:
-        # _build_user_message always sets content as a str — no cast needed.
-        store.append(key[0], key[1], user_msg["role"], user_msg["content"])
-        store.append(key[0], key[1], "assistant", assistant_text)
+        store.append(key[0], key[1], role, content)
     except Exception as exc:
-        logger.debug("multitenancy: SessionStore.append failed (%s)", exc)
+        logger.debug("multitenancy: SessionStore.append(%s) failed (%s)", role, exc)
+
+
+def _persist_turn(key: tuple[str, str], user_msg: dict, assistant_text: str) -> None:
+    """Append a (user, assistant) turn to both in-memory cache and SessionStore."""
+    _persist_history_message(key, user_msg)
+    _persist_history_message(key, {"role": "assistant", "content": assistant_text})
+
+
+def _persist_user_message(key: tuple[str, str], user_msg: dict) -> None:
+    """Persist the user request before execution so interruption can resume."""
+    _persist_history_message(key, user_msg)
+
+
+def _persist_assistant_message(key: tuple[str, str], assistant_text: str) -> None:
+    """Persist an assistant response or interruption marker."""
+    _persist_history_message(key, {"role": "assistant", "content": assistant_text})
+
+
+_INTERRUPTED_TASK_MESSAGE = (
+    "上一个任务在完成前被中断或取消；如果用户要求继续，请根据上一条用户请求继续推进，不要丢失上下文。"
+)
+
+
+def _persist_interruption_marker(key: tuple[str, str]) -> None:
+    """Persist the canonical interruption marker, avoiding duplicate adjacent markers."""
+    history = _session_history.get(key, [])
+    if history and history[-1].get("role") == "assistant" and history[-1].get("content") == _INTERRUPTED_TASK_MESSAGE:
+        return
+    _persist_assistant_message(key, _INTERRUPTED_TASK_MESSAGE)
+
+
+def _cancel_inflight_task(key: tuple[str, str, str], *, preserve_resume_marker: bool) -> Optional[asyncio.Task]:
+    """Cancel one active dispatch and optionally write a resumable marker first."""
+    task = _user_inflight_tasks.pop(key, None)
+    hist_key = _user_inflight_history_keys.pop(key, None)
+    if task is None or task.done():
+        return task
+    if preserve_resume_marker and hist_key is not None:
+        _persist_interruption_marker(hist_key)
+    _suppress_interruption_marker_tasks.add(task)
+    task.cancel()
+    return task
 
 
 def _clear_history(key: tuple[str, str]) -> bool:
@@ -1295,14 +1353,34 @@ async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
                 user_prompt="Describe this image in thorough detail.",
             )
             result = _json.loads(result_json) if isinstance(result_json, str) else result_json
-            if result.get("success"):
+            if isinstance(result, dict) and result.get("success"):
                 descriptions.append(f"[Image: {result.get('analysis', '')}]")
+            else:
+                error = ""
+                if isinstance(result, dict):
+                    error = str(result.get("error") or result.get("analysis") or "").strip()
+                descriptions.append(_image_analysis_unavailable_note(path, error))
         except Exception as exc:
             logger.debug("multitenancy: local vision fallback error on %s: %s", path, exc)
+            descriptions.append(_image_analysis_unavailable_note(path, str(exc)))
     if not descriptions:
         return None
     base = getattr(event, "text", "") or ""
     return "\n".join(descriptions) + ("\n" + base if base else "")
+
+
+def _image_analysis_unavailable_note(path: Any, error: str = "") -> str:
+    """Return recoverable context when an image is present but vision fails."""
+    reason = re.sub(r"\s+", " ", str(error or "")).strip()
+    if len(reason) > 300:
+        reason = reason[:297] + "..."
+    suffix = f" Reason: {reason}" if reason else ""
+    return (
+        "[Image analysis unavailable: the image is attached at "
+        f"{path}, but automatic vision analysis failed.{suffix} "
+        "If the user asks about the screenshot, explain that a vision-capable "
+        "model or permission is required, or ask the user to describe the image.]"
+    )
 
 
 # -- Hook entry point --------------------------------------------------------
@@ -1671,13 +1749,18 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     logger.debug("multitenancy: duplicate processing_complete failed: %s", exc)
             return
 
-        # Register self in the user's in-flight slot (replace previous)
+        # Register self in the context-scoped in-flight slot (replace previous)
         current = asyncio.current_task()
-        prev = _user_inflight_tasks.get(sender)
+        inflight_key = _inflight_key(profile_name, sender, sender_alt, chat_id)
+        prev = _user_inflight_tasks.get(inflight_key)
         if prev is not None and not prev.done() and prev is not current:
+            prev_hist_key = _user_inflight_history_keys.get(inflight_key)
+            if prev_hist_key is not None:
+                _persist_interruption_marker(prev_hist_key)
+            _suppress_interruption_marker_tasks.add(prev)
             prev.cancel()
         if current is not None:
-            _user_inflight_tasks[sender] = current
+            _user_inflight_tasks[inflight_key] = current
 
         outcome_failed = False
         if feishu_full:
@@ -1693,6 +1776,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         prior = _load_history(hist_key)
         user_msg = _build_user_message(event, text_override=enriched_text)
         conversation = prior + [user_msg]
+        _persist_user_message(hist_key, user_msg)
+        if current is not None and _user_inflight_tasks.get(inflight_key) is current:
+            _user_inflight_history_keys[inflight_key] = hist_key
         agent_event = _event_with_text(event, user_msg["content"])
 
         try:
@@ -1729,9 +1815,13 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
 
             # Record turn into history + persist to SessionStore.
             if response_text and isinstance(response_text, str):
-                _persist_turn(hist_key, user_msg, response_text)
+                _persist_assistant_message(hist_key, response_text)
 
             _touch_route(sender, sender_alt)
+        except asyncio.CancelledError:
+            if current not in _suppress_interruption_marker_tasks:
+                _persist_interruption_marker(hist_key)
+            raise
         except Exception:
             outcome_failed = True
             raise
@@ -1746,8 +1836,11 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                         await adapter.on_processing_complete(event, out)
                 except Exception as exc:
                     logger.debug("multitenancy: on_processing_complete failed: %s", exc)
-            if _user_inflight_tasks.get(sender) is current:
-                _user_inflight_tasks.pop(sender, None)
+            if _user_inflight_tasks.get(inflight_key) is current:
+                _user_inflight_tasks.pop(inflight_key, None)
+                _user_inflight_history_keys.pop(inflight_key, None)
+            if current is not None:
+                _suppress_interruption_marker_tasks.discard(current)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1900,14 +1993,16 @@ async def _handle_command(
     if approval_reply is not None:
         reply = approval_reply
     elif cmd == "stop":
-        task = _user_inflight_tasks.pop(sender, None)
+        task = _cancel_inflight_task(
+            _inflight_key(profile_name, sender, sender_alt, chat_id),
+            preserve_resume_marker=True,
+        )
         if task is not None and not task.done():
-            task.cancel()
             reply = "已停止当前任务"
         else:
             reply = "没有进行中的任务"
     elif cmd == "status":
-        task = _user_inflight_tasks.get(sender)
+        task = _user_inflight_tasks.get(_inflight_key(profile_name, sender, sender_alt, chat_id))
         running = task is not None and not task.done()
         # Surface session memory size + profile so the user knows their context.
         if profile_name:
@@ -1921,6 +2016,10 @@ async def _handle_command(
             f"会话历史: {hist_len} 条消息"
         )
     elif cmd in ("new", "reset"):
+        _cancel_inflight_task(
+            _inflight_key(profile_name, sender, sender_alt, chat_id),
+            preserve_resume_marker=False,
+        )
         # Clear this user's per-profile history (cache + persistent SessionStore).
         if profile_name:
             key = _history_key(profile_name, sender, sender_alt)
@@ -3171,7 +3270,12 @@ def _ensure_group_profile(
     # Group profiles get an empty feishu_uat/ directory but no per-user JSON;
     # the marker file below tells UAT helpers to refuse to load user tokens.
     (profile_home / "feishu_uat").mkdir(parents=True, exist_ok=True, mode=0o700)
-    _sync_default_skills_for_profile(profile_home, shared_home)
+    upstream_profile_home = _upstream_profile_home_for_owner(owner_open_id, shared_home)
+    _sync_default_skills_for_profile(
+        profile_home,
+        shared_home,
+        upstream_profile_home=upstream_profile_home,
+    )
 
     marker_path = profile_home / "group_profile.json"
     if not marker_path.exists():
@@ -3343,13 +3447,41 @@ def _ensure_auto_profile(
     _sync_default_skills_for_profile(profile_home, shared_home)
 
 
-def _sync_default_skills_for_profile(profile_home: Path, shared_home: Path) -> None:
+def _sync_default_skills_for_profile(
+    profile_home: Path,
+    shared_home: Path,
+    *,
+    upstream_profile_home: Path | None = None,
+) -> None:
     # Use a relative import so the call works both when the package is loaded
     # as ``hermes_multitenancy`` (pytest/direct install) and when the Hermes
     # plugin loader exposes it as ``hermes_plugins.multitenancy.hermes_multitenancy``.
     from .sync.feishu_org import _sync_default_profile_skills
 
-    _sync_default_profile_skills(profile_home, shared_home)
+    _sync_default_profile_skills(
+        profile_home,
+        shared_home,
+        upstream_profile_home=upstream_profile_home,
+    )
+
+
+def _upstream_profile_home_for_owner(owner_open_id: str, shared_home: Path) -> Path | None:
+    table = _get_routing_table()
+    if table is None or not owner_open_id:
+        return None
+    try:
+        owner = table.resolve_owner_root(owner_open_id) or table.lookup_by_open_id(owner_open_id)
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: owner profile lookup failed owner=%s: %s",
+            owner_open_id,
+            exc,
+        )
+        return None
+    if owner is None or not owner.profile_name:
+        return None
+    candidate = shared_home / "profiles" / owner.profile_name
+    return candidate if candidate.exists() else None
 
 
 def _shared_home_for_profile(profile_home: Path) -> Path:
@@ -3944,6 +4076,18 @@ async def _stream_into_feishu_shared_consumer(
         ),
         metadata=None,
     )
+    required_consumer_methods = (
+        "ensure_streaming_card_started",
+        "update_streaming_card_status",
+        "update_streaming_card_reasoning",
+        "update_streaming_card_tool_started",
+        "update_streaming_card_tool_completed",
+    )
+    if not all(hasattr(consumer, name) for name in required_consumer_methods):
+        logger.debug(
+            "multitenancy: GatewayStreamConsumer lacks shared-card methods; falling back"
+        )
+        return None
     consumer_task: Optional[asyncio.Task] = None
     idle_heartbeat_task: Optional[asyncio.Task] = None
     terminal_update_sent = False
@@ -3998,10 +4142,12 @@ async def _stream_into_feishu_shared_consumer(
                 logger.debug("multitenancy: shared card start failed while cancelling: %s", exc)
                 started = False
             if started:
-                try:
-                    await consumer.abort_streaming_card(_STREAM_ABORT_FALLBACK)
-                except Exception as exc:
-                    logger.debug("multitenancy: shared card abort-after-start failed: %s", exc)
+                aborter = getattr(consumer, "abort_streaming_card", None)
+                if aborter is not None:
+                    try:
+                        await aborter(_STREAM_ABORT_FALLBACK)
+                    except Exception as exc:
+                        logger.debug("multitenancy: shared card abort-after-start failed: %s", exc)
             raise
 
         if not started:
@@ -4024,10 +4170,12 @@ async def _stream_into_feishu_shared_consumer(
                 await prime_task
             except Exception as exc:
                 logger.debug("multitenancy: shared card prime failed while cancelling: %s", exc)
-            try:
-                await consumer.abort_streaming_card(_STREAM_ABORT_FALLBACK)
-            except Exception as exc:
-                logger.debug("multitenancy: shared card abort-after-prime failed: %s", exc)
+            aborter = getattr(consumer, "abort_streaming_card", None)
+            if aborter is not None:
+                try:
+                    await aborter(_STREAM_ABORT_FALLBACK)
+                except Exception as exc:
+                    logger.debug("multitenancy: shared card abort-after-prime failed: %s", exc)
             raise
 
         idle_heartbeat_task = asyncio.create_task(_idle_card_heartbeat())
@@ -4137,15 +4285,17 @@ async def _stream_into_feishu_shared_consumer(
     except asyncio.CancelledError:
         await _stop_idle_card_heartbeat()
         if not terminal_update_sent:
-            try:
-                await _run_terminal_stream_update(
-                    consumer.abort_streaming_card(_abort_content()),
-                    label="shared stream abort update",
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as abort_exc:
-                logger.debug("multitenancy: shared stream abort update failed: %s", abort_exc)
+            aborter = getattr(consumer, "abort_streaming_card", None)
+            if aborter is not None:
+                try:
+                    await _run_terminal_stream_update(
+                        aborter(_abort_content()),
+                        label="shared stream abort update",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as abort_exc:
+                    logger.debug("multitenancy: shared stream abort update failed: %s", abort_exc)
         if consumer_task is not None:
             consumer.finish()
             try:

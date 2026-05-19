@@ -875,6 +875,45 @@ def test_run_with_aiagent_sets_gateway_session_context(monkeypatch, tmp_path: Pa
     }
 
 
+def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_path: Path):
+    """Official-clean Hermes no longer ships tools.feishu_oapi_client."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    tools_mod = types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.delitem(sys.modules, "tools.feishu_oapi_client", raising=False)
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["toolsets"] = kwargs.get("toolsets")
+
+        def run_conversation(self, user_message, task_id, conversation_history=None):
+            seen["user_message"] = user_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            seen["cleanup"] = True
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+
+    event = _event()
+    event.source.user_id = "ou_clean_upstream_sender"
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen["user_message"] == "hello"
+    assert seen["cleanup"] is True
+
+
 def test_run_with_aiagent_passes_router_history_without_current_user(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 

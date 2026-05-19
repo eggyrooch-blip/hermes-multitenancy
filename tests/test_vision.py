@@ -7,6 +7,7 @@ runs offline and reproducibly.
 from __future__ import annotations
 
 import json
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -88,6 +89,31 @@ async def test_local_fallback_image_only(monkeypatch):
     assert result is not None
     assert "A cat" in result
     assert result.endswith("?")
+
+
+def test_local_fallback_surfaces_vision_provider_failure(monkeypatch):
+    """Screenshot failures must stay visible and recoverable, not disappear."""
+    _install_fake_vision_module(
+        monkeypatch,
+        {
+            "success": False,
+            "error": "Error code: 429 - subscription does not include vision",
+        },
+    )
+    from hermes_multitenancy.router import _local_enrich_with_vision_only
+
+    event = _make_event(
+        text="我该如何在这个web页面中给你发送截图呢?",
+        media_urls=["/Users/kite/.hermes/profiles/coder/images/clip.png"],
+        media_types=["image/png"],
+    )
+    result = asyncio.run(_local_enrich_with_vision_only(event))
+
+    assert result is not None
+    assert "Image analysis unavailable" in result
+    assert "clip.png" in result
+    assert "vision-capable model or permission is required" in result
+    assert result.endswith("我该如何在这个web页面中给你发送截图呢?")
 
 
 @pytest.mark.asyncio

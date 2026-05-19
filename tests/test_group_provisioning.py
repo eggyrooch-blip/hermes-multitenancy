@@ -307,6 +307,74 @@ def test_ensure_group_profile_inherits_default_skills(tmp_path):
     assert lark_target.resolve() == lark_source.resolve()
 
 
+def test_group_profile_inherits_owner_child_shareable_skills_not_tokens(tmp_path):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _ensure_group_profile
+    from hermes_multitenancy.sync.feishu_org import Employee, _sync_default_profile_skills
+
+    shared_home = tmp_path
+    shared_skill = shared_home / "skills" / "internal" / "readonly-report"
+    private_skill = shared_home / "skills" / "internal" / "personal-oauth"
+    shared_skill.mkdir(parents=True)
+    private_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text("# Readonly Report\n", encoding="utf-8")
+    (private_skill / "SKILL.md").write_text("# Personal OAuth\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: internal/readonly-report
+    audience:
+      departments: [od_sales]
+    requires_token: false
+  - path: internal/personal-oauth
+    audience:
+      departments: [od_sales]
+    token_policy: user_oauth
+""",
+        encoding="utf-8",
+    )
+    owner_profile = shared_home / "profiles" / "alice"
+    owner = Employee(
+        open_id="ou_alice",
+        user_id="alice",
+        agent_id="alice",
+        profile_name="alice",
+        name="Alice",
+        dept_id="od_sales",
+        dept_name="Sales",
+        leader_user_id=None,
+    )
+    _sync_default_profile_skills(owner_profile, shared_home, owner)
+    (owner_profile / "tokens").mkdir(parents=True)
+    (owner_profile / "tokens" / "personal-oauth.json").write_text("secret", encoding="utf-8")
+
+    router_mod.override_routing_table(":memory:")
+    try:
+        table = router_mod._get_routing_table()
+        assert table is not None
+        table.upsert(
+            user_id="alice",
+            profile_name="alice",
+            open_id="ou_alice",
+            provenance="sync",
+        )
+        group_profile = shared_home / "profiles" / "feishu_group_sales"
+        _ensure_group_profile(
+            profile_name="feishu_group_sales",
+            profile_home=group_profile,
+            chat_id="oc_sales",
+            owner_open_id="ou_alice",
+            display_label="Alice-Sales",
+        )
+    finally:
+        router_mod.override_routing_table(None)
+
+    assert (group_profile / "skills" / "internal" / "readonly-report").is_symlink()
+    assert not (group_profile / "skills" / "internal" / "personal-oauth").exists()
+    assert list((group_profile / "tokens").glob("*")) == []
+    assert list((group_profile / "feishu_uat").glob("*")) == []
+
+
 # -- resolve_or_auto_provision_group_route ----------------------------------
 
 

@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TRACE_PATH = ROOT / "scripts" / "skills_second_problem_trace.py"
+
+
+def _load_trace_module():
+    spec = importlib.util.spec_from_file_location("skills_second_problem_trace", TRACE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_second_problem_trace_records_absent_exact_text_and_candidate_classes(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "hermes.md").write_text("上下文割裂 导致第二轮问题丢历史\n重复 dispatch 产生两张 CardKit\n", encoding="utf-8")
+    (docs / "openclaw.md").write_text("慢模型等待时用户感觉中断，需要继续追问\n", encoding="utf-8")
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["ok"] is True
+    assert report["searched_files"] == 2
+    assert report["exact_text_found"] is False
+    classes = {item["name"]: item for item in report["candidate_classes"]}
+    assert classes["context_fragmentation"]["match_count"] == 1
+    assert classes["duplicate_dispatch_card"]["match_count"] == 1
+    assert classes["slow_model_idle_wait"]["match_count"] == 1
+
+
+def test_second_problem_trace_marks_exact_text_found(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "feedback.md").write_text("然后第二个问题 是卡片重复出现\n", encoding="utf-8")
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["ok"] is True
+    assert report["exact_text_found"] is True
+    assert report["exact_match_count"] == 1
+    assert report["exact_matches"][0]["path"].endswith("feedback.md")
+
+
+def test_second_problem_trace_distinguishes_placeholder_phrase_without_issue_text(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "placeholder.md").write_text("然后第二个问题\n\n\n这个是用户在生产环境中的反馈\n", encoding="utf-8")
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["ok"] is True
+    assert report["exact_phrase_match_count"] == 1
+    assert report["exact_issue_text_found"] is False
+    assert report["exact_text_found"] is False
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
+def test_second_problem_trace_records_referenced_feedback_artifacts_as_unavailable(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "feedback.md").write_text("先报个问题，会中断，需要继续\n", encoding="utf-8")
+
+    report = trace_mod.build_trace([docs], referenced_artifacts=["Image #1", "Image #2"])
+
+    assert report["ok"] is True
+    assert report["referenced_artifacts"] == [
+        {"label": "Image #1", "content_available": False, "evidence_path": ""},
+        {"label": "Image #2", "content_available": False, "evidence_path": ""},
+    ]
+
+
+def test_second_problem_trace_marks_referenced_artifacts_available_from_artifact_roots(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    artifacts = tmp_path / "artifacts"
+    docs.mkdir()
+    artifacts.mkdir()
+    (docs / "feedback.md").write_text("先报个问题，会中断，需要继续\n", encoding="utf-8")
+    image_one = artifacts / "Image #1.png"
+    image_two = artifacts / "image-2.jpg"
+    image_one.write_bytes(b"\x89PNG\r\n\x1a\n")
+    image_two.write_bytes(b"\xff\xd8\xff")
+
+    report = trace_mod.build_trace(
+        [docs],
+        referenced_artifacts=["Image #1", "Image #2"],
+        artifact_roots=[artifacts],
+    )
+
+    assert report["ok"] is True
+    assert report["referenced_artifacts"] == [
+        {
+            "label": "Image #1",
+            "content_available": True,
+            "evidence_path": str(image_one),
+            "content_kind": "image",
+            "extracted_text": "",
+            "mapped_uat_scenarios": [],
+        },
+        {
+            "label": "Image #2",
+            "content_available": True,
+            "evidence_path": str(image_two),
+            "content_kind": "image",
+            "extracted_text": "",
+            "mapped_uat_scenarios": [],
+        },
+    ]
+
+
+def test_second_problem_trace_ingests_text_feedback_artifacts_for_exact_second_problem(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    artifacts = tmp_path / "artifacts"
+    docs.mkdir()
+    artifacts.mkdir()
+    (artifacts / "production-feedback.md").write_text("然后第二个问题 是卡片重复出现\n", encoding="utf-8")
+
+    report = trace_mod.build_trace(
+        [docs],
+        exact_phrases=["然后第二个问题"],
+        artifact_roots=[artifacts],
+    )
+
+    assert report["ok"] is True
+    assert report["exact_text_found"] is True
+    assert report["exact_matches"][0]["path"].endswith("production-feedback.md")
+
+
+def test_second_problem_trace_uses_feedback_artifact_manifest_for_paths_and_uat_mapping(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    artifacts = tmp_path / "artifacts"
+    docs.mkdir()
+    artifacts.mkdir()
+    transcript = artifacts / "second-problem-transcript.txt"
+    transcript.write_text("然后第二个问题 是卡片重复出现\n", encoding="utf-8")
+    (artifacts / "feedback-artifacts.json").write_text(
+        """
+        {
+          "artifacts": [
+            {
+              "label": "Image #1",
+              "path": "second-problem-transcript.txt",
+              "content_kind": "text",
+              "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [docs],
+        exact_phrases=["然后第二个问题"],
+        referenced_artifacts=["Image #1", "Image #2"],
+        artifact_roots=[artifacts],
+    )
+
+    assert report["ok"] is True
+    assert report["referenced_artifacts"][0] == {
+        "label": "Image #1",
+        "content_available": True,
+        "evidence_path": str(transcript),
+        "content_kind": "text",
+        "extracted_text": "然后第二个问题 是卡片重复出现\n",
+        "mapped_uat_scenarios": ["offline_session_guard_replacement_no_duplicate_dispatch"],
+    }
+    assert report["referenced_artifacts"][1] == {"label": "Image #2", "content_available": False, "evidence_path": ""}
+    assert report["exact_text_found"] is True
+    assert report["exact_matches"][0]["mapped_uat_scenarios"] == [
+        "offline_session_guard_replacement_no_duplicate_dispatch"
+    ]
+
+
+def test_second_problem_trace_ignores_self_reference_exact_phrase_matches(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    repo_like = tmp_path / "repo"
+    tests = repo_like / "tests"
+    tmp_evidence = tmp_path / "evidence"
+    session_root = tmp_path / "sessions"
+    tests.mkdir(parents=True)
+    tmp_evidence.mkdir()
+    session_root.mkdir()
+    (tests / "test_skills_uat_completion_audit.py").write_text(
+        '"phrase": "然后第二个问题",\n',
+        encoding="utf-8",
+    )
+    (tmp_evidence / "second-problem-trace-with-agent-history.json").write_text(
+        '"phrase": "然后第二个问题",\n',
+        encoding="utf-8",
+    )
+    (session_root / "rollout.jsonl").write_text(
+        '{"type":"response_item","payload":{"output":"然后第二个问题 without the actual problem text. Search the repo"}}\n',
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace(
+        [repo_like, session_root],
+        exact_phrases=["然后第二个问题"],
+        artifact_roots=[tmp_evidence],
+    )
+
+    assert report["exact_text_found"] is False
+    assert report["exact_match_count"] == 0
+
+
+def test_second_problem_trace_marks_phrase_absent_separately_from_blank_body(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "feedback.md").write_text("先报个问题，执行一半突然就没了\n", encoding="utf-8")
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_phrase_match_count"] == 0
+    assert report["exact_issue_text_absent_reason"] == "exact_phrase_not_found"

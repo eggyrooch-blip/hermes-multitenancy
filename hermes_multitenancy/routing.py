@@ -472,6 +472,7 @@ class RoutingTable:
         profile_name: str,
         owner_open_id: str,
         display_label: Optional[str] = None,
+        upstream_profile: Optional[str] = None,
     ) -> str:
         """Insert or refresh a GROUP route keyed by chat_id.
 
@@ -481,6 +482,8 @@ class RoutingTable:
         ``owner_open_id`` is immutable on a resurrected row — if a row with
         the same chat_id already exists, owner_open_id is preserved.
         ``display_label`` is mutable (group renames refresh it).
+        ``upstream_profile`` records the owner's root profile when known; if
+        omitted, it is derived from the active sync-root row for owner_open_id.
         """
         if not chat_id:
             raise ValueError("chat_id is required for group routing rows")
@@ -502,9 +505,22 @@ class RoutingTable:
             INSERT INTO multitenancy_routing
                 (user_id, profile_name, open_id, union_id, active,
                  synced_at, version, created_at, updated_at,
-                 kind, chat_id, owner_open_id, display_label)
+                 kind, chat_id, owner_open_id, display_label,
+                 agent_id, provenance, upstream_profile)
             VALUES (?, ?, '', NULL, 1, ?, 1, ?, ?,
-                    'group', ?, ?, ?)
+                    'group', ?, ?, ?, ?, 'group',
+                    COALESCE(
+                        ?,
+                        (
+                            SELECT profile_name
+                            FROM multitenancy_routing
+                            WHERE open_id = ?
+                              AND active = 1
+                              AND kind = 'user'
+                              AND provenance = 'sync'
+                            LIMIT 1
+                        )
+                    ))
             ON CONFLICT(user_id) DO UPDATE SET
                 profile_name  = excluded.profile_name,
                 chat_id       = excluded.chat_id,
@@ -520,6 +536,11 @@ class RoutingTable:
                 version       = version + 1,
                 updated_at    = excluded.updated_at,
                 kind          = 'group',
+                agent_id      = COALESCE(agent_id, excluded.agent_id),
+                provenance    = 'group',
+                upstream_profile = COALESCE(
+                    upstream_profile, excluded.upstream_profile
+                ),
                 open_id       = '',
                 union_id      = NULL
             """,
@@ -532,6 +553,9 @@ class RoutingTable:
                 chat_id,
                 owner_open_id,
                 display_label,
+                synthetic_user_id,
+                upstream_profile,
+                owner_open_id,
             ),
         )
         self._conn.commit()

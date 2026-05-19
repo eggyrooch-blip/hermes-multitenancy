@@ -87,6 +87,16 @@ def resolve_profile_home(open_id: str) -> Optional[Path]:
     return _SPIKE_ROUTING.get(open_id)
 
 
+def _consume_cancelled_runner(task: asyncio.Task) -> None:
+    """Observe a detached cancelled runner so asyncio does not log it as lost."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.debug("multitenancy: detached runner finished after cancel: %s", exc)
+
+
 class ProfileRuntime:
     """Runs an agent against a specific profile home directory.
 
@@ -123,7 +133,15 @@ class ProfileRuntime:
                 os.environ[HERMES_HOME_ENV] = str(self.profile_home)
                 try:
                     self._verify_switch()
-                    return await self._run_agent_fn(event, self.profile_home)
+                    runner_task = asyncio.create_task(
+                        self._run_agent_fn(event, self.profile_home)
+                    )
+                    try:
+                        return await asyncio.shield(runner_task)
+                    except asyncio.CancelledError:
+                        runner_task.cancel()
+                        runner_task.add_done_callback(_consume_cancelled_runner)
+                        raise
                 finally:
                     if original is None:
                         os.environ.pop(HERMES_HOME_ENV, None)

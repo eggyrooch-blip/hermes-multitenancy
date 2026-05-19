@@ -118,12 +118,13 @@ def test_skill_slash_uses_routed_profile_home(monkeypatch, tmp_path):
     import sys
     from types import ModuleType
 
-    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.router import handle_async, _inflight_key, _user_inflight_history_keys, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import router as router_mod
 
     clear_spike_routes()
     _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
     router_home = tmp_path / "multitenancy_router"
     profile_home = tmp_path / "owner"
     router_home.mkdir()
@@ -192,12 +193,13 @@ def test_skill_slash_uses_routed_profile_home(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_stop_cancels_inflight_task(monkeypatch):
     """/stop must cancel the user's currently-running dispatch."""
-    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.router import handle_async, _inflight_key, _user_inflight_history_keys, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import runtime as runtime_mod
 
     clear_spike_routes()
     _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
 
     cancelled_evt = asyncio.Event()
 
@@ -214,6 +216,7 @@ async def test_stop_cancels_inflight_task(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
         add_spike_route("ou_stop", home)
+        key = _inflight_key(home.name, "ou_stop", None, "chat-cmd")
 
         sends = []
 
@@ -231,9 +234,9 @@ async def test_stop_cancels_inflight_task(monkeypatch):
         # Wait until it registers in the inflight map
         for _ in range(50):
             await asyncio.sleep(0.005)
-            if "ou_stop" in _user_inflight_tasks:
+            if key in _user_inflight_tasks:
                 break
-        assert "ou_stop" in _user_inflight_tasks
+        assert key in _user_inflight_tasks
 
         # Now send /stop — should cancel the slow task
         await handle_async(event=_build_event("/stop", user_id="ou_stop"), gateway=gateway)
@@ -245,14 +248,14 @@ async def test_stop_cancels_inflight_task(monkeypatch):
 
         # /stop reply was sent
         assert any("已停止当前任务" in s for s in sends), sends
-        assert "ou_stop" not in _user_inflight_tasks
+        assert key not in _user_inflight_tasks
 
     clear_spike_routes()
 
 
 @pytest.mark.asyncio
 async def test_stop_when_idle_replies_no_inflight():
-    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.router import handle_async, _inflight_key, _user_inflight_tasks
 
     _user_inflight_tasks.clear()
     sends = []
@@ -382,7 +385,7 @@ async def test_status_reports_idle_when_no_inflight():
 
 @pytest.mark.asyncio
 async def test_status_reports_running_when_inflight(monkeypatch):
-    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.router import handle_async, _inflight_key, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
     from hermes_multitenancy import runtime as runtime_mod
 
@@ -400,6 +403,7 @@ async def test_status_reports_running_when_inflight(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
         add_spike_route("ou_run", home)
+        key = _inflight_key(home.name, "ou_run", None, "chat-cmd")
 
         sends = []
 
@@ -415,7 +419,7 @@ async def test_status_reports_running_when_inflight(monkeypatch):
         )
         for _ in range(50):
             await asyncio.sleep(0.005)
-            if "ou_run" in _user_inflight_tasks:
+            if key in _user_inflight_tasks:
                 break
 
         await handle_async(event=_build_event("/status", user_id="ou_run"), gateway=gateway)
@@ -966,12 +970,17 @@ async def test_quick_command_exec_runs_in_profile_env_when_explicitly_enabled(mo
 @pytest.mark.asyncio
 async def test_second_message_cancels_first(monkeypatch):
     """A new dispatch from the same user should replace the prior one."""
-    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.router import handle_async, _user_inflight_history_keys, _user_inflight_tasks
     from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
     from hermes_multitenancy import runtime as runtime_mod
 
     clear_spike_routes()
     _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
 
     cancelled = asyncio.Event()
     second_done = asyncio.Event()
@@ -1021,7 +1030,377 @@ async def test_second_message_cancels_first(monkeypatch):
             await first
         await second
 
+        history = router_mod._session_history[(home.name, "ou_replace")]
+        assert history[0]["role"] == "user"
+        assert history[0]["content"] == "first"
+        assert "中断或取消" in history[1]["content"]
+        assert history[-2]["content"] == "second"
+        assert history[-1]["content"] == "second-ok"
+
     clear_spike_routes()
+    router_mod.override_session_store(None)
+
+
+def test_replacement_streaming_turn_receives_interrupted_context(monkeypatch):
+    asyncio.run(_run_replacement_streaming_turn_receives_interrupted_context(monkeypatch))
+
+
+def test_inflight_replacement_is_scoped_to_profile_and_chat(monkeypatch):
+    asyncio.run(_run_inflight_replacement_is_scoped_to_profile_and_chat(monkeypatch))
+
+
+async def _run_inflight_replacement_is_scoped_to_profile_and_chat(monkeypatch):
+    """A group turn from the same owner must not cancel their private DM turn."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_history_keys, _user_inflight_tasks
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy import router as router_mod
+
+    _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
+
+    dm_started = asyncio.Event()
+    group_started = asyncio.Event()
+    dm_cancelled = asyncio.Event()
+    release_dm = asyncio.Event()
+    release_group = asyncio.Event()
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            if profile_name == "alice":
+                dm_started.set()
+                try:
+                    await release_dm.wait()
+                except asyncio.CancelledError:
+                    dm_cancelled.set()
+                    raise
+                return "dm-ok"
+            if profile_name == "feishu_group_sales":
+                group_started.set()
+                await release_group.wait()
+                return "group-ok"
+            raise AssertionError(f"unexpected profile {profile_name}")
+
+    router_mod.override_pool(Pool())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        monkeypatch.setenv("HOME", str(root))
+        profiles = root / ".hermes" / "profiles"
+        (profiles / "alice").mkdir(parents=True)
+        (profiles / "feishu_group_sales").mkdir(parents=True)
+        db_path = root / "multitenancy.db"
+        table = RoutingTable(db_path)
+        try:
+            table.upsert(user_id="alice", profile_name="alice", open_id="ou_same_owner", provenance="sync")
+            table.upsert_group(
+                chat_id="oc_sales",
+                profile_name="feishu_group_sales",
+                owner_open_id="ou_same_owner",
+                display_label="Sales",
+                upstream_profile="alice",
+            )
+        finally:
+            table.close()
+        router_mod.override_routing_table(db_path)
+
+        sends = []
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None):
+                sends.append((c, m))
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+        dm_task = asyncio.create_task(
+            handle_async(event=_build_event("private slow", user_id="ou_same_owner", chat_id="dm-chat"), gateway=gateway)
+        )
+        await asyncio.wait_for(dm_started.wait(), timeout=1.0)
+        group_event = _build_event("group slow", user_id="ou_same_owner", chat_id="oc_sales")
+        group_event.source.chat_type = "group"
+        group_task = asyncio.create_task(handle_async(event=group_event, gateway=gateway))
+        await asyncio.wait_for(group_started.wait(), timeout=1.0)
+
+        await asyncio.sleep(0.05)
+        assert not dm_cancelled.is_set()
+
+        release_group.set()
+        release_dm.set()
+        await group_task
+        await dm_task
+        assert ("oc_sales", "group-ok") in sends
+        assert ("dm-chat", "dm-ok") in sends
+
+    router_mod.override_pool(None)
+    router_mod.override_routing_table(None)
+    router_mod.override_session_store(None)
+
+
+def test_replacement_cancel_writes_single_interruption_marker(monkeypatch):
+    asyncio.run(_run_replacement_cancel_writes_single_interruption_marker(monkeypatch))
+
+
+async def _run_replacement_cancel_writes_single_interruption_marker(monkeypatch):
+    """If the old task handles cancellation late, it must not append a second marker."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_history_keys, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import runtime as runtime_mod
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
+
+    first_started = asyncio.Event()
+    first_cancel_seen = asyncio.Event()
+    release_first_cancel = asyncio.Event()
+    second_done = asyncio.Event()
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            return await runner(event, home)
+
+    async def runner(event, home):
+        if getattr(event, "text", "") == "first":
+            first_started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                first_cancel_seen.set()
+                await release_first_cancel.wait()
+                raise
+        second_done.set()
+        return "second-ok"
+
+    router_mod.override_pool(Pool())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_late_cancel", home)
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None): pass
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+        first = asyncio.create_task(
+            handle_async(event=_build_event("first", user_id="ou_late_cancel"), gateway=gateway)
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        second = asyncio.create_task(
+            handle_async(event=_build_event("second", user_id="ou_late_cancel"), gateway=gateway)
+        )
+        await asyncio.wait_for(first_cancel_seen.wait(), timeout=1.0)
+        await asyncio.wait_for(second_done.wait(), timeout=1.0)
+        await second
+        release_first_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        history = router_mod._session_history[(home.name, "ou_late_cancel")]
+        markers = [
+            item for item in history
+            if item["role"] == "assistant" and "中断或取消" in item["content"]
+        ]
+        assert len(markers) == 1
+        assert history[-1] == {"role": "assistant", "content": "second-ok"}
+
+    clear_spike_routes()
+    router_mod.override_pool(None)
+    router_mod.override_session_store(None)
+
+
+def test_new_command_cancels_without_resume_marker(monkeypatch):
+    asyncio.run(_run_new_command_cancels_without_resume_marker(monkeypatch))
+
+
+async def _run_new_command_cancels_without_resume_marker(monkeypatch):
+    """/new is an explicit reset: cancel old work and leave no resume marker."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_history_keys, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import runtime as runtime_mod
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    sends = []
+
+    async def runner(event, home):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "never"
+
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", runner)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_new_reset", home)
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None):
+                sends.append(m)
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+        first = asyncio.create_task(
+            handle_async(event=_build_event("old work", user_id="ou_new_reset"), gateway=gateway)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await handle_async(event=_build_event("/new", user_id="ou_new_reset"), gateway=gateway)
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        assert any("会话已重置" in send for send in sends)
+        assert router_mod._session_history.get((home.name, "ou_new_reset"), []) == []
+
+    clear_spike_routes()
+    router_mod.override_session_store(None)
+
+
+async def _run_replacement_streaming_turn_receives_interrupted_context(monkeypatch):
+    """Streaming replacement must see the cancelled prompt in its current messages."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_history_keys, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
+
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    second_messages = {}
+
+    async def fake_stream(adapter, chat_id, profile_name, profile_home, event, *, messages):
+        text = getattr(event, "text", "")
+        if text == "first":
+            first_started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+        second_messages["messages"] = list(messages)
+        return "second-ok"
+
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_stream_replace", home)
+
+        class Adapter:
+            async def send(self, c, m, *, reply_to=None, metadata=None): pass
+            async def edit_message(self, *args, **kwargs): pass
+            async def on_processing_start(self, event): pass
+            async def on_processing_complete(self, event, outcome): pass
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+        first = asyncio.create_task(
+            handle_async(event=_build_event("first", user_id="ou_stream_replace"), gateway=gateway)
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        second = asyncio.create_task(
+            handle_async(event=_build_event("second", user_id="ou_stream_replace"), gateway=gateway)
+        )
+        await asyncio.wait_for(first_cancelled.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+
+        messages = second_messages["messages"]
+        assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+        assert messages[0]["content"] == "first"
+        assert "中断或取消" in messages[1]["content"]
+        assert messages[2]["content"] == "second"
+
+    clear_spike_routes()
+    router_mod.override_session_store(None)
+
+
+def test_interrupted_request_is_available_to_continue_turn(monkeypatch):
+    asyncio.run(_run_interrupted_request_is_available_to_continue_turn(monkeypatch))
+
+
+async def _run_interrupted_request_is_available_to_continue_turn(monkeypatch):
+    """If a run disappears mid-flight, a later "继续" turn must see the lost prompt."""
+    from hermes_multitenancy.router import handle_async, _user_inflight_history_keys, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import runtime as runtime_mod
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    _user_inflight_history_keys.clear()
+    router_mod._session_history.clear()
+    router_mod._session_loaded.clear()
+    router_mod.override_session_store(":memory:")
+
+    seen_second_event = {}
+    started = asyncio.Event()
+
+    async def runner(event, home):
+        text = getattr(event, "text", "")
+        if "生成天气报告" in text:
+            started.set()
+            await asyncio.sleep(60)
+        seen_second_event["text"] = text
+        return "continued-ok"
+
+    monkeypatch.setattr(runtime_mod, "_default_run_agent", runner)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        add_spike_route("ou_resume", home)
+
+        class Adapter:
+            async def send_typing(self, c): pass
+            async def send(self, c, m, *, reply_to=None, metadata=None): pass
+
+        gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+        first = asyncio.create_task(
+            handle_async(event=_build_event("生成天气报告并发给我", user_id="ou_resume"), gateway=gateway)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        await handle_async(event=_build_event("继续", user_id="ou_resume"), gateway=gateway)
+
+    assert "继续" in seen_second_event["text"]
+    history = router_mod._session_history[(home.name, "ou_resume")]
+    assert history[0]["content"] == "生成天气报告并发给我"
+    assert "中断或取消" in history[1]["content"]
+    assert history[2]["content"] == "继续"
+    assert history[3]["content"] == "continued-ok"
+
+    clear_spike_routes()
+    router_mod.override_session_store(None)
 
 
 def test_session_guard_transfers_to_replacement_dispatch(monkeypatch):

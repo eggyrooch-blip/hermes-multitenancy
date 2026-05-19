@@ -380,6 +380,300 @@ skills:
     assert lark_target.resolve() == lark_source.resolve()
 
 
+def test_sync_profiles_distributes_shared_skills_by_audience_without_copying(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    keep_source = shared_home / "skills" / "Keep" / "keep-record"
+    finance_source = shared_home / "skills" / "internal" / "finance-cli"
+    keep_source.mkdir(parents=True)
+    finance_source.mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/keep-record
+    install_mode: symlink
+    audience: all
+  - path: internal/finance-cli
+    install_mode: symlink
+    audience:
+      departments: [od_finance]
+""",
+        encoding="utf-8",
+    )
+    (keep_source / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    (finance_source / "SKILL.md").write_text("# Finance CLI\n", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [
+            Department(dept_id="od_finance", name="Finance", leader_user_id="alice"),
+            Department(dept_id="od_ops", name="Ops", leader_user_id="bob"),
+        ],
+        {
+            "od_finance": [DepartmentUser(open_id="ou_alice", user_id="alice")],
+            "od_ops": [DepartmentUser(open_id="ou_bob", user_id="bob")],
+        },
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    alice_skills = profiles_root / "alice" / "skills"
+    bob_skills = profiles_root / "bob" / "skills"
+    assert (alice_skills / "Keep" / "keep-record").is_symlink()
+    assert (alice_skills / "Keep" / "keep-record").resolve() == keep_source.resolve()
+    assert (bob_skills / "Keep" / "keep-record").is_symlink()
+    assert (alice_skills / "internal" / "finance-cli").is_symlink()
+    assert (alice_skills / "internal" / "finance-cli").resolve() == finance_source.resolve()
+    assert not (bob_skills / "internal" / "finance-cli").exists()
+
+
+def test_sync_profiles_prunes_removed_managed_skill_but_preserves_self_installed(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    managed_source = shared_home / "skills" / "Keep" / "kep-hades-cli"
+    removed_source = shared_home / "skills" / "internal" / "old-cli"
+    managed_source.mkdir(parents=True)
+    removed_source.mkdir(parents=True)
+    (managed_source / "SKILL.md").write_text("# Hades\n", encoding="utf-8")
+    (removed_source / "SKILL.md").write_text("# Old\n", encoding="utf-8")
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/kep-hades-cli
+    install_mode: symlink
+    audience: all
+  - path: internal/old-cli
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {"od_ops": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+    profile_skills = profiles_root / "alice" / "skills"
+    self_installed = profile_skills / "personal-tool"
+    self_installed.mkdir()
+    (self_installed / "SKILL.md").write_text("# Personal\n", encoding="utf-8")
+
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/kep-hades-cli
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    assert (profile_skills / "Keep" / "kep-hades-cli").is_symlink()
+    assert not (profile_skills / "internal" / "old-cli").exists()
+    assert (self_installed / "SKILL.md").read_text(encoding="utf-8") == "# Personal\n"
+
+
+def test_sync_profiles_can_switch_managed_symlink_between_versions(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    v1_source = shared_home / "skill-releases" / "keep-record" / "v1"
+    v2_source = shared_home / "skill-releases" / "keep-record" / "v2"
+    v1_source.mkdir(parents=True)
+    v2_source.mkdir(parents=True)
+    (v1_source / "SKILL.md").write_text("# Keep Record v1\n", encoding="utf-8")
+    (v2_source / "SKILL.md").write_text("# Keep Record v2\n", encoding="utf-8")
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {"od_ops": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/keep-record
+    source: skill-releases/keep-record/v1
+    version: v1
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+    target = profiles_root / "alice" / "skills" / "Keep" / "keep-record"
+    assert target.resolve() == v1_source.resolve()
+
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/keep-record
+    source: skill-releases/keep-record/v2
+    version: v2
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    manifest = json.loads((profiles_root / "alice" / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))
+    assert target.resolve() == v2_source.resolve()
+    assert manifest["skills"]["Keep/keep-record"]["version"] == "v2"
+
+
+def test_child_profile_inherits_only_child_shareable_skill_packages_without_tokens(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import Employee, _sync_default_profile_skills
+
+    shared_home = tmp_path / "shared"
+    free_source = shared_home / "skills" / "internal" / "readonly-report"
+    oauth_source = shared_home / "skills" / "internal" / "personal-oauth"
+    free_source.mkdir(parents=True)
+    oauth_source.mkdir(parents=True)
+    (free_source / "SKILL.md").write_text("# Readonly Report\n", encoding="utf-8")
+    (oauth_source / "SKILL.md").write_text("# Personal OAuth\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: internal/readonly-report
+    install_mode: symlink
+    audience:
+      departments: [od_sales]
+    requires_token: false
+  - path: internal/personal-oauth
+    install_mode: symlink
+    audience:
+      departments: [od_sales]
+    token_policy: user_oauth
+""",
+        encoding="utf-8",
+    )
+    owner_home = shared_home / "profiles" / "alice"
+    owner = Employee(
+        open_id="ou_alice",
+        user_id="alice",
+        agent_id="alice",
+        profile_name="alice",
+        name="Alice",
+        dept_id="od_sales",
+        dept_name="Sales",
+        leader_user_id=None,
+    )
+
+    assert _sync_default_profile_skills(owner_home, shared_home, owner) is True
+    (owner_home / "tokens").mkdir(parents=True)
+    (owner_home / "tokens" / "personal-oauth.json").write_text("secret", encoding="utf-8")
+
+    child_home = shared_home / "profiles" / "feishu_group_sales"
+    assert _sync_default_profile_skills(
+        child_home,
+        shared_home,
+        upstream_profile_home=owner_home,
+    ) is True
+
+    child_skills = child_home / "skills"
+    inherited = child_skills / "internal" / "readonly-report"
+    assert inherited.is_symlink()
+    assert inherited.resolve() == free_source.resolve()
+    assert not (child_skills / "internal" / "personal-oauth").exists()
+    assert not (child_home / "tokens" / "personal-oauth.json").exists()
+    manifest = json.loads((child_skills / ".hermes-managed.json").read_text(encoding="utf-8"))
+    assert manifest["skills"]["internal/readonly-report"]["inherited_from"] == "alice"
+    assert manifest["skills"]["internal/readonly-report"]["requires_token"] is False
+
+
+def test_child_profile_does_not_receive_all_audience_user_token_skills(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import Employee, _sync_default_profile_skills
+
+    shared_home = tmp_path / "shared"
+    free_source = shared_home / "skills" / "internal" / "team-readonly"
+    oauth_source = shared_home / "skills" / "internal" / "all-user-oauth"
+    free_source.mkdir(parents=True)
+    oauth_source.mkdir(parents=True)
+    (free_source / "SKILL.md").write_text("# Team Readonly\n", encoding="utf-8")
+    (oauth_source / "SKILL.md").write_text("# User OAuth\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: internal/team-readonly
+    audience: all
+    requires_token: false
+  - path: internal/all-user-oauth
+    audience: all
+    token_policy: user_oauth
+""",
+        encoding="utf-8",
+    )
+    owner_home = shared_home / "profiles" / "alice"
+    owner = Employee(
+        open_id="ou_alice",
+        user_id="alice",
+        agent_id="alice",
+        profile_name="alice",
+        name="Alice",
+        dept_id="",
+        dept_name="",
+        leader_user_id=None,
+    )
+
+    assert _sync_default_profile_skills(owner_home, shared_home, owner) is True
+    assert (owner_home / "skills" / "internal" / "all-user-oauth").is_symlink()
+
+    child_home = shared_home / "profiles" / "feishu_group_sales"
+    assert _sync_default_profile_skills(
+        child_home,
+        shared_home,
+        upstream_profile_home=owner_home,
+    ) is True
+
+    assert (child_home / "skills" / "internal" / "team-readonly").is_symlink()
+    assert not (child_home / "skills" / "internal" / "all-user-oauth").exists()
+
+
+def test_symlink_distribution_falls_back_to_filtered_copy_when_source_contains_secret_files(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    skill_source = shared_home / "skills" / "internal" / "unsafe-shared"
+    skill_source.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Unsafe Shared\n", encoding="utf-8")
+    (skill_source / ".env").write_text("TOKEN=do-not-link\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: internal/unsafe-shared
+    audience: all
+    install_mode: symlink
+""",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_root", name="Root")],
+        {"od_root": [DepartmentUser(open_id="ou_a", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    installed = profiles_root / "alice" / "skills" / "internal" / "unsafe-shared"
+    assert installed.exists()
+    assert not installed.is_symlink()
+    assert (installed / "SKILL.md").exists()
+    assert not (installed / ".env").exists()
+    manifest = json.loads((installed.parent.parent / ".hermes-managed.json").read_text(encoding="utf-8"))
+    entry = manifest["skills"]["internal/unsafe-shared"]
+    assert entry["install_mode"] == "copy"
+    assert entry["requested_install_mode"] == "symlink"
+    assert entry["secret_guard"] == "copy_filtered"
+
+
 def test_sync_feishu_org_dry_run_does_not_write_profiles_or_db(tmp_path):
     from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.sync import Department, DepartmentUser, sync_feishu_org
