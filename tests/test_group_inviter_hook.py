@@ -321,6 +321,7 @@ def test_install_hook_skips_when_module_not_importable():
     """If FeishuAdapter cannot be imported (e.g. in a unit-test process), the
     helper must log + return rather than raise."""
     from hermes_multitenancy import group_inviter_hook
+    import builtins
     import sys
 
     saved_modules = {}
@@ -328,11 +329,20 @@ def test_install_hook_skips_when_module_not_importable():
         if name in sys.modules:
             saved_modules[name] = sys.modules.pop(name)
     group_inviter_hook._HOOK_INSTALLED = False
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "gateway.platforms.feishu":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
     try:
+        builtins.__import__ = blocked_import
         group_inviter_hook.install_feishu_bot_added_hook()  # must not raise
         # And the install flag must NOT be set so a later retry can succeed.
         assert group_inviter_hook._HOOK_INSTALLED is False
     finally:
+        builtins.__import__ = real_import
         for name, mod in saved_modules.items():
             sys.modules[name] = mod
         group_inviter_hook._HOOK_INSTALLED = False

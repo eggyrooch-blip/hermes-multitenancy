@@ -125,6 +125,143 @@ class _DeferredLifecycleCardAdapter(_CardCapableAdapter):
         self.lifecycle.append(("complete_deferred", str(outcome)))
 
 
+class _CleanFeishuLikeAdapter:
+    """Official-clean Feishu adapter shape: card patching exists, streaming surface does not."""
+
+    def __init__(self):
+        self._client = object()
+        self.card_sends = []
+        self.card_patches = []
+        self.sent = []
+        self.edits = []
+
+    async def _feishu_send_with_retry(
+        self, *, chat_id, msg_type, payload, reply_to, metadata
+    ):
+        self.card_sends.append(
+            {
+                "chat_id": chat_id,
+                "msg_type": msg_type,
+                "payload": payload,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SimpleNamespace(code=0, data={"message_id": "compat-card-1"})
+
+    def _finalize_send_result(self, response, default_message):
+        message_id = getattr(response, "data", {}).get("message_id")
+        return SimpleNamespace(
+            success=bool(message_id),
+            message_id=message_id,
+            error=None if message_id else default_message,
+            raw_response=response,
+        )
+
+    async def _patch_auth_card(self, message_id, card):
+        self.card_patches.append({"message_id": message_id, "card": card})
+        return True
+
+    def format_message(self, content):
+        return str(content or "")
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+        self.sent.append({"chat_id": chat_id, "content": content})
+        return SimpleNamespace(success=True, message_id="text-1")
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False):
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+            }
+        )
+        return SimpleNamespace(success=True, message_id=message_id)
+
+
+class _CleanFeishuUpdateOnlyAdapter(_CleanFeishuLikeAdapter):
+    """Clean Feishu adapter shape that updates cards through message.update."""
+
+    def __init__(self):
+        super().__init__()
+        self.card_patches = None
+        self.update_requests = []
+        self._patch_auth_card = None
+
+        class MessageApi:
+            def __init__(api_self, outer):
+                api_self.outer = outer
+
+            def update(api_self, request):
+                api_self.outer.update_requests.append(request)
+                return SimpleNamespace(code=0, msg="success")
+
+        self._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=MessageApi(self)))
+        )
+
+    @staticmethod
+    def _build_update_message_body(*, msg_type, content):
+        return SimpleNamespace(msg_type=msg_type, content=content)
+
+    @staticmethod
+    def _build_update_message_request(message_id, request_body):
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    def _finalize_send_result(self, response, default_message):
+        if getattr(response, "code", 1) == 0:
+            message_id = getattr(response, "data", {}).get("message_id")
+            return SimpleNamespace(success=True, message_id=message_id, error=None, raw_response=response)
+        return SimpleNamespace(success=False, message_id=None, error=default_message, raw_response=response)
+
+
+class _OpenClawCardKitAdapter(_CleanFeishuLikeAdapter):
+    """Feishu adapter exposing the CardKit APIs used by openclaw-lark."""
+
+    def __init__(self):
+        super().__init__()
+        self._patch_auth_card = None
+        self.created_cards = []
+        self.content_updates = []
+        self.settings_updates = []
+        self.card_updates = []
+
+        class CardApi:
+            def __init__(api_self, outer):
+                api_self.outer = outer
+
+            def create(api_self, request):
+                api_self.outer.created_cards.append(request)
+                return SimpleNamespace(code=0, msg="success", data={"card_id": "ck-1"})
+
+            def settings(api_self, request):
+                api_self.outer.settings_updates.append(request)
+                return SimpleNamespace(code=0, msg="success")
+
+            def update(api_self, request):
+                api_self.outer.card_updates.append(request)
+                return SimpleNamespace(code=0, msg="success")
+
+        class CardElementApi:
+            def __init__(api_self, outer):
+                api_self.outer = outer
+
+            def content(api_self, request):
+                api_self.outer.content_updates.append(request)
+                return SimpleNamespace(code=0, msg="success")
+
+        self._client = SimpleNamespace(
+            cardkit=SimpleNamespace(
+                v1=SimpleNamespace(
+                    card=CardApi(self),
+                    card_element=CardElementApi(self),
+                )
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
     monkeypatch, tmp_path
@@ -161,6 +298,368 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
         "content": "Hello world",
         "finalize": True,
     }
+
+
+def test_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapter(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapter(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapter(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("tool_started", {"name": "lark_cli", "preview": "GET /user_info"})
+        yield ("tool_completed", {"name": "lark_cli", "duration": 0.3, "is_error": False})
+        yield ("content", "Hello from clean adapter")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+
+    adapter = _CleanFeishuLikeAdapter()
+    assert not hasattr(adapter, "supports_streaming_card")
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Hello from clean adapter"
+    assert adapter.supports_streaming_card() is True
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert len(adapter.card_sends) == 1
+    assert adapter.card_sends[0]["msg_type"] == "interactive"
+    initial_card = json.loads(adapter.card_sends[0]["payload"])
+    assert "header" not in initial_card
+    assert adapter.card_patches[-1]["message_id"] == "compat-card-1"
+    final_card = adapter.card_patches[-1]["card"]
+    assert "header" not in final_card
+    rendered = "\n".join(element["content"] for element in final_card["elements"])
+    assert "**Tool calls:**" in rendered
+    assert "`lark_cli` (300 ms)" in rendered
+    assert "Hello from clean adapter" in rendered
+    assert "Done (" in rendered
+
+
+def test_stream_into_feishu_updates_interactive_card_without_auth_patch_helper(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_updates_interactive_card_without_auth_patch_helper(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_updates_interactive_card_without_auth_patch_helper(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "Updated through Feishu message.update")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+
+    adapter = _CleanFeishuUpdateOnlyAdapter()
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Updated through Feishu message.update"
+    assert adapter.sent == []
+    assert len(adapter.card_sends) == 1
+    assert len(adapter.update_requests) >= 1
+    final_request = adapter.update_requests[-1]
+    assert final_request.message_id == "compat-card-1"
+    assert final_request.request_body.msg_type == "interactive"
+    final_card = json.loads(final_request.request_body.content)
+    assert "header" not in final_card
+    rendered = "\n".join(element["content"] for element in final_card["elements"])
+    assert "Updated through Feishu message.update" in rendered
+    assert "Done (" in rendered
+
+
+def test_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
+    asyncio.run(_run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout())
+
+
+async def _run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_reasoning(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="Reasoning:\n_checking user context_",
+    )
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview="GET /user_info",
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        duration=0.3,
+        is_error=False,
+    )
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="<think>hidden chain</think># Result\n\nVisible answer\n\n![bad](https://example.com/a.png)",
+        finalize=True,
+    )
+
+    final_card = adapter.card_patches[-1]["card"]
+    elements = final_card["elements"]
+    assert [element["tag"] for element in elements] == [
+        "markdown",
+        "collapsible_panel",
+        "markdown",
+        "markdown",
+    ]
+    assert elements[0]["content"] == "**Tool calls:**\n- `lark_cli` (300 ms)"
+    reasoning_panel = elements[1]
+    assert reasoning_panel["expanded"] is False
+    assert reasoning_panel["header"]["title"]["content"].startswith("💭 Thought")
+    assert reasoning_panel["header"]["icon"]["token"] == "down-small-ccm_outlined"
+    assert reasoning_panel["elements"][0]["content"] == "hidden chain"
+
+    body_text = elements[2]["content"]
+    assert body_text.startswith("#### Result")
+    assert "Visible answer" in body_text
+    assert "hidden chain" not in body_text
+    assert "https://example.com/a.png" not in body_text
+
+    assert elements[3]["content"].startswith("Done (")
+    assert elements[3]["text_size"] == "notation"
+
+
+def test_cardkit_compat_never_renders_raw_tool_call_xml():
+    asyncio.run(_run_cardkit_compat_never_renders_raw_tool_call_xml())
+
+
+async def _run_cardkit_compat_never_renders_raw_tool_call_xml():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+    raw_tool = (
+        '<tool_call>{"name":"lark_cli","arguments":{"command":"lark-cli doc +create '
+        '--title \\"测试文档\\" --content \\"测试\\" --markdown true"}}</tool_call>'
+    )
+
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content=raw_tool + raw_tool,
+        finalize=True,
+    )
+
+    final_card = adapter.card_patches[-1]["card"]
+    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    assert "<tool_call>" not in rendered
+    assert "lark-cli doc +create" not in rendered
+    assert "**Tool calls:**" in rendered
+    assert "- `lark_cli` failed" in rendered
+    assert "Done (" in rendered
+
+
+def test_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("tool_started", {"name": "lark_cli", "preview": "GET /user_info"})
+        yield ("tool_completed", {"name": "lark_cli", "duration": 0.3, "is_error": False})
+        yield ("content", "Hello")
+        yield ("content", " CardKit")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+
+    adapter = _OpenClawCardKitAdapter()
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Hello CardKit"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert len(adapter.created_cards) == 1
+    initial_request = adapter.created_cards[0]
+    initial_card = json.loads(initial_request.request_body.data)
+    assert initial_request.request_body.type == "card_json"
+    assert initial_card["schema"] == "2.0"
+    assert initial_card["config"]["streaming_mode"] is True
+    assert initial_card["body"]["elements"][0]["element_id"] == "streaming_content"
+    assert len(adapter.card_sends) == 1
+    sent_payload = json.loads(adapter.card_sends[0]["payload"])
+    assert sent_payload == {"type": "card", "data": {"card_id": "ck-1"}}
+    assert adapter.content_updates
+    assert any("Hello" in req.request_body.content for req in adapter.content_updates)
+    assert adapter.settings_updates[-1].request_body.settings == json.dumps({"streaming_mode": False})
+    assert adapter.card_updates[-1].card_id == "ck-1"
+    final_card = json.loads(adapter.card_updates[-1].request_body.card["data"])
+    assert final_card["schema"] == "2.0"
+    assert "header" not in final_card
+    final_text = "\n".join(
+        element.get("content", "")
+        for element in final_card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+    assert "**Tool calls:**" in final_text
+    assert "`lark_cli` (300 ms)" in final_text
+    assert "Hello CardKit" in final_text
+    assert "Done (" in final_text
+
+
+def test_stream_into_feishu_streams_cardkit_cumulative_text_for_typewriter(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_streams_cardkit_cumulative_text_for_typewriter(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_streams_cardkit_cumulative_text_for_typewriter(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        for chunk in ("H", "e", "l", "l", "o"):
+            yield ("content", chunk)
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+
+    adapter = _OpenClawCardKitAdapter()
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Hello"
+    streamed_contents = [
+        req.request_body.content
+        for req in adapter.content_updates
+    ]
+    assert "H" in streamed_contents
+    assert "Hello" in streamed_contents
+    assert streamed_contents.index("H") < streamed_contents.index("Hello")
+
+
+def test_stream_into_feishu_skips_legacy_shared_consumer_without_card_methods(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_skips_legacy_shared_consumer_without_card_methods(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_skips_legacy_shared_consumer_without_card_methods(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "Compat survives legacy consumer")
+
+    class LegacyGatewayStreamConsumer:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("legacy shared consumer should not be constructed")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(
+        router_mod,
+        "GatewayStreamConsumer",
+        LegacyGatewayStreamConsumer,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        router_mod,
+        "StreamConsumerConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+
+    adapter = _CleanFeishuLikeAdapter()
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Compat survives legacy consumer"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert len(adapter.card_sends) == 1
+    assert adapter.card_sends[0]["msg_type"] == "interactive"
+    final_card = adapter.card_patches[-1]["card"]
+    assert "header" not in final_card
+    rendered = "\n".join(element["content"] for element in final_card["elements"])
+    assert "Compat survives legacy consumer" in rendered
+    assert "Done (" in rendered
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 """Compatibility registration for the trusted lark-cli bridge.
 
 Official upstream Hermes does not ship owner's local fork tool named
-``lark_cli``.  Multitenancy-owned profiles still depend on that bridge for
+``lark_cli``. Multitenancy-owned profiles still depend on that bridge for
 Feishu/Lark OpenAPI access, so the plugin registers the tool itself when the
 routed AIAgent runtime imports this module.
 """
@@ -69,7 +69,7 @@ _SAFE_ENV_NAMES = {
 def _redact(text: str) -> str:
     redacted = text or ""
     for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub(lambda m: f"{m.group(1)}***REDACTED***", redacted)
+        redacted = pattern.sub(lambda match: f"{match.group(1)}***REDACTED***", redacted)
     return redacted
 
 
@@ -98,6 +98,8 @@ def _matches_pattern(argv: list[str], pattern: list[str]) -> bool:
 
 
 def _api_request_from_argv(argv: list[str]) -> tuple[str, str] | None:
+    if len(argv) >= 2 and argv[0].upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+        return argv[0].upper(), _normalise_openapi_path(argv[1])
     if len(argv) < 3 or argv[0] != "api":
         return None
     return argv[1].upper(), _normalise_openapi_path(argv[2])
@@ -119,7 +121,7 @@ def _rule_matches(mode: str, argv: list[str], rule: dict[str, Any]) -> bool:
         return bool(prefix and path.startswith(str(prefix)))
 
     pattern = rule.get("pattern")
-    return isinstance(pattern, list) and _matches_pattern(argv, [str(p) for p in pattern])
+    return isinstance(pattern, list) and _matches_pattern(argv, [str(part) for part in pattern])
 
 
 def _policy_decision(mode: str, argv: list[str], risk: str, policy: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -319,9 +321,8 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     if mode == "api":
         api_req = _api_request_from_argv(argv)
         if not api_req:
-            return tool_error("api mode requires argv like ['api', '<METHOD>', '<PATH>']")
-        argv[1] = api_req[0]
-        argv[2] = api_req[1]
+            return tool_error("api mode requires argv like ['api', '<METHOD>', '<PATH>'] or ['<METHOD>', '<PATH>']")
+        argv = ["api", api_req[0], api_req[1], *argv[3:]] if argv and argv[0] == "api" else ["api", api_req[0], api_req[1], *argv[2:]]
     elif argv and argv[0] == "api":
         return tool_error("api command must use mode=api")
 

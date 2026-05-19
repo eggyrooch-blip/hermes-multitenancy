@@ -351,6 +351,80 @@ def test_broker_can_use_profile_local_uat_json_without_vault_key(monkeypatch, tm
     assert captured["authorization"] == "Bearer json-only-uat"
 
 
+def test_broker_refreshes_profile_uat_before_injecting_user_token(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "alice" / "feishu_uat"
+    profile_dir.mkdir(parents=True)
+    token_path = profile_dir / "ou_alice.json"
+    token_path.write_text(
+        json.dumps(
+            {
+                "user_open_id": "ou_alice",
+                "app_id": "cli_public",
+                "access_token": "expired-json-uat",
+                "refresh_token": "refresh-json",
+                "expires_at": int(time.time() * 1000) - 1000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def fake_refresh(**kwargs):
+        seen.update(kwargs)
+        token_path.write_text(
+            json.dumps(
+                {
+                    "user_open_id": "ou_alice",
+                    "app_id": "cli_public",
+                    "access_token": "refreshed-json-uat",
+                    "refresh_token": "refresh-json",
+                    "expires_at": int(time.time() * 1000) + 7200_000,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(feishu_uat_auth, "refresh_uat_if_needed", fake_refresh, raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_forward(_method, _url, headers, _body, _timeout):
+        captured["authorization"] = headers.get("Authorization")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 200
+    assert seen["profile_name"] == "alice"
+    assert seen["open_id"] == "ou_alice"
+    assert captured["authorization"] == "Bearer refreshed-json-uat"
+
+
 def test_broker_injects_user_uat_and_strips_client_auth_headers(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.lark_cli_auth_broker import (
         BrokerResponse,
