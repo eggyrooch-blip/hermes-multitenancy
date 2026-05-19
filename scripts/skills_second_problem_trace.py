@@ -9,6 +9,7 @@ exact phrase and which nearby candidate classes exist in local notes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -115,6 +116,7 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"唯一\s*blocker.*精确正文", re.IGNORECASE),
     re.compile(r"不能标\s*complete", re.IGNORECASE),
     re.compile(r"no issue text", re.IGNORECASE),
+    re.compile(r"\bis still absent\b", re.IGNORECASE),
 ]
 IMAGE_SOURCE_PATTERN = re.compile(r"\[Image:\s*source:\s*([^\]\n]+)\]")
 INTERNAL_CONTEXT_PREFIXES = (
@@ -284,10 +286,21 @@ def _thread_goal_feedback_matches(
         rows.append({
             "path": str(path),
             "line": line_number,
+            "objective_hash": hashlib.sha256(objective.encode("utf-8")).hexdigest(),
             "image_placeholder_count": sum(objective.count(label) for label in referenced_artifacts),
             "sample": objective[:240],
         })
     return rows
+
+
+def _unique_goal_context_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    for match in matches:
+        objective_hash = str(match.get("objective_hash") or "")
+        if not objective_hash:
+            continue
+        unique.setdefault(objective_hash, match)
+    return list(unique.values())
 
 
 def _sample_line(text: str, pattern: str) -> str:
@@ -620,7 +633,7 @@ def build_trace(
     historical_image_keys: set[tuple[str, str]] = set()
     structured_feedback_payload_matches: list[dict[str, Any]] = []
     current_feedback_structured_payload_matches: list[dict[str, Any]] = []
-    current_feedback_goal_context_matches: list[dict[str, Any]] = []
+    current_feedback_goal_context_snapshots: list[dict[str, Any]] = []
     candidate_classes: list[dict[str, Any]] = [
         {"name": item["name"], "match_count": 0, "evidence_files": []}
         for item in CANDIDATE_CLASSES
@@ -646,7 +659,7 @@ def build_trace(
                 text_phrases=current_feedback_phrases,
             )
         )
-        current_feedback_goal_context_matches.extend(
+        current_feedback_goal_context_snapshots.extend(
             _thread_goal_feedback_matches(
                 path,
                 text,
@@ -694,6 +707,10 @@ def build_trace(
                         "sample": _sample_line(text, matched_pattern),
                     })
 
+    current_feedback_goal_context_matches = _unique_goal_context_matches(
+        current_feedback_goal_context_snapshots
+    )
+
     return {
         "ok": True,
         "searched_roots": [str(path) for path in search_roots],
@@ -734,6 +751,8 @@ def build_trace(
             for match in current_feedback_structured_payload_matches
         ),
         "current_feedback_structured_payload_matches": current_feedback_structured_payload_matches[:20],
+        "current_feedback_goal_context_snapshot_count": len(current_feedback_goal_context_snapshots),
+        "current_feedback_goal_context_unique_count": len(current_feedback_goal_context_matches),
         "current_feedback_goal_context_match_count": len(current_feedback_goal_context_matches),
         "current_feedback_goal_context_image_placeholder_count": sum(
             int(match.get("image_placeholder_count") or 0) for match in current_feedback_goal_context_matches

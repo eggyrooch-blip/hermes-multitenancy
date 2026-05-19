@@ -840,6 +840,8 @@ def test_completion_audit_blocks_when_feedback_screenshots_are_only_text_transcr
     assert "current_feedback_structured_image_payload_count=0" in artifact_item["note"]
     assert "current_feedback_structured_local_image_payload_count=0" in artifact_item["note"]
     assert "current_feedback_goal_context_match_count=0" in artifact_item["note"]
+    assert "current_feedback_goal_context_snapshot_count=0" in artifact_item["note"]
+    assert "current_feedback_goal_context_unique_count=0" in artifact_item["note"]
     assert "current_feedback_goal_context_image_placeholder_count=0" in artifact_item["note"]
     assert "searched_raw_image_files=0" in artifact_item["note"]
     assert "artifact_kinds={'Image #1': 'text', 'Image #2': 'text'}" in artifact_item["note"]
@@ -859,6 +861,8 @@ def test_completion_audit_surfaces_text_only_goal_context_feedback_without_accep
     trace_path = tmp_path / "second-problem-trace.json"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     trace["current_feedback_goal_context_match_count"] = 1
+    trace["current_feedback_goal_context_snapshot_count"] = 3
+    trace["current_feedback_goal_context_unique_count"] = 1
     trace["current_feedback_goal_context_image_placeholder_count"] = 2
     trace["current_feedback_goal_context_matches"] = [
         {
@@ -884,6 +888,8 @@ def test_completion_audit_surfaces_text_only_goal_context_feedback_without_accep
     )
     assert artifact_item["status"] == "blocked"
     assert "current_feedback_goal_context_match_count=1" in artifact_item["note"]
+    assert "current_feedback_goal_context_snapshot_count=3" in artifact_item["note"]
+    assert "current_feedback_goal_context_unique_count=1" in artifact_item["note"]
     assert "current_feedback_goal_context_image_placeholder_count=2" in artifact_item["note"]
     assert "non_image_artifacts=['Image #1', 'Image #2']" in artifact_item["note"]
 

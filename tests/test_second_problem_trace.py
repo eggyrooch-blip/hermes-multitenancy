@@ -115,6 +115,24 @@ def test_second_problem_trace_treats_state_journal_missing_exact_body_as_placeho
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
+def test_second_problem_trace_treats_english_state_absence_note_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "STATE.md").write_text(
+        "Latest evidence separates recoverable user image payloads from thread-goal "
+        "image placeholders, but 然后第二个问题 is still absent.\n",
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([docs], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_match_count"] == 0
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
 def test_second_problem_trace_records_referenced_feedback_artifacts_as_unavailable(tmp_path: Path):
     trace_mod = _load_trace_module()
     docs = tmp_path / "docs"
@@ -632,12 +650,15 @@ def test_second_problem_trace_separates_goal_context_from_recoverable_image_payl
     assert report["structured_feedback_image_payload_count"] == 0
     assert report["current_feedback_structured_message_count"] == 0
     assert report["current_feedback_structured_image_payload_count"] == 0
+    assert report["current_feedback_goal_context_snapshot_count"] == 1
+    assert report["current_feedback_goal_context_unique_count"] == 1
     assert report["current_feedback_goal_context_match_count"] == 1
     assert report["current_feedback_goal_context_image_placeholder_count"] == 2
     assert report["current_feedback_goal_context_matches"] == [
         {
             "path": str(sessions / "rollout.jsonl"),
             "line": 2,
+            "objective_hash": report["current_feedback_goal_context_matches"][0]["objective_hash"],
             "image_placeholder_count": 2,
             "sample": (
                 "[Image #1] [Image #2] 可以可以，我正在体验 Hermes\n"
@@ -647,3 +668,39 @@ def test_second_problem_trace_separates_goal_context_from_recoverable_image_payl
             ),
         }
     ]
+
+
+def test_second_problem_trace_deduplicates_repeated_thread_goal_snapshots(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    objective = (
+        "[Image #1] [Image #2] 可以可以，我正在体验 Hermes\n"
+        "先报个问题，我遇到两次了，就是会中断，执行一半突然就没了\n"
+        "然后第二个问题\n"
+        "这个是用户在生产环境中的反馈"
+    )
+    payload = trace_mod.json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_updated",
+                "goal": {"objective": objective},
+            },
+        },
+        ensure_ascii=False,
+    )
+    (first / "rollout.jsonl").write_text(payload + "\n", encoding="utf-8")
+    (second / "rollout.jsonl").write_text(payload + "\n", encoding="utf-8")
+
+    report = trace_mod.build_trace(
+        [first, second],
+        referenced_artifacts=["Image #1", "Image #2"],
+    )
+
+    assert report["current_feedback_goal_context_snapshot_count"] == 2
+    assert report["current_feedback_goal_context_unique_count"] == 1
+    assert report["current_feedback_goal_context_match_count"] == 1
+    assert report["current_feedback_goal_context_image_placeholder_count"] == 2
