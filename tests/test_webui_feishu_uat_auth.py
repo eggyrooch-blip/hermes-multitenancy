@@ -299,6 +299,46 @@ def test_feishu_uat_status_marks_reauth_when_refresh_token_expired(tmp_path, mon
     assert "old-access" not in str(status)
 
 
+def test_feishu_uat_status_reports_unexpected_refresh_error(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    now_ms = int(time.time() * 1000)
+    CredentialStore(shared / "multitenancy.db").put_credential(
+        profile_name="owner",
+        subject_id="ou_owner",
+        provider="feishu",
+        secret_kind="uat",
+        payload={
+            "app_id": "cli_test",
+            "user_open_id": "ou_owner",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at": now_ms - 1000,
+            "refresh_expires_at": now_ms + 86400_000,
+            "scope": "offline_access",
+        },
+        scopes=["offline_access"],
+        expires_at=now_ms - 1000,
+    )
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "_refresh_uat_token",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("network stack exploded")),
+    )
+
+    status = feishu_uat_auth.credential_status(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert status["status"] == "expired"
+    assert "unexpected refresh error" in status["refresh_error"]
+    assert "old-access" not in str(status)
+
+
 def test_webui_feishu_auth_session_polls_success_and_saves_vault(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

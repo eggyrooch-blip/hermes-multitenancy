@@ -158,6 +158,8 @@ def credential_status(
         )
     except FeishuUatAuthError as exc:
         refresh_error = exc.message
+    except Exception as exc:
+        refresh_error = f"unexpected refresh error: {exc}"
     store = CredentialStore(shared / "multitenancy.db")
     try:
         status = store.get_status(
