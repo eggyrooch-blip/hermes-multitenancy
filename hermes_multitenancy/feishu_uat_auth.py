@@ -596,6 +596,24 @@ def _refresh_access_token(client_id: str, client_secret: str, refresh_token: str
         return json.loads(response.read().decode("utf-8"))
 
 
+def _mint_tenant_access_token(client_id: str, client_secret: str, *, timeout: int = 10) -> str:
+    body = json.dumps({"app_id": client_id, "app_secret": client_secret}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{FEISHU_OPEN_BASE_URL}/open-apis/auth/v3/tenant_access_token/internal",
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed Feishu host.
+        raw = json.loads(response.read().decode("utf-8"))
+    if int(raw.get("code") or 0) != 0:
+        raise FeishuUatAuthError("Feishu tenant token request rejected", status=503)
+    token = str(raw.get("tenant_access_token") or raw.get("app_access_token") or "").strip()
+    if not token:
+        raise FeishuUatAuthError("Feishu tenant token response is missing token", status=503)
+    return token
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")

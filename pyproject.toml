@@ -40,7 +40,15 @@ Repository = "https://github.com/eggyrooch-blip/hermes-multitenancy"
 Issues = "https://github.com/eggyrooch-blip/hermes-multitenancy/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-asyncio>=0.21"]
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "aiohttp>=3.9",
+    "openpyxl>=3.1",
+    "Pillow>=10",
+    "python-docx>=1.1",
+    "reportlab>=4.0",
+]
 
 [project.scripts]
 hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
