@@ -103,6 +103,72 @@ def test_url_guard_can_allow_private_but_never_metadata(tmp_path: Path):
     assert browser_policy.decide_url("http://169.254.169.254/latest/meta-data/", decision).allowed is False
 
 
+def test_url_guard_blocks_hostname_that_resolves_private(monkeypatch, tmp_path: Path):
+    decision = browser_policy.browser_decision(
+        {"multitenancy": {"browser": {"enabled": True}}},
+        tmp_path / "profiles" / "alice",
+    )
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "internal.example"
+        return [
+            (
+                browser_policy.socket.AF_INET,
+                browser_policy.socket.SOCK_STREAM,
+                6,
+                "",
+                ("127.0.0.1", 0),
+            )
+        ]
+
+    monkeypatch.setattr(browser_policy.socket, "getaddrinfo", fake_getaddrinfo)
+
+    result = browser_policy.decide_url("https://internal.example/path", decision)
+
+    assert result.allowed is False
+    assert "private/internal" in result.reason
+
+
+def test_url_guard_allows_private_dns_when_enabled_but_never_metadata(
+    monkeypatch,
+    tmp_path: Path,
+):
+    decision = browser_policy.browser_decision(
+        {"multitenancy": {"browser": {"enabled": True, "allow_private_urls": True}}},
+        tmp_path / "profiles" / "alice",
+    )
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host == "internal.example":
+            return [
+                (
+                    browser_policy.socket.AF_INET,
+                    browser_policy.socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("10.0.0.5", 0),
+                )
+            ]
+        if host == "metadata.example":
+            return [
+                (
+                    browser_policy.socket.AF_INET,
+                    browser_policy.socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("169.254.169.254", 0),
+                )
+            ]
+        raise AssertionError(host)
+
+    monkeypatch.setattr(browser_policy.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert browser_policy.decide_url("https://internal.example/", decision).allowed is True
+    metadata = browser_policy.decide_url("https://metadata.example/", decision)
+    assert metadata.allowed is False
+    assert "metadata" in metadata.reason
+
+
 def test_install_browser_guard_wraps_upstream_navigate(monkeypatch, tmp_path: Path):
     profile = tmp_path / "profiles" / "alice"
     calls = []

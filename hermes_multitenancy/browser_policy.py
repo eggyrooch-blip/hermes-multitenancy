@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -221,11 +222,40 @@ def _ip_for_host(host: str):
         return None
 
 
+def _resolved_ips_for_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    ip = _ip_for_host(host)
+    if ip is not None:
+        return [ip]
+    try:
+        results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+
+    resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for result in results:
+        try:
+            sockaddr = result[4]
+            resolved.append(ipaddress.ip_address(str(sockaddr[0]).strip("[]")))
+        except (IndexError, ValueError, TypeError):
+            continue
+    return resolved
+
+
+def _is_private_or_internal_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
 def _is_metadata_host(host: str) -> bool:
     if host in _METADATA_HOSTS:
         return True
-    ip = _ip_for_host(host)
-    return ip in _METADATA_IPS if ip is not None else False
+    return any(ip in _METADATA_IPS for ip in _resolved_ips_for_host(host))
 
 
 def _is_private_or_internal_host(host: str) -> bool:
@@ -235,17 +265,7 @@ def _is_private_or_internal_host(host: str) -> bool:
         return True
     if host.endswith(".local"):
         return True
-    ip = _ip_for_host(host)
-    if ip is None:
-        return False
-    return bool(
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+    return any(_is_private_or_internal_ip(ip) for ip in _resolved_ips_for_host(host))
 
 
 def decide_url(url: str, decision: BrowserDecision) -> UrlDecision:
