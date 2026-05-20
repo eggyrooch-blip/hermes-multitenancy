@@ -175,6 +175,19 @@ def _webui_owned_profile_name(owner_open_id: str, profile_name: str) -> str:
     return cron_api.validate_profile_name(f"{prefix}{stem}{suffix}")
 
 
+def _owner_allowed_upstream_profiles(table: Any, trusted_owner: str, owner_root: Any) -> set[str]:
+    profiles = {str(owner_root.profile_name)}
+    try:
+        profiles.update(
+            str(row.profile_name)
+            for row in table.list_by_owner(trusted_owner)
+            if getattr(row, "profile_name", None)
+        )
+    except Exception:
+        logger.exception("[multitenancy] failed to enumerate owner profiles for upstream validation")
+    return profiles
+
+
 def _resolve_owner_scoped_profile(
     request: Any,
     payload: dict[str, Any],
@@ -495,6 +508,12 @@ def create_run_broker_app(
             return web.json_response({
                 "error": f"asserted owner '{trusted_owner}' has no sync-root profile"
             }, status=403)
+        allowed_upstreams = _owner_allowed_upstream_profiles(table, trusted_owner, owner_root)
+        if upstream_profile is not None and upstream_profile not in allowed_upstreams:
+            return web.json_response({
+                "error": f"upstream_profile '{upstream_profile}' is not accessible for asserted owner"
+            }, status=403)
+        effective_upstream_profile = upstream_profile or owner_root.profile_name
 
         stable_agent_id = _webui_agent_id(trusted_owner, profile_name)
         if requested_agent_id and requested_agent_id != stable_agent_id:
@@ -512,7 +531,7 @@ def create_run_broker_app(
                 profile_name=routed_profile_name,
                 owner_open_id=trusted_owner,
                 display_label=display_label,
-                upstream_profile=upstream_profile or owner_root.profile_name,
+                upstream_profile=effective_upstream_profile,
             )
             shared_home = _shared_home_from_env()
             router_mod._ensure_webui_agent_profile(
@@ -521,7 +540,7 @@ def create_run_broker_app(
                 owner_open_id=trusted_owner,
                 display_label=display_label,
                 agent_id=agent_id,
-                upstream_profile=upstream_profile or owner_root.profile_name,
+                upstream_profile=effective_upstream_profile,
             )
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=403)
@@ -533,7 +552,7 @@ def create_run_broker_app(
             "routed_profile_name": routed_profile_name,
             "owner_open_id": trusted_owner,
             "display_label": display_label,
-            "upstream_profile": upstream_profile or owner_root.profile_name,
+            "upstream_profile": effective_upstream_profile,
         })
 
     async def handle_list_jobs(request):

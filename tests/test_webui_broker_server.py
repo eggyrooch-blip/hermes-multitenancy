@@ -1119,6 +1119,109 @@ def test_webui_profile_provisioning_requires_owner_header(tmp_path):
     asyncio.run(runner())
 
 
+def test_webui_profile_provisioning_rejects_cross_owner_upstream_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "profiles" / "owner_b").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.upsert(user_id="root-b", profile_name="owner_b", open_id="ou_owner_b", provenance="sync")
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "owner_b",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "upstream_profile" in body
+        assert not any((shared_home / "profiles").glob("webui_*_web_coder_*"))
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_allows_owned_upstream_agent_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "profiles" / "owned_template").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.upsert_owned_agent(
+        agent_id="webui:ou_owner_a:template",
+        profile_name="owned_template",
+        owner_open_id="ou_owner_a",
+        display_label="Template",
+        upstream_profile="owner_a",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "owned_template",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["upstream_profile"] == "owned_template"
+
+    asyncio.run(runner())
+
+
 def test_webui_profile_provisioning_rejects_cross_owner_agent_id(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
