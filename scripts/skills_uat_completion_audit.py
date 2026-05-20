@@ -661,6 +661,32 @@ def _hermes_loader_symlink_ok(case: dict[str, Any]) -> tuple[bool, str]:
     return ok, note
 
 
+def _keep_four_skill_policy_ok(case: dict[str, Any]) -> tuple[bool, str]:
+    keep_user_skills = sorted(str(skill) for skill in case.get("keep_user_skills") or [])
+    ops_user_skills = sorted(str(skill) for skill in case.get("ops_user_skills") or [])
+    expected_keep = {"keep-record", "kep-cli", "kep-prd-analysis", "kep-hades-cli"}
+    expected_ops = {"kep-hades-cli"}
+    keep_set = set(keep_user_skills)
+    ops_set = set(ops_user_skills)
+    missing_keep = sorted(expected_keep - keep_set)
+    unexpected_keep = sorted(keep_set - expected_keep)
+    missing_ops = sorted(expected_ops - ops_set)
+    unexpected_ops = sorted(ops_set - expected_ops)
+    ok = (
+        case.get("ok") is True
+        and not missing_keep
+        and not unexpected_keep
+        and not missing_ops
+        and not unexpected_ops
+    )
+    note = (
+        f"keep_user_skills={keep_user_skills}; ops_user_skills={ops_user_skills}; "
+        f"missing_keep_skills={missing_keep}; unexpected_keep_skills={unexpected_keep}; "
+        f"missing_ops_skills={missing_ops}; unexpected_ops_skills={unexpected_ops}"
+    )
+    return ok, note
+
+
 def _skill_inventory_ok(case: dict[str, Any]) -> tuple[bool, str]:
     source_counts = case.get("source_counts") if isinstance(case.get("source_counts"), dict) else {}
     required_sources = ("managed", "personal", "unknown")
@@ -1002,6 +1028,14 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         "covered" if loader_ok else "failed",
         str(matrix_path),
         loader_note,
+    ))
+    keep_case = cases.get("offline_keep_four_skill_policy_model") or {}
+    keep_ok, keep_note = _keep_four_skill_policy_ok(keep_case)
+    items.append(_item(
+        "Validate Keep-style four-skill policy model covers QR, OAuth, shared-token, and tokenless department distribution.",
+        "covered" if keep_ok else "failed",
+        str(matrix_path),
+        keep_note,
     ))
     new_hire_case = cases.get("offline_new_hire_sync_auto_installs_managed_skills") or {}
     new_hire_ok, new_hire_note = _new_hire_sync_ok(new_hire_case)
