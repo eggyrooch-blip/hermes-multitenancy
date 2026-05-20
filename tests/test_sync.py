@@ -211,6 +211,114 @@ def test_cli_apply_end_to_end(tmp_path):
         t.close()
 
 
+def test_plan_profile_skill_sync_reports_add_modified_removed_and_secret_guard(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import (
+        Employee,
+        MANAGED_SKILL_MANIFEST,
+        plan_profile_skill_sync,
+    )
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    (shared / "skills" / "lark-base").mkdir(parents=True)
+    (shared / "skills" / "lark-base" / "SKILL.md").write_text("# Lark Base\n", encoding="utf-8")
+    (shared / "skills" / "internal" / "report").mkdir(parents=True)
+    (shared / "skills" / "internal" / "report" / "SKILL.md").write_text("# Report\n", encoding="utf-8")
+    (shared / "skills" / "lark-secret").mkdir(parents=True)
+    (shared / "skills" / "lark-secret" / "SKILL.md").write_text("# Secret\n", encoding="utf-8")
+    (shared / "skills" / "lark-secret" / ".env").write_text("TOKEN=should-not-leak\n", encoding="utf-8")
+    (shared / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: lark-base
+    install_mode: symlink
+  - path: internal/report
+    install_mode: copy
+  - path: lark-secret
+    install_mode: symlink
+""",
+        encoding="utf-8",
+    )
+    (profile / "skills" / "internal" / "report").mkdir(parents=True)
+    (profile / "skills" / "internal" / "report" / "SKILL.md").write_text("# User edited\n", encoding="utf-8")
+    (profile / "skills").mkdir(parents=True, exist_ok=True)
+    (profile / "skills" / MANAGED_SKILL_MANIFEST).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "skills": {
+                    "internal/report": {
+                        "source": str(shared / "skills" / "internal" / "report"),
+                        "install_mode": "copy",
+                    },
+                    "old-skill": {
+                        "source": str(shared / "skills" / "old-skill"),
+                        "install_mode": "copy",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = plan_profile_skill_sync(
+        profile,
+        shared,
+        Employee(
+            open_id="ou_alice",
+            user_id="alice",
+            agent_id="alice",
+            profile_name="alice",
+            name="Alice",
+            dept_id="dept",
+            dept_name="Dept",
+            leader_user_id=None,
+        ),
+    )
+
+    assert result["changed"] is True
+    assert result["counts"]["upstream_added"] == 2
+    assert result["counts"]["profile_modified"] == 1
+    assert result["counts"]["multitenancy_removed"] == 1
+    items = {item["path"]: item for item in result["items"]}
+    assert items["lark-base"]["change"] == "upstream_added"
+    assert items["lark-secret"]["secret_guard"] == "copy_filtered"
+    assert items["internal/report"]["change"] == "profile_modified"
+    assert items["old-skill"]["change"] == "multitenancy_removed"
+    assert not (profile / "skills" / "lark-base").exists()
+    assert "should-not-leak" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_sync_cli_plan_skills_outputs_secret_free_json(capsys, tmp_path):
+    from hermes_multitenancy.sync.cli import main
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    (shared / "skills" / "lark-docs").mkdir(parents=True)
+    (shared / "skills" / "lark-docs" / "SKILL.md").write_text("# Docs\n", encoding="utf-8")
+    (shared / "profile-skill-defaults.yaml").write_text("skills:\n  - lark-docs\n", encoding="utf-8")
+
+    code = main([
+        "plan-skills",
+        "--home",
+        str(shared),
+        "--profile-home",
+        str(profile),
+        "--profile-name",
+        "alice",
+        "--open-id",
+        "ou_alice",
+    ])
+    output = capsys.readouterr().out
+
+    assert code == 0
+    parsed = json.loads(output)
+    assert parsed["changed"] is True
+    assert parsed["counts"]["upstream_added"] == 1
+    assert parsed["items"][0]["path"] == "lark-docs"
+    assert parsed["secret_free"] is True
+
+
 def test_profile_name_for_user_id_normalizes_to_hermes_profile_id():
     from hermes_multitenancy.sync import profile_name_for_user_id
 

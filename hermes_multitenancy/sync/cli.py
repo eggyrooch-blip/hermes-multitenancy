@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from .feishu_hr import UserSpec, apply_users
-from .feishu_org import sync_feishu_org
+from .feishu_org import Employee, plan_profile_skill_sync, sync_feishu_org
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,6 +56,16 @@ def main(argv: list[str] | None = None) -> int:
     p_materialize.add_argument("--db", type=Path, default=None, help="Credential DB path (default: <home>/multitenancy.db)")
     p_materialize.add_argument("--config", type=Path, default=None, help="Materialization config path")
     p_materialize.add_argument("--dry-run", action="store_true", help="Plan writes without touching profile files")
+
+    p_plan_skills = sub.add_parser("plan-skills", help="Plan profile skill sync without writing files")
+    p_plan_skills.add_argument("--home", type=Path, default=None, help="Shared Hermes home (default: HERMES_HOME or ~/.hermes)")
+    p_plan_skills.add_argument("--profile-home", type=Path, required=True, help="Target profile home")
+    p_plan_skills.add_argument("--profile-name", required=True, help="Target profile name")
+    p_plan_skills.add_argument("--open-id", default="", help="Feishu open_id for audience matching")
+    p_plan_skills.add_argument("--user-id", default=None, help="Feishu user_id for audience matching")
+    p_plan_skills.add_argument("--dept-id", default="", help="Department id for audience matching")
+    p_plan_skills.add_argument("--dept-name", default="", help="Department name for audience matching")
+    p_plan_skills.add_argument("--upstream-profile-home", type=Path, default=None, help="Optional upstream profile home for child inheritance")
 
     args = parser.parse_args(argv)
 
@@ -112,6 +122,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(stats, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "plan-skills":
+        home = (args.home or Path("~/.hermes")).expanduser()
+        employee = Employee(
+            open_id=args.open_id,
+            user_id=args.user_id or args.profile_name,
+            agent_id=args.profile_name,
+            profile_name=args.profile_name,
+            name=args.profile_name,
+            dept_id=args.dept_id,
+            dept_name=args.dept_name,
+            leader_user_id=None,
+        )
+        stats = plan_profile_skill_sync(
+            args.profile_home,
+            home,
+            employee,
+            upstream_profile_home=args.upstream_profile_home,
+        )
+        print(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
     return 2

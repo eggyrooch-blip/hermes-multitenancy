@@ -279,7 +279,7 @@ def lark_cli_canary_preflight(
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in {"preflight", "import-legacy-uat", "import-app-config"}:
+    if not argv or argv[0] not in {"preflight", "import-legacy-uat", "import-app-config", "health"}:
         argv.insert(0, "preflight")
     parser = argparse.ArgumentParser(prog="lark-cli-canary-preflight")
     subparsers = parser.add_subparsers(dest="cmd")
@@ -296,6 +296,10 @@ def main(argv: list[str] | None = None) -> int:
     p_import_app = subparsers.add_parser("import-app-config")
     p_import_app.add_argument("--shared-home", type=Path, default=Path("~/.hermes"))
     p_import_app.add_argument("--config", type=Path, default=None)
+    p_health = subparsers.add_parser("health")
+    p_health.add_argument("--shared-home", type=Path, default=Path("~/.hermes"))
+    p_health.add_argument("--profile-home", type=Path, default=None)
+    p_health.add_argument("--router-profile-home", type=Path, default=None)
     args = parser.parse_args(argv)
     if args.cmd == "import-legacy-uat":
         result = import_legacy_uat_to_vault(
@@ -313,6 +317,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if result["imported"] else 2
+    if args.cmd == "health":
+        from .upstream_health import upstream_capability_health
+
+        result = upstream_capability_health(
+            shared_home=args.shared_home,
+            profile_home=args.profile_home,
+            router_profile_home=args.router_profile_home,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if result["ready"] else 2
     result = lark_cli_canary_preflight(
         shared_home=args.shared_home,
         profile_name=args.profile,

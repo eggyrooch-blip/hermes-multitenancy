@@ -618,6 +618,122 @@ def _sync_default_profile_skills(
     employee: Employee | None = None,
     upstream_profile_home: Path | None = None,
 ) -> bool:
+    changed = False
+    desired: dict[str, dict[str, Any]] = {}
+    for spec in _profile_skill_specs(
+        profile_home,
+        shared_home,
+        employee=employee,
+        upstream_profile_home=upstream_profile_home,
+    ):
+        rel_path, src, metadata = _desired_skill_metadata(spec, shared_home=shared_home)
+        if not src.is_dir():
+            continue
+        dst = profile_home / "skills" / rel_path
+        if metadata.get("install_mode") == "symlink":
+            if _skill_tree_has_secret_files(src):
+                changed = _copy_skill_tree(src, dst) or changed
+            else:
+                changed = _link_shared_skill_tree(src, dst) or changed
+        else:
+            changed = _copy_skill_tree(src, dst) or changed
+        desired[str(rel_path)] = metadata
+    changed = _prune_removed_managed_skills(profile_home, desired) or changed
+    changed = _write_managed_skill_manifest(profile_home, desired) or changed
+    return changed
+
+
+def plan_profile_skill_sync(
+    profile_home: Path,
+    shared_home: Path,
+    employee: Employee | None = None,
+    upstream_profile_home: Path | None = None,
+) -> dict[str, Any]:
+    """Plan profile skill sync without mutating the profile filesystem."""
+    desired: dict[str, dict[str, Any]] = {}
+    items: list[dict[str, Any]] = []
+    for spec in _profile_skill_specs(
+        profile_home,
+        shared_home,
+        employee=employee,
+        upstream_profile_home=upstream_profile_home,
+    ):
+        rel_path, src, metadata = _desired_skill_metadata(spec, shared_home=shared_home)
+        if not src.is_dir():
+            continue
+        desired[str(rel_path)] = metadata
+
+    previous = _read_managed_skill_manifest(profile_home)
+    for rel_raw, metadata in sorted(desired.items()):
+        rel_path = _safe_skill_relative_path(rel_raw)
+        if rel_path is None:
+            continue
+        previous_metadata = previous.get(rel_raw)
+        change = "unchanged"
+        if not isinstance(previous_metadata, dict):
+            change = "upstream_added"
+        elif _profile_skill_target_modified(profile_home / "skills" / rel_path, metadata):
+            change = "profile_modified"
+        elif _managed_skill_metadata_changed(previous_metadata, metadata):
+            change = "upstream_updated"
+        item = {
+            "path": rel_raw,
+            "change": change,
+            "install_mode": metadata.get("install_mode"),
+            "managed": True,
+            "source_exists": True,
+        }
+        for key in (
+            "requested_install_mode",
+            "secret_guard",
+            "version",
+            "token_policy",
+            "requires_token",
+            "share_with_children",
+            "inherited_from",
+        ):
+            if metadata.get(key) is not None:
+                item[key] = metadata[key]
+        items.append(item)
+
+    for rel_raw in sorted(set(previous) - set(desired)):
+        if _safe_skill_relative_path(rel_raw) is None:
+            continue
+        items.append(
+            {
+                "path": rel_raw,
+                "change": "multitenancy_removed",
+                "managed": True,
+                "source_exists": False,
+            }
+        )
+
+    counts = {
+        "upstream_added": 0,
+        "upstream_updated": 0,
+        "profile_modified": 0,
+        "multitenancy_removed": 0,
+        "unchanged": 0,
+    }
+    for item in items:
+        counts[str(item["change"])] += 1
+    return {
+        "profile_home": str(profile_home),
+        "shared_home": str(shared_home),
+        "changed": any(item["change"] != "unchanged" for item in items),
+        "counts": counts,
+        "items": items,
+        "secret_free": True,
+    }
+
+
+def _profile_skill_specs(
+    profile_home: Path,
+    shared_home: Path,
+    *,
+    employee: Employee | None = None,
+    upstream_profile_home: Path | None = None,
+) -> list[dict[str, Any]]:
     child_only = upstream_profile_home is not None and employee is None
     if employee is None:
         employee = Employee(
@@ -630,8 +746,6 @@ def _sync_default_profile_skills(
             dept_name="",
             leader_user_id=None,
         )
-    changed = False
-    desired: dict[str, dict[str, Any]] = {}
     specs_by_path: dict[str, dict[str, Any]] = {}
     for spec in _child_profile_skill_specs_from_upstream(
         upstream_profile_home, shared_home=shared_home
@@ -639,48 +753,38 @@ def _sync_default_profile_skills(
         specs_by_path[str(spec["path"])] = spec
     if not child_only:
         for spec in _default_profile_skill_specs(shared_home, employee):
-            # Direct profile audience always wins over child inheritance for the
-            # same visible skill path.
             specs_by_path[str(spec["path"])] = spec
+    return sorted(specs_by_path.values(), key=lambda item: str(item["path"]))
 
-    for spec in sorted(specs_by_path.values(), key=lambda item: str(item["path"])):
-        rel_path = spec["path"]
-        install_mode = spec["install_mode"]
-        src = spec.get("source_path") or (shared_home / "skills" / rel_path)
-        if not src.is_dir():
-            continue
-        dst = profile_home / "skills" / rel_path
-        actual_install_mode = install_mode
-        secret_guard = None
-        if install_mode == "symlink":
-            if _skill_tree_has_secret_files(src):
-                actual_install_mode = "copy"
-                secret_guard = "copy_filtered"
-                changed = _copy_skill_tree(src, dst) or changed
-            else:
-                changed = _link_shared_skill_tree(src, dst) or changed
-        else:
-            changed = _copy_skill_tree(src, dst) or changed
-        desired[str(rel_path)] = {
-            "source": str(src),
-            "install_mode": actual_install_mode,
-        }
-        if actual_install_mode != install_mode:
-            desired[str(rel_path)]["requested_install_mode"] = install_mode
-        if secret_guard is not None:
-            desired[str(rel_path)]["secret_guard"] = secret_guard
-        for key in (
-            "version",
-            "token_policy",
-            "requires_token",
-            "share_with_children",
-            "inherited_from",
-        ):
-            if spec.get(key) is not None:
-                desired[str(rel_path)][key] = spec[key]
-    changed = _prune_removed_managed_skills(profile_home, desired) or changed
-    changed = _write_managed_skill_manifest(profile_home, desired) or changed
-    return changed
+
+def _desired_skill_metadata(
+    spec: dict[str, Any],
+    *,
+    shared_home: Path,
+) -> tuple[Path, Path, dict[str, Any]]:
+    rel_path = spec["path"]
+    install_mode = spec["install_mode"]
+    src = spec.get("source_path") or (shared_home / "skills" / rel_path)
+    actual_install_mode = install_mode
+    metadata: dict[str, Any] = {
+        "source": str(src),
+        "install_mode": actual_install_mode,
+    }
+    if install_mode == "symlink" and src.is_dir() and _skill_tree_has_secret_files(src):
+        actual_install_mode = "copy"
+        metadata["install_mode"] = actual_install_mode
+        metadata["requested_install_mode"] = install_mode
+        metadata["secret_guard"] = "copy_filtered"
+    for key in (
+        "version",
+        "token_policy",
+        "requires_token",
+        "share_with_children",
+        "inherited_from",
+    ):
+        if spec.get(key) is not None:
+            metadata[key] = spec[key]
+    return rel_path, src, metadata
 
 
 def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[dict[str, Any]]:
@@ -949,6 +1053,52 @@ def _skill_tree_has_secret_files(src: Path) -> bool:
             if _is_secret_skill_file(item.relative_to(src)):
                 return True
     return False
+
+
+def _profile_skill_target_modified(target: Path, metadata: dict[str, Any]) -> bool:
+    source = Path(str(metadata.get("source") or ""))
+    install_mode = str(metadata.get("install_mode") or "")
+    if not source.is_dir():
+        return True
+    if install_mode == "symlink":
+        return not _same_symlink(target, source)
+    if not target.is_dir() or target.is_symlink():
+        return True
+    return _skill_tree_digest(source) != _skill_tree_digest(target)
+
+
+def _managed_skill_metadata_changed(previous: dict[str, Any], desired: dict[str, Any]) -> bool:
+    keys = {
+        "source",
+        "install_mode",
+        "requested_install_mode",
+        "secret_guard",
+        "version",
+        "token_policy",
+        "requires_token",
+        "share_with_children",
+        "inherited_from",
+    }
+    return {key: previous.get(key) for key in keys} != {key: desired.get(key) for key in keys}
+
+
+def _skill_tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    if not root.exists():
+        return ""
+    for item in sorted(root.rglob("*"), key=lambda path: str(path.relative_to(root))):
+        rel = item.relative_to(root)
+        if item.is_symlink() or any(part in _SKILL_IGNORED_DIRS for part in rel.parts):
+            continue
+        if item.is_dir():
+            continue
+        if _is_secret_skill_file(rel):
+            continue
+        digest.update(str(rel).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(item.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _should_symlink_shared_skill(rel_path: Path) -> bool:
