@@ -4185,6 +4185,17 @@ _STREAM_ABORT_FALLBACK = "Aborted."
 _STREAM_MAX_VISIBLE_CHARS = 3_000
 
 
+def _is_aiagent_stream_idle_timeout(exc: BaseException) -> bool:
+    return "AIAgent subprocess produced no stream events" in str(exc)
+
+
+def _aiagent_stream_timeout_notice(exc: BaseException) -> str:
+    return (
+        "\n\n⚠️ 当前任务长时间没有新的运行事件，已停止本次流式执行。\n"
+        f"{exc}"
+    )
+
+
 def _stream_card_idle_status(tick: int) -> str:
     """Return a visibly changing pre-token status for CardKit typewriter keepalive."""
     dots = "." * (3 + (tick % 3))
@@ -4359,6 +4370,15 @@ async def _stream_into_feishu_shared_consumer(
                             last_reasoning_edit = now
                         continue
 
+                    if kind == "status":
+                        text = str(delta or "").strip()
+                        if text:
+                            try:
+                                await consumer.update_streaming_card_status(text)
+                            except Exception as exc:
+                                logger.debug("multitenancy: shared card status update failed: %s", exc)
+                        continue
+
                     if kind == "tool_started":
                         payload = delta if isinstance(delta, dict) else {"name": str(delta or "tool")}
                         await consumer.update_streaming_card_tool_started(
@@ -4400,18 +4420,25 @@ async def _stream_into_feishu_shared_consumer(
                     consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
                     content_delta_seen = True
             except Exception as exc:
-                logger.info("multitenancy: shared streaming failed (%s) — falling back to non-stream", exc)
-                try:
-                    content = await real_run_agent(event, profile_home, messages=messages)
-                except Exception as fallback_exc:
-                    logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
-                    content = (
-                        "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
-                        "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
-                    )
-                if not content_delta_seen:
-                    consumer.on_delta(_clean_stream_display_text(content, profile_home))
+                if _is_aiagent_stream_idle_timeout(exc):
+                    logger.warning("multitenancy: shared streaming stopped on idle timeout: %s", exc)
+                    timeout_notice = _aiagent_stream_timeout_notice(exc)
+                    content += timeout_notice
+                    consumer.on_delta(_clean_stream_display_text(timeout_notice, profile_home))
                     content_delta_seen = True
+                else:
+                    logger.info("multitenancy: shared streaming failed (%s) — falling back to non-stream", exc)
+                    try:
+                        content = await real_run_agent(event, profile_home, messages=messages)
+                    except Exception as fallback_exc:
+                        logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
+                        content = (
+                            "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
+                            "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
+                        )
+                    if not content_delta_seen:
+                        consumer.on_delta(_clean_stream_display_text(content, profile_home))
+                        content_delta_seen = True
         finally:
             _PROFILE_HOME_VAR.reset(token)
             await _stop_idle_card_heartbeat()
@@ -4738,6 +4765,22 @@ async def _stream_into_feishu(
                         if isinstance(delta, dict):
                             _clear_pending_approval(delta)
                         continue
+                    elif kind == "status":
+                        status_text = str(delta or "").strip()
+                        if status_text:
+                            try:
+                                await _update_feishu_stream_status(
+                                    adapter,
+                                    chat_id,
+                                    placeholder_id,
+                                    status_text,
+                                    mode=stream_mode,
+                                )
+                            except Exception as exc:
+                                logger.debug("multitenancy: stream status update failed: %s", exc)
+                            last_edit_time = time.monotonic()
+                            last_render_len = len(render())
+                        continue
                     elif kind == "done":
                         continue
                     else:
@@ -4835,20 +4878,36 @@ async def _stream_into_feishu(
                         last_edit_time = now
                         last_render_len = len(rendered)
             except Exception as exc:
-                logger.info("multitenancy: streaming failed (%s) — falling back to non-stream", exc)
-                try:
-                    content = await real_run_agent(event, profile_home, messages=messages)
-                    full_content = content
-                except Exception as fallback_exc:
-                    # Both stream + non-stream LLM paths failed (e.g. region block,
-                    # exhausted credentials). Surface a user-visible error instead
-                    # of leaving the "..." placeholder hanging.
-                    logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
-                    content = (
-                        "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
-                        "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
-                    )
-                    full_content = content
+                if _is_aiagent_stream_idle_timeout(exc):
+                    logger.warning("multitenancy: streaming stopped on idle timeout: %s", exc)
+                    timeout_notice = _aiagent_stream_timeout_notice(exc)
+                    content += timeout_notice
+                    full_content += timeout_notice
+                    try:
+                        await _update_feishu_stream_status(
+                            adapter,
+                            chat_id,
+                            placeholder_id,
+                            "任务长时间没有新的运行事件，已停止。",
+                            mode=stream_mode,
+                        )
+                    except Exception as status_exc:
+                        logger.debug("multitenancy: idle-timeout status update failed: %s", status_exc)
+                else:
+                    logger.info("multitenancy: streaming failed (%s) — falling back to non-stream", exc)
+                    try:
+                        content = await real_run_agent(event, profile_home, messages=messages)
+                        full_content = content
+                    except Exception as fallback_exc:
+                        # Both stream + non-stream LLM paths failed (e.g. region block,
+                        # exhausted credentials). Surface a user-visible error instead
+                        # of leaving the "..." placeholder hanging.
+                        logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
+                        content = (
+                            "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
+                            "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
+                        )
+                        full_content = content
         finally:
             _PROFILE_HOME_VAR.reset(token)
             await _stop_idle_card_heartbeat()

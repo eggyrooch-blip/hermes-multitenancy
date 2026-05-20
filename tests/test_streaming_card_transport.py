@@ -1540,6 +1540,72 @@ async def test_stream_into_feishu_updates_card_for_tool_and_reasoning_events(
     assert adapter.updates[-1]["finalize"] is True
 
 
+@pytest.mark.asyncio
+async def test_stream_into_feishu_status_event_updates_card_without_polluting_content(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "Phase 2: 子 Agent 并行验证\n")
+        yield ("status", "Hermes 正在等待当前工具或子任务输出，已等待 315 秒。")
+        yield ("content", "done")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    adapter = _CardCapableAdapter()
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Phase 2: 子 Agent 并行验证\ndone"
+    assert adapter.status_updates[-1] == {
+        "chat_id": "chat-1",
+        "message_id": "card-1",
+        "content": "Hermes 正在等待当前工具或子任务输出，已等待 315 秒。",
+    }
+    assert adapter.updates[-1]["content"] == "Phase 2: 子 Agent 并行验证\ndone"
+    assert "315 秒" not in adapter.updates[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_stream_into_feishu_idle_timeout_finalizes_without_nonstream_rerun(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "Phase 2 running")
+        raise RuntimeError("AIAgent subprocess produced no stream events for 1200s")
+
+    async def fail_nonstream(*_args, **_kwargs):
+        raise AssertionError("idle timeout must not rerun the whole agent")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(agent_real, "real_run_agent", fail_nonstream)
+
+    adapter = _CardCapableAdapter()
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert "Phase 2 running" in response
+    assert "produced no stream events" in response
+    assert adapter.status_updates[-1]["content"] == "任务长时间没有新的运行事件，已停止。"
+    assert "produced no stream events" in adapter.updates[-1]["content"]
+    assert adapter.updates[-1]["finalize"] is True
+
+
 def test_stream_into_feishu_streams_raw_reasoning_in_card(monkeypatch, tmp_path):
     from hermes_multitenancy import agent_real, router as router_mod
 

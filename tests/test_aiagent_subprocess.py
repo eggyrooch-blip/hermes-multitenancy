@@ -689,6 +689,143 @@ async def test_stream_aiagent_subprocess_wait_heartbeat_does_not_become_reasonin
     assert events == [("done", "ok")]
 
 
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_emits_status_while_waiting_after_first_event(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return b'{"event": "tool_started", "name": "delegate_task"}\n'
+            if self.calls == 2:
+                await asyncio.sleep(0.03)
+                return b'{"event": "done", "result": "ok", "error": null}\n'
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    events = [
+        item
+        async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+    ]
+
+    assert events[0] == ("tool_started", {"name": "delegate_task"})
+    assert events[1][0] == "status"
+    assert "正在等待当前工具或子任务输出" in events[1][1]
+    assert events[-1] == ("done", "ok")
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_idle_timeout_is_runtime_error_not_cancelled(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    created = {}
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return b'{"event": "tool_started", "name": "delegate_task"}\n'
+            await asyncio.sleep(60)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        created["proc"] = FakeProc()
+        return created["proc"]
+
+    monkeypatch.setenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "0.02")
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError, match="produced no stream events"):
+        async for _item in agent_real._stream_aiagent_subprocess(_event(), tmp_path):
+            pass
+
+    assert created["proc"].killed is True
+
+
 def test_event_payload_carries_sender_open_id_from_raw_message(tmp_path: Path):
     from hermes_multitenancy import agent_real
 

@@ -2049,7 +2049,7 @@ async def _run_aiagent_subprocess(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
-    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "1200"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env_scope = _aiagent_subprocess_env_scope(event, profile_home, approval_dir=approval_dir)
     env_scope_entered = False
@@ -2369,7 +2369,7 @@ async def _stream_aiagent_subprocess(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
-    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "1200"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env_scope = _aiagent_subprocess_env_scope(
         event,
@@ -2438,6 +2438,8 @@ async def _stream_aiagent_subprocess(
                         read_task.cancel()
                         try:
                             await read_task
+                        except asyncio.CancelledError:
+                            pass
                         except Exception:
                             pass
                         raise asyncio.TimeoutError()
@@ -2447,11 +2449,18 @@ async def _stream_aiagent_subprocess(
                     if done:
                         break
                     heartbeat_count += 1
+                    total_elapsed = time.monotonic() - started_at
                     logger.info(
-                        "[multitenancy] waiting for AIAgent subprocess first event elapsed=%.3fs heartbeat=%s",
-                        time.monotonic() - started_at,
+                        "[multitenancy] waiting for AIAgent subprocess stream event elapsed=%.3fs heartbeat=%s",
+                        total_elapsed,
                         heartbeat_count,
                     )
+                    if first_event_logged:
+                        yield (
+                            "status",
+                            "Hermes 正在等待当前工具或子任务输出，"
+                            f"已等待 {int(total_elapsed)} 秒。",
+                        )
                 line = read_task.result()
             finally:
                 if not read_task.done():
@@ -2537,6 +2546,13 @@ async def _stream_aiagent_subprocess(
             raise RuntimeError(f"AIAgent subprocess exited {returncode}: {stderr_text[-1000:]}")
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
+    except asyncio.TimeoutError as exc:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise RuntimeError(
+            f"AIAgent subprocess produced no stream events for {timeout_s:g}s"
+        ) from exc
     except asyncio.CancelledError:
         if proc is not None:
             proc.kill()
