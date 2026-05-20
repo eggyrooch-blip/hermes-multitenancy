@@ -1077,6 +1077,20 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         f"group_personal_install_preserved={group_child_version_case.get('group_personal_install_preserved')}; "
         f"group_token_files={group_child_version_case.get('group_token_files')}",
     ))
+    child_reverse_case = cases.get("offline_child_install_does_not_sync_back_to_parent") or {}
+    child_reverse_ok = (
+        child_reverse_case.get("ok") is True
+        and child_reverse_case.get("group_personal_install") is True
+        and child_reverse_case.get("owner_received_child_install") is False
+    )
+    items.append(_item(
+        "Validate child or group-local skill installs do not sync back into the owner/root profile.",
+        "covered" if child_reverse_ok else "failed",
+        str(matrix_path),
+        "group_personal_install="
+        f"{child_reverse_case.get('group_personal_install')}; "
+        f"owner_received_child_install={child_reverse_case.get('owner_received_child_install')}",
+    ))
     context_case = cases.get("offline_context_continuity_private_and_group") or {}
     items.append(_item(
         "Cover the candidate 'second problem' class found in local Hermes notes: private/group context fragmentation.",

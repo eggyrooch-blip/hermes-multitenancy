@@ -259,6 +259,8 @@ def test_second_problem_trace_treats_generated_test_fixture_followup_as_placehol
     assert report["exact_issue_text_found"] is False
     assert report["exact_match_count"] == 0
     assert report["placeholder_match_count"] == 1
+    assert report["placeholder_source_counts"] == {"agent_history_generated_fixture": 1}
+    assert report["exact_phrase_source_counts"] == {"agent_history_generated_fixture": 1}
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 

@@ -171,6 +171,11 @@ def _base_evidence(tmp_path: Path) -> object:
                 "group_personal_install_preserved": True,
                 "group_token_files": 0,
             })
+        if name == "offline_child_install_does_not_sync_back_to_parent":
+            case.update({
+                "group_personal_install": True,
+                "owner_received_child_install": False,
+            })
         if name == "offline_continue_turn_reconstructs_interrupted_request":
             case.update({
                 "continue_used_previous_request": True,
@@ -794,6 +799,34 @@ def test_completion_audit_requires_group_child_version_case_to_track_upstream_ow
         item
         for item in report["items"]
         if item["requirement"].startswith("Validate group child profiles inherit upstream shared skill version")
+    )
+    assert item["status"] == "failed"
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_requires_child_install_to_stay_out_of_owner_profile(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    skills_path = tmp_path / "skills-uat-latest.json"
+    payload = json.loads(skills_path.read_text(encoding="utf-8"))
+    case = next(
+        case
+        for case in payload["cases"]
+        if case.get("name") == "offline_child_install_does_not_sync_back_to_parent"
+    )
+    case["owner_received_child_install"] = True
+    skills_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Validate child or group-local skill installs do not sync back")
     )
     assert item["status"] == "failed"
     assert report["evidence_ok"] is False
@@ -1523,7 +1556,7 @@ def test_completion_audit_accepts_required_dialogue_and_write_identity_coverage(
 
     assert report["failed"] == 0
     assert report["blocked"] == 3
-    assert report["covered"] == 26
+    assert report["covered"] == 27
     assert report["evidence_ok"] is True
     assert report["completion_state"] == "incomplete"
 
@@ -1551,7 +1584,7 @@ def test_completion_audit_treats_missing_credential_key_real_cases_as_blocked_no
     assert "blocked_failures" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 25
+    assert report["covered"] == 26
     assert report["evidence_ok"] is True
 
 
@@ -1578,7 +1611,7 @@ def test_completion_audit_treats_expired_real_user_uat_as_blocked_not_failed(tmp
     assert "real_feishu_uat_user_info" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 25
+    assert report["covered"] == 26
     assert report["evidence_ok"] is True
 
 
@@ -1611,7 +1644,7 @@ def test_completion_audit_treats_scope_inventory_without_valid_user_uat_as_block
     assert scope_item["status"] == "blocked"
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 25
+    assert report["covered"] == 26
     assert report["evidence_ok"] is True
 
 

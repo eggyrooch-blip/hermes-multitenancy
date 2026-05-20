@@ -536,6 +536,8 @@ def _exact_phrase_source(path: Path, sample: str, followup_text: str) -> str:
             return "agent_history_goal_context"
         if "Search the repo" in combined or "without the actual problem text" in combined:
             return "agent_history_investigation_instruction"
+        if "mapped_uat_scenarios" in combined or "if exact_found else" in combined:
+            return "agent_history_generated_fixture"
         return "agent_history_other"
     if "/AgentOS/" in normalized_path or path.name.upper() == "STATE.MD":
         return "state_journal_documented_absence"
