@@ -3286,7 +3286,6 @@ def _ensure_group_profile(
     _sync_default_skills_for_profile(
         profile_home,
         shared_home,
-        include_default_skills=True,
         upstream_profile_home=upstream_profile_home,
     )
 
