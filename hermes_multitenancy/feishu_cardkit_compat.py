@@ -31,6 +31,7 @@ _UNCLOSED_REASONING_TAG_RE = re.compile(
 )
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+_HIDDEN_TOOL_NAMES = {"skill_view"}
 
 try:  # pragma: no cover - import shape depends on the installed Hermes agent.
     from gateway.platforms.base import SendResult  # type: ignore
@@ -303,6 +304,13 @@ async def _flush_state(
         card_id = str(state.get("card_id") or "")
         original_card_id = str(state.get("original_card_id") or "")
         if final and original_card_id:
+            if card_id:
+                await _stream_cardkit_content(
+                    adapter,
+                    card_id,
+                    _render_stream_text(state),
+                    _next_sequence(state),
+                )
             await _set_card_streaming_mode(adapter, original_card_id, False, _next_sequence(state))
             await _update_cardkit_card(adapter, original_card_id, _to_cardkit2(_render_message_card(state)), _next_sequence(state))
             if pop:
@@ -553,6 +561,7 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     reasoning = _clean_reasoning_prefix(str(state.get("reasoning") or "")).strip()
     status = str(state.get("status") or "").strip()
     tools = list(state.get("tools") or [])
+    content = _strip_tool_process_narration(content, tools)
 
     parts: list[str] = []
     tool_section = _render_tool_calls_section(tools)
@@ -585,6 +594,7 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
     if reasoning:
         elements.append(_render_reasoning_panel(reasoning, state))
     if content:
+        content = _strip_tool_process_narration(content, tools)
         elements.append({"tag": "markdown", "content": _optimize_markdown_style(content)})
     else:
         elements.append({"tag": "markdown", "content": "..."})
@@ -647,12 +657,38 @@ def _render_reasoning_panel(reasoning: str, state: dict[str, Any]) -> dict[str, 
 
 
 def _render_tool_calls_section(tools: list[Any]) -> str:
-    normalized = [tool for tool in tools[-5:] if isinstance(tool, dict)]
+    normalized = _normalize_tool_rows(tools)[-5:]
     if not normalized:
         return ""
     lines = ["**Tool calls:**"]
     lines.extend(_render_tool_call_line(tool) for tool in normalized)
     return "\n".join(lines)
+
+
+def _normalize_tool_rows(tools: list[Any]) -> list[dict[str, Any]]:
+    rows = [
+        tool
+        for tool in tools
+        if isinstance(tool, dict)
+        and str(tool.get("name") or "") not in _HIDDEN_TOOL_NAMES
+    ]
+    result: list[dict[str, Any]] = []
+    for index, tool in enumerate(rows):
+        name = str(tool.get("name") or "")
+        preview = str(tool.get("preview") or "").strip().lower()
+        has_later_concrete = any(
+            str(later.get("name") or "") == name
+            and (
+                later.get("duration") is not None
+                or later.get("status") in {"done", "error"}
+                or later.get("args")
+            )
+            for later in rows[index + 1 :]
+        )
+        if preview == "generating arguments" and has_later_concrete:
+            continue
+        result.append(tool)
+    return result
 
 
 def _render_tool_call_line(tool: dict[str, Any]) -> str:
@@ -718,6 +754,39 @@ def _merge_raw_tool_intents(state: dict[str, Any], intents: list[dict[str, Any]]
 
 def _strip_tool_call_blocks(text: str) -> str:
     return _TOOL_CALL_BLOCK_RE.sub("", str(text or ""))
+
+
+_TOOL_PROCESS_NARRATION_RE = re.compile(
+    r"^\s*(?:"
+    r"我需要先|"
+    r"让我先|"
+    r"现在让我|"
+    r"接下来(?:我)?(?:来|会|将)?|"
+    r"找到了[\s\S]*(?:现在让我|让我|接下来)|"
+    r"文件已下载[，,]?\s*(?:让我|现在让我|接下来)|"
+    r"I need to|"
+    r"Let me|"
+    r"I'll (?:now|first)|"
+    r"Now I'll|"
+    r"Next(?:,| I)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_tool_process_narration(text: str, tools: list[Any]) -> str:
+    raw = str(text or "").strip()
+    if not raw or not tools:
+        return raw
+    paragraphs = re.split(r"\n\s*\n", raw)
+    kept = [
+        paragraph.strip()
+        for paragraph in paragraphs
+        if paragraph.strip() and not _TOOL_PROCESS_NARRATION_RE.match(paragraph.strip())
+    ]
+    if not kept:
+        return raw
+    return "\n\n".join(kept).strip()
 
 
 def _format_reasoning_label(state: dict[str, Any]) -> tuple[str, str]:

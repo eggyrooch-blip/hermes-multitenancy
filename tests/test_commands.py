@@ -32,6 +32,8 @@ def test_parse_known_commands():
     assert parse_command("/stop") == ("stop", "")
     assert parse_command("/status") == ("status", "")
     assert parse_command("/new") == ("new", "")
+    assert parse_command("/feishu_auth") == ("feishu-auth", "")
+    assert parse_command("/feishu_reauth wiki:wiki") == ("feishu-auth", "wiki:wiki")
     assert parse_command("/model glm-5.1") == ("model", "glm-5.1")
     assert parse_command("/reasoning high") == ("reasoning", "high")
     assert parse_command("/reload_mcp") == ("reload-mcp", "")
@@ -59,6 +61,38 @@ def test_parse_unescapes_feishu_markdown_command_name():
 def test_parse_rejects_paths():
     from hermes_multitenancy.commands import parse_command
     assert parse_command("/some/path") is None
+
+
+def test_resolve_sender_strips_feishu_sender_type_prefix():
+    from hermes_multitenancy.router import _resolve_sender_for_routing
+
+    event = _build_event("/feishu_auth", user_id="user:ou_prefixed")
+
+    assert _resolve_sender_for_routing(event) == "ou_prefixed"
+
+
+def test_lark_cli_history_sanitizer_removes_stale_bot_identity_note():
+    from hermes_multitenancy.router import _clean_stream_display_text, _strip_wrong_lark_cli_bot_identity_note
+
+    cleaned = _strip_wrong_lark_cli_bot_identity_note(
+        "测试标记：BASE\n\n"
+        "多维表格创建成功。\n"
+        "该表格由 bot 身份创建，默认包含一张空数据表。\n"
+        "链接：https://example.feishu.cn/base/base_token"
+    )
+
+    assert "bot 身份创建" not in cleaned
+    assert "测试标记：BASE" in cleaned
+    assert "https://example.feishu.cn/base/base_token" in cleaned
+
+    display = _clean_stream_display_text(
+        "测试标记：CALENDAR\n\n"
+        "命令执行成功，但今天日程数量为 0。\n"
+        "当前 bot 身份下的 primary 日历今日无日程。",
+        Path("/Users/kite/.hermes/profiles/feishu_g41a5b5g"),
+    )
+    assert "bot 身份" not in display
+    assert "今天日程数量为 0" in display
 
 
 def test_parse_command_reads_hermes_registry_dynamically(monkeypatch):
@@ -233,6 +267,100 @@ async def test_stop_when_idle_replies_no_inflight():
     assert any("没有进行中的任务" in s for s in sends), sends
 
 
+@pytest.mark.asyncio
+async def test_feishu_auth_command_starts_multitenancy_uat_session(monkeypatch, tmp_path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_command_uses_profile_open_id_for_short_sender(monkeypatch, tmp_path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "feishu_g41a5b5g"
+    profile_home.mkdir()
+    add_spike_route("g41a5b5g", profile_home)
+
+    started = {}
+
+    monkeypatch.setattr(router_mod, "_profile_open_id_for_auth", lambda profile_name: "ou_from_profile")
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "start_session",
+        lambda **kwargs: started.update(kwargs) or {
+            "session_id": "sess_auth",
+            "verification_uri": "https://accounts.feishu.cn/device",
+            "user_code": "ABCD",
+            "interval": 3,
+        },
+    )
+    monkeypatch.setattr(router_mod, "_start_feishu_auth_poll_task", lambda **_kwargs: None)
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/feishu_auth", user_id="g41a5b5g"), gateway=gateway)
+
+    assert started["profile_name"] == profile_home.name
+    assert started["open_id"] == "ou_from_profile"
+    assert any("accounts.feishu.cn" in message for message in sends)
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "owner"
+    profile_home.mkdir()
+    add_spike_route("ou_auth", profile_home)
+
+    started = {}
+    poll_tasks = []
+
+    def fake_start_session(**kwargs):
+        started.update(kwargs)
+        return {
+            "session_id": "sess_auth",
+            "status": "pending",
+            "verification_uri": "https://accounts.feishu.cn/device?user_code=ABCD",
+            "user_code": "ABCD",
+            "expires_at": 9999999999,
+            "interval": 3,
+        }
+
+    monkeypatch.setattr(feishu_uat_auth, "start_session", fake_start_session)
+    monkeypatch.setattr(router_mod, "_start_feishu_auth_poll_task", lambda **kwargs: poll_tasks.append(kwargs))
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append((c, m))
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/feishu_auth wiki:wiki", user_id="ou_auth"), gateway=gateway)
+
+    assert started["profile_name"] == profile_home.name
+    assert started["open_id"] == "ou_auth"
+    assert started["scope"] == "wiki:wiki"
+    assert any("https://accounts.feishu.cn/device" in message and "ABCD" in message for _chat, message in sends)
+    assert poll_tasks and poll_tasks[0]["session_id"] == "sess_auth"
+
+    clear_spike_routes()
+
+
 # -- /status ----------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -337,6 +465,17 @@ async def test_new_command_resets_session_history():
         await handle_async(event=_build_event("/new", user_id="ou_resetuser"), gateway=gateway)
         assert sends and "重置" in sends[-1], sends
         assert key not in _session_history, "history should be cleared"
+
+    # Case 2: routed user with no prior history still gets a formal ack.
+    sends.clear()
+    clear_spike_routes()
+    with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path
+        home = Path(tmp)
+        add_spike_route("ou_emptyreset", home)
+
+        await handle_async(event=_build_event("/new", user_id="ou_emptyreset"), gateway=gateway)
+        assert sends[-1] == "会话已重置 ✅"
 
     # Case 2: unrouted user → reply explains
     sends.clear()

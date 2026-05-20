@@ -7,6 +7,7 @@ command dispatch.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import json
@@ -15,6 +16,7 @@ import os
 import re
 import shutil
 import time
+import zlib
 import zipfile
 from contextlib import asynccontextmanager
 from itertools import zip_longest
@@ -69,6 +71,22 @@ _LARK_CLI_SOUL_GUIDANCE = "\n".join(
         "- 如果需要调用飞书能力，必须等待真实工具结果；不要编造 message_id、文档链接或调用结果。",
         "- 如果 `lark_cli` 返回 credential unavailable、validation、unsupported 或权限错误，立即停止重试并如实说明需要授权/权限/命令支持。",
         "- `lark_cli` 的 identity 使用 auto，profile runtime 会按个人/群聊边界选择 user 或 bot。",
+        "- `lark_cli` 工具结果里的 `identity` 字段是身份事实；当 identity=user 时，不得说资源由 bot/应用身份创建。",
+        "Feishu file output rules:",
+        "- 当用户要求生成文件、图片、报表、PDF、docx、xlsx、csv、json、markdown 并发回时，不要要求用户提供本机路径。",
+        "- 直接在回复中输出一个 ```hermes-artifact-json fenced block，字段使用 filename、format、marker/content/data/rows/title；不要使用宿主机绝对路径。",
+        "- filename 只写普通文件名，例如 report.md、summary.pdf、chart.png；Hermes 会自动保存到当前 profile 的 Downloads 并通过飞书附件发送。",
+        "- 图片如果要作为可下载原文件发送，在 artifact JSON 中设置 as_document=true。",
+        "- artifact JSON 是内部交付协议；除必要的测试标记和简短说明外，不要把本机路径、/workspace 路径或 MEDIA 指令解释给用户。",
+    ]
+)
+
+_GROUP_EXTERNAL_TOOL_SOUL_GUIDANCE = "\n".join(
+    [
+        "External tool safety rules:",
+        "- 当用户要求天气、网页查询或其它外部网络查询时，优先使用只读工具或只读命令。",
+        "- 如果必须用 terminal 访问网络，URL 必须写完整 scheme（例如 `https://example.com`），并使用 short timeout，避免把危险命令推给用户审批。",
+        "- 不要使用 schemeless URL（例如 `example.com/path`）或下载后执行的命令。",
     ]
 )
 
@@ -108,10 +126,34 @@ def _trim_history(history: list[dict]) -> list[dict]:
     return history[-_SESSION_HISTORY_MAX:]
 
 
+_WRONG_LARK_CLI_BOT_IDENTITY_NOTE_RE = re.compile(
+    r"(?im)^[^\n]*(?:(?:由|以|当前)\s*(?:bot|应用)\s*身份(?:创建|下)?)[^\n]*(?:\n|$)"
+)
+
+
+def _strip_wrong_lark_cli_bot_identity_note(text: str) -> str:
+    """Remove stale hallucinated bot-identity notes from Feishu UAT history."""
+    cleaned = _WRONG_LARK_CLI_BOT_IDENTITY_NOTE_RE.sub("", str(text or ""))
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_history_messages(history: list[dict]) -> list[dict]:
+    sanitized: list[dict] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        if copied.get("role") == "assistant":
+            copied["content"] = _strip_wrong_lark_cli_bot_identity_note(str(copied.get("content") or ""))
+        sanitized.append(copied)
+    return sanitized
+
+
 def _load_history(key: tuple[str, str]) -> list[dict]:
     """Get history for ``key`` — first call hydrates from SessionStore, subsequent calls hit cache."""
     if key in _session_loaded:
-        return list(_session_history.get(key, []))
+        return _sanitize_history_messages(list(_session_history.get(key, [])))
     store = _get_session_store()
     if store is not None:
         try:
@@ -120,13 +162,14 @@ def _load_history(key: tuple[str, str]) -> list[dict]:
             logger.debug("multitenancy: SessionStore.load_recent failed (%s)", exc)
             persisted = []
         if persisted:
-            _session_history[key] = persisted
+            _session_history[key] = _sanitize_history_messages(persisted)
     _session_loaded.add(key)
-    return list(_session_history.get(key, []))
+    return _sanitize_history_messages(list(_session_history.get(key, [])))
 
 
 def _persist_turn(key: tuple[str, str], user_msg: dict, assistant_text: str) -> None:
     """Append a (user, assistant) turn to both in-memory cache and SessionStore."""
+    assistant_text = _strip_wrong_lark_cli_bot_identity_note(assistant_text)
     new_history = _session_history.get(key, []) + [
         user_msg,
         {"role": "assistant", "content": assistant_text},
@@ -298,8 +341,15 @@ def _build_user_message(event: Any, *, text_override: Optional[str] = None) -> d
     return {"role": "user", "content": text}
 
 
+def _normalize_feishu_open_id(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if raw.startswith("user:"):
+        raw = raw.split(":", 1)[1]
+    return raw if raw.startswith("ou_") else None
+
+
 def _is_feishu_open_id(value: Any) -> bool:
-    return bool(value) and str(value).startswith("ou_")
+    return _normalize_feishu_open_id(value) is not None
 
 
 def _nested_get(value: Any, path: tuple[str, ...]) -> Any:
@@ -322,7 +372,7 @@ def _current_sender_open_id() -> Optional[str]:
         candidate = feishu_oapi.current_sender_open_id.get()
     except Exception:
         return None
-    return str(candidate) if _is_feishu_open_id(candidate) else None
+    return _normalize_feishu_open_id(candidate)
 
 
 def _resolve_sender_for_routing(event: Any, *, fallback: str = "unknown") -> str:
@@ -342,8 +392,9 @@ def _resolve_sender_for_routing(event: Any, *, fallback: str = "unknown") -> str
         getattr(source, "user_id_alt", None) if source is not None else None,
     )
     for candidate in direct_candidates:
-        if _is_feishu_open_id(candidate):
-            return str(candidate)
+        normalized = _normalize_feishu_open_id(candidate)
+        if normalized:
+            return normalized
 
     raw_candidates = (
         getattr(event, "raw", None),
@@ -360,8 +411,9 @@ def _resolve_sender_for_routing(event: Any, *, fallback: str = "unknown") -> str
     for raw in raw_candidates:
         for path in paths:
             candidate = _nested_get(raw, path)
-            if _is_feishu_open_id(candidate):
-                return str(candidate)
+            normalized = _normalize_feishu_open_id(candidate)
+            if normalized:
+                return normalized
 
     return fallback
 
@@ -381,17 +433,35 @@ def _clean_stream_display_text(text: str, profile_home: Optional[Path] = None) -
         from gateway.stream_consumer import GatewayStreamConsumer  # type: ignore
 
         cleaned = GatewayStreamConsumer._clean_for_display(text)
+        cleaned = _ARTIFACT_JSON_RE.sub("", cleaned)
     except Exception:
         cleaned = str(text or "").replace("[[audio_as_voice]]", "")
+        cleaned = _ARTIFACT_JSON_RE.sub("", cleaned)
         cleaned = re.sub(r'''[`"']?MEDIA:\s*\S+[`"']?''', "", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         cleaned = cleaned.rstrip()
+    cleaned = cleaned.replace("[[as_document]]", "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).rstrip()
     if profile_home is not None:
         cleaned = _strip_plain_profile_file_paths_for_display(cleaned, profile_home)
+        if not Path(profile_home).name.startswith(_GROUP_PROFILE_PREFIX):
+            cleaned = _strip_wrong_lark_cli_bot_identity_note(cleaned)
+    return cleaned
+
+
+def _clean_stream_delta_text(text: str, profile_home: Optional[Path] = None) -> str:
+    """Clean one streamed content delta without dropping token boundary spaces."""
+    raw = str(text or "")
+    cleaned = _clean_stream_display_text(raw, profile_home)
+    if cleaned and raw[:1].isspace() and not cleaned[:1].isspace():
+        leading = re.match(r"^\s+", raw)
+        if leading:
+            cleaned = leading.group(0) + cleaned
     return cleaned
 
 
 _MEDIA_DIRECTIVE_RE = re.compile(r'''(?P<prefix>[`"']?MEDIA:\s*)(?P<path>\S+)(?P<suffix>[`"']?)''')
+_ARTIFACT_JSON_RE = re.compile(r"```hermes-artifact-json\s*(?P<body>.*?)\s*```", re.DOTALL | re.IGNORECASE)
 _PROFILE_FILE_PATH_RE = re.compile(
     r'''(?P<path>(?:/workspace|/[^`"'<>\n\r]+?)'''
     r'''\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'''
@@ -427,11 +497,153 @@ async def _deliver_media_from_stream_response(
     deliver = getattr(gateway, "_deliver_media_from_response", None)
     if not callable(deliver):
         return
+    response = _materialize_response_artifacts(response, profile_home)
     response_with_files = _append_profile_file_media_directives(response, profile_home)
     scoped_response = _profile_scoped_media_response(response_with_files, profile_home)
     if "MEDIA:" not in scoped_response:
         return
     await deliver(scoped_response, event, adapter)
+
+
+def _materialize_response_artifacts(response: str, profile_home: Path) -> str:
+    """Write model-emitted artifact JSON blocks into profile workspace files.
+
+    The model has no direct filesystem tool in some Feishu profiles. This
+    controlled bridge lets it emit file content declaratively while preserving
+    the existing outbound MEDIA safety boundary.
+    """
+    text = str(response or "")
+    if "```hermes-artifact-json" not in text.lower():
+        return text
+    root = profile_home.expanduser().resolve(strict=False)
+    workspace = (root / "workspace").resolve(strict=False)
+    downloads = (workspace / "Downloads").resolve(strict=False)
+    media_additions: list[str] = []
+
+    for match in _ARTIFACT_JSON_RE.finditer(text):
+        try:
+            spec = json.loads(match.group("body"))
+        except Exception as exc:
+            logger.debug("multitenancy: invalid artifact json skipped: %s", exc)
+            continue
+        if not isinstance(spec, dict):
+            continue
+        raw_path = str(spec.get("path") or "").strip()
+        filename = str(spec.get("filename") or spec.get("name") or "").strip()
+        if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
+            candidate = workspace / raw_path.removeprefix("/workspace").lstrip("/")
+        else:
+            if raw_path:
+                candidate = Path(raw_path).expanduser()
+            elif filename:
+                candidate = downloads / filename
+            else:
+                continue
+            if not candidate.is_absolute():
+                candidate = workspace / candidate
+        target = candidate.resolve(strict=False)
+        if not (target == downloads or downloads in target.parents):
+            logger.warning("multitenancy: blocked response artifact outside workspace downloads path=%s", target)
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_response_artifact(target, spec)
+            try:
+                media_path = "/workspace/" + str(target.relative_to(workspace).as_posix())
+            except ValueError:
+                media_path = "/workspace/Downloads/" + target.name
+            if f"MEDIA:{media_path}" not in text:
+                if bool(spec.get("as_document")) and "[[as_document]]" not in text:
+                    media_additions.append("[[as_document]]")
+                media_additions.append(f"MEDIA:{media_path}")
+        except Exception as exc:
+            logger.warning("multitenancy: failed to materialize response artifact path=%s error=%s", target, exc)
+    if not media_additions:
+        return text
+    return f"{text.rstrip()}\n" + "\n".join(media_additions)
+
+
+def _write_response_artifact(path: Path, spec: dict[str, Any]) -> None:
+    fmt = str(spec.get("format") or path.suffix.lstrip(".")).lower()
+    marker = str(spec.get("marker") or "")
+    if fmt in {"md", "markdown", "txt", "csv"}:
+        content = str(spec.get("content") or marker or "")
+        path.write_text(content, encoding="utf-8")
+    elif fmt == "json":
+        data = spec.get("data")
+        if data is None:
+            data = {"marker": marker, "content": spec.get("content") or marker}
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    elif fmt == "xlsx":
+        _write_artifact_xlsx(path, spec)
+    elif fmt == "docx":
+        _write_artifact_docx(path, spec)
+    elif fmt == "pdf":
+        _write_artifact_pdf(path, spec)
+    elif fmt in {"png", "jpg", "jpeg"}:
+        _write_artifact_image(path, spec)
+    else:
+        content = str(spec.get("content") or marker or "")
+        path.write_text(content, encoding="utf-8")
+
+
+def _artifact_rows(spec: dict[str, Any]) -> list[list[Any]]:
+    rows = spec.get("rows")
+    if isinstance(rows, list) and all(isinstance(row, list) for row in rows):
+        return rows
+    marker = str(spec.get("marker") or "")
+    return [["marker", "value", "note"], [marker, 42, "generated by Hermes artifact bridge"]]
+
+
+def _write_artifact_xlsx(path: Path, spec: dict[str, Any]) -> None:
+    from openpyxl import Workbook  # type: ignore
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = str(spec.get("sheet") or "matrix")[:31]
+    for row in _artifact_rows(spec):
+        ws.append(row)
+    wb.save(path)
+
+
+def _write_artifact_docx(path: Path, spec: dict[str, Any]) -> None:
+    from docx import Document  # type: ignore
+
+    doc = Document()
+    title = str(spec.get("title") or "Hermes generated document")
+    doc.add_heading(title, level=1)
+    content = str(spec.get("content") or spec.get("marker") or "")
+    for paragraph in content.splitlines() or [content]:
+        if paragraph.strip():
+            doc.add_paragraph(paragraph)
+    doc.save(path)
+
+
+def _write_artifact_pdf(path: Path, spec: dict[str, Any]) -> None:
+    from reportlab.lib.pagesizes import letter  # type: ignore
+    from reportlab.pdfgen import canvas  # type: ignore
+
+    c = canvas.Canvas(str(path), pagesize=letter)
+    y = 720
+    for line in str(spec.get("content") or spec.get("marker") or "").splitlines() or [str(spec.get("marker") or "")]:
+        c.drawString(72, y, line[:120])
+        y -= 24
+        if y < 72:
+            c.showPage()
+            y = 720
+    c.save()
+
+
+def _write_artifact_image(path: Path, spec: dict[str, Any]) -> None:
+    from PIL import Image, ImageDraw  # type: ignore
+
+    marker = str(spec.get("marker") or spec.get("content") or "")
+    image = Image.new("RGB", (1000, 420), color=(245, 250, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((40, 40, 960, 380), outline=(20, 120, 80), width=5)
+    draw.text((70, 120), marker[:100], fill=(0, 0, 0))
+    draw.text((70, 190), "Hermes generated image artifact", fill=(20, 120, 80))
+    image.save(path)
 
 
 def _append_profile_file_media_directives(response: str, profile_home: Path) -> str:
@@ -498,6 +710,13 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
             candidate = root / candidate
         resolved = candidate.resolve(strict=False)
         if resolved == root or root in resolved.parents:
+            if not _is_deliverable_profile_file(resolved, root):
+                logger.warning(
+                    "multitenancy: blocked outbound MEDIA for non-deliverable profile file path=%s profile_home=%s",
+                    resolved,
+                    root,
+                )
+                return ""
             workspace_artifact = _publish_profile_media_artifact(resolved, root)
             deliver_path = workspace_artifact or resolved
             return f"{match.group('prefix')}{deliver_path}{match.group('suffix')}"
@@ -563,7 +782,7 @@ def _is_deliverable_profile_file(source: Path, profile_home: Path) -> bool:
         return False
     try:
         if source.stat().st_size > _AUTO_FILE_DELIVERY_MAX_BYTES:
-            logger.warning(
+            logger.info(
                 "multitenancy: skipped auto file delivery for oversized file path=%s size=%s",
                 source,
                 source.stat().st_size,
@@ -645,6 +864,70 @@ def _publish_profile_media_artifact(source: Path, profile_home: Path) -> Optiona
 _IMAGE_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"}
 
 
+def _event_has_image_media(event: Any) -> bool:
+    media_urls = getattr(event, "media_urls", None) or []
+    media_types = getattr(event, "media_types", None) or []
+    if not media_urls:
+        return False
+    message_type_obj = getattr(event, "message_type", None)
+    message_type_parts = [
+        str(getattr(message_type_obj, "value", "") or ""),
+        str(getattr(message_type_obj, "name", "") or ""),
+        str(message_type_obj or ""),
+    ]
+    message_type = " ".join(message_type_parts).lower()
+    if "photo" in message_type or "image" in message_type:
+        return True
+    for raw_path, raw_mtype in zip_longest(media_urls, media_types, fillvalue=""):
+        raw = str(raw_path or "")
+        suffix = Path(raw).suffix.lower()
+        media_type = str(raw_mtype or "").lower()
+        normalized = raw.replace("\\", "/").lower()
+        if media_type.startswith("image") or suffix in _IMAGE_FILE_EXTENSIONS or "/cache/images/" in normalized:
+            return True
+    return False
+
+
+def _image_vision_unavailable_response(event: Any, enriched_text: Optional[str]) -> Optional[str]:
+    """Return a direct blocked reply when upstream image analysis is unavailable."""
+    if not _event_has_image_media(event):
+        return None
+    text = str(enriched_text or "")
+    lowered = text.lower()
+    failure_markers = (
+        "something went wrong when i tried to look at it",
+        "couldn't quite see it",
+        "vision auto-analysis error",
+    )
+    if not any(marker in lowered for marker in failure_markers):
+        return None
+
+    names: list[str] = []
+    for raw_path in getattr(event, "media_urls", None) or []:
+        name = Path(str(raw_path or "")).name
+        if name:
+            names.append(name)
+    suffix = f"\n已收到图片附件：{', '.join(names[:3])}。" if names else ""
+    message_id = _event_message_id(event)
+    message_note = f"\nFeishu message_id: {message_id}" if message_id else ""
+    return (
+        "无法读取图片内容：当前图片视觉分析不可用，vision_analyze provider rejected the request。"
+        f"{suffix}{message_note}\n请修复 profile 的 vision provider/key 后重试。"
+    )
+
+
+def _image_prep_unavailable_note(event: Any) -> str:
+    paths = ", ".join(str(path) for path in (getattr(event, "media_urls", None) or [])[:3])
+    suffix = f" using image_url: {paths}" if paths else ""
+    message_id = _event_message_id(event)
+    message_note = f" Feishu message_id: {message_id}." if message_id else ""
+    return (
+        "[The user sent an image but something went wrong when I tried to look at it~ "
+        "You can try examining it yourself with vision_analyze"
+        f"{suffix}.{message_note}]"
+    )
+
+
 def _materialize_inbound_media_for_profile(event: Any, profile_home: Path) -> None:
     """Copy gateway-cached inbound media into the routed profile boundary."""
     media_urls = getattr(event, "media_urls", None) or []
@@ -689,7 +972,7 @@ def _materialize_inbound_media_for_profile(event: Any, profile_home: Path) -> No
             rewritten.append(rewritten_path)
             replacements[raw] = rewritten_path
             changed = True
-            logger.info(
+            logger.warning(
                 "multitenancy: materialized inbound media for profile source=%s target=%s",
                 source,
                 target,
@@ -733,6 +1016,15 @@ async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]
         Enriched text string, or None on failure (caller falls back to event.text).
     """
     native_text: Optional[str] = None
+    if _event_has_image_media(event):
+        strategy = os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_STRATEGY", "gateway").strip().lower()
+        if strategy in {"blocked", "block", "skip", "disabled", "off"}:
+            logger.warning(
+                "multitenancy: image preprocessing blocked by strategy message_id=%s",
+                _event_message_id(event) or "",
+            )
+            return _image_prep_unavailable_note(event)
+
     prep = getattr(gateway, "_prepare_inbound_message_text", None)
     if gateway is None or prep is None or not callable(prep):
         logger.debug("multitenancy: gateway._prepare_inbound_message_text unavailable")
@@ -740,7 +1032,15 @@ async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]
         source = getattr(event, "source", None)
         if source is not None:
             try:
-                native_text = await prep(event=event, source=source, history=[])
+                prep_call = prep(event=event, source=source, history=[])
+                if _event_has_image_media(event):
+                    timeout_s = float(os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_TIMEOUT_S", "30"))
+                    native_text = await asyncio.wait_for(prep_call, timeout=max(0.1, timeout_s))
+                else:
+                    native_text = await prep_call
+            except asyncio.TimeoutError:
+                logger.warning("multitenancy: image preprocessing timed out")
+                native_text = _image_prep_unavailable_note(event)
             except Exception as exc:
                 logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
 
@@ -790,7 +1090,8 @@ def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> O
         if not path.is_file():
             continue
         name = path.name
-        if f"[Content of {name}]" in existing:
+        suffix = path.suffix.lower()
+        if suffix not in {".xlsx", ".docx", ".pdf"} and f"[Content of {name}]" in existing:
             continue
         try:
             if path.stat().st_size > _MAX_LOCAL_ENRICH_FILE_BYTES:
@@ -798,11 +1099,14 @@ def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> O
                 continue
         except OSError:
             continue
-        suffix = path.suffix.lower()
         media_type = str(raw_mtype or "").lower()
         try:
             if suffix == ".xlsx":
                 content = _extract_xlsx_text(path)
+            elif suffix == ".docx":
+                content = _extract_docx_text(path)
+            elif suffix == ".pdf":
+                content = _extract_pdf_text(path)
             elif media_type.startswith("text/") or suffix in _TEXT_FILE_EXTENSIONS:
                 with path.open("rb") as handle:
                     content = handle.read(_MAX_LOCAL_TEXT_PREVIEW_BYTES).decode("utf-8", errors="replace")
@@ -812,8 +1116,12 @@ def _local_enrich_with_file_content(event: Any, *, existing_text: str = "") -> O
             logger.debug("multitenancy: local file enrichment failed for %s: %s", path, exc)
             continue
         content = content.strip()
-        if content:
-            parts.append(f"[Content of {name}]:\n{content}")
+        if not content or content in existing:
+            continue
+        header = f"[Content of {name}]"
+        if suffix in {".xlsx", ".docx", ".pdf"} and header in existing:
+            header = f"[Content of {name} - multitenancy {suffix.lstrip('.')} fallback]"
+        parts.append(f"{header}:\n{content}")
     if not parts:
         return None
     return "\n\n".join(parts)
@@ -864,9 +1172,13 @@ def _extract_xlsx_text(path: Path, *, max_sheets: int = 3, max_rows: int = 50, m
                 for cell in row.findall("main:c", ns)[:max_cells]:
                     value = cell.find("main:v", ns)
                     raw = value.text if value is not None else ""
-                    if cell.attrib.get("t") == "s" and raw.isdigit():
+                    cell_type = cell.attrib.get("t")
+                    if cell_type == "s" and raw.isdigit():
                         idx = int(raw)
                         raw = shared_strings[idx] if idx < len(shared_strings) else raw
+                    elif cell_type == "inlineStr":
+                        texts = [node.text or "" for node in cell.findall(".//main:t", ns)]
+                        raw = "".join(texts)
                     cells.append(raw or "")
                 if any(cells):
                     rows.append("\t".join(cells))
@@ -880,6 +1192,82 @@ def _read_zip_member_limited(zf: zipfile.ZipFile, name: str) -> bytes:
     if info.file_size > _MAX_XLSX_XML_BYTES:
         raise ValueError(f"xlsx member too large: {name}")
     return zf.read(name)
+
+
+def _extract_docx_text(path: Path, *, max_paragraphs: int = 80) -> str:
+    """Extract a small text preview from a DOCX file using only stdlib."""
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with zipfile.ZipFile(path) as zf:
+        if "word/document.xml" not in zf.namelist():
+            return ""
+        root = ET.fromstring(_read_zip_member_limited(zf, "word/document.xml"))
+        paragraphs: list[str] = []
+        for para in root.findall(".//w:p", ns)[:max_paragraphs]:
+            texts = [node.text or "" for node in para.findall(".//w:t", ns)]
+            text = "".join(texts).strip()
+            if text:
+                paragraphs.append(text)
+        return "\n".join(paragraphs)
+
+
+_PDF_STREAM_RE = re.compile(rb"stream\r?\n(?P<body>.*?)\r?\n?endstream", re.DOTALL)
+_PDF_TEXT_STRING_RE = re.compile(rb"\((?:\\.|[^\\()])*\)")
+
+
+def _extract_pdf_text(path: Path, *, max_bytes: int = _MAX_LOCAL_TEXT_PREVIEW_BYTES) -> str:
+    """Best-effort PDF text preview for small generated/text PDFs.
+
+    This intentionally stays lightweight. It covers the real UAT fixtures
+    generated by ReportLab (ASCII85Decode + FlateDecode text streams) and
+    simple uncompressed text streams; scanned PDFs still require OCR/vision.
+    """
+    raw = path.read_bytes()[: _MAX_LOCAL_ENRICH_FILE_BYTES]
+    chunks: list[str] = []
+    for match in _PDF_STREAM_RE.finditer(raw):
+        stream = match.group("body").strip()
+        decoded = _decode_pdf_stream(stream)
+        if not decoded:
+            continue
+        chunks.extend(_extract_pdf_literal_strings(decoded))
+        if sum(len(item) for item in chunks) >= max_bytes:
+            break
+    if not chunks:
+        chunks.extend(_extract_pdf_literal_strings(raw))
+    text = "\n".join(item for item in chunks if item.strip())
+    return text[:max_bytes]
+
+
+def _decode_pdf_stream(stream: bytes) -> bytes:
+    candidates = [stream]
+    try:
+        candidates.append(base64.a85decode(stream, adobe=True))
+    except Exception:
+        pass
+    for candidate in list(candidates):
+        try:
+            decoded = zlib.decompress(candidate)
+        except Exception:
+            continue
+        candidates.append(decoded)
+    return candidates[-1] if candidates else b""
+
+
+def _extract_pdf_literal_strings(raw: bytes) -> list[str]:
+    values: list[str] = []
+    for match in _PDF_TEXT_STRING_RE.finditer(raw):
+        token = match.group(0)[1:-1]
+        token = (
+            token.replace(rb"\(", b"(")
+            .replace(rb"\)", b")")
+            .replace(rb"\\", b"\\")
+            .replace(rb"\n", b"\n")
+            .replace(rb"\r", b"\r")
+            .replace(rb"\t", b"\t")
+        )
+        text = token.decode("utf-8", errors="replace").strip()
+        if text:
+            values.append(text)
+    return values
 
 
 async def _local_enrich_with_vision_only(event: Any) -> Optional[str]:
@@ -1081,6 +1469,15 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         text = getattr(event, "text", "") or ""
 
         sender_alt = getattr(source, "user_id_alt", None) if source else None
+        if getattr(event, "media_urls", None):
+            logger.info(
+                "multitenancy: handle_async media event message_id=%s text_len=%s media_urls=%s media_types=%s message_type=%s",
+                _event_message_id(event) or "",
+                len(str(text or "")),
+                list(getattr(event, "media_urls", None) or []),
+                list(getattr(event, "media_types", None) or []),
+                str(getattr(event, "message_type", "")),
+            )
 
         # Group-chat profile resolution — when the event is from a group/topic
         # chat, the route is keyed by chat_id (not the @-er's open_id). This
@@ -1212,6 +1609,19 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # the real prompt and the dedupe/admission key should reflect it.
         _materialize_inbound_media_for_profile(event, profile_home)
         enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
+        vision_blocked = _image_vision_unavailable_response(event, enriched_text)
+        if vision_blocked:
+            logger.info(
+                "multitenancy: sending image vision unavailable response profile=%s message_id=%s",
+                profile_name,
+                _event_message_id(event) or "",
+            )
+            hist_key = _history_key(profile_name, sender, sender_alt)
+            user_msg = _build_user_message(event, text_override=enriched_text)
+            _persist_turn(hist_key, user_msg, vision_blocked)
+            if adapter is not None:
+                await _safe_call(adapter.send, chat_id, vision_blocked)
+            return
         run_content = enriched_text or text
         if not run_content and getattr(event, "media_urls", None):
             run_content = "[media attachment]"
@@ -1514,10 +1924,21 @@ async def _handle_command(
         # Clear this user's per-profile history (cache + persistent SessionStore).
         if profile_name:
             key = _history_key(profile_name, sender, sender_alt)
-            had = _clear_history(key)
-            reply = "会话已重置 ✅" if had else "会话已重置 (本来也是空的)"
+            _clear_history(key)
+            reply = "会话已重置 ✅"
         else:
             reply = "(未路由的用户) 没有历史可重置"
+    elif cmd == "feishu-auth":
+        reply = _handle_feishu_auth_command(
+            args=_args,
+            sender=sender,
+            sender_alt=sender_alt,
+            profile_name=profile_name,
+            profile_home=profile_home,
+            chat_id=chat_id,
+            gateway=gateway,
+            event=event,
+        )
     elif cmd == "help":
         reply = _gateway_help_text()
     else:
@@ -1547,6 +1968,158 @@ async def _handle_command(
 
     if adapter is not None:
         await _safe_call(adapter.send, chat_id, reply)
+
+
+def _handle_feishu_auth_command(
+    *,
+    args: str,
+    sender: str,
+    sender_alt: Optional[str],
+    profile_name: Optional[str],
+    profile_home: Optional[Path],
+    chat_id: str,
+    gateway: Any,
+    event: Any,
+) -> str:
+    """Start a multitenancy-owned Feishu UAT device-flow auth session."""
+    del profile_home
+    from . import feishu_uat_auth
+
+    open_id = (
+        _normalize_feishu_open_id(sender)
+        or _normalize_feishu_open_id(sender_alt)
+        or _profile_open_id_for_auth(profile_name)
+        or ""
+    )
+    if not _is_feishu_open_id(open_id):
+        return "无法启动飞书授权：当前消息没有可用的 sender open_id。"
+    if not profile_name:
+        return "无法启动飞书授权：当前飞书用户还没有绑定 Hermes profile。"
+
+    scope = args.strip() or None
+    try:
+        session = feishu_uat_auth.start_session(
+            profile_name=profile_name,
+            open_id=open_id,
+            scope=scope,
+        )
+    except feishu_uat_auth.FeishuUatAuthError as exc:
+        return f"无法启动飞书授权：{exc.message}"
+
+    session_id = str(session.get("session_id") or "")
+    _start_feishu_auth_poll_task(
+        session_id=session_id,
+        profile_name=profile_name,
+        open_id=open_id,
+        chat_id=chat_id,
+        gateway=gateway,
+        event=event,
+        interval=int(session.get("interval") or 3),
+    )
+    verification_uri = str(session.get("verification_uri") or "")
+    user_code = str(session.get("user_code") or "")
+    return (
+        "请打开下面链接完成飞书 UAT 授权：\n"
+        f"{verification_uri}\n\n"
+        f"验证码：`{user_code}`\n"
+        "完成后我会自动确认，并把 UAT 写入当前 Hermes profile。"
+    )
+
+
+def _profile_open_id_for_auth(profile_name: Optional[str]) -> Optional[str]:
+    if not profile_name:
+        return None
+    table = _get_routing_table()
+    if table is None:
+        return None
+    try:
+        db_path = table.db_path
+    except AttributeError:
+        return None
+    try:
+        import sqlite3
+
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
+            row = conn.execute(
+                "SELECT open_id FROM multitenancy_routing "
+                "WHERE profile_name = ? AND active = 1 AND kind = 'user' "
+                "AND open_id LIKE 'ou_%' ORDER BY updated_at DESC LIMIT 1",
+                (profile_name,),
+            ).fetchone()
+    except Exception as exc:
+        logger.debug("multitenancy: profile auth open_id lookup failed (%s)", exc)
+        return None
+    return str(row[0]) if row else None
+
+
+def _start_feishu_auth_poll_task(
+    *,
+    session_id: str,
+    profile_name: str,
+    open_id: str,
+    chat_id: str,
+    gateway: Any,
+    event: Any,
+    interval: int,
+) -> None:
+    if not session_id:
+        return
+    task = asyncio.create_task(
+        _poll_feishu_auth_session_until_done(
+            session_id=session_id,
+            profile_name=profile_name,
+            open_id=open_id,
+            chat_id=chat_id,
+            gateway=gateway,
+            event=event,
+            interval=interval,
+        ),
+        name=f"feishu-auth:{profile_name}:{open_id}:{session_id}",
+    )
+    task.add_done_callback(lambda t: logger.debug("Feishu auth poll task ended: %s", t.get_name()))
+
+
+async def _poll_feishu_auth_session_until_done(
+    *,
+    session_id: str,
+    profile_name: str,
+    open_id: str,
+    chat_id: str,
+    gateway: Any,
+    event: Any,
+    interval: int,
+) -> None:
+    from . import feishu_uat_auth
+
+    adapter = _get_feishu_adapter(gateway)
+    current_interval = max(int(interval or 3), 2)
+    while True:
+        await asyncio.sleep(current_interval)
+        try:
+            session = await asyncio.to_thread(
+                feishu_uat_auth.poll_session,
+                session_id=session_id,
+                profile_name=profile_name,
+                open_id=open_id,
+            )
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            if adapter is not None:
+                await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{exc.message}")
+            return
+        status = str(session.get("status") or "")
+        if status == "pending":
+            current_interval = max(int(session.get("interval") or current_interval), 2)
+            continue
+        if adapter is None:
+            return
+        if status == "success":
+            await _safe_call(adapter.send, chat_id, "✅ 飞书 UAT 授权完成，后续 lark_cli 将优先使用你的 user 身份。")
+        elif status == "expired":
+            await _safe_call(adapter.send, chat_id, "飞书 UAT 授权已过期，请重新发送 /feishu_auth。")
+        else:
+            error = str(session.get("error") or status or "unknown error")
+            await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{error}")
+        return
 
 
 def _handle_pending_approval_command(
@@ -2039,8 +2612,10 @@ def _gateway_help_text() -> str:
 
         lines = gateway_help_lines()
         if lines:
-            if not any("/help" in line for line in lines):
-                lines = ["`/help` -- 显示这条帮助", *lines]
+            help_lines = [line for line in lines if "/help" in line]
+            lines = (help_lines[:1] or ["`/help` -- 显示这条帮助"]) + [
+                line for line in lines if "/help" not in line
+            ]
             return "📖 可用命令\n" + "\n".join(lines[:30])
     except Exception:
         pass
@@ -2248,7 +2823,7 @@ def _is_group_chat_type(chat_type: str) -> bool:
 # Commands that bind/replace a per-user Feishu identity. None of them make
 # sense in a group profile (it owns no UAT), so all are hard-rejected.
 _GROUP_BLOCKED_COMMANDS: frozenset[str] = frozenset(
-    {"feishu_auth", "feishu_logout", "feishu_reauth"}
+    {"feishu_auth", "feishu-auth", "feishu_logout", "feishu-logout", "feishu_reauth", "feishu-reauth"}
 )
 # Zero-width / bidi chars Feishu clients occasionally inject; stripped before
 # the command-name membership check so they can't smuggle a blocked command
@@ -2420,7 +2995,23 @@ async def resolve_or_auto_provision_group_route(
         return None, None
     row = table.lookup_by_chat_id(chat_id)
     if row is not None:
-        return row.profile_name, _profile_name_to_home(row.profile_name)
+        profile_home = _profile_name_to_home(row.profile_name)
+        try:
+            _ensure_group_profile(
+                profile_name=row.profile_name,
+                profile_home=profile_home,
+                chat_id=chat_id,
+                owner_open_id=row.owner_open_id or "",
+                display_label=row.display_label or row.profile_name,
+            )
+        except Exception as exc:
+            logger.debug(
+                "multitenancy: failed to normalize existing group profile chat_id=%s profile=%s: %s",
+                chat_id,
+                row.profile_name,
+                exc,
+            )
+        return row.profile_name, profile_home
     return await _provision_group_route(chat_id=chat_id, gateway=gateway)
 
 
@@ -2567,12 +3158,15 @@ def _ensure_group_profile(
                     "",
                     _LARK_CLI_SOUL_GUIDANCE,
                     "",
+                    _GROUP_EXTERNAL_TOOL_SOUL_GUIDANCE,
+                    "",
                 ]
             ),
             encoding="utf-8",
         )
     else:
         _ensure_soul_guidance(soul_path, _LARK_CLI_SOUL_GUIDANCE)
+        _ensure_soul_guidance(soul_path, _GROUP_EXTERNAL_TOOL_SOUL_GUIDANCE)
 
     # Group profiles get an empty feishu_uat/ directory but no per-user JSON;
     # the marker file below tells UAT helpers to refuse to load user tokens.
@@ -2834,9 +3428,24 @@ def _apply_lark_cli_profile_defaults(config: dict[str, Any]) -> None:
             # `skills` toolset, so lark-* skill bodies symlinked into the
             # profile never surfaced in the agent manifest (user report:
             # 技能里看不到 lark skills). Keep aligned with api_server/webui.
-            platform_modes.setdefault("feishu", "merge_default")
-            platform_modes.setdefault("api_server", "merge_default")
-            platform_modes.setdefault("webui", "merge_default")
+            for platform_key in ("feishu", "api_server", "webui"):
+                explicit_toolsets = _normalize_string_list(platform_toolsets.get(platform_key))
+                current_mode = str(platform_modes.get(platform_key) or "").strip().lower()
+                if explicit_toolsets == _LARK_CLI_PROFILE_TOOLSETS and current_mode in {
+                    "",
+                    "explicit",
+                    "strict",
+                    "replace",
+                }:
+                    platform_modes[platform_key] = "merge_default"
+                else:
+                    platform_modes.setdefault(platform_key, "merge_default")
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _ensure_soul_guidance(soul_path: Path, guidance: str) -> None:
@@ -3084,6 +3693,12 @@ def _adapter_supports_streaming_card(adapter) -> bool:
     """Return True when the shared Feishu adapter can drive card streaming."""
     if adapter is None:
         return False
+    try:
+        from .feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+        ensure_feishu_cardkit_streaming(adapter)
+    except Exception as exc:
+        logger.debug("multitenancy: Feishu CardKit compat install skipped: %s", exc)
     supports = getattr(adapter, "supports_streaming_card", None)
     if callable(supports):
         try:
@@ -3300,6 +3915,19 @@ async def _stream_into_feishu_shared_consumer(
     """
     if GatewayStreamConsumer is None or StreamConsumerConfig is None:
         return None
+    required_methods = (
+        "ensure_streaming_card_started",
+        "run",
+        "on_delta",
+        "finish",
+        "update_streaming_card_status",
+        "update_streaming_card_reasoning",
+        "update_streaming_card_tool_started",
+        "update_streaming_card_tool_completed",
+    )
+    if not all(hasattr(GatewayStreamConsumer, method) for method in required_methods):
+        logger.debug("multitenancy: shared GatewayStreamConsumer lacks card methods; using adapter surface")
+        return None
 
     import time
     from .agent_real import stream_run_agent, real_run_agent
@@ -3472,7 +4100,7 @@ async def _stream_into_feishu_shared_consumer(
                     if len(piece) > remaining:
                         piece = piece[:remaining] + _STREAM_TRUNCATION_SUFFIX
                         content = content[:_STREAM_MAX_VISIBLE_CHARS] + _STREAM_TRUNCATION_SUFFIX
-                        consumer.on_delta(_clean_stream_display_text(piece, profile_home))
+                        consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
                         content_delta_seen = True
                         logger.info(
                             "multitenancy: shared stream content truncated max_chars=%s",
@@ -3480,7 +4108,7 @@ async def _stream_into_feishu_shared_consumer(
                         )
                         break
                     content += piece
-                    consumer.on_delta(_clean_stream_display_text(piece, profile_home))
+                    consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
                     content_delta_seen = True
             except Exception as exc:
                 logger.info("multitenancy: shared streaming failed (%s) — falling back to non-stream", exc)

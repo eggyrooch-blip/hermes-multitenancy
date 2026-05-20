@@ -11,6 +11,10 @@ from typing import Optional
 
 
 _FALLBACK_ALIASES = {
+    "feishu_auth": "feishu-auth",
+    "feishu_reauth": "feishu-auth",
+    "feishu-auth": "feishu-auth",
+    "feishu-reauth": "feishu-auth",
     "provider": "model",
     "reset": "new",
     "bg": "background",
@@ -33,6 +37,7 @@ _FALLBACK_GATEWAY_COMMANDS = frozenset(
         "debug",
         "deny",
         "fast",
+        "feishu-auth",
         "help",
         "insights",
         "model",

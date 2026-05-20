@@ -1411,7 +1411,7 @@ def _aiagent_subprocess_env_scope(
     extra: Optional[dict[str, str]] = None,
 ) -> Iterator[dict[str, str]]:
     """Build child env while keeping per-run broker lifetime scoped to spawn."""
-    sender_open_id = _resolve_sender_open_id(event)
+    sender_open_id = _resolve_subprocess_sender_open_id(event)
     merged_extra = dict(extra or {})
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
@@ -2001,7 +2001,7 @@ async def _stream_aiagent_subprocess(
     except Exception:
         pass
     if not sender_open_id:
-        sender_open_id = _resolve_sender_open_id(event)
+        sender_open_id = _resolve_subprocess_sender_open_id(event)
     _canonical_session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
     user_text = getattr(event, "text", "") or ""
     _state_db_path = profile_home / "state.db"

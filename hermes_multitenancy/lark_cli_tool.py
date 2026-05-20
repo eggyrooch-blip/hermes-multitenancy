@@ -37,8 +37,17 @@ POLICY_PATH = Path(__file__).resolve().parents[1] / "config" / "lark_cli_policy.
 _SECRET_PATTERNS = [
     re.compile(r"(?i)(Authorization\s*[:=]\s*Bearer\s+)[^\s\"',}]+"),
     re.compile(r"(?i)(Bearer\s+)[^\s\"',}]+"),
-    re.compile(r"(?i)((?:access_token|refresh_token|app_secret|proxy_key|token)\s*[\"'=:\s]+\s*)[^\"'\s,}]+"),
+    re.compile(r"(?i)((?:access_token|refresh_token|app_secret|proxy_key)\s*[\"'=:\s]+\s*)[^\"'\s,}]+"),
     re.compile(r"(?i)(LARKSUITE_CLI_PROXY_KEY=)[^\s]+"),
+]
+
+_NON_BUSINESS_NOTICE_PATTERNS = [
+    re.compile(
+        r"(?im)^.*(?:new version|newer version|update available|lark-cli update|upgrade lark-cli).*(?:\n|$)"
+    ),
+    re.compile(
+        r"(?im)^.*(?:有新版本|新版本可用|可升级|升级 lark-cli|更新 lark-cli).*(?:\n|$)"
+    ),
 ]
 
 _SAFE_ENV_NAMES = {
@@ -71,6 +80,13 @@ def _redact(text: str) -> str:
     for pattern in _SECRET_PATTERNS:
         redacted = pattern.sub(lambda match: f"{match.group(1)}***REDACTED***", redacted)
     return redacted
+
+
+def _strip_non_business_notices(text: str) -> str:
+    cleaned = text or ""
+    for pattern in _NON_BUSINESS_NOTICE_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned.strip()
 
 
 def _load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
@@ -168,7 +184,23 @@ def _argv_with_json_format(argv: list[str], mode: str = "api") -> list[str]:
 def _supports_identity_flag(argv: list[str], mode: str) -> bool:
     if not argv or argv[0] in {"auth", "doctor", "schema"}:
         return False
+    if any(item in {"--help", "-h", "help"} for item in argv):
+        return False
     return not (mode == "shortcut" and argv[0] in {"event"})
+
+
+def _has_identity_flag(command: list[str]) -> bool:
+    return any(item == "--as" or item.startswith("--as=") for item in command)
+
+
+def _effective_identity(requested: Any) -> str:
+    default_as = str(os.getenv("LARKSUITE_CLI_DEFAULT_AS") or "").strip().lower()
+    if default_as in {"user", "bot"}:
+        return default_as
+    identity = str(requested or "auto").strip().lower()
+    if identity in {"user", "bot"}:
+        return identity
+    return "auto"
 
 
 def _safe_env() -> dict[str, str]:
@@ -334,9 +366,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     if not binary:
         return tool_error("lark-cli binary not found; set HERMES_LARK_CLI_BIN or install lark-cli")
 
-    identity = str(args.get("identity") or "auto")
+    identity = _effective_identity(args.get("identity"))
     command = [binary, *_argv_with_json_format(argv, mode)]
-    if "--as" not in command and identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
+    if not _has_identity_flag(command) and identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
         command.extend(["--as", identity])
 
     timeout = min(int(args.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS)
@@ -377,13 +409,14 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             risk=risk,
         )
 
-    stdout = _redact(completed.stdout)
-    stderr = _redact(completed.stderr)
+    stdout = _strip_non_business_notices(_redact(completed.stdout))
+    stderr = _strip_non_business_notices(_redact(completed.stderr))
     parsed = _parse_json_output(stdout)
     return tool_result(
         ok=completed.returncode == 0,
         approval_required=False,
         mode=mode,
+        identity=identity,
         command=argv,
         exit_code=completed.returncode,
         json=parsed,

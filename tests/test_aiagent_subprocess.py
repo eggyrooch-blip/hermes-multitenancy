@@ -2327,6 +2327,50 @@ def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatc
         assert env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
 
 
+def test_aiagent_subprocess_env_scope_prefers_raw_feishu_open_id_for_broker(monkeypatch, tmp_path: Path):
+    """Feishu route ids like g41a5b5g must not be used as UAT broker subjects."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    event = _event()
+    event.source.user_id = "g41a5b5g"
+    event.sender_open_id = "g41a5b5g"
+    event.raw_message = {
+        "event": {
+            "sender": {
+                "sender_id": {
+                    "open_id": "ou_real_sender",
+                },
+            },
+        },
+    }
+    seen: dict[str, object] = {}
+
+    @contextmanager
+    def fake_scope(profile_home, sender_open_id):
+        seen["sender_open_id"] = sender_open_id
+        yield {
+            "HERMES_LARK_CLI_BIN": "/tmp/lark-cli-authsidecar",
+            "LARKSUITE_CLI_AUTH_PROXY": "http://127.0.0.1:19090",
+            "LARKSUITE_CLI_PROXY_KEY": "short-lived",
+            "LARKSUITE_CLI_APP_ID": "cli_public",
+            "LARKSUITE_CLI_DEFAULT_AS": "user",
+        }
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        assert seen["sender_open_id"] == "ou_real_sender"
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_real_sender"
+        assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+
+
 def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
     """`extra` parameter wins over defaults so callers can override per-spawn."""
     from hermes_multitenancy import agent_real

@@ -141,9 +141,12 @@ def test_ensure_group_profile_writes_marker_and_soul(tmp_path):
     assert "owner-IT组" in soul_text
     assert "lark_cli" in soul_text
     assert "bot identity" in soul_text
+    assert "https://" in soul_text
+    assert "short timeout" in soul_text
     config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
     assert "lark-cli" in config_text
     assert "toolsets_mode: explicit" in config_text
+    assert "feishu: merge_default" in config_text
     assert "api_server:" in config_text
     assert "terminal" not in config_text
     assert "feishu_docx" not in config_text
@@ -340,6 +343,55 @@ async def test_resolve_returns_existing_group_route(isolated_router):
     )
     assert profile_name == "feishu_group_existing"
     assert profile_home == tmp_path / "profiles" / "feishu_group_existing"
+
+
+@pytest.mark.asyncio
+async def test_resolve_existing_group_route_normalizes_legacy_feishu_explicit_mode(
+    isolated_router,
+):
+    """Existing group profiles created before the CardKit/file-IO work may
+    still pin Feishu to only ["lark-cli"]. Route resolution must migrate them
+    so group Feishu can use default file/web tools while lark_cli stays present.
+    """
+    router_mod, tmp_path = isolated_router
+    table = router_mod._get_routing_table()
+    profile_home = tmp_path / "profiles" / "feishu_group_legacy"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  default: openai/test-model",
+                "platform_toolsets:",
+                "  feishu:",
+                "    - lark-cli",
+                "multitenancy:",
+                "  toolsets_mode: explicit",
+                "  platform_toolsets_mode:",
+                "    feishu: explicit",
+                "    api_server: merge_default",
+                "    webui: merge_default",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    table.upsert_group(
+        chat_id="oc_existing",
+        profile_name="feishu_group_legacy",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT",
+    )
+
+    profile_name, returned_home = await router_mod.resolve_or_auto_provision_group_route(
+        chat_id="oc_existing", gateway=None
+    )
+
+    assert profile_name == "feishu_group_legacy"
+    assert returned_home == profile_home
+    config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
+    assert "feishu: merge_default" in config_text
+    assert "feishu: explicit" not in config_text
 
 
 @pytest.mark.asyncio

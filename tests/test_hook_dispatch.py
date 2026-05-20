@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+import zlib
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +68,121 @@ def test_profile_scoped_media_response_maps_sandbox_workspace_path(tmp_path):
     )
 
     assert response == f"created\nMEDIA:{report.resolve()}"
+
+
+def test_materialize_response_artifact_json_writes_workspace_file(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    response = """
+测试标记：OUT_MD
+```hermes-artifact-json
+{"path":"/workspace/Downloads/out.md","format":"md","content":"# title\\n\\nOUT_MARKER\\n"}
+```
+MEDIA:/workspace/Downloads/out.md
+"""
+
+    materialized = router_mod._materialize_response_artifacts(response, tmp_path)
+
+    written = tmp_path / "workspace" / "Downloads" / "out.md"
+    assert written.read_text(encoding="utf-8") == "# title\n\nOUT_MARKER\n"
+    scoped = router_mod._profile_scoped_media_response(materialized, tmp_path)
+    assert f"MEDIA:{written.resolve(strict=False)}" in scoped
+
+
+def test_materialize_response_artifact_json_defaults_to_downloads_and_appends_media(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    response = """
+测试标记：OUT_MD
+```hermes-artifact-json
+{"filename":"out.md","format":"md","content":"# title\\n\\nOUT_MARKER\\n"}
+```
+"""
+
+    materialized = router_mod._materialize_response_artifacts(response, tmp_path)
+
+    written = tmp_path / "workspace" / "Downloads" / "out.md"
+    assert written.read_text(encoding="utf-8") == "# title\n\nOUT_MARKER\n"
+    assert "MEDIA:/workspace/Downloads/out.md" in materialized
+
+
+def test_materialize_response_artifact_json_can_request_image_document_delivery(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    response = """
+```hermes-artifact-json
+{"filename":"out.png","format":"png","marker":"OUT_PNG","as_document":true}
+```
+"""
+
+    materialized = router_mod._materialize_response_artifacts(response, tmp_path)
+
+    assert (tmp_path / "workspace" / "Downloads" / "out.png").is_file()
+    assert "[[as_document]]" in materialized
+    assert "MEDIA:/workspace/Downloads/out.png" in materialized
+
+
+def test_materialize_response_artifact_json_blocks_outside_workspace(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    response = """
+```hermes-artifact-json
+{"path":"/workspace/../.env","format":"md","content":"SECRET=leak"}
+```
+MEDIA:/workspace/../.env
+"""
+
+    materialized = router_mod._materialize_response_artifacts(response, tmp_path)
+
+    assert not (tmp_path / ".env").exists()
+    assert materialized == response
+
+
+def test_clean_stream_display_text_hides_artifact_json_blocks(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    visible = router_mod._clean_stream_display_text(
+        """测试标记：OUT
+```hermes-artifact-json
+{"path":"/workspace/Downloads/out.md","format":"md","content":"OUT_MARKER"}
+``` 
+[[as_document]]
+MEDIA:/workspace/Downloads/out.md
+正文仍然可见。""",
+        tmp_path,
+    )
+
+    assert "hermes-artifact-json" not in visible
+    assert "[[as_document]]" not in visible
+    assert "MEDIA:" not in visible
+    assert "正文仍然可见" in visible
+
+
+def test_materialize_response_artifact_json_writes_structured_formats(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    specs = [
+        {"path": "/workspace/Downloads/out.json", "format": "json", "marker": "OUT_JSON", "data": {"marker": "OUT_JSON"}},
+        {"path": "/workspace/Downloads/out.xlsx", "format": "xlsx", "marker": "OUT_XLSX", "rows": [["marker"], ["OUT_XLSX"]]},
+        {"path": "/workspace/Downloads/out.docx", "format": "docx", "marker": "OUT_DOCX", "content": "OUT_DOCX"},
+        {"path": "/workspace/Downloads/out.pdf", "format": "pdf", "marker": "OUT_PDF", "content": "OUT_PDF"},
+        {"path": "/workspace/Downloads/out.png", "format": "png", "marker": "OUT_PNG"},
+        {"path": "/workspace/Downloads/out.jpg", "format": "jpg", "marker": "OUT_JPG"},
+    ]
+    response = "\n".join(
+        f"```hermes-artifact-json\n{json.dumps(spec)}\n```"
+        for spec in specs
+    )
+
+    router_mod._materialize_response_artifacts(response, tmp_path)
+
+    downloads = tmp_path / "workspace" / "Downloads"
+    assert json.loads((downloads / "out.json").read_text(encoding="utf-8"))["marker"] == "OUT_JSON"
+    assert "OUT_XLSX" in router_mod._extract_xlsx_text(downloads / "out.xlsx")
+    assert "OUT_DOCX" in router_mod._extract_docx_text(downloads / "out.docx")
+    assert "OUT_PDF" in router_mod._extract_pdf_text(downloads / "out.pdf")
+    assert (downloads / "out.png").is_file()
+    assert (downloads / "out.jpg").is_file()
 
 
 def test_profile_scoped_media_response_blocks_temp_path_without_profile_artifact(tmp_path):
@@ -148,6 +266,78 @@ def _write_minimal_xlsx(path: Path) -> None:
             zf.writestr(name, content)
 
 
+def _write_inline_string_xlsx(path: Path) -> None:
+    files = {
+        "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>""",
+        "_rels/.rels": """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+        "xl/workbook.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="matrix" sheetId="1" r:id="rId1"/></sheets>
+</workbook>""",
+        "xl/_rels/workbook.xml.rels": """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""",
+        "xl/worksheets/sheet1.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>marker</t></is></c><c r="B1" t="inlineStr"><is><t>amount</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>HERMES_MT_XLSX_INLINE_MARKER</t></is></c><c r="B2"><v>42</v></c></row>
+  </sheetData>
+</worksheet>""",
+    }
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+
+
+def _write_minimal_docx(path: Path) -> None:
+    files = {
+        "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>""",
+        "_rels/.rels": """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>""",
+        "word/document.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Hermes DOCX media matrix</w:t></w:r></w:p>
+    <w:p><w:r><w:t>HERMES_MT_DOCX_MARKER</w:t></w:r></w:p>
+  </w:body>
+</w:document>""",
+    }
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+
+
+def _write_minimal_pdf(path: Path) -> None:
+    stream = b"BT 72 720 Td (HERMES_MT_PDF_MARKER) Tj T* (Please summarize this PDF.) Tj ET"
+    encoded = base64.a85encode(zlib.compress(stream), adobe=True)
+    path.write_bytes(
+        b"%PDF-1.3\n"
+        b"1 0 obj << /Filter [ /ASCII85Decode /FlateDecode ] /Length "
+        + str(len(encoded)).encode("ascii")
+        + b" >>\nstream\n"
+        + encoded
+        + b"\nendstream\nendobj\n%%EOF\n"
+    )
+
+
 def test_local_file_enrichment_extracts_csv_and_xlsx(tmp_path):
     """Feishu document compatibility belongs in multitenancy, not Hermes-agent patches."""
     from hermes_multitenancy import router as router_mod
@@ -170,6 +360,87 @@ def test_local_file_enrichment_extracts_csv_and_xlsx(tmp_path):
     assert "HERMES_MT_XLSX_MARKER" in enriched
 
 
+def test_local_file_enrichment_extracts_docx_and_pdf(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    docx_path = tmp_path / "doc.docx"
+    pdf_path = tmp_path / "doc.pdf"
+    _write_minimal_docx(docx_path)
+    _write_minimal_pdf(pdf_path)
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(docx_path), str(pdf_path)],
+        media_types=["application/octet-stream", "application/octet-stream"],
+    )
+
+    enriched = router_mod._local_enrich_with_file_content(event)
+
+    assert "[Content of doc.docx]" in enriched
+    assert "HERMES_MT_DOCX_MARKER" in enriched
+    assert "[Content of doc.pdf]" in enriched
+    assert "HERMES_MT_PDF_MARKER" in enriched
+
+
+def test_local_file_enrichment_adds_doc_fallback_when_native_preview_is_lossy(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    docx_path = tmp_path / "lossy.docx"
+    _write_minimal_docx(docx_path)
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(docx_path)],
+        media_types=["application/octet-stream"],
+    )
+
+    enriched = router_mod._local_enrich_with_file_content(
+        event,
+        existing_text="[The user sent a document: 'lossy.docx'. Ask the user what they'd like you to do with it.]",
+    )
+
+    assert enriched is not None
+    assert "HERMES_MT_DOCX_MARKER" in enriched
+
+
+def test_local_file_enrichment_extracts_xlsx_inline_strings(tmp_path):
+    """Real Feishu/openpyxl sheets may store strings inline, not in sharedStrings.xml."""
+    from hermes_multitenancy import router as router_mod
+
+    xlsx_path = tmp_path / "inline.xlsx"
+    _write_inline_string_xlsx(xlsx_path)
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(xlsx_path)],
+        media_types=["application/octet-stream"],
+    )
+
+    enriched = router_mod._local_enrich_with_file_content(event)
+
+    assert "[Content of inline.xlsx]" in enriched
+    assert "marker\tamount" in enriched
+    assert "HERMES_MT_XLSX_INLINE_MARKER\t42" in enriched
+
+
+def test_local_file_enrichment_adds_xlsx_fallback_when_native_preview_is_lossy(tmp_path):
+    """If Hermes' native xlsx preview drops strings, multitenancy appends its richer preview."""
+    from hermes_multitenancy import router as router_mod
+
+    xlsx_path = tmp_path / "lossy.xlsx"
+    _write_inline_string_xlsx(xlsx_path)
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(xlsx_path)],
+        media_types=["application/octet-stream"],
+    )
+
+    enriched = router_mod._local_enrich_with_file_content(
+        event,
+        existing_text="[Content of lossy.xlsx]:\n[matrix]\n\t\t42",
+    )
+
+    assert enriched is not None
+    assert "HERMES_MT_XLSX_INLINE_MARKER\t42" in enriched
+
+
 def test_local_file_enrichment_handles_missing_media_types_and_skips_large_files(tmp_path):
     """Attachment fallback should cover all media URLs and avoid parsing large payloads."""
     from hermes_multitenancy import router as router_mod
@@ -189,6 +460,79 @@ def test_local_file_enrichment_handles_missing_media_types_and_skips_large_files
     assert "huge.csv" not in enriched
     assert "[Content of sheet.xlsx]" in enriched
     assert "HERMES_MT_XLSX_MARKER" in enriched
+
+
+def test_event_has_image_media_detects_gateway_photo_enum_shape(tmp_path):
+    """Feishu photo events may carry MessageType.PHOTO with blank media_type."""
+    from hermes_multitenancy import router as router_mod
+
+    event = SimpleNamespace(
+        message_type=SimpleNamespace(name="PHOTO", value="photo"),
+        media_urls=[str(tmp_path / "cache" / "images" / "img_abc")],
+        media_types=[""],
+    )
+
+    assert router_mod._event_has_image_media(event)
+
+
+def test_event_has_image_media_detects_gateway_image_cache_path(tmp_path):
+    """Feishu image cache paths can be extensionless with blank media_type."""
+    from hermes_multitenancy import router as router_mod
+
+    event = SimpleNamespace(
+        media_urls=[str(tmp_path / "cache" / "images" / "img_abc")],
+        media_types=[""],
+    )
+
+    assert router_mod._event_has_image_media(event)
+
+
+@pytest.mark.asyncio
+async def test_enrich_via_hermes_pipeline_blocks_image_preprocessing_when_configured(monkeypatch, tmp_path):
+    """Current Feishu UAT should not hang on unavailable vision credentials."""
+    from hermes_multitenancy import router as router_mod
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_IMAGE_PREP_STRATEGY", "blocked")
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(tmp_path / "cache" / "images" / "img_abc")],
+        media_types=[""],
+        source=SimpleNamespace(),
+    )
+
+    class Gateway:
+        async def _prepare_inbound_message_text(self, *, event, source, history):
+            raise AssertionError("default image strategy should not call gateway vision preprocessing")
+
+    enriched = await router_mod._enrich_via_hermes_pipeline(event, Gateway())
+
+    assert "something went wrong when I tried to look at it" in enriched
+    assert "vision_analyze" in enriched
+
+
+@pytest.mark.asyncio
+async def test_enrich_via_hermes_pipeline_times_out_image_preprocessing(monkeypatch, tmp_path):
+    """Slow/broken image vision preprocessing should surface a bounded unsupported note."""
+    from hermes_multitenancy import router as router_mod
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_IMAGE_PREP_STRATEGY", "gateway")
+    monkeypatch.setenv("HERMES_MULTITENANCY_IMAGE_PREP_TIMEOUT_S", "0.01")
+    event = SimpleNamespace(
+        text="",
+        media_urls=[str(tmp_path / "inbound.jpg")],
+        media_types=["image/jpeg"],
+        source=SimpleNamespace(),
+    )
+
+    class Gateway:
+        async def _prepare_inbound_message_text(self, *, event, source, history):
+            await asyncio.sleep(1)
+            return "too late"
+
+    enriched = await router_mod._enrich_via_hermes_pipeline(event, Gateway())
+
+    assert "something went wrong when I tried to look at it" in enriched
+    assert "vision_analyze" in enriched
 
 
 @pytest.mark.asyncio
@@ -1245,6 +1589,63 @@ async def test_handle_async_streams_enriched_text_to_aiagent(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_handle_async_short_circuits_when_image_vision_is_unavailable(monkeypatch, tmp_path):
+    """A broken vision provider should produce a clear blocked reply, not a tool-call timeout."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "vision-profile"
+    profile_home.mkdir()
+    add_spike_route("ou_image_sender", profile_home)
+
+    event = _build_event(text="", user_id="ou_image_sender")
+    event.message_id = "om_image"
+    event.media_urls = [str(profile_home / "cache" / "images" / "inbound_jpg_FEISHU_MEDIA_FILE_JPG_TEST.jpg")]
+    event.media_types = ["image/jpeg"]
+
+    async def fake_enrich(event, gateway):
+        return (
+            "[The user sent an image but something went wrong when I tried to look at it~ "
+            "You can try examining it yourself with vision_analyze using image_url: "
+            f"{event.media_urls[0]}]"
+        )
+
+    async def fake_stream(*args, **kwargs):
+        raise AssertionError("image vision unavailable should not dispatch to AIAgent")
+
+    sent = []
+
+    class FullFeishuAdapter:
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        async def on_processing_start(self, event):
+            return None
+
+        async def on_processing_complete(self, event, outcome):
+            return None
+
+        async def edit_message(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+
+    await router_mod.handle_async(event=event, gateway=SimpleNamespace(adapters={"feishu": FullFeishuAdapter()}))
+
+    assert sent
+    assert sent[0][0] == "chat-123"
+    assert "无法读取图片内容" in sent[0][1]
+    assert "vision_analyze" in sent[0][1]
+    assert "/Users/" not in sent[0][1]
+    assert "/cache/images/" not in sent[0][1]
+    assert "FEISHU_MEDIA_FILE_JPG_TEST" in sent[0][1]
+
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
 async def test_handle_async_reuses_gateway_media_delivery_after_stream(monkeypatch, tmp_path):
     """Multitenant streaming must reuse Hermes' native MEDIA:<path> delivery path."""
     from hermes_multitenancy import router as router_mod
@@ -1430,6 +1831,59 @@ def test_plain_profile_file_paths_are_hidden_from_visible_text(tmp_path):
     assert str(report) not in visible
     assert "[文件已作为附件发送]" in visible
     assert (profile_home / "workspace" / "Downloads" / "report.md").read_text(encoding="utf-8") == "report"
+
+
+@pytest.mark.asyncio
+async def test_handle_async_blocks_explicit_media_directive_for_sensitive_profile_file(monkeypatch, tmp_path):
+    """Explicit MEDIA directives must not bypass sensitive profile file filters."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "profiles" / "explicit-sensitive-profile"
+    profile_home.mkdir(parents=True)
+    add_spike_route("ou_explicit_sensitive_file", profile_home)
+
+    env_file = profile_home / ".env"
+    env_file.write_text("SECRET=value", encoding="utf-8")
+
+    async def fake_enrich(event, gateway):
+        return "send env file"
+
+    async def fake_stream(adapter, chat_id, profile_name, profile_home, event, *, messages=None):
+        return f"created\nMEDIA:{env_file}"
+
+    class FullFeishuAdapter:
+        async def on_processing_start(self, event):
+            return None
+
+        async def on_processing_complete(self, event, outcome):
+            return None
+
+        async def edit_message(self, *args, **kwargs):
+            return None
+
+    delivered = []
+
+    async def deliver_media(response, delivered_event, adapter):
+        delivered.append(response)
+
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+
+    gateway = SimpleNamespace(
+        adapters={"feishu": FullFeishuAdapter()},
+        _deliver_media_from_response=deliver_media,
+    )
+
+    await router_mod.handle_async(
+        event=_build_event(text="send env file", user_id="ou_explicit_sensitive_file"),
+        gateway=gateway,
+    )
+
+    assert delivered == []
+
+    clear_spike_routes()
 
 
 @pytest.mark.asyncio

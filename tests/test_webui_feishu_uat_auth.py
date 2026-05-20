@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 import time
+import urllib.error
 
 
 def _prepare_shared_home(tmp_path, monkeypatch):
@@ -103,6 +105,31 @@ def test_feishu_uat_status_reports_lark_cli_bot_fallback(tmp_path, monkeypatch):
     }
 
 
+def test_feishu_uat_auth_loads_shared_env_for_router_process(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    CredentialStore(shared / "multitenancy.db").put_credential(
+        profile_name="__global__",
+        subject_id="feishu_app",
+        provider="feishu",
+        secret_kind="app",
+        payload={"app_id": "cli_from_vault", "app_secret": "secret_from_vault"},
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+    (shared / ".env").write_text(
+        "HERMES_MULTITENANCY_CREDENTIAL_KEY=test-key\n"
+        "FEISHU_APP_ID=cli_from_env\n"
+        "FEISHU_APP_SECRET=secret_from_env\n",
+        encoding="utf-8",
+    )
+
+    assert feishu_uat_auth._feishu_app_credentials(shared) == ("cli_from_env", "secret_from_env")
+
+
 def test_feishu_uat_status_refreshes_expired_token_and_mirrors_json(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
     from hermes_multitenancy.credentials import CredentialStore
@@ -174,6 +201,76 @@ def test_feishu_uat_status_refreshes_expired_token_and_mirrors_json(tmp_path, mo
     )
     assert payload["access_token"] == "new-access"
     assert payload["refresh_token"] == "new-refresh"
+
+
+def test_feishu_uat_device_flow_falls_back_without_legacy_helper(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    calls = []
+
+    def fake_post(url, payload):
+        calls.append((url, payload))
+        return {
+            "device_code": " dc_test ",
+            "user_code": "UAT-123",
+            "verification_uri": "https://accounts.feishu.cn/device",
+            "verification_uri_complete": "https://accounts.feishu.cn/device?user_code=UAT-123",
+            "expires_in": 1800,
+            "interval": 1,
+        }
+
+    monkeypatch.setattr(feishu_uat_auth, "_api_post", fake_post)
+
+    result = feishu_uat_auth._begin_device_authorization("cli_test", None, "secret_test")
+
+    assert result["device_code"] == "dc_test"
+    assert result["user_code"] == "UAT-123"
+    assert result["interval"] == 2
+    assert calls[0][0].endswith("/oauth/v1/device_authorization")
+    assert calls[0][1]["client_secret"] == "secret_test"
+    assert "offline_access" in calls[0][1]["scope"].split()
+
+
+def test_feishu_uat_poll_falls_back_without_legacy_helper(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    def fake_post(url, payload):
+        assert url.endswith("/open-apis/authen/v2/oauth/token")
+        assert payload["grant_type"] == "urn:ietf:params:oauth:grant-type:device_code"
+        assert payload["client_secret"] == "secret_test"
+        return {
+            "access_token": "uat-access",
+            "refresh_token": "uat-refresh",
+            "expires_in": 7200,
+            "refresh_token_expires_in": 2592000,
+            "scope": "offline_access wiki:wiki",
+        }
+
+    monkeypatch.setattr(feishu_uat_auth, "_api_post", fake_post)
+
+    result = feishu_uat_auth._poll_device_token("dc_test", "cli_test", "secret_test")
+
+    assert result["access_token"] == "uat-access"
+    assert result["refresh_token"] == "uat-refresh"
+    assert result["refresh_expires_in"] == 2592000
+    assert result["scope"] == "offline_access wiki:wiki"
+
+
+def test_feishu_uat_api_post_parses_oauth_error_json_from_http_error(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    def fake_urlopen(_request, timeout):
+        raise urllib.error.HTTPError(
+            "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"authorization_pending"}'),
+        )
+
+    monkeypatch.setattr(feishu_uat_auth.urllib.request, "urlopen", fake_urlopen)
+
+    assert feishu_uat_auth._api_post("https://example.com/token", {}) == {"error": "authorization_pending"}
 
 
 def test_legacy_refresh_entrypoint_delegates_to_multitenancy_refresh(tmp_path, monkeypatch):

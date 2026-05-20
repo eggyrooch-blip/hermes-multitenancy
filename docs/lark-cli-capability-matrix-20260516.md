@@ -146,8 +146,69 @@ Final ledger recompute:
 | T3 | 72 | 3 | 0 | 0 |
 | T4 | 72 | 3 | 0 | 0 |
 
+## 2026-05-19 T4 Restore-CardKit Rerun
+
+During `restore-feishu-cardkit-output`, T4 was rerun through real Feishu private chat after the CardKit/lark-cli identity fixes. Mail was intentionally skipped per operator instruction. The rerun scope was every non-mail `lark-cli` capability with three natural-language requests per capability, plus `shared` credential-boundary checks.
+
+| Path | Coverage | Pass | Blocked | Skipped | Fail | Evidence |
+|---|---:|---:|---:|---:|---:|---|
+| T4 `feishu_g41a5b5g` Feishu private -> user `lark-cli` | 24 non-mail capabilities x 3 messages = 72 rows | 71 | 1 | 3 mail rows | 0 | `/tmp/hermes-lark-cli-matrix/t4-*fix*.jsonl`, summaries `t4-*-summary-20260519-*.tsv` |
+
+Representative evidence:
+
+- `contact/3` originally failed because the auth broker used profile short id `g41a5b5g` instead of raw Feishu `ou_cf23e7c262afa4b7a006baa75f863ed5`. After `_aiagent_subprocess_env_scope()` switched to raw sender open_id, all contact rows passed.
+- `slides/1` originally failed because default `--as user` was injected into a help command. After help/auth/schema/event commands stopped receiving identity injection, slides rows passed.
+- Real disposable artifacts created by user identity include docx `Z30LdY1UmoTr0bxnhFtcyqSDnid`, sheet `FfTpsCfKmhz7AbtodhVcoCMOncf`, and slide deck `KXaFsqWW4l1yXpdgjWacIYopn3s`.
+- `shared/auth status` remains an expected blocked row: Hermes injects credentials externally, so profile-local interactive `lark-cli auth` management is intentionally unavailable.
+
 Remaining product actions, not Hermes bridge bugs:
 
 1. Add/authorize `search:docs:read` if `drive +search` should work for `owner` UAT.
 2. Enable/bind Feishu Mail mailbox if `mail +triage` should work for `owner`.
 3. Keep `auth status` expectations documented: Hermes injects credentials externally, so interactive `lark-cli auth` management is intentionally blocked inside profiles.
+
+## Release UAT Gates Added 2026-05-19
+
+Before shipping `restore-feishu-cardkit-output`, keep these as explicit gates:
+
+- T4 real Feishu private chat, no-mail `lark-cli` rerun stays required.
+- Real Feishu context-continuity UAT stays required for both private chat and group chat. Each release candidate must run a multi-turn sequence that proves the next turn can use prior user facts, prior assistant facts, and prior tool/file results without the user restating them. A broken follow-up such as answering a different topic, forgetting a marker/code word, or losing the previous file/tool artifact is a release-blocking `fail`.
+- Real Feishu file IO media matrix stays required: inbound `.md/.txt/.json/.csv/.xlsx/.pdf/.docx` must read markers; inbound images are allowed only as `blocked` while the vision provider is invalid; outbound generated files must be requested with natural user prompts, not internal `/workspace` or `MEDIA:` instructions.
+- Current implementation supports natural outbound prompts via profile SOUL + `hermes-artifact-json` bridge: model emits `filename/format/content|data|rows`, router defaults to `workspace/Downloads` and auto-delivers the file. Focused local regressions passed; latest real natural-prompt rerun is blocked before Hermes receives the request because `lark-cli-authsidecar POST /open-apis/im/v1/messages --as user` returned `HTTP 502: forward request failed` for `20260519_221201` and `20260519_222135`, with no matching `state.db` rows. Do not count this as Hermes file-output failure; rerun once Feishu/lark-cli user message sending is stable.
+
+## Release UAT Gate Added 2026-05-19: Context Continuity
+
+This gate is separate from the lark-cli capability matrix and the file IO media matrix. It exists because a single-turn pass can still hide a broken session/history path.
+
+| Path | Required sequence | Pass condition |
+|---|---|---|
+| T4 private Feishu UAT | `/new`; send a unique marker plus a code word; follow up with "刚才的代号是什么"; follow up again asking it to relate that code word to the previous answer | The assistant answers the exact marker/code word in each follow-up without the user restating it |
+| T2 group Feishu UAT | `@bot /new`; send a unique marker plus a code word in the group; follow up with `@bot 刚才的代号是什么`; then ask one more contextual question | The group profile keeps the same group+sender context and answers the prior marker/code word |
+| Private file/tool continuity | Upload or generate a file/tool artifact; then ask "继续用刚才那个文件/结果..." | The assistant uses the previous artifact/result and does not ask for it again |
+| Group file/tool continuity | Same as above, but through the group profile and bot identity | The assistant keeps the prior artifact/result within that group profile only |
+
+Evidence must include Feishu message IDs or profile `state.db` rows for every turn. Any `/new`, duplicate-message skip, approval prompt, or interrupted long task must be recorded because it changes the session boundary.
+
+### 2026-05-19 Context Evidence
+
+Two real-message continuity probes were run after the user reported group/private context felt disconnected.
+
+| Probe | Path | Marker base | Result | Evidence |
+|---|---|---|---|---|
+| Short-term no-tool | T4 private Feishu UAT | `CTX_NOTOOL_PRIVATE_20260519_232945` | pass: no tools used; turn B recalled code word `苜蓿` from turn A | `feishu_g41a5b5g/state.db` rows `5045-5048` |
+| Short-term no-tool | T2 group Feishu UAT | `CTX_NOTOOL_GROUP_20260519_233041` | pass: no tools used; turn B recalled code word `苜蓿` from turn A | `feishu_group_dfe8bc83167b_e18e/state.db` rows `2209-2212` |
+| Memory-assisted sanity | T4 private Feishu UAT | `CTX_PRIVATE_20260519_232507` | pass: turns B/C recalled `海盐`; turn A used `memory`, so this is not counted as pure session-history proof | `feishu_g41a5b5g/state.db` rows `5037-5044` |
+| Memory-assisted sanity | T2 group Feishu UAT | `CTX_GROUP_20260519_232719` | pass: turns B/C recalled `海盐`; turn A used `memory`, so this is not counted as pure session-history proof | `feishu_group_dfe8bc83167b_e18e/state.db` rows `2201-2208` |
+
+Operational note: an earlier context probe sent the next turn while a previous turn was still streaming, causing a visible "Interrupting current task" placeholder in Feishu. That is a test-runner bug, not a passing context result. Future UAT scripts must wait for a stable final assistant row before sending the next turn.
+
+### 2026-05-20 CardKit Final-Card Evidence
+
+The Feishu CardKit release gate also checks the user-visible final card shape after tool execution. The required shape is Hermes product style, not raw native Hermes text: `Tool calls:` with business tools only, optional collapsed reasoning, markdown body, then `Done (x.xs)`.
+
+| Probe | Path | Marker | Result | Evidence |
+|---|---|---|---|---|
+| Final card lark-cli | T4 private Feishu UAT | `CARDKIT_PRIVATE_SHIP_20260520_000543` | pass: final card contains `Tool calls`, a single visible `lark_cli` duration line, body, and `Done`; no `generating arguments`, `skill_view`, or process narration | Feishu interactive message `om_x100b6ffceb0eaca4b3c2f594fe7937a` |
+| Final card lark-cli | T2 group Feishu UAT | `CARDKIT_GROUP_SHIP_20260520_000543` | pass: group mention entered the group profile, `lark_cli` used bot identity to read recent group messages, final card contains clean tool/body/done layout; no internal tool rows or process narration | Feishu interactive message `om_x100b6ffce7e8d0a4b208a3d2c5e70c4`, `feishu_group_dfe8bc83167b_e18e/state.db` rows `2253-2258` |
+
+Regression coverage for this gate: `tests/test_streaming_card_transport.py tests/test_commands.py::test_new_command_resets_session_history tests/test_group_provisioning.py tests/test_lark_cli_tool_registration.py` => `70 passed`.

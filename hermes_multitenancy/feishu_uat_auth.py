@@ -147,6 +147,7 @@ def credential_status(
     shared_home: Optional[Path] = None,
 ) -> dict[str, Any]:
     shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
     _assert_route(shared, profile_name, open_id)
     refresh_error = ""
     try:
@@ -207,6 +208,7 @@ def refresh_uat_if_needed(
     A successful refresh must update both in one place to avoid token skew.
     """
     shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
     _assert_route(shared, profile_name, open_id)
     payload = _load_best_uat_payload(shared, profile_name, open_id)
     if not payload:
@@ -264,6 +266,7 @@ def refresh_uat_for_user(
     canonical store and the profile-local JSON is only the compatibility mirror.
     """
     shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
     routed_profile = profile_name or _profile_name_for_open_id(shared, open_id)
     return refresh_uat_if_needed(
         profile_name=routed_profile,
@@ -302,6 +305,7 @@ def start_session(
     shared_home: Optional[Path] = None,
 ) -> dict[str, Any]:
     shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
     _assert_route(shared, profile_name, open_id)
     client_id, client_secret = _feishu_app_credentials(shared)
     data = _begin_device_authorization(client_id, scope, client_secret)
@@ -332,6 +336,7 @@ def poll_session(
     shared_home: Optional[Path] = None,
 ) -> dict[str, Any]:
     shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
     session = _sessions.get(session_id)
     if session is None:
         raise FeishuUatAuthError("authorization session not found", status=404)
@@ -417,6 +422,7 @@ def _clean_id(name: str, value: str) -> str:
 
 
 def _feishu_app_credentials(shared_home: Path) -> tuple[str, str]:
+    _load_shared_env(shared_home)
     client_id = os.environ.get("FEISHU_APP_ID", "").strip()
     client_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
     if client_id and client_secret:
@@ -448,6 +454,32 @@ def _feishu_app_credentials(shared_home: Path) -> tuple[str, str]:
         if store is not None:
             store.close()
     raise FeishuUatAuthError("Feishu app credentials are not configured", status=503)
+
+
+def _load_shared_env(shared_home: Path) -> None:
+    env_path = shared_home / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in {
+            "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+            "HERMES_CREDENTIAL_KEY",
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_DOMAIN",
+            "HERMES_LARK_CLI_APP_ID",
+        }:
+            continue
+        if os.environ.get(key):
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
 
 
 def _token_payload(result: dict[str, Any], *, open_id: str, app_id: str, scope: str) -> dict[str, Any]:
@@ -597,8 +629,7 @@ def _poll_device_token(device_code: str, client_id: str, client_secret: str) -> 
 
 def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -> dict[str, Any]:
     data = _api_post(
-        "/open-apis/authen/v2/oauth/token",
-        FEISHU_OPEN_BASE_URL,
+        f"{FEISHU_OPEN_BASE_URL}/open-apis/authen/v2/oauth/token",
         {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -639,14 +670,13 @@ def _is_missing_legacy_feishu_auth(exc: ModuleNotFoundError) -> bool:
 
 
 def _scope_with_offline_access(scope: str | None) -> str:
-    parts = parse_scopes(scope or FEISHU_DEFAULT_SCOPE)
+    parts = parse_scopes(scope or os.environ.get("HERMES_FEISHU_UAT_DEFAULT_SCOPE") or FEISHU_DEFAULT_SCOPE)
     if "offline_access" not in parts:
         parts.append("offline_access")
     return " ".join(dict.fromkeys(parts))
 
 
-def _api_post(path: str, base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    url = f"{base_url}{path}"
+def _api_post(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         data = _http_json("POST", url, payload=payload)
     except OSError as exc:
@@ -666,8 +696,7 @@ def _begin_device_authorization_local(
     client_secret: str,
 ) -> dict[str, Any]:
     data = _api_post(
-        "/oauth/v1/device_authorization",
-        FEISHU_ACCOUNTS_BASE_URL,
+        f"{FEISHU_ACCOUNTS_BASE_URL}/oauth/v1/device_authorization",
         {
             "client_id": client_id,
             "client_secret": client_secret,
@@ -687,7 +716,7 @@ def _begin_device_authorization_local(
         "verification_uri": str(data.get("verification_uri") or "").strip(),
         "verification_uri_complete": str(data["verification_uri_complete"]).strip(),
         "expires_in": int(data.get("expires_in", 1800)),
-        "interval": max(int(data.get("interval", 3)), 1),
+        "interval": max(int(data.get("interval", 3)), 2),
     }
 
 
@@ -703,8 +732,7 @@ def _refresh_token_expires_in(data: dict[str, Any], default: int = 30 * 24 * 360
 
 def _poll_device_token_local(device_code: str, client_id: str, client_secret: str) -> dict[str, Any]:
     data = _api_post(
-        "/open-apis/authen/v2/oauth/token",
-        FEISHU_OPEN_BASE_URL,
+        f"{FEISHU_OPEN_BASE_URL}/open-apis/authen/v2/oauth/token",
         {
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             "client_id": client_id,

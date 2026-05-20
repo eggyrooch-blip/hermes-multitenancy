@@ -491,6 +491,146 @@ async def _run_cardkit_compat_never_renders_raw_tool_call_xml():
     assert "Done (" in rendered
 
 
+def test_cardkit_compat_filters_tool_process_narration_from_final_body():
+    asyncio.run(_run_cardkit_compat_filters_tool_process_narration_from_final_body())
+
+
+async def _run_cardkit_compat_filters_tool_process_narration_from_final_body():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview="im +chat-messages-list",
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        duration=31.289,
+        is_error=False,
+    )
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content=(
+            "我需要先找到你刚发的 markdown 文件。让我先在群聊的最近消息中查找文件。\n\n"
+            "让我先获取群聊中最近的消息，找到你发送的 markdown 文件。\n\n"
+            "找到了文件消息。现在让我下载这个文件来读取内容。\n\n"
+            "文件已下载，让我读取内容。\n\n"
+            "已读取你发送的 markdown 文件，文件内容中的**测试内容标记**为：\n\n"
+            "`GROUP_FILE_CONTENT_RERUN_20260519_233509`"
+        ),
+        finalize=True,
+    )
+
+    final_card = adapter.card_patches[-1]["card"]
+    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    assert "我需要先找到" not in rendered
+    assert "让我先获取" not in rendered
+    assert "现在让我下载" not in rendered
+    assert "文件已下载，让我读取内容" not in rendered
+    assert "已读取你发送的 markdown 文件" in rendered
+    assert "GROUP_FILE_CONTENT_RERUN_20260519_233509" in rendered
+
+
+def test_cardkit_compat_collapses_argument_generation_tool_rows():
+    asyncio.run(_run_cardkit_compat_collapses_argument_generation_tool_rows())
+
+
+async def _run_cardkit_compat_collapses_argument_generation_tool_rows():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview="generating arguments",
+    )
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview=None,
+        args={"argv": ["auth", "status"]},
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        duration=0.487,
+        is_error=False,
+    )
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="CARDKIT_PRIVATE_SPOT\n\n查询结果摘要",
+        finalize=True,
+    )
+
+    final_card = adapter.card_patches[-1]["card"]
+    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    assert "generating arguments" not in rendered
+    assert rendered.count("`lark_cli`") == 1
+    assert "- `lark_cli` (487 ms)" in rendered
+
+
+def test_cardkit_compat_hides_internal_skill_view_tool_rows():
+    asyncio.run(_run_cardkit_compat_hides_internal_skill_view_tool_rows())
+
+
+async def _run_cardkit_compat_hides_internal_skill_view_tool_rows():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="skill_view",
+        preview="lark-im",
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="skill_view",
+        duration=0.037,
+        is_error=False,
+    )
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview=None,
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        duration=1.159,
+        is_error=False,
+    )
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="CARDKIT_GROUP_SPOT\n\n结果摘要",
+        finalize=True,
+    )
+
+    final_card = adapter.card_patches[-1]["card"]
+    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    assert "`skill_view`" not in rendered
+    assert "- `lark_cli` (1159 ms)" in rendered
+
+
 def test_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     monkeypatch, tmp_path
 ):
