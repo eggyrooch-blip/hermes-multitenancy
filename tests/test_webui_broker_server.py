@@ -756,6 +756,170 @@ def test_webui_run_broker_owner_header_agent_id_resolves_owned_profile(tmp_path)
     asyncio.run(runner())
 
 
+def test_webui_profile_provisioning_creates_owner_scoped_agent_route(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="feishu_g41a5b5g",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": " ou_owner ",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "feishu_g41a5b5g",
+                    "display_label": "Coder",
+                    "description": "Software engineering agent",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+
+            table = router_mod._get_routing_table()
+            assert table is not None
+            row = table.lookup_agent(body["agent_id"])
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["profile_name"] == "web_coder"
+        assert body["owner_open_id"] == "ou_owner"
+        assert body["agent_id"] == "webui:ou_owner:web_coder"
+        assert row is not None
+        assert row.profile_name == "web_coder"
+        assert row.kind == "agent"
+        assert row.provenance == "webui-agent"
+        assert row.owner_open_id == "ou_owner"
+        assert row.upstream_profile == "feishu_g41a5b5g"
+        assert row.display_label == "Coder"
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_requires_owner_header(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    RoutingTable(db_path).close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "feishu_g41a5b5g",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "owner identity required" in body
+
+    asyncio.run(runner())
+
+
+def test_webui_profile_provisioning_rejects_cross_owner_agent_id(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="root-other",
+        profile_name="other_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded._conn.execute(
+        """
+        INSERT INTO multitenancy_routing
+            (user_id, profile_name, open_id, active, synced_at, version,
+             created_at, updated_at, kind, owner_open_id, display_label,
+             agent_id, provenance, upstream_profile)
+        VALUES
+            ('webui:ou_other:web_coder', 'web_coder', 'webui:ou_other:web_coder',
+             1, 1, 1, 1, 1, 'agent', 'ou_other', 'Other Coder',
+             'webui:ou_other:web_coder', 'webui-agent', 'other_profile')
+        """
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "profile_name": "web_coder",
+                    "agent_id": "webui:ou_other:web_coder",
+                    "upstream_profile": "owner_profile",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert "does not belong" in body
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_owner_header_rejects_cross_owner_agent_id(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
