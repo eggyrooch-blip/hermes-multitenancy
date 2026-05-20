@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import types
+import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -1103,10 +1104,22 @@ def case_real_tat_bot_token(real_home: Path) -> dict[str, Any]:
         )
     finally:
         store.close()
-    tat = _mint_tenant_access_token(payload, timeout=10)
+    tat = ""
+    attempts = 0
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        try:
+            tat = _mint_tenant_access_token(payload, timeout=10)
+            break
+        except urllib.error.URLError:
+            if attempt == max_attempts:
+                raise
+            time.sleep(0.5 * attempt)
     _assert(bool(tat), "TAT mint returned empty token")
     return {
         "tat_minted": True,
+        "tat_attempts": attempts,
         "token_length": len(tat),
         "secret_free": True,
     }

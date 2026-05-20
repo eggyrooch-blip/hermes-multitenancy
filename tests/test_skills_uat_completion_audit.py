@@ -155,6 +155,13 @@ def _base_evidence(tmp_path: Path) -> object:
                 "group_has_token": False,
                 "inactive_has_token": False,
             })
+        if name == "real_feishu_tat_bot_token":
+            case.update({
+                "tat_minted": True,
+                "tat_attempts": 1,
+                "token_length": 42,
+                "secret_free": True,
+            })
         if name == "offline_distribution_audience_symlink_version_self_install":
             case.update({
                 "manifest_version": "v2",
@@ -710,6 +717,39 @@ def test_completion_audit_requires_shared_token_group_isolation_details(tmp_path
     assert "scoped_group_has_token=True" in item["note"]
     assert "wildcard_group_has_token=True" in item["note"]
     assert "wildcard_inactive_has_token=True" in item["note"]
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_requires_real_tat_bot_token_secret_free_details(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    matrix_path = tmp_path / "skills-uat-latest.json"
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    for case in matrix["cases"]:
+        if case["name"] == "real_feishu_tat_bot_token":
+            case["tat_minted"] = False
+            case["token_length"] = 0
+            case["secret_free"] = False
+            case["tat_attempts"] = 0
+            break
+    matrix_path.write_text(json.dumps(matrix, ensure_ascii=False), encoding="utf-8")
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Validate real Feishu bot TAT")
+    )
+    assert item["status"] == "failed"
+    assert "tat_minted=False" in item["note"]
+    assert "token_length=0" in item["note"]
+    assert "secret_free=False" in item["note"]
+    assert "tat_attempts=0" in item["note"]
     assert report["evidence_ok"] is False
 
 
@@ -1685,7 +1725,7 @@ def test_completion_audit_accepts_required_dialogue_and_write_identity_coverage(
 
     assert report["failed"] == 0
     assert report["blocked"] == 3
-    assert report["covered"] == 30
+    assert report["covered"] == 31
     assert report["evidence_ok"] is True
     assert report["completion_state"] == "incomplete"
 
@@ -1712,7 +1752,7 @@ def test_completion_audit_treats_missing_credential_key_real_cases_as_blocked_no
     assert matrix_item["status"] == "covered"
     assert "blocked_failures" in matrix_item["note"]
     assert report["failed"] == 0
-    assert report["blocked"] == 4
+    assert report["blocked"] == 5
     assert report["covered"] == 29
     assert report["evidence_ok"] is True
 
@@ -1740,7 +1780,7 @@ def test_completion_audit_treats_expired_real_user_uat_as_blocked_not_failed(tmp
     assert "real_feishu_uat_user_info" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 29
+    assert report["covered"] == 30
     assert report["evidence_ok"] is True
 
 
@@ -1773,7 +1813,7 @@ def test_completion_audit_treats_scope_inventory_without_valid_user_uat_as_block
     assert scope_item["status"] == "blocked"
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 29
+    assert report["covered"] == 30
     assert report["evidence_ok"] is True
 
 

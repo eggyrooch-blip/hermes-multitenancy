@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import time
+import urllib.error
 from pathlib import Path
 
 
@@ -327,3 +328,39 @@ def test_real_uat_scope_inventory_is_secret_free(monkeypatch, tmp_path: Path):
     assert "im:message.send_as_user" in result["required_core_scopes"]
     assert "secret-access" not in str(result)
     assert "secret-refresh" not in str(result)
+
+
+def test_real_tat_bot_token_retries_transient_network_errors(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-tat-retry-key")
+    matrix_mod = _load_matrix_module()
+    monkeypatch.setattr(matrix_mod.time, "sleep", lambda _seconds: None)
+    real_home = tmp_path / "real-home"
+    store = CredentialStore(real_home / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__global__",
+            subject_id="feishu_app",
+            provider="feishu",
+            secret_kind="app",
+            payload={"app_id": "cli_app", "app_secret": "app-secret", "domain": "feishu"},
+        )
+    finally:
+        store.close()
+    calls: list[float] = []
+
+    def fake_mint(payload, *, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise urllib.error.URLError(TimeoutError("handshake timed out"))
+        return "tat-secret"
+
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker._mint_tenant_access_token", fake_mint)
+
+    result = matrix_mod.case_real_tat_bot_token(real_home)
+
+    assert result["tat_minted"] is True
+    assert result["token_length"] == len("tat-secret")
+    assert result["tat_attempts"] == 2
+    assert len(calls) == 2

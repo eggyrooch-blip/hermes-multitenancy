@@ -792,6 +792,21 @@ def _real_home_skill_inventory_ok(case: dict[str, Any]) -> tuple[bool, str]:
     return not missing, note
 
 
+def _real_tat_bot_token_ok(case: dict[str, Any]) -> tuple[bool, str]:
+    tat_minted = case.get("tat_minted") is True
+    secret_free = case.get("secret_free") is True
+    token_length = int(case.get("token_length") or 0)
+    tat_attempts = int(case.get("tat_attempts") or 0)
+    ok = case.get("ok") is True and tat_minted and secret_free and token_length > 0 and 1 <= tat_attempts <= 3
+    note = (
+        f"ok={case.get('ok') is True}; tat_minted={tat_minted}; "
+        f"token_length={token_length}; secret_free={secret_free}; "
+        f"tat_attempts={tat_attempts}"
+        + (f"; reason={case.get('reason')}" if case.get("reason") else "")
+    )
+    return ok, note
+
+
 def _continue_reconstruction_ok(case: dict[str, Any]) -> tuple[bool, str]:
     used_previous = case.get("continue_used_previous_request") is True
     response = str(case.get("continue_response") or "")
@@ -1307,6 +1322,17 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         uat_scope_status,
         str(matrix_path),
         uat_scope_note,
+    ))
+    tat_case = cases.get("real_feishu_tat_bot_token") or {}
+    tat_ok, tat_note = _real_tat_bot_token_ok(tat_case)
+    tat_status = "covered" if tat_ok else (
+        "blocked" if "real_feishu_tat_bot_token" in blocked_matrix_failures else "failed"
+    )
+    items.append(_item(
+        "Validate real Feishu bot TAT can be minted from app credentials without exposing token material.",
+        tat_status,
+        str(matrix_path),
+        tat_note,
     ))
 
     dialogue_ok, missing_dialogue_labels, dialogue_counts = _coverage_by_label(
