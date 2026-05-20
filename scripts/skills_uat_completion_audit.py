@@ -687,6 +687,24 @@ def _keep_four_skill_policy_ok(case: dict[str, Any]) -> tuple[bool, str]:
     return ok, note
 
 
+def _profile_user_audience_ok(case: dict[str, Any]) -> tuple[bool, str]:
+    profile_audience_profile = str(case.get("profile_audience_profile") or "")
+    user_audience_user = str(case.get("user_audience_user") or "")
+    carol_received_targeted_skill = case.get("carol_received_targeted_skill") is True
+    ok = (
+        case.get("ok") is True
+        and profile_audience_profile == "alice"
+        and user_audience_user == "bob"
+        and not carol_received_targeted_skill
+    )
+    note = (
+        f"profile_audience_profile={profile_audience_profile}; "
+        f"user_audience_user={user_audience_user}; "
+        f"carol_received_targeted_skill={carol_received_targeted_skill}"
+    )
+    return ok, note
+
+
 def _skill_inventory_ok(case: dict[str, Any]) -> tuple[bool, str]:
     source_counts = case.get("source_counts") if isinstance(case.get("source_counts"), dict) else {}
     required_sources = ("managed", "personal", "unknown")
@@ -1036,6 +1054,14 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         "covered" if keep_ok else "failed",
         str(matrix_path),
         keep_note,
+    ))
+    audience_case = cases.get("offline_profile_user_audience_distribution") or {}
+    audience_ok, audience_note = _profile_user_audience_ok(audience_case)
+    items.append(_item(
+        "Validate profile and user audience distribution reaches only the explicitly targeted identities.",
+        "covered" if audience_ok else "failed",
+        str(matrix_path),
+        audience_note,
     ))
     new_hire_case = cases.get("offline_new_hire_sync_auto_installs_managed_skills") or {}
     new_hire_ok, new_hire_note = _new_hire_sync_ok(new_hire_case)

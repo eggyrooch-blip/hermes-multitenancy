@@ -132,6 +132,12 @@ def _base_evidence(tmp_path: Path) -> object:
                 ],
                 "ops_user_skills": ["kep-hades-cli"],
             })
+        if name == "offline_profile_user_audience_distribution":
+            case.update({
+                "profile_audience_profile": "alice",
+                "user_audience_user": "bob",
+                "carol_received_targeted_skill": False,
+            })
         if name == "offline_distribution_audience_symlink_version_self_install":
             case.update({
                 "manifest_version": "v2",
@@ -622,6 +628,37 @@ def test_completion_audit_requires_keep_four_skill_policy_details(tmp_path: Path
     assert item["status"] == "failed"
     assert "missing_keep_skills=['kep-prd-analysis']" in item["note"]
     assert "unexpected_ops_skills=['kep-cli']" in item["note"]
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_requires_profile_user_audience_details(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    matrix_path = tmp_path / "skills-uat-latest.json"
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    audience_case = next(
+        case
+        for case in matrix["cases"]
+        if case.get("name") == "offline_profile_user_audience_distribution"
+    )
+    audience_case["profile_audience_profile"] = "bob"
+    audience_case["carol_received_targeted_skill"] = True
+    matrix_path.write_text(json.dumps(matrix, ensure_ascii=False), encoding="utf-8")
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Validate profile and user audience distribution")
+    )
+    assert item["status"] == "failed"
+    assert "profile_audience_profile=bob" in item["note"]
+    assert "carol_received_targeted_skill=True" in item["note"]
     assert report["evidence_ok"] is False
 
 
@@ -1597,7 +1634,7 @@ def test_completion_audit_accepts_required_dialogue_and_write_identity_coverage(
 
     assert report["failed"] == 0
     assert report["blocked"] == 3
-    assert report["covered"] == 28
+    assert report["covered"] == 29
     assert report["evidence_ok"] is True
     assert report["completion_state"] == "incomplete"
 
@@ -1625,7 +1662,7 @@ def test_completion_audit_treats_missing_credential_key_real_cases_as_blocked_no
     assert "blocked_failures" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 27
+    assert report["covered"] == 28
     assert report["evidence_ok"] is True
 
 
@@ -1652,7 +1689,7 @@ def test_completion_audit_treats_expired_real_user_uat_as_blocked_not_failed(tmp
     assert "real_feishu_uat_user_info" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 27
+    assert report["covered"] == 28
     assert report["evidence_ok"] is True
 
 
@@ -1685,7 +1722,7 @@ def test_completion_audit_treats_scope_inventory_without_valid_user_uat_as_block
     assert scope_item["status"] == "blocked"
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 27
+    assert report["covered"] == 28
     assert report["evidence_ok"] is True
 
 
