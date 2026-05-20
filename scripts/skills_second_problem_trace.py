@@ -138,6 +138,7 @@ PLACEHOLDER_FOLLOWUP_PATTERNS = [
     re.compile(r"without the actual problem text", re.IGNORECASE),
     re.compile(r"Search the repo", re.IGNORECASE),
     re.compile(r"说明占位"),
+    re.compile(r"没有正文"),
     re.compile(r"没有问题正文"),
     re.compile(r"没有第二问题正文"),
     re.compile(r"实际正文"),

@@ -243,6 +243,24 @@ def test_second_problem_trace_treats_english_state_absent_suffix_as_placeholder(
     assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
 
 
+def test_second_problem_trace_treats_agent_history_no_body_note_as_placeholder(tmp_path: Path):
+    trace_mod = _load_trace_module()
+    sessions = tmp_path / ".codex" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "rollout.jsonl").write_text(
+        '{"type":"response_item","payload":{"output":"> 当前反馈中'
+        '“然后第二个问题”没有正文。生产 66 仍未变更。"}}\n',
+        encoding="utf-8",
+    )
+
+    report = trace_mod.build_trace([sessions], exact_phrases=["然后第二个问题"])
+
+    assert report["exact_text_found"] is False
+    assert report["exact_issue_text_found"] is False
+    assert report["placeholder_match_count"] == 1
+    assert report["exact_issue_text_absent_reason"] == "phrase_present_but_only_placeholder_followup"
+
+
 def test_second_problem_trace_treats_generated_test_fixture_followup_as_placeholder(tmp_path: Path):
     trace_mod = _load_trace_module()
     sessions = tmp_path / ".codex" / "sessions"
