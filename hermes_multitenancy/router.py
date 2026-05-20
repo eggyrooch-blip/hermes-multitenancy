@@ -3286,6 +3286,7 @@ def _ensure_group_profile(
     _sync_default_skills_for_profile(
         profile_home,
         shared_home,
+        include_default_skills=True,
         upstream_profile_home=upstream_profile_home,
     )
 
@@ -3315,8 +3316,95 @@ def _ensure_group_profile(
     _ensure_shared_profile_file(profile_home, shared_home, "auth.json")
 
 
-def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str) -> None:
-    """Materialize <profile>/.env with ONLY model keys + FEISHU_HOME_CHANNEL.
+def _ensure_webui_agent_profile(
+    *,
+    profile_name: str,
+    profile_home: Path,
+    owner_open_id: str,
+    display_label: str,
+    agent_id: str,
+    upstream_profile: str | None = None,
+) -> None:
+    """Create the on-disk skeleton for a WebUI group-chat agent profile.
+
+    WebUI group-chat agents are not real Feishu ``oc_*`` groups, but they must
+    run with the same tokenless/bot-only boundary as Feishu group profiles.
+    """
+    profile_home.mkdir(parents=True, exist_ok=True)
+    shared_home = _shared_home_for_profile(profile_home)
+
+    config_path = profile_home / "config.yaml"
+    if config_path.exists():
+        _normalize_profile_config_file(config_path, shared_home=shared_home)
+    else:
+        config_path.write_text(
+            _dump_profile_config(_profile_config_from_shared_home(shared_home)),
+            encoding="utf-8",
+        )
+
+    soul_path = profile_home / "SOUL.md"
+    if not soul_path.exists():
+        soul_path.write_text(
+            "\n".join(
+                [
+                    f"# Hermes WebUI Group Agent Profile {profile_name}",
+                    "",
+                    f"You are a WebUI group-chat agent named `{display_label}`.",
+                    f"This profile is owned by Feishu user `{owner_open_id}`.",
+                    "Identity rules (strict):",
+                    "- 你不能以 WebUI 群成员任何一个个人的身份操作飞书数据。",
+                    "- /feishu_auth 在 WebUI 群聊 agent 模式下被禁用，任何用户的 UAT 不会被加载。",
+                    "- 该 profile 使用 `lark_cli` 时默认走 bot identity。",
+                    "- 该 profile 的对话和记忆与其它 profile 完全隔离。",
+                    "",
+                    _LARK_CLI_SOUL_GUIDANCE,
+                    "",
+                    _GROUP_EXTERNAL_TOOL_SOUL_GUIDANCE,
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    else:
+        _ensure_soul_guidance(soul_path, _LARK_CLI_SOUL_GUIDANCE)
+        _ensure_soul_guidance(soul_path, _GROUP_EXTERNAL_TOOL_SOUL_GUIDANCE)
+
+    (profile_home / "feishu_uat").mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    upstream_profile_home: Path | None = None
+    if upstream_profile:
+        candidate = shared_home / "profiles" / upstream_profile
+        upstream_profile_home = candidate if candidate.exists() else None
+    if upstream_profile_home is None:
+        upstream_profile_home = _upstream_profile_home_for_owner(owner_open_id, shared_home)
+    _sync_default_skills_for_profile(
+        profile_home,
+        shared_home,
+        include_default_skills=True,
+        upstream_profile_home=upstream_profile_home,
+    )
+
+    marker_path = profile_home / "group_profile.json"
+    marker_payload = {
+        "kind": "group",
+        "chat_id": agent_id,
+        "owner_open_id": owner_open_id,
+        "display_label": display_label,
+        "feishu_auth_disabled": True,
+        "source": "webui-agent",
+    }
+    if not marker_path.exists():
+        marker_path.write_text(
+            json.dumps(marker_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    _write_group_profile_env(profile_home, shared_home, None)
+    _ensure_shared_profile_file(profile_home, shared_home, "auth.json")
+
+
+def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str | None) -> None:
+    """Materialize <profile>/.env with ONLY model keys and optional FEISHU_HOME_CHANNEL.
 
     The subprocess env is whitelisted (``_SUBPROCESS_ENV_ALLOWLIST``) and
     does NOT pass model provider API keys, so the AIAgent child reads them
@@ -3330,9 +3418,10 @@ def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str
     already flows through the allowlisted subprocess env, so it never
     needs to land on disk in a tenant dir.
 
-    Group profiles also preempt the gateway's home-channel onboarding
-    prompt by declaring the group chat itself as the home channel. Re-runs
-    are idempotent.
+    Real Feishu group profiles also preempt the gateway's home-channel
+    onboarding prompt by declaring the group chat itself as the home channel.
+    WebUI group agents pass no chat_id because they are not real Feishu chats.
+    Re-runs are idempotent.
     """
     from .agent_real import _MODEL_ENV_ALLOWLIST
 
@@ -3355,7 +3444,8 @@ def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str
             key = stripped.split("=", 1)[0].strip()
             if key in _MODEL_ENV_ALLOWLIST:
                 base_lines.append(line)
-    base_lines.append(f"FEISHU_HOME_CHANNEL={chat_id}")
+    if chat_id:
+        base_lines.append(f"FEISHU_HOME_CHANNEL={chat_id}")
     # Atomic write: a crash between unlink() and write_text() used to leave
     # the profile with NO .env (all inherited creds gone until reprovision).
     # Write a sibling temp file then os.replace() — the rename is atomic on
@@ -3463,16 +3553,30 @@ def _sync_default_skills_for_profile(
     profile_home: Path,
     shared_home: Path,
     *,
+    include_default_skills: bool = False,
     upstream_profile_home: Path | None = None,
 ) -> None:
     # Use a relative import so the call works both when the package is loaded
     # as ``hermes_multitenancy`` (pytest/direct install) and when the Hermes
     # plugin loader exposes it as ``hermes_plugins.multitenancy.hermes_multitenancy``.
-    from .sync.feishu_org import _sync_default_profile_skills
+    from .sync.feishu_org import Employee, _sync_default_profile_skills
 
+    employee = None
+    if include_default_skills:
+        employee = Employee(
+            open_id="",
+            user_id=profile_home.name,
+            agent_id=profile_home.name,
+            profile_name=profile_home.name,
+            name=profile_home.name,
+            dept_id="",
+            dept_name="",
+            leader_user_id=None,
+        )
     _sync_default_profile_skills(
         profile_home,
         shared_home,
+        employee=employee,
         upstream_profile_home=upstream_profile_home,
     )
 

@@ -503,6 +503,15 @@ def create_run_broker_app(
                 display_label=display_label,
                 upstream_profile=upstream_profile or owner_root.profile_name,
             )
+            shared_home = _shared_home_from_env()
+            router_mod._ensure_webui_agent_profile(
+                profile_name=profile_name,
+                profile_home=shared_home / "profiles" / profile_name,
+                owner_open_id=trusted_owner,
+                display_label=display_label,
+                agent_id=agent_id,
+                upstream_profile=upstream_profile or owner_root.profile_name,
+            )
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=403)
 

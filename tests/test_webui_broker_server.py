@@ -866,6 +866,89 @@ def test_webui_profile_provisioning_creates_owner_scoped_agent_route(tmp_path):
     asyncio.run(runner())
 
 
+def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "feishu_g41a5b5g").mkdir(parents=True)
+    (shared_home / "skills" / "lark-docs").mkdir(parents=True)
+    (shared_home / "skills" / "lark-docs" / "SKILL.md").write_text("# Lark Docs\n", encoding="utf-8")
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        "skills:\n  - lark-docs\n",
+        encoding="utf-8",
+    )
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platforms:\n  feishu:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="feishu_g41a5b5g",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                }, json={
+                    "profile_name": "web_coder",
+                    "upstream_profile": "feishu_g41a5b5g",
+                    "display_label": "Coder",
+                })
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["agent_id"] == "webui:ou_owner:web_coder"
+
+    asyncio.run(runner())
+
+    profile_home = shared_home / "profiles" / "web_coder"
+    marker = json.loads((profile_home / "group_profile.json").read_text(encoding="utf-8"))
+    assert marker == {
+        "kind": "group",
+        "chat_id": "webui:ou_owner:web_coder",
+        "owner_open_id": "ou_owner",
+        "display_label": "Coder",
+        "feishu_auth_disabled": True,
+        "source": "webui-agent",
+    }
+    assert (profile_home / "feishu_uat").is_dir()
+    assert list((profile_home / "feishu_uat").glob("*.json")) == []
+    assert (profile_home / "skills" / "lark-docs").is_symlink()
+
+    config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
+    assert "lark-cli" in config_text
+    assert "platform_toolsets_mode" in config_text
+
+    env_text = (profile_home / ".env").read_text(encoding="utf-8")
+    assert "FEISHU_HOME_CHANNEL" not in env_text
+
+
 def test_webui_profile_provisioning_requires_owner_header(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
