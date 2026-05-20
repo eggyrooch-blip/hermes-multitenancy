@@ -103,7 +103,25 @@ def test_materialize_response_artifact_json_defaults_to_downloads_and_appends_me
 
     written = tmp_path / "workspace" / "Downloads" / "out.md"
     assert written.read_text(encoding="utf-8") == "# title\n\nOUT_MARKER\n"
+    assert "[[as_document]]" not in materialized
     assert "MEDIA:/workspace/Downloads/out.md" in materialized
+
+
+def test_materialize_response_artifact_json_ignores_markdown_as_document(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    response = """
+```hermes-artifact-json
+{"filename":"out.markdown","format":"markdown","content":"# title\\n","as_document":true}
+```
+"""
+
+    materialized = router_mod._materialize_response_artifacts(response, tmp_path)
+
+    written = tmp_path / "workspace" / "Downloads" / "out.markdown"
+    assert written.read_text(encoding="utf-8") == "# title\n"
+    assert "[[as_document]]" not in materialized
+    assert "MEDIA:/workspace/Downloads/out.markdown" in materialized
 
 
 def test_materialize_response_artifact_json_can_request_image_document_delivery(tmp_path):
@@ -1839,6 +1857,7 @@ async def test_handle_async_auto_delivers_plain_profile_file_path(monkeypatch, t
     workspace_report = profile_home / "workspace" / "Downloads" / report.name
     assert workspace_report.read_text(encoding="utf-8") == "profile report"
     assert delivered == [f"done: {report}\nMEDIA:{workspace_report.resolve()}"]
+    assert f"MEDIA:{workspace_report.resolve()}" in delivered[0]
 
     clear_spike_routes()
 
@@ -1896,7 +1915,7 @@ async def test_handle_async_does_not_auto_deliver_sensitive_profile_file_path(mo
 
 
 def test_plain_profile_file_paths_are_hidden_from_visible_text(tmp_path):
-    """Visible card text should not expose host paths that will be sent as files."""
+    """Visible card text should not expose host paths that will be sent as docs."""
     from hermes_multitenancy import router as router_mod
 
     profile_home = tmp_path / "profiles" / "visible-path-profile"
@@ -1907,8 +1926,27 @@ def test_plain_profile_file_paths_are_hidden_from_visible_text(tmp_path):
     visible = router_mod._clean_stream_display_text(f"saved at {report}", profile_home)
 
     assert str(report) not in visible
-    assert "[文件已作为附件发送]" in visible
+    assert "[Markdown 源文件已自动发送]" in visible
     assert (profile_home / "workspace" / "Downloads" / "report.md").read_text(encoding="utf-8") == "report"
+
+
+def test_plain_profile_markdown_paths_are_hidden_from_visible_text(tmp_path):
+    """Both .md and .markdown source files are delivered without exposing host paths."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "visible-markdown-profile"
+    report = profile_home / ".ai-docs" / "report.markdown"
+    report.parent.mkdir(parents=True)
+    report.write_text("report", encoding="utf-8")
+
+    visible = router_mod._clean_stream_display_text(f"saved at {report}", profile_home)
+    response = router_mod._append_profile_file_media_directives(f"saved at {report}", profile_home)
+    workspace_report = profile_home / "workspace" / "Downloads" / "report.markdown"
+
+    assert str(report) not in visible
+    assert "[Markdown 源文件已自动发送]" in visible
+    assert workspace_report.read_text(encoding="utf-8") == "report"
+    assert f"MEDIA:{workspace_report.resolve()}" in response
 
 
 @pytest.mark.asyncio

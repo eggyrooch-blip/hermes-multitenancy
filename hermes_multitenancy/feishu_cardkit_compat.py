@@ -259,7 +259,7 @@ async def _update_streaming_card_tool_started(
             "args": args,
         }
     )
-    return await _flush_state(self, message_id, state)
+    return _result(True, message_id=str(message_id))
 
 
 async def _update_streaming_card_tool_completed(
@@ -287,7 +287,7 @@ async def _update_streaming_card_tool_completed(
                 "duration": duration,
             }
         )
-    return await _flush_state(self, message_id, state)
+    return _result(True, message_id=str(message_id))
 
 
 async def _flush_state(
@@ -564,9 +564,6 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     content = _strip_tool_process_narration(content, tools)
 
     parts: list[str] = []
-    tool_section = _render_tool_calls_section(tools)
-    if tool_section:
-        parts.append(tool_section)
     if content:
         parts.append(content)
     elif reasoning:

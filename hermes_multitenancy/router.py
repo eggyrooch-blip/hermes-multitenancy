@@ -79,7 +79,7 @@ _LARK_CLI_SOUL_GUIDANCE = "\n".join(
         "Feishu file output rules:",
         "- 当用户要求生成文件、图片、报表、PDF、docx、xlsx、csv、json、markdown 并发回时，不要要求用户提供本机路径。",
         "- 直接在回复中输出一个 ```hermes-artifact-json fenced block，字段使用 filename、format、marker/content/data/rows/title；不要使用宿主机绝对路径。",
-        "- filename 只写普通文件名，例如 report.md、summary.pdf、chart.png；Hermes 会自动保存到当前 profile 的 Downloads 并通过飞书附件发送。",
+        "- filename 只写普通文件名，例如 report.md、summary.pdf、chart.png；Hermes 会自动保存到当前 profile 的 Downloads 并通过飞书发送；markdown 源文件必须自动交付给用户。",
         "- 图片如果要作为可下载原文件发送，在 artifact JSON 中设置 as_document=true。",
         "- artifact JSON 是内部交付协议；除必要的测试标记和简短说明外，不要把本机路径、/workspace 路径或 MEDIA 指令解释给用户。",
     ]
@@ -534,9 +534,10 @@ _ARTIFACT_JSON_RE = re.compile(r"```hermes-artifact-json\s*(?P<body>.*?)\s*```",
 _PROFILE_FILE_PATH_RE = re.compile(
     r'''(?P<path>(?:/workspace|/[^`"'<>\n\r]+?)'''
     r'''\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'''
-    r'''epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|json|md))'''
+    r'''epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|json|md|markdown))'''
 )
 _AUTO_FILE_DELIVERY_MAX_BYTES = int(os.getenv("HERMES_MULTITENANCY_AUTO_FILE_DELIVERY_MAX_BYTES", "52428800"))
+_MARKDOWN_DOCUMENT_EXTENSIONS = {".md", ".markdown"}
 _SENSITIVE_PROFILE_FILE_NAMES = {
     ".env",
     "auth.json",
@@ -622,7 +623,11 @@ def _materialize_response_artifacts(response: str, profile_home: Path) -> str:
             except ValueError:
                 media_path = "/workspace/Downloads/" + target.name
             if f"MEDIA:{media_path}" not in text:
-                if bool(spec.get("as_document")) and "[[as_document]]" not in text:
+                if (
+                    bool(spec.get("as_document"))
+                    and target.suffix.lower() not in _MARKDOWN_DOCUMENT_EXTENSIONS
+                    and "[[as_document]]" not in text
+                ):
                     media_additions.append("[[as_document]]")
                 media_additions.append(f"MEDIA:{media_path}")
         except Exception as exc:
@@ -749,7 +754,10 @@ def _strip_plain_profile_file_paths_for_display(text: str, profile_home: Path) -
         raw_path = match.group("path").strip().rstrip(".,;:)]}")
         if not raw_path:
             return match.group(0)
-        if _publish_mentioned_profile_file(raw_path, root) is not None:
+        published = _publish_mentioned_profile_file(raw_path, root)
+        if published is not None:
+            if _should_deliver_as_feishu_document(published):
+                return "[Markdown 源文件已自动发送]"
             return "[文件已作为附件发送]"
         candidate = Path(raw_path).expanduser()
         if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
@@ -762,6 +770,10 @@ def _strip_plain_profile_file_paths_for_display(text: str, profile_home: Path) -
         return match.group(0)
 
     return _PROFILE_FILE_PATH_RE.sub(repl, raw)
+
+
+def _should_deliver_as_feishu_document(path: Path) -> bool:
+    return path.suffix.lower() in _MARKDOWN_DOCUMENT_EXTENSIONS
 
 
 def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
@@ -4167,8 +4179,10 @@ _STREAM_CARD_REASONING_MIN_SECONDS = 2.0
 _STREAM_CARD_PRIME_STATUS = "Hermes 正在准备响应..."
 _STREAM_CARD_IDLE_HEARTBEAT_SECONDS = 2.5
 _STREAM_ABORT_FALLBACK = "Aborted."
+# Soft per-card segment target for the legacy CardKit compat path. This is not
+# a Feishu/CardKit platform limit; shared GatewayStreamConsumer uses its own
+# adapter-specific splitting and must receive the complete stream.
 _STREAM_MAX_VISIBLE_CHARS = 3_000
-_STREAM_TRUNCATION_SUFFIX = "\n\n...[已截断: 回复过长，已保留前半部分以保证卡片及时完成]"
 
 
 def _stream_card_idle_status(tick: int) -> str:
@@ -4382,19 +4396,6 @@ async def _stream_into_feishu_shared_consumer(
                     piece = str(delta or "")
                     if not piece:
                         continue
-                    remaining = _STREAM_MAX_VISIBLE_CHARS - len(content)
-                    if remaining <= 0:
-                        continue
-                    if len(piece) > remaining:
-                        piece = piece[:remaining] + _STREAM_TRUNCATION_SUFFIX
-                        content = content[:_STREAM_MAX_VISIBLE_CHARS] + _STREAM_TRUNCATION_SUFFIX
-                        consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
-                        content_delta_seen = True
-                        logger.info(
-                            "multitenancy: shared stream content truncated max_chars=%s",
-                            _STREAM_MAX_VISIBLE_CHARS,
-                        )
-                        break
                     content += piece
                     consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
                     content_delta_seen = True
@@ -4498,6 +4499,7 @@ async def _stream_into_feishu(
     target_ready_at = stream_started_at
     thinking = ""
     content = ""
+    full_content = ""
     last_edit_time = 0.0
     last_render_len = 0
     last_reasoning_render_len = 0
@@ -4545,6 +4547,55 @@ async def _stream_into_feishu(
     def abort_content() -> str:
         raw = content if content else (thinking if thinking else _STREAM_ABORT_FALLBACK)
         return _clean_stream_display_text(raw, profile_home)
+
+    async def _flush_current_segment(*, finalize: bool) -> None:
+        nonlocal last_edit_time, last_render_len, terminal_update_sent
+        if placeholder_id is None:
+            return
+        rendered = render()
+        try:
+            await _run_terminal_stream_update(
+                _update_feishu_stream_target(
+                    adapter,
+                    chat_id,
+                    placeholder_id,
+                    rendered,
+                    mode=stream_mode,
+                    finalize=finalize,
+                ),
+                label="stream segment update",
+            )
+            last_edit_time = time.monotonic()
+            last_render_len = len(rendered)
+            if finalize:
+                terminal_update_sent = True
+        except Exception as exc:
+            logger.debug("multitenancy: stream segment update failed: %s", exc)
+
+    async def _start_next_stream_segment() -> None:
+        nonlocal stream_mode, placeholder_id, content, content_started
+        nonlocal last_edit_time, last_render_len, terminal_update_sent
+        if placeholder_id is not None:
+            await _flush_current_segment(finalize=True)
+        stream_mode, placeholder_id = await _start_feishu_stream_target(adapter, chat_id)
+        terminal_update_sent = False
+        content = ""
+        content_started = False
+        last_edit_time = time.monotonic()
+        last_render_len = 0
+        if placeholder_id is None:
+            return
+        if stream_mode == "card":
+            try:
+                await _update_feishu_stream_status(
+                    adapter,
+                    chat_id,
+                    placeholder_id,
+                    "继续输出...",
+                    mode=stream_mode,
+                )
+            except Exception as exc:
+                logger.debug("multitenancy: continuation card prime update failed: %s", exc)
 
     try:
         # Create/send can complete remotely after this task is cancelled. Shield
@@ -4690,39 +4741,75 @@ async def _stream_into_feishu(
                     elif kind == "done":
                         continue
                     else:
-                        content += str(delta or "")
-                        if len(content) > _STREAM_MAX_VISIBLE_CHARS:
-                            content = (
-                                content[:_STREAM_MAX_VISIBLE_CHARS]
-                                + _STREAM_TRUNCATION_SUFFIX
-                            )
-                            logger.info(
-                                "multitenancy: stream content truncated and finalized "
-                                "message_id=%s max_chars=%s",
-                                placeholder_id,
-                                _STREAM_MAX_VISIBLE_CHARS,
-                            )
-                            break
-                        if not content_started:
-                            # Force an immediate edit on phase transition so the user
-                            # sees the answer start the moment reasoning ends.
-                            content_started = True
-                            try:
-                                await _update_feishu_stream_target(
-                                    adapter,
-                                    chat_id,
-                                    placeholder_id,
-                                    render(),
-                                    mode=stream_mode,
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "multitenancy: phase-transition stream update failed: %s",
-                                    exc,
-                                )
-                            last_edit_time = time.monotonic()
-                            last_render_len = len(render())
+                        piece = str(delta or "")
+                        if not piece:
                             continue
+                        full_content += piece
+                        while piece:
+                            remaining = _STREAM_MAX_VISIBLE_CHARS - len(content)
+                            if remaining <= 0:
+                                logger.info(
+                                    "multitenancy: stream content segment finalized "
+                                    "message_id=%s max_chars=%s",
+                                    placeholder_id,
+                                    _STREAM_MAX_VISIBLE_CHARS,
+                                )
+                                await _start_next_stream_segment()
+                                if placeholder_id is None:
+                                    break
+                                remaining = _STREAM_MAX_VISIBLE_CHARS
+                            segment_piece = piece[:remaining]
+                            piece = piece[remaining:]
+                            content += segment_piece
+                            rendered = render()
+                            now = time.monotonic()
+                            if not content_started:
+                                # Force an immediate edit on phase transition so the user
+                                # sees the answer start the moment reasoning ends.
+                                content_started = True
+                                try:
+                                    await _update_feishu_stream_target(
+                                        adapter,
+                                        chat_id,
+                                        placeholder_id,
+                                        rendered,
+                                        mode=stream_mode,
+                                    )
+                                except Exception as exc:
+                                    logger.debug(
+                                        "multitenancy: phase-transition stream update failed: %s",
+                                        exc,
+                                    )
+                                last_edit_time = time.monotonic()
+                                last_render_len = len(rendered)
+                            elif (
+                                piece
+                                or len(rendered) - last_render_len >= _STREAM_CONTENT_MIN_CHARS
+                                or now - last_edit_time >= _STREAM_CONTENT_MIN_SECONDS
+                            ):
+                                try:
+                                    await _update_feishu_stream_target(
+                                        adapter,
+                                        chat_id,
+                                        placeholder_id,
+                                        rendered,
+                                        mode=stream_mode,
+                                    )
+                                except Exception as exc:
+                                    logger.debug("multitenancy: stream update mid-stream failed: %s", exc)
+                                last_edit_time = now
+                                last_render_len = len(rendered)
+                            if piece:
+                                logger.info(
+                                    "multitenancy: stream content segment split "
+                                    "message_id=%s max_chars=%s",
+                                    placeholder_id,
+                                    _STREAM_MAX_VISIBLE_CHARS,
+                                )
+                                await _start_next_stream_segment()
+                                if placeholder_id is None:
+                                    break
+                        continue
 
                     now = time.monotonic()
                     rendered = render()
@@ -4751,6 +4838,7 @@ async def _stream_into_feishu(
                 logger.info("multitenancy: streaming failed (%s) — falling back to non-stream", exc)
                 try:
                     content = await real_run_agent(event, profile_home, messages=messages)
+                    full_content = content
                 except Exception as fallback_exc:
                     # Both stream + non-stream LLM paths failed (e.g. region block,
                     # exhausted credentials). Surface a user-visible error instead
@@ -4760,12 +4848,13 @@ async def _stream_into_feishu(
                         "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
                         "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
                     )
+                    full_content = content
         finally:
             _PROFILE_HOME_VAR.reset(token)
             await _stop_idle_card_heartbeat()
 
-        full = content if content else (thinking if thinking else "(empty response)")
-        display_full = _clean_stream_display_text(full, profile_home)
+        full = full_content or content or (thinking if thinking else "(empty response)")
+        display_current = _clean_stream_display_text(content or full, profile_home)
 
         # 3. Final commit. finalize=True signals end of stream to Feishu.
         try:
@@ -4774,7 +4863,7 @@ async def _stream_into_feishu(
                     adapter,
                     chat_id,
                     placeholder_id,
-                    display_full,
+                    display_current,
                     mode=stream_mode,
                     finalize=True,
                 ),

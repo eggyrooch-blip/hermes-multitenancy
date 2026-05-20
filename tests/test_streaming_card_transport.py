@@ -742,6 +742,102 @@ async def _run_stream_into_feishu_streams_cardkit_cumulative_text_for_typewriter
     assert streamed_contents.index("H") < streamed_contents.index("Hello")
 
 
+def test_stream_into_feishu_cardkit_continues_after_visible_segment_limit(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_cardkit_continues_after_visible_segment_limit(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_cardkit_continues_after_visible_segment_limit(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "12345")
+        yield ("content", "67890")
+        yield ("content", "abcdef")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+    monkeypatch.setattr(router_mod, "_STREAM_MAX_VISIBLE_CHARS", 10)
+
+    adapter = _OpenClawCardKitAdapter()
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "1234567890abcdef"
+    rendered_final_cards = [
+        json.loads(req.request_body.card["data"])
+        for req in adapter.card_updates
+    ]
+    rendered_final_text = "\n".join(
+        element.get("content", "")
+        for card in rendered_final_cards
+        for element in card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+    assert "1234567890" in rendered_final_text
+    assert "abcdef" in rendered_final_text
+    assert "已截断" not in rendered_final_text
+
+
+def test_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
+    asyncio.run(_run_cardkit_compat_tool_events_do_not_rewrite_streaming_content())
+
+
+async def _run_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_OpenClawCardKitAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview="generating arguments",
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        duration=0.4,
+        is_error=False,
+    )
+
+    assert adapter.content_updates == []
+
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="final answer",
+        finalize=True,
+    )
+
+    final_card = json.loads(adapter.card_updates[-1].request_body.card["data"])
+    final_text = "\n".join(
+        element.get("content", "")
+        for element in final_card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+    assert "**Tool calls:**" in final_text
+    assert "`lark_cli` (400 ms)" in final_text
+    assert "final answer" in final_text
+
+
 def test_stream_into_feishu_skips_legacy_shared_consumer_without_card_methods(
     monkeypatch, tmp_path
 ):
@@ -901,6 +997,90 @@ async def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     ]
     assert consumer.deltas == ["Hello", " world"]
     assert consumer.finished is True
+
+
+@pytest.mark.asyncio
+async def test_shared_consumer_stream_does_not_truncate_at_visible_limit(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "12345")
+        yield ("content", "67890")
+        yield ("content", "abcdef")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router_mod, "_STREAM_MAX_VISIBLE_CHARS", 10)
+
+    created = []
+
+    class RecordingConsumer:
+        def __init__(self, adapter, chat_id, config=None, metadata=None):
+            self.adapter = adapter
+            self.chat_id = chat_id
+            self.config = config
+            self.metadata = metadata
+            self.deltas = []
+            self.statuses = []
+            self.reasoning = []
+            self.tool_starts = []
+            self.tool_completions = []
+            self.finished = False
+            self._done = asyncio.Event()
+            created.append(self)
+
+        async def ensure_streaming_card_started(self):
+            return True
+
+        async def run(self):
+            await self._done.wait()
+
+        def on_delta(self, text):
+            self.deltas.append(text)
+
+        async def update_streaming_card_status(self, content):
+            self.statuses.append(content)
+            return True
+
+        async def update_streaming_card_reasoning(self, content):
+            self.reasoning.append(content)
+            return True
+
+        async def update_streaming_card_tool_started(self, tool_name, *, preview=None, args=None):
+            self.tool_starts.append({"tool_name": tool_name, "preview": preview, "args": args})
+            return True
+
+        async def update_streaming_card_tool_completed(self, tool_name, *, duration=None, is_error=False):
+            self.tool_completions.append(
+                {"tool_name": tool_name, "duration": duration, "is_error": is_error}
+            )
+            return True
+
+        def finish(self):
+            self.finished = True
+            self._done.set()
+
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", RecordingConsumer, raising=False)
+    monkeypatch.setattr(
+        router_mod,
+        "StreamConsumerConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+
+    response = await router_mod._stream_into_feishu(
+        _CardCapableAdapter(),
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "1234567890abcdef"
+    assert created[0].deltas == ["12345", "67890", "abcdef"]
+    assert all("已截断" not in delta for delta in created[0].deltas)
 
 
 @pytest.mark.asyncio

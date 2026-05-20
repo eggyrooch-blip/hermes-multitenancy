@@ -129,6 +129,33 @@ def test_url_guard_blocks_hostname_that_resolves_private(monkeypatch, tmp_path: 
     assert "private/internal" in result.reason
 
 
+def test_url_guard_allows_public_hostname_resolved_to_fake_ip(
+    monkeypatch,
+    tmp_path: Path,
+):
+    decision = browser_policy.browser_decision(
+        {"multitenancy": {"browser": {"enabled": True}}},
+        tmp_path / "profiles" / "alice",
+    )
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "example.com"
+        return [
+            (
+                browser_policy.socket.AF_INET,
+                browser_policy.socket.SOCK_STREAM,
+                6,
+                "",
+                ("198.18.18.245", 0),
+            )
+        ]
+
+    monkeypatch.setattr(browser_policy.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert browser_policy.decide_url("https://example.com/", decision).allowed is True
+    assert browser_policy.decide_url("http://198.18.18.245/", decision).allowed is False
+
+
 def test_url_guard_allows_private_dns_when_enabled_but_never_metadata(
     monkeypatch,
     tmp_path: Path,

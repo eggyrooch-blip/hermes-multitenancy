@@ -30,6 +30,7 @@ _METADATA_IPS = {
     ipaddress.ip_address("169.254.170.2"),
     ipaddress.ip_address("100.100.100.200"),
 }
+_BENCHMARK_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 
 
 @dataclass(frozen=True)
@@ -252,6 +253,10 @@ def _is_private_or_internal_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address
     )
 
 
+def _is_benchmark_fake_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return ip.version == 4 and ip in _BENCHMARK_FAKE_IP_NET
+
+
 def _is_metadata_host(host: str) -> bool:
     if host in _METADATA_HOSTS:
         return True
@@ -261,11 +266,17 @@ def _is_metadata_host(host: str) -> bool:
 def _is_private_or_internal_host(host: str) -> bool:
     if not host:
         return True
+    literal_ip = _ip_for_host(host)
+    if literal_ip is not None:
+        return _is_private_or_internal_ip(literal_ip)
     if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
         return True
     if host.endswith(".local"):
         return True
-    return any(_is_private_or_internal_ip(ip) for ip in _resolved_ips_for_host(host))
+    return any(
+        _is_private_or_internal_ip(ip) and not _is_benchmark_fake_ip(ip)
+        for ip in _resolved_ips_for_host(host)
+    )
 
 
 def decide_url(url: str, decision: BrowserDecision) -> UrlDecision:
