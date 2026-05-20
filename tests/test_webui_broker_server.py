@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import types
@@ -917,6 +918,159 @@ def test_webui_skillhub_install_without_owner_header_rejects_spoofed_profile(tmp
         assert response.status == 403
         assert body == {"error": "owner identity required (X-Hermes-Owner-Open-Id)"}
         assert not (shared / "profiles" / "victim").exists()
+
+    asyncio.run(runner())
+
+
+def test_webui_skillhub_install_blocks_external_source_without_policy_allow(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    skill_source = shared / "skills" / "hub" / "weather"
+    profile = shared / "profiles" / "owner_sync_profile"
+    skill_source.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    (shared / "discovery-policy.yaml").write_text(
+        """
+        enabled: true
+        audit:
+          enabled: true
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/skills/install",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "skill_path": "hub/weather",
+                        "version": "v1",
+                        "discovery_source": "skills-sh",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        audit_path = shared / "audit" / "discovery-policy.jsonl"
+        record = json.loads(audit_path.read_text(encoding="utf-8").strip())
+
+        assert response.status == 403
+        assert body["error"] == "discovery source blocked by policy"
+        assert body["discovery_policy"]["source"] == "skills-sh"
+        assert body["discovery_policy"]["allowed"] is False
+        assert not (profile / "skills" / "hub" / "weather").exists()
+        assert record["profile_name"] == "owner_sync_profile"
+        assert record["user_key"] == "ou_owner"
+        assert record["sources"]["blocked"] == ["skills-sh"]
+
+    asyncio.run(runner())
+
+
+def test_webui_skillhub_install_allows_external_source_for_matching_owner(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    skill_source = shared / "skills" / "hub" / "weather"
+    profile = shared / "profiles" / "owner_sync_profile"
+    skill_source.mkdir(parents=True)
+    profile.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Weather\n", encoding="utf-8")
+    (shared / "discovery-policy.yaml").write_text(
+        """
+        enabled: true
+        audit:
+          enabled: true
+        sources:
+          skills-sh:
+            action: allow
+            audience:
+              users:
+                - ou_owner
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/skills/install",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "skill_path": "hub/weather",
+                        "version": "v1",
+                        "discovery_source": "skills-sh",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        audit_path = shared / "audit" / "discovery-policy.jsonl"
+        record = json.loads(audit_path.read_text(encoding="utf-8").strip())
+
+        assert response.status == 200
+        assert body["profile_name"] == "owner_sync_profile"
+        assert body["discovery_policy"]["source"] == "skills-sh"
+        assert body["discovery_policy"]["allowed"] is True
+        assert body["install"]["installed"] is True
+        assert (profile / "skills" / "hub" / "weather").is_symlink()
+        assert record["sources"]["allowed"] == ["skills-sh"]
 
     asyncio.run(runner())
 

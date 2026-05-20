@@ -656,6 +656,34 @@ def create_run_broker_app(
                 }, status=403)
             profile_name = resolved_profile_name
             shared_home = _shared_home_from_env()
+            discovery_policy = None
+            discovery_source = _skillhub_discovery_source(payload)
+            if discovery_source:
+                from .discovery_policy import plan_profile_discovery
+
+                owner_open_id = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+                plan = plan_profile_discovery(
+                    shared_home=shared_home,
+                    profile_name=profile_name,
+                    user_key=owner_open_id or None,
+                    requested_sources=[discovery_source],
+                    requested_toolsets=[],
+                    audit=True,
+                )
+                decision = plan["sources"].get(discovery_source) or {}
+                discovery_policy = {
+                    "source": discovery_source,
+                    "allowed": bool(decision.get("allowed")),
+                    "reason": decision.get("reason"),
+                    "requires_audit": bool(decision.get("requires_audit")),
+                    "audit_written": bool((plan.get("audit") or {}).get("written")),
+                }
+                if not discovery_policy["allowed"]:
+                    return web.json_response({
+                        "error": "discovery source blocked by policy",
+                        "profile_name": profile_name,
+                        "discovery_policy": discovery_policy,
+                    }, status=403)
             install = skill_registry.install_shared_skill_for_profile(
                 shared_home=shared_home,
                 profile_home=shared_home / "profiles" / profile_name,
@@ -670,6 +698,7 @@ def create_run_broker_app(
                 "profile_name": profile_name,
                 "install": install,
                 "installed_skills": installed,
+                **({"discovery_policy": discovery_policy} if discovery_policy else {}),
             })
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
@@ -709,6 +738,14 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/jobs/{job_id}/pause", handle_pause_job)
     app.router.add_post("/api/run-broker/jobs/{job_id}/resume", handle_resume_job)
     return app
+
+
+def _skillhub_discovery_source(payload: dict[str, Any]) -> str | None:
+    for key in ("discovery_source", "catalog_source", "source_kind", "source_type"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return None
 
 
 async def start_run_broker_server() -> None:
