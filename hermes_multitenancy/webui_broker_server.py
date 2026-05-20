@@ -268,6 +268,7 @@ def _build_webui_event(request: RunRequest) -> Any:
         text=request.content,
         message_id=request.message_id,
         channel="webui",
+        sender_open_id=request.user_key if str(request.user_key or "").startswith("ou_") else "",
         source=SimpleNamespace(
             platform=SimpleNamespace(value=request.channel),
             user_id=request.user_key,

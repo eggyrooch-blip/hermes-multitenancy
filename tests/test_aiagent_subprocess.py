@@ -2668,6 +2668,61 @@ def test_aiagent_subprocess_env_scope_prefers_raw_feishu_open_id_for_broker(monk
         assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
 
 
+def test_aiagent_subprocess_env_scope_uses_webui_owner_uat_for_lark_cli_default(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """WebUI Run Broker runs must select user identity when the owner has UAT."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "owner"
+    uat_dir = profile / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    (uat_dir / "ou_owner.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="owner",
+            user_key="ou_owner",
+            content="创建一个飞书云文档",
+            session_id="webui-lark-cli-identity",
+        )
+    )
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_owner"
+        assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+
+
 def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
     """`extra` parameter wins over defaults so callers can override per-spawn."""
     from hermes_multitenancy import agent_real

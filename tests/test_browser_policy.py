@@ -75,11 +75,25 @@ def test_browser_env_uses_profile_local_chrome_for_testing(tmp_path: Path):
     assert "/Applications/Google Chrome.app" not in env["AGENT_BROWSER_EXECUTABLE_PATH"]
 
 
-def test_url_guard_blocks_private_and_metadata_urls(tmp_path: Path):
+def test_url_guard_blocks_private_and_metadata_urls(monkeypatch, tmp_path: Path):
     decision = browser_policy.browser_decision(
         {"multitenancy": {"browser": {"enabled": True}}},
         tmp_path / "profiles" / "alice",
     )
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "example.com"
+        return [
+            (
+                browser_policy.socket.AF_INET,
+                browser_policy.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 0),
+            )
+        ]
+
+    monkeypatch.setattr(browser_policy.socket, "getaddrinfo", fake_getaddrinfo)
 
     for url in (
         "http://127.0.0.1:8876/health",
@@ -199,6 +213,20 @@ def test_url_guard_allows_private_dns_when_enabled_but_never_metadata(
 def test_install_browser_guard_wraps_upstream_navigate(monkeypatch, tmp_path: Path):
     profile = tmp_path / "profiles" / "alice"
     calls = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "example.com"
+        return [
+            (
+                browser_policy.socket.AF_INET,
+                browser_policy.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 0),
+            )
+        ]
+
+    monkeypatch.setattr(browser_policy.socket, "getaddrinfo", fake_getaddrinfo)
 
     fake_browser_tool = types.SimpleNamespace()
 

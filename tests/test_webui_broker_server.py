@@ -354,6 +354,25 @@ def test_webui_run_broker_event_preserves_webui_session_boundary():
     assert "platform:feishu" not in session_id
 
 
+def test_webui_run_broker_event_exposes_owner_open_id_for_lark_cli_identity():
+    from hermes_multitenancy.agent_real import _resolve_subprocess_sender_open_id
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_owner",
+        content="创建一个飞书云文档",
+        session_id="webui-lark-cli-identity",
+    )
+
+    event = _build_webui_event(request)
+
+    assert event.sender_open_id == "ou_owner"
+    assert _resolve_subprocess_sender_open_id(event) == "ou_owner"
+
+
 def test_run_broker_loads_only_shared_runtime_env(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
 
