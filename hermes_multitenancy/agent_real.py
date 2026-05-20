@@ -1885,6 +1885,8 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
                 continue
             if not _is_safe_shared_skill_symlink_target(resolved, allowed_roots):
                 continue
+            if resolved.is_dir() and not (resolved / "SKILL.md").is_file():
+                continue
             if resolved.is_dir() and _sandbox_skill_tree_has_secret_files(resolved):
                 logger.warning(
                     "[multitenancy] skipping shared skill sandbox bind with secret-like files: %s",

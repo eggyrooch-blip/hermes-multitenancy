@@ -3276,6 +3276,43 @@ def test_wrap_linux_bwrap_skips_secret_like_shared_skill_targets(monkeypatch, tm
     assert ("--ro-bind", str(skill_source), str(skill_source)) not in triples
 
 
+def test_wrap_linux_bwrap_ignores_non_skill_dependency_symlinks(monkeypatch, tmp_path: Path, caplog):
+    """Dependency symlinks under a copied skill are not treated as skill roots."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    dep_source = shared / "skills" / "Keep" / "keep-record" / "node_modules"
+    dep_source.mkdir(parents=True)
+    (dep_source / "token-helper.js").write_text("// not a skill root\n", encoding="utf-8")
+    skill_dir = profile / "skills" / "Keep" / "keep-record"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Keep Record\n", encoding="utf-8")
+    dep_link = skill_dir / "node_modules"
+    dep_link.symlink_to(dep_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.agent_real"):
+        wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(dep_source), str(dep_source)) not in triples
+    assert not any("skipping shared skill sandbox bind" in rec.message for rec in caplog.records)
+
+
 def test_bwrap_default_args_masks_profile_and_shared_secret_files():
     """The sandbox may use env-loaded secrets, but tools must not read secret files."""
     from hermes_multitenancy import agent_real
