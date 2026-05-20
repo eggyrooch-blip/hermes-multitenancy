@@ -574,6 +574,36 @@ def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
     asyncio.run(runner())
 
 
+def test_webui_run_broker_job_run_requires_authorization(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        store = _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            unauthorized = await client.post("/api/run-broker/jobs/abc123abc123/run")
+            body = await unauthorized.json()
+        finally:
+            await client.close()
+
+        assert unauthorized.status == 401
+        assert body == {"error": "unauthorized"}
+        assert store == {}
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
