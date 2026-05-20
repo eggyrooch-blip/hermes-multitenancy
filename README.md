@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-[![tests](https://img.shields.io/badge/tests-139%20passing-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-make%20test-brightgreen)](#testing)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#how-it-stays-compatible)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#proof-of-end-to-end)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -27,50 +27,49 @@ I love hermes-agent — it's the most polished personal-agent runtime I've used.
 This plugin is the answer: a **`pre_gateway_dispatch` hook** intercepts every Feishu message, looks up the user in a SQLite routing table, dispatches to a per-user `ProfileRuntime` that holds an independent SOUL + history + LLM client. One bot serves N users, each user feels like they have their own personal hermes agent.
 
 ```mermaid
-flowchart LR
+flowchart TB
     admin["Feishu admin / operator"]
-    app["One Feishu app + one bot\nshared APP_ID / APP_SECRET"]
-    contact["Feishu Contact v3\ndepartments + users"]
-    sync["pull-feishu org sync\nsnapshot + profiles + routes"]
-    table["SQLite multitenancy_routing\nopen_id / union_id -> profile"]
-    userA["Feishu user A\nopen_id ou_*"]
-    userB["Feishu user B\nopen_id ou_*"]
-    unknown["Unknown sender\nnot in sync result"]
-    gateway["Hermes gateway\nsingle websocket"]
-    router["multitenancy router\npre_gateway_dispatch"]
-    guard["tenant boundary guard\ncanonical sender / env lock / media filter / exec opt-in"]
-    slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
-    approval["approval bridge\nsession env + stream events + decision file"]
-    cron["shared cron store\n~/.hermes/cron/jobs.json"]
-    profileA["profile: ee966643\ncanonical Feishu user_id"]
-    profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
-    fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
-    aiagent["AIAgent subprocess\nprofile HERMES_HOME + shared-return bridges"]
-    feishu["Feishu CardKit / IM\ntext, cards, files"]
+    app["One Feishu app + one bot\nshared app credential"]
+    contact["Feishu Contact v3\norg/users/departments"]
+    sync["pull-feishu org sync\nprofiles + routes + skill distribution"]
+    db[("~/.hermes/multitenancy.db\nrouting + sessions + credential vault")]
+    webui["Hermes WebUI\nchat/jobs/profile provisioning"]
+    cron["profile cron jobs\nrouter-side worker"]
+    user["Feishu user/group\nopen_id ou_* / chat oc_*"]
+    gateway["Hermes gateway\nsingle Feishu websocket"]
+    router["hermes-multitenancy\npre_gateway_dispatch router"]
+    broker["Run Broker\nchannel=feishu/webui/cron/kanban"]
+    profile["routed profile home\nSOUL + memory + config + workspace"]
+    sandbox["profile runtime guard\nHOME/XDG/TMPDIR pivot + bwrap/sandbox-exec"]
+    aiagent["AIAgent subprocess\nHermes runtime, no core patch"]
+    larkbroker["per-run lark-cli auth broker\nlocalhost + HMAC"]
+    larkcli["lark-cli-authsidecar\ntrusted Feishu OpenAPI CLI"]
+    vault["credential vault\nFeishu app, UAT, provider/API keys"]
+    uat["profile-local UAT mirror\nfeishu_uat/<open_id>.json"]
+    card["Feishu CardKit / IM / files"]
 
     admin --> app
-    admin --> contact --> sync --> table
-    sync --> profileA
-    sync --> profileB
-    userA --> app
-    userB --> app
-    unknown --> app
-    app --> gateway --> router --> guard
-    guard -->|slash command| slash
-    slash -->|gateway handler / quick alias / plugin / unknown| feishu
-    slash -->|quick exec only when explicitly enabled| aiagent
-    slash -->|skill invocation| aiagent
-    guard --> table
-    table -->|active route| profileA --> aiagent --> feishu
-    table -->|active route| profileB --> aiagent
-    guard -->|route miss + auto-provision| fallback --> aiagent
-    aiagent -->|MEDIA path must stay in profile home| feishu
-    aiagent -->|cronjob create| cron -->|gateway ticker delivers| feishu
-    aiagent -->|dangerous command approval_required/resolved| approval -->|router prompt + decision file| feishu
-    feishu -->|/approve / /deny| router --> approval
+    admin --> contact --> sync --> db
+    sync --> profile
+    user --> app --> gateway --> router
+    webui --> broker
+    cron --> broker
+    router --> db
+    router --> broker
+    broker --> db
+    broker --> profile --> sandbox --> aiagent
+    vault --> db
+    db --> vault
+    db --> uat
+    aiagent --> larkbroker --> larkcli --> card
+    larkbroker --> vault
+    larkbroker --> uat
+    aiagent -->|stream events, tools, approvals, artifacts| broker
+    broker -->|CardKit stream + MEDIA only from profile scope| card
+    card --> user
 ```
 
-**Hermes-agent: 0 lines changed.** Verified by `git status`.
+**Hermes-agent: 0 lines changed.** The deployment contract is plugin + profile runtime + sidecar services, not a Hermes core fork.
 
 ---
 
@@ -82,18 +81,19 @@ If you are an agent taking over this repo, this is the main contract:
 2. **Identity uses the canonical sender.** `_resolve_sender_for_routing()` prefers the real Feishu `open_id` (`ou_*`) from the Feishu contextvar, `event.sender_open_id`, `source.open_id/user_id`, and `raw/raw_event/event`. `user_id_alt` / `union_id` is only a legacy route lookup helper, not the new session key.
 3. **Routes live in SQLite.** `multitenancy_routing.open_id -> profile_name` decides which `~/.hermes/profiles/<profile>/` handles the turn. A real `ou_*` will not be absorbed by a stale `union_id`; legacy alt routes are used only when no real `ou_*` is available.
 4. **Normal messages run inside the routed profile.** The router builds a profile-scoped event, writes the resolved `sender_open_id` back to the event, then dispatches to the streaming AIAgent subprocess. The child runs with that profile's `HERMES_HOME`; `agent_real._build_subprocess_env` strips the parent gateway's environment down to an explicit allowlist and pivots `HOME`/`WORKSPACE`/`XDG_*`/`TMPDIR` into `<profile>/{home,workspace,cache,config,state,data,tmp}` so token-bearing skills, MCP servers and CLIs behave like they are running as the current profile user. The runtime also sets `HERMES_PROFILE` plus Keep-compatible `KEP_PROFILE`, prepends shared `<hermes_home>/bin` so tools can be installed once while their token/state writes stay profile-local, and translates common OpenClaw/ClawHub `{baseDir}` skill templates inside the child process. Feishu UAT tokens are loaded from `<profile>/feishu_uat/<open_id>.json` (rebound at runtime by `_configure_feishu_uat_home`); the org-sync pass migrates the legacy shared `<hermes_home>/feishu_uat/<ou_*>.json` forward. See `docs/profile-isolation.md`.
-5. **Default skills and group credentials materialize from runtime state.** Optional `<hermes_home>/profile-skill-defaults.yaml` entries copy company-default skills from `<hermes_home>/skills/` into every synced or auto-provisioned profile while skipping secret-looking files. Optional `<hermes_home>/credential-materialization.yaml` entries map encrypted vault payloads to profile-local files such as `workspace/credentials/gitlab.token` for an audience list, with `profiles: ["*"]` expanding to active routing rows for company-wide access. Entries may also declare `env: GITLAB_TOKEN`; the routed AIAgent receives that env from the vault and registers it for terminal/code passthrough so commands can use `${GITLAB_TOKEN}` without the model reading the token file. `pull-feishu` runs credential materialization after profile sync when the file exists, and `hermes-multitenancy-sync materialize-credentials` can be run directly. This replaces OpenClaw-style per-skill token fanout scripts with one generic vault-to-profile compatibility layer.
-6. **Cron/reminder jobs use the shared gateway scheduler store.** Inside the AIAgent subprocess, `agent_real._configure_cron_home()` temporarily binds `cron.jobs` and `tools.cronjob_tools` to the shared Hermes home (`~/.hermes/cron/jobs.json`), not `~/.hermes/profiles/<profile>/cron/jobs.json`. This matters because the single gateway cron ticker only watches the shared store; otherwise "remind me in 3 minutes" jobs can stay forever `scheduled`.
-7. **Dangerous-command approvals cross the subprocess boundary.** The profile AIAgent registers `tools.approval` with a router-compatible gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`). The child also sets child-local `HERMES_SESSION_KEY` / `HERMES_GATEWAY_SESSION` / `HERMES_EXEC_ASK`, because terminal/process guards may run in worker threads that do not inherit contextvars. The child emits `approval_required` / `approval_resolved`; the parent `_stream_aiagent_subprocess()` must forward those events to the router; the router prompts Feishu; `/approve` / `/deny` writes a decision file that releases the child and resumes Hermes' native approval flow. The matching Hermes core terminal guard must run before sandbox/environment creation, otherwise the approval prompt can be blocked by environment startup.
-8. **CardKit heartbeat lives in the parent router.** The router primes the card and sends idle heartbeat status updates before the child emits tokens; the heartbeat stops once reasoning/tool/content events arrive.
-9. **Memory is keyed by `(profile, canonical sender)`.** `_history_key()` does not use `sender_alt or sender`, so stale/shared alternate IDs cannot merge two users' memory.
-10. **Slash commands never leak into the LLM.** `/model`, `/reasoning`, `/reload-mcp` and other registry commands use Hermes gateway handlers; skill slash rewrites into native skill invocation for the routed profile; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec follows config; unknown slash returns Hermes-style unknown-command.
-11. **Slash handlers run with a profile context lock.** Gateway/plugin handlers execute inside `_profile_gateway_context()`, which serializes temporary `HERMES_HOME` and gateway session-key overrides so concurrent slash commands cannot cross profiles.
-12. **Local exec is off by default.** `quick_commands` alias remains available; `type: exec` is denied unless `multitenancy.allow_quick_exec: true` or `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` is set. Allowed exec inherits the routed profile's `HERMES_HOME`. Keep it off in production until profile sandboxing is enforced.
-13. **Attachments and file replies stay in profile scope.** Inbound attachments still delegate to Hermes' native `_prepare_inbound_message_text`; the plugin adds a bounded fallback for locally cached tabular files (`.csv` / `.xlsx`) when upstream does not inline them. Outbound `MEDIA:<path>` replies are filtered so only paths resolving inside the routed `profile_home` are delivered. Tool/browser artifacts discovered in profile-local download/cache/tmp/data directories are published into `profile_home/workspace/Downloads` first so Feishu delivery and the WebUI file browser consume the same profile-visible location. If the model only mentions a real profile-local file path as plain text, the router now auto-attaches it by copying a safe workspace-visible copy to `workspace/Downloads`, hiding the host path from visible card text, and adding the internal `MEDIA:` directive; known secret paths such as `.env`, `auth.json`, `feishu_uat/`, `credentials/`, and `tokens/` are blocked.
-14. **Feishu UAT refreshes are mirrored into the credential vault.** Org sync copies refreshed shared `feishu_uat/<open_id>.json` files into each routed profile and, when a credential key is configured, writes the same payload into `multitenancy_credentials`. JSON remains a migration fallback; the DB stays the runtime credential source.
-15. **Background terminal notify is not claimed as supported.** A child-local `process_registry` is invisible to the parent gateway watcher. Each child calls `agent.close()` on exit to clean such resources instead of leaving unmanaged background processes. True `terminal(background=true, notify_on_complete=true)` support should move process ownership into the parent process.
-16. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0` and keep `multitenancy.allow_quick_exec=false`. Application-layer isolation (route/session/slash/media boundaries) is handled by this plugin. Profile execution-environment sandboxing档 A — parent-env allowlist, HOME/WORKSPACE/XDG/TMPDIR pivot, `chmod 0700` on the profile tree, per-profile `feishu_uat/` and `tokens/` directories — is enabled by default; verify a deployed profile with `scripts/verify-isolation.sh`. Kernel-level containment via `sandbox-exec` / Linux `bwrap` adds filesystem containment; until it is enabled for every profile, treat档 A as defense-in-depth rather than an authorisation boundary. Full details: `docs/profile-isolation.md`.
+5. **Default skills and group credentials materialize from runtime state.** `profile-skill-defaults.yaml`, `skill-distribution.yaml`, and `skill-bundles.yaml` express managed skills; sync installs them into profiles while skipping secret-looking files. `credential-materialization.yaml` maps encrypted vault payloads to profile-local compatibility files such as `workspace/credentials/gitlab.token`; `profiles: ["*"]` expands to active routing rows. Entries may declare `env: GITLAB_TOKEN`, in which case the routed AIAgent receives that env from the vault and registers it for terminal/code passthrough without the model reading the token file.
+6. **lark-cli is an external runtime dependency.** This repo registers the `lark_cli` tool and starts a per-run localhost auth broker, but the deployment must provide an authsidecar-capable `lark-cli` binary. The default path is `<shared HERMES_HOME>/bin/lark-cli-authsidecar`; `HERMES_LARK_CLI_BIN` overrides it. Personal profiles use `user` identity only when the current `open_id` has valid UAT; group/WebUI agent profiles default to `bot`.
+7. **Cron/reminder jobs are profile-scoped but router-executed.** WebUI/upstream cron tooling writes profile-local `cron/jobs.json`. The router-side worker scans active profiles, creates `RunRequest(channel="cron")`, executes through Run Broker, delivers to Feishu when requested, and mirrors context into `multitenancy_sessions`.
+8. **Dangerous-command approvals cross the subprocess boundary.** The profile AIAgent registers `tools.approval` with a router-compatible gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`). The child also sets child-local `HERMES_SESSION_KEY` / `HERMES_GATEWAY_SESSION` / `HERMES_EXEC_ASK`, because terminal/process guards may run in worker threads that do not inherit contextvars. The child emits `approval_required` / `approval_resolved`; the parent `_stream_aiagent_subprocess()` must forward those events to the router; the router prompts Feishu; `/approve` / `/deny` writes a decision file that releases the child and resumes Hermes' native approval flow.
+9. **CardKit heartbeat lives in the parent router.** The router primes the card and sends idle heartbeat status updates before the child emits tokens; the heartbeat stops once reasoning/tool/content events arrive.
+10. **Memory is keyed by `(profile, canonical sender)`.** `_history_key()` does not use `sender_alt or sender`, so stale/shared alternate IDs cannot merge two users' memory.
+11. **Slash commands never leak into the LLM.** `/model`, `/reasoning`, `/reload-mcp` and other registry commands use Hermes gateway handlers; skill slash rewrites into native skill invocation for the routed profile; plugin slash delegates to `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec follows config; unknown slash returns Hermes-style unknown-command.
+12. **Slash handlers run with a profile context lock only when needed.** Gateway/quick/plugin commands that must interrupt a run, such as `/stop`, bypass the long profile env lock; unknown slash commands that may map to profile-local skills resolve inside the profile context.
+13. **Local exec is off by default.** `quick_commands` alias remains available; `type: exec` is denied unless `multitenancy.allow_quick_exec: true` or `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` is set. Allowed exec inherits the routed profile's `HERMES_HOME`. Keep it off in production until profile sandboxing is enforced.
+14. **Attachments and file replies stay in profile scope.** Inbound attachments still delegate to Hermes' native `_prepare_inbound_message_text`; the plugin adds a bounded fallback for locally cached tabular files (`.csv` / `.xlsx`) when upstream does not inline them. Outbound `MEDIA:<path>` replies are filtered so only paths resolving inside the routed `profile_home` are delivered. Known secret paths such as `.env`, `auth.json`, `feishu_uat/`, `credentials/`, and `tokens/` are blocked.
+15. **Feishu UAT refreshes are mirrored into the credential vault.** Org sync copies refreshed shared `feishu_uat/<open_id>.json` files into each routed profile and, when a credential key is configured, writes the same payload into `multitenancy_credentials`. JSON remains a migration fallback; the DB stays the runtime credential source.
+16. **Background terminal notify is not claimed as supported.** A child-local `process_registry` is invisible to the parent gateway watcher. Each child calls `agent.close()` on exit to clean such resources instead of leaving unmanaged background processes. True `terminal(background=true, notify_on_complete=true)` support should move process ownership into the parent process.
+17. **Production posture.** For company deployments, prefer `HERMES_MULTITENANCY_AUTO_PROVISION=0` and keep `multitenancy.allow_quick_exec=false`. Application-layer isolation (route/session/slash/media boundaries) is handled by this plugin. Profile execution-environment sandboxing档 A — parent-env allowlist, HOME/WORKSPACE/XDG/TMPDIR pivot, `chmod 0700` on the profile tree, per-profile `feishu_uat/` and `tokens/` directories — is enabled by default; verify a deployed profile with `scripts/verify-isolation.sh`. Kernel-level containment via `sandbox-exec` / Linux `bwrap` adds filesystem containment; until it is enabled for every profile, treat档 A as defense-in-depth rather than an authorisation boundary. Full details: `docs/profile-isolation.md`.
 
 ---
 
@@ -115,52 +115,99 @@ You do **not** need one Feishu app per user. Reuse one Feishu app/bot for all te
 3. Per-user Feishu UAT tokens are first captured by OAuth into `~/.hermes/feishu_uat/<open_id>.json` (gateway-side, shared), then migrated to `~/.hermes/profiles/<profile>/feishu_uat/<open_id>.json` by the org-sync pass — that per-profile copy is what the AIAgent subprocess actually reads. Do not commit token files. See `docs/profile-isolation.md` §6.
 4. Keep per-profile model/tool credentials under `~/.hermes/profiles/<profile>/`. The Feishu app is shared; profile persona, memory, tools and LLM credentials stay isolated.
 
-Discussion group: [Eggyrooch's Feishu group invite](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=419if828-a007-453f-ad1c-31edef49520f).
-
 ---
 
 ## 🚀 Quick Start
 
+Set `HERMES_HOME` first. All commands below assume one shared Hermes home, one
+Feishu app, and per-user profiles under `$HERMES_HOME/profiles/`.
+
+```bash
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/bin" "$HERMES_HOME/logs"
+```
+
 ### 1. Install the plugin
 
-Use Hermes' plugin installer for normal installs. It clones this repository into
-`~/.hermes/plugins/multitenancy`, reads the root `plugin.yaml`, and adds
-`multitenancy` to `plugins.enabled` when `--enable` is supplied.
+Hermes can load this as a directory plugin from `$HERMES_HOME/plugins/multitenancy`.
+The plugin installer should create that directory and enable `plugins.enabled`.
 
 ```bash
 hermes plugins install eggyrooch-blip/hermes-multitenancy --enable
 hermes plugins list
-hermes gateway restart
 ```
 
-For local development, use an editable checkout:
+For a pinned checkout or local development, install from a real repository path
+instead. This is the most transparent path for agents and production operators
+because the loaded plugin path can be inspected directly.
 
 ```bash
-git clone https://github.com/eggyrooch-blip/hermes-multitenancy ~/projects/hermes-multitenancy
-cd ~/projects/hermes-multitenancy
-hermes plugins install "file://$PWD" --force --enable
-python -m pip install --no-deps -e ".[test]"   # optional: only for running this repo's tests
-hermes gateway restart
+git clone https://github.com/eggyrooch-blip/hermes-multitenancy /opt/hermes-multitenancy
+hermes plugins install "file:///opt/hermes-multitenancy" --force --enable
+python -m pip install --no-deps -e "/opt/hermes-multitenancy[test]"
 ```
 
-### 2. Enable in `config.yaml`
+Manual fallback, if the Hermes plugin installer is unavailable:
 
-The installer handles this when you pass `--enable`. For manual installs,
-ensure the default gateway home contains:
+```bash
+mkdir -p "$HERMES_HOME/plugins"
+ln -sfn /opt/hermes-multitenancy "$HERMES_HOME/plugins/multitenancy"
+```
+
+Ensure the shared Hermes config enables the plugin:
 
 ```yaml
-# ~/.hermes/config.yaml
+# $HERMES_HOME/config.yaml
 plugins:
   enabled:
     - multitenancy
 ```
 
+### 2. Install lark-cli/authsidecar
+
+`hermes-multitenancy` registers the `lark_cli` tool and starts the per-run
+credential broker, but it does **not** vendor or automatically install the
+`lark-cli` binary. New environments must provide an authsidecar-capable
+`lark-cli` before Feishu tools can work.
+
+Default binary lookup order:
+
+1. `HERMES_LARK_CLI_BIN`, when set.
+2. `$HERMES_HOME/bin/lark-cli-authsidecar`.
+3. A plain `lark-cli` found on `PATH` for limited checks.
+
+Build the authsidecar binary from an official `larksuite/cli` checkout:
+
+```bash
+git clone https://github.com/larksuite/cli /opt/larksuite-cli
+cd /opt/hermes-multitenancy
+LARK_CLI_SOURCE_DIR=/opt/larksuite-cli \
+HERMES_LARK_CLI_BIN="$HERMES_HOME/bin/lark-cli-authsidecar" \
+LARK_CLI_EXPECTED_VERSION="<expected-lark-cli-version>" \
+LARK_CLI_EXPECTED_SOURCE_HEAD="<expected-source-short-sha>" \
+  scripts/build_lark_cli_authsidecar.sh
+```
+
+If your deployment already ships a vetted authsidecar binary, place it at the
+default path or point to it explicitly:
+
+```bash
+install -m 0755 /path/to/lark-cli-authsidecar "$HERMES_HOME/bin/lark-cli-authsidecar"
+export HERMES_LARK_CLI_BIN="$HERMES_HOME/bin/lark-cli-authsidecar"
+```
+
+The authsidecar never receives raw Feishu app secrets from the model. The
+routed AIAgent talks to a localhost auth broker; the broker injects either the
+current user's UAT or a bot tenant token from the credential vault.
+
 ### 3. Configure one shared Feishu bot
 
-Use your existing Hermes Feishu app credentials as a migration source, then store them in the multitenancy credential vault. The exact surrounding Hermes config can vary by version; the important part is that all profiles reuse one shared app credential while user UAT stays profile-scoped.
+Use one Feishu app/bot for all tenants. Keep the app credential outside git.
+The shared config can be a migration source, but production should import it
+into `multitenancy_credentials`.
 
 ```yaml
-# ~/.hermes/config.yaml
+# $HERMES_HOME/config.yaml
 platforms:
   feishu:
     enabled: true
@@ -169,88 +216,155 @@ platforms:
       app_secret: "${FEISHU_APP_SECRET}"
 ```
 
-Then run your Hermes Feishu authorization/UAT flow for each real user. Token files initially land under the shared home (OAuth callback writes there):
+Import the app credential into the vault without printing the secret:
+
+```bash
+export HERMES_MULTITENANCY_CREDENTIAL_KEY="<32-byte-or-longer-secret-key>"
+python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
+  import-app-config \
+  --shared-home "$HERMES_HOME" \
+  --config "$HERMES_HOME/config.yaml"
+```
+
+User UAT is profile-scoped. OAuth/device-flow writes or imports a user token,
+then multitenancy mirrors it to:
 
 ```text
-~/.hermes/feishu_uat/ou_xxx.json
-~/.hermes/feishu_uat/ou_yyy.json
+$HERMES_HOME/profiles/<profile>/feishu_uat/<open_id>.json
+multitenancy_credentials(profile=<profile>, subject=<open_id>, provider=feishu, kind=uat)
 ```
 
-The next org-sync pass copies each user's token forward into their profile (`~/.hermes/profiles/<profile>/feishu_uat/<open_id>.json`), which is the path the AIAgent subprocess actually reads from after档 A profile isolation. See `docs/profile-isolation.md` §6.
+Never commit `.env`, `auth.json`, `feishu_uat/*.json`, `tokens/`,
+`workspace/credentials/`, cookies, or raw OAuth payloads.
 
-### 4. Sync Feishu org into profiles + routes
+### 4. Sync profiles and routes
 
-If your Feishu app has Contact read scopes, use the Python org sync:
+If the Feishu app has Contact read scopes, use org sync. Dry-run first:
 
 ```bash
-# Preview only; does not write profiles or DB rows
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dry-run
-
-# Apply and save an org snapshot
-mkdir -p ~/.hermes/org-snapshots
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu \
-  --snapshot-out ~/.hermes/org-snapshots
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu --dry-run
+mkdir -p "$HERMES_HOME/org-snapshots"
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu \
+  --snapshot-out "$HERMES_HOME/org-snapshots"
 ```
 
-The sync command reuses the current `HERMES_HOME` Feishu config (`config.yaml` / `.env` / environment), pulls Feishu Contact v3 departments and users, creates `~/.hermes/profiles/<user_id>/` from Feishu `user_id`, and writes `multitenancy_routing`. It only updates a managed org block inside `SOUL.md`; manually edited content outside that block is preserved.
+Org sync creates or updates `$HERMES_HOME/profiles/<user_id>/`, writes
+`multitenancy_routing`, updates only the managed org block in `SOUL.md`,
+syncs managed skills, and runs credential materialization when configured.
 
-If you do not have Contact scopes yet, or want to run a strict manual allowlist, keep using the JSON route reconciler:
+Without Contact scopes, apply an explicit allowlist:
 
 ```bash
-# Directory-plugin install path
-python ~/.hermes/plugins/multitenancy/sync.py apply users.json
-
-# Editable/pip install path, if you installed this repo as a package too
-hermes-multitenancy-sync apply users.json
+python "$HERMES_HOME/plugins/multitenancy/sync.py" apply users.json
 ```
 
-Where `users.json` is:
+`users.json` format:
 
 ```json
 [
   {"user_id": "alice", "profile_name": "alice_profile", "open_id": "ou_xxx", "union_id": "on_xxx"},
-  {"user_id": "bob",   "profile_name": "bob_profile",   "open_id": "ou_yyy", "union_id": "on_yyy"}
+  {"user_id": "bob", "profile_name": "bob_profile", "open_id": "ou_yyy", "union_id": "on_yyy"}
 ]
 ```
 
-Each `profile_name` should already exist as a hermes profile directory at `~/.hermes/profiles/<name>/` with its own `SOUL.md`, `config.yaml`, `auth.json` or `.env`. The plugin will route Feishu messages from `ou_xxx` to `alice_profile`'s SOUL+memory, and from `ou_yyy` to `bob_profile`.
-
-For first-run UAT you can also leave auto-provision enabled (`HERMES_MULTITENANCY_AUTO_PROVISION=1`, the default). An unseen sender `ou_new_user` gets a deterministic fallback profile such as `~/.hermes/profiles/feishu_ou_new_user/`, seeded from the shared Hermes config. Once org sync learns that user's canonical Feishu `user_id`, it takes over the route to the `user_id` profile.
-
-Restart the hermes gateway. **Done.**
-
-### 5. Verify
+For company deployments, prefer strict routing after the initial rollout:
 
 ```bash
-hermes plugins list
-hermes gateway status
-sqlite3 ~/.hermes/multitenancy.db 'select open_id, profile_name, active from multitenancy_routing;'
-```
-
-Send two different Feishu users the same prompt through the same bot. The
-gateway log should show different sender `ou_*` values and different profile
-homes.
-
-### 6. Automate, scope, and recover
-
-After the first sync, run a periodic full sync through cron or a systemd timer. A full sync handles join/move/leave: new employees get profiles + routes, department or manager changes refresh only the managed org block in `SOUL.md`, and users missing from the full Contact result are soft-deleted from routing (`active=0`) while their profiles, memories, and sessions remain on disk.
-
-```cron
-*/30 * * * * HERMES_HOME=/Users/kite/.hermes /usr/bin/python3 /Users/kite/.hermes/plugins/multitenancy/sync.py pull-feishu --snapshot-out /Users/kite/.hermes/org-snapshots >> /Users/kite/.hermes/logs/multitenancy-sync.log 2>&1
-```
-
-When only some people need org sync, use a department-scoped sync or a manual allowlist:
-
-```bash
-# Sync one department subtree; out-of-scope routes are not soft-deleted by default
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dept <open_department_id> --dry-run
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dept <open_department_id>
-
-# Strict allowlist mode: unknown users do not auto-create fallback profiles
 export HERMES_MULTITENANCY_AUTO_PROVISION=0
 ```
 
-If sync goes wrong, stop the timer first, then inspect `pull-feishu --dry-run` and the latest snapshot. A user can send `/status` in Feishu to see the current profile; locally, run `hermes -p <profile_name> chat` to enter that profile. Unknown-user fallback profiles live at `~/.hermes/profiles/feishu_<open_id>/`.
+### 5. Run the gateway and broker surfaces
+
+At minimum, restart the Hermes gateway so it imports the plugin. WebUI and cron
+deployments normally also enable the Run Broker sidecar on localhost.
+
+```bash
+export HERMES_MULTITENANCY_RUN_BROKER_SERVER=1
+export HERMES_MULTITENANCY_CRON_RUN_BROKER=1
+export HERMES_MULTITENANCY_RUN_BROKER_KEY="<shared-secret-for-server-to-server-calls>"
+hermes gateway restart
+```
+
+Production services should set the same environment through the service manager
+instead of an interactive shell. Keep the Feishu websocket entry on the router
+gateway; profile gateways, when used for API-server compatibility, should not
+open their own Feishu websocket for the same bot.
+
+### 6. Verify
+
+Run secret-free checks before sending real traffic:
+
+```bash
+hermes plugins list
+sqlite3 "$HERMES_HOME/multitenancy.db" \
+  'select open_id, profile_name, active from multitenancy_routing limit 20;'
+
+python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
+  health \
+  --shared-home "$HERMES_HOME" \
+  --router-profile-home "$HERMES_HOME/profiles/multitenancy_router"
+
+python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
+  preflight \
+  --shared-home "$HERMES_HOME" \
+  --profile "<profile>" \
+  --open-id "<ou_open_id>" \
+  --binary "$HERMES_HOME/bin/lark-cli-authsidecar"
+```
+
+Then send two Feishu users the same prompt through the same bot. Logs should
+show different canonical `ou_*` senders, different routed profile homes, and
+`lark_cli_default_identity=user` only for profiles with a valid user UAT.
+
+### 7. Automate, scope, and recover
+
+Run full org sync periodically through cron or a systemd timer. A full sync
+handles join/move/leave: new employees get profiles and routes, org changes
+refresh the managed `SOUL.md` block, and missing users are soft-deleted from
+routing while profile memories remain on disk.
+
+```cron
+*/30 * * * * HERMES_HOME=/opt/hermes python /opt/hermes/.hermes/plugins/multitenancy/sync.py pull-feishu --snapshot-out /opt/hermes/.hermes/org-snapshots >> /opt/hermes/.hermes/logs/multitenancy-sync.log 2>&1
+```
+
+For a department-scoped sync:
+
+```bash
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu --dept <open_department_id> --dry-run
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu --dept <open_department_id>
+```
+
+If sync goes wrong, stop the timer first, inspect `pull-feishu --dry-run` and
+the latest snapshot, then use `/status` from Feishu or inspect
+`multitenancy_routing` locally. Unknown-user fallback profiles live at
+`$HERMES_HOME/profiles/feishu_<open_id>/`.
+
+---
+
+## 🚢 Production deployment runbook
+
+Use this order when an agent needs to deploy the repository:
+
+1. Update and verify the canonical repository locally.
+2. Run `uv run --extra test pytest -q` or `make test`.
+3. Push the reviewed commit to GitHub.
+4. On the production host, back up the current checkout, `$HERMES_HOME/config.yaml`,
+   `$HERMES_HOME/.env`, `$HERMES_HOME/multitenancy.db`, service units, and the
+   active profile directories. Do not print secret file contents into logs.
+5. Fast-forward the production checkout only: `git pull --ff-only`.
+6. Reinstall the package into the Hermes Python environment if production uses
+   editable imports: `python -m pip install --no-deps -e /path/to/hermes-multitenancy`.
+7. Ensure `$HERMES_HOME/plugins/multitenancy` points at the production checkout
+   or was refreshed by `hermes plugins install`.
+8. Ensure `$HERMES_HOME/bin/lark-cli-authsidecar` exists and is executable, or
+   set `HERMES_LARK_CLI_BIN` in the service environment.
+9. Restart the router gateway and any Run Broker/WebUI services.
+10. Verify `health`, `preflight`, route rows, service logs, and one read-only
+    `lark_cli` user-info canary before declaring the deploy usable.
+
+Rollback is a normal forward fix or a restored checkout plus service restart.
+Do not copy tokens between profiles by hand; use the credential vault and
+`credential-materialization.yaml` when a compatibility file is required.
 
 ---
 
@@ -292,6 +406,9 @@ These checks were run live through Feishu's WebSocket gateway and an OpenAI-comp
 | Reply context (quoted message) | ✅ — same delegate, plus our own `reply_to_text` fallback |
 | Multi-user shared-session attribution | ✅ — same delegate |
 | Tool use (real AIAgent loop with browser/search/shell) | ✅ — via isolated `AIAgent` subprocess bridge |
+| lark-cli Feishu OpenAPI bridge | ✅ — `lark_cli` tool registration plus per-run auth broker; deployment must provide `lark-cli-authsidecar` |
+| Credential vault + materialization | ✅ — stores Feishu app/UAT/provider secrets in `multitenancy_credentials`, exposes only redacted status, materializes compatibility files when configured |
+| Managed skill distribution | ✅ — `profile-skill-defaults.yaml`, `skill-distribution.yaml`, and `skill-bundles.yaml` with secret guard and child-profile inheritance rules |
 | Cron / reminder proactive delivery | ✅ — WebUI/broker-created jobs default to `deliver=feishu`, are stored in the routed profile cron store, and are executed/delivered by the router multi-profile worker |
 | Dangerous-command approval proactive delivery | ✅ — child `approval_required`/`approval_resolved` → parent stream parser → router Feishu prompt → `/approve`/`/deny` decision file; child-local session env covers terminal worker threads; core terminal guard runs before environment creation |
 | CardKit idle heartbeat | ✅ — parent router prime + heartbeat; does not depend on early child tokens |
@@ -359,6 +476,14 @@ after those generic surfaces settle and external usage proves the behavior.
      ├─ pool.py           LRU RuntimePool (50 hot / 5min idle / cold-start sem)
      ├─ routing.py        SQLite multitenancy_routing table (open_id → profile)
      ├─ sessions.py       SQLite multitenancy_sessions (per-user history, persistent)
+     ├─ credentials.py    encrypted credential vault rows in multitenancy.db
+     ├─ lark_cli_tool.py  Hermes tool registration for lark_cli / lark-cli
+     ├─ lark_cli_auth_broker.py per-run localhost credential proxy for authsidecar
+     ├─ run_broker.py     channel-neutral execution contract for Feishu/WebUI/cron
+     ├─ webui_broker_server.py localhost HTTP/SSE sidecar for WebUI and jobs
+     ├─ cron_worker.py    multi-profile cron worker and Run Broker bridge
+     ├─ skill_registry.py managed/personal/unknown skill audit + install helpers
+     ├─ upstream_health.py secret-free upgrade/deploy health checks
      ├─ commands.py       Hermes registry-backed slash command parser
      ├─ agent_real.py     AIAgent subprocess bridge + legacy OpenAI-compat fallback
      ├─ aiagent_subprocess.py isolated child-process entry point for AIAgent/tool loop
@@ -420,34 +545,27 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 
 ```bash
 # Default suite (no network)
-PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q -m "not integration"
+uv run --extra test pytest -q
 
-# Focused Feishu multitenancy regression suite used for this PR
-PYTHONPATH=/path/to/hermes-agent python -m pytest \
+# Same command through the repo Makefile
+make test
+
+# Focused Feishu multitenancy regression suite
+uv run --extra test pytest \
   tests/test_hook_dispatch.py \
   tests/test_aiagent_subprocess.py \
   tests/test_streaming_card_transport.py \
   -q
 
 # Live LLM integration — calls your configured provider
-PYTHONPATH=. python -m pytest tests/ -m integration -v
+uv run --extra test pytest tests/ -m integration -v
 ```
 
-Full dual-account Feishu UAT lives in the Hermes UAT worktree, not this plugin
-package:
+Current skills/lark-cli/UAT audit helpers live in this repository:
 
 ```bash
-python scripts/stress_test_feishu_pipeline.py \
-  --suite full \
-  --users UserA,UserB \
-  --parallel-users \
-  --chat-id "$HERMES_FEISHU_TEST_CHAT_ID" \
-  --fixtures .uat/fixtures/dual-users.local.json \
-  --allow-destructive \
-  --strict-identity \
-  --route-mode multitenant \
-  --require-card-final \
-  --checkpoint ~/.hermes/uat/checkpoints/full-dual-20260505.jsonl
+make skills-uat
+make skills-uat-strict
 ```
 
 ---
@@ -487,15 +605,15 @@ Issues and PRs welcome.
 
 When filing a bug, please include:
 
-1. Output of `pytest tests/ -q` from your machine
+1. Output of `uv run --extra test pytest -q` or `make test` from your machine
 2. Hermes-agent version (`pip show hermes-agent | grep Version`)
 3. Plugin version (`pip show hermes-multitenancy | grep Version`)
 4. Relevant gateway log lines (especially anything with `multitenancy:` prefix)
 
 ### Pull requests
 
-1. Fork → create a branch → run `pytest tests/ -q` (must be green) → open PR.
-2. **Tests are required** for behaviour changes. We hold a hard line on `pytest tests/ -q -m "not integration"` staying at 128+ green.
+1. Fork → create a branch → run `uv run --extra test pytest -q` or `make test` (must be green) → open PR.
+2. **Tests are required** for behaviour changes. Keep the full default suite green.
 3. **Don't mass-rename** — keep diffs small and reviewable.
 4. **No `feishu.py` patches** — the whole point of this plugin is hermes-agent stays unmodified. If you find a hermes API limitation, file an upstream issue at https://github.com/NousResearch/hermes-agent and link it here.
 
@@ -506,13 +624,13 @@ If you upgrade `hermes-agent` and our integration tests break, please file an is
 - The pytest output
 - A pointer to the upstream commit (if you can find it)
 
-We pin `hermes-agent>=1.0` in `pyproject.toml` but the plugin loader contract evolves — we need community eyes on what changes.
+We currently require `hermes-agent>=0.14,<1.0` in `pyproject.toml`; the plugin loader contract still evolves, so we need community eyes on what changes.
 
 ### Wanted contributions (priority order)
 
 1. **Per-profile `SessionStore`** — session rows are isolated by `(profile, canonical sender)` in the shared `multitenancy.db`; splitting into per-profile DBs is still useful scale hardening and mirrors hermes' own profile layout.
 2. **Prompt caching** — Anthropic `cache_control` for the SOUL prefix. Cuts token cost ~50% on long-running chats.
-3. **CI matrix** — GitHub Actions running `pytest tests/ -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
+3. **CI matrix** — GitHub Actions running `uv run --extra test pytest -q` against multiple `hermes-agent` versions to catch upstream contract drift early.
 4. **More live UAT fixtures** — broaden destructive/write-path coverage without relying on shared production-like resources.
 
 ---

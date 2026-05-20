@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-[![tests](https://img.shields.io/badge/tests-139%20passing-brightgreen)](#-测试)
+[![tests](https://img.shields.io/badge/tests-make%20test-brightgreen)](#-测试)
 [![hermes 0 patches](https://img.shields.io/badge/hermes--agent-0%20patches-brightgreen)](#-为什么能保持兼容)
 [![real Feishu verified](https://img.shields.io/badge/real%20Feishu-verified-brightgreen)](#-端到端验证)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -27,50 +27,49 @@
 这个插件就是答案: 用一个 **`pre_gateway_dispatch` hook** 拦截每条飞书消息, 在 SQLite 路由表里查到这个用户对应哪个 profile, 然后派发到一个独立的 `ProfileRuntime` (持有独立的 SOUL + 历史 + LLM 客户端)。一个 Bot 服务 N 个用户, 每个用户感觉自己拥有一个专属的 hermes Agent。
 
 ```mermaid
-flowchart LR
+flowchart TB
     admin["飞书管理员 / 平台运维"]
-    app["一个飞书应用 + 一个 Bot\n复用 APP_ID / APP_SECRET"]
-    contact["Feishu Contact v3\n部门 + 用户"]
-    sync["pull-feishu 组织同步\nsnapshot + profile + route"]
-    table["SQLite multitenancy_routing\nopen_id / union_id -> profile"]
-    userA["飞书用户 A\nopen_id ou_*"]
-    userB["飞书用户 B\nopen_id ou_*"]
-    unknown["未知用户\n未进入同步结果"]
-    gateway["Hermes gateway\n单 websocket"]
-    router["multitenancy router\npre_gateway_dispatch"]
-    guard["租户边界 guard\ncanonical sender / env lock / media filter / exec opt-in"]
-    slash["Hermes slash control plane\nregistry / skill / plugin / quick / unknown"]
-    approval["approval bridge\nsession env + stream events + decision file"]
-    cron["shared cron store\n~/.hermes/cron/jobs.json"]
-    profileA["profile: ee966643\ncanonical Feishu user_id"]
-    profileB["profile: g41a5b5g\ncanonical Feishu user_id"]
-    fallback["fallback profile: feishu_ou_xxx\nauto-provision only"]
-    aiagent["AIAgent subprocess\nprofile HERMES_HOME + shared-return bridges"]
-    feishu["Feishu CardKit / IM\n文本、卡片、文件"]
+    app["一个飞书应用 + 一个 Bot\n共享应用凭证"]
+    contact["Feishu Contact v3\n组织、用户、部门"]
+    sync["pull-feishu 组织同步\nprofiles + routes + skill 分发"]
+    db[("~/.hermes/multitenancy.db\nrouting + sessions + credential vault")]
+    webui["Hermes WebUI\n聊天、任务、profile 创建"]
+    cron["profile cron jobs\nrouter-side worker"]
+    user["飞书用户/群聊\nopen_id ou_* / chat oc_*"]
+    gateway["Hermes gateway\n单 Feishu websocket"]
+    router["hermes-multitenancy\npre_gateway_dispatch router"]
+    broker["Run Broker\nchannel=feishu/webui/cron/kanban"]
+    profile["路由后的 profile home\nSOUL + memory + config + workspace"]
+    sandbox["profile runtime guard\nHOME/XDG/TMPDIR pivot + bwrap/sandbox-exec"]
+    aiagent["AIAgent subprocess\nHermes runtime, 不 patch core"]
+    larkbroker["per-run lark-cli auth broker\nlocalhost + HMAC"]
+    larkcli["lark-cli-authsidecar\n可信飞书 OpenAPI CLI"]
+    vault["credential vault\nFeishu app, UAT, provider/API keys"]
+    uat["profile-local UAT mirror\nfeishu_uat/<open_id>.json"]
+    card["Feishu CardKit / IM / 文件"]
 
     admin --> app
-    admin --> contact --> sync --> table
-    sync --> profileA
-    sync --> profileB
-    userA --> app
-    userB --> app
-    unknown --> app
-    app --> gateway --> router --> guard
-    guard -->|slash command| slash
-    slash -->|gateway handler / quick alias / plugin / unknown| feishu
-    slash -->|quick exec only when explicitly enabled| aiagent
-    slash -->|skill invocation| aiagent
-    guard --> table
-    table -->|active route| profileA --> aiagent --> feishu
-    table -->|active route| profileB --> aiagent
-    guard -->|route miss + auto-provision| fallback --> aiagent
-    aiagent -->|MEDIA path must stay in profile home| feishu
-    aiagent -->|cronjob create| cron -->|gateway ticker delivers| feishu
-    aiagent -->|dangerous command approval_required/resolved| approval -->|router prompt + decision file| feishu
-    feishu -->|/approve / /deny| router --> approval
+    admin --> contact --> sync --> db
+    sync --> profile
+    user --> app --> gateway --> router
+    webui --> broker
+    cron --> broker
+    router --> db
+    router --> broker
+    broker --> db
+    broker --> profile --> sandbox --> aiagent
+    vault --> db
+    db --> vault
+    db --> uat
+    aiagent --> larkbroker --> larkcli --> card
+    larkbroker --> vault
+    larkbroker --> uat
+    aiagent -->|stream events, tools, approvals, artifacts| broker
+    broker -->|CardKit stream + 仅 profile 范围 MEDIA| card
+    card --> user
 ```
 
-**hermes-agent: 改动 0 行。** `git status` 可验。
+**hermes-agent: 改动 0 行。** 部署契约是 plugin + profile runtime + sidecar 服务, 不是 Hermes core fork。
 
 ---
 
@@ -81,17 +80,20 @@ flowchart LR
 1. **入口不改 Hermes core。** `hermes_multitenancy.register(ctx)` 注册 `pre_gateway_dispatch` hook。收到飞书消息后, hook 返回 `{"action": "skip"}`, 由插件自己的 `handle_async()` 接管后续路由和回复。
 2. **身份只认 canonical sender。** `_resolve_sender_for_routing()` 优先取真实飞书 `open_id` (`ou_*`): Feishu contextvar、`event.sender_open_id`、`source.open_id/user_id`、`raw/raw_event/event` 都会查。`user_id_alt` / `union_id` 只用于旧路由查找, 不作为新 session key。
 3. **路由是 SQLite 表。** `multitenancy_routing.open_id -> profile_name` 决定用户进入哪个 `~/.hermes/profiles/<profile>/`。有真实 `ou_*` 时不会被 stale `union_id` 吸收到老 profile; 没有 `ou_*` 时才 fallback 到 legacy alt route。
-4. **普通消息进入 profile runtime。** router 构造 profile-scoped event, 把真实 `sender_open_id` 写回 event, 再进入 streaming AIAgent subprocess。子进程以该 profile 的 `HERMES_HOME` 运行, Feishu UAT token 仍按 `~/.hermes/feishu_uat/<open_id>.json` 查。
-5. **cron/提醒任务写共享 gateway 调度存储。** AIAgent 子进程里 `agent_real._configure_cron_home()` 会临时把 `cron.jobs` 和 `tools.cronjob_tools` 绑定到共享 Hermes home (`~/.hermes/cron/jobs.json`), 而不是 `~/.hermes/profiles/<profile>/cron/jobs.json`。原因是单 gateway 的 cron ticker 只轮询共享存储; 否则 "3 分钟后提醒我" 这类任务会一直停在 `scheduled`。
-6. **危险命令审批跨子进程 bridge。** profile AIAgent 会用 router 兼容的 gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`) 注册 `tools.approval` notify。子进程同时设置 child-local `HERMES_SESSION_KEY` / `HERMES_GATEWAY_SESSION` / `HERMES_EXEC_ASK`, 因为 terminal/process guard 可能跑在不继承 contextvars 的 worker 线程里。子进程发 `approval_required` / `approval_resolved` stream event; 父进程 `_stream_aiagent_subprocess()` 必须原样转发这些事件给 router, router 给飞书发审批提示; 用户回 `/approve` / `/deny` 后, router 写 decision file, 子进程解除阻塞并继续原生 Hermes approval flow。对应 Hermes core 的 terminal guard 还必须先于 sandbox/environment 创建执行,否则审批提示会被环境初始化阻塞。
-7. **CardKit heartbeat 在父 router 内维持。** token 前空窗不依赖子进程主动发消息; `_stream_into_feishu*()` 会先 prime 卡片, 再用 idle heartbeat 更新状态, 等子进程出现 reasoning/tool/content 事件后停止 heartbeat。
-8. **session 记忆按 `(profile, canonical sender)` 隔离。** `_history_key()` 不再用 `sender_alt or sender`, 避免 stale/shared alt 把两个用户记忆合并。
-9. **slash 命令不漏进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等走 Hermes gateway handler; skill slash 改写为 Hermes 原生 skill invocation 后进对应 profile 的 agent; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec 按配置处理; unknown slash 返回 Hermes 风格 unknown-command。
-10. **slash handler 有 profile 上下文锁。** gateway/plugin handler 在 `_profile_gateway_context()` 内运行, 串行切换 `HERMES_HOME` 和 gateway session key, 防止并发 slash 串租户。
-11. **本机 exec 默认关闭。** `quick_commands` 的 alias 仍可用; `type: exec` 默认禁用。只有 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 后才允许, 且 exec 继承当前 profile 的 `HERMES_HOME`。生产建议等 profile 沙箱落地后再开。
-12. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。若模型只在回复文本里写出一个真实存在的 profile-local 文件路径，router 会自动复制一个 WebUI 可见副本到 `workspace/Downloads`，把可见卡片里的宿主路径替换为附件提示，并追加内部 `MEDIA:` 指令让飞书直接发文件；`.env`、`auth.json`、`feishu_uat/`、`credentials/`、`tokens/` 等敏感路径会被拦截。
-13. **后台 terminal notify 不是父 gateway 能直接接管的路径。** AIAgent 在子进程内运行, child-local `process_registry` 不会被父 gateway watcher 看到; 当前实现会在每次子进程结束时调用 `agent.close()` 清理这类资源, 避免留下无人管理的后台进程。需要真正支持 `terminal(background=true, notify_on_complete=true)` 时, 应改为父进程托管 process registry, 不能只在 profile 子进程里启用。
-14. **生产推荐策略。** 公司/生产环境建议 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 做白名单路由, `multitenancy.allow_quick_exec=false`, 再叠加 profile 沙箱。沙箱负责 OS 级隔离; 本插件负责路由/session/slash/附件这些应用层边界。
+4. **普通消息进入 profile runtime。** router 构造 profile-scoped event, 把真实 `sender_open_id` 写回 event, 再进入 streaming AIAgent subprocess。子进程以该 profile 的 `HERMES_HOME` 运行；`agent_real._build_subprocess_env` 只继承显式 allowlist, 并把 `HOME`、`WORKSPACE`、`XDG_*`、`TMPDIR` 都 pivot 到当前 profile, 让 token-bearing skills/MCP/CLI 像在独立用户环境里运行。
+5. **默认 skill 与群/组织凭证从运行态分发。** `profile-skill-defaults.yaml`、`skill-distribution.yaml`、`skill-bundles.yaml` 描述托管 skill；sync 安装到 profile 时会跳过 secret-looking 文件。`credential-materialization.yaml` 把 vault 里的加密 payload 写成 profile-local 兼容文件, 例如 `workspace/credentials/gitlab.token`；`profiles: ["*"]` 会展开为 active routing rows。entry 也可以声明 `env: GITLAB_TOKEN`, AIAgent 会从 vault 注入 env 并注册 terminal/code passthrough, 不需要模型读取 token 文件。
+6. **lark-cli 是外部运行时依赖。** 本仓注册 `lark_cli` tool 并启动 per-run localhost auth broker, 但部署环境必须自己提供带 authsidecar 能力的 `lark-cli` 二进制。默认路径是 `<shared HERMES_HOME>/bin/lark-cli-authsidecar`; `HERMES_LARK_CLI_BIN` 可覆盖。个人 profile 只有当前 `open_id` 有有效 UAT 时才默认 `user` identity；群聊/WebUI agent profile 默认 `bot`。
+7. **cron/提醒任务是 profile-scoped, 但由 router 执行。** WebUI/upstream cron tooling 写入 profile-local `cron/jobs.json`。router-side worker 扫描 active profiles, 构造 `RunRequest(channel="cron")`, 通过 Run Broker 执行, 按需投递飞书, 并把上下文 mirror 到 `multitenancy_sessions`。
+8. **危险命令审批跨子进程 bridge。** profile AIAgent 会用 router 兼容的 gateway session key (`multitenancy:<platform>:<profile>:<chat>:<sender>`) 注册 `tools.approval` notify。子进程同时设置 child-local `HERMES_SESSION_KEY` / `HERMES_GATEWAY_SESSION` / `HERMES_EXEC_ASK`, 因为 terminal/process guard 可能跑在不继承 contextvars 的 worker 线程里。子进程发 `approval_required` / `approval_resolved` stream event; 父进程 `_stream_aiagent_subprocess()` 必须原样转发这些事件给 router, router 给飞书发审批提示; 用户回 `/approve` / `/deny` 后, router 写 decision file, 子进程解除阻塞并继续原生 Hermes approval flow。
+9. **CardKit heartbeat 在父 router 内维持。** token 前空窗不依赖子进程主动发消息; `_stream_into_feishu*()` 会先 prime 卡片, 再用 idle heartbeat 更新状态, 等子进程出现 reasoning/tool/content 事件后停止 heartbeat。
+10. **session 记忆按 `(profile, canonical sender)` 隔离。** `_history_key()` 不再用 `sender_alt or sender`, 避免 stale/shared alt 把两个用户记忆合并。
+11. **slash 命令不漏进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等走 Hermes gateway handler; skill slash 改写为 Hermes 原生 skill invocation 后进对应 profile 的 agent; plugin slash 走 `hermes_cli.plugins.get_plugin_command_handler`; quick alias/exec 按配置处理; unknown slash 返回 Hermes 风格 unknown-command。
+12. **slash handler 只在必要时持有 profile 上下文锁。** `/stop` 这类必须打断当前任务的 gateway/quick/plugin 命令会绕开长 profile env lock；可能映射到 profile-local skill 的 unknown slash 才进入 profile context 解析。
+13. **本机 exec 默认关闭。** `quick_commands` 的 alias 仍可用; `type: exec` 默认禁用。只有 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 后才允许, 且 exec 继承当前 profile 的 `HERMES_HOME`。生产建议等 profile 沙箱落地后再开。
+14. **附件/文件回复限制在 profile 内。** 入站附件仍委托 Hermes 原生 `_prepare_inbound_message_text`; 出站 `MEDIA:<path>` 会先过滤, 只有解析后位于当前 `profile_home` 内的路径才会交给 Feishu adapter 投递。`.env`、`auth.json`、`feishu_uat/`、`credentials/`、`tokens/` 等敏感路径会被拦截。
+15. **Feishu UAT refresh 会 mirror 到 credential vault。** Org sync 会把刷新后的 shared `feishu_uat/<open_id>.json` 复制进 routed profile；配置 credential key 后, 同一 payload 也会写入 `multitenancy_credentials`。JSON 只是迁移兼容路径, DB 才是运行期 credential source。
+16. **后台 terminal notify 不是父 gateway 能直接接管的路径。** AIAgent 在子进程内运行, child-local `process_registry` 不会被父 gateway watcher 看到; 当前实现会在每次子进程结束时调用 `agent.close()` 清理这类资源, 避免留下无人管理的后台进程。需要真正支持 `terminal(background=true, notify_on_complete=true)` 时, 应改为父进程托管 process registry, 不能只在 profile 子进程里启用。
+17. **生产推荐策略。** 公司/生产环境建议 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 做白名单路由, `multitenancy.allow_quick_exec=false`, 再叠加 profile 沙箱。沙箱负责 OS 级隔离; 本插件负责路由/session/slash/附件这些应用层边界。
 
 ---
 
@@ -99,7 +101,7 @@ flowchart LR
 
 | 角色 | 负责内容 |
 |---|---|
-| 飞书管理员 | 创建或复用一个内部飞书应用, 开启 Bot / websocket / 权限范围, 并保证共享 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 不进 git。 |
+| 飞书管理员 | 创建或复用一个内部飞书应用, 开启 Bot / websocket / 权限范围, 并保证共享应用凭证不进 git。生产把它作为 `__global__/feishu_app/feishu/app` 存进 credential vault。 |
 | 平台运维 | 安装 hermes + 本插件, 运行 gateway, 维护路由表和 profile 目录。 |
 | 飞书用户 | 通过飞书授权/UAT 流程认证一次, 之后只和同一个 Bot 对话。用户 token 从共享 Hermes home 离线刷新。 |
 | Agent profile 负责人 | 维护每个 profile 的 `SOUL.md`, `config.yaml`, `.env`, 工具策略、会话库和模型凭证。 |
@@ -108,56 +110,92 @@ flowchart LR
 
 你不需要给每个用户建一个飞书应用。所有租户复用同一个飞书应用/Bot:
 
-1. 共享飞书应用凭证只放在 gateway/default Hermes 配置或环境变量里。
+1. 共享飞书应用凭证存进 multitenancy credential vault (`profile_name=__global__`, `subject_id=feishu_app`, `provider=feishu`, `secret_kind=app`)。环境变量/default Hermes config 只作为迁移或 fallback 来源。
 2. 新路由优先使用真实飞书发送者 `open_id` (`ou_*`)。为了迁移旧数据, router 仍可 fallback 到 `union_id` (`on_*`)。
-3. 每个用户的飞书 UAT token 放在 `~/.hermes/feishu_uat/<open_id>.json`, 不要提交 token 文件。
-4. 每个 profile 的模型/工具凭证放在 `~/.hermes/profiles/<profile>/`。飞书应用共享, 但人格、记忆、工具和 LLM 凭证隔离。
-
-讨论群组: [Eggyrooch 邀请你加入飞书群](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=419if828-a007-453f-ad1c-31edef49520f)。
+3. 用户 UAT 先由 OAuth 写入共享 `~/.hermes/feishu_uat/<open_id>.json`, 再由 org sync 迁移到 `~/.hermes/profiles/<profile>/feishu_uat/<open_id>.json`；AIAgent subprocess 实际读取 profile-local mirror。不要提交 token 文件。
+4. 每个 profile 的模型/工具凭证放在 `~/.hermes/profiles/<profile>/` 或 credential vault。飞书应用共享, 但人格、记忆、工具和 LLM 凭证隔离。
 
 ---
 
 ## 🚀 快速上手
 
+先设定共享 `HERMES_HOME`。下面所有命令都假设一个共享 Hermes home、一个飞书应用、每个用户一个 `$HERMES_HOME/profiles/<profile>/`。
+
+```bash
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/bin" "$HERMES_HOME/logs"
+```
+
 ### 1. 安装插件
 
-正常安装请使用 Hermes 自带插件安装器。它会把本仓库 clone 到
-`~/.hermes/plugins/multitenancy`, 读取根目录 `plugin.yaml`, 并在传入
-`--enable` 时自动写入 `plugins.enabled`。
+Hermes 会从 `$HERMES_HOME/plugins/multitenancy` 加载 directory plugin。正常安装请先使用 Hermes 插件安装器；它应当创建插件目录并写入 `plugins.enabled`。
 
 ```bash
 hermes plugins install eggyrooch-blip/hermes-multitenancy --enable
 hermes plugins list
-hermes gateway restart
 ```
 
-本地开发再使用 editable checkout:
+如果需要固定 checkout 或方便 agent/生产排查, 用真实仓库路径安装更透明:
 
 ```bash
-git clone https://github.com/eggyrooch-blip/hermes-multitenancy ~/projects/hermes-multitenancy
-cd ~/projects/hermes-multitenancy
-hermes plugins install "file://$PWD" --force --enable
-python -m pip install --no-deps -e ".[test]"   # 可选: 只用于跑本仓库测试
-hermes gateway restart
+git clone https://github.com/eggyrooch-blip/hermes-multitenancy /opt/hermes-multitenancy
+hermes plugins install "file:///opt/hermes-multitenancy" --force --enable
+python -m pip install --no-deps -e "/opt/hermes-multitenancy[test]"
 ```
 
-### 2. 在 `config.yaml` 启用
+如果 Hermes 插件安装器不可用, 可手动把插件路径指过去:
 
-传入 `--enable` 时安装器会自动完成。手动安装时, 确保默认 gateway home 有:
+```bash
+mkdir -p "$HERMES_HOME/plugins"
+ln -sfn /opt/hermes-multitenancy "$HERMES_HOME/plugins/multitenancy"
+```
+
+确保共享 Hermes config 启用插件:
 
 ```yaml
-# ~/.hermes/config.yaml
+# $HERMES_HOME/config.yaml
 plugins:
   enabled:
     - multitenancy
 ```
 
+### 2. 安装 lark-cli/authsidecar
+
+`hermes-multitenancy` 会注册 `lark_cli` tool 并启动 per-run credential broker, 但它**不会**自带或自动安装 `lark-cli` 二进制。新环境必须先提供带 authsidecar 能力的 `lark-cli`, 飞书长尾 OpenAPI 工具才可用。
+
+默认二进制查找顺序:
+
+1. 设置了 `HERMES_LARK_CLI_BIN` 时使用它。
+2. 否则使用 `$HERMES_HOME/bin/lark-cli-authsidecar`。
+3. 部分检查会 fallback 到 `PATH` 里的普通 `lark-cli`。
+
+从官方 `larksuite/cli` checkout 构建 authsidecar:
+
+```bash
+git clone https://github.com/larksuite/cli /opt/larksuite-cli
+cd /opt/hermes-multitenancy
+LARK_CLI_SOURCE_DIR=/opt/larksuite-cli \
+HERMES_LARK_CLI_BIN="$HERMES_HOME/bin/lark-cli-authsidecar" \
+LARK_CLI_EXPECTED_VERSION="<expected-lark-cli-version>" \
+LARK_CLI_EXPECTED_SOURCE_HEAD="<expected-source-short-sha>" \
+  scripts/build_lark_cli_authsidecar.sh
+```
+
+如果生产环境已经有审计过的 authsidecar 二进制, 放到默认路径或显式指定:
+
+```bash
+install -m 0755 /path/to/lark-cli-authsidecar "$HERMES_HOME/bin/lark-cli-authsidecar"
+export HERMES_LARK_CLI_BIN="$HERMES_HOME/bin/lark-cli-authsidecar"
+```
+
+authsidecar 不从模型侧接收飞书 app secret。AIAgent 只连接 localhost auth broker；broker 从 credential vault 注入当前用户 UAT 或 bot tenant token。
+
 ### 3. 配置一个共享飞书 Bot
 
-在默认 gateway home 里使用你已有的 Hermes 飞书应用凭证。不同 Hermes 版本的外层配置可能略有差异, 关键是所有 profile 复用同一组应用凭证。
+所有租户复用一个飞书应用/Bot。应用凭证不要进 git。共享 config 可以作为迁移来源, 生产应导入 `multitenancy_credentials`。
 
 ```yaml
-# ~/.hermes/config.yaml
+# $HERMES_HOME/config.yaml
 platforms:
   feishu:
     enabled: true
@@ -166,37 +204,42 @@ platforms:
       app_secret: "${FEISHU_APP_SECRET}"
 ```
 
-然后让每个真实用户各自跑一次 Hermes 飞书授权/UAT 流程。token 文件应落在共享 home 下, 例如:
+把 app credential 导入 vault；命令输出不会打印 secret:
+
+```bash
+export HERMES_MULTITENANCY_CREDENTIAL_KEY="<32-byte-or-longer-secret-key>"
+python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
+  import-app-config \
+  --shared-home "$HERMES_HOME" \
+  --config "$HERMES_HOME/config.yaml"
+```
+
+用户 UAT 是 profile-scoped。OAuth/device-flow 写入或导入用户 token 后, multitenancy 会 mirror 到:
 
 ```text
-~/.hermes/feishu_uat/ou_xxx.json
-~/.hermes/feishu_uat/ou_yyy.json
+$HERMES_HOME/profiles/<profile>/feishu_uat/<open_id>.json
+multitenancy_credentials(profile=<profile>, subject=<open_id>, provider=feishu, kind=uat)
 ```
 
-### 4. 同步飞书组织到 profile + 路由
+不要提交 `.env`、`auth.json`、`feishu_uat/*.json`、`tokens/`、`workspace/credentials/`、cookie 或 OAuth payload 原文。
 
-如果你的飞书应用有通讯录读取权限, 推荐直接用 Python org sync:
+### 4. 同步 profile 和路由
+
+如果飞书应用有通讯录读取权限, 用 org sync。先 dry-run:
 
 ```bash
-# 先预览, 不写 profile / DB
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dry-run
-
-# 确认无误后正式同步, 同时保存组织快照
-mkdir -p ~/.hermes/org-snapshots
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu \
-  --snapshot-out ~/.hermes/org-snapshots
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu --dry-run
+mkdir -p "$HERMES_HOME/org-snapshots"
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu \
+  --snapshot-out "$HERMES_HOME/org-snapshots"
 ```
 
-同步会复用当前 `HERMES_HOME` 里的 Hermes 飞书配置 (`config.yaml` / `.env` / 环境变量), 拉取 Feishu Contact v3 部门和用户, 用 Feishu `user_id` 作为业务主键创建 `~/.hermes/profiles/<user_id>/`, 并写入 `multitenancy_routing`。`SOUL.md` 只更新带标记的组织托管区块, 不覆盖人工内容。
+Org sync 会创建/更新 `$HERMES_HOME/profiles/<user_id>/`, 写入 `multitenancy_routing`, 只更新 `SOUL.md` 的托管组织区块, 同步 managed skills, 并在配置存在时执行 credential materialization。
 
-如果你还没有通讯录权限, 或只想手工维护白名单, 仍可使用原来的 JSON 路由同步:
+没有通讯录权限时, 使用显式白名单:
 
 ```bash
-# directory-plugin 安装路径
-python ~/.hermes/plugins/multitenancy/sync.py apply users.json
-
-# 如果你额外以 editable/pip package 安装了本仓库, 也可以用:
-hermes-multitenancy-sync apply users.json
+python "$HERMES_HOME/plugins/multitenancy/sync.py" apply users.json
 ```
 
 `users.json` 格式:
@@ -204,47 +247,88 @@ hermes-multitenancy-sync apply users.json
 ```json
 [
   {"user_id": "alice", "profile_name": "alice_profile", "open_id": "ou_xxx", "union_id": "on_xxx"},
-  {"user_id": "bob",   "profile_name": "bob_profile",   "open_id": "ou_yyy", "union_id": "on_yyy"}
+  {"user_id": "bob", "profile_name": "bob_profile", "open_id": "ou_yyy", "union_id": "on_yyy"}
 ]
 ```
 
-每个 `profile_name` 必须事先存在于 `~/.hermes/profiles/<name>/` 下, 自带 `SOUL.md` / `config.yaml` / `auth.json` 或 `.env`。插件会把 `ou_xxx` 路由到 `alice_profile` 的 SOUL+memory, 把 `ou_yyy` 路由到 `bob_profile`。
-
-第一次 UAT 也可以保留自动建档开关 (`HERMES_MULTITENANCY_AUTO_PROVISION=1`, 默认开启)。未见过的发送者 `ou_new_user` 会得到一个确定性的兜底 profile, 例如 `~/.hermes/profiles/feishu_ou_new_user/`, 由共享 Hermes 配置初始化。后续 org sync 学到真实 Feishu `user_id` 后, 会把路由接管到 canonical `user_id` profile。
-
-重启 hermes gateway。**搞定。**
-
-### 5. 验证
+公司部署在初始 rollout 之后建议启用严格路由:
 
 ```bash
-hermes plugins list
-hermes gateway status
-sqlite3 ~/.hermes/multitenancy.db 'select open_id, profile_name, active from multitenancy_routing;'
-```
-
-让两个不同飞书用户通过同一个 Bot 发送同一句提示。gateway 日志应该能看到
-不同的 sender `ou_*` 和不同的 profile home。
-
-### 6. 自动同步、按需同步和兜底
-
-首次同步后, 建议用 cron 或 systemd timer 定期全量同步。全量同步会处理入转调离: 新员工创建 profile + 路由, 转岗更新 `SOUL.md` 的组织托管区块, 离职/移出通讯录的用户软删除路由 (`active=0`), 但保留 profile、记忆和会话。
-
-```cron
-*/30 * * * * HERMES_HOME=/Users/kite/.hermes /usr/bin/python3 /Users/kite/.hermes/plugins/multitenancy/sync.py pull-feishu --snapshot-out /Users/kite/.hermes/org-snapshots >> /Users/kite/.hermes/logs/multitenancy-sync.log 2>&1
-```
-
-不是所有人都需要组织同步时, 用部门范围或白名单模式:
-
-```bash
-# 只同步一个部门子树; 默认不会软删除范围外已有路由
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dept <open_department_id> --dry-run
-python ~/.hermes/plugins/multitenancy/sync.py pull-feishu --dept <open_department_id>
-
-# 严格白名单: 关闭未知用户自动建档, 只让 apply users.json / scoped sync 写路由
 export HERMES_MULTITENANCY_AUTO_PROVISION=0
 ```
 
-如果同步出现纰漏, 先停定时任务, 用 `--dry-run` 和最新 snapshot 排查。用户在飞书发 `/status` 可看到当前 profile; 本机可用 `hermes -p <profile_name> chat` 进入对应 profile。未知用户兜底 profile 路径是 `~/.hermes/profiles/feishu_<open_id>/`。
+### 5. 启动 gateway 和 broker 面
+
+至少要重启 Hermes gateway, 让它重新 import 插件。WebUI 和 cron 部署通常还会启用 localhost Run Broker sidecar。
+
+```bash
+export HERMES_MULTITENANCY_RUN_BROKER_SERVER=1
+export HERMES_MULTITENANCY_CRON_RUN_BROKER=1
+export HERMES_MULTITENANCY_RUN_BROKER_KEY="<shared-secret-for-server-to-server-calls>"
+hermes gateway restart
+```
+
+生产服务应通过 service manager 设置这些环境变量, 不要依赖交互式 shell。Feishu websocket 入口应只保留 router gateway；profile gateway 若为了 API-server 兼容而存在, 不应再为同一个 Bot 打开自己的 Feishu websocket。
+
+### 6. 验证
+
+真实流量前先跑 secret-free 检查:
+
+```bash
+hermes plugins list
+sqlite3 "$HERMES_HOME/multitenancy.db" \
+  'select open_id, profile_name, active from multitenancy_routing limit 20;'
+
+python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
+  health \
+  --shared-home "$HERMES_HOME" \
+  --router-profile-home "$HERMES_HOME/profiles/multitenancy_router"
+
+python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
+  preflight \
+  --shared-home "$HERMES_HOME" \
+  --profile "<profile>" \
+  --open-id "<ou_open_id>" \
+  --binary "$HERMES_HOME/bin/lark-cli-authsidecar"
+```
+
+然后让两个不同飞书用户通过同一个 Bot 发送同一句提示。日志应显示不同 canonical `ou_*` sender、不同 routed profile home；只有拥有有效用户 UAT 的 profile 才应显示 `lark_cli_default_identity=user`。
+
+### 7. 自动同步、按需同步和恢复
+
+首次同步后, 用 cron 或 systemd timer 定期全量同步。全量同步处理入转调离: 新员工创建 profile + 路由, 组织变化刷新 `SOUL.md` 托管区块, 缺失用户软删除路由, 但保留 profile 记忆。
+
+```cron
+*/30 * * * * HERMES_HOME=/opt/hermes python /opt/hermes/.hermes/plugins/multitenancy/sync.py pull-feishu --snapshot-out /opt/hermes/.hermes/org-snapshots >> /opt/hermes/.hermes/logs/multitenancy-sync.log 2>&1
+```
+
+部门范围同步:
+
+```bash
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu --dept <open_department_id> --dry-run
+python "$HERMES_HOME/plugins/multitenancy/sync.py" pull-feishu --dept <open_department_id>
+```
+
+如果同步出错, 先停 timer, 再检查 `pull-feishu --dry-run` 和最新 snapshot。用户可在飞书发 `/status`; 本机可查 `multitenancy_routing`。未知用户 fallback profile 位于 `$HERMES_HOME/profiles/feishu_<open_id>/`。
+
+---
+
+## 🚢 生产部署 runbook
+
+Agent 部署这个仓库时按这个顺序走:
+
+1. 在本地 canonical 仓库完成修改和验证。
+2. 跑 `uv run --extra test pytest -q` 或 `make test`。
+3. 把 review 后的 commit 推到 GitHub。
+4. 在生产主机备份当前 checkout、`$HERMES_HOME/config.yaml`、`$HERMES_HOME/.env`、`$HERMES_HOME/multitenancy.db`、service unit 和 active profile 目录。不要把 secret 文件内容打进日志。
+5. 生产 checkout 只做 fast-forward: `git pull --ff-only`。
+6. 如果生产通过 editable import 使用本仓, 在 Hermes Python 环境里执行 `python -m pip install --no-deps -e /path/to/hermes-multitenancy`。
+7. 确认 `$HERMES_HOME/plugins/multitenancy` 指向生产 checkout, 或已由 `hermes plugins install` 刷新。
+8. 确认 `$HERMES_HOME/bin/lark-cli-authsidecar` 存在且可执行, 或在 service 环境里设置 `HERMES_LARK_CLI_BIN`。
+9. 重启 router gateway 和相关 Run Broker/WebUI 服务。
+10. 跑 `health`、`preflight`、route row 检查、service log 检查和一个只读 `lark_cli` user-info canary, 再宣称部署可用。
+
+回滚应使用正常 forward fix 或恢复 checkout 后重启服务。不要手工在 profile 间复制 token；需要兼容文件时用 credential vault 和 `credential-materialization.yaml`。
 
 ---
 
@@ -286,7 +370,10 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 | 引用上下文 (回复消息) | ✅ —— 同一委托, 加上我们自己的 `reply_to_text` 兜底 |
 | 多用户共享会话归属 | ✅ —— 同一委托 |
 | 工具调用 (真正的 AIAgent loop, 浏览器/搜索/shell) | ✅ —— 通过隔离的 `AIAgent` subprocess bridge |
-| Cron / reminder 主动回调 | ✅ —— job 写 shared cron store, 由父 gateway ticker 投递回原 Feishu chat |
+| lark-cli 飞书 OpenAPI bridge | ✅ —— 注册 `lark_cli` tool 并启动 per-run auth broker；部署环境必须提供 `lark-cli-authsidecar` |
+| Credential vault + materialization | ✅ —— Feishu app/UAT/provider secrets 存在 `multitenancy_credentials`, 对外只暴露 redacted status, 按配置 materialize 兼容文件 |
+| Managed skill distribution | ✅ —— 支持 `profile-skill-defaults.yaml`、`skill-distribution.yaml`、`skill-bundles.yaml`, 带 secret guard 和子 profile 继承规则 |
+| Cron / reminder 主动回调 | ✅ —— WebUI/broker 创建的 job 默认 `deliver=feishu`, 存在 routed profile cron store, 由 router multi-profile worker 执行/投递 |
 | 危险命令 approval 主动回调 | ✅ —— 子进程 `approval_required`/`approval_resolved` → parent stream parser → router 飞书提示 → `/approve`/`/deny` 写回 decision file; child-local session env 覆盖 terminal worker 线程; core terminal guard 先于 environment 创建 |
 | CardKit idle heartbeat | ✅ —— 父 router prime + heartbeat, 不依赖子进程先吐 token |
 | Background terminal `notify_on_complete` | ⚠️ 不宣称支持 —— 子进程 registry 父 gateway 不可见; 子进程结束时执行 `agent.close()` 清理, 防止孤儿后台任务 |
@@ -352,6 +439,14 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
      ├─ pool.py           LRU RuntimePool (50 热 / 5 分钟空闲 / 冷启信号量)
      ├─ routing.py        SQLite multitenancy_routing 表 (open_id → profile)
      ├─ sessions.py       SQLite multitenancy_sessions (按用户历史, 持久化)
+     ├─ credentials.py    multitenancy.db 中的加密 credential vault 行
+     ├─ lark_cli_tool.py  Hermes tool registration for lark_cli / lark-cli
+     ├─ lark_cli_auth_broker.py per-run localhost credential proxy for authsidecar
+     ├─ run_broker.py     Feishu/WebUI/cron 共用的 channel-neutral execution contract
+     ├─ webui_broker_server.py WebUI 和 jobs 使用的 localhost HTTP/SSE sidecar
+     ├─ cron_worker.py    multi-profile cron worker 和 Run Broker bridge
+     ├─ skill_registry.py managed/personal/unknown skill audit + install helpers
+     ├─ upstream_health.py secret-free 升级/部署健康检查
      ├─ commands.py       基于 Hermes registry 的斜杠命令解析
      ├─ agent_real.py     AIAgent subprocess bridge + 旧 OpenAI 兼容 fallback
      ├─ aiagent_subprocess.py 隔离子进程入口, 跑 AIAgent/tool loop
@@ -413,33 +508,27 @@ export HERMES_MULTITENANCY_AUTO_PROVISION=0
 
 ```bash
 # 默认套件 (无网络)
-PYTHONPATH=/path/to/hermes-agent python -m pytest tests/ -q -m "not integration"
+uv run --extra test pytest -q
 
-# 本 PR 使用的飞书多租户重点回归套件
-PYTHONPATH=/path/to/hermes-agent python -m pytest \
+# 通过 Makefile 跑同一套默认测试
+make test
+
+# 飞书多租户重点回归套件
+uv run --extra test pytest \
   tests/test_hook_dispatch.py \
   tests/test_aiagent_subprocess.py \
   tests/test_streaming_card_transport.py \
   -q
 
 # 真实 LLM 集成 —— 调你配置的 provider
-PYTHONPATH=. python -m pytest tests/ -m integration -v
+uv run --extra test pytest tests/ -m integration -v
 ```
 
-完整双账号飞书 UAT 在 Hermes UAT worktree 中运行, 不在插件包内:
+当前 skills/lark-cli/UAT 审计 helper 在本仓:
 
 ```bash
-python scripts/stress_test_feishu_pipeline.py \
-  --suite full \
-  --users 用户A,用户B \
-  --parallel-users \
-  --chat-id "$HERMES_FEISHU_TEST_CHAT_ID" \
-  --fixtures .uat/fixtures/dual-users.local.json \
-  --allow-destructive \
-  --strict-identity \
-  --route-mode multitenant \
-  --require-card-final \
-  --checkpoint ~/.hermes/uat/checkpoints/full-dual-20260505.jsonl
+make skills-uat
+make skills-uat-strict
 ```
 
 ---
@@ -479,15 +568,15 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 提 Bug 时请附:
 
-1. 你机器上 `pytest tests/ -q` 的输出
+1. 你机器上 `uv run --extra test pytest -q` 或 `make test` 的输出
 2. hermes-agent 版本 (`pip show hermes-agent | grep Version`)
 3. 插件版本 (`pip show hermes-multitenancy | grep Version`)
 4. 相关 gateway 日志 (尤其是 `multitenancy:` 前缀的)
 
 ### Pull Request
 
-1. Fork → 起分支 → 跑 `pytest tests/ -q` (必须全绿) → 开 PR
-2. **行为变更必须有测试。** 我们卡死 `pytest tests/ -q -m "not integration"` 必须 128+ 全绿。
+1. Fork → 起分支 → 跑 `uv run --extra test pytest -q` 或 `make test` (必须全绿) → 开 PR
+2. **行为变更必须有测试。** 默认完整测试套件必须保持绿色。
 3. **不要大批量重命名** —— 保持 diff 小且可审。
 4. **不要 patch `feishu.py`** —— 这个插件存在的全部意义就是 hermes-agent 不被改动。如果你撞到 hermes API 限制, 去上游 https://github.com/NousResearch/hermes-agent 提 issue, 然后在这里链过来。
 
@@ -498,13 +587,13 @@ sqlite3 ~/.hermes/multitenancy.db \
 - pytest 输出
 - 一条上游 commit 的指针 (能找到的话)
 
-我们在 `pyproject.toml` 锁了 `hermes-agent>=1.0`, 但插件加载契约还在演进 —— 需要社区一起盯变化。
+当前 `pyproject.toml` 要求 `hermes-agent>=0.14,<1.0`; 插件加载契约仍在演进 —— 需要社区一起盯变化。
 
 ### 想要的贡献 (按优先级)
 
 1. **按 profile 拆 `SessionStore`** —— 当前会话行按 `(profile, canonical sender)` 在共享 `multitenancy.db` 中隔离; 按 profile 拆库仍是规模化加固项, 也更贴近 hermes 自己的 profile 布局。
 2. **Prompt 缓存** —— Anthropic `cache_control` 给 SOUL 前缀加缓存。长期对话 token 成本砍 ~50%。
-3. **CI 矩阵** —— GitHub Actions 在多个 `hermes-agent` 版本上跑 `pytest tests/ -q`, 提早发现上游契约漂移。
+3. **CI 矩阵** —— GitHub Actions 在多个 `hermes-agent` 版本上跑 `uv run --extra test pytest -q`, 提早发现上游契约漂移。
 4. **更多 live UAT fixture** —— 扩大写操作/破坏性路径覆盖,但不依赖共享生产类资源。
 
 ---
