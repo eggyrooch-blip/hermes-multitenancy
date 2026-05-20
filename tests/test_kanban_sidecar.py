@@ -180,17 +180,134 @@ def test_kanban_sidecar_executes_only_when_explicitly_enabled(monkeypatch, tmp_p
     assert live["status"] == "executed"
     assert live["will_execute"] is True
     assert live["summary"]["spawned_count"] == 1
-    assert calls == [
+    assert calls[0] == {
+        "board": "ops",
+        "dry_run": True,
+        "max_spawn": None,
+        "max_in_progress": None,
+    }
+    assert calls[1]["board"] == "ops"
+    assert calls[1]["dry_run"] is False
+    assert calls[1]["max_spawn"] is None
+    assert calls[1]["max_in_progress"] is None
+    assert callable(calls[1]["spawn_fn"])
+
+
+def test_kanban_task_builds_profile_scoped_run_request(tmp_path: Path):
+    from hermes_multitenancy import kanban_sidecar
+
+    task = SimpleNamespace(
+        id="task-123",
+        title="Prepare weekly report",
+        body="Summarize this week's incidents",
+        assignee="worker_a",
+        tenant="tenant-a",
+        created_by="ou_creator",
+        current_run_id=42,
+    )
+    config = kanban_sidecar.KanbanSidecarConfig(
+        enabled=True,
+        board="ops",
+        sidecar_profile="kanban_orchestrator",
+        allowed_task_profiles=("worker_a",),
+        profile_user_keys={"worker_a": "ou_worker_a"},
+        delivery_mode="feishu",
+    )
+
+    request = kanban_sidecar.build_run_request_for_task(
+        task,
+        config=config,
+        workspace="/tmp/workspace/task-123",
+    )
+
+    assert request.channel == "kanban"
+    assert request.profile_name == "worker_a"
+    assert request.user_key == "ou_worker_a"
+    assert request.credential_subject == "ou_worker_a"
+    assert request.session_id == "kanban:ops:task-123"
+    assert request.message_id == "task-123"
+    assert request.delivery_mode == "feishu"
+    assert request.requires_host_tools is True
+    assert "Prepare weekly report" in request.content
+    assert request.metadata == {
+        "kanban_task_id": "task-123",
+        "kanban_board": "ops",
+        "kanban_tenant": "tenant-a",
+        "kanban_run_id": 42,
+        "kanban_workspace": "/tmp/workspace/task-123",
+        "kanban_assignee": "worker_a",
+        "allowed_task_profiles": ["worker_a"],
+    }
+
+
+def test_kanban_sidecar_run_broker_spawn_completes_task(monkeypatch):
+    from hermes_multitenancy import kanban_sidecar
+
+    completed: list[dict] = []
+    dispatched = []
+
+    class FakeKanbanDb:
+        @staticmethod
+        def connect(*, board=None):
+            assert board == "ops"
+            return SimpleNamespace(close=lambda: None)
+
+        @staticmethod
+        def complete_task(conn, task_id, *, result=None, summary=None, metadata=None):
+            completed.append({
+                "task_id": task_id,
+                "result": result,
+                "summary": summary,
+                "metadata": metadata,
+            })
+            return True
+
+    async def dispatch_agent(request):
+        dispatched.append(request)
+        return "KANBAN_RUNBROKER_OK"
+
+    config = kanban_sidecar.KanbanSidecarConfig(
+        enabled=True,
+        board="ops",
+        sidecar_profile="kanban_orchestrator",
+        allowed_task_profiles=("worker_a",),
+        profile_user_keys={"worker_a": "ou_worker_a"},
+        delivery_mode="webui",
+    )
+    spawn = kanban_sidecar.build_run_broker_spawn(
+        config,
+        kanban_db=FakeKanbanDb,
+        dispatch_agent=dispatch_agent,
+        sandbox_available=lambda: True,
+    )
+    task = SimpleNamespace(
+        id="task-live",
+        title="Do the work",
+        body="Return the marker",
+        assignee="worker_a",
+        tenant=None,
+        created_by="ou_creator",
+        current_run_id=7,
+    )
+
+    pid = spawn(task, "/tmp/workspace/task-live", board="ops")
+
+    assert pid is None
+    assert len(dispatched) == 1
+    assert dispatched[0].channel == "kanban"
+    assert dispatched[0].profile_name == "worker_a"
+    assert dispatched[0].delivery_mode == "webui"
+    assert completed == [
         {
-            "board": "ops",
-            "dry_run": True,
-            "max_spawn": None,
-            "max_in_progress": None,
-        },
-        {
-            "board": "ops",
-            "dry_run": False,
-            "max_spawn": None,
-            "max_in_progress": None,
-        },
+            "task_id": "task-live",
+            "result": "KANBAN_RUNBROKER_OK",
+            "summary": "KANBAN_RUNBROKER_OK",
+            "metadata": {
+                "channel": "kanban",
+                "profile_name": "worker_a",
+                "user_key": "ou_worker_a",
+                "delivery_mode": "webui",
+                "workspace": "/tmp/workspace/task-live",
+            },
+        }
     ]

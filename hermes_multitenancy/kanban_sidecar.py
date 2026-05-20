@@ -7,12 +7,17 @@ multitenancy profile boundary has been checked.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 import importlib
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .run_broker import RunBroker
+from .run_models import RunRequest
 
 
 CONFIG_NAME = "kanban-sidecar.yaml"
@@ -30,6 +35,10 @@ class KanbanSidecarConfig:
     max_spawn: int | None = None
     max_in_progress: int | None = None
     execute: bool = False
+    run_broker: bool = True
+    allowed_task_profiles: tuple[str, ...] = ()
+    profile_user_keys: dict[str, str] | None = None
+    delivery_mode: str = "feishu"
 
 
 def plan_kanban_sidecar(
@@ -119,6 +128,18 @@ def load_config(shared_home: str | Path) -> KanbanSidecarConfig:
         max_spawn=_optional_int(raw.get("max_spawn")),
         max_in_progress=_optional_int(raw.get("max_in_progress")),
         execute=_bool(raw.get("execute")),
+        run_broker=_bool(raw.get("run_broker", True)),
+        allowed_task_profiles=tuple(
+            str(item).strip()
+            for item in _as_list(raw.get("allowed_task_profiles"))
+            if str(item).strip()
+        ),
+        profile_user_keys={
+            str(key).strip(): str(value).strip()
+            for key, value in (raw.get("profile_user_keys") or {}).items()
+            if str(key).strip() and str(value).strip()
+        } if isinstance(raw.get("profile_user_keys"), dict) else None,
+        delivery_mode=str(raw.get("delivery_mode") or "feishu").strip() or "feishu",
     )
 
 
@@ -156,6 +177,9 @@ def _base_result(
         "execute_configured": config.execute,
         "max_spawn": config.max_spawn,
         "max_in_progress": config.max_in_progress,
+        "run_broker": config.run_broker,
+        "allowed_task_profiles": list(config.allowed_task_profiles),
+        "delivery_mode": config.delivery_mode,
         "problems": problems,
         "summary": {},
         "spawned": [],
@@ -186,12 +210,166 @@ def _profile_allowed(config: KanbanSidecarConfig, current_profile: str | None) -
 
 def _dispatch_once(config: KanbanSidecarConfig, *, dry_run: bool) -> Any:
     kanban_db = importlib.import_module("hermes_cli.kanban_db")
-    return kanban_db.dispatch_once(
-        board=config.board,
-        dry_run=dry_run,
-        max_spawn=config.max_spawn,
-        max_in_progress=config.max_in_progress,
+    kwargs: dict[str, Any] = {
+        "board": config.board,
+        "dry_run": dry_run,
+        "max_spawn": config.max_spawn,
+        "max_in_progress": config.max_in_progress,
+    }
+    if config.run_broker and not dry_run:
+        kwargs["spawn_fn"] = build_run_broker_spawn(config, kanban_db=kanban_db)
+
+    dispatch_once = kanban_db.dispatch_once
+    try:
+        sig = inspect.signature(dispatch_once)
+        needs_conn = "conn" in sig.parameters
+    except (TypeError, ValueError):
+        needs_conn = False
+    if not needs_conn:
+        return dispatch_once(**kwargs)
+
+    conn = kanban_db.connect(board=config.board)
+    try:
+        return dispatch_once(conn, **kwargs)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def build_run_request_for_task(
+    task: Any,
+    *,
+    config: KanbanSidecarConfig,
+    workspace: str,
+) -> RunRequest:
+    assignee = str(getattr(task, "assignee", "") or "").strip()
+    if not assignee:
+        raise ValueError(f"kanban task {getattr(task, 'id', '<unknown>')} has no assignee")
+    if assignee == ROUTER_PROFILE:
+        raise ValueError("router profile must not execute Kanban tasks")
+    if config.allowed_task_profiles and assignee not in config.allowed_task_profiles:
+        raise ValueError(f"kanban task assignee {assignee!r} is not allowlisted")
+
+    task_id = str(getattr(task, "id", "") or "").strip()
+    title = str(getattr(task, "title", "") or "").strip()
+    body = str(getattr(task, "body", "") or "").strip()
+    user_key = _task_user_key(task, config)
+    content = f"Kanban task {task_id}: {title}".strip()
+    if body:
+        content += f"\n\n{body}"
+
+    metadata = {
+        "kanban_task_id": task_id,
+        "kanban_board": config.board,
+        "kanban_tenant": getattr(task, "tenant", None),
+        "kanban_run_id": getattr(task, "current_run_id", None),
+        "kanban_workspace": str(workspace),
+        "kanban_assignee": assignee,
+        "allowed_task_profiles": list(config.allowed_task_profiles),
+    }
+    return RunRequest(
+        channel="kanban",
+        profile_name=assignee,
+        user_key=user_key,
+        content=content,
+        chat_id=f"kanban:{config.board}",
+        session_id=f"kanban:{config.board}:{task_id}",
+        message_id=task_id,
+        idempotency_key=f"kanban:{config.board}:{task_id}:{getattr(task, 'current_run_id', '')}",
+        delivery_mode=config.delivery_mode,
+        credential_subject=user_key,
+        requires_host_tools=True,
+        metadata=metadata,
     )
+
+
+def build_run_broker_spawn(
+    config: KanbanSidecarConfig,
+    *,
+    kanban_db: Any,
+    dispatch_agent: Any | None = None,
+    sandbox_available: Any | None = None,
+):
+    """Return an upstream Kanban ``spawn_fn`` that executes via RunBroker."""
+
+    async def default_dispatch(request: RunRequest) -> str:
+        from types import SimpleNamespace
+        from .agent_real import real_run_agent
+
+        shared_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        if shared_home.name != request.profile_name and (shared_home / "profiles").exists():
+            profile_home = shared_home / "profiles" / request.profile_name
+        elif shared_home.parent.name == "profiles":
+            profile_home = shared_home.parent / request.profile_name
+        else:
+            profile_home = shared_home / "profiles" / request.profile_name
+        event = SimpleNamespace(
+            text=request.content,
+            message_id=request.message_id,
+            source=SimpleNamespace(
+                platform=SimpleNamespace(value="kanban"),
+                chat_id=request.chat_id or "",
+                chat_name="Kanban",
+                chat_type="kanban",
+                user_id=request.user_key,
+                user_name=request.user_key,
+                user_id_alt=request.user_key,
+                message_id=request.message_id,
+            ),
+        )
+        return await real_run_agent(event, profile_home)
+
+    async def run_request(request: RunRequest) -> str:
+        broker = RunBroker(
+            dispatch_agent=dispatch_agent or default_dispatch,
+            sandbox_available=sandbox_available,
+        )
+        result = await broker.run(request)
+        return result.content
+
+    def spawn(task: Any, workspace: str, *, board: str | None = None) -> None:
+        request = build_run_request_for_task(task, config=config, workspace=workspace)
+        content = asyncio.run(run_request(request))
+        conn = kanban_db.connect(board=board or config.board)
+        try:
+            kanban_db.complete_task(
+                conn,
+                request.metadata["kanban_task_id"],
+                result=content,
+                summary=_first_line(content),
+                metadata={
+                    "channel": request.channel,
+                    "profile_name": request.profile_name,
+                    "user_key": request.user_key,
+                    "delivery_mode": request.delivery_mode,
+                    "workspace": workspace,
+                },
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return None
+
+    return spawn
+
+
+def _task_user_key(task: Any, config: KanbanSidecarConfig) -> str:
+    assignee = str(getattr(task, "assignee", "") or "").strip()
+    profile_user_keys = config.profile_user_keys or {}
+    user_key = str(profile_user_keys.get(assignee) or "").strip()
+    if not user_key:
+        user_key = str(getattr(task, "created_by", "") or getattr(task, "tenant", "") or "").strip()
+    if not user_key:
+        raise ValueError(f"kanban task {getattr(task, 'id', '<unknown>')} has no user_key/created_by")
+    return user_key
+
+
+def _first_line(text: str) -> str:
+    return str(text or "").strip().splitlines()[0][:400] if str(text or "").strip() else ""
 
 
 def _summarize_dispatch(result: Any) -> dict[str, Any]:

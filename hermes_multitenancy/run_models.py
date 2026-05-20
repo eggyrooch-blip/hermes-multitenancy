@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
-RunChannel = Literal["feishu", "webui", "cron"]
+RunChannel = Literal["feishu", "webui", "cron", "kanban"]
 RunEventKind = Literal[
     "content",
     "thinking",
@@ -18,7 +18,7 @@ RunEventKind = Literal[
     "error",
 ]
 
-_VALID_CHANNELS = {"feishu", "webui", "cron"}
+_VALID_CHANNELS = {"feishu", "webui", "cron", "kanban"}
 
 
 def _clean(value: str) -> str:
