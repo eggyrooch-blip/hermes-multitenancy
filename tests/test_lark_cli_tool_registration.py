@@ -306,6 +306,51 @@ def test_lark_cli_tool_profile_default_user_overrides_model_bot_guess(monkeypatc
     assert captured["command"][-2:] == ["--as", "user"]
 
 
+def test_lark_cli_tool_profile_default_user_overrides_explicit_argv_as_bot(monkeypatch, tmp_path):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"ok":true,"identity":"user"}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["markdown", "+create", "--as", "bot", "--file", "./技术方案.md"],
+            "identity": "auto",
+            "risk": "write",
+            "reason": "create document from markdown",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "user"
+    assert "--as=bot" not in captured["command"]
+    assert "bot" not in captured["command"]
+    assert captured["command"][-2:] == ["--as", "user"]
+
+
 def test_lark_cli_tool_filters_non_business_update_notice(monkeypatch, tmp_path):
     from hermes_multitenancy import lark_cli_tool
 

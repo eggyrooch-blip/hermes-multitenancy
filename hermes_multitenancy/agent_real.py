@@ -2459,7 +2459,7 @@ async def _stream_aiagent_subprocess(
                     phase = "等待当前工具或子任务输出" if first_event_logged else "准备响应"
                     yield (
                         "status",
-                        f"Hermes 正在{phase}{dots} 已等待 {int(total_elapsed)} 秒。",
+                        f"Hermes 正在{phase}{dots}",
                     )
                 line = read_task.result()
             finally:

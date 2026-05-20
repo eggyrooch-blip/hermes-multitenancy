@@ -107,6 +107,11 @@ _session_history: dict[tuple[str, str], list[dict]] = {}
 # so we only hit SQLite once per pair per process lifetime.
 _session_loaded: set[tuple[str, str]] = set()
 _pending_approval_requests: dict[str, list[dict]] = {}
+_RECENT_PROFILE_FILE_CONTEXT_MAX = 5
+_recent_profile_files_by_chat: dict[tuple[str, str], list[str]] = {}
+_RECENT_FILE_CONTEXT_TRIGGER_RE = re.compile(
+    r"(这个文件|该文件|这个文档|该文档|刚才.*文件|上面.*文件|源文件|markdown|Markdown|\.md\b|转成飞书云文档|转云文档)"
+)
 
 
 def _history_key(profile_name: str, sender: str, sender_alt: Optional[str]) -> tuple[str, str]:
@@ -575,7 +580,13 @@ async def _deliver_media_from_stream_response(
     scoped_response = _profile_scoped_media_response(response_with_files, profile_home)
     if "MEDIA:" not in scoped_response:
         return
-    delivered = await _deliver_profile_scoped_media_directives(adapter, event, gateway, scoped_response)
+    delivered = await _deliver_profile_scoped_media_directives(
+        adapter,
+        event,
+        gateway,
+        scoped_response,
+        profile_home=profile_home,
+    )
     if delivered:
         return
     deliver = getattr(gateway, "_deliver_media_from_response", None)
@@ -617,6 +628,8 @@ async def _deliver_profile_scoped_media_directives(
     event: Any,
     gateway: Any,
     scoped_response: str,
+    *,
+    profile_home: Optional[Path] = None,
 ) -> int:
     """Deliver already-scoped MEDIA directives without upstream path regex loss."""
     if adapter is None:
@@ -655,6 +668,8 @@ async def _deliver_profile_scoped_media_directives(
                 continue
             if getattr(result, "success", True):
                 delivered += 1
+                if profile_home is not None:
+                    _remember_recent_profile_file(profile_home.name, chat_id, path, profile_home)
                 logger.info("multitenancy: delivered post-stream media attachment path=%s", path)
             else:
                 logger.warning(
@@ -989,6 +1004,107 @@ def _is_deliverable_profile_file(source: Path, profile_home: Path) -> bool:
         logger.warning("multitenancy: blocked auto file delivery for sensitive file path=%s", source)
         return False
     return True
+
+
+def _remember_recent_profile_file(profile_name: str, chat_id: str, path: Path, profile_home: Path) -> None:
+    if not profile_name or not chat_id:
+        return
+    resolved = path.expanduser().resolve(strict=False)
+    if not _is_deliverable_profile_file(resolved, profile_home):
+        return
+    key = (profile_name, chat_id)
+    existing = [item for item in _recent_profile_files_by_chat.get(key, []) if item != str(resolved)]
+    existing.append(str(resolved))
+    _recent_profile_files_by_chat[key] = existing[-_RECENT_PROFILE_FILE_CONTEXT_MAX:]
+
+
+def _should_append_recent_profile_file_context(text: str) -> bool:
+    return bool(_RECENT_FILE_CONTEXT_TRIGGER_RE.search(str(text or "")))
+
+
+def _workspace_alias_for_profile_file(path: Path, profile_home: Path) -> str:
+    workspace_root = (profile_home / "workspace").resolve(strict=False)
+    resolved = path.expanduser().resolve(strict=False)
+    try:
+        relative = resolved.relative_to(workspace_root)
+    except ValueError:
+        return str(resolved)
+    return "/workspace/" + relative.as_posix()
+
+
+def _recent_profile_files_from_history(prior_messages: list[dict], profile_home: Path) -> list[tuple[Path, Path]]:
+    candidates: list[tuple[Path, Path]] = []
+    seen: set[str] = set()
+    for message in reversed(prior_messages[-_SESSION_HISTORY_MAX:]):
+        if message.get("role") not in {"assistant", "tool"}:
+            continue
+        content = str(message.get("content") or "")
+        for match in _PROFILE_FILE_PATH_RE.finditer(content):
+            raw_path = match.group("path").strip().strip("`\"'")
+            source = Path(raw_path).expanduser()
+            if not source.is_absolute():
+                source = profile_home / source
+            source = source.resolve(strict=False)
+            published = _publish_mentioned_profile_file(raw_path, profile_home)
+            if published is None:
+                continue
+            resolved = published.resolve(strict=False)
+            if str(resolved) in seen:
+                continue
+            seen.add(str(resolved))
+            candidates.append((source, resolved))
+            if len(candidates) >= _RECENT_PROFILE_FILE_CONTEXT_MAX:
+                return candidates
+    return candidates
+
+
+def _append_recent_profile_file_context(
+    text: str,
+    *,
+    profile_name: str,
+    chat_id: str,
+    profile_home: Path,
+    prior_messages: list[dict],
+) -> str:
+    raw = str(text or "")
+    if not _should_append_recent_profile_file_context(raw):
+        return raw
+
+    candidates: list[tuple[Path, Path]] = []
+    seen: set[str] = set()
+    for stored in _recent_profile_files_by_chat.get((profile_name, chat_id), []):
+        path = Path(stored).expanduser().resolve(strict=False)
+        if _is_deliverable_profile_file(path, profile_home) and str(path) not in seen:
+            candidates.append((path, path))
+            seen.add(str(path))
+
+    for source, path in _recent_profile_files_from_history(prior_messages, profile_home):
+        if str(path) not in seen:
+            candidates.append((source, path))
+            seen.add(str(path))
+        if len(candidates) >= _RECENT_PROFILE_FILE_CONTEXT_MAX:
+            break
+
+    if not candidates:
+        return raw
+
+    lines = [
+        "",
+        "",
+        "[Hermes context: 最近 Hermes 已投递给当前会话的文件]",
+    ]
+    for source, path in candidates[:_RECENT_PROFILE_FILE_CONTEXT_MAX]:
+        lines.extend(
+            [
+                f"- file_name: {path.name}",
+                f"  workspace_path: {_workspace_alias_for_profile_file(path, profile_home)}",
+                f"  profile_path: {path}",
+            ]
+        )
+        if source != path:
+            lines.append(f"  source_path: {source}")
+    lines.append("[/Hermes context]")
+    return raw + "\n".join(lines)
 
 
 def _resolve_profile_media_artifact(raw_path: str, profile_home: Path) -> Optional[Path]:
@@ -1905,7 +2021,14 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # First lookup for a (profile, user) pair hydrates from SessionStore.
         hist_key = _history_key(profile_name, sender, sender_alt)
         prior = _load_history(hist_key)
-        user_msg = _build_user_message(event, text_override=enriched_text)
+        contextual_text = _append_recent_profile_file_context(
+            enriched_text or text,
+            profile_name=profile_name,
+            chat_id=chat_id,
+            profile_home=profile_home,
+            prior_messages=prior,
+        )
+        user_msg = _build_user_message(event, text_override=contextual_text)
         conversation = prior + [user_msg]
         _persist_user_message(hist_key, user_msg)
         if current is not None and _user_inflight_tasks.get(inflight_key) is current:
@@ -4306,7 +4429,7 @@ def _aiagent_stream_timeout_notice(exc: BaseException) -> str:
 
 def _stream_card_idle_status(tick: int) -> str:
     """Return a visibly changing pre-token status for CardKit typewriter keepalive."""
-    dots = "." * (3 + (tick % 3))
+    dots = "." * (((tick - 1) % 3) + 1)
     return f"Hermes 正在准备响应{dots}"
 
 

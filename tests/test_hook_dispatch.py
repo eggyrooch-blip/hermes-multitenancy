@@ -2025,6 +2025,36 @@ async def test_post_stream_media_delivery_sends_chinese_markdown_filename_direct
     ]
 
 
+def test_recent_profile_markdown_file_context_is_added_for_this_file_request(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    report = profile_home / ".ai-docs" / "kep-prd-analysis" / "技术方案_260.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("report", encoding="utf-8")
+
+    prior = [
+        {
+            "role": "assistant",
+            "content": f"💾 方案已保存：`{report}`\n[Markdown 源文件已自动发送]",
+        }
+    ]
+
+    text = router_mod._append_recent_profile_file_context(
+        "该文件转成飞书云文档发给我",
+        profile_name="owner",
+        chat_id="oc_chat",
+        profile_home=profile_home,
+        prior_messages=prior,
+    )
+
+    workspace_file = profile_home / "workspace" / "Downloads" / "技术方案_260.md"
+    assert workspace_file.read_text(encoding="utf-8") == "report"
+    assert "最近 Hermes 已投递给当前会话的文件" in text
+    assert "workspace_path: /workspace/Downloads/技术方案_260.md" in text
+    assert str(report) in text
+
+
 @pytest.mark.asyncio
 async def test_handle_async_blocks_explicit_media_directive_for_sensitive_profile_file(monkeypatch, tmp_path):
     """Explicit MEDIA directives must not bypass sensitive profile file filters."""

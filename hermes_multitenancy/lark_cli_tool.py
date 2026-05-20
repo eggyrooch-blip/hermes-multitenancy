@@ -193,6 +193,22 @@ def _has_identity_flag(command: list[str]) -> bool:
     return any(item == "--as" or item.startswith("--as=") for item in command)
 
 
+def _without_identity_flag(argv: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    skip_next = False
+    for item in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--as":
+            skip_next = True
+            continue
+        if item.startswith("--as="):
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
 def _effective_identity(requested: Any) -> str:
     default_as = str(os.getenv("LARKSUITE_CLI_DEFAULT_AS") or "").strip().lower()
     if default_as in {"user", "bot"}:
@@ -367,6 +383,8 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         return tool_error("lark-cli binary not found; set HERMES_LARK_CLI_BIN or install lark-cli")
 
     identity = _effective_identity(args.get("identity"))
+    if identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
+        argv = _without_identity_flag(argv)
     command = [binary, *_argv_with_json_format(argv, mode)]
     if not _has_identity_flag(command) and identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
         command.extend(["--as", identity])

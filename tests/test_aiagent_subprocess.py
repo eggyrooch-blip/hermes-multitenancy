@@ -688,6 +688,7 @@ async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_st
 
     assert events[0][0] == "status"
     assert "Hermes 正在准备响应." in events[0][1]
+    assert "已等待" not in events[0][1]
     assert events[-1] == ("done", "ok")
 
 

@@ -999,6 +999,17 @@ async def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     assert consumer.finished is True
 
 
+def test_stream_card_idle_status_cycles_one_to_three_dots():
+    from hermes_multitenancy import router as router_mod
+
+    assert [router_mod._stream_card_idle_status(i) for i in range(1, 5)] == [
+        "Hermes 正在准备响应.",
+        "Hermes 正在准备响应..",
+        "Hermes 正在准备响应...",
+        "Hermes 正在准备响应.",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_shared_consumer_stream_does_not_truncate_at_visible_limit(
     monkeypatch, tmp_path
