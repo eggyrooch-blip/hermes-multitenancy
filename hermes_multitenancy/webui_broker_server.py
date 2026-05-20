@@ -7,6 +7,7 @@ execution endpoint directly.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -163,6 +164,12 @@ def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
 
 def _webui_agent_id(owner_open_id: str, profile_name: str) -> str:
     return f"webui:{owner_open_id}:{profile_name}"
+
+
+def _webui_owned_profile_name(owner_open_id: str, profile_name: str) -> str:
+    owner_hash = hashlib.sha256(owner_open_id.encode("utf-8")).hexdigest()[:12]
+    prefix = f"webui_{owner_hash}_"
+    return cron_api.validate_profile_name(f"{prefix}{profile_name[:128 - len(prefix)]}")
 
 
 def _resolve_owner_scoped_profile(
@@ -496,17 +503,18 @@ def create_run_broker_app(
             return web.json_response({"error": "agent_id does not match owner/profile"}, status=400)
 
         try:
+            routed_profile_name = _webui_owned_profile_name(trusted_owner, profile_name)
             agent_id = table.upsert_owned_agent(
                 agent_id=stable_agent_id,
-                profile_name=profile_name,
+                profile_name=routed_profile_name,
                 owner_open_id=trusted_owner,
                 display_label=display_label,
                 upstream_profile=upstream_profile or owner_root.profile_name,
             )
             shared_home = _shared_home_from_env()
             router_mod._ensure_webui_agent_profile(
-                profile_name=profile_name,
-                profile_home=shared_home / "profiles" / profile_name,
+                profile_name=routed_profile_name,
+                profile_home=shared_home / "profiles" / routed_profile_name,
                 owner_open_id=trusted_owner,
                 display_label=display_label,
                 agent_id=agent_id,
@@ -519,6 +527,7 @@ def create_run_broker_app(
             "ok": True,
             "agent_id": agent_id,
             "profile_name": profile_name,
+            "routed_profile_name": routed_profile_name,
             "owner_open_id": trusted_owner,
             "display_label": display_label,
             "upstream_profile": upstream_profile or owner_root.profile_name,

@@ -853,10 +853,11 @@ def test_webui_profile_provisioning_creates_owner_scoped_agent_route(tmp_path):
 
         assert response.status == 200
         assert body["profile_name"] == "web_coder"
+        assert body["routed_profile_name"].startswith("webui_")
         assert body["owner_open_id"] == "ou_owner"
         assert body["agent_id"] == "webui:ou_owner:web_coder"
         assert row is not None
-        assert row.profile_name == "web_coder"
+        assert row.profile_name == body["routed_profile_name"]
         assert row.kind == "agent"
         assert row.provenance == "webui-agent"
         assert row.owner_open_id == "ou_owner"
@@ -924,10 +925,11 @@ def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_pat
 
         assert response.status == 200
         assert body["agent_id"] == "webui:ou_owner:web_coder"
+        return body
 
-    asyncio.run(runner())
+    body = asyncio.run(runner())
 
-    profile_home = shared_home / "profiles" / "web_coder"
+    profile_home = shared_home / "profiles" / body["routed_profile_name"]
     marker = json.loads((profile_home / "group_profile.json").read_text(encoding="utf-8"))
     assert marker == {
         "kind": "group",
@@ -947,6 +949,78 @@ def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_pat
 
     env_text = (profile_home / ".env").read_text(encoding="utf-8")
     assert "FEISHU_HOME_CHANNEL" not in env_text
+
+
+def test_webui_profile_provisioning_isolates_same_name_across_owners(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "profiles" / "owner_b").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.upsert(user_id="root-b", profile_name="owner_b", open_id="ou_owner_b", provenance="sync")
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response_a = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={
+                    "profile_name": "web_coder",
+                    "display_label": "Coder",
+                })
+                body_a = await response_a.json()
+                response_b = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_b",
+                }, json={
+                    "profile_name": "web_coder",
+                    "display_label": "Coder",
+                })
+                body_b = await response_b.json()
+            finally:
+                await client.close()
+
+            table = router_mod._get_routing_table()
+            assert table is not None
+            row_a = table.lookup_agent(body_a["agent_id"])
+            row_b = table.lookup_agent(body_b["agent_id"])
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response_a.status == 200
+        assert response_b.status == 200
+        assert row_a is not None
+        assert row_b is not None
+        return body_a, body_b, row_a.profile_name, row_b.profile_name
+
+    body_a, body_b, profile_a, profile_b = asyncio.run(runner())
+
+    assert body_a["agent_id"] == "webui:ou_owner_a:web_coder"
+    assert body_b["agent_id"] == "webui:ou_owner_b:web_coder"
+    assert profile_a != profile_b
+    assert profile_a != "web_coder"
+    assert profile_b != "web_coder"
+    assert (shared_home / "profiles" / profile_a / "group_profile.json").is_file()
+    assert (shared_home / "profiles" / profile_b / "group_profile.json").is_file()
+    assert not (shared_home / "profiles" / "web_coder").exists()
 
 
 def test_webui_profile_provisioning_requires_owner_header(tmp_path):
