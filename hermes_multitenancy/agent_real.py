@@ -1101,6 +1101,7 @@ def _build_subprocess_env(
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
     env.update(_lark_cli_sidecar_env_for_aiagent(profile_home))
+    env.update(_browser_env_for_aiagent(profile_home))
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
 
@@ -1146,6 +1147,18 @@ def _build_subprocess_env(
         except Exception:
             pass
     return env
+
+
+def _browser_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Expose profile-scoped env for Hermes native browser tools."""
+    try:
+        from .browser_policy import browser_decision, browser_env
+
+        config = _load_yaml(profile_home / "config.yaml")
+        return browser_env(browser_decision(config, profile_home))
+    except Exception:
+        logger.debug("[multitenancy] failed to resolve browser env for subprocess", exc_info=True)
+        return {}
 
 
 def _lark_cli_sidecar_env_for_aiagent(profile_home: Path) -> dict[str, str]:
@@ -1597,6 +1610,7 @@ def _apply_runtime_env_for_aiagent(profile_home: Path):
     credential_env = _credential_env_for_aiagent(profile_home)
     runtime_env.update(credential_env)
     runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
+    runtime_env.update(_browser_env_for_aiagent(profile_home))
     if not runtime_env:
         return lambda: None
     old_env = {key: os.environ.get(key) for key in runtime_env}
@@ -2768,6 +2782,12 @@ def _run_with_aiagent(
     # 3) Lazy-import hermes core (only when this code path is hit).
     _install_credential_env_passthrough(profile_home)
     _install_skill_runtime_compat(profile_home)
+    try:
+        from .browser_policy import install_browser_guard
+
+        install_browser_guard(config, profile_home)
+    except Exception:
+        logger.debug("[multitenancy] browser guard install skipped", exc_info=True)
     from run_agent import AIAgent
     sender_open_id_scope, current_sender_open_id, shared_hermes_home = _load_feishu_oapi_runtime(profile_home)
     try:
@@ -3117,12 +3137,27 @@ def _resolve_enabled_toolsets(
             logger.warning("[multitenancy] discovery policy filter failed: %s", exc)
             return [item for item in toolsets if item != "x_search"]
 
+    def apply_profile_tool_policies(toolsets: list[str] | None) -> list[str] | None:
+        filtered = apply_discovery_policy(toolsets)
+        if profile_home is None:
+            return filtered
+        try:
+            from .browser_policy import browser_decision, browser_toolsets_for_policy
+
+            return browser_toolsets_for_policy(
+                filtered,
+                browser_decision(config, profile_home),
+            )
+        except Exception as exc:
+            logger.warning("[multitenancy] browser toolset policy failed: %s", exc)
+            return [item for item in filtered or [] if item != "browser"] or None
+
     if explicit_toolsets and mode in {"explicit", "strict", "replace"}:
         logger.info(
             "[multitenancy] platform_toolsets explicit mode for %s: %s",
             platform_key, explicit_toolsets,
         )
-        return apply_discovery_policy(explicit_toolsets)
+        return apply_profile_tool_policies(explicit_toolsets)
 
     default_toolsets: list[str] = []
     resolver_platform_key = "api_server" if platform_key == "webui" else platform_key
@@ -3162,9 +3197,9 @@ def _resolve_enabled_toolsets(
             "[multitenancy] platform_toolsets merged for %s: explicit=%s default=%s merged=%s",
             platform_key, explicit_toolsets, default_toolsets, merged,
         )
-        return apply_discovery_policy(merged)
+        return apply_profile_tool_policies(merged)
 
-    return apply_discovery_policy(default_toolsets) or None
+    return apply_profile_tool_policies(default_toolsets) or None
 
 
 def _fallback_default_toolsets(platform_key: str) -> list[str]:

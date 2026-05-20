@@ -515,6 +515,29 @@ credentials:
     assert env["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
 
 
+def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env_disabled = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert "HERMES_MULTITENANCY_BROWSER_ENABLED" not in env_disabled
+
+    (profile_home / "config.yaml").write_text(
+        "multitenancy:\n  browser:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    env_enabled = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env_enabled["HERMES_MULTITENANCY_BROWSER_ENABLED"] == "1"
+    assert env_enabled["HERMES_BROWSER_SOCKET_BASE_DIR"] == str(profile_home / "browser" / "run")
+    assert env_enabled["PLAYWRIGHT_BROWSERS_PATH"] == str(profile_home / "browser" / "ms-playwright")
+
+
 @pytest.mark.asyncio
 async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
@@ -1105,6 +1128,47 @@ def test_resolve_enabled_toolsets_preserves_webui_core_tools_without_resolver():
         "webui",
         platform_tools_resolver=None,
     ) == ["file", "lark-cli", "terminal", "web"]
+
+
+def test_resolve_enabled_toolsets_removes_browser_unless_profile_enabled(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+
+    def fake_get_platform_tools(config, platform, *, include_default_mcp_servers=True):
+        return {"browser", "web", "file"}
+
+    assert agent_real._resolve_enabled_toolsets(
+        {},
+        "webui",
+        platform_tools_resolver=fake_get_platform_tools,
+        profile_home=profile_home,
+    ) == ["file", "web"]
+
+    assert agent_real._resolve_enabled_toolsets(
+        {"multitenancy": {"browser": {"enabled": True}}},
+        "webui",
+        platform_tools_resolver=fake_get_platform_tools,
+        profile_home=profile_home,
+    ) == ["browser", "file", "web"]
+
+
+def test_resolve_enabled_toolsets_denies_browser_for_router_profile(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "multitenancy_router"
+    profile_home.mkdir(parents=True)
+
+    assert agent_real._resolve_enabled_toolsets(
+        {
+            "platform_toolsets": {"webui": ["browser", "web"]},
+            "multitenancy": {"browser": {"enabled": True}},
+        },
+        "webui",
+        platform_tools_resolver=None,
+        profile_home=profile_home,
+    ) == ["file", "terminal", "web"]
 
 
 def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp_path: Path):
@@ -2844,6 +2908,17 @@ def test_sandbox_policy_only_allows_signalling_children():
     assert "(allow signal)" not in policy.replace("(allow signal (target children))", "")
 
 
+def test_macos_sandbox_policy_allows_native_browser_paths_without_personal_chrome():
+    from hermes_multitenancy import agent_real
+
+    policy = agent_real._SANDBOX_POLICY_FILE.read_text(encoding="utf-8")
+
+    assert '(string-append (param "HERMES_AGENT_REPO") "/node_modules/agent-browser")' in policy
+    assert '(string-append (param "PROFILE_HOME") "/browser")' in policy
+    assert '(string-append (param "SHARED_HOME") "/browser-browsers")' in policy
+    assert "Application Support/Google/Chrome" not in policy
+
+
 # ---------------------------------------------------------------------------
 # 档 B — Linux bwrap backend (cross-platform — runs on macOS via platform mock)
 # ---------------------------------------------------------------------------
@@ -3028,6 +3103,11 @@ def test_bwrap_default_args_provides_openclaw_workspace_and_shared_bin():
     triples = set(zip(tokens, tokens[1:], tokens[2:]))
     assert ("--bind", "/probe/shared/profiles/alice/workspace", "/workspace") in triples
     assert ("--ro-bind-try", "/probe/shared/bin", "/probe/shared/bin") in triples
+    assert (
+        "--ro-bind-try",
+        "/probe/shared/browser-browsers",
+        "/probe/shared/browser-browsers",
+    ) in triples
 
 
 def test_bwrap_default_args_does_not_bind_entire_shared_home():

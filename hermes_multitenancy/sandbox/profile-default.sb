@@ -51,6 +51,13 @@
     (subpath "/opt/homebrew")
     ;; kep-cli + hades-cli + tirith live under ~/.hermes/bin/
     (subpath (string-append (param "SHARED_HOME") "/bin"))
+    ;; Hermes native browser runtime. agent-browser lives under the upstream
+    ;; hermes-agent repo; browser binaries/cache are either profile-local or
+    ;; Hermes-managed shared cache, never the user's desktop Chrome profile.
+    (subpath (string-append (param "HERMES_AGENT_REPO") "/node_modules/.bin"))
+    (subpath (string-append (param "HERMES_AGENT_REPO") "/node_modules/agent-browser"))
+    (subpath (string-append (param "PROFILE_HOME") "/browser"))
+    (subpath (string-append (param "SHARED_HOME") "/browser-browsers"))
     ;; uv-managed Python interpreters. venv/bin/python is typically a
     ;; symlink to ~/.local/share/uv/python/cpython-X.Y.../python, and
     ;; sandbox-exec checks the *resolved* binary path before allowing
@@ -90,6 +97,7 @@
     (subpath (param "HERMES_AGENT_REPO"))
     (subpath (param "HERMES_MT_REPO"))
     (subpath "/opt/homebrew")
+    (subpath (string-append (param "SHARED_HOME") "/browser-browsers"))
     ;; uv-managed Python install (venv/bin/python is a symlink into here).
     ;; Must allow read AND exec — see the process-exec* block above for
     ;; the exec rule and the rationale.

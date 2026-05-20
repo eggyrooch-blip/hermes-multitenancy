@@ -63,6 +63,7 @@
 # the routed profile via HOME=/PROFILE_HOME/home or /workspace; the host
 # dotdirs below are read-only legacy compatibility only.
 --ro-bind-try ${SHARED_HOME}/bin ${SHARED_HOME}/bin
+--ro-bind-try ${SHARED_HOME}/browser-browsers ${SHARED_HOME}/browser-browsers
 --ro-bind-try ${USER_HOME}/.aws ${USER_HOME}/.aws
 --ro-bind-try ${USER_HOME}/.config/gh ${USER_HOME}/.config/gh
 --ro-bind-try ${USER_HOME}/.config/git ${USER_HOME}/.config/git

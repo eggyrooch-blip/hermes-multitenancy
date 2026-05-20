@@ -61,6 +61,8 @@ kanban:
     assert checks["credential_provider_boundary"]["owner"] == "multitenancy_vault"
     assert checks["kanban_gateway_boundary"]["ok"] is True
     assert checks["profile_capability_discovery"]["ok"] is True
+    assert checks["profile_browser_runtime"]["ok"] is True
+    assert checks["profile_browser_runtime"]["status"] == "not_checked"
     rendered = json.dumps(report, ensure_ascii=False)
     assert "should-not-leak" not in rendered
     assert "api_key" not in rendered
@@ -103,6 +105,37 @@ def test_upstream_capability_health_honors_curator_paused_runtime_state(tmp_path
     assert checks["skill_curator"]["ok"] is True
     assert checks["skill_curator"]["status"] == "paused"
     assert checks["skill_curator"]["source"] == "runtime_state"
+
+
+def test_upstream_capability_health_reports_profile_browser_runtime(tmp_path: Path):
+    from hermes_multitenancy.upstream_health import upstream_capability_health
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    router = shared / "profiles" / "multitenancy_router"
+    _write_yaml(
+        profile / "config.yaml",
+        """
+multitenancy:
+  browser:
+    enabled: true
+    backend: local
+    allow_private_urls: false
+""",
+    )
+    _write_yaml(router / "config.yaml", "kanban:\n  dispatch_in_gateway: false\n")
+
+    report = upstream_capability_health(
+        shared_home=shared,
+        profile_home=profile,
+        router_profile_home=router,
+    )
+
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["profile_browser_runtime"]["ok"] is True
+    assert checks["profile_browser_runtime"]["status"] == "enabled"
+    assert checks["profile_browser_runtime"]["backend"] == "local"
+    assert checks["profile_browser_runtime"]["runtime_dir"] == str(profile / "browser")
 
 
 def test_lark_cli_canary_health_subcommand_outputs_report(capsys, tmp_path: Path):

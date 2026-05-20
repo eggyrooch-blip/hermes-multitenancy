@@ -54,6 +54,12 @@ def upstream_capability_health(
         _credential_provider_boundary_check(shared_config),
         _kanban_gateway_boundary_check(router_config),
         _profile_capability_discovery_check(shared_config),
+        _profile_browser_runtime_check(
+            profile_config,
+            profile_home=profile_home,
+            router_config=router_config,
+            router_profile_home=router_profile_home,
+        ),
     ]
     attention = [check["name"] for check in checks if not check.get("ok")]
     return {
@@ -239,6 +245,56 @@ def _profile_capability_discovery_check(config: dict[str, Any]) -> dict[str, Any
         "owner": "multitenancy_audience_audit_secret_guard",
         "enabled_surfaces": sorted(risky),
         "reason": "capability discovery must pass audience, audit, and secret guard before profile exposure",
+    }
+
+
+def _profile_browser_runtime_check(
+    config: dict[str, Any],
+    *,
+    profile_home: Path | None,
+    router_config: dict[str, Any],
+    router_profile_home: Path,
+) -> dict[str, Any]:
+    try:
+        from .browser_policy import browser_decision
+    except Exception as exc:
+        return {
+            "name": "profile_browser_runtime",
+            "ok": False,
+            "status": "unavailable",
+            "reason": exc.__class__.__name__,
+        }
+
+    router_decision = browser_decision(router_config, router_profile_home)
+    if router_decision.enabled:
+        return {
+            "name": "profile_browser_runtime",
+            "ok": False,
+            "status": "router_enabled",
+            "owner": "multitenancy_profile_policy",
+            "reason": "router profile must not run browser tasks",
+        }
+
+    if profile_home is None:
+        return {
+            "name": "profile_browser_runtime",
+            "ok": True,
+            "status": "not_checked",
+            "owner": "multitenancy_profile_policy",
+            "reason": "pass profile_home to check profile browser runtime policy",
+        }
+
+    decision = browser_decision(config, profile_home)
+    runtime_dir = decision.runtime_dir
+    return {
+        "name": "profile_browser_runtime",
+        "ok": True,
+        "status": "enabled" if decision.enabled else "disabled",
+        "owner": "multitenancy_profile_policy",
+        "backend": decision.backend,
+        "allow_private_urls": decision.allow_private_urls,
+        "runtime_dir": str(runtime_dir) if runtime_dir else None,
+        "reason": decision.reason,
     }
 
 
