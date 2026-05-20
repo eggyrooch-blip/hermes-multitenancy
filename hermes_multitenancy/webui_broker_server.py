@@ -161,6 +161,10 @@ def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
     }
 
 
+def _webui_agent_id(owner_open_id: str, profile_name: str) -> str:
+    return f"webui:{owner_open_id}:{profile_name}"
+
+
 def _resolve_owner_scoped_profile(
     request: Any,
     payload: dict[str, Any],
@@ -443,6 +447,73 @@ def create_run_broker_app(
         finally:
             await response.write_eof()
         return response
+
+    async def handle_provision_profile(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if not trusted_owner:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
+
+        try:
+            payload = await request.json()
+            profile_name = cron_api.validate_profile_name(
+                str(payload.get("profile_name") or payload.get("profile") or "")
+            )
+            display_label = str(payload.get("display_label") or profile_name).strip() or profile_name
+            upstream_profile = str(payload.get("upstream_profile") or "").strip() or None
+            if upstream_profile is not None:
+                upstream_profile = cron_api.validate_profile_name(upstream_profile)
+            requested_agent_id = str(payload.get("agent_id") or "").strip()
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return web.json_response({
+                "error": "trusted owner header requires routing table verification"
+            }, status=403)
+        owner_root = table.resolve_owner_root(trusted_owner)
+        if owner_root is None:
+            return web.json_response({
+                "error": f"asserted owner '{trusted_owner}' has no sync-root profile"
+            }, status=403)
+
+        stable_agent_id = _webui_agent_id(trusted_owner, profile_name)
+        if requested_agent_id and requested_agent_id != stable_agent_id:
+            existing = table.lookup_agent(requested_agent_id)
+            if existing is not None and existing.owner_open_id != trusted_owner:
+                return web.json_response({
+                    "error": f"agent_id '{requested_agent_id}' does not belong to asserted owner"
+                }, status=403)
+            return web.json_response({"error": "agent_id does not match owner/profile"}, status=400)
+
+        try:
+            agent_id = table.upsert_owned_agent(
+                agent_id=stable_agent_id,
+                profile_name=profile_name,
+                owner_open_id=trusted_owner,
+                display_label=display_label,
+                upstream_profile=upstream_profile or owner_root.profile_name,
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        return web.json_response({
+            "ok": True,
+            "agent_id": agent_id,
+            "profile_name": profile_name,
+            "owner_open_id": trusted_owner,
+            "display_label": display_label,
+            "upstream_profile": upstream_profile or owner_root.profile_name,
+        })
 
     async def handle_list_jobs(request):
         if not _authorized(request):
@@ -736,6 +807,7 @@ def create_run_broker_app(
 
     app = web.Application()
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)

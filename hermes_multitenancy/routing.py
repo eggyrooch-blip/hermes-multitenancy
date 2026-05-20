@@ -31,6 +31,7 @@ DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
 
 KIND_USER = "user"
 KIND_GROUP = "group"
+KIND_AGENT = "agent"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS multitenancy_routing (
@@ -560,6 +561,86 @@ class RoutingTable:
         )
         self._conn.commit()
         return synthetic_user_id
+
+    def upsert_owned_agent(
+        self,
+        *,
+        agent_id: str,
+        profile_name: str,
+        owner_open_id: str,
+        display_label: Optional[str] = None,
+        upstream_profile: Optional[str] = None,
+    ) -> str:
+        """Insert or refresh a WebUI-owned agent route keyed by agent_id."""
+        if not agent_id:
+            raise ValueError("agent_id is required for agent routing rows")
+        if not owner_open_id:
+            raise ValueError("owner_open_id is required for agent routing rows")
+        existing = self.lookup_agent(agent_id)
+        if existing is not None and existing.owner_open_id != owner_open_id:
+            raise ValueError("agent_id does not belong to asserted owner")
+
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_routing
+                (user_id, profile_name, open_id, union_id, active,
+                 synced_at, version, created_at, updated_at,
+                 kind, chat_id, owner_open_id, display_label,
+                 agent_id, provenance, upstream_profile)
+            VALUES (?, ?, ?, NULL, 1, ?, 1, ?, ?,
+                    'agent', NULL, ?, ?, ?, 'webui-agent',
+                    COALESCE(
+                        ?,
+                        (
+                            SELECT profile_name
+                            FROM multitenancy_routing
+                            WHERE open_id = ?
+                              AND active = 1
+                              AND kind = 'user'
+                              AND provenance = 'sync'
+                            LIMIT 1
+                        )
+                    ))
+            ON CONFLICT(user_id) DO UPDATE SET
+                profile_name  = excluded.profile_name,
+                open_id       = excluded.open_id,
+                union_id      = NULL,
+                active        = 1,
+                deleted_at    = NULL,
+                synced_at     = excluded.synced_at,
+                version       = version + 1,
+                updated_at    = excluded.updated_at,
+                kind          = 'agent',
+                chat_id       = NULL,
+                owner_open_id = COALESCE(
+                    NULLIF(owner_open_id, ''), excluded.owner_open_id
+                ),
+                display_label = COALESCE(
+                    excluded.display_label, display_label
+                ),
+                agent_id      = excluded.agent_id,
+                provenance    = 'webui-agent',
+                upstream_profile = COALESCE(
+                    excluded.upstream_profile, upstream_profile
+                )
+            """,
+            (
+                agent_id,
+                profile_name,
+                agent_id,
+                now,
+                now,
+                now,
+                owner_open_id,
+                display_label,
+                agent_id,
+                upstream_profile,
+                owner_open_id,
+            ),
+        )
+        self._conn.commit()
+        return agent_id
 
     def update_display_label(self, chat_id: str, display_label: str) -> bool:
         """Refresh a group row's display_label (e.g. after group rename).
