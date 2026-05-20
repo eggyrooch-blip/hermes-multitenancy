@@ -1923,6 +1923,185 @@ def test_build_subprocess_env_converts_auth_pool_token_to_provider_env(tmp_path:
     assert env["ANTHROPIC_API_KEY"] == "auth-token"
 
 
+def test_provider_adapter_profile_local_overrides_org_default(monkeypatch, tmp_path: Path):
+    """Profile-local model provider credentials win over org/global fallback rows."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.provider_adapter import plan_provider_credentials
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: anthropic/claude-test\n", encoding="utf-8")
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    store = CredentialStore(shared / "multitenancy.db")
+    expires_at = int(time.time() * 1000) + 3600_000
+    for profile_name, token in (
+        ("__global__", "fallback-token"),
+        ("__org__", "org-token"),
+        ("alice", "profile-token"),
+    ):
+        store.put_credential(
+            profile_name=profile_name,
+            subject_id="anthropic",
+            provider="anthropic",
+            secret_kind="api_key",
+            payload={"api_key": token},
+            expires_at=expires_at,
+        )
+    store.close()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    plan = plan_provider_credentials(profile)
+    raw_plan = json.dumps(plan, ensure_ascii=False)
+
+    assert env["ANTHROPIC_API_KEY"] == "profile-token"
+    assert "_HERMES_FORCE_ANTHROPIC_API_KEY" not in env
+    assert "_HERMES_FORCE_HERMES_MULTITENANCY_CREDENTIAL_KEY" not in env
+    anthropic = next(item for item in plan["providers"] if item["provider"] == "anthropic")
+    assert anthropic["selected_source"] == "profile"
+    assert anthropic["source_profile"] == "alice"
+    assert anthropic["status"] == "valid"
+    assert "profile-token" not in raw_plan
+    assert "org-token" not in raw_plan
+    assert "fallback-token" not in raw_plan
+
+
+def test_provider_adapter_org_default_fills_thin_profile(monkeypatch, tmp_path: Path):
+    """A thin profile with no local key can inherit the organization provider."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.provider_adapter import plan_provider_credentials
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "thin"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  default: anthropic/claude-test\nfallback:\n  - openrouter/test\n",
+        encoding="utf-8",
+    )
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    store = CredentialStore(shared / "multitenancy.db")
+    expires_at = int(time.time() * 1000) + 3600_000
+    store.put_credential(
+        profile_name="__org__",
+        subject_id="anthropic",
+        provider="anthropic",
+        secret_kind="api_key",
+        payload={"api_key": "org-token"},
+        expires_at=expires_at,
+    )
+    store.put_credential(
+        profile_name="__global__",
+        subject_id="openrouter",
+        provider="openrouter",
+        secret_kind="api_key",
+        payload={"api_key": "fallback-openrouter-token"},
+        expires_at=expires_at,
+    )
+    store.close()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    plan = plan_provider_credentials(profile)
+
+    assert env["ANTHROPIC_API_KEY"] == "org-token"
+    assert env["OPENROUTER_API_KEY"] == "fallback-openrouter-token"
+    sources = {item["provider"]: item["selected_source"] for item in plan["providers"]}
+    assert sources == {"anthropic": "org", "openrouter": "fallback"}
+
+
+def test_provider_adapter_ignores_feishu_credentials(monkeypatch, tmp_path: Path):
+    """Provider fallback must not turn Feishu app/UAT rows into model env secrets."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.provider_adapter import plan_provider_credentials
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: feishu/not-a-model-provider\n", encoding="utf-8")
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    store = CredentialStore(shared / "multitenancy.db")
+    store.put_credential(
+        profile_name="__global__",
+        subject_id="feishu_app",
+        provider="feishu",
+        secret_kind="app",
+        payload={"app_id": "cli_test", "app_secret": "app-secret"},
+    )
+    store.put_credential(
+        profile_name="__org__",
+        subject_id="feishu",
+        provider="feishu",
+        secret_kind="uat",
+        payload={"access_token": "uat-token", "refresh_token": "refresh-token"},
+    )
+    store.close()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    plan = plan_provider_credentials(profile)
+    raw_plan = json.dumps(plan, ensure_ascii=False)
+
+    assert "FEISHU_APP_ID" not in env
+    assert "FEISHU_APP_SECRET" not in env
+    assert "FEISHU_UAT_ACCESS_TOKEN" not in env
+    assert "FEISHU_UAT_REFRESH_TOKEN" not in env
+    assert "feishu" not in {item["provider"] for item in plan["providers"]}
+    assert "app-secret" not in raw_plan
+    assert "uat-token" not in raw_plan
+
+
+def test_credential_status_uses_provider_adapter_without_secrets(monkeypatch, tmp_path: Path):
+    """Model-visible provider status reports inherited state, not raw keys."""
+    from hermes_multitenancy.credential_tool import credential_status
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "thin"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model:\n  default: anthropic/claude-test\n", encoding="utf-8")
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    CredentialStore(shared / "multitenancy.db").put_credential(
+        profile_name="__org__",
+        subject_id="anthropic",
+        provider="anthropic",
+        secret_kind="api_key",
+        payload={"api_key": "org-token"},
+        scopes=["llm:chat"],
+        expires_at=int(time.time() * 1000) + 3600_000,
+    )
+
+    raw = credential_status({"provider": "anthropic", "credential_kind": "api_key"})
+    status = json.loads(raw)
+
+    assert status["status"] == "valid"
+    assert status["provider"] == "anthropic"
+    assert status["credential_kind"] == "api_key"
+    assert status["selected_source"] == "org"
+    assert status["source_profile"] == "__org__"
+    assert status["has_credential"] is True
+    assert "org-token" not in raw
+
+
 def test_build_subprocess_env_pivots_home_workspace_and_token_compat_env(tmp_path: Path):
     """Token-oriented skills should work unchanged inside a profile.
 

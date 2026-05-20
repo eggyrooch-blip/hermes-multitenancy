@@ -107,6 +107,46 @@ def test_feishu_uat_status_reports_lark_cli_bot_fallback(tmp_path, monkeypatch):
     }
 
 
+def test_feishu_uat_status_does_not_use_provider_fallback(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    (shared / "provider-adapter.yaml").write_text("enabled: true\n", encoding="utf-8")
+    store = CredentialStore(shared / "multitenancy.db")
+    expires_at = int(time.time() * 1000) + 3600_000
+    store.put_credential(
+        profile_name="__org__",
+        subject_id="ou_owner",
+        provider="feishu",
+        secret_kind="uat",
+        payload={"access_token": "org-uat-token", "refresh_token": "org-refresh-token"},
+        expires_at=expires_at,
+    )
+    store.put_credential(
+        profile_name="owner",
+        subject_id="ou_other",
+        provider="feishu",
+        secret_kind="uat",
+        payload={"access_token": "other-uat-token", "refresh_token": "other-refresh-token"},
+        expires_at=expires_at,
+    )
+    store.close()
+
+    status = feishu_uat_auth.credential_status(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+    raw = json.dumps(status, ensure_ascii=False)
+
+    assert status["status"] == "missing"
+    assert status["profile_name"] == "owner"
+    assert status["subject_id"] == "ou_owner"
+    assert "org-uat-token" not in raw
+    assert "other-uat-token" not in raw
+
+
 def test_feishu_uat_auth_loads_shared_env_for_router_process(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
     from hermes_multitenancy.credentials import CredentialStore

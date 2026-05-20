@@ -1459,6 +1459,15 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         logger.debug("[multitenancy] failed to load profile .env for subprocess", exc_info=True)
 
     try:
+        from .provider_adapter import provider_env_for_aiagent
+
+        for key, value in provider_env_for_aiagent(profile_home, existing_env=loaded).items():
+            if key not in loaded:
+                loaded[key] = value
+    except Exception:
+        logger.debug("[multitenancy] failed to load provider adapter env for subprocess", exc_info=True)
+
+    try:
         config = _load_yaml(profile_home / "config.yaml")
         primary = ((config.get("model") or {}).get("default") or "").strip()
         provider = _split_model_spec(primary)[0] if primary else ""

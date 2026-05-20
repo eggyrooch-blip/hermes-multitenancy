@@ -52,6 +52,35 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
         if requested_profile != profile_name:
             return _error("credential status is limited to the current profile only")
 
+        provider = str(args.get("provider") or "feishu").strip()
+        secret_kind = str(args.get("credential_kind") or args.get("secret_kind") or "uat").strip()
+        required_scopes = args.get("required_scopes") or []
+        if isinstance(required_scopes, str):
+            required_scopes = [required_scopes]
+
+        if provider and provider != "feishu" and secret_kind in {"api_key", "token"}:
+            adapter_status = _provider_adapter_status(provider)
+            if adapter_status is not None:
+                return json.dumps(
+                    {
+                        "profile": profile_name,
+                        "provider": provider,
+                        "subject_id": adapter_status.get("subject_id") or provider,
+                        "credential_kind": secret_kind,
+                        "status": adapter_status.get("status"),
+                        "storage": adapter_status.get("storage"),
+                        "expires_at": adapter_status.get("expires_at"),
+                        "scopes": adapter_status.get("scopes") or [],
+                        "missing_scopes": adapter_status.get("missing_scopes") or [],
+                        "has_credential": bool(adapter_status.get("has_credential")),
+                        "selected_source": adapter_status.get("selected_source"),
+                        "source_profile": adapter_status.get("source_profile"),
+                        "env": adapter_status.get("env"),
+                        "sandbox_note": ".env/auth.json are masked by design",
+                    },
+                    ensure_ascii=False,
+                )
+
         subject_id = str(
             args.get("subject_id")
             or os.getenv("HERMES_FEISHU_USER_OPEN_ID")
@@ -59,12 +88,6 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
         ).strip()
         if not subject_id:
             return _error("subject_id is required when HERMES_FEISHU_USER_OPEN_ID is unset")
-
-        provider = str(args.get("provider") or "feishu").strip()
-        secret_kind = str(args.get("credential_kind") or args.get("secret_kind") or "uat").strip()
-        required_scopes = args.get("required_scopes") or []
-        if isinstance(required_scopes, str):
-            required_scopes = [required_scopes]
 
         store = CredentialStore(_shared_home() / "multitenancy.db")
         status = store.get_status(
@@ -127,6 +150,22 @@ def _shared_home() -> Path:
     home = Path(os.getenv("HERMES_HOME") or "").expanduser()
     if home.parent.name == "profiles":
         return home.parent.parent
+    return home
+
+
+def _provider_adapter_status(provider: str) -> dict[str, Any] | None:
+    try:
+        from .provider_adapter import status_for_provider
+
+        return status_for_provider(_current_profile_home(), provider=provider)
+    except Exception:
+        return None
+
+
+def _current_profile_home() -> Path:
+    home = Path(os.getenv("HERMES_HOME") or "").expanduser()
+    if not str(home) or str(home) == ".":
+        raise RuntimeError("HERMES_HOME is required")
     return home
 
 
