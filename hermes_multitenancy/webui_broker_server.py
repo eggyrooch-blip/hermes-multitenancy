@@ -168,8 +168,11 @@ def _webui_agent_id(owner_open_id: str, profile_name: str) -> str:
 
 def _webui_owned_profile_name(owner_open_id: str, profile_name: str) -> str:
     owner_hash = hashlib.sha256(owner_open_id.encode("utf-8")).hexdigest()[:12]
+    name_hash = hashlib.sha256(profile_name.encode("utf-8")).hexdigest()[:10]
     prefix = f"webui_{owner_hash}_"
-    return cron_api.validate_profile_name(f"{prefix}{profile_name[:128 - len(prefix)]}")
+    suffix = f"_{name_hash}"
+    stem = profile_name[:128 - len(prefix) - len(suffix)]
+    return cron_api.validate_profile_name(f"{prefix}{stem}{suffix}")
 
 
 def _resolve_owner_scoped_profile(

@@ -1023,6 +1023,65 @@ def test_webui_profile_provisioning_isolates_same_name_across_owners(tmp_path, m
     assert not (shared_home / "profiles" / "web_coder").exists()
 
 
+def test_webui_profile_provisioning_isolates_truncated_names_for_same_owner(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared_home = tmp_path / "home"
+    (shared_home / "profiles" / "owner_a").mkdir(parents=True)
+    (shared_home / "config.yaml").write_text("model:\n  default: openai/test-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="root-a", profile_name="owner_a", open_id="ou_owner_a", provenance="sync")
+    seeded.close()
+
+    base = "a" * 109
+    logical_a = base + ("x" * 19)
+    logical_b = base + ("y" * 19)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda _request: "",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response_a = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={"profile_name": logical_a})
+                body_a = await response_a.json()
+                response_b = await client.post("/api/run-broker/profiles", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner_a",
+                }, json={"profile_name": logical_b})
+                body_b = await response_b.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response_a.status == 200
+        assert response_b.status == 200
+        return body_a, body_b
+
+    body_a, body_b = asyncio.run(runner())
+
+    assert body_a["agent_id"] != body_b["agent_id"]
+    assert body_a["routed_profile_name"] != body_b["routed_profile_name"]
+    assert len(body_a["routed_profile_name"]) <= 128
+    assert len(body_b["routed_profile_name"]) <= 128
+    assert (shared_home / "profiles" / body_a["routed_profile_name"] / "group_profile.json").is_file()
+    assert (shared_home / "profiles" / body_b["routed_profile_name"] / "group_profile.json").is_file()
+
+
 def test_webui_profile_provisioning_requires_owner_header(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
