@@ -705,6 +705,49 @@ def _profile_user_audience_ok(case: dict[str, Any]) -> tuple[bool, str]:
     return ok, note
 
 
+def _shared_token_isolation_ok(scoped_case: dict[str, Any], wildcard_case: dict[str, Any]) -> tuple[bool, str]:
+    scoped_profiles_targeted = int(scoped_case.get("profiles_targeted") or 0)
+    scoped_written = int(scoped_case.get("written") or 0)
+    scoped_alice_token_mode = str(scoped_case.get("alice_token_mode") or "")
+    scoped_bob_has_token = scoped_case.get("bob_has_token") is True
+    scoped_group_has_token = scoped_case.get("group_has_token") is True
+    wildcard_profiles_targeted = int(wildcard_case.get("profiles_targeted") or 0)
+    wildcard_written = int(wildcard_case.get("written") or 0)
+    wildcard_alice_has_token = wildcard_case.get("alice_has_token") is True
+    wildcard_bob_has_token = wildcard_case.get("bob_has_token") is True
+    wildcard_group_has_token = wildcard_case.get("group_has_token") is True
+    wildcard_inactive_has_token = wildcard_case.get("inactive_has_token") is True
+    ok = (
+        scoped_case.get("ok") is True
+        and wildcard_case.get("ok") is True
+        and scoped_profiles_targeted == 1
+        and scoped_written == 1
+        and scoped_alice_token_mode == "0o600"
+        and not scoped_bob_has_token
+        and not scoped_group_has_token
+        and wildcard_profiles_targeted == 2
+        and wildcard_written == 2
+        and wildcard_alice_has_token
+        and wildcard_bob_has_token
+        and not wildcard_group_has_token
+        and not wildcard_inactive_has_token
+    )
+    note = (
+        f"scoped_profiles_targeted={scoped_profiles_targeted}; "
+        f"scoped_written={scoped_written}; "
+        f"scoped_alice_token_mode={scoped_alice_token_mode}; "
+        f"scoped_bob_has_token={scoped_bob_has_token}; "
+        f"scoped_group_has_token={scoped_group_has_token}; "
+        f"wildcard_profiles_targeted={wildcard_profiles_targeted}; "
+        f"wildcard_written={wildcard_written}; "
+        f"wildcard_alice_has_token={wildcard_alice_has_token}; "
+        f"wildcard_bob_has_token={wildcard_bob_has_token}; "
+        f"wildcard_group_has_token={wildcard_group_has_token}; "
+        f"wildcard_inactive_has_token={wildcard_inactive_has_token}"
+    )
+    return ok, note
+
+
 def _skill_inventory_ok(case: dict[str, Any]) -> tuple[bool, str]:
     source_counts = case.get("source_counts") if isinstance(case.get("source_counts"), dict) else {}
     required_sources = ("managed", "personal", "unknown")
@@ -1062,6 +1105,15 @@ def audit(evidence_dir: Path, worktree: Path | None = None, gateway_plugin_link:
         "covered" if audience_ok else "failed",
         str(matrix_path),
         audience_note,
+    ))
+    scoped_token_case = cases.get("offline_shared_token_materialization_is_scoped") or {}
+    wildcard_token_case = cases.get("offline_wildcard_shared_token_skips_group_profiles") or {}
+    shared_token_ok, shared_token_note = _shared_token_isolation_ok(scoped_token_case, wildcard_token_case)
+    items.append(_item(
+        "Validate shared token materialization is explicit, chmod 0600, and never written to group or inactive profiles by wildcard.",
+        "covered" if shared_token_ok else "failed",
+        str(matrix_path),
+        shared_token_note,
     ))
     new_hire_case = cases.get("offline_new_hire_sync_auto_installs_managed_skills") or {}
     new_hire_ok, new_hire_note = _new_hire_sync_ok(new_hire_case)

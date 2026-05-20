@@ -138,6 +138,23 @@ def _base_evidence(tmp_path: Path) -> object:
                 "user_audience_user": "bob",
                 "carol_received_targeted_skill": False,
             })
+        if name == "offline_shared_token_materialization_is_scoped":
+            case.update({
+                "profiles_targeted": 1,
+                "written": 1,
+                "alice_token_mode": "0o600",
+                "bob_has_token": False,
+                "group_has_token": False,
+            })
+        if name == "offline_wildcard_shared_token_skips_group_profiles":
+            case.update({
+                "profiles_targeted": 2,
+                "written": 2,
+                "alice_has_token": True,
+                "bob_has_token": True,
+                "group_has_token": False,
+                "inactive_has_token": False,
+            })
         if name == "offline_distribution_audience_symlink_version_self_install":
             case.update({
                 "manifest_version": "v2",
@@ -659,6 +676,40 @@ def test_completion_audit_requires_profile_user_audience_details(tmp_path: Path)
     assert item["status"] == "failed"
     assert "profile_audience_profile=bob" in item["note"]
     assert "carol_received_targeted_skill=True" in item["note"]
+    assert report["evidence_ok"] is False
+
+
+def test_completion_audit_requires_shared_token_group_isolation_details(tmp_path: Path):
+    audit_mod = _base_evidence(tmp_path)
+    _write_passing_dialogue_evidence(tmp_path)
+    _write_passing_write_evidence(tmp_path)
+    _write_passing_group_write_evidence(tmp_path)
+    matrix_path = tmp_path / "skills-uat-latest.json"
+    matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    for case in matrix["cases"]:
+        if case["name"] == "offline_shared_token_materialization_is_scoped":
+            case["alice_token_mode"] = "0o644"
+            case["group_has_token"] = True
+        if case["name"] == "offline_wildcard_shared_token_skips_group_profiles":
+            case["profiles_targeted"] = 3
+            case["group_has_token"] = True
+            case["inactive_has_token"] = True
+    matrix_path.write_text(json.dumps(matrix, ensure_ascii=False), encoding="utf-8")
+    link = tmp_path / "gateway-plugin"
+    link.symlink_to(tmp_path / "other-worktree", target_is_directory=True)
+
+    report = audit_mod.audit(tmp_path, worktree=ROOT, gateway_plugin_link=link)
+
+    item = next(
+        item
+        for item in report["items"]
+        if item["requirement"].startswith("Validate shared token materialization")
+    )
+    assert item["status"] == "failed"
+    assert "scoped_alice_token_mode=0o644" in item["note"]
+    assert "scoped_group_has_token=True" in item["note"]
+    assert "wildcard_group_has_token=True" in item["note"]
+    assert "wildcard_inactive_has_token=True" in item["note"]
     assert report["evidence_ok"] is False
 
 
@@ -1634,7 +1685,7 @@ def test_completion_audit_accepts_required_dialogue_and_write_identity_coverage(
 
     assert report["failed"] == 0
     assert report["blocked"] == 3
-    assert report["covered"] == 29
+    assert report["covered"] == 30
     assert report["evidence_ok"] is True
     assert report["completion_state"] == "incomplete"
 
@@ -1662,7 +1713,7 @@ def test_completion_audit_treats_missing_credential_key_real_cases_as_blocked_no
     assert "blocked_failures" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 28
+    assert report["covered"] == 29
     assert report["evidence_ok"] is True
 
 
@@ -1689,7 +1740,7 @@ def test_completion_audit_treats_expired_real_user_uat_as_blocked_not_failed(tmp
     assert "real_feishu_uat_user_info" in matrix_item["note"]
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 28
+    assert report["covered"] == 29
     assert report["evidence_ok"] is True
 
 
@@ -1722,7 +1773,7 @@ def test_completion_audit_treats_scope_inventory_without_valid_user_uat_as_block
     assert scope_item["status"] == "blocked"
     assert report["failed"] == 0
     assert report["blocked"] == 4
-    assert report["covered"] == 28
+    assert report["covered"] == 29
     assert report["evidence_ok"] is True
 
 
