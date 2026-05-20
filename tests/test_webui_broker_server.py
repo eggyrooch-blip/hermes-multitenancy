@@ -424,20 +424,33 @@ def _install_fake_cron(monkeypatch):
         store.setdefault(key, [])
         return store[key]
 
-    def create_job(**kwargs):
+    def create_job(
+        *,
+        prompt,
+        schedule,
+        name=None,
+        repeat=None,
+        deliver=None,
+        skills=None,
+        model=None,
+        provider=None,
+        base_url=None,
+        workdir=None,
+        profile=None,
+    ):
+        del model, provider, base_url, workdir, profile
         job = {
             "id": "abc123abc123",
             "job_id": "abc123abc123",
-            "name": kwargs["name"],
-            "prompt": kwargs.get("prompt", ""),
-            "schedule": kwargs.get("schedule"),
-            "schedule_display": kwargs.get("schedule"),
-            "repeat": {"times": kwargs.get("repeat"), "completed": 0},
-            "deliver": kwargs.get("deliver", "local"),
+            "name": name,
+            "prompt": prompt,
+            "schedule": schedule,
+            "schedule_display": schedule,
+            "repeat": {"times": repeat, "completed": 0},
+            "deliver": deliver or "local",
             "enabled": True,
             "state": "scheduled",
-            "owner_open_id": kwargs.get("owner_open_id"),
-            "owner_profile": kwargs.get("owner_profile"),
+            "skills": skills or [],
         }
         bucket().append(job)
         return job
@@ -577,6 +590,56 @@ def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path)
         assert create_body["job"]["deliver"] == "feishu"
         assert create_body["job"]["owner_open_id"] == "ou_yaojunhua"
         assert create_body["job"]["owner_profile"] == "yaojunhua"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_jobs_expose_shadow_plan(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Profile": "owner",
+            "X-Hermes-User-Key": "ou_owner",
+        }
+        try:
+            created = await client.post("/api/run-broker/jobs", headers=headers, json={
+                "name": "cron canary",
+                "schedule": "*/5 * * * *",
+                "prompt": "ping",
+            })
+            plan_response = await client.get("/api/run-broker/jobs/abc123abc123/plan?shadow=1&due=1", headers=headers)
+            plan_body = await plan_response.json()
+        finally:
+            await client.close()
+
+        assert created.status == 200
+        assert plan_response.status == 200
+        assert plan_body["plan"]["mode"] == "shadow"
+        assert plan_body["plan"]["will_execute"] is False
+        assert plan_body["plan"]["would_execute"] is True
+        assert plan_body["plan"]["profile_name"] == "owner"
+        assert plan_body["plan"]["user_key"] == "ou_owner"
+        assert plan_body["plan"]["deliver_target"] == {
+            "platform": "feishu",
+            "chat_id": "ou_owner",
+            "thread_id": None,
+        }
+        assert plan_body["plan"]["secret_free"] is True
 
     asyncio.run(runner())
 

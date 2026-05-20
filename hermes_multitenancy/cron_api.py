@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import inspect
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -142,6 +143,17 @@ def get_job(profile_name: str, job_id: str) -> dict[str, Any]:
     return job
 
 
+def plan_job(profile_name: str, job_id: str, *, shadow: bool = True, due: Optional[bool] = None) -> dict[str, Any]:
+    profile_name = validate_profile_name(profile_name)
+    job = get_job(profile_name, job_id)
+    return cron_worker.plan_cron_bridge_run(
+        job,
+        profile_home=profile_home_for(profile_name),
+        due=due,
+        shadow=shadow,
+    )
+
+
 def create_job(profile_name: str, user_key: str, body: dict[str, Any]) -> dict[str, Any]:
     profile_name = validate_profile_name(profile_name)
     user_key = str(user_key or "").strip()
@@ -155,16 +167,32 @@ def create_job(profile_name: str, user_key: str, body: dict[str, Any]) -> dict[s
         "schedule": str(body.get("schedule") or "").strip(),
         "name": str(body.get("name") or "").strip(),
         "deliver": deliver,
-        "owner_open_id": user_key,
-        "owner_profile": profile_name,
     }
     if body.get("skills"):
         kwargs["skills"] = body.get("skills")
     if body.get("repeat") is not None:
         kwargs["repeat"] = body.get("repeat")
+    for key in ("model", "provider", "base_url", "workdir", "profile"):
+        if body.get(key) is not None:
+            kwargs[key] = body.get(key)
 
     with cron_profile_scope(profile_home_for(profile_name)) as cron_jobs:
-        return cron_jobs.create_job(**kwargs)
+        try:
+            parameters = inspect.signature(cron_jobs.create_job).parameters
+            if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+                create_kwargs = kwargs
+            else:
+                supported = set(parameters)
+                create_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+        except (TypeError, ValueError):
+            create_kwargs = kwargs
+        job = cron_jobs.create_job(**create_kwargs)
+        owner_updates = {
+            "owner_open_id": user_key,
+            "owner_profile": profile_name,
+        }
+        updated = cron_jobs.update_job(job["id"], owner_updates)
+        return updated or {**job, **owner_updates}
 
 
 def update_job(profile_name: str, job_id: str, body: dict[str, Any]) -> dict[str, Any]:

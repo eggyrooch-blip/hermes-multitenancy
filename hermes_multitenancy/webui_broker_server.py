@@ -485,6 +485,22 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI cron get failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_plan_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            shadow = request.query.get("shadow", "1").lower() in {"1", "true", "yes", "on"}
+            due_raw = request.query.get("due")
+            due = None if due_raw is None else due_raw.lower() in {"1", "true", "yes", "on"}
+            plan = cron_api.plan_job(profile_name, request.match_info["job_id"], shadow=shadow, due=due)
+            return web.json_response({"plan": plan})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron plan failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_update_job(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -686,6 +702,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/skills/audit", handle_skill_audit)
     app.router.add_get("/api/run-broker/jobs", handle_list_jobs)
     app.router.add_post("/api/run-broker/jobs", handle_create_job)
+    app.router.add_get("/api/run-broker/jobs/{job_id}/plan", handle_plan_job)
     app.router.add_get("/api/run-broker/jobs/{job_id}", handle_get_job)
     app.router.add_patch("/api/run-broker/jobs/{job_id}", handle_update_job)
     app.router.add_delete("/api/run-broker/jobs/{job_id}", handle_delete_job)

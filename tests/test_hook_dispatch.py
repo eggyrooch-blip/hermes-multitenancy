@@ -666,6 +666,84 @@ def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
     assert request.metadata["provider"] == "openai"
 
 
+def test_cron_run_request_rejects_missing_owner_and_router_profile(tmp_path):
+    """Cron bridge must not fall back to the shared/router profile identity."""
+    from hermes_multitenancy import cron_worker
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    router_home = tmp_path / ".hermes" / "profiles" / "multitenancy_router"
+
+    with pytest.raises(ValueError, match="owner_open_id"):
+        cron_worker._build_cron_run_request(
+            {
+                "id": "job123",
+                "name": "bad cron",
+                "prompt": "should not run",
+                "deliver": "feishu",
+            },
+            profile_home=profile_home,
+            prompt="should not run",
+        )
+    with pytest.raises(ValueError, match="multitenancy_router"):
+        cron_worker._build_cron_run_request(
+            {
+                "id": "job124",
+                "name": "router cron",
+                "prompt": "should not run",
+                "owner_open_id": "ou_owner",
+                "owner_profile": "multitenancy_router",
+                "deliver": "feishu",
+            },
+            profile_home=router_home,
+            prompt="should not run",
+        )
+
+
+def test_cron_bridge_shadow_plan_is_secret_free_and_non_executing(tmp_path):
+    """Shadow mode should explain the cron route without dispatching or leaking secrets."""
+    from hermes_multitenancy import cron_worker
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    plan = cron_worker.plan_cron_bridge_run(
+        {
+            "id": "job123",
+            "name": "Daily summary",
+            "prompt": "summarize",
+            "deliver": "feishu",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "owner",
+            "next_run_at": "2026-05-20T09:30:00+08:00",
+            "enabled": True,
+            "state": "scheduled",
+            "env": {"OPENAI_API_KEY": "sk-should-not-leak"},
+        },
+        profile_home=profile_home,
+        due=True,
+        shadow=True,
+    )
+
+    assert plan["mode"] == "shadow"
+    assert plan["will_execute"] is False
+    assert plan["would_execute"] is True
+    assert plan["profile_name"] == "owner"
+    assert plan["profile_home"] == str(profile_home)
+    assert plan["user_key"] == "ou_owner"
+    assert plan["credential_subject"] == "ou_owner"
+    assert plan["deliver_target"] == {"platform": "feishu", "chat_id": "ou_owner", "thread_id": None}
+    assert plan["next_run_at"] == "2026-05-20T09:30:00+08:00"
+    assert plan["secret_free"] is True
+    assert "should-not-leak" not in json.dumps(plan)
+
+
+def test_feishu_response_message_id_handles_sdk_and_dict_shapes():
+    from hermes_multitenancy import cron_worker
+
+    assert cron_worker._feishu_response_message_id(SimpleNamespace(data=SimpleNamespace(message_id="om_sdk"))) == "om_sdk"
+    assert cron_worker._feishu_response_message_id({"message_id": "om_dict"}) == "om_dict"
+    assert cron_worker._feishu_response_message_id({"message": {"message_id": "om_nested"}}) == "om_nested"
+    assert cron_worker._feishu_response_message_id(object()) is None
+
+
 def test_cron_delivery_mirror_persists_owner_context(tmp_path, monkeypatch):
     """Successful cron delivery is remembered for the owner's next Feishu turn."""
     from hermes_multitenancy import cron_worker

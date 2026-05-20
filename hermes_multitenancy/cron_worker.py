@@ -245,19 +245,22 @@ def _current_profile_home() -> Path:
 
 def _cron_user_key(job: dict, profile_name: str) -> str:
     owner_open_id = str(job.get("owner_open_id") or "").strip()
-    if owner_open_id:
-        return owner_open_id
-    return str(job.get("owner_profile") or "").strip() or profile_name
+    if not owner_open_id.startswith("ou_"):
+        raise ValueError("cron owner_open_id is required")
+    return owner_open_id
 
 
 def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> RunRequest:
     profile_name = str(job.get("owner_profile") or "").strip() or profile_home.name
+    if profile_name == "multitenancy_router":
+        raise ValueError("cron owner_profile must not be multitenancy_router")
     user_key = _cron_user_key(job, profile_name)
     job_id = str(job.get("id") or "").strip()
     metadata = {
         "job_id": job_id,
         "job_name": str(job.get("name") or job_id or "scheduled task"),
         "deliver": job.get("deliver"),
+        "profile_home": str(profile_home),
         "model": job.get("model"),
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
@@ -269,13 +272,83 @@ def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> Ru
         profile_name=profile_name,
         user_key=user_key,
         content=prompt,
+        chat_id=user_key,
         session_id=f"cron:{job_id}" if job_id else None,
         message_id=job_id or None,
+        idempotency_key=f"cron:{profile_name}:{user_key}:{job_id}" if job_id else None,
         delivery_mode=str(job.get("deliver") or "feishu"),
         credential_subject=user_key,
         requires_host_tools=True,
         metadata={k: v for k, v in metadata.items() if v not in (None, "", [])},
     )
+
+
+def _cron_deliver_target(job: dict, user_key: str) -> Optional[dict[str, Any]]:
+    deliver = str(job.get("deliver") or "feishu").strip().lower()
+    if deliver == "local":
+        return None
+    if deliver == "feishu" and user_key.startswith("ou_"):
+        return {"platform": "feishu", "chat_id": user_key, "thread_id": None}
+    return None
+
+
+def plan_cron_bridge_run(
+    job: dict,
+    *,
+    profile_home: Path,
+    due: Optional[bool] = None,
+    shadow: bool = True,
+) -> dict[str, Any]:
+    """Return a secret-free profile cron bridge plan without dispatching.
+
+    The plan intentionally omits prompt text, env vars, credentials, and model
+    secrets. It is used by WebUI/runbook canaries to compare upstream
+    profile-scoped cron metadata with the multitenancy RunRequest boundary.
+    """
+    profile_home = profile_home.expanduser().resolve()
+    job_id = str(job.get("id") or "").strip()
+    problems: list[str] = []
+    request: Optional[RunRequest] = None
+    try:
+        request = _build_cron_run_request(
+            job,
+            profile_home=profile_home,
+            prompt=str(job.get("prompt") or "cron bridge shadow prompt"),
+        )
+    except Exception as exc:
+        problems.append(str(exc))
+
+    profile_name = request.profile_name if request is not None else str(job.get("owner_profile") or profile_home.name)
+    user_key = request.user_key if request is not None else str(job.get("owner_open_id") or "")
+    enabled = bool(job.get("enabled", True)) and str(job.get("state") or "scheduled").strip().lower() != "paused"
+    due_value = bool(due) if due is not None else enabled
+    would_execute = bool(request is not None and enabled and due_value and not problems)
+    deliver_target = _cron_deliver_target(job, user_key) if request is not None else None
+    if would_execute and str(job.get("deliver") or "feishu").strip().lower() != "local" and deliver_target is None:
+        problems.append("cron deliver target could not be resolved")
+        would_execute = False
+
+    return {
+        "mode": "shadow" if shadow else "execute",
+        "job_id": job_id,
+        "job_name": str(job.get("name") or job_id or "scheduled task"),
+        "profile_name": profile_name,
+        "profile_home": str(profile_home),
+        "user_key": user_key,
+        "credential_subject": request.credential_subject if request is not None else None,
+        "channel": "cron",
+        "session_id": request.session_id if request is not None else None,
+        "idempotency_key": request.effective_idempotency_key if request is not None else None,
+        "deliver": job.get("deliver") or "feishu",
+        "deliver_target": deliver_target,
+        "next_run_at": job.get("next_run_at") or job.get("next_run"),
+        "enabled": enabled,
+        "due": due_value,
+        "would_execute": would_execute,
+        "will_execute": would_execute and not shadow,
+        "problems": problems,
+        "secret_free": True,
+    }
 
 
 def _build_cron_event(request: RunRequest) -> Any:
@@ -444,11 +517,32 @@ def _patch_feishu_open_id_send() -> None:
             uuid_value=str(uuid.uuid4()),
         )
         request = self._build_create_message_request("open_id", body)
-        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+        response = await asyncio.to_thread(self._client.im.v1.message.create, request)
+        logger.info(
+            "[multitenancy] delivered Feishu open_id message chat_id=%s message_id=%s",
+            chat_id,
+            _feishu_response_message_id(response) or "unknown",
+        )
+        return response
 
     setattr(send_raw_message, "_hermes_multitenancy_patched", True)
     FeishuAdapter._send_raw_message = send_raw_message
     logger.info("[multitenancy] patched Feishu delivery for user open_id targets")
+
+
+def _feishu_response_message_id(response: Any) -> Optional[str]:
+    data = getattr(response, "data", None)
+    for source in (data, response):
+        if source is None:
+            continue
+        value = getattr(source, "message_id", None)
+        if value:
+            return str(value)
+        if isinstance(source, dict):
+            value = source.get("message_id") or source.get("message", {}).get("message_id")
+            if value:
+                return str(value)
+    return None
 
 
 def _resolve_profiles_root() -> Optional[Path]:
