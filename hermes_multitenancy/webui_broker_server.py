@@ -554,6 +554,19 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI cron resume failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_run_job(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            profile_name, _user_key = _tenant_from_request(request)
+            job = cron_api.trigger_job(profile_name, request.match_info["job_id"])
+            return web.json_response({"job": job, "queued": True})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI cron run trigger failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_feishu_uat_status(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -737,6 +750,7 @@ def create_run_broker_app(
     app.router.add_delete("/api/run-broker/jobs/{job_id}", handle_delete_job)
     app.router.add_post("/api/run-broker/jobs/{job_id}/pause", handle_pause_job)
     app.router.add_post("/api/run-broker/jobs/{job_id}/resume", handle_resume_job)
+    app.router.add_post("/api/run-broker/jobs/{job_id}/run", handle_run_job)
     return app
 
 

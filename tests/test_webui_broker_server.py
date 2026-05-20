@@ -482,6 +482,18 @@ def _install_fake_cron(monkeypatch):
     def resume_job(job_id):
         return update_job(job_id, {"enabled": True, "state": "scheduled"})
 
+    def trigger_job(job_id):
+        return update_job(
+            job_id,
+            {
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "next_run_at": "now",
+            },
+        )
+
     jobs_mod.create_job = create_job
     jobs_mod.list_jobs = list_jobs
     jobs_mod.get_job = get_job
@@ -489,6 +501,7 @@ def _install_fake_cron(monkeypatch):
     jobs_mod.remove_job = remove_job
     jobs_mod.pause_job = pause_job
     jobs_mod.resume_job = resume_job
+    jobs_mod.trigger_job = trigger_job
     cron_pkg.jobs = jobs_mod
     cron_pkg.scheduler = scheduler_mod
 
@@ -534,6 +547,8 @@ def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
             list_body = await listed.json()
             paused = await client.post("/api/run-broker/jobs/abc123abc123/pause", headers=headers)
             pause_body = await paused.json()
+            triggered = await client.post("/api/run-broker/jobs/abc123abc123/run", headers=headers)
+            trigger_body = await triggered.json()
             deleted = await client.delete("/api/run-broker/jobs/abc123abc123", headers=headers)
             delete_body = await deleted.json()
         finally:
@@ -548,6 +563,10 @@ def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
         assert list_body["jobs"][0]["id"] == "abc123abc123"
         assert paused.status == 200
         assert pause_body["job"]["state"] == "paused"
+        assert triggered.status == 200
+        assert trigger_body["queued"] is True
+        assert trigger_body["job"]["state"] == "scheduled"
+        assert trigger_body["job"]["next_run_at"] == "now"
         assert deleted.status == 200
         assert delete_body == {"ok": True}
         assert store[str(expected_jobs_file)] == []

@@ -233,3 +233,25 @@ def resume_job(profile_name: str, job_id: str) -> dict[str, Any]:
     if not job:
         raise CronApiError("Job not found", 404)
     return job
+
+
+def trigger_job(profile_name: str, job_id: str) -> dict[str, Any]:
+    """Queue a profile job for the next multitenancy cron worker tick."""
+    job_id = validate_job_id(job_id)
+    with cron_profile_scope(profile_home_for(profile_name)) as cron_jobs:
+        trigger = getattr(cron_jobs, "trigger_job", None)
+        if trigger is not None:
+            job = trigger(job_id)
+        else:
+            job = cron_jobs.update_job(
+                job_id,
+                {
+                    "enabled": True,
+                    "state": "scheduled",
+                    "paused_at": None,
+                    "paused_reason": None,
+                },
+            )
+    if not job:
+        raise CronApiError("Job not found", 404)
+    return job
