@@ -2775,14 +2775,8 @@ def _run_with_aiagent(
     except Exception:
         _get_platform_tools = None  # graceful: fall back to None toolsets
 
-    # 4) Resolve toolsets enabled for this platform on this profile.
+    # 4) Resolve platform and sender identity for toolset policy.
     platform_key = _resolve_platform_value(getattr(event, "source", None))
-    enabled_toolsets = _resolve_enabled_toolsets(
-        config,
-        platform_key,
-        platform_tools_resolver=_get_platform_tools,
-    )
-
     # 5) Sender's real Feishu open_id (ou_*) for per-user UAT routing.
     # The feishu adapter already set this contextvar in
     # _process_inbound_message before dispatching us — prefer that value
@@ -2790,6 +2784,25 @@ def _run_with_aiagent(
     # ou_* form). Only fall back to event.source on weird code paths
     # (e.g., synthetic events constructed without going through the adapter).
     sender_open_id = (current_sender_open_id.get() or "") or _resolve_sender_open_id(event)
+
+    try:
+        enabled_toolsets = _resolve_enabled_toolsets(
+            config,
+            platform_key,
+            platform_tools_resolver=_get_platform_tools,
+            profile_home=profile_home,
+            shared_home=shared_hermes_home,
+            user_key=sender_open_id or None,
+            xai_credentials={"available": True, "source": "upstream_toolset"},
+        )
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc):
+            raise
+        enabled_toolsets = _resolve_enabled_toolsets(
+            config,
+            platform_key,
+            platform_tools_resolver=_get_platform_tools,
+        )
 
     # 6) Pull source / session metadata for AIAgent kwargs.
     source = getattr(event, "source", None)
@@ -3055,6 +3068,11 @@ def _resolve_enabled_toolsets(
     platform_key: str,
     *,
     platform_tools_resolver: Any,
+    profile_home: Path | None = None,
+    shared_home: Path | None = None,
+    user_key: str | None = None,
+    departments: list[str] | tuple[str, ...] | None = None,
+    xai_credentials: dict[str, Any] | None = None,
 ) -> Optional[list[str]]:
     """Resolve profile toolsets without dropping core non-Feishu abilities.
 
@@ -3073,12 +3091,38 @@ def _resolve_enabled_toolsets(
     explicit_toolsets = _normalize_toolset_list(explicit)
     mode = _toolsets_mode(config, platform_key)
 
+    def apply_discovery_policy(toolsets: list[str] | None) -> list[str] | None:
+        if not toolsets or not (profile_home or shared_home):
+            return toolsets
+        try:
+            from .discovery_policy import apply_toolset_policy
+
+            profile_name = profile_home.name if profile_home is not None else str(config.get("profile_name") or "")
+            if not profile_name:
+                return [item for item in toolsets if item != "x_search"]
+            root = shared_home
+            if root is None and profile_home is not None:
+                root = profile_home.parent.parent if profile_home.parent.name == "profiles" else profile_home
+            if root is None:
+                return [item for item in toolsets if item != "x_search"]
+            return apply_toolset_policy(
+                toolsets,
+                shared_home=root,
+                profile_name=profile_name,
+                user_key=user_key,
+                departments=departments,
+                xai_credentials=xai_credentials,
+            )
+        except Exception as exc:
+            logger.warning("[multitenancy] discovery policy filter failed: %s", exc)
+            return [item for item in toolsets if item != "x_search"]
+
     if explicit_toolsets and mode in {"explicit", "strict", "replace"}:
         logger.info(
             "[multitenancy] platform_toolsets explicit mode for %s: %s",
             platform_key, explicit_toolsets,
         )
-        return explicit_toolsets
+        return apply_discovery_policy(explicit_toolsets)
 
     default_toolsets: list[str] = []
     resolver_platform_key = "api_server" if platform_key == "webui" else platform_key
@@ -3118,9 +3162,9 @@ def _resolve_enabled_toolsets(
             "[multitenancy] platform_toolsets merged for %s: explicit=%s default=%s merged=%s",
             platform_key, explicit_toolsets, default_toolsets, merged,
         )
-        return merged
+        return apply_discovery_policy(merged)
 
-    return default_toolsets or None
+    return apply_discovery_policy(default_toolsets) or None
 
 
 def _fallback_default_toolsets(platform_key: str) -> list[str]:
