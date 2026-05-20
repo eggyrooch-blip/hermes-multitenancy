@@ -3205,6 +3205,77 @@ def test_bwrap_default_args_does_not_bind_entire_shared_home():
     ) in triples
 
 
+def test_wrap_linux_bwrap_binds_installed_shared_skill_symlink_targets(monkeypatch, tmp_path: Path):
+    """Profile skill symlinks to shared skills must resolve inside bwrap."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "skills" / "Keep" / "kep-prd-analysis"
+    (skill_source / "references").mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# KEP PRD Analysis\n", encoding="utf-8")
+    (skill_source / "references" / "architecture-examples.md").write_text("ref", encoding="utf-8")
+    skill_link = profile / "skills" / "Keep" / "kep-prd-analysis"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--dir", str(shared / "skills"), "--dir") in triples
+    assert ("--dir", str(shared / "skills" / "Keep"), "--ro-bind") in triples
+    assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+    assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
+
+
+def test_wrap_linux_bwrap_skips_secret_like_shared_skill_targets(monkeypatch, tmp_path: Path):
+    """A shared skill symlink is not mounted if its target later gains secrets."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "skills" / "Keep" / "secret-prd-analysis"
+    skill_source.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Secret PRD Analysis\n", encoding="utf-8")
+    (skill_source / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+    skill_link = profile / "skills" / "Keep" / "secret-prd-analysis"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) not in triples
+
+
 def test_bwrap_default_args_masks_profile_and_shared_secret_files():
     """The sandbox may use env-loaded secrets, but tools must not read secret files."""
     from hermes_multitenancy import agent_real

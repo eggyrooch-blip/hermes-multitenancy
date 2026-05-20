@@ -1702,6 +1702,9 @@ _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # sandbox-cross-platform-design.md §6 for the trade-off).
 _BWRAP_EXEC = "/usr/bin/bwrap"
 _BWRAP_ARGS_FILE = Path(__file__).parent / "sandbox" / "bwrap-default.args"
+_SANDBOX_SKILL_IGNORED_DIRS = {".git", ".github", ".hub", ".archive", "__pycache__"}
+_SANDBOX_SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
+_SANDBOX_SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
 
 
 def _resolve_hermes_agent_repo() -> Path:
@@ -1850,6 +1853,124 @@ def _render_bwrap_args(text: str, substitutions: dict[str, str]) -> list[str]:
     return tokens
 
 
+def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> list[str]:
+    """Expose only installed shared-skill symlink targets inside bwrap.
+
+    Profile skills are often stable symlinks to shared managed skill releases.
+    The base bwrap policy deliberately does not mount ``SHARED_HOME`` wholesale,
+    so those symlinks otherwise resolve to missing targets inside the sandbox.
+    We bind only symlink targets that the current profile already references,
+    and only when the target remains under approved shared skill roots.
+    """
+    skills_root = profile_home.expanduser().resolve(strict=False) / "skills"
+    if not skills_root.is_dir():
+        return []
+    shared = shared_home.expanduser().resolve(strict=False)
+    allowed_roots = [
+        (shared / "skills").resolve(strict=False),
+        (shared / "skill-releases").resolve(strict=False),
+    ]
+    targets: set[Path] = set()
+
+    for root, dirs, files in os.walk(skills_root, followlinks=False):
+        root_path = Path(root)
+        entries = list(dirs) + list(files)
+        for name in entries:
+            item = root_path / name
+            if not item.is_symlink():
+                continue
+            try:
+                resolved = item.resolve(strict=True)
+            except OSError:
+                continue
+            if not _is_safe_shared_skill_symlink_target(resolved, allowed_roots):
+                continue
+            if resolved.is_dir() and _sandbox_skill_tree_has_secret_files(resolved):
+                logger.warning(
+                    "[multitenancy] skipping shared skill sandbox bind with secret-like files: %s",
+                    resolved,
+                )
+                continue
+            if resolved.is_file() and _is_sandbox_secret_skill_file(resolved.name):
+                logger.warning(
+                    "[multitenancy] skipping shared skill sandbox bind for secret-like file: %s",
+                    resolved,
+                )
+                continue
+            targets.add(resolved)
+        dirs[:] = [
+            name
+            for name in dirs
+            if not (root_path / name).is_symlink()
+            and name not in _SANDBOX_SKILL_IGNORED_DIRS
+        ]
+
+    args: list[str] = []
+    created_dirs: set[Path] = set()
+    for target in sorted(targets, key=lambda p: str(p)):
+        for parent in _shared_skill_target_parent_dirs(target, shared):
+            if parent in created_dirs:
+                continue
+            args.extend(["--dir", str(parent)])
+            created_dirs.add(parent)
+        args.extend(["--ro-bind", str(target), str(target)])
+    return args
+
+
+def _is_safe_shared_skill_symlink_target(target: Path, allowed_roots: list[Path]) -> bool:
+    try:
+        resolved = target.resolve(strict=True)
+    except OSError:
+        return False
+    for root in allowed_roots:
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def _shared_skill_target_parent_dirs(target: Path, shared_home: Path) -> list[Path]:
+    dirs: list[Path] = []
+    parent = target.parent if target.is_file() else target.parent
+    try:
+        rel = parent.relative_to(shared_home)
+    except ValueError:
+        return dirs
+    current = shared_home
+    for part in rel.parts:
+        current = current / part
+        dirs.append(current)
+    return dirs
+
+
+def _sandbox_skill_tree_has_secret_files(src: Path) -> bool:
+    for root, dirs, files in os.walk(src, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = [
+            dirname
+            for dirname in dirs
+            if not (root_path / dirname).is_symlink()
+            and dirname not in _SANDBOX_SKILL_IGNORED_DIRS
+        ]
+        for filename in files:
+            item = root_path / filename
+            if item.is_symlink():
+                continue
+            rel = item.relative_to(src)
+            if _is_sandbox_secret_skill_file(rel):
+                return True
+    return False
+
+
+def _is_sandbox_secret_skill_file(rel_path: str | Path) -> bool:
+    path = Path(rel_path)
+    name = path.name.lower()
+    if name in _SANDBOX_SKILL_SECRET_FILE_NAMES:
+        return True
+    if name.endswith((".token", ".secret", ".key")):
+        return True
+    return any(part in name for part in _SANDBOX_SKILL_SECRET_NAME_PARTS)
+
+
 def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
     """Linux backend: wrap with /usr/bin/bwrap + bwrap-default.args.
 
@@ -1892,6 +2013,7 @@ def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
         "HERMES_MT_REPO": str(mt_repo),
     }
     bwrap_args = _render_bwrap_args(_BWRAP_ARGS_FILE.read_text(), substitutions)
+    bwrap_args.extend(_shared_skill_symlink_bwrap_args(profile_home_resolved, shared_home))
     wrapped = [_BWRAP_EXEC, *bwrap_args, "--", *cmd]
     logger.info(
         "[multitenancy] bwrap wrap: policy=%s profile=%s agent_repo=%s",
