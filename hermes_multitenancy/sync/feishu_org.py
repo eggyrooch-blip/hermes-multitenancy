@@ -34,6 +34,10 @@ SKILL_DISTRIBUTION_CONFIG_NAMES = (
     "skill-distribution.yaml",
     "skill-distribution.yml",
 )
+SKILL_BUNDLES_CONFIG_NAMES = (
+    "skill-bundles.yaml",
+    "skill-bundles.yml",
+)
 MANAGED_SKILL_MANIFEST = ".hermes-managed.json"
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -691,6 +695,7 @@ def plan_profile_skill_sync(
             "requires_token",
             "share_with_children",
             "inherited_from",
+            "bundle",
         ):
             if metadata.get(key) is not None:
                 item[key] = metadata[key]
@@ -776,11 +781,14 @@ def _desired_skill_metadata(
         metadata["requested_install_mode"] = install_mode
         metadata["secret_guard"] = "copy_filtered"
     for key in (
+        "requested_install_mode",
+        "secret_guard",
         "version",
         "token_policy",
         "requires_token",
         "share_with_children",
         "inherited_from",
+        "bundle",
     ):
         if spec.get(key) is not None:
             metadata[key] = spec[key]
@@ -788,27 +796,28 @@ def _desired_skill_metadata(
 
 
 def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
     distribution = _skill_distribution_config_path(shared_home)
     if distribution is not None:
         raw = yaml.safe_load(distribution.read_text(encoding="utf-8")) or {}
         items = raw.get("skills") or []
         if not isinstance(items, list):
             raise ValueError("skill distribution config must contain skills: []")
-        specs: list[dict[str, Any]] = []
         for item in items:
             spec = _coerce_skill_distribution_entry(item, employee, shared_home=shared_home)
             if spec is not None:
                 specs.append(spec)
-        return sorted(specs, key=lambda item: str(item["path"]))
-
-    return [
-        {
-            "path": rel_path,
-            "install_mode": "symlink" if _should_symlink_shared_skill(rel_path) else "copy",
-            "share_with_children": False,
-        }
-        for rel_path in _default_profile_skill_paths(shared_home)
-    ]
+    else:
+        specs.extend(
+            {
+                "path": rel_path,
+                "install_mode": "symlink" if _should_symlink_shared_skill(rel_path) else "copy",
+                "share_with_children": False,
+            }
+            for rel_path in _default_profile_skill_paths(shared_home)
+        )
+    specs.extend(_skill_bundle_profile_specs(shared_home, employee))
+    return sorted(specs, key=lambda item: str(item["path"]))
 
 
 def _child_profile_skill_specs_from_upstream(
@@ -840,7 +849,7 @@ def _child_profile_skill_specs_from_upstream(
         }
         if source_path is not None:
             spec["source_path"] = source_path
-        for key in ("version", "token_policy", "requires_token"):
+        for key in ("version", "token_policy", "requires_token", "bundle", "requested_install_mode", "secret_guard"):
             if metadata.get(key) is not None:
                 spec[key] = metadata[key]
         specs.append(spec)
@@ -849,6 +858,82 @@ def _child_profile_skill_specs_from_upstream(
 
 def _skill_distribution_config_path(shared_home: Path) -> Optional[Path]:
     return next((shared_home / name for name in SKILL_DISTRIBUTION_CONFIG_NAMES if (shared_home / name).exists()), None)
+
+
+def _skill_bundle_config_path(shared_home: Path) -> Optional[Path]:
+    return next((shared_home / name for name in SKILL_BUNDLES_CONFIG_NAMES if (shared_home / name).exists()), None)
+
+
+def _skill_bundle_profile_specs(shared_home: Path, employee: Employee) -> list[dict[str, Any]]:
+    config_path = _skill_bundle_config_path(shared_home)
+    if config_path is None:
+        return []
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    root = raw.get("skill_bundles") if isinstance(raw, dict) else None
+    if root is None and isinstance(raw, dict):
+        root = raw
+    if not isinstance(root, dict):
+        raise ValueError("skill bundles config must contain skill_bundles: {}")
+    bundles_raw = root.get("bundles") or {}
+    if isinstance(bundles_raw, list):
+        bundles = {
+            str(item.get("name") or item.get("id") or "").strip(): item
+            for item in bundles_raw
+            if isinstance(item, dict)
+        }
+    elif isinstance(bundles_raw, dict):
+        bundles = {str(name): value for name, value in bundles_raw.items()}
+    else:
+        raise ValueError("skill bundles config must contain bundles as mapping or list")
+
+    default_bundle_names = _as_string_set(root.get("default"))
+    specs: list[dict[str, Any]] = []
+    for bundle_name, bundle_raw in sorted(bundles.items()):
+        if not bundle_name or not isinstance(bundle_raw, dict):
+            continue
+        bundle_audience = bundle_raw.get("audience", "all")
+        if not _skill_audience_matches(bundle_audience, employee):
+            continue
+        if default_bundle_names and bundle_name not in default_bundle_names and _skill_audience_is_global(bundle_audience):
+            continue
+        skills = bundle_raw.get("skills") or []
+        if not isinstance(skills, list):
+            raise ValueError(f"skill bundle {bundle_name!r} must contain skills: []")
+        for item in skills:
+            coerced = _coerce_bundle_skill_entry(
+                item,
+                employee,
+                shared_home=shared_home,
+                bundle_name=bundle_name,
+                bundle=bundle_raw,
+            )
+            if coerced is not None:
+                specs.append(coerced)
+    return specs
+
+
+def _coerce_bundle_skill_entry(
+    item: Any,
+    employee: Employee,
+    *,
+    shared_home: Path,
+    bundle_name: str,
+    bundle: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if isinstance(item, str):
+        merged: dict[str, Any] = {"path": item}
+    elif isinstance(item, dict):
+        merged = dict(item)
+    else:
+        return None
+    for key in ("audience", "install_mode", "token_policy", "requires_token", "share_with_children", "source", "src", "version"):
+        if key not in merged and bundle.get(key) is not None:
+            merged[key] = bundle[key]
+    spec = _coerce_skill_distribution_entry(merged, employee, shared_home=shared_home)
+    if spec is None:
+        return None
+    spec["bundle"] = bundle_name
+    return spec
 
 
 def _coerce_skill_distribution_entry(
@@ -944,6 +1029,14 @@ def _skill_audience_matches(audience: Any, employee: Employee) -> bool:
     departments = _as_string_set(audience.get("departments") or audience.get("department_ids") or audience.get("dept_ids"))
     if departments and (employee.dept_id in departments or employee.dept_name in departments):
         return True
+    return False
+
+
+def _skill_audience_is_global(audience: Any) -> bool:
+    if audience is None:
+        return True
+    if isinstance(audience, str):
+        return audience.strip().lower() in {"all", "*", "everyone", "__all__"}
     return False
 
 

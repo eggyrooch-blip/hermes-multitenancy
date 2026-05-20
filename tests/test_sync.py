@@ -319,6 +319,215 @@ def test_sync_cli_plan_skills_outputs_secret_free_json(capsys, tmp_path):
     assert parsed["secret_free"] is True
 
 
+def test_plan_profile_skill_sync_reads_org_default_skill_bundle(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import Employee, plan_profile_skill_sync
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    org_skill = shared / "skills" / "org" / "default-docs"
+    org_skill.mkdir(parents=True)
+    (org_skill / "SKILL.md").write_text("# Default Docs\n", encoding="utf-8")
+    (shared / "skill-bundles.yaml").write_text(
+        """
+skill_bundles:
+  default:
+    - org-default
+  bundles:
+    org-default:
+      audience: all
+      skills:
+        - path: org/default-docs
+          install_mode: copy
+          token_policy: none
+""",
+        encoding="utf-8",
+    )
+
+    result = plan_profile_skill_sync(
+        profile,
+        shared,
+        Employee(
+            open_id="ou_alice",
+            user_id="alice",
+            agent_id="alice",
+            profile_name="alice",
+            name="Alice",
+            dept_id="od_ops",
+            dept_name="Ops",
+            leader_user_id=None,
+        ),
+    )
+
+    items = {item["path"]: item for item in result["items"]}
+    assert items["org/default-docs"]["change"] == "upstream_added"
+    assert items["org/default-docs"]["token_policy"] == "none"
+    assert items["org/default-docs"]["bundle"] == "org-default"
+    assert result["counts"]["upstream_added"] == 1
+
+
+def test_plan_profile_skill_sync_skips_non_default_global_skill_bundle(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import Employee, plan_profile_skill_sync
+
+    shared = tmp_path / ".hermes"
+    default_skill = shared / "skills" / "org" / "default-docs"
+    optional_skill = shared / "skills" / "org" / "optional-lab"
+    for skill in (default_skill, optional_skill):
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"# {skill.name}\n", encoding="utf-8")
+    (shared / "skill-bundles.yaml").write_text(
+        """
+skill_bundles:
+  default: [org-default]
+  bundles:
+    org-default:
+      audience: all
+      skills:
+        - org/default-docs
+    optional-lab:
+      audience: all
+      skills:
+        - org/optional-lab
+""",
+        encoding="utf-8",
+    )
+
+    result = plan_profile_skill_sync(
+        shared / "profiles" / "alice",
+        shared,
+        Employee(
+            open_id="ou_alice",
+            user_id="alice",
+            agent_id="alice",
+            profile_name="alice",
+            name="Alice",
+            dept_id="od_ops",
+            dept_name="Ops",
+            leader_user_id=None,
+        ),
+    )
+
+    paths = {item["path"] for item in result["items"]}
+    assert "org/default-docs" in paths
+    assert "org/optional-lab" not in paths
+
+
+def test_plan_profile_skill_sync_filters_department_skill_bundle_by_audience(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import Employee, plan_profile_skill_sync
+
+    shared = tmp_path / ".hermes"
+    finance_skill = shared / "skills" / "dept" / "finance-report"
+    finance_skill.mkdir(parents=True)
+    (finance_skill / "SKILL.md").write_text("# Finance Report\n", encoding="utf-8")
+    (shared / "skill-bundles.yaml").write_text(
+        """
+skill_bundles:
+  default: [org-default]
+  bundles:
+    org-default:
+      audience: all
+      skills: []
+    finance:
+      audience:
+        departments: [od_finance]
+      skills:
+        - path: dept/finance-report
+          install_mode: symlink
+          requires_token: false
+""",
+        encoding="utf-8",
+    )
+
+    finance = plan_profile_skill_sync(
+        shared / "profiles" / "alice",
+        shared,
+        Employee(
+            open_id="ou_alice",
+            user_id="alice",
+            agent_id="alice",
+            profile_name="alice",
+            name="Alice",
+            dept_id="od_finance",
+            dept_name="Finance",
+            leader_user_id=None,
+        ),
+    )
+    ops = plan_profile_skill_sync(
+        shared / "profiles" / "bob",
+        shared,
+        Employee(
+            open_id="ou_bob",
+            user_id="bob",
+            agent_id="bob",
+            profile_name="bob",
+            name="Bob",
+            dept_id="od_ops",
+            dept_name="Ops",
+            leader_user_id=None,
+        ),
+    )
+
+    assert "dept/finance-report" in {item["path"] for item in finance["items"]}
+    assert "dept/finance-report" not in {item["path"] for item in ops["items"]}
+
+
+def test_child_profile_inherits_only_shareable_bundle_skills(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import Employee, _sync_default_profile_skills, plan_profile_skill_sync
+
+    shared = tmp_path / ".hermes"
+    shared_skill = shared / "skills" / "org" / "readonly"
+    oauth_skill = shared / "skills" / "org" / "personal-oauth"
+    secret_skill = shared / "skills" / "org" / "secret-shared"
+    for skill in (shared_skill, oauth_skill, secret_skill):
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"# {skill.name}\n", encoding="utf-8")
+    (secret_skill / ".env").write_text("TOKEN=should-not-leak\n", encoding="utf-8")
+    (shared / "skill-bundles.yaml").write_text(
+        """
+skill_bundles:
+  default: [org-default]
+  bundles:
+    org-default:
+      audience: all
+      skills:
+        - path: org/readonly
+          install_mode: symlink
+          requires_token: false
+        - path: org/personal-oauth
+          install_mode: symlink
+          token_policy: user_oauth
+        - path: org/secret-shared
+          install_mode: symlink
+          token_policy: bot
+""",
+        encoding="utf-8",
+    )
+    owner = Employee(
+        open_id="ou_alice",
+        user_id="alice",
+        agent_id="alice",
+        profile_name="alice",
+        name="Alice",
+        dept_id="od_ops",
+        dept_name="Ops",
+        leader_user_id=None,
+    )
+    owner_home = shared / "profiles" / "alice"
+
+    assert _sync_default_profile_skills(owner_home, shared, owner) is True
+    child = plan_profile_skill_sync(
+        shared / "profiles" / "feishu_group_ops",
+        shared,
+        upstream_profile_home=owner_home,
+    )
+
+    items = {item["path"]: item for item in child["items"]}
+    assert "org/readonly" in items
+    assert "org/secret-shared" in items
+    assert "org/personal-oauth" not in items
+    assert items["org/secret-shared"]["secret_guard"] == "copy_filtered"
+    assert "should-not-leak" not in json.dumps(child, ensure_ascii=False)
+
+
 def test_profile_name_for_user_id_normalizes_to_hermes_profile_id():
     from hermes_multitenancy.sync import profile_name_for_user_id
 
