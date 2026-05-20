@@ -3335,11 +3335,11 @@ def _ensure_webui_agent_profile(
     config_path = profile_home / "config.yaml"
     if config_path.exists():
         _normalize_profile_config_file(config_path, shared_home=shared_home)
+        _disable_webui_agent_feishu_platform_file(config_path)
     else:
-        config_path.write_text(
-            _dump_profile_config(_profile_config_from_shared_home(shared_home)),
-            encoding="utf-8",
-        )
+        config = _profile_config_from_shared_home(shared_home)
+        _disable_webui_agent_feishu_platform(config)
+        config_path.write_text(_dump_profile_config(config), encoding="utf-8")
 
     soul_path = profile_home / "SOUL.md"
     if not soul_path.exists():
@@ -3657,6 +3657,31 @@ def _normalize_profile_config_file(config_path: Path, *, shared_home: Path) -> N
     after = json.dumps(normalized, sort_keys=True, ensure_ascii=True)
     if after != before:
         config_path.write_text(_dump_profile_config(normalized), encoding="utf-8")
+
+
+def _disable_webui_agent_feishu_platform_file(config_path: Path) -> None:
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.debug("multitenancy: failed to read WebUI agent config %s: %s", config_path, exc)
+        return
+    if not isinstance(loaded, dict):
+        return
+    before = json.dumps(loaded, sort_keys=True, ensure_ascii=True)
+    _disable_webui_agent_feishu_platform(loaded)
+    normalized = _normalize_profile_config(loaded)
+    after = json.dumps(normalized, sort_keys=True, ensure_ascii=True)
+    if after != before:
+        config_path.write_text(_dump_profile_config(normalized), encoding="utf-8")
+
+
+def _disable_webui_agent_feishu_platform(config: dict[str, Any]) -> None:
+    """WebUI group agents use lark-cli bot auth but must not connect Feishu."""
+    platforms = config.setdefault("platforms", {})
+    if isinstance(platforms, dict):
+        platforms["feishu"] = {"enabled": False}
 
 
 def _apply_lark_cli_profile_defaults(config: dict[str, Any]) -> None:

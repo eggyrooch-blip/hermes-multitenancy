@@ -884,7 +884,13 @@ def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_pat
     )
     (shared_home / "config.yaml").write_text(
         "model:\n  default: openai/test-model\n"
-        "platforms:\n  feishu:\n    enabled: true\n",
+        "platforms:\n"
+        "  feishu:\n"
+        "    enabled: true\n"
+        "    extra:\n"
+        "      app_id: cli_should_not_copy\n"
+        "      app_secret: secret_should_not_copy\n"
+        "      connection_mode: websocket\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
@@ -946,6 +952,10 @@ def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_pat
     config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
     assert "lark-cli" in config_text
     assert "platform_toolsets_mode" in config_text
+    assert "enabled: false" in config_text
+    assert "cli_should_not_copy" not in config_text
+    assert "secret_should_not_copy" not in config_text
+    assert "connection_mode" not in config_text
 
     env_text = (profile_home / ".env").read_text(encoding="utf-8")
     assert "FEISHU_HOME_CHANNEL" not in env_text
