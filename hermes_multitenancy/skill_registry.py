@@ -122,9 +122,12 @@ def audit_installed_skills(
     }
     if not profiles.is_dir():
         return report
+    from .curator_adapter import build_curator_dry_run_plan, load_usage
+
     for profile_home in sorted(p for p in profiles.iterdir() if p.is_dir()):
         skills_root = profile_home / "skills"
         installed = list_installed_skills(profile_home=profile_home)
+        curator_usage = load_usage(profile_home=profile_home)
         rows: list[dict[str, Any]] = []
         for rel_path, meta in installed.items():
             target = skills_root / rel_path
@@ -134,9 +137,13 @@ def audit_installed_skills(
                 rel_path=rel_path,
                 target=target,
                 meta=meta,
+                curator_usage=curator_usage,
             )
             rows.append(row)
         report["profiles"][profile_home.name] = {
+            "curator": {
+                "dry_run_plan": build_curator_dry_run_plan(profile_home=profile_home),
+            },
             "skills": rows,
         }
     return report
@@ -149,6 +156,7 @@ def _audit_one_skill(
     rel_path: str,
     target: Path,
     meta: dict[str, Any],
+    curator_usage: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     is_symlink = target.is_symlink()
@@ -180,6 +188,15 @@ def _audit_one_skill(
         "token_files_present": token_present,
         "warnings": warnings,
     }
+    from .curator_adapter import curator_metadata_for_skill
+
+    row["curator"] = curator_metadata_for_skill(
+        profile_home=profile_home,
+        skill_path=rel_path,
+        skill_md=skill_md,
+        source=row["source"],
+        usage=curator_usage,
+    )
     return row
 
 

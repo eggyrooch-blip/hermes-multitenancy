@@ -167,6 +167,13 @@ def test_audit_installed_skills_marks_managed_personal_unknown_and_warnings(tmp_
 
     report = audit_installed_skills(shared_home=shared, profiles_root=shared / "profiles")
 
+    assert report["profiles"]["alice"]["curator"] == {
+        "dry_run_plan": {
+            "command": ["hermes", "curator", "run", "--dry-run"],
+            "env": {"HERMES_HOME": str(profile)},
+            "executes": False,
+        }
+    }
     rows = {row["skill_path"]: row for row in report["profiles"]["alice"]["skills"]}
     assert rows["Keep/keep-record"]["source"] == "managed"
     assert rows["hub/personal-tool"]["source"] == "personal"
@@ -190,3 +197,188 @@ def test_audit_installed_skills_tolerates_nested_symlink_loop(tmp_path: Path):
 
     rows = report["profiles"]["alice"]["skills"]
     assert [row["skill_path"] for row in rows] == ["loop"]
+
+
+def test_audit_installed_skills_adds_curator_policy_without_exposing_tokens(tmp_path: Path):
+    from hermes_multitenancy.skill_registry import audit_installed_skills
+
+    shared = tmp_path / ".hermes"
+    shared_skill = shared / "skills" / "Keep" / "keep-record"
+    personal_skill = shared / "skills" / "scratch-agent"
+    shared_skill.mkdir(parents=True)
+    personal_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text(
+        "---\nname: keep-record\n---\n# Keep\n",
+        encoding="utf-8",
+    )
+    (personal_skill / "SKILL.md").write_text(
+        "---\nname: scratch-agent\n---\n# Scratch Agent\n",
+        encoding="utf-8",
+    )
+
+    profile = shared / "profiles" / "alice"
+    skills = profile / "skills"
+    skills.mkdir(parents=True)
+    (skills / ".hermes-managed.json").write_text(
+        """
+{
+  "version": 1,
+  "skills": {
+    "Keep/keep-record": {
+      "source": "managed",
+      "version": "2026.05.20"
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (skills / ".hermes-personal-installs.json").write_text(
+        """
+{
+  "version": 1,
+  "skills": {
+    "scratch-agent": {
+      "source": "personal"
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (skills / "Keep").mkdir()
+    (skills / "Keep" / "keep-record").symlink_to(shared_skill, target_is_directory=True)
+    (skills / "scratch-agent").symlink_to(personal_skill, target_is_directory=True)
+    (profile / "tokens").mkdir()
+    (profile / "tokens" / "scratch-agent.json").write_text(
+        '{"access_token":"secret-token"}',
+        encoding="utf-8",
+    )
+    (skills / ".usage.json").write_text(
+        """
+{
+  "keep-record": {
+    "created_by": "agent",
+    "use_count": 9,
+    "last_used_at": "2026-05-20T01:00:00+00:00",
+    "state": "active",
+    "pinned": false
+  },
+  "scratch-agent": {
+    "created_by": "agent",
+    "use_count": 2,
+    "last_used_at": "2026-05-20T02:00:00+00:00",
+    "state": "stale",
+    "pinned": true,
+    "access_token": "must-not-leak"
+  }
+}
+""",
+        encoding="utf-8",
+    )
+
+    report = audit_installed_skills(shared_home=shared, profiles_root=shared / "profiles")
+
+    rows = {row["skill_path"]: row for row in report["profiles"]["alice"]["skills"]}
+    assert rows["Keep/keep-record"]["curator"] == {
+        "eligible": False,
+        "reason": "managed_by_multitenancy",
+        "skill_name": "keep-record",
+        "state": "active",
+        "pinned": False,
+        "usage": {
+            "use_count": 9,
+            "view_count": 0,
+            "patch_count": 0,
+            "last_used_at": "2026-05-20T01:00:00+00:00",
+            "last_viewed_at": None,
+            "last_patched_at": None,
+            "latest_activity_at": "2026-05-20T01:00:00+00:00",
+            "activity_count": 9,
+        },
+    }
+    assert rows["scratch-agent"]["curator"]["eligible"] is True
+    assert rows["scratch-agent"]["curator"]["reason"] == "agent_created_personal_skill"
+    assert rows["scratch-agent"]["curator"]["pinned"] is True
+    assert rows["scratch-agent"]["curator"]["usage"]["activity_count"] == 2
+    assert "access_token" not in rows["scratch-agent"]["curator"]["usage"]
+    assert "secret-token" not in str(report)
+
+
+def test_audit_installed_skills_keeps_skillhub_installs_advisory_by_default(tmp_path: Path):
+    from hermes_multitenancy.skill_registry import audit_installed_skills
+
+    shared = tmp_path / ".hermes"
+    source = shared / "skills" / "hub" / "weather"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("---\nname: weather\n---\n# Weather\n", encoding="utf-8")
+    profile = shared / "profiles" / "alice"
+    (profile / "skills" / "hub").mkdir(parents=True)
+    (profile / "skills" / "hub" / "weather").symlink_to(source, target_is_directory=True)
+    (profile / "skills" / ".hermes-personal-installs.json").write_text(
+        """
+{
+  "version": 1,
+  "skills": {
+    "hub/weather": {
+      "source": "personal",
+      "install_mode": "symlink"
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (profile / "skills" / ".usage.json").write_text(
+        '{"weather":{"use_count":4,"last_used_at":"2026-05-20T03:00:00+00:00"}}',
+        encoding="utf-8",
+    )
+
+    report = audit_installed_skills(shared_home=shared, profiles_root=shared / "profiles")
+
+    row = report["profiles"]["alice"]["skills"][0]
+    assert row["curator"]["eligible"] is False
+    assert row["curator"]["reason"] == "personal_not_agent_created"
+    assert row["curator"]["usage"]["activity_count"] == 4
+
+
+def test_curator_dry_run_plan_is_profile_scoped_and_non_executing(tmp_path: Path):
+    from hermes_multitenancy.curator_adapter import build_curator_dry_run_plan
+
+    profile = tmp_path / ".hermes" / "profiles" / "alice"
+
+    plan = build_curator_dry_run_plan(profile_home=profile)
+
+    assert plan == {
+        "command": ["hermes", "curator", "run", "--dry-run"],
+        "env": {"HERMES_HOME": str(profile)},
+        "executes": False,
+    }
+
+
+def test_curator_metadata_blocks_org_shared_sources_even_when_agent_created(tmp_path: Path):
+    from hermes_multitenancy.curator_adapter import curator_metadata_for_skill
+
+    profile = tmp_path / ".hermes" / "profiles" / "alice"
+    skill = profile / "skills" / "org" / "default-profile"
+    skill.mkdir(parents=True)
+    skill_md = skill / "SKILL.md"
+    skill_md.write_text("---\nname: default-profile\n---\n# Default\n", encoding="utf-8")
+    usage = {
+        "default-profile": {
+            "created_by": "agent",
+            "use_count": 5,
+        }
+    }
+
+    for source in ("org", "shared"):
+        metadata = curator_metadata_for_skill(
+            profile_home=profile,
+            skill_path="org/default-profile",
+            skill_md=skill_md,
+            source=source,
+            usage=usage,
+        )
+
+        assert metadata["eligible"] is False
+        assert metadata["reason"] == f"{source}_skill_not_eligible"
