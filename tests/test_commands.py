@@ -49,6 +49,16 @@ def test_parse_unknown_slash_is_still_handled():
     assert parse_command("/") is None
 
 
+def test_parse_skill_slash_with_adjacent_url():
+    """Feishu command messages may omit the space between skill name and URL."""
+    from hermes_multitenancy.commands import parse_command
+
+    assert parse_command("/kep-prd-analysishttps://keep.feishu.cn/wiki/SJu6wjoWxiuUCVkhG79ch1cunNb") == (
+        "kep-prd-analysis",
+        "https://keep.feishu.cn/wiki/SJu6wjoWxiuUCVkhG79ch1cunNb",
+    )
+
+
 def test_parse_unescapes_feishu_markdown_command_name():
     from hermes_multitenancy.commands import parse_command, unknown_command_message
 
@@ -739,6 +749,78 @@ async def test_skill_slash_command_rewrites_into_agent_prompt(monkeypatch, tmp_p
     assert sends == ["agent ok"]
     assert "Hermes skill slash invocation" in caplog.text
     clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_group_skill_slash_with_adjacent_url_rewrites_into_agent_prompt(monkeypatch, tmp_path, caplog):
+    """Group command text like /kep-prd-analysishttps://... must still load the skill."""
+    import sys
+    from types import ModuleType
+
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy import router as router_mod
+
+    caplog.set_level("INFO")
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "group"
+    profile_home.mkdir()
+
+    async def fake_group_route(*, chat_id, gateway):
+        return "group", profile_home
+
+    monkeypatch.setattr(router_mod, "resolve_or_auto_provision_group_route", fake_group_route)
+    fake_skill_commands = SimpleNamespace(
+        get_skill_commands=lambda: {"/kep-prd-analysis": {"name": "kep-prd-analysis"}},
+        resolve_skill_command_key=lambda command: "/kep-prd-analysis"
+        if command.replace("_", "-") == "kep-prd-analysis"
+        else None,
+        build_skill_invocation_message=lambda cmd_key, user_instruction, task_id=None: (
+            f"[skill:{cmd_key} task:{task_id}] {user_instruction}"
+        ),
+    )
+    fake_skill_utils = SimpleNamespace(get_disabled_skill_names=lambda platform=None: set())
+    monkeypatch.setitem(sys.modules, "agent", ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+    monkeypatch.setitem(sys.modules, "agent.skill_utils", fake_skill_utils)
+
+    seen = {}
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            seen["profile_name"] = profile_name
+            seen["home"] = home
+            seen["text"] = event.text
+            return "agent ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: Pool())
+
+    sends = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    event = _build_event(
+        "/kep-prd-analysishttps://keep.feishu.cn/wiki/SJu6wjoWxiuUCVkhG79ch1cunNb",
+        user_id="ou_skill",
+        chat_id="oc_group",
+    )
+    event.source.chat_type = "group"
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+    await handle_async(event=event, gateway=gateway)
+
+    assert seen == {
+        "profile_name": "group",
+        "home": profile_home,
+        "text": (
+            "[skill:/kep-prd-analysis task:multitenancy:feishu:group:oc_group:ou_skill] "
+            "https://keep.feishu.cn/wiki/SJu6wjoWxiuUCVkhG79ch1cunNb"
+        ),
+    }
+    assert sends == ["agent ok"]
+    assert "Hermes skill slash invocation" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -1124,6 +1124,7 @@ def _build_subprocess_env(
             p.strip() for p in allowlist_raw.split(",") if p.strip()
         }:
             env["HERMES_SANDBOX_HOST"] = "1"
+            env.setdefault("HERMES_YOLO_MODE", "1")
 
     if extra:
         env.update(extra)

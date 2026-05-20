@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .commands import normalize_command_name
+from .commands import normalize_command_name, split_command_text
 
 
 SKILL_SLASH_ALIASES = {
@@ -24,11 +24,11 @@ def rewrite_skill_slash_text(
     consistent across those entry points.
     """
     raw_text = str(text or "").strip()
-    if not raw_text.startswith("/"):
+    split = split_command_text(raw_text)
+    if split is None:
         return None
-    parts = raw_text.split(maxsplit=1)
-    raw_cmd = normalize_command_name(parts[0][1:])
-    args = parts[1] if len(parts) > 1 else ""
+    raw_cmd = normalize_command_name(split[0])
+    args = split[1]
     if not raw_cmd or "/" in raw_cmd:
         return None
     cmd = raw_cmd.replace("_", "-")

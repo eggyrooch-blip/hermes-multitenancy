@@ -7,7 +7,11 @@ fallback only keeps the plugin testable outside a Hermes checkout.
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
+
+
+_ADJACENT_URL_COMMAND_RE = re.compile(r"^([A-Za-z0-9_.\\-]+)(https?://.+)$", re.IGNORECASE)
 
 
 _FALLBACK_ALIASES = {
@@ -76,6 +80,27 @@ def normalize_command_name(name: str) -> str:
     )
 
 
+def split_command_text(text: str) -> Optional[tuple[str, str]]:
+    """Split slash command text into raw command name and args.
+
+    Feishu command messages sometimes arrive as ``/skillhttps://...`` when
+    the user picks a command and pastes a URL immediately after it. Treat that
+    as ``/skill https://...`` while preserving the existing path rejection for
+    normal ``/some/path`` text.
+    """
+    if not text or not text.startswith("/"):
+        return None
+    parts = text.split(maxsplit=1)
+    raw = parts[0][1:]
+    args = parts[1] if len(parts) > 1 else ""
+    adjacent = _ADJACENT_URL_COMMAND_RE.match(raw)
+    if adjacent:
+        raw = adjacent.group(1)
+        adjacent_args = adjacent.group(2)
+        args = f"{adjacent_args} {args}".strip() if args else adjacent_args
+    return raw, args
+
+
 def parse_command(text: str) -> Optional[tuple[str, str]]:
     """Parse a slash command. Returns ``(canonical_command, args)`` or ``None``.
 
@@ -83,11 +108,11 @@ def parse_command(text: str) -> Optional[tuple[str, str]]:
     native unknown-command guidance instead of leaking ``/unknown`` into the
     LLM as a normal prompt.
     """
-    if not text or not text.startswith("/"):
+    split = split_command_text(text)
+    if split is None:
         return None
-    parts = text.split(maxsplit=1)
-    raw = normalize_command_name(parts[0][1:])
-    args = parts[1] if len(parts) > 1 else ""
+    raw = normalize_command_name(split[0])
+    args = split[1]
     # Reject paths and known-bad shapes
     if "/" in raw or not raw:
         return None

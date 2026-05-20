@@ -2221,6 +2221,21 @@ def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
     assert stream_env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
 
 
+def test_build_subprocess_env_auto_approves_inside_sandbox_host(monkeypatch, tmp_path: Path):
+    """Sandboxed routed profiles should not pause on duplicate dangerous-command prompts."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "owner"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["HERMES_SANDBOX_HOST"] == "1"
+    assert env["HERMES_YOLO_MODE"] == "1"
+
+
 def test_build_subprocess_env_prepends_shared_bin_to_path(monkeypatch, tmp_path: Path):
     """Shared Hermes-managed CLI installs must be callable while token state stays profile-local."""
     from hermes_multitenancy import agent_real
