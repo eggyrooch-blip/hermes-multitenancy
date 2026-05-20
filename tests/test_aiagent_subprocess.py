@@ -629,7 +629,7 @@ async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_stream_aiagent_subprocess_wait_heartbeat_does_not_become_reasoning(monkeypatch, tmp_path: Path):
+async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_status(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
     class FakeStdin:
@@ -686,7 +686,9 @@ async def test_stream_aiagent_subprocess_wait_heartbeat_does_not_become_reasonin
         async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
     ]
 
-    assert events == [("done", "ok")]
+    assert events[0][0] == "status"
+    assert "Hermes 正在准备响应." in events[0][1]
+    assert events[-1] == ("done", "ok")
 
 
 @pytest.mark.asyncio
@@ -753,7 +755,7 @@ async def test_stream_aiagent_subprocess_emits_status_while_waiting_after_first_
 
     assert events[0] == ("tool_started", {"name": "delegate_task"})
     assert events[1][0] == "status"
-    assert "正在等待当前工具或子任务输出" in events[1][1]
+    assert "正在等待当前工具或子任务输出." in events[1][1]
     assert events[-1] == ("done", "ok")
 
 

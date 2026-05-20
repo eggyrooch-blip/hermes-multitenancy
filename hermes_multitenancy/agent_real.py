@@ -2049,7 +2049,7 @@ async def _run_aiagent_subprocess(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
-    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "1200"))
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env_scope = _aiagent_subprocess_env_scope(event, profile_home, approval_dir=approval_dir)
     env_scope_entered = False
@@ -2369,7 +2369,7 @@ async def _stream_aiagent_subprocess(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
-    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "1200"))
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env_scope = _aiagent_subprocess_env_scope(
         event,
@@ -2455,12 +2455,12 @@ async def _stream_aiagent_subprocess(
                         total_elapsed,
                         heartbeat_count,
                     )
-                    if first_event_logged:
-                        yield (
-                            "status",
-                            "Hermes 正在等待当前工具或子任务输出，"
-                            f"已等待 {int(total_elapsed)} 秒。",
-                        )
+                    dots = "." * (((heartbeat_count - 1) % 3) + 1)
+                    phase = "等待当前工具或子任务输出" if first_event_logged else "准备响应"
+                    yield (
+                        "status",
+                        f"Hermes 正在{phase}{dots} 已等待 {int(total_elapsed)} 秒。",
+                    )
                 line = read_task.result()
             finally:
                 if not read_task.done():

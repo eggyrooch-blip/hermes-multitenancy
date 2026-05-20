@@ -511,6 +511,7 @@ def _clean_stream_display_text(text: str, profile_home: Optional[Path] = None) -
         cleaned = cleaned.rstrip()
     cleaned = cleaned.replace("[[as_document]]", "")
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).rstrip()
+    cleaned = _linkify_feishu_document_ids(cleaned)
     if profile_home is not None:
         cleaned = _strip_plain_profile_file_paths_for_display(cleaned, profile_home)
         if not Path(profile_home).name.startswith(_GROUP_PROFILE_PREFIX):
@@ -535,6 +536,11 @@ _PROFILE_FILE_PATH_RE = re.compile(
     r'''(?P<path>(?:/workspace|/[^`"'<>\n\r]+?)'''
     r'''\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'''
     r'''epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|json|md|markdown))'''
+)
+_FEISHU_DOCUMENT_ID_LINE_RE = re.compile(
+    r"(?m)^(?P<prefix>\s*(?:🆔\s*)?(?:(?:飞书)?(?:云)?文档|wiki|Wiki|WIKI|知识库)\s*"
+    r"(?:ID|Id|id|Token|token|令牌)?\s*[:：]\s*)"
+    r"[`\"']?(?P<token>[A-Za-z0-9]{20,})[`\"']?(?P<suffix>\s*)$"
 )
 _AUTO_FILE_DELIVERY_MAX_BYTES = int(os.getenv("HERMES_MULTITENANCY_AUTO_FILE_DELIVERY_MAX_BYTES", "52428800"))
 _MARKDOWN_DOCUMENT_EXTENSIONS = {".md", ".markdown"}
@@ -564,15 +570,117 @@ async def _deliver_media_from_stream_response(
     profile_home: Path,
 ) -> None:
     """Delegate post-stream media attachment delivery to Hermes' native gateway path."""
-    deliver = getattr(gateway, "_deliver_media_from_response", None)
-    if not callable(deliver):
-        return
     response = _materialize_response_artifacts(response, profile_home)
     response_with_files = _append_profile_file_media_directives(response, profile_home)
     scoped_response = _profile_scoped_media_response(response_with_files, profile_home)
     if "MEDIA:" not in scoped_response:
         return
+    delivered = await _deliver_profile_scoped_media_directives(adapter, event, gateway, scoped_response)
+    if delivered:
+        return
+    deliver = getattr(gateway, "_deliver_media_from_response", None)
+    if not callable(deliver):
+        logger.warning("multitenancy: no post-stream media delivery surface available")
+        return
     await deliver(scoped_response, event, adapter)
+
+
+def _feishu_document_base_url() -> Optional[str]:
+    configured = os.getenv("HERMES_FEISHU_DOCUMENT_BASE_URL", "").strip()
+    return configured.rstrip("/") if configured else "https://feishu.cn"
+
+
+def _linkify_feishu_document_ids(text: str) -> str:
+    """Turn visible Feishu document tokens into clickable document URLs."""
+    raw = str(text or "")
+    if not raw:
+        return raw
+    base = _feishu_document_base_url()
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group("token")
+        prefix = match.group("prefix").lower()
+        resource = "wiki" if "wiki" in prefix or "知识库" in prefix else "docx"
+        label = "飞书 Wiki 链接" if resource == "wiki" else "飞书文档链接"
+        return f"🔗 {label}：{base}/{resource}/{token}"
+
+    return _FEISHU_DOCUMENT_ID_LINE_RE.sub(repl, raw)
+
+
+_MEDIA_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+_MEDIA_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+_MEDIA_AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac"}
+
+
+async def _deliver_profile_scoped_media_directives(
+    adapter: Any,
+    event: Any,
+    gateway: Any,
+    scoped_response: str,
+) -> int:
+    """Deliver already-scoped MEDIA directives without upstream path regex loss."""
+    if adapter is None:
+        return 0
+    source = getattr(event, "source", None)
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    if not chat_id:
+        return 0
+    force_document = "[[as_document]]" in str(scoped_response or "")
+    audio_as_voice = "[[audio_as_voice]]" in str(scoped_response or "")
+    metadata = _thread_metadata_for_media_delivery(gateway, event)
+    delivered = 0
+    seen: set[Path] = set()
+    for match in _MEDIA_DIRECTIVE_RE.finditer(str(scoped_response or "")):
+        raw_path = match.group("path").strip().strip("`\"'")
+        path = Path(raw_path).expanduser().resolve(strict=False)
+        if path in seen or not path.exists() or not path.is_file():
+            continue
+        seen.add(path)
+        ext = path.suffix.lower()
+        try:
+            if ext in _MEDIA_IMAGE_EXTENSIONS and not force_document and hasattr(adapter, "send_image_file"):
+                result = await adapter.send_image_file(chat_id=chat_id, image_path=str(path), metadata=metadata)
+            elif ext in _MEDIA_VIDEO_EXTENSIONS and hasattr(adapter, "send_video"):
+                result = await adapter.send_video(chat_id=chat_id, video_path=str(path), metadata=metadata)
+            elif ext in _MEDIA_AUDIO_EXTENSIONS and audio_as_voice and hasattr(adapter, "send_voice"):
+                result = await adapter.send_voice(chat_id=chat_id, audio_path=str(path), metadata=metadata)
+            elif hasattr(adapter, "send_document"):
+                result = await adapter.send_document(
+                    chat_id=chat_id,
+                    file_path=str(path),
+                    file_name=path.name,
+                    metadata=metadata,
+                )
+            else:
+                continue
+            if getattr(result, "success", True):
+                delivered += 1
+                logger.info("multitenancy: delivered post-stream media attachment path=%s", path)
+            else:
+                logger.warning(
+                    "multitenancy: post-stream media delivery failed path=%s error=%s",
+                    path,
+                    getattr(result, "error", None),
+                )
+        except Exception as exc:
+            logger.warning("multitenancy: post-stream media delivery failed path=%s error=%s", path, exc)
+    return delivered
+
+
+def _thread_metadata_for_media_delivery(gateway: Any, event: Any) -> Optional[dict[str, Any]]:
+    try:
+        source = getattr(event, "source", None)
+        reply_anchor = None
+        anchor_fn = getattr(gateway, "_reply_anchor_for_event", None)
+        if callable(anchor_fn):
+            reply_anchor = anchor_fn(event)
+        meta_fn = getattr(gateway, "_thread_metadata_for_source", None)
+        if callable(meta_fn):
+            metadata = meta_fn(source, reply_anchor)
+            return dict(metadata) if isinstance(metadata, dict) else metadata
+    except Exception as exc:
+        logger.debug("multitenancy: thread metadata lookup for media delivery failed: %s", exc)
+    return None
 
 
 def _materialize_response_artifacts(response: str, profile_home: Path) -> str:

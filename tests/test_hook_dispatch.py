@@ -1930,6 +1930,40 @@ def test_plain_profile_file_paths_are_hidden_from_visible_text(tmp_path):
     assert (profile_home / "workspace" / "Downloads" / "report.md").read_text(encoding="utf-8") == "report"
 
 
+def test_feishu_document_id_is_rendered_as_link_when_tenant_base_url_configured(monkeypatch):
+    """Skill output can hand users a clickable doc URL for configured tenants."""
+    from hermes_multitenancy import router as router_mod
+
+    monkeypatch.setenv("HERMES_FEISHU_DOCUMENT_BASE_URL", "https://docs.example.feishu.cn")
+    visible = router_mod._clean_stream_display_text(
+        "📄 文档：260 9.0 voc反馈优化（平台部分）\n"
+        "🆔 飞书文档ID：EOWEwIt58iEhR8kaSkycakM3nge"
+    )
+
+    assert "飞书文档ID" not in visible
+    assert "https://docs.example.feishu.cn/docx/EOWEwIt58iEhR8kaSkycakM3nge" in visible
+
+
+def test_feishu_document_id_uses_public_feishu_domain_without_tenant_base_url(monkeypatch):
+    """Open-source defaults use Feishu's public URL, not a company tenant domain."""
+    from hermes_multitenancy import router as router_mod
+
+    monkeypatch.delenv("HERMES_FEISHU_DOCUMENT_BASE_URL", raising=False)
+    visible = router_mod._clean_stream_display_text("🆔 飞书文档ID：EOWEwIt58iEhR8kaSkycakM3nge")
+
+    assert visible == "🔗 飞书文档链接：https://feishu.cn/docx/EOWEwIt58iEhR8kaSkycakM3nge"
+
+
+def test_feishu_wiki_token_is_rendered_as_wiki_link(monkeypatch):
+    """Wiki-space tokens should keep the /wiki/ route instead of /docx/."""
+    from hermes_multitenancy import router as router_mod
+
+    monkeypatch.delenv("HERMES_FEISHU_DOCUMENT_BASE_URL", raising=False)
+    visible = router_mod._clean_stream_display_text("wiki token：QHwGwy1cJidhf2k6oyjcmgLdnAh")
+
+    assert visible == "🔗 飞书 Wiki 链接：https://feishu.cn/wiki/QHwGwy1cJidhf2k6oyjcmgLdnAh"
+
+
 def test_plain_profile_markdown_paths_are_hidden_from_visible_text(tmp_path):
     """Both .md and .markdown source files are delivered without exposing host paths."""
     from hermes_multitenancy import router as router_mod
@@ -1947,6 +1981,48 @@ def test_plain_profile_markdown_paths_are_hidden_from_visible_text(tmp_path):
     assert "[Markdown 源文件已自动发送]" in visible
     assert workspace_report.read_text(encoding="utf-8") == "report"
     assert f"MEDIA:{workspace_report.resolve()}" in response
+
+
+@pytest.mark.asyncio
+async def test_post_stream_media_delivery_sends_chinese_markdown_filename_directly(tmp_path):
+    """Upstream MEDIA extraction misses Chinese .md filenames; multitenancy must not."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    source = profile_home / ".ai-docs" / "技术方案_260.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("report", encoding="utf-8")
+    event = _build_event(chat_id="oc_chat")
+
+    class Adapter:
+        def __init__(self):
+            self.documents = []
+
+        async def send_document(self, **kwargs):
+            self.documents.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    adapter = Adapter()
+    gateway = SimpleNamespace()
+
+    await router_mod._deliver_media_from_stream_response(
+        gateway,
+        f"💾 方案已保存：{source}",
+        event,
+        adapter,
+        profile_home,
+    )
+
+    workspace_file = profile_home / "workspace" / "Downloads" / "技术方案_260.md"
+    assert workspace_file.read_text(encoding="utf-8") == "report"
+    assert adapter.documents == [
+        {
+            "chat_id": "oc_chat",
+            "file_path": str(workspace_file.resolve()),
+            "file_name": "技术方案_260.md",
+            "metadata": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
