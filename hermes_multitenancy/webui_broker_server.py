@@ -365,7 +365,7 @@ async def _default_dispatch_agent(
         messages = request.messages or None
         async for kind, payload in stream_run_agent(event, profile_home, messages=messages):
             if kind == "content":
-                text = str(payload or "")
+                text = router_mod._webui_profile_scoped_media_response(str(payload or ""), profile_home)
                 if text:
                     content_parts.append(text)
                     await _maybe_await(
@@ -424,7 +424,8 @@ async def _default_dispatch_agent(
             # Return "" so RunBroker.run does NOT emit it a second time.
             return ""
         # Nothing streamed — fall back to one-shot; RunBroker emits it once.
-        return await real_run_agent(event, profile_home, messages=messages)
+        fallback_text = await real_run_agent(event, profile_home, messages=messages)
+        return router_mod._webui_profile_scoped_media_response(fallback_text, profile_home)
     finally:
         _PROFILE_HOME_VAR.reset(token)
 

@@ -116,6 +116,62 @@ def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_
     asyncio.run(runner())
 
 
+def test_webui_run_broker_streams_media_as_workspace_alias(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    generated = profile_home / "home" / "generated_art.png"
+    generated.parent.mkdir(parents=True)
+    generated.write_bytes(b"png")
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", f"done\nMEDIA:{generated}"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "generate image",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert "MEDIA:/workspace/Downloads/generated_art.png" in body
+        assert str(generated) not in body
+        assert (profile_home / "workspace" / "Downloads" / "generated_art.png").read_bytes() == b"png"
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 

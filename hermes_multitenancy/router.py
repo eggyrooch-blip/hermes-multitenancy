@@ -1001,6 +1001,27 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
     return _MEDIA_DIRECTIVE_RE.sub(repl, str(response or ""))
 
 
+def _webui_profile_scoped_media_response(response: str, profile_home: Path) -> str:
+    """Scope outbound MEDIA and expose workspace files through browser-safe aliases."""
+    root = profile_home.expanduser().resolve(strict=False)
+    scoped = _profile_scoped_media_response(response, root)
+
+    def repl(match: re.Match[str]) -> str:
+        raw_path = match.group("path").strip()
+        candidate = Path(raw_path).expanduser()
+        if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
+            return match.group(0)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        workspace_root = (root / "workspace").resolve(strict=False)
+        if resolved == workspace_root or workspace_root in resolved.parents:
+            return f"{match.group('prefix')}{_workspace_alias_for_profile_file(resolved, root)}{match.group('suffix')}"
+        return match.group(0)
+
+    return _MEDIA_DIRECTIVE_RE.sub(repl, scoped)
+
+
 def _publish_mentioned_profile_file(raw_path: str, profile_home: Path) -> Optional[Path]:
     if raw_path == "/workspace" or raw_path.startswith("/workspace/"):
         workspace_relative = raw_path.removeprefix("/workspace").lstrip("/")
@@ -1172,6 +1193,7 @@ def _resolve_profile_media_artifact(raw_path: str, profile_home: Path) -> Option
     if not name:
         return None
     search_dirs = (
+        profile_home / "home",
         profile_home / "home" / "Downloads",
         profile_home / "cache" / "images",
         profile_home / "tmp",
@@ -1199,11 +1221,12 @@ def _publish_profile_media_artifact(source: Path, profile_home: Path) -> Optiona
         root / "tmp",
         root / "data",
     )
+    direct_home_file = source.parent == (root / "home").resolve(strict=False)
     source_in_artifacts = any(
         source == directory.resolve(strict=False)
         or directory.resolve(strict=False) in source.parents
         for directory in artifact_dirs
-    )
+    ) or direct_home_file
     if not source_in_artifacts:
         return None
     target_dir = (workspace_root / "Downloads").resolve(strict=False)

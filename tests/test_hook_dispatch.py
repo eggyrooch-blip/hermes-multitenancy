@@ -53,6 +53,98 @@ def test_profile_scoped_media_response_rewrites_temp_path_to_profile_artifact(tm
     assert workspace_artifact.read_bytes() == b"png"
 
 
+def test_profile_scoped_media_response_publishes_direct_profile_home_file(tmp_path):
+    """Files generated directly under profile home are published for WebUI chat downloads."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    source = profile_home / "home" / "generated_art.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"png")
+    workspace_artifact = profile_home / "workspace" / "Downloads" / "generated_art.png"
+
+    response = router_mod._profile_scoped_media_response(
+        f"created\nMEDIA:{source}",
+        profile_home,
+    )
+
+    assert response == f"created\nMEDIA:{workspace_artifact.resolve()}"
+    assert workspace_artifact.read_bytes() == b"png"
+
+
+def test_profile_scoped_media_response_resolves_temp_path_to_direct_profile_home_file(tmp_path):
+    """Tool-reported temp paths can resolve to same-name direct profile-home artifacts."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    source = profile_home / "home" / "generated_art.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"png")
+    workspace_artifact = profile_home / "workspace" / "Downloads" / "generated_art.png"
+
+    response = router_mod._profile_scoped_media_response(
+        "created\nMEDIA:/tmp/generated_art.png",
+        profile_home,
+    )
+
+    assert response == f"created\nMEDIA:{workspace_artifact.resolve()}"
+    assert workspace_artifact.read_bytes() == b"png"
+
+
+def test_webui_profile_scoped_media_response_uses_workspace_alias_for_direct_home_file(tmp_path):
+    """WebUI streamed MEDIA paths should be browser-downloadable workspace aliases."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    source = profile_home / "home" / "generated_art.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"png")
+    workspace_artifact = profile_home / "workspace" / "Downloads" / "generated_art.png"
+
+    response = router_mod._webui_profile_scoped_media_response(
+        f"created\nMEDIA:{source}",
+        profile_home,
+    )
+
+    assert response == "created\nMEDIA:/workspace/Downloads/generated_art.png"
+    assert workspace_artifact.read_bytes() == b"png"
+
+
+def test_webui_profile_scoped_media_response_maps_workspace_absolute_to_alias(tmp_path):
+    """Existing workspace artifacts are exposed to WebUI without server absolute paths."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    source = profile_home / "workspace" / "Downloads" / "report.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# ok", encoding="utf-8")
+
+    response = router_mod._webui_profile_scoped_media_response(
+        f"done\nMEDIA:{source}",
+        profile_home,
+    )
+
+    assert response == "done\nMEDIA:/workspace/Downloads/report.md"
+
+
+def test_profile_scoped_media_response_does_not_publish_nested_profile_home_dotdir(tmp_path):
+    """Only direct profile-home files are treated as generated artifacts."""
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    source = profile_home / "home" / ".lark-cli" / "state.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"png")
+
+    response = router_mod._profile_scoped_media_response(
+        f"created\nMEDIA:{source}",
+        profile_home,
+    )
+
+    assert response == f"created\nMEDIA:{source.resolve()}"
+    assert not (profile_home / "workspace" / "Downloads" / "state.png").exists()
+
+
 def test_profile_scoped_media_response_maps_sandbox_workspace_path(tmp_path):
     """Sandbox /workspace MEDIA paths map back to the routed profile workspace."""
     from hermes_multitenancy import router as router_mod
