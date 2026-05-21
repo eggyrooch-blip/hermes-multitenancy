@@ -85,6 +85,7 @@ _MODEL_ENV_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 _AIAGENT_TOOL_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    "FAL_KEY",
     "TAVILY_API_KEY",
     "TAVILY_BASE_URL",
 })

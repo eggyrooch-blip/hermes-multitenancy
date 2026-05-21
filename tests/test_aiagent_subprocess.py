@@ -555,6 +555,44 @@ def test_shared_tavily_env_reaches_aiagent_without_terminal_force(monkeypatch, t
     assert "_HERMES_FORCE_TAVILY_API_KEY" not in env
 
 
+def test_shared_fal_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "FAL_KEY=fal-test",
+                "UNRELATED_SECRET=do-not-forward",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    loaded = agent_real._profile_env_for_aiagent(profile_home)
+    assert loaded["FAL_KEY"] == "fal-test"
+    assert "UNRELATED_SECRET" not in loaded
+
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_FAL_KEY", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["FAL_KEY"] == "fal-test"
+        assert "_HERMES_FORCE_FAL_KEY" not in os.environ
+    finally:
+        cleanup()
+    assert "FAL_KEY" not in os.environ
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert env["FAL_KEY"] == "fal-test"
+    assert "_HERMES_FORCE_FAL_KEY" not in env
+
+
 def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
     from hermes_multitenancy import agent_real
 
