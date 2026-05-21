@@ -664,7 +664,7 @@ async def test_enrich_via_hermes_pipeline_times_out_image_preprocessing(monkeypa
 
     enriched = await router_mod._enrich_via_hermes_pipeline(event, Gateway())
 
-    assert "something went wrong when I tried to look at it" in enriched
+    assert "vision auto-analysis timed out" in enriched
     assert "vision_analyze" in enriched
 
 
@@ -1854,6 +1854,29 @@ async def test_handle_async_short_circuits_when_image_vision_is_unavailable(monk
     assert "FEISHU_MEDIA_FILE_JPG_TEST" in sent[0][1]
 
     clear_spike_routes()
+
+
+def test_image_vision_unavailable_response_reports_timeout_without_provider_repair(tmp_path):
+    """Image preprocessing timeout should not tell users to fix provider credentials."""
+    from hermes_multitenancy import router as router_mod
+
+    event = SimpleNamespace(
+        message_id="om_timeout",
+        media_urls=[str(tmp_path / "cache" / "images" / "img_timeout.jpg")],
+        media_types=["image/jpeg"],
+    )
+    enriched = (
+        "[The user sent an image but vision auto-analysis timed out before vision_analyze completed "
+        f"using image_url: {event.media_urls[0]}. Feishu message_id: om_timeout.]"
+    )
+
+    response = router_mod._image_vision_unavailable_response(event, enriched)
+
+    assert response is not None
+    assert "超时" in response
+    assert "provider/key" not in response
+    assert "provider rejected" not in response
+    assert "om_timeout" in response
 
 
 @pytest.mark.asyncio

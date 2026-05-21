@@ -1281,12 +1281,17 @@ def _image_vision_unavailable_response(event: Any, enriched_text: Optional[str])
         return None
     text = str(enriched_text or "")
     lowered = text.lower()
+    timeout_markers = (
+        "vision auto-analysis timed out",
+        "image preprocessing timed out",
+    )
     failure_markers = (
         "something went wrong when i tried to look at it",
         "couldn't quite see it",
         "vision auto-analysis error",
     )
-    if not any(marker in lowered for marker in failure_markers):
+    is_timeout = any(marker in lowered for marker in timeout_markers)
+    if not (is_timeout or any(marker in lowered for marker in failure_markers)):
         return None
 
     names: list[str] = []
@@ -1297,17 +1302,28 @@ def _image_vision_unavailable_response(event: Any, enriched_text: Optional[str])
     suffix = f"\n已收到图片附件：{', '.join(names[:3])}。" if names else ""
     message_id = _event_message_id(event)
     message_note = f"\nFeishu message_id: {message_id}" if message_id else ""
+    if is_timeout:
+        return (
+            "无法读取图片内容：已收到图片附件，但自动视觉分析超时。"
+            f"{suffix}{message_note}\n可以稍后重试，或提高图片预分析超时时间后再试。"
+        )
     return (
         "无法读取图片内容：当前图片视觉分析不可用，vision_analyze provider rejected the request。"
         f"{suffix}{message_note}\n请修复 profile 的 vision provider/key 后重试。"
     )
 
 
-def _image_prep_unavailable_note(event: Any) -> str:
+def _image_prep_unavailable_note(event: Any, *, reason: str = "provider") -> str:
     paths = ", ".join(str(path) for path in (getattr(event, "media_urls", None) or [])[:3])
     suffix = f" using image_url: {paths}" if paths else ""
     message_id = _event_message_id(event)
     message_note = f" Feishu message_id: {message_id}." if message_id else ""
+    if reason == "timeout":
+        return (
+            "[The user sent an image but vision auto-analysis timed out before vision_analyze completed. "
+            "You can try again later or examine it yourself with vision_analyze"
+            f"{suffix}.{message_note}]"
+        )
     return (
         "[The user sent an image but something went wrong when I tried to look at it~ "
         "You can try examining it yourself with vision_analyze"
@@ -1427,7 +1443,7 @@ async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]
                     native_text = await prep_call
             except asyncio.TimeoutError:
                 logger.warning("multitenancy: image preprocessing timed out")
-                native_text = _image_prep_unavailable_note(event)
+                native_text = _image_prep_unavailable_note(event, reason="timeout")
             except Exception as exc:
                 logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
 
