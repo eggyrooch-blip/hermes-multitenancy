@@ -107,6 +107,127 @@ def test_run_broker_dedupes_before_dispatch():
     assert calls == ["hi"]
 
 
+def test_router_mark_seen_dedupes_webui_with_explicit_idempotency_key(tmp_path):
+    from hermes_multitenancy import router
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.sessions import SessionStore
+
+    router.override_session_store(SessionStore(tmp_path / "sessions.db"))
+    calls = []
+
+    async def dispatch(request):
+        calls.append(request.content)
+        return "ok"
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        mark_seen=router._mark_run_request_seen,
+        sandbox_available=lambda: True,
+    )
+
+    first = asyncio.run(broker.run(RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="first turn content with enough words to avoid short-content exemptions",
+        idempotency_key="webui:session-1:turn-1",
+    )))
+    second = asyncio.run(broker.run(RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="retry payload may differ but the explicit turn key is the same",
+        idempotency_key="webui:session-1:turn-1",
+    )))
+
+    router.override_session_store(None)
+
+    assert first.duplicate is False
+    assert second.duplicate is True
+    assert calls == ["first turn content with enough words to avoid short-content exemptions"]
+
+
+def test_router_mark_seen_does_not_content_dedupe_webui_without_explicit_key(tmp_path):
+    from hermes_multitenancy import router
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.sessions import SessionStore
+
+    router.override_session_store(SessionStore(tmp_path / "sessions.db"))
+    calls = []
+
+    async def dispatch(request):
+        calls.append(request.content)
+        return "ok"
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        mark_seen=router._mark_run_request_seen,
+        sandbox_available=lambda: True,
+    )
+    content = "same webui prompt that is long enough to trigger the old content hash fallback"
+
+    first = asyncio.run(broker.run(RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content=content,
+    )))
+    second = asyncio.run(broker.run(RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content=content,
+    )))
+
+    router.override_session_store(None)
+
+    assert first.duplicate is False
+    assert second.duplicate is False
+    assert calls == [content, content]
+
+
+def test_router_mark_seen_keeps_content_dedupe_for_non_webui_without_explicit_key(tmp_path):
+    from hermes_multitenancy import router
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.sessions import SessionStore
+
+    router.override_session_store(SessionStore(tmp_path / "sessions.db"))
+    calls = []
+
+    async def dispatch(request):
+        calls.append(request.content)
+        return "ok"
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        mark_seen=router._mark_run_request_seen,
+        sandbox_available=lambda: True,
+    )
+    content = "same feishu prompt that remains protected by content hash fallback dedupe"
+
+    first = asyncio.run(broker.run(RunRequest(
+        channel="feishu",
+        profile_name="owner",
+        user_key="ou_1",
+        content=content,
+    )))
+    second = asyncio.run(broker.run(RunRequest(
+        channel="feishu",
+        profile_name="owner",
+        user_key="ou_1",
+        content=content,
+    )))
+
+    router.override_session_store(None)
+
+    assert first.duplicate is False
+    assert second.duplicate is True
+    assert calls == [content]
+
+
 def test_run_broker_admit_runs_policy_and_dedupe_without_dispatch():
     from hermes_multitenancy.run_broker import RunBroker
     from hermes_multitenancy.run_models import RunRequest

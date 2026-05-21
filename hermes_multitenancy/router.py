@@ -304,16 +304,27 @@ def _normalize_dedupe_text(text: str) -> str:
 
 
 def _run_request_dedupe_record(request: Any) -> Optional[tuple[str, Optional[str], Optional[str], int]]:
+    idempotency_key = str(getattr(request, "idempotency_key", "") or "").strip()
+    channel = str(getattr(request, "channel", "") or "").strip()
     message_id = str(getattr(request, "message_id", "") or "").strip()
     profile_name = str(getattr(request, "profile_name", "") or "").strip()
     user_key = str(getattr(request, "user_key", "") or "").strip()
     content = str(getattr(request, "content", "") or "")
+    if idempotency_key:
+        digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        ttl = _dedupe_env_int(
+            "HERMES_MULTITENANCY_EVENT_DEDUPE_TTL_SECONDS",
+            _DEDUPE_MESSAGE_TTL_SECONDS,
+        )
+        return (f"idem:{channel}:{profile_name}:{user_key}:{digest}", None, None, ttl)
     if message_id:
         ttl = _dedupe_env_int(
             "HERMES_MULTITENANCY_EVENT_DEDUPE_TTL_SECONDS",
             _DEDUPE_MESSAGE_TTL_SECONDS,
         )
         return (f"msg:{profile_name}:{user_key}:{message_id}", message_id, None, ttl)
+    if channel == "webui":
+        return None
 
     normalized = _normalize_dedupe_text(content)
     min_chars = _dedupe_env_int(
