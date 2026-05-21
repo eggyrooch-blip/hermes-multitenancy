@@ -360,23 +360,29 @@ async def _default_dispatch_agent(
         return await router_mod._get_pool().dispatch(request.profile_name, profile_home, event)
 
     content_parts: list[str] = []
+    pending_media_text = ""
     token = _PROFILE_HOME_VAR.set(profile_home)
     try:
         messages = request.messages or None
         async for kind, payload in stream_run_agent(event, profile_home, messages=messages):
             if kind == "content":
-                text = router_mod._webui_profile_scoped_media_response(str(payload or ""), profile_home)
-                if text:
-                    content_parts.append(text)
-                    await _maybe_await(
-                        emit_event(
-                            RunEvent(
-                                kind="content",
-                                text=text,
-                                payload={"text": text},
+                pending_media_text, text_items = _webui_streamable_media_text(
+                    pending_media_text + str(payload or ""),
+                    router_mod=router_mod,
+                    profile_home=profile_home,
+                )
+                for text in text_items:
+                    if text:
+                        content_parts.append(text)
+                        await _maybe_await(
+                            emit_event(
+                                RunEvent(
+                                    kind="content",
+                                    text=text,
+                                    payload={"text": text},
+                                )
                             )
                         )
-                    )
                 continue
             if kind == "thinking":
                 text = str(payload or "")
@@ -419,6 +425,20 @@ async def _default_dispatch_agent(
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
                 await _maybe_await(emit_event(RunEvent(kind=kind, payload=event_payload)))
 
+        if pending_media_text:
+            text = router_mod._webui_profile_scoped_media_response(pending_media_text, profile_home)
+            if text:
+                content_parts.append(text)
+                await _maybe_await(
+                    emit_event(
+                        RunEvent(
+                            kind="content",
+                            text=text,
+                            payload={"text": text},
+                        )
+                    )
+                )
+
         if "".join(content_parts).strip():
             # Answer already delivered via streamed content frames above.
             # Return "" so RunBroker.run does NOT emit it a second time.
@@ -428,6 +448,23 @@ async def _default_dispatch_agent(
         return router_mod._webui_profile_scoped_media_response(fallback_text, profile_home)
     finally:
         _PROFILE_HOME_VAR.reset(token)
+
+
+def _webui_streamable_media_text(text: str, *, router_mod, profile_home: Path) -> tuple[str, list[str]]:
+    """Return pending trailing MEDIA directive text and safe-to-stream chunks."""
+    raw = str(text or "")
+    marker_index = raw.rfind("MEDIA:")
+    if marker_index < 0:
+        return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home)]
+
+    newline_after_marker = raw.find("\n", marker_index)
+    if newline_after_marker < 0:
+        prefix = raw[:marker_index]
+        pending = raw[marker_index:]
+        items = [router_mod._webui_profile_scoped_media_response(prefix, profile_home)] if prefix else []
+        return pending, items
+
+    return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home)]
 
 
 def _default_mark_seen(request: RunRequest) -> bool:
