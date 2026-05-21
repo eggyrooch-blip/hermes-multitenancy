@@ -92,6 +92,19 @@ _FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FEISHU_UAT_REFRESH_TOKEN",
 })
 _CREDENTIAL_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def _animated_stream_status(phase: str, tick: int) -> str:
+    marker = _STREAM_STATUS_ANIMATION_MARKERS[(max(1, int(tick)) - 1) % len(_STREAM_STATUS_ANIMATION_MARKERS)]
+    return f"Hermes 正在{phase}...{marker}"
+
+
+def _strip_stream_status_animation_markers(text: str) -> str:
+    result = str(text or "")
+    for marker in _STREAM_STATUS_ANIMATION_MARKERS:
+        result = result.replace(marker, "")
+    return result
 
 
 async def stream_run_agent(  # type: ignore[override]
@@ -1390,6 +1403,8 @@ def _lark_cli_auth_broker_scope(
         yield {}
         return
 
+    default_as = _lark_cli_default_identity(profile_home, sender_open_id)
+    allowed_identities = frozenset({"user"}) if default_as == "user" else frozenset({"user", "bot"})
     key = secrets.token_urlsafe(32)
     server = start_lark_cli_auth_broker_server(
         LarkCliAuthBrokerContext(
@@ -1397,11 +1412,10 @@ def _lark_cli_auth_broker_scope(
             profile_name=profile_home.name,
             user_open_id=sender_open_id,
             hmac_key=key,
-            allowed_identities=frozenset({"user", "bot"}),
+            allowed_identities=allowed_identities,
         )
     )
     try:
-        default_as = _lark_cli_default_identity(profile_home, sender_open_id)
         yield {
             "HERMES_LARK_CLI_BIN": str(binary),
             "LARKSUITE_CLI_AUTH_PROXY": server.url,
@@ -2455,11 +2469,10 @@ async def _stream_aiagent_subprocess(
                         total_elapsed,
                         heartbeat_count,
                     )
-                    dots = "." * (((heartbeat_count - 1) % 3) + 1)
                     phase = "等待当前工具或子任务输出" if first_event_logged else "准备响应"
                     yield (
                         "status",
-                        f"Hermes 正在{phase}{dots}",
+                        _animated_stream_status(phase, heartbeat_count),
                     )
                 line = read_task.result()
             finally:

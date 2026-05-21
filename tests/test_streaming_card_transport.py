@@ -405,6 +405,91 @@ def test_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
     asyncio.run(_run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout())
 
 
+def test_cardkit_compat_flushes_tool_events_during_stream():
+    asyncio.run(_run_cardkit_compat_flushes_tool_events_during_stream())
+
+
+async def _run_cardkit_compat_flushes_tool_events_during_stream():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        preview="GET /open-apis/authen/v1/user_info",
+    )
+    assert adapter.card_patches
+    rendered_running = "\n".join(
+        element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
+    )
+    assert "`lark_cli`: GET /open-apis/authen/v1/user_info" in rendered_running
+
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="lark_cli",
+        duration=0.42,
+        is_error=False,
+    )
+    rendered_done = "\n".join(
+        element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
+    )
+    assert "`lark_cli` (420 ms)" in rendered_done
+
+
+def test_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_rewrite():
+    asyncio.run(_run_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_rewrite())
+
+
+async def _run_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_rewrite():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_OpenClawCardKitAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="terminal",
+        preview="python -c 'print(1)'",
+    )
+    await adapter.update_streaming_card_reasoning(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="我在检查参数",
+    )
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="最终结果",
+        finalize=False,
+    )
+
+    assert len(adapter.content_updates) >= 3
+    assert adapter.card_updates == []
+    streamed_content = [
+        request.request_body.content
+        for request in adapter.content_updates
+        if getattr(request, "element_id", "") == "streaming_content"
+    ]
+    streamed_tools = [
+        request.request_body.content
+        for request in adapter.content_updates
+        if getattr(request, "element_id", "") == "tool_calls"
+    ]
+    streamed_reasoning = [
+        request.request_body.content
+        for request in adapter.content_updates
+        if getattr(request, "element_id", "") == "reasoning_content"
+    ]
+    assert any("`terminal`: python -c 'print(1)'" in item for item in streamed_tools)
+    assert any("我在检查参数" in item for item in streamed_reasoning)
+    assert streamed_content[-1] == "最终结果"
+
+
 async def _run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
     from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
 
@@ -676,7 +761,16 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     assert initial_request.request_body.type == "card_json"
     assert initial_card["schema"] == "2.0"
     assert initial_card["config"]["streaming_mode"] is True
-    assert initial_card["body"]["elements"][0]["element_id"] == "streaming_content"
+    assert [
+        element["element_id"]
+        for element in initial_card["body"]["elements"]
+        if "element_id" in element
+    ][:4] == [
+        "tool_calls",
+        "reasoning_content",
+        "status_content",
+        "streaming_content",
+    ]
     assert len(adapter.card_sends) == 1
     sent_payload = json.loads(adapter.card_sends[0]["payload"])
     assert sent_payload == {"type": "card", "data": {"card_id": "ck-1"}}
@@ -818,7 +912,14 @@ async def _run_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
         is_error=False,
     )
 
-    assert adapter.content_updates == []
+    assert [
+        getattr(request, "element_id", "")
+        for request in adapter.content_updates
+    ] == ["tool_calls", "tool_calls"]
+    assert all(
+        getattr(request, "element_id", "") != "streaming_content"
+        for request in adapter.content_updates
+    )
 
     await adapter.update_streaming_card(
         chat_id="chat-1",
@@ -999,15 +1100,15 @@ async def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     assert consumer.finished is True
 
 
-def test_stream_card_idle_status_cycles_one_to_three_dots():
+def test_stream_card_idle_status_keeps_three_visible_dots_while_refreshing():
     from hermes_multitenancy import router as router_mod
 
-    assert [router_mod._stream_card_idle_status(i) for i in range(1, 5)] == [
-        "Hermes 正在准备响应.",
-        "Hermes 正在准备响应..",
-        "Hermes 正在准备响应...",
-        "Hermes 正在准备响应.",
-    ]
+    statuses = [router_mod._stream_card_idle_status(i) for i in range(1, 5)]
+    assert len(set(statuses)) == 4
+    assert [
+        router_mod._strip_stream_status_animation_markers(status)
+        for status in statuses
+    ] == ["Hermes 正在准备响应..."] * 4
 
 
 @pytest.mark.asyncio

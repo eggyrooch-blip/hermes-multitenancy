@@ -4409,6 +4409,7 @@ _STREAM_CARD_REASONING_MIN_CHARS = 100
 _STREAM_CARD_REASONING_MIN_SECONDS = 2.0
 _STREAM_CARD_PRIME_STATUS = "Hermes 正在准备响应..."
 _STREAM_CARD_IDLE_HEARTBEAT_SECONDS = 2.5
+_STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 _STREAM_ABORT_FALLBACK = "Aborted."
 # Soft per-card segment target for the legacy CardKit compat path. This is not
 # a Feishu/CardKit platform limit; shared GatewayStreamConsumer uses its own
@@ -4428,9 +4429,16 @@ def _aiagent_stream_timeout_notice(exc: BaseException) -> str:
 
 
 def _stream_card_idle_status(tick: int) -> str:
-    """Return a visibly changing pre-token status for CardKit typewriter keepalive."""
-    dots = "." * (((tick - 1) % 3) + 1)
-    return f"Hermes 正在准备响应{dots}"
+    """Return a changing pre-token status whose visible text keeps three dots."""
+    marker = _STREAM_STATUS_ANIMATION_MARKERS[(max(1, int(tick)) - 1) % len(_STREAM_STATUS_ANIMATION_MARKERS)]
+    return f"{_STREAM_CARD_PRIME_STATUS}{marker}"
+
+
+def _strip_stream_status_animation_markers(text: str) -> str:
+    result = str(text or "")
+    for marker in _STREAM_STATUS_ANIMATION_MARKERS:
+        result = result.replace(marker, "")
+    return result
 
 
 async def _stream_into_feishu_shared_consumer(

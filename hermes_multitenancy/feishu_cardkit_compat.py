@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED_ATTR = "_hermes_mt_cardkit_compat_installed"
 _STATE_ATTR = "_hermes_mt_streaming_card_state"
+_TOOLS_ELEMENT_ID = "tool_calls"
+_REASONING_ELEMENT_ID = "reasoning_content"
+_STATUS_ELEMENT_ID = "status_content"
 _STREAMING_ELEMENT_ID = "streaming_content"
 _REASONING_TAG_RE = re.compile(
     r"<(think|thinking|thought|antthinking)\b[^>]*>([\s\S]*?)</\1>",
@@ -224,6 +227,19 @@ async def _update_streaming_card_reasoning(
         state["reasoning_started_at"] = time.monotonic()
     answer_text, reasoning_text = _split_reasoning_text(_format(self, content))
     state["reasoning"] = reasoning_text or answer_text
+    if state.get("card_id"):
+        try:
+            await _stream_cardkit_element(
+                self,
+                str(state["card_id"]),
+                _REASONING_ELEMENT_ID,
+                _render_reasoning_stream_text(state),
+                _next_sequence(state),
+            )
+            return _result(True, message_id=str(message_id))
+        except Exception as exc:
+            logger.warning("multitenancy: Feishu CardKit reasoning update failed, falling back to full flush: %s", exc)
+            state["card_id"] = None
     return await _flush_state(self, message_id, state)
 
 
@@ -237,6 +253,19 @@ async def _update_streaming_card_status(
     del chat_id
     state = _state_for(self, message_id)
     state["status"] = _format(self, content)
+    if state.get("card_id"):
+        try:
+            await _stream_cardkit_element(
+                self,
+                str(state["card_id"]),
+                _STATUS_ELEMENT_ID,
+                str(state.get("status") or " "),
+                _next_sequence(state),
+            )
+            return _result(True, message_id=str(message_id))
+        except Exception as exc:
+            logger.warning("multitenancy: Feishu CardKit status update failed, falling back to full flush: %s", exc)
+            state["card_id"] = None
     return await _flush_state(self, message_id, state)
 
 
@@ -259,7 +288,20 @@ async def _update_streaming_card_tool_started(
             "args": args,
         }
     )
-    return _result(True, message_id=str(message_id))
+    if state.get("card_id"):
+        try:
+            await _stream_cardkit_element(
+                self,
+                str(state["card_id"]),
+                _TOOLS_ELEMENT_ID,
+                _render_tool_calls_section(list(state.get("tools") or [])) or " ",
+                _next_sequence(state),
+            )
+            return _result(True, message_id=str(message_id))
+        except Exception as exc:
+            logger.warning("multitenancy: Feishu CardKit tool update failed, falling back to full flush: %s", exc)
+            state["card_id"] = None
+    return await _flush_state(self, message_id, state)
 
 
 async def _update_streaming_card_tool_completed(
@@ -287,7 +329,20 @@ async def _update_streaming_card_tool_completed(
                 "duration": duration,
             }
         )
-    return _result(True, message_id=str(message_id))
+    if state.get("card_id"):
+        try:
+            await _stream_cardkit_element(
+                self,
+                str(state["card_id"]),
+                _TOOLS_ELEMENT_ID,
+                _render_tool_calls_section(list(state.get("tools") or [])) or " ",
+                _next_sequence(state),
+            )
+            return _result(True, message_id=str(message_id))
+        except Exception as exc:
+            logger.warning("multitenancy: Feishu CardKit tool update failed, falling back to full flush: %s", exc)
+            state["card_id"] = None
+    return await _flush_state(self, message_id, state)
 
 
 async def _flush_state(
@@ -393,7 +448,11 @@ async def _create_cardkit_card(adapter: Any, card: dict[str, Any]) -> Optional[s
 
 
 async def _stream_cardkit_content(adapter: Any, card_id: str, content: str, sequence: int) -> None:
-    request = _build_content_card_element_request(card_id, _STREAMING_ELEMENT_ID, content, sequence)
+    await _stream_cardkit_element(adapter, card_id, _STREAMING_ELEMENT_ID, content, sequence)
+
+
+async def _stream_cardkit_element(adapter: Any, card_id: str, element_id: str, content: str, sequence: int) -> None:
+    request = _build_content_card_element_request(card_id, element_id, content, sequence)
     response = await asyncio.to_thread(adapter._client.cardkit.v1.card_element.content, request)
     _raise_on_lark_error(response, "cardElement.content")
 
@@ -540,6 +599,30 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
             "elements": [
                 {
                     "tag": "markdown",
+                    "content": " ",
+                    "text_align": "left",
+                    "text_size": "normal_v2",
+                    "margin": "0px 0px 0px 0px",
+                    "element_id": _TOOLS_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": " ",
+                    "text_align": "left",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                    "element_id": _REASONING_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": " ",
+                    "text_align": "left",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                    "element_id": _STATUS_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
                     "content": "",
                     "text_align": "left",
                     "text_size": "normal_v2",
@@ -561,18 +644,27 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     reasoning = _clean_reasoning_prefix(str(state.get("reasoning") or "")).strip()
     status = str(state.get("status") or "").strip()
     tools = list(state.get("tools") or [])
+    tool_section = _render_tool_calls_section(tools)
     content = _strip_tool_process_narration(content, tools)
 
     parts: list[str] = []
     if content:
         parts.append(content)
-    elif reasoning:
-        parts.append(f"💭 **Thinking...**\n\n{_clip(reasoning, 1200)}")
+    elif tool_section or reasoning:
+        if tool_section:
+            parts.append(tool_section)
+        if reasoning:
+            parts.append(f"💭 **Thinking...**\n\n{_clip(reasoning, 1200)}")
     elif status:
         parts.append(status)
     else:
         parts.append("Thinking...")
     return "\n\n".join(part for part in parts if part).strip() or "Thinking..."
+
+
+def _render_reasoning_stream_text(state: dict[str, Any]) -> str:
+    reasoning = _clean_reasoning_prefix(str(state.get("reasoning") or "")).strip()
+    return f"💭 **Thinking...**\n\n{_clip(reasoning, 1200)}" if reasoning else " "
 
 
 def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:

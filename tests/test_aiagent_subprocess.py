@@ -538,6 +538,18 @@ def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: P
     assert env_enabled["PLAYWRIGHT_BROWSERS_PATH"] == str(profile_home / "browser" / "ms-playwright")
 
 
+def test_aiagent_stream_status_keeps_three_visible_dots_while_refreshing():
+    from hermes_multitenancy import agent_real
+
+    statuses = [agent_real._animated_stream_status("准备响应", tick) for tick in range(1, 5)]
+
+    assert len(set(statuses)) == 4
+    assert [
+        agent_real._strip_stream_status_animation_markers(status)
+        for status in statuses
+    ] == ["Hermes 正在准备响应..."] * 4
+
+
 @pytest.mark.asyncio
 async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
@@ -687,7 +699,7 @@ async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_st
     ]
 
     assert events[0][0] == "status"
-    assert "Hermes 正在准备响应." in events[0][1]
+    assert agent_real._strip_stream_status_animation_markers(events[0][1]) == "Hermes 正在准备响应..."
     assert "已等待" not in events[0][1]
     assert events[-1] == ("done", "ok")
 
@@ -756,7 +768,10 @@ async def test_stream_aiagent_subprocess_emits_status_while_waiting_after_first_
 
     assert events[0] == ("tool_started", {"name": "delegate_task"})
     assert events[1][0] == "status"
-    assert "正在等待当前工具或子任务输出." in events[1][1]
+    assert (
+        agent_real._strip_stream_status_animation_markers(events[1][1])
+        == "Hermes 正在等待当前工具或子任务输出..."
+    )
     assert events[-1] == ("done", "ok")
 
 
@@ -2499,10 +2514,17 @@ def test_lark_cli_auth_broker_scope_defaults_to_user_when_profile_has_uat(monkey
         def close(self):
             pass
 
-    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
 
     with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
         assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+        assert seen["context"].allowed_identities == frozenset({"user"})
 
 
 def test_lark_cli_auth_broker_scope_forces_bot_for_group_profile(monkeypatch, tmp_path: Path):
