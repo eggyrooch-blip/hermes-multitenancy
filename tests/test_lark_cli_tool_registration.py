@@ -351,6 +351,92 @@ def test_lark_cli_tool_profile_default_user_overrides_explicit_argv_as_bot(monke
     assert captured["command"][-2:] == ["--as", "user"]
 
 
+def test_lark_cli_tool_rejects_personal_write_when_sender_user_identity_is_not_bound(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("personal user write must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["POST", "/open-apis/calendar/v4/calendars/primary/events"],
+            "identity": "auto",
+            "risk": "write",
+            "reason": "create calendar event",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile write requires bound Feishu user identity" in result["error"]
+
+
+def test_lark_cli_tool_allows_group_profile_bot_write_with_sender_context(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "feishu_group_test"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"ok":true,"identity":"bot"}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["POST", "/open-apis/calendar/v4/calendars/primary/events"],
+            "identity": "auto",
+            "risk": "write",
+            "reason": "group bot calendar event",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "bot"
+    assert captured["command"][-2:] == ["--as", "bot"]
+
+
 def test_lark_cli_tool_filters_non_business_update_notice(monkeypatch, tmp_path):
     from hermes_multitenancy import lark_cli_tool
 

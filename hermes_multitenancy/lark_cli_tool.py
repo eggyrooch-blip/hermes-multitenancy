@@ -62,6 +62,7 @@ _SAFE_ENV_NAMES = {
     "HERMES_BASE_HOME",
     "HERMES_HOME",
     "HERMES_PROFILE",
+    "HERMES_FEISHU_USER_OPEN_ID",
     "HERMES_LARK_CLI_BIN",
     "LARKSUITE_CLI_AUTH_PROXY",
     "LARKSUITE_CLI_PROXY_KEY",
@@ -217,6 +218,34 @@ def _effective_identity(requested: Any) -> str:
     if identity in {"user", "bot"}:
         return identity
     return "auto"
+
+
+def _is_group_profile(profile_home: Path | None) -> bool:
+    if profile_home is None:
+        return False
+    if profile_home.name.startswith("feishu_group_"):
+        return True
+    marker = profile_home / "group_profile.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return str(payload.get("kind") or "").strip().lower() == "group"
+
+
+def _personal_user_write_identity_error(env: dict[str, str], risk: str, identity: str) -> str | None:
+    if risk not in {"write", "admin"}:
+        return None
+    if identity == "user":
+        return None
+    if not str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
+        return None
+    if _is_group_profile(_profile_home(env)):
+        return None
+    return (
+        "personal profile write requires bound Feishu user identity; "
+        "refusing to execute with bot/auto identity"
+    )
 
 
 def _safe_env() -> dict[str, str]:
@@ -398,6 +427,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     output_paths, output_error = _extract_output_paths(command, workspace)
     if output_error:
         return tool_error(output_error, mode=mode, command=argv, risk=risk)
+    identity_error = _personal_user_write_identity_error(env, risk, identity)
+    if identity_error:
+        return tool_error(identity_error, mode=mode, command=argv, risk=risk, identity=identity)
 
     cwd = str(workspace) if workspace is not None and workspace.exists() else None
     try:

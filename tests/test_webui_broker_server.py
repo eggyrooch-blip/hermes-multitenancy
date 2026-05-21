@@ -373,6 +373,29 @@ def test_webui_run_broker_event_exposes_owner_open_id_for_lark_cli_identity():
     assert _resolve_subprocess_sender_open_id(event) == "ou_owner"
 
 
+def test_webui_run_broker_event_injects_current_datetime_instruction():
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_owner",
+        content="今天中午一点约会议室",
+        session_id="webui-current-date",
+        metadata={"instructions": "existing instructions"},
+    )
+
+    event = _build_webui_event(request)
+    instructions = event.raw_event["metadata"]["instructions"]
+
+    assert "existing instructions" in instructions
+    assert "Current date/time:" in instructions
+    assert "Timezone:" in instructions
+    assert "Interpret relative dates" in instructions
+    assert "room attendee declined" in instructions
+
+
 def test_run_broker_loads_only_shared_runtime_env(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
 

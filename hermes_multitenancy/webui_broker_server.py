@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
@@ -288,6 +289,28 @@ def _event_to_sse(event: RunEvent) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _webui_current_datetime_instruction() -> str:
+    now = datetime.now().astimezone()
+    timezone = now.tzname() or str(now.astimezone().tzinfo)
+    return (
+        f"Current date/time: {now.strftime('%Y-%m-%d %H:%M:%S %z')}. "
+        f"Timezone: {timezone}. Interpret relative dates such as today, "
+        "tomorrow, 今天, 明天, and noon from this value. For calendar work, "
+        "derive timestamps from this value and verify the created event time "
+        "before reporting success. When the user asks for calendar attachments "
+        "or meeting rooms, inspect the API response and report failure rather "
+        "than success if the attachment is missing or the room attendee declined."
+    )
+
+
+def _metadata_with_webui_runtime_context(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    merged = dict(metadata or {})
+    existing = str(merged.get("instructions") or "").strip()
+    current = _webui_current_datetime_instruction()
+    merged["instructions"] = "\n".join(part for part in [existing, current] if part)
+    return merged
+
+
 def _build_webui_event(request: RunRequest) -> Any:
     """Create the smallest event shape expected by ProfileRuntime/agent_real."""
     return SimpleNamespace(
@@ -307,7 +330,7 @@ def _build_webui_event(request: RunRequest) -> Any:
         raw_event={
             "channel": request.channel,
             "session_id": request.session_id,
-            "metadata": dict(request.metadata or {}),
+            "metadata": _metadata_with_webui_runtime_context(request.metadata),
         },
     )
 
