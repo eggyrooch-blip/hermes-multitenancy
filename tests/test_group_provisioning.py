@@ -375,6 +375,73 @@ skills:
     assert list((group_profile / "feishu_uat").glob("*")) == []
 
 
+def test_group_profile_keeps_default_skills_when_owner_route_exists(tmp_path):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _ensure_group_profile
+    from hermes_multitenancy.sync.feishu_org import Employee, _sync_default_profile_skills
+
+    shared_home = tmp_path
+    default_skill = shared_home / "skills" / "Keep" / "kep-prd-analysis"
+    owner_shared_skill = shared_home / "skills" / "internal" / "readonly-report"
+    owner_private_skill = shared_home / "skills" / "internal" / "personal-oauth"
+    for skill_dir in (default_skill, owner_shared_skill, owner_private_skill):
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(f"# {skill_dir.name}\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/kep-prd-analysis
+    audience: all
+  - path: internal/readonly-report
+    audience:
+      departments: [od_sales]
+    requires_token: false
+  - path: internal/personal-oauth
+    audience:
+      departments: [od_sales]
+    token_policy: user_oauth
+""",
+        encoding="utf-8",
+    )
+    owner_profile = shared_home / "profiles" / "alice"
+    owner = Employee(
+        open_id="ou_alice",
+        user_id="alice",
+        agent_id="alice",
+        profile_name="alice",
+        name="Alice",
+        dept_id="od_sales",
+        dept_name="Sales",
+        leader_user_id=None,
+    )
+    _sync_default_profile_skills(owner_profile, shared_home, owner)
+
+    router_mod.override_routing_table(":memory:")
+    try:
+        table = router_mod._get_routing_table()
+        assert table is not None
+        table.upsert(
+            user_id="alice",
+            profile_name="alice",
+            open_id="ou_alice",
+            provenance="sync",
+        )
+        group_profile = shared_home / "profiles" / "feishu_group_sales"
+        _ensure_group_profile(
+            profile_name="feishu_group_sales",
+            profile_home=group_profile,
+            chat_id="oc_sales",
+            owner_open_id="ou_alice",
+            display_label="Alice-Sales",
+        )
+    finally:
+        router_mod.override_routing_table(None)
+
+    assert (group_profile / "skills" / "Keep" / "kep-prd-analysis").is_symlink()
+    assert (group_profile / "skills" / "internal" / "readonly-report").is_symlink()
+    assert not (group_profile / "skills" / "internal" / "personal-oauth").exists()
+
+
 # -- resolve_or_auto_provision_group_route ----------------------------------
 
 

@@ -824,13 +824,13 @@ def _profile_skill_specs(
             leader_user_id=None,
         )
     specs_by_path: dict[str, dict[str, Any]] = {}
+    if not child_only:
+        for spec in _default_profile_skill_specs(shared_home, employee):
+            specs_by_path[str(spec["path"])] = spec
     for spec in _child_profile_skill_specs_from_upstream(
         upstream_profile_home, shared_home=shared_home
     ):
         specs_by_path[str(spec["path"])] = spec
-    if not child_only:
-        for spec in _default_profile_skill_specs(shared_home, employee):
-            specs_by_path[str(spec["path"])] = spec
     return sorted(specs_by_path.values(), key=lambda item: str(item["path"]))
 
 
