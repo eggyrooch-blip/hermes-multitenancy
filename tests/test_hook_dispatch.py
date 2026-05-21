@@ -107,6 +107,29 @@ def test_materialize_response_artifact_json_defaults_to_downloads_and_appends_me
     assert "MEDIA:/workspace/Downloads/out.md" in materialized
 
 
+def test_materialize_response_artifact_json_reuses_existing_markdown_source_for_marker_only_spec(tmp_path):
+    """Marker-only markdown artifact specs must not overwrite a real generated source file."""
+    from hermes_multitenancy import router as router_mod
+
+    source = tmp_path / ".ai-docs" / "kep-prd-analysis" / "技术方案_数据中心分享接入动态模版_20260521.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Real plan\n\nnot a placeholder\n", encoding="utf-8")
+
+    response = """
+done
+```hermes-artifact-json
+{"filename": "技术方案_数据中心分享接入动态模版_20260521.md", "format": "markdown", "marker": "TECH_PLAN"}
+```
+"""
+
+    materialized = router_mod._materialize_response_artifacts(response, tmp_path)
+    delivered = tmp_path / "workspace" / "Downloads" / source.name
+
+    assert delivered.read_text(encoding="utf-8") == "# Real plan\n\nnot a placeholder\n"
+    assert delivered.read_text(encoding="utf-8") != "TECH_PLAN"
+    assert "MEDIA:/workspace/Downloads/技术方案_数据中心分享接入动态模版_20260521.md" in materialized
+
+
 def test_materialize_response_artifact_json_ignores_markdown_as_document(tmp_path):
     from hermes_multitenancy import router as router_mod
 

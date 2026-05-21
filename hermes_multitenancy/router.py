@@ -751,7 +751,16 @@ def _materialize_response_artifacts(response: str, profile_home: Path) -> str:
             continue
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            _write_response_artifact(target, spec)
+            existing_source = _existing_profile_source_for_artifact_spec(spec, target, root)
+            if existing_source is not None:
+                shutil.copy2(existing_source, target)
+                logger.info(
+                    "multitenancy: reused existing profile artifact source=%s target=%s",
+                    existing_source,
+                    target,
+                )
+            else:
+                _write_response_artifact(target, spec)
             try:
                 media_path = "/workspace/" + str(target.relative_to(workspace).as_posix())
             except ValueError:
@@ -769,6 +778,45 @@ def _materialize_response_artifacts(response: str, profile_home: Path) -> str:
     if not media_additions:
         return text
     return f"{text.rstrip()}\n" + "\n".join(media_additions)
+
+
+def _existing_profile_source_for_artifact_spec(spec: dict[str, Any], target: Path, profile_home: Path) -> Optional[Path]:
+    """Find a real profile-local source when an artifact JSON block is only a placeholder.
+
+    Some skills already write the complete markdown to `.ai-docs/...` and then
+    emit a marker-only artifact JSON block with the same filename. In that case
+    the marker is a delivery hint, not file content.
+    """
+    fmt = str(spec.get("format") or target.suffix.lstrip(".")).lower()
+    if fmt not in {"md", "markdown"} and target.suffix.lower() not in _MARKDOWN_DOCUMENT_EXTENSIONS:
+        return None
+    if any(spec.get(key) not in (None, "") for key in ("content", "data", "rows")):
+        return None
+    filename = Path(str(spec.get("filename") or spec.get("name") or target.name)).name
+    if not filename:
+        return None
+    root = profile_home.expanduser().resolve(strict=False)
+    resolved_target = target.expanduser().resolve(strict=False)
+    search_roots = (
+        root / ".ai-docs",
+        root / "home" / "Downloads",
+        root / "data",
+        root / "tmp",
+    )
+    for search_root in search_roots:
+        if not search_root.exists():
+            continue
+        try:
+            matches = search_root.rglob(filename) if search_root.is_dir() else [search_root]
+            for candidate in matches:
+                resolved = candidate.expanduser().resolve(strict=False)
+                if resolved == resolved_target:
+                    continue
+                if _is_deliverable_profile_file(resolved, root):
+                    return resolved
+        except OSError:
+            continue
+    return None
 
 
 def _write_response_artifact(path: Path, spec: dict[str, Any]) -> None:
