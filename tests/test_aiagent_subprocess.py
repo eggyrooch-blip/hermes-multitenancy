@@ -515,6 +515,46 @@ credentials:
     assert env["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
 
 
+def test_shared_tavily_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "TAVILY_API_KEY=tvly-test",
+                "TAVILY_BASE_URL=https://tavily.example.test",
+                "UNRELATED_SECRET=do-not-forward",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    loaded = agent_real._profile_env_for_aiagent(profile_home)
+    assert loaded["TAVILY_API_KEY"] == "tvly-test"
+    assert loaded["TAVILY_BASE_URL"] == "https://tavily.example.test"
+    assert "UNRELATED_SECRET" not in loaded
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_TAVILY_API_KEY", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["TAVILY_API_KEY"] == "tvly-test"
+        assert "_HERMES_FORCE_TAVILY_API_KEY" not in os.environ
+    finally:
+        cleanup()
+    assert "TAVILY_API_KEY" not in os.environ
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert env["TAVILY_API_KEY"] == "tvly-test"
+    assert "_HERMES_FORCE_TAVILY_API_KEY" not in env
+
+
 def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
     from hermes_multitenancy import agent_real
 

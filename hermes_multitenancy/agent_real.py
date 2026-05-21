@@ -84,6 +84,15 @@ _MODEL_ENV_ALLOWLIST: frozenset[str] = frozenset(
     for key in names
 )
 
+_AIAGENT_TOOL_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    "TAVILY_API_KEY",
+    "TAVILY_BASE_URL",
+})
+
+_SHARED_AIAGENT_ENV_ALLOWLIST: frozenset[str] = (
+    _MODEL_ENV_ALLOWLIST | _AIAGENT_TOOL_ENV_ALLOWLIST
+)
+
 _FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
@@ -1469,7 +1478,7 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     shared_env = _resolve_shared_hermes_home(profile_home) / ".env"
     try:
         if shared_env.exists():
-            loaded.update(_dotenv_values_for_aiagent(shared_env, allowed_keys=_MODEL_ENV_ALLOWLIST))
+            loaded.update(_dotenv_values_for_aiagent(shared_env, allowed_keys=_SHARED_AIAGENT_ENV_ALLOWLIST))
 
         profile_allowed_keys: Optional[frozenset[str]] = None
         try:
@@ -1479,7 +1488,7 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
                 and shared_env.exists()
                 and profile_env.resolve() == shared_env.resolve()
             ):
-                profile_allowed_keys = _MODEL_ENV_ALLOWLIST
+                profile_allowed_keys = _SHARED_AIAGENT_ENV_ALLOWLIST
         except OSError:
             pass
         loaded.update(_dotenv_values_for_aiagent(profile_env, allowed_keys=profile_allowed_keys))
