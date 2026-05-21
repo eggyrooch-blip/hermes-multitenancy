@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -1187,6 +1189,76 @@ def test_cli_pull_feishu_delegates_to_sync(monkeypatch, capsys):
     assert calls[0]["dry_run"] is True
     assert calls[0]["soft_delete_missing"] is None
     assert json.loads(capsys.readouterr().out)["employees"] == 1
+
+
+def test_contact_client_uses_vault_app_credential_without_legacy_tools(monkeypatch, tmp_path):
+    """Clean upstream no longer ships tools.feishu_oapi_client; org sync still works."""
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.sync import FeishuContactClient
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    fake_tools = types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", fake_tools)
+    monkeypatch.delitem(sys.modules, "tools.feishu_oapi_client", raising=False)
+
+    store = CredentialStore(shared_home / "multitenancy.db", encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="__global__",
+            subject_id="feishu_app",
+            provider="feishu",
+            secret_kind="app",
+            payload={"app_id": "cli_x", "app_secret": "sec_x", "domain": "feishu"},
+        )
+    finally:
+        store.close()
+
+    seen_urls: list[str] = []
+    seen_auth_headers: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+    def fake_urlopen(request, timeout=0):
+        seen_urls.append(request.full_url)
+        auth_header = request.headers.get("Authorization") or ""
+        if auth_header:
+            seen_auth_headers.append(auth_header)
+        if request.full_url.endswith("/open-apis/auth/v3/tenant_access_token/internal"):
+            return FakeResponse({"code": 0, "tenant_access_token": "tenant-token"})
+        return FakeResponse({
+            "code": 0,
+            "msg": "ok",
+            "data": {
+                "items": [{
+                    "open_id": "ou_alice",
+                    "user_id": "alice",
+                    "union_id": "on_alice",
+                }]
+            },
+        })
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    contact = FeishuContactClient.for_current_home(api_delay=0)
+    users = contact.fetch_department_users("od_sales")
+
+    assert [u.open_id for u in users] == ["ou_alice"]
+    assert any("/open-apis/contact/v3/users/find_by_department" in url for url in seen_urls)
+    assert seen_auth_headers == ["Bearer tenant-token"]
 
 
 # ---------------------------------------------------------------------------

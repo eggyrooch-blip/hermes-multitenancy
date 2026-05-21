@@ -13,6 +13,8 @@ import re
 import shutil
 import sqlite3
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +147,72 @@ class OrgSnapshot:
         return data
 
 
+class _VaultFeishuClient:
+    """Minimal Contact API client for clean upstream installs without legacy tools."""
+
+    def __init__(self, app_payload: dict[str, Any], *, timeout: float = 10.0) -> None:
+        self._app_payload = app_payload
+        self._timeout = timeout
+        self._tenant_access_token: Optional[str] = None
+        domain = str(app_payload.get("domain") or app_payload.get("FEISHU_DOMAIN") or "feishu").strip().lower()
+        self._base_url = "https://open.larksuite.com" if domain == "larksuite" else "https://open.feishu.cn"
+
+    @classmethod
+    def for_current_home(cls, *, timeout: float = 10.0) -> "_VaultFeishuClient":
+        from ..credentials import CredentialStore
+
+        shared_home = _get_current_shared_home()
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name="__global__",
+                subject_id="feishu_app",
+                provider="feishu",
+                secret_kind="app",
+            )
+        finally:
+            store.close()
+        return cls(payload, timeout=timeout)
+
+    def do_request(
+        self,
+        method: str,
+        uri: str,
+        *,
+        queries: list[tuple[str, str]] | None = None,
+    ) -> tuple[int, str, dict[str, Any]]:
+        token = self._get_tenant_access_token()
+        url = f"{self._base_url}{uri}"
+        if queries:
+            url = f"{url}?{urllib.parse.urlencode(queries)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            method=method.upper(),
+        )
+        with urllib.request.urlopen(request, timeout=self._timeout) as response:  # noqa: S310 - fixed Feishu host.
+            raw = response.read()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise FeishuOrgSyncError(f"{method} {uri} returned invalid JSON") from exc
+        return (
+            int(payload.get("code") or 0),
+            str(payload.get("msg") or ""),
+            payload.get("data") if isinstance(payload.get("data"), dict) else {},
+        )
+
+    def _get_tenant_access_token(self) -> str:
+        if not self._tenant_access_token:
+            from ..lark_cli_auth_broker import _mint_tenant_access_token
+
+            self._tenant_access_token = _mint_tenant_access_token(self._app_payload, timeout=self._timeout)
+        return self._tenant_access_token
+
+
 class FeishuContactClient:
     """Small Contact v3 adapter over Hermes' existing FeishuClient."""
 
@@ -161,8 +229,12 @@ class FeishuContactClient:
 
     @classmethod
     def for_current_home(cls, *, api_delay: float = 0.65) -> "FeishuContactClient":
-        from tools.feishu_oapi_client import FeishuClient  # type: ignore
-
+        try:
+            from tools.feishu_oapi_client import FeishuClient  # type: ignore
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"tools", "tools.feishu_oapi_client"}:
+                raise
+            return cls(_VaultFeishuClient.for_current_home(), api_delay=api_delay)
         return cls(FeishuClient.for_tenant(), api_delay=api_delay)
 
     def fetch_department_detail(self, dept_id: str) -> Optional[Department]:
@@ -1418,6 +1490,16 @@ def _get_current_hermes_home() -> Path:
     except Exception:
         env_home = os.getenv("HERMES_HOME")
         return Path(env_home).expanduser() if env_home else Path.home() / ".hermes"
+
+
+def _get_current_shared_home() -> Path:
+    env_shared = os.getenv("HERMES_SHARED_HOME")
+    if env_shared:
+        return Path(env_shared).expanduser()
+    current = _get_current_hermes_home()
+    if current.parent.name == "profiles":
+        return current.parent.parent
+    return current
 
 
 def _get_default_hermes_root() -> Path:
