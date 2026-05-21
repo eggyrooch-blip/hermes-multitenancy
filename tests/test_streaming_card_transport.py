@@ -344,9 +344,11 @@ async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapt
     assert adapter.card_sends[0]["msg_type"] == "interactive"
     initial_card = json.loads(adapter.card_sends[0]["payload"])
     assert "header" not in initial_card
+    assert initial_card["config"]["wide_screen_mode"] is False
     assert adapter.card_patches[-1]["message_id"] == "compat-card-1"
     final_card = adapter.card_patches[-1]["card"]
     assert "header" not in final_card
+    assert final_card["config"]["wide_screen_mode"] is True
     rendered = "\n".join(element["content"] for element in final_card["elements"])
     assert "**Tool calls:**" in rendered
     assert "`lark_cli` (300 ms)" in rendered
@@ -409,6 +411,24 @@ def test_cardkit_compat_flushes_tool_events_during_stream():
     asyncio.run(_run_cardkit_compat_flushes_tool_events_during_stream())
 
 
+def test_cardkit_compat_initial_card_uses_compact_empty_placeholders():
+    asyncio.run(_run_cardkit_compat_initial_card_uses_compact_empty_placeholders())
+
+
+async def _run_cardkit_compat_initial_card_uses_compact_empty_placeholders():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    await adapter.start_streaming_card(chat_id="chat-1")
+
+    initial_card = json.loads(adapter.card_sends[0]["payload"])
+    assert initial_card["config"]["wide_screen_mode"] is False
+    elements = initial_card["elements"]
+    assert [element["content"] for element in elements] == [
+        "Hermes is preparing a response..."
+    ]
+
+
 async def _run_cardkit_compat_flushes_tool_events_during_stream():
     from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
 
@@ -438,6 +458,33 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
         element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
     )
     assert "`lark_cli` (420 ms)" in rendered_done
+
+
+def test_cardkit_compat_renders_tool_argument_summary():
+    asyncio.run(_run_cardkit_compat_renders_tool_argument_summary())
+
+
+async def _run_cardkit_compat_renders_tool_argument_summary():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="execute_code",
+        preview="generating arguments",
+        args={"language": "python", "path": "home/generated_art.png"},
+    )
+
+    rendered = "\n".join(
+        element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
+    )
+    assert "generating arguments" not in rendered
+    assert "`execute_code` running" in rendered
+    assert "language=python" in rendered
+    assert "path=home/generated_art.png" in rendered
 
 
 def test_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_rewrite():
@@ -766,10 +813,10 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
         for element in initial_card["body"]["elements"]
         if "element_id" in element
     ][:4] == [
+        "streaming_content",
         "tool_calls",
         "reasoning_content",
         "status_content",
-        "streaming_content",
     ]
     assert len(adapter.card_sends) == 1
     sent_payload = json.loads(adapter.card_sends[0]["payload"])
@@ -999,15 +1046,35 @@ async def _run_stream_into_feishu_skips_legacy_shared_consumer_without_card_meth
     assert "Done (" in rendered
 
 
-@pytest.mark.asyncio
-async def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transport(
+def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transport(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transport(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transport(
     monkeypatch, tmp_path
 ):
     from hermes_multitenancy import agent_real, router as router_mod
 
     async def fake_stream(event, home, *, messages=None):
         yield ("thinking", "checking")
-        yield ("tool_started", {"name": "feishu_calendar_list_events", "preview": "week"})
+        yield (
+            "tool_started",
+            {
+                "name": "feishu_calendar_list_events",
+                "preview": str(home / "home" / "generated_art.png"),
+                "args": {
+                    "path": str(home / "workspace" / "docs" / "plan.md"),
+                    "host_path": "/Users/kite/.ssh/id_rsa",
+                },
+            },
+        )
         yield (
             "tool_completed",
             {"name": "feishu_calendar_list_events", "duration": 0.2, "is_error": False},
@@ -1088,16 +1155,110 @@ async def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     consumer = created[0]
     assert consumer.adapter is adapter
     assert consumer.chat_id == "chat-1"
-    assert consumer.statuses == ["Hermes 正在准备响应..."]
+    assert consumer.config.edit_interval <= 0.3
+    assert consumer.config.buffer_threshold <= 40
+    assert [
+        router_mod._strip_stream_status_animation_markers(status)
+        for status in consumer.statuses
+    ] == ["Hermes 正在准备响应."]
     assert consumer.reasoning == ["checking"]
     assert consumer.tool_starts == [
-        {"tool_name": "feishu_calendar_list_events", "preview": "week", "args": None}
+        {
+            "tool_name": "feishu_calendar_list_events",
+            "preview": "home/generated_art.png",
+            "args": {"path": "workspace/docs/plan.md", "host_path": "[宿主路径已隐藏]"},
+        }
     ]
     assert consumer.tool_completions == [
         {"tool_name": "feishu_calendar_list_events", "duration": 0.2, "is_error": False}
     ]
     assert consumer.deltas == ["Hello", " world"]
     assert consumer.finished is True
+
+
+def test_shared_consumer_flushes_short_reasoning_before_first_content(monkeypatch, tmp_path):
+    asyncio.run(
+        _run_shared_consumer_flushes_short_reasoning_before_first_content(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_shared_consumer_flushes_short_reasoning_before_first_content(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("thinking", "first ")
+        yield ("thinking", "second")
+        yield ("content", "answer")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    created = []
+
+    class RecordingConsumer:
+        def __init__(self, adapter, chat_id, config=None, metadata=None):
+            self.reasoning = []
+            self.statuses = []
+            self.deltas = []
+            self.tool_starts = []
+            self.tool_completions = []
+            self._done = asyncio.Event()
+            created.append(self)
+
+        async def ensure_streaming_card_started(self):
+            return True
+
+        async def run(self):
+            await self._done.wait()
+
+        def on_delta(self, text):
+            self.deltas.append(text)
+
+        async def update_streaming_card_status(self, content):
+            self.statuses.append(content)
+            return True
+
+        async def update_streaming_card_reasoning(self, content):
+            self.reasoning.append(content)
+            return True
+
+        async def update_streaming_card_tool_started(self, tool_name, *, preview=None, args=None):
+            self.tool_starts.append({"tool_name": tool_name, "preview": preview, "args": args})
+            return True
+
+        async def update_streaming_card_tool_completed(self, tool_name, *, duration=None, is_error=False):
+            self.tool_completions.append(
+                {"tool_name": tool_name, "duration": duration, "is_error": is_error}
+            )
+            return True
+
+        def finish(self):
+            self._done.set()
+
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", RecordingConsumer, raising=False)
+    monkeypatch.setattr(
+        router_mod,
+        "StreamConsumerConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+
+    response = await router_mod._stream_into_feishu(
+        _CardCapableAdapter(),
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "answer"
+    assert created[0].reasoning[-1] == "first second"
+    assert created[0].deltas == ["answer"]
 
 
 def test_stream_card_idle_status_keeps_three_visible_dots_while_refreshing():
@@ -1108,7 +1269,12 @@ def test_stream_card_idle_status_keeps_three_visible_dots_while_refreshing():
     assert [
         router_mod._strip_stream_status_animation_markers(status)
         for status in statuses
-    ] == ["Hermes 正在准备响应..."] * 4
+    ] == [
+        "Hermes 正在准备响应.",
+        "Hermes 正在准备响应..",
+        "Hermes 正在准备响应...",
+        "Hermes 正在准备响应.",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1298,13 +1464,10 @@ async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
     assert adapter.started == [
         {"chat_id": "chat-1", "reply_to": None, "metadata": None}
     ]
-    assert adapter.status_updates == [
-        {
-            "chat_id": "chat-1",
-            "message_id": "card-1",
-            "content": "Hermes 正在准备响应...",
-        }
-    ]
+    assert len(adapter.status_updates) == 1
+    assert router_mod._strip_stream_status_animation_markers(
+        adapter.status_updates[0]["content"]
+    ) == "Hermes 正在准备响应."
     assert adapter.reasoning_updates == []
 
     release_stream.set()
@@ -1347,14 +1510,71 @@ async def test_stream_into_feishu_keeps_card_alive_while_agent_is_silent(
             await asyncio.sleep(0.005)
 
     await asyncio.wait_for(wait_for_status_heartbeat(), timeout=1)
-    assert adapter.status_updates[0]["content"] == "Hermes 正在准备响应..."
-    assert adapter.status_updates[1]["content"] != adapter.status_updates[0]["content"]
+    assert [
+        router_mod._strip_stream_status_animation_markers(update["content"])
+        for update in adapter.status_updates[:2]
+    ] == ["Hermes 正在准备响应.", "Hermes 正在准备响应.."]
     assert adapter.reasoning_updates == []
 
     release_stream.set()
     assert await task == "ready"
     assert adapter.updates[-1]["content"] == "ready"
     assert adapter.updates[-1]["finalize"] is True
+
+
+def test_stream_into_feishu_keeps_status_animating_after_tool_event(monkeypatch, tmp_path):
+    asyncio.run(
+        _run_stream_into_feishu_keeps_status_animating_after_tool_event(
+            monkeypatch,
+            tmp_path,
+        )
+    )
+
+
+async def _run_stream_into_feishu_keeps_status_animating_after_tool_event(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    monkeypatch.setattr(router_mod, "_STREAM_CARD_IDLE_HEARTBEAT_SECONDS", 0.01)
+    adapter = _CardCapableAdapter()
+    tool_started = asyncio.Event()
+    release_stream = asyncio.Event()
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("tool_started", {"name": "execute_code", "args": {"language": "python"}})
+        tool_started.set()
+        await release_stream.wait()
+        yield ("content", "ready")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    task = asyncio.create_task(
+        router_mod._stream_into_feishu(
+            adapter,
+            "chat-1",
+            "profile",
+            tmp_path,
+            SimpleNamespace(text="hi"),
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    )
+
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+    async def wait_for_status_heartbeat():
+        while len(adapter.status_updates) < 2:
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(wait_for_status_heartbeat(), timeout=1)
+    assert [
+        router_mod._strip_stream_status_animation_markers(update["content"])
+        for update in adapter.status_updates[:2]
+    ] == ["Hermes 正在准备响应.", "Hermes 正在准备响应.."]
+    assert adapter.tool_starts[0]["tool_name"] == "execute_code"
+
+    release_stream.set()
+    assert await task == "ready"
 
 
 def test_stream_into_feishu_prompts_for_child_approval_and_approve_resolves(
@@ -1550,7 +1770,7 @@ async def test_stream_into_feishu_aborts_card_when_cancelled_during_prime(
         async def update_streaming_card_status(
             self, *, chat_id, message_id, content
         ):
-            if content == "Hermes 正在准备响应...":
+            if content.startswith("Hermes 正在准备响应."):
                 self.prime_entered.set()
                 await self.release_prime.wait()
             return await super().update_streaming_card_status(
@@ -1625,13 +1845,10 @@ async def test_stream_into_feishu_updates_card_for_tool_and_reasoning_events(
             "args": None,
         }
     ]
-    assert adapter.status_updates == [
-        {
-            "chat_id": "chat-1",
-            "message_id": "card-1",
-            "content": "Hermes 正在准备响应...",
-        },
-    ]
+    assert len(adapter.status_updates) == 1
+    assert router_mod._strip_stream_status_animation_markers(
+        adapter.status_updates[0]["content"]
+    ) == "Hermes 正在准备响应."
     assert adapter.reasoning_updates == [
         {
             "chat_id": "chat-1",
@@ -1741,9 +1958,10 @@ def test_stream_into_feishu_streams_raw_reasoning_in_card(monkeypatch, tmp_path)
     )
 
     assert response == "done"
-    assert [item["content"] for item in adapter.status_updates] == [
-        "Hermes 正在准备响应...",
-    ]
+    assert [
+        router_mod._strip_stream_status_animation_markers(item["content"])
+        for item in adapter.status_updates
+    ] == ["Hermes 正在准备响应."]
     assert [item["content"] for item in adapter.reasoning_updates] == [
         "The user wants to update a Feishu record.",
     ]

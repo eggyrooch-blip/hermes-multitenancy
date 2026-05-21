@@ -599,27 +599,11 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": " ",
+                    "content": "",
                     "text_align": "left",
                     "text_size": "normal_v2",
                     "margin": "0px 0px 0px 0px",
-                    "element_id": _TOOLS_ELEMENT_ID,
-                },
-                {
-                    "tag": "markdown",
-                    "content": " ",
-                    "text_align": "left",
-                    "text_size": "notation",
-                    "margin": "0px 0px 0px 0px",
-                    "element_id": _REASONING_ELEMENT_ID,
-                },
-                {
-                    "tag": "markdown",
-                    "content": " ",
-                    "text_align": "left",
-                    "text_size": "notation",
-                    "margin": "0px 0px 0px 0px",
-                    "element_id": _STATUS_ELEMENT_ID,
+                    "element_id": _STREAMING_ELEMENT_ID,
                 },
                 {
                     "tag": "markdown",
@@ -627,7 +611,23 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
                     "text_align": "left",
                     "text_size": "normal_v2",
                     "margin": "0px 0px 0px 0px",
-                    "element_id": _STREAMING_ELEMENT_ID,
+                    "element_id": _TOOLS_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": "",
+                    "text_align": "left",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                    "element_id": _REASONING_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": "",
+                    "text_align": "left",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                    "element_id": _STATUS_ELEMENT_ID,
                 },
                 {
                     "tag": "markdown",
@@ -685,7 +685,7 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
     if content:
         content = _strip_tool_process_narration(content, tools)
         elements.append({"tag": "markdown", "content": _optimize_markdown_style(content)})
-    else:
+    elif state.get("finalized") or state.get("aborted") or not elements:
         elements.append({"tag": "markdown", "content": "..."})
     if state.get("finalized") or state.get("aborted"):
         elements.append(
@@ -698,13 +698,28 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "config": {
-            "wide_screen_mode": True,
+            "wide_screen_mode": _should_use_wide_screen_mode(
+                content=content,
+                reasoning=reasoning,
+                tools=tools,
+            ),
             "update_multi": True,
             "locales": ["zh_cn", "en_us"],
             "summary": {"content": _plain_summary(content or status or "Hermes")},
         },
         "elements": elements,
     }
+
+
+def _should_use_wide_screen_mode(*, content: str, reasoning: str, tools: list[Any]) -> bool:
+    """Keep status-only cards compact while preserving width for dense answers."""
+    visible = str(content or "")
+    if tools:
+        return True
+    if len(visible) > 500 or len(str(reasoning or "")) > 300:
+        return True
+    dense_markers = ("\n|", "```", "<table", "<img", "![")
+    return any(marker in visible for marker in dense_markers)
 
 
 def _to_cardkit2(card: dict[str, Any]) -> dict[str, Any]:
@@ -786,9 +801,56 @@ def _render_tool_call_line(tool: dict[str, Any]) -> str:
     extra = " running" if status == "running" else " failed" if status == "error" else ""
     if tool.get("duration") is not None:
         extra = f" ({_format_tool_duration(tool['duration'])})"
-    elif tool.get("preview"):
-        extra = f": {_clip(str(tool['preview']), 160)}"
+    args_summary = _format_tool_args_summary(tool.get("args"))
+    preview = str(tool.get("preview") or "").strip()
+    if args_summary:
+        return f"- `{name}`{extra}: {args_summary}"
+    if tool.get("duration") is None and preview and preview.lower() != "generating arguments":
+        extra = f": {_clip(preview, 160)}"
     return f"- `{name}`{extra}"
+
+
+def _format_tool_args_summary(args: Any) -> str:
+    if not isinstance(args, dict) or not args:
+        return ""
+    parts: list[str] = []
+    for key in sorted(args):
+        value = args.get(key)
+        key_text = str(key)
+        if re.search(r"(token|secret|password|passwd|credential|authorization)", key_text, re.IGNORECASE):
+            value_text = "[已隐藏]"
+        else:
+            value_text = _format_tool_arg_value(value)
+        if value_text:
+            parts.append(f"{key_text}={value_text}")
+        if len(parts) >= 4:
+            break
+    return _clip(", ".join(parts), 220)
+
+
+def _format_tool_arg_value(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        items = [_format_tool_arg_value(item) for item in list(value)[:4]]
+        suffix = ", ..." if len(value) > 4 else ""
+        return "[" + ", ".join(item for item in items if item) + suffix + "]"
+    if isinstance(value, dict):
+        keys = list(value.keys())[:4]
+        inner = ", ".join(f"{key}:{_format_tool_arg_value(value.get(key))}" for key in keys)
+        if len(value) > 4:
+            inner += ", ..."
+        return "{" + inner + "}"
+    text = str(value).replace("\n", " ").strip()
+    if not text:
+        return ""
+    if any(char.isspace() for char in text) or "," in text:
+        return json.dumps(_clip(text, 120), ensure_ascii=False)
+    return _clip(text, 120)
 
 
 def _render_done_footer(state: dict[str, Any]) -> str:

@@ -546,6 +546,67 @@ def _clean_stream_delta_text(text: str, profile_home: Optional[Path] = None) -> 
     return cleaned
 
 
+def _sanitize_tool_event_payload(payload: Any, profile_home: Optional[Path]) -> dict[str, Any]:
+    """Prepare tool progress metadata for user-visible cards."""
+    data = payload if isinstance(payload, dict) else {"name": str(payload or "tool")}
+    result: dict[str, Any] = {}
+    for key, value in data.items():
+        if key in {"preview", "args", "name", "tool_name", "duration", "is_error"}:
+            result[key] = _sanitize_tool_event_value(value, profile_home, key=str(key))
+    return result
+
+
+def _sanitize_tool_event_value(value: Any, profile_home: Optional[Path], *, key: str = "") -> Any:
+    if re.search(r"(token|secret|password|passwd|credential|authorization)", key, re.IGNORECASE):
+        return "[已隐藏]"
+    if isinstance(value, str):
+        return _sanitize_tool_event_string(value, profile_home)
+    if isinstance(value, dict):
+        return {
+            str(item_key): _sanitize_tool_event_value(item_value, profile_home, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_tool_event_value(item, profile_home, key=key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_tool_event_value(item, profile_home, key=key) for item in value)
+    return value
+
+
+def _sanitize_tool_event_string(text: str, profile_home: Optional[Path]) -> str:
+    raw = str(text or "")
+    if not raw:
+        return raw
+    cleaned = raw
+    root: Optional[Path] = None
+    if profile_home is not None:
+        root = Path(profile_home).expanduser().resolve(strict=False)
+        root_text = str(root)
+        cleaned = cleaned.replace(root_text + "/", "")
+        if cleaned == root_text:
+            cleaned = "."
+        workspace_root = str(root / "workspace")
+        cleaned = cleaned.replace(workspace_root + "/", "workspace/")
+    cleaned = re.sub(r"(?<!\w)/workspace/", "workspace/", cleaned)
+
+    def repl(match: re.Match[str]) -> str:
+        candidate = match.group(0).rstrip(".,;:)]}")
+        suffix = match.group(0)[len(candidate) :]
+        if root is not None:
+            try:
+                resolved = Path(candidate).expanduser().resolve(strict=False)
+                if resolved == root:
+                    return "." + suffix
+                if root in resolved.parents:
+                    return resolved.relative_to(root).as_posix() + suffix
+            except Exception:
+                pass
+        return "[宿主路径已隐藏]" + suffix
+
+    cleaned = re.sub(r"/(?:Users|home)/[^\s`\"'<>]+", repl, cleaned)
+    return cleaned
+
+
 _MEDIA_DIRECTIVE_RE = re.compile(r'''(?P<prefix>[`"']?MEDIA:\s*)(?P<path>\S+)(?P<suffix>[`"']?)''')
 _ARTIFACT_JSON_RE = re.compile(r"```hermes-artifact-json\s*(?P<body>.*?)\s*```", re.DOTALL | re.IGNORECASE)
 _PROFILE_FILE_PATH_RE = re.compile(
@@ -4452,10 +4513,10 @@ async def _update_feishu_stream_status(
 
 
 async def _update_feishu_stream_tool_event(
-    adapter, chat_id, message_id, payload, *, mode: str, completed: bool
+    adapter, chat_id, message_id, payload, *, mode: str, completed: bool, profile_home: Optional[Path] = None
 ):
     """Update active/completed tool state on the streaming surface."""
-    payload = payload if isinstance(payload, dict) else {"name": str(payload or "tool")}
+    payload = _sanitize_tool_event_payload(payload, profile_home)
     tool_name = str(payload.get("name") or payload.get("tool_name") or "tool")
     if mode == "card":
         method_name = (
@@ -4503,6 +4564,8 @@ async def _update_feishu_stream_tool_event(
 # cause visible flicker when the gateway sits an RTT away from open.feishu.cn.
 _STREAM_CONTENT_MIN_CHARS = 120
 _STREAM_CONTENT_MIN_SECONDS = 2.0
+_STREAM_CARDKIT_CONTENT_MIN_CHARS = 30
+_STREAM_CARDKIT_CONTENT_MIN_SECONDS = 0.2
 _STREAM_THINKING_MIN_SECONDS = 2.0
 _STREAM_CARD_REASONING_MIN_CHARS = 100
 _STREAM_CARD_REASONING_MIN_SECONDS = 2.0
@@ -4530,7 +4593,9 @@ def _aiagent_stream_timeout_notice(exc: BaseException) -> str:
 def _stream_card_idle_status(tick: int) -> str:
     """Return a changing pre-token status whose visible text keeps three dots."""
     marker = _STREAM_STATUS_ANIMATION_MARKERS[(max(1, int(tick)) - 1) % len(_STREAM_STATUS_ANIMATION_MARKERS)]
-    return f"{_STREAM_CARD_PRIME_STATUS}{marker}"
+    dots = "." * (((max(1, int(tick)) - 1) % 3) + 1)
+    base = _STREAM_CARD_PRIME_STATUS.rstrip(".")
+    return f"{base}{dots}{marker}"
 
 
 def _strip_stream_status_animation_markers(text: str) -> str:
@@ -4573,8 +4638,8 @@ async def _stream_into_feishu_shared_consumer(
         adapter,
         chat_id,
         StreamConsumerConfig(
-            edit_interval=_STREAM_CONTENT_MIN_SECONDS,
-            buffer_threshold=_STREAM_CONTENT_MIN_CHARS,
+            edit_interval=_STREAM_CARDKIT_CONTENT_MIN_SECONDS,
+            buffer_threshold=_STREAM_CARDKIT_CONTENT_MIN_CHARS,
             cursor=" ▉",
         ),
         metadata=None,
@@ -4602,10 +4667,10 @@ async def _stream_into_feishu_shared_consumer(
     last_reasoning_len = 0
 
     async def _idle_card_heartbeat() -> None:
-        tick = 1
+        tick = 2
         while True:
             await asyncio.sleep(_STREAM_CARD_IDLE_HEARTBEAT_SECONDS)
-            if first_agent_event_seen or content_delta_seen:
+            if content_delta_seen:
                 return
             try:
                 await consumer.update_streaming_card_status(_stream_card_idle_status(tick))
@@ -4664,7 +4729,7 @@ async def _stream_into_feishu_shared_consumer(
         consumer_task = asyncio.create_task(consumer.run())
 
         prime_task = asyncio.create_task(
-            consumer.update_streaming_card_status(_STREAM_CARD_PRIME_STATUS)
+            consumer.update_streaming_card_status(_stream_card_idle_status(1))
         )
         try:
             await asyncio.shield(prime_task)
@@ -4718,7 +4783,7 @@ async def _stream_into_feishu_shared_consumer(
                         continue
 
                     if kind == "tool_started":
-                        payload = delta if isinstance(delta, dict) else {"name": str(delta or "tool")}
+                        payload = _sanitize_tool_event_payload(delta, profile_home)
                         await consumer.update_streaming_card_tool_started(
                             str(payload.get("name") or payload.get("tool_name") or "tool"),
                             preview=payload.get("preview"),
@@ -4727,7 +4792,7 @@ async def _stream_into_feishu_shared_consumer(
                         continue
 
                     if kind == "tool_completed":
-                        payload = delta if isinstance(delta, dict) else {"name": str(delta or "tool")}
+                        payload = _sanitize_tool_event_payload(delta, profile_home)
                         await consumer.update_streaming_card_tool_completed(
                             str(payload.get("name") or payload.get("tool_name") or "tool"),
                             duration=payload.get("duration"),
@@ -4754,6 +4819,10 @@ async def _stream_into_feishu_shared_consumer(
                     piece = str(delta or "")
                     if not piece:
                         continue
+                    if thinking and len(thinking) > last_reasoning_len:
+                        await consumer.update_streaming_card_reasoning(thinking)
+                        last_reasoning_len = len(thinking)
+                        last_reasoning_edit = time.monotonic()
                     content += piece
                     consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
                     content_delta_seen = True
@@ -4875,10 +4944,10 @@ async def _stream_into_feishu(
     idle_heartbeat_task: Optional[asyncio.Task] = None
 
     async def _idle_card_heartbeat() -> None:
-        tick = 1
+        tick = 2
         while True:
             await asyncio.sleep(_STREAM_CARD_IDLE_HEARTBEAT_SECONDS)
-            if first_agent_event_seen or content_started or placeholder_id is None:
+            if content_started or placeholder_id is None:
                 return
             try:
                 await _update_feishu_stream_status(
@@ -5002,7 +5071,7 @@ async def _stream_into_feishu(
                     adapter,
                     chat_id,
                     placeholder_id,
-                    _STREAM_CARD_PRIME_STATUS,
+                    _stream_card_idle_status(1),
                     mode=stream_mode,
                 )
                 logger.info(
@@ -5063,6 +5132,7 @@ async def _stream_into_feishu(
                                 delta,
                                 mode=stream_mode,
                                 completed=False,
+                                profile_home=profile_home,
                             )
                         except Exception as exc:
                             logger.debug("multitenancy: card tool-start update failed: %s", exc)
@@ -5078,6 +5148,7 @@ async def _stream_into_feishu(
                                 delta,
                                 mode=stream_mode,
                                 completed=True,
+                                profile_home=profile_home,
                             )
                         except Exception as exc:
                             logger.debug("multitenancy: card tool-complete update failed: %s", exc)
