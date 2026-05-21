@@ -12,6 +12,7 @@ import inspect
 import importlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,14 @@ from .run_models import RunRequest
 CONFIG_NAME = "kanban-sidecar.yaml"
 ROUTER_PROFILE = "multitenancy_router"
 _SECRET_KEY_PARTS = ("secret", "token", "password", "api_key", "credential")
+_BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+class KanbanApiError(ValueError):
+    def __init__(self, message: str, *, status: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -141,6 +150,377 @@ def load_config(shared_home: str | Path) -> KanbanSidecarConfig:
         } if isinstance(raw.get("profile_user_keys"), dict) else None,
         delivery_mode=str(raw.get("delivery_mode") or "feishu").strip() or "feishu",
     )
+
+
+def list_owner_assignees(*, owner_open_id: str, board: str = "default") -> list[dict[str, Any]]:
+    """Return only Kanban assignees backed by the asserted owner's routes."""
+    _owned_rows, owned_profiles, _owner_root = _owner_scope(owner_open_id)
+    tasks = _list_owner_tasks(owner_open_id=owner_open_id, board=board)
+    counts: dict[str, dict[str, int]] = {}
+    for task in tasks:
+        assignee = str(_get(task, "assignee", "") or "").strip()
+        if not assignee:
+            continue
+        status = str(_get(task, "status", "") or "").strip() or "unknown"
+        counts.setdefault(assignee, {})
+        counts[assignee][status] = counts[assignee].get(status, 0) + 1
+
+    result = []
+    for row in _owned_rows:
+        name = str(getattr(row, "profile_name", "") or "").strip()
+        if not name or name not in owned_profiles:
+            continue
+        result.append(
+            {
+                "name": name,
+                "display_label": getattr(row, "display_label", None) or name,
+                "agent_id": getattr(row, "agent_id", None),
+                "kind": getattr(row, "kind", None),
+                "on_disk": True,
+                "counts": counts.get(name, {}),
+            }
+        )
+    return result
+
+
+def list_owner_tasks(
+    *,
+    owner_open_id: str,
+    board: str = "default",
+    status: str | None = None,
+    assignee: str | None = None,
+    tenant: str | None = None,
+    include_archived: bool = False,
+) -> list[dict[str, Any]]:
+    """List Kanban tasks visible to the asserted owner."""
+    tasks = _list_owner_tasks(
+        owner_open_id=owner_open_id,
+        board=board,
+        status=status,
+        assignee=assignee,
+        tenant=tenant,
+        include_archived=include_archived,
+    )
+    return [_task_to_dict(task) for task in tasks]
+
+
+def create_owner_task(
+    *,
+    owner_open_id: str,
+    payload: dict[str, Any],
+    board: str = "default",
+) -> dict[str, Any]:
+    """Create a Kanban task under the asserted owner boundary."""
+    _rows, owned_profiles, owner_root = _owner_scope(owner_open_id)
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        raise KanbanApiError("title is required", status=400)
+    assignee = _optional_text(payload.get("assignee"))
+    if assignee is not None and assignee not in owned_profiles:
+        raise KanbanApiError(f"assignee {assignee!r} is not accessible for asserted owner", status=403)
+    priority = payload.get("priority", 0)
+    if priority in (None, ""):
+        priority = 0
+    if not isinstance(priority, int):
+        raise KanbanApiError("priority must be an integer", status=400)
+    normalized_board = normalize_board_slug(board)
+    kanban_db = importlib.import_module("hermes_cli.kanban_db")
+    conn = kanban_db.connect(board=normalized_board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title=title,
+            body=_optional_text(payload.get("body")),
+            assignee=assignee,
+            created_by=str(owner_root.profile_name),
+            tenant=owner_open_id,
+            priority=priority,
+            board=normalized_board,
+        )
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        _close_conn(conn)
+    return _task_to_dict(task) if task is not None else {"id": task_id}
+
+
+def owner_kanban_stats(*, owner_open_id: str, board: str = "default") -> dict[str, Any]:
+    tasks = _list_owner_tasks(owner_open_id=owner_open_id, board=board)
+    by_status: dict[str, int] = {}
+    by_assignee: dict[str, int] = {}
+    for task in tasks:
+        status = str(_get(task, "status", "") or "").strip() or "unknown"
+        by_status[status] = by_status.get(status, 0) + 1
+        assignee = str(_get(task, "assignee", "") or "").strip()
+        if assignee:
+            by_assignee[assignee] = by_assignee.get(assignee, 0) + 1
+    return {"by_status": by_status, "by_assignee": by_assignee, "total": len(tasks)}
+
+
+def owner_kanban_capabilities() -> dict[str, Any]:
+    capabilities = [
+        {"key": "explicitBoard", "status": "supported", "canonicalRoute": None, "canonicalCommand": "--board", "requiresBoard": True},
+        {"key": "boardsList", "status": "supported", "canonicalRoute": "/boards", "canonicalCommand": "boards list", "requiresBoard": False},
+        {"key": "boardCreate", "status": "missing", "reason": "Chat-plane Kanban does not expose board creation", "canonicalRoute": "/boards", "canonicalCommand": "boards create", "requiresBoard": False},
+        {"key": "boardArchive", "status": "missing", "reason": "Chat-plane Kanban does not expose board archive/delete", "canonicalRoute": "/boards/{slug}", "canonicalCommand": "boards rm", "requiresBoard": False},
+        {"key": "taskCrudLite", "status": "supported", "canonicalRoute": "/tasks", "canonicalCommand": "list/create", "requiresBoard": True},
+        {"key": "commentsWrite", "status": "missing", "reason": "Chat-plane Kanban comment writes remain disabled until owner-scoped sidecar support exists", "canonicalRoute": "/tasks/{task_id}/comments", "canonicalCommand": "comment", "requiresBoard": True},
+        {"key": "taskLog", "status": "missing", "reason": "Chat-plane Kanban logs remain disabled until owner-scoped artifact/log support exists", "canonicalRoute": "/tasks/{task_id}/log", "canonicalCommand": "log", "requiresBoard": True},
+        {"key": "diagnostics", "status": "missing", "reason": "Chat-plane Kanban diagnostics remain disabled until owner-scoped sidecar support exists", "canonicalRoute": "/diagnostics", "canonicalCommand": "diagnostics", "requiresBoard": True},
+        {"key": "reclaim", "status": "missing", "reason": "Chat-plane Kanban reclaim remains disabled until owner-scoped sidecar support exists", "canonicalRoute": "/tasks/{task_id}/reclaim", "canonicalCommand": "reclaim", "requiresBoard": True},
+        {"key": "reassign", "status": "missing", "reason": "Chat-plane Kanban reassign remains disabled until owner-scoped sidecar support exists", "canonicalRoute": "/tasks/{task_id}/reassign", "canonicalCommand": "reassign", "requiresBoard": True},
+        {"key": "specify", "status": "missing", "reason": "Chat-plane Kanban specify remains disabled until owner-scoped sidecar support exists", "canonicalRoute": "/tasks/{task_id}/specify", "canonicalCommand": "specify", "requiresBoard": True},
+        {"key": "dispatch", "status": "supported", "canonicalRoute": "/dispatch", "canonicalCommand": "dispatch via RunBroker", "requiresBoard": True},
+        {"key": "links", "status": "missing", "reason": "Chat-plane Kanban links remain disabled until owner-scoped sidecar support exists", "canonicalRoute": "/links", "canonicalCommand": "link/unlink", "requiresBoard": True},
+        {"key": "bulk", "status": "missing", "reason": "Chat-plane Kanban bulk writes remain disabled until owner-scoped sidecar support exists", "canonicalRoute": "/tasks/bulk", "canonicalCommand": "bulk", "requiresBoard": True},
+        {"key": "events", "status": "missing", "reason": "Disabled in chat-plane because WebSocket upgrade cannot enforce per-openid owner filtering", "canonicalRoute": "/events", "canonicalCommand": "watch", "requiresBoard": True},
+    ]
+    supports = {item["key"]: item["status"] == "supported" for item in capabilities}
+    missing = [item["key"] for item in capabilities if item["status"] != "supported"]
+    return {"source": "hermes-multitenancy-run-broker", "supports": supports, "missing": missing, "capabilities": capabilities}
+
+
+def list_owner_boards(*, owner_open_id: str, include_archived: bool = False) -> list[dict[str, Any]]:
+    kanban_db = importlib.import_module("hermes_cli.kanban_db")
+    boards = list(kanban_db.list_boards(include_archived=include_archived))
+    result = []
+    for board in boards:
+        slug = normalize_board_slug(str(board.get("slug") or "default"))
+        stats = owner_kanban_stats(owner_open_id=owner_open_id, board=slug)
+        if slug != "default" and stats["total"] == 0:
+            continue
+        safe = dict(board)
+        safe["counts"] = stats["by_status"]
+        safe["total"] = stats["total"]
+        result.append(safe)
+    if not result:
+        result.append(
+            {
+                "slug": "default",
+                "name": "Default",
+                "description": "",
+                "icon": "kanban",
+                "color": "#888888",
+                "archived": False,
+                "counts": {},
+                "total": 0,
+            }
+        )
+    return result
+
+
+def dispatch_owner_kanban(
+    *,
+    owner_open_id: str,
+    board: str = "default",
+    dry_run: bool = True,
+    max_spawn: int | None = None,
+    max_in_progress: int | None = None,
+) -> dict[str, Any]:
+    """Run an owner-bounded dispatch pass through the sidecar guardrails."""
+    _rows, owned_profiles, _owner_root = _owner_scope(owner_open_id)
+    normalized_board = normalize_board_slug(board)
+    all_tasks = _list_all_tasks(board=normalized_board, include_archived=True)
+    foreign = [
+        str(_get(task, "id", "") or "")
+        for task in all_tasks
+        if not _task_visible_to_owner(task, owned_profiles=owned_profiles, owner_open_id=owner_open_id)
+    ]
+    if foreign:
+        raise KanbanApiError("Kanban dispatch is disabled while this board contains tasks owned by other owners", status=403)
+
+    config = KanbanSidecarConfig(
+        enabled=True,
+        board=normalized_board,
+        tenant=owner_open_id,
+        allowed_task_profiles=tuple(sorted(owned_profiles)),
+        profile_user_keys={profile: owner_open_id for profile in owned_profiles},
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        execute=True,
+        run_broker=True,
+        delivery_mode="feishu",
+    )
+    result = _dispatch_once(config, dry_run=bool(dry_run))
+    summary = _summarize_dispatch(result)
+    return {
+        "status": "dry_run" if dry_run else "executed",
+        "board": normalized_board,
+        "tenant": owner_open_id,
+        "run_broker": True,
+        "allowed_task_profiles": sorted(owned_profiles),
+        **summary,
+    }
+
+
+def normalize_board_slug(board: str | None) -> str:
+    if board is None:
+        return "default"
+    slug = str(board).strip().lower()
+    if not slug or not _BOARD_SLUG_RE.match(slug):
+        raise KanbanApiError("invalid board slug", status=400)
+    return slug
+
+
+def _owner_scope(owner_open_id: str) -> tuple[list[Any], set[str], Any]:
+    owner = str(owner_open_id or "").strip()
+    if not owner:
+        raise KanbanApiError("owner identity required (X-Hermes-Owner-Open-Id)", status=403)
+
+    from . import router as router_mod
+
+    table = router_mod._get_routing_table()
+    if table is None:
+        raise KanbanApiError("trusted owner header requires routing table verification", status=403)
+    owner_root = table.resolve_owner_root(owner)
+    if owner_root is None:
+        raise KanbanApiError(f"asserted owner {owner!r} has no sync-root profile", status=403)
+
+    rows: list[Any] = [owner_root]
+    seen = {str(owner_root.profile_name)}
+    for row in table.list_by_owner(owner):
+        profile_name = str(getattr(row, "profile_name", "") or "").strip()
+        if profile_name and profile_name not in seen:
+            rows.append(row)
+            seen.add(profile_name)
+    return rows, seen, owner_root
+
+
+def _list_owner_tasks(
+    *,
+    owner_open_id: str,
+    board: str,
+    status: str | None = None,
+    assignee: str | None = None,
+    tenant: str | None = None,
+    include_archived: bool = False,
+) -> list[Any]:
+    _rows, owned_profiles, _owner_root = _owner_scope(owner_open_id)
+    if assignee is not None and assignee not in owned_profiles:
+        return []
+    if tenant is not None and tenant != owner_open_id:
+        return []
+    tasks = _list_all_tasks(
+        board=board,
+        status=status,
+        assignee=assignee,
+        tenant=tenant,
+        include_archived=include_archived,
+    )
+    return [
+        task
+        for task in tasks
+        if _task_visible_to_owner(task, owned_profiles=owned_profiles, owner_open_id=owner_open_id)
+    ]
+
+
+def _list_all_tasks(
+    *,
+    board: str,
+    status: str | None = None,
+    assignee: str | None = None,
+    tenant: str | None = None,
+    include_archived: bool = False,
+) -> list[Any]:
+    normalized_board = normalize_board_slug(board)
+    kanban_db = importlib.import_module("hermes_cli.kanban_db")
+    conn = kanban_db.connect(board=normalized_board)
+    try:
+        return list(
+            kanban_db.list_tasks(
+                conn,
+                status=status,
+                assignee=assignee,
+                tenant=tenant,
+                include_archived=include_archived,
+            )
+        )
+    finally:
+        _close_conn(conn)
+
+
+def _task_visible_to_owner(
+    task: Any,
+    *,
+    owned_profiles: set[str],
+    owner_open_id: str,
+) -> bool:
+    created_by = str(_get(task, "created_by", "") or "").strip()
+    assignee = str(_get(task, "assignee", "") or "").strip()
+    tenant = str(_get(task, "tenant", "") or "").strip()
+
+    # Treat conflicting attribution as foreign instead of relying on a single
+    # positive signal. Old Kanban rows can be hand-edited or created by older
+    # code paths; dispatch must refuse mixed-owner boards before RunBroker
+    # admission, not discover an alien assignee at execution time.
+    if tenant and tenant != owner_open_id:
+        return False
+    if assignee and assignee not in owned_profiles:
+        return False
+    if created_by and created_by not in owned_profiles and created_by != owner_open_id:
+        return False
+
+    return (
+        bool(created_by)
+        or bool(assignee)
+        or tenant == owner_open_id
+    )
+
+
+def _task_to_dict(task: Any) -> dict[str, Any]:
+    if task is None:
+        return {}
+    if isinstance(task, dict):
+        raw = dict(task)
+    elif hasattr(task, "__dict__"):
+        raw = {
+            key: value
+            for key, value in vars(task).items()
+            if not key.startswith("_") and _is_json_scalar_or_list(value)
+        }
+    else:
+        raw = {"id": str(task)}
+    fields = [
+        "id",
+        "title",
+        "body",
+        "assignee",
+        "status",
+        "priority",
+        "created_by",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "workspace_kind",
+        "workspace_path",
+        "tenant",
+        "result",
+        "skills",
+    ]
+    return {key: raw.get(key) for key in fields if key in raw}
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _is_json_scalar_or_list(value: Any) -> bool:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return True
+    if isinstance(value, list):
+        return all(_is_json_scalar_or_list(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_scalar_or_list(item) for key, item in value.items())
+    return False
+
+
+def _close_conn(conn: Any) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def _resolve_runtime(

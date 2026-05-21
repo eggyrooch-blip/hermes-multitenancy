@@ -162,6 +162,32 @@ def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
     }
 
 
+def _trusted_owner_from_request(request: Any) -> str:
+    return str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+
+
+def _kanban_board_from_request(request: Any) -> str:
+    return str(request.query.get("board") or "default").strip() or "default"
+
+
+def _optional_positive_int(value: Any, name: str, *, max_value: int = 100) -> int | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    if value > max_value:
+        raise ValueError(f"{name} must be <= {max_value}")
+    return value
+
+
+def _optional_bool(value: Any, name: str, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be boolean")
+    return value
+
+
 def _webui_agent_id(owner_open_id: str, profile_name: str) -> str:
     return f"webui:{owner_open_id}:{profile_name}"
 
@@ -765,6 +791,144 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI Feishu auth cancel failed")
             return web.json_response({"error": str(exc), "status": "error"}, status=500)
 
+    async def handle_kanban_assignees(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            assignees = kanban_sidecar.list_owner_assignees(
+                owner_open_id=_trusted_owner_from_request(request),
+                board=_kanban_board_from_request(request),
+            )
+            return web.json_response({"assignees": assignees})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban assignees failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_kanban_capabilities(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            # Still require owner scope so this endpoint cannot be used as a
+            # generic unauthenticated capability probe when broker auth is off
+            # in local development.
+            kanban_sidecar.list_owner_assignees(
+                owner_open_id=_trusted_owner_from_request(request),
+                board=_kanban_board_from_request(request),
+            )
+            return web.json_response({"capabilities": kanban_sidecar.owner_kanban_capabilities()})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban capabilities failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_kanban_stats(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            stats = kanban_sidecar.owner_kanban_stats(
+                owner_open_id=_trusted_owner_from_request(request),
+                board=_kanban_board_from_request(request),
+            )
+            return web.json_response({"stats": stats})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban stats failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_kanban_boards(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            include_archived = request.query.get("includeArchived", "").lower() in {"1", "true", "yes", "on"}
+            boards = kanban_sidecar.list_owner_boards(
+                owner_open_id=_trusted_owner_from_request(request),
+                include_archived=include_archived,
+            )
+            return web.json_response({"boards": boards})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban boards failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_kanban_tasks(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            include_archived = request.query.get("includeArchived", "").lower() in {"1", "true", "yes", "on"}
+            tasks = kanban_sidecar.list_owner_tasks(
+                owner_open_id=_trusted_owner_from_request(request),
+                board=_kanban_board_from_request(request),
+                status=request.query.get("status"),
+                assignee=request.query.get("assignee"),
+                tenant=request.query.get("tenant"),
+                include_archived=include_archived,
+            )
+            return web.json_response({"tasks": tasks})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban list failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_kanban_create_task(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            payload = await request.json()
+            task = kanban_sidecar.create_owner_task(
+                owner_open_id=_trusted_owner_from_request(request),
+                payload=payload,
+                board=_kanban_board_from_request(request),
+            )
+            return web.json_response({"task": task})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban create failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def handle_kanban_dispatch(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import kanban_sidecar
+
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                return web.json_response({"error": "request body must be an object"}, status=400)
+            result = kanban_sidecar.dispatch_owner_kanban(
+                owner_open_id=_trusted_owner_from_request(request),
+                board=_kanban_board_from_request(request),
+                dry_run=_optional_bool(payload.get("dryRun"), "dryRun", default=True),
+                max_spawn=_optional_positive_int(payload.get("max"), "max"),
+                max_in_progress=_optional_positive_int(payload.get("maxInProgress"), "maxInProgress"),
+            )
+            return web.json_response({"result": result})
+        except kanban_sidecar.KanbanApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI Kanban dispatch failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_skillhub_install(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -853,6 +1017,13 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
     app.router.add_delete("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_cancel)
+    app.router.add_get("/api/run-broker/kanban/boards", handle_kanban_boards)
+    app.router.add_get("/api/run-broker/kanban/capabilities", handle_kanban_capabilities)
+    app.router.add_get("/api/run-broker/kanban/assignees", handle_kanban_assignees)
+    app.router.add_get("/api/run-broker/kanban/stats", handle_kanban_stats)
+    app.router.add_get("/api/run-broker/kanban/tasks", handle_kanban_tasks)
+    app.router.add_post("/api/run-broker/kanban/tasks", handle_kanban_create_task)
+    app.router.add_post("/api/run-broker/kanban/dispatch", handle_kanban_dispatch)
     app.router.add_post("/api/run-broker/skills/install", handle_skillhub_install)
     app.router.add_get("/api/run-broker/skills/audit", handle_skill_audit)
     app.router.add_get("/api/run-broker/jobs", handle_list_jobs)
