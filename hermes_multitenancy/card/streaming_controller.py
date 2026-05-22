@@ -43,10 +43,17 @@ from .sanitization import _format
 from .state import (
     _INSTALLED_ATTR,
     _STATE_ATTR,
+    PHASE_ABORTED,
+    PHASE_COMPLETED,
+    PHASE_CREATING,
+    PHASE_CREATION_FAILED,
+    PHASE_STREAMING,
+    _acquire_epoch,
     _new_state,
     _next_sequence,
     _state_for,
     _states,
+    _transition,
 )
 from .tool_use_display import (
     _extract_raw_tool_call_intents,
@@ -122,6 +129,8 @@ async def _start_streaming_card(
         return _result(False, error="streaming card compat unavailable")
 
     state = _new_state()
+    state["epoch"] = _acquire_epoch(self)
+    _transition(state, PHASE_CREATING)
     if _can_use_cardkit(self):
         try:
             card_id = await _create_cardkit_card(self, _render_cardkit_initial_card())
@@ -139,6 +148,7 @@ async def _start_streaming_card(
                 result = _finalize(self, response, "streaming CardKit send failed")
                 message_id = getattr(result, "message_id", None)
                 if getattr(result, "success", False) and message_id:
+                    _transition(state, PHASE_STREAMING)
                     _states(self)[str(message_id)] = state
                     logger.info(
                         "multitenancy: Feishu CardKit compat card sent message_id=%s card_id=%s",
@@ -146,6 +156,7 @@ async def _start_streaming_card(
                         card_id,
                     )
                     return result
+                _transition(state, PHASE_CREATION_FAILED)
                 return result
         except Exception as exc:
             logger.warning("multitenancy: Feishu CardKit compat flow failed, using IM fallback: %s", exc)
@@ -164,10 +175,14 @@ async def _start_streaming_card(
         result = _finalize(self, response, "streaming card compat send failed")
         message_id = getattr(result, "message_id", None)
         if getattr(result, "success", False) and message_id:
+            _transition(state, PHASE_STREAMING)
             _states(self)[str(message_id)] = state
+        else:
+            _transition(state, PHASE_CREATION_FAILED)
         return result
     except Exception as exc:
         logger.warning("multitenancy: Feishu CardKit compat start failed: %s", exc)
+        _transition(state, PHASE_CREATION_FAILED)
         return _result(False, error=str(exc))
 
 
@@ -210,6 +225,7 @@ async def _abort_streaming_card(
     state["status"] = "Aborted."
     state["aborted"] = True
     state["finalized"] = True
+    _transition(state, PHASE_ABORTED)
     return await _flush_state(self, message_id, state, final=True, pop=True)
 
 
@@ -373,6 +389,8 @@ async def _flush_state(
                 )
             await _set_card_streaming_mode(adapter, original_card_id, False, _next_sequence(state))
             await _update_cardkit_card(adapter, original_card_id, _to_cardkit2(_render_message_card(state)), _next_sequence(state))
+            if not state.get("aborted"):
+                _transition(state, PHASE_COMPLETED)
             if pop:
                 _states(adapter).pop(str(message_id), None)
             return _result(True, message_id=str(message_id))
@@ -393,6 +411,8 @@ async def _flush_state(
             return _result(True, message_id=str(message_id))
 
         success = await _patch_interactive_state(adapter, str(message_id), state)
+        if success and final and not state.get("aborted"):
+            _transition(state, PHASE_COMPLETED)
         if success and pop:
             _states(adapter).pop(str(message_id), None)
         return _result(bool(success), message_id=str(message_id), error=None if success else "card patch failed")
