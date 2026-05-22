@@ -8,6 +8,21 @@ from types import SimpleNamespace
 import pytest
 
 
+def _card_text(card_or_elements):
+    elements = card_or_elements.get("elements", card_or_elements) if isinstance(card_or_elements, dict) else card_or_elements
+    parts = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        content = element.get("content")
+        if content:
+            parts.append(str(content))
+        nested = element.get("elements")
+        if nested:
+            parts.append(_card_text(nested))
+    return "\n".join(part for part in parts if part)
+
+
 class _CardCapableAdapter:
     def __init__(self):
         self.sent = []
@@ -355,8 +370,10 @@ async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapt
     final_card = adapter.card_patches[-1]["card"]
     assert "header" not in final_card
     assert final_card["config"]["wide_screen_mode"] is True
-    rendered = "\n".join(element["content"] for element in final_card["elements"])
-    assert "**Tool calls:**" in rendered
+    rendered = _card_text(final_card)
+    assert final_card["elements"][0]["tag"] == "collapsible_panel"
+    assert final_card["elements"][0]["expanded"] is False
+    assert "**Tool calls:**" not in rendered
     assert "`lark_cli` (300 ms)" in rendered
     assert "Hello from clean adapter" in rendered
     assert "Done (" in rendered
@@ -404,7 +421,7 @@ async def _run_stream_into_feishu_updates_interactive_card_without_auth_patch_he
     assert final_request.request_body.msg_type == "interactive"
     final_card = json.loads(final_request.request_body.content)
     assert "header" not in final_card
-    rendered = "\n".join(element["content"] for element in final_card["elements"])
+    rendered = _card_text(final_card)
     assert "Updated through Feishu message.update" in rendered
     assert "Done (" in rendered
 
@@ -430,9 +447,8 @@ async def _run_cardkit_compat_initial_card_uses_compact_empty_placeholders():
     initial_card = json.loads(adapter.card_sends[0]["payload"])
     assert initial_card["config"]["wide_screen_mode"] is False
     elements = initial_card["elements"]
-    assert [element["content"] for element in elements] == [
-        "Thinking..."
-    ]
+    assert [element["content"] for element in elements] == ["..."]
+    assert "Thinking" not in _card_text(elements)
 
 
 async def _run_cardkit_compat_flushes_tool_events_during_stream():
@@ -448,10 +464,8 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
         preview="GET /open-apis/authen/v1/user_info",
     )
     assert adapter.card_patches
-    rendered_running = "\n".join(
-        element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
-    )
-    assert "`lark_cli`: GET /open-apis/authen/v1/user_info" in rendered_running
+    rendered_running = _card_text(adapter.card_patches[-1]["card"])
+    assert "- `lark_cli`: GET /open-apis/authen/v1/user_info" in rendered_running
 
     await adapter.update_streaming_card_tool_completed(
         chat_id="chat-1",
@@ -460,9 +474,7 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
         duration=0.42,
         is_error=False,
     )
-    rendered_done = "\n".join(
-        element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
-    )
+    rendered_done = _card_text(adapter.card_patches[-1]["card"])
     assert "`lark_cli` (420 ms)" in rendered_done
 
 
@@ -484,9 +496,7 @@ async def _run_cardkit_compat_renders_tool_argument_summary():
         args={"language": "python", "path": "home/generated_art.png"},
     )
 
-    rendered = "\n".join(
-        element.get("content", "") for element in adapter.card_patches[-1]["card"]["elements"]
-    )
+    rendered = _card_text(adapter.card_patches[-1]["card"])
     assert "generating arguments" not in rendered
     assert "`execute_code` running" in rendered
     assert "language=python" in rendered
@@ -538,7 +548,8 @@ async def _run_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_re
         for request in adapter.content_updates
         if getattr(request, "element_id", "") == "reasoning_content"
     ]
-    assert any("`terminal`: python -c 'print(1)'" in item for item in streamed_tools)
+    assert any("- `terminal` running" in item for item in streamed_tools)
+    assert all("python -c" not in item for item in streamed_tools)
     assert any("我在检查参数" in item for item in streamed_reasoning)
     assert streamed_content[-1] == "最终结果"
 
@@ -577,12 +588,15 @@ async def _run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
     final_card = adapter.card_patches[-1]["card"]
     elements = final_card["elements"]
     assert [element["tag"] for element in elements] == [
-        "markdown",
+        "collapsible_panel",
         "collapsible_panel",
         "markdown",
         "markdown",
     ]
-    assert elements[0]["content"] == "**Tool calls:**\n- `lark_cli` (300 ms)"
+    tool_panel = elements[0]
+    assert tool_panel["expanded"] is False
+    assert tool_panel["header"]["title"]["content"] == "Tool calls"
+    assert tool_panel["elements"][0]["content"] == "- `lark_cli` (300 ms)"
     reasoning_panel = elements[1]
     assert reasoning_panel["expanded"] is False
     assert reasoning_panel["header"]["title"]["content"].startswith("💭 Thought")
@@ -621,10 +635,11 @@ async def _run_cardkit_compat_never_renders_raw_tool_call_xml():
     )
 
     final_card = adapter.card_patches[-1]["card"]
-    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    rendered = _card_text(final_card)
     assert "<tool_call>" not in rendered
     assert "lark-cli doc +create" not in rendered
-    assert "**Tool calls:**" in rendered
+    assert final_card["elements"][0]["tag"] == "collapsible_panel"
+    assert "**Tool calls:**" not in rendered
     assert "- `lark_cli` failed" in rendered
     assert "Done (" in rendered
 
@@ -667,7 +682,7 @@ async def _run_cardkit_compat_filters_tool_process_narration_from_final_body():
     )
 
     final_card = adapter.card_patches[-1]["card"]
-    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    rendered = _card_text(final_card)
     assert "我需要先找到" not in rendered
     assert "让我先获取" not in rendered
     assert "现在让我下载" not in rendered
@@ -714,7 +729,7 @@ async def _run_cardkit_compat_collapses_argument_generation_tool_rows():
     )
 
     final_card = adapter.card_patches[-1]["card"]
-    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    rendered = _card_text(final_card)
     assert "generating arguments" not in rendered
     assert rendered.count("`lark_cli`") == 1
     assert "- `lark_cli` (487 ms)" in rendered
@@ -764,7 +779,7 @@ async def _run_cardkit_compat_hides_internal_skill_view_tool_rows():
     )
 
     final_card = adapter.card_patches[-1]["card"]
-    rendered = "\n".join(element.get("content", "") for element in final_card["elements"])
+    rendered = _card_text(final_card)
     assert "`skill_view`" not in rendered
     assert "- `lark_cli` (1159 ms)" in rendered
 
@@ -819,8 +834,8 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
         for element in initial_card["body"]["elements"]
         if "element_id" in element
     ][:4] == [
-        "streaming_content",
         "tool_calls",
+        "streaming_content",
         "reasoning_content",
         "status_content",
     ]
@@ -839,10 +854,68 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
         for element in final_card["body"]["elements"]
         if element.get("tag") == "markdown"
     )
-    assert "**Tool calls:**" in final_text
-    assert "`lark_cli` (300 ms)" in final_text
+    tool_panel = final_card["body"]["elements"][0]
+    assert tool_panel["tag"] == "collapsible_panel"
+    assert tool_panel["expanded"] is False
+    assert tool_panel["header"]["title"]["content"] == "Tool calls"
+    assert "`lark_cli` (300 ms)" in tool_panel["elements"][0]["content"]
+    assert "**Tool calls:**" not in final_text
     assert "Hello CardKit" in final_text
     assert "Done (" in final_text
+
+
+def test_cardkit_initial_card_has_delay_streaming_and_no_visible_thinking():
+    from hermes_multitenancy.feishu_cardkit_compat import _render_cardkit_initial_card
+
+    card = _render_cardkit_initial_card()
+    config = card["config"]
+
+    assert config["streaming_mode"] is True
+    assert config["streaming_config"]["print_strategy"] == "delay"
+    assert config["streaming_config"]["print_frequency_ms"] == {
+        "default": 100,
+        "android": 100,
+        "ios": 100,
+        "pc": 100,
+    }
+    assert config["summary"]["content"] == ""
+    assert "Thinking" not in json.dumps(card, ensure_ascii=False)
+    assert "思考" not in json.dumps(card, ensure_ascii=False)
+    assert [
+        element["element_id"]
+        for element in card["body"]["elements"]
+        if "element_id" in element
+    ][:2] == ["tool_calls", "streaming_content"]
+
+
+def test_stream_throttle_timing_matches_openclaw_lark():
+    from hermes_multitenancy import router as router_mod
+
+    assert router_mod._STREAM_CARDKIT_CONTENT_MIN_SECONDS == 0.1
+    assert router_mod._STREAM_CONTENT_MIN_SECONDS == 1.5
+
+
+def test_markdown_table_over_limit_degrades_to_openclaw_code_mode():
+    from hermes_multitenancy.feishu_cardkit_compat import _optimize_markdown_style
+
+    text = """Before
+
+| Name | URL | Note | Owner | Status |
+|---|---|---|---|---|
+| **A** | [site](https://example.com) | `x` | Sunke | Ready |
+
+After"""
+
+    optimized = _optimize_markdown_style(text)
+
+    assert "Before" in optimized
+    assert "After" in optimized
+    assert "```" in optimized
+    assert "| Name" in optimized
+    assert "| A" in optimized
+    assert "site" in optimized
+    assert "[site](https://example.com)" not in optimized
+    assert "**A**" not in optimized
 
 
 def test_stream_into_feishu_streams_cardkit_cumulative_text_for_typewriter(
@@ -982,12 +1055,9 @@ async def _run_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
     )
 
     final_card = json.loads(adapter.card_updates[-1].request_body.card["data"])
-    final_text = "\n".join(
-        element.get("content", "")
-        for element in final_card["body"]["elements"]
-        if element.get("tag") == "markdown"
-    )
-    assert "**Tool calls:**" in final_text
+    final_text = _card_text(final_card["body"]["elements"])
+    assert final_card["body"]["elements"][0]["tag"] == "collapsible_panel"
+    assert "**Tool calls:**" not in final_text
     assert "`lark_cli` (400 ms)" in final_text
     assert "final answer" in final_text
 
@@ -1047,7 +1117,7 @@ async def _run_stream_into_feishu_skips_legacy_shared_consumer_without_card_meth
     assert adapter.card_sends[0]["msg_type"] == "interactive"
     final_card = adapter.card_patches[-1]["card"]
     assert "header" not in final_card
-    rendered = "\n".join(element["content"] for element in final_card["elements"])
+    rendered = _card_text(final_card)
     assert "Compat survives legacy consumer" in rendered
     assert "Done (" in rendered
 
@@ -1166,7 +1236,7 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     assert [
         router_mod._strip_stream_status_animation_markers(status)
         for status in consumer.statuses
-    ] == ["Thinking."]
+    ] == [""]
     assert consumer.reasoning == ["checking"]
     assert consumer.tool_starts == [
         {
@@ -1275,12 +1345,7 @@ def test_stream_card_idle_status_keeps_three_visible_dots_while_refreshing():
     assert [
         router_mod._strip_stream_status_animation_markers(status)
         for status in statuses
-    ] == [
-        "Thinking.",
-        "Thinking..",
-        "Thinking...",
-        "Thinking.",
-    ]
+    ] == ["", "", "", ""]
 
 
 @pytest.mark.asyncio
@@ -1528,7 +1593,7 @@ async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
     assert len(adapter.status_updates) == 1
     assert router_mod._strip_stream_status_animation_markers(
         adapter.status_updates[0]["content"]
-    ) == "Thinking."
+    ) == ""
     assert adapter.reasoning_updates == []
 
     release_stream.set()
@@ -1574,7 +1639,7 @@ async def test_stream_into_feishu_keeps_card_alive_while_agent_is_silent(
     assert [
         router_mod._strip_stream_status_animation_markers(update["content"])
         for update in adapter.status_updates[:2]
-    ] == ["Thinking.", "Thinking.."]
+    ] == ["", ""]
     assert adapter.reasoning_updates == []
 
     release_stream.set()
@@ -1631,7 +1696,7 @@ async def _run_stream_into_feishu_keeps_status_animating_after_tool_event(
     assert [
         router_mod._strip_stream_status_animation_markers(update["content"])
         for update in adapter.status_updates[:2]
-    ] == ["Thinking.", "Thinking.."]
+    ] == ["", ""]
     assert adapter.tool_starts[0]["tool_name"] == "execute_code"
 
     release_stream.set()
@@ -1831,7 +1896,7 @@ async def test_stream_into_feishu_aborts_card_when_cancelled_during_prime(
         async def update_streaming_card_status(
             self, *, chat_id, message_id, content
         ):
-            if content.startswith("Thinking."):
+            if content:
                 self.prime_entered.set()
                 await self.release_prime.wait()
             return await super().update_streaming_card_status(
@@ -1909,7 +1974,7 @@ async def test_stream_into_feishu_updates_card_for_tool_and_reasoning_events(
     assert len(adapter.status_updates) == 1
     assert router_mod._strip_stream_status_animation_markers(
         adapter.status_updates[0]["content"]
-    ) == "Thinking."
+    ) == ""
     assert adapter.reasoning_updates == [
         {
             "chat_id": "chat-1",
@@ -2022,7 +2087,7 @@ def test_stream_into_feishu_streams_raw_reasoning_in_card(monkeypatch, tmp_path)
     assert [
         router_mod._strip_stream_status_animation_markers(item["content"])
         for item in adapter.status_updates
-    ] == ["Thinking."]
+    ] == [""]
     assert [item["content"] for item in adapter.reasoning_updates] == [
         "The user wants to update a Feishu record.",
     ]
@@ -2063,7 +2128,7 @@ async def test_stream_into_feishu_falls_back_to_text_edit_when_card_start_fails(
     assert adapter.sent == [
         {
             "chat_id": "chat-1",
-            "content": "Thinking...",
+            "content": "\u200b",
             "reply_to": "om_source_fallback",
             "metadata": None,
         }

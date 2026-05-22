@@ -625,7 +625,7 @@ def test_aiagent_stream_status_keeps_three_visible_dots_while_refreshing():
     assert [
         agent_real._strip_stream_status_animation_markers(status)
         for status in statuses
-    ] == ["Hermes 正在准备响应..."] * 4
+    ] == [""] * 4
 
 
 @pytest.mark.asyncio
@@ -777,7 +777,7 @@ async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_st
     ]
 
     assert events[0][0] == "status"
-    assert agent_real._strip_stream_status_animation_markers(events[0][1]) == "Hermes 正在准备响应..."
+    assert agent_real._strip_stream_status_animation_markers(events[0][1]) == ""
     assert "已等待" not in events[0][1]
     assert events[-1] == ("done", "ok")
 
@@ -846,10 +846,7 @@ async def test_stream_aiagent_subprocess_emits_status_while_waiting_after_first_
 
     assert events[0] == ("tool_started", {"name": "delegate_task"})
     assert events[1][0] == "status"
-    assert (
-        agent_real._strip_stream_status_animation_markers(events[1][1])
-        == "Hermes 正在等待当前工具或子任务输出..."
-    )
+    assert agent_real._strip_stream_status_animation_markers(events[1][1]) == ""
     assert events[-1] == ("done", "ok")
 
 

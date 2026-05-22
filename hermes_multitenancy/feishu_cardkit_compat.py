@@ -542,7 +542,7 @@ def _build_patch_message_request(message_id: str, card: dict[str, Any]) -> Any:
 
 def _new_state() -> dict[str, Any]:
     return {
-        "status": "Thinking...",
+        "status": "",
         "reasoning": "",
         "reasoning_started_at": None,
         "reasoning_elapsed": None,
@@ -589,10 +589,15 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
         "schema": "2.0",
         "config": {
             "streaming_mode": True,
+            "streaming_config": {
+                "print_frequency_ms": {"default": 100, "android": 100, "ios": 100, "pc": 100},
+                "print_step": {"default": 1, "android": 1, "ios": 1, "pc": 1},
+                "print_strategy": "delay",
+            },
             "locales": ["zh_cn", "en_us"],
             "summary": {
-                "content": "Thinking...",
-                "i18n_content": {"zh_cn": "思考中...", "en_us": "Thinking..."},
+                "content": "",
+                "i18n_content": {"zh_cn": "", "en_us": ""},
             },
         },
         "body": {
@@ -603,7 +608,7 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
                     "text_align": "left",
                     "text_size": "normal_v2",
                     "margin": "0px 0px 0px 0px",
-                    "element_id": _STREAMING_ELEMENT_ID,
+                    "element_id": _TOOLS_ELEMENT_ID,
                 },
                 {
                     "tag": "markdown",
@@ -611,7 +616,7 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
                     "text_align": "left",
                     "text_size": "normal_v2",
                     "margin": "0px 0px 0px 0px",
-                    "element_id": _TOOLS_ELEMENT_ID,
+                    "element_id": _STREAMING_ELEMENT_ID,
                 },
                 {
                     "tag": "markdown",
@@ -647,7 +652,6 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
 def _render_stream_text(state: dict[str, Any]) -> str:
     content = _optimize_markdown_style(_strip_tool_call_blocks(_strip_reasoning_tags(str(state.get("content") or ""))).strip())
     reasoning = _clean_reasoning_prefix(str(state.get("reasoning") or "")).strip()
-    status = str(state.get("status") or "").strip()
     tools = list(state.get("tools") or [])
     tool_section = _render_tool_calls_section(tools)
     content = _strip_tool_process_narration(content, tools)
@@ -656,20 +660,16 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     if content:
         parts.append(content)
     elif tool_section or reasoning:
-        if tool_section:
-            parts.append(tool_section)
         if reasoning:
-            parts.append(f"💭 **Thinking...**\n\n{_clip(reasoning, 1200)}")
-    elif status:
-        parts.append(status)
+            parts.append(f"💭 **Thought**\n\n{_clip(reasoning, 1200)}")
     else:
-        parts.append("Thinking...")
-    return "\n\n".join(part for part in parts if part).strip() or "Thinking..."
+        parts.append(" ")
+    return "\n\n".join(part for part in parts if part).strip() or " "
 
 
 def _render_reasoning_stream_text(state: dict[str, Any]) -> str:
     reasoning = _clean_reasoning_prefix(str(state.get("reasoning") or "")).strip()
-    return f"💭 **Thinking...**\n\n{_clip(reasoning, 1200)}" if reasoning else " "
+    return f"💭 **Thought**\n\n{_clip(reasoning, 1200)}" if reasoning else " "
 
 
 def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
@@ -682,7 +682,7 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
 
     tool_section = _render_tool_calls_section(tools)
     if tool_section:
-        elements.append({"tag": "markdown", "content": tool_section})
+        elements.append(_render_tool_calls_panel(tool_section))
     if status and not state.get("finalized"):
         elements.append({"tag": "markdown", "content": status})
     if reasoning:
@@ -769,9 +769,30 @@ def _render_tool_calls_section(tools: list[Any]) -> str:
     normalized = _normalize_tool_rows(tools)[-5:]
     if not normalized:
         return ""
-    lines = ["**Tool calls:**"]
-    lines.extend(_render_tool_call_line(tool) for tool in normalized)
+    lines = [_render_tool_call_line(tool) for tool in normalized]
     return "\n".join(lines)
+
+
+def _render_tool_calls_panel(tool_section: str) -> dict[str, Any]:
+    return {
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "header": {
+            "title": {"tag": "markdown", "content": "Tool calls"},
+            "vertical_align": "center",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "size": "16px 16px",
+            },
+            "icon_position": "follow_text",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "5px"},
+        "vertical_spacing": "8px",
+        "padding": "8px 8px 8px 8px",
+        "elements": [{"tag": "markdown", "content": tool_section, "text_size": "notation"}],
+    }
 
 
 def _normalize_tool_rows(tools: list[Any]) -> list[dict[str, Any]]:
@@ -806,6 +827,8 @@ def _render_tool_call_line(tool: dict[str, Any]) -> str:
     extra = " running" if status == "running" else " failed" if status == "error" else ""
     if tool.get("duration") is not None:
         extra = f" ({_format_tool_duration(tool['duration'])})"
+    if name == "terminal":
+        return f"- `{name}`{extra}"
     args_summary = _format_tool_args_summary(tool.get("args"))
     preview = str(tool.get("preview") or "").strip()
     if args_summary:
@@ -1011,11 +1034,15 @@ def _optimize_markdown_style_inner(text: str, card_version: int = 2) -> str:
     original = str(text or "")
     code_blocks: list[str] = []
 
-    def stash_code_block(match: re.Match[str]) -> str:
-        code_blocks.append(match.group(0))
+    def stash_code_text(block: str) -> str:
+        code_blocks.append(block)
         return f"___CB_{len(code_blocks) - 1}___"
 
+    def stash_code_block(match: re.Match[str]) -> str:
+        return stash_code_text(match.group(0))
+
     result = re.sub(r"```[\s\S]*?```", stash_code_block, original)
+    result = _degrade_limited_markdown_tables(result, stash_code_text)
     if re.search(r"^#{1,3} ", original, flags=re.MULTILINE):
         result = re.sub(r"^#{2,6} (.+)$", r"##### \1", result, flags=re.MULTILINE)
         result = re.sub(r"^# (.+)$", r"#### \1", result, flags=re.MULTILINE)
@@ -1035,6 +1062,114 @@ def _optimize_markdown_style_inner(text: str, card_version: int = 2) -> str:
             result = result.replace(f"___CB_{index}___", block)
 
     return re.sub(r"\n{3,}", "\n\n", result)
+
+
+_MARKDOWN_TABLE_MAX_NATIVE_COLUMNS = 4
+_MARKDOWN_TABLE_MAX_NATIVE_ROWS = 12
+_MARKDOWN_TABLE_MAX_NATIVE_CHARS = 1200
+_MARKDOWN_TABLE_MAX_NATIVE_LINE_CHARS = 120
+
+
+def _degrade_limited_markdown_tables(text: str, stash_code_text: Any) -> str:
+    """Downgrade oversized markdown tables using openclaw-lark's code-mode shape."""
+    lines = str(text or "").splitlines()
+    result: list[str] = []
+    index = 0
+    while index < len(lines):
+        if _is_markdown_table_start(lines, index):
+            end = index + 2
+            while end < len(lines) and _is_markdown_table_row(lines[end]):
+                end += 1
+            block_lines = lines[index:end]
+            if _should_degrade_markdown_table(block_lines):
+                result.append(stash_code_text(_render_markdown_table_code_block(block_lines)))
+            else:
+                result.extend(block_lines)
+            index = end
+            continue
+        result.append(lines[index])
+        index += 1
+    return "\n".join(result)
+
+
+def _is_markdown_table_start(lines: list[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and _is_markdown_table_row(lines[index])
+        and _is_markdown_table_separator(lines[index + 1])
+    )
+
+
+def _is_markdown_table_row(line: str) -> bool:
+    stripped = str(line or "").strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    if not _is_markdown_table_row(line):
+        return False
+    cells = _split_markdown_table_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    stripped = str(line or "").strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _should_degrade_markdown_table(block_lines: list[str]) -> bool:
+    rows = [_split_markdown_table_row(line) for line in block_lines if _is_markdown_table_row(line)]
+    columns = max((len(row) for row in rows), default=0)
+    data_rows = max(0, len(rows) - 2)
+    return (
+        columns > _MARKDOWN_TABLE_MAX_NATIVE_COLUMNS
+        or data_rows > _MARKDOWN_TABLE_MAX_NATIVE_ROWS
+        or sum(len(line) for line in block_lines) > _MARKDOWN_TABLE_MAX_NATIVE_CHARS
+        or any(len(line) > _MARKDOWN_TABLE_MAX_NATIVE_LINE_CHARS for line in block_lines)
+    )
+
+
+def _render_markdown_table_code_block(block_lines: list[str]) -> str:
+    rows = [
+        [_plain_table_cell(cell) for cell in _split_markdown_table_row(line)]
+        for line in block_lines
+        if _is_markdown_table_row(line)
+    ]
+    if len(rows) < 2:
+        return "```\n" + "\n".join(block_lines) + "\n```"
+
+    column_count = max(len(row) for row in rows)
+    normalized_rows = [row + [""] * (column_count - len(row)) for row in rows]
+    widths = [
+        max(3, *(len(row[column]) for row in normalized_rows))
+        for column in range(column_count)
+    ]
+
+    rendered: list[str] = []
+    for row_index, row in enumerate(normalized_rows):
+        if row_index == 1:
+            cells = ["-" * width for width in widths]
+        else:
+            cells = [cell.ljust(widths[column]) for column, cell in enumerate(row)]
+        rendered.append("| " + " | ".join(cells) + " |")
+    return "```\n" + "\n".join(rendered) + "\n```"
+
+
+def _plain_table_cell(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"~~([^~]+)~~", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _strip_invalid_image_keys(text: str) -> str:

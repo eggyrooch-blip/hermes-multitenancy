@@ -4434,7 +4434,7 @@ async def _start_feishu_stream_target(
                     getattr(result, "error", None),
                 )
 
-    placeholder_send = await adapter.send(chat_id, "Thinking...", reply_to=reply_to, metadata=metadata)
+    placeholder_send = await adapter.send(chat_id, _STREAM_INVISIBLE_PLACEHOLDER, reply_to=reply_to, metadata=metadata)
     message_id = (
         placeholder_send.message_id
         if getattr(placeholder_send, "success", False)
@@ -4584,22 +4584,19 @@ async def _update_feishu_stream_tool_event(
     )
 
 
-# Throttle edit_message calls. Hermes mainstream uses 1.5s between edits
-# (run.py:9502 _PROGRESS_EDIT_INTERVAL); we mirror that as the floor for the
-# content phase. CardKit reasoning can update more often because it streams
-# into a stable card element; legacy edit_message keeps the wider heartbeat.
-# Streaming card flush throttle (tuned 2026-05-12 for remote-RTT UX).
-# CardKit only exposes cardElement.content as the streaming endpoint, and
-# every call fully replaces the rendered markdown — high-frequency flushes
-# cause visible flicker when the gateway sits an RTT away from open.feishu.cn.
+# Streaming-card flush throttles match openclaw-lark:
+# CARDKIT_MS=100 for cardElement.content and PATCH_MS=1500 for legacy edits.
+# The character thresholds are Hermes' local stream-consumer coalescing floor;
+# time-based throttle is the cross-project contract.
 _STREAM_CONTENT_MIN_CHARS = 120
-_STREAM_CONTENT_MIN_SECONDS = 2.0
+_STREAM_CONTENT_MIN_SECONDS = 1.5
 _STREAM_CARDKIT_CONTENT_MIN_CHARS = 30
-_STREAM_CARDKIT_CONTENT_MIN_SECONDS = 0.2
+_STREAM_CARDKIT_CONTENT_MIN_SECONDS = 0.1
 _STREAM_THINKING_MIN_SECONDS = 2.0
 _STREAM_CARD_REASONING_MIN_CHARS = 100
 _STREAM_CARD_REASONING_MIN_SECONDS = 2.0
-_STREAM_CARD_PRIME_STATUS = "Thinking..."
+_STREAM_CARD_PRIME_STATUS = ""
+_STREAM_INVISIBLE_PLACEHOLDER = "\u200b"
 _STREAM_CARD_IDLE_HEARTBEAT_SECONDS = 2.5
 _STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 _STREAM_ABORT_FALLBACK = "Aborted."
@@ -4621,11 +4618,9 @@ def _aiagent_stream_timeout_notice(exc: BaseException) -> str:
 
 
 def _stream_card_idle_status(tick: int) -> str:
-    """Return a changing pre-token status whose visible text keeps three dots."""
+    """Return a changing pre-token status marker with no visible waiting text."""
     marker = _STREAM_STATUS_ANIMATION_MARKERS[(max(1, int(tick)) - 1) % len(_STREAM_STATUS_ANIMATION_MARKERS)]
-    dots = "." * (((max(1, int(tick)) - 1) % 3) + 1)
-    base = _STREAM_CARD_PRIME_STATUS.rstrip(".")
-    return f"{base}{dots}{marker}"
+    return marker
 
 
 def _strip_stream_status_animation_markers(text: str) -> str:
@@ -5024,7 +5019,7 @@ async def _stream_into_feishu(
         if content:
             return _clean_stream_display_text(content, profile_home)
         preview = thinking[-160:].strip() if thinking else ""
-        return f"💭 思考中…\n{preview}" if preview else "💭 思考中…"
+        return _clean_stream_display_text(preview, profile_home) if preview else _STREAM_INVISIBLE_PLACEHOLDER
 
     def abort_content() -> str:
         raw = content if content else (thinking if thinking else _STREAM_ABORT_FALLBACK)
@@ -5078,7 +5073,7 @@ async def _stream_into_feishu(
                     adapter,
                     chat_id,
                     placeholder_id,
-                    "继续输出...",
+                    _STREAM_INVISIBLE_PLACEHOLDER,
                     mode=stream_mode,
                 )
             except Exception as exc:

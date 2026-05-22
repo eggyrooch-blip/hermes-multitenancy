@@ -106,8 +106,9 @@ _STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 
 
 def _animated_stream_status(phase: str, tick: int) -> str:
+    del phase
     marker = _STREAM_STATUS_ANIMATION_MARKERS[(max(1, int(tick)) - 1) % len(_STREAM_STATUS_ANIMATION_MARKERS)]
-    return f"Hermes 正在{phase}...{marker}"
+    return marker
 
 
 def _strip_stream_status_animation_markers(text: str) -> str:
