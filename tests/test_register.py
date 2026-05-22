@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import sys
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - test env is 3.11+, kept for local compatibility.
+    import tomli as tomllib
 
 import pytest
 
@@ -31,6 +37,20 @@ def test_pyproject_entry_point():
     proj = Path(__file__).parent.parent / "pyproject.toml"
     text = proj.read_text()
     assert 'multitenancy = "hermes_multitenancy"' in text
+
+
+def test_pyproject_declares_all_python_packages():
+    """Explicit setuptools package lists must include new subpackages."""
+    root = Path(__file__).parent.parent
+    config = tomllib.loads((root / "pyproject.toml").read_text())
+    declared = set(config["tool"]["setuptools"]["packages"])
+    discovered = {
+        path.relative_to(root).as_posix().replace("/", ".")
+        for path in (root / "hermes_multitenancy").rglob("*")
+        if path.is_dir() and (path / "__init__.py").exists()
+    }
+    discovered.add("hermes_multitenancy")
+    assert discovered <= declared
 
 
 def test_register_calls_register_hook_once():

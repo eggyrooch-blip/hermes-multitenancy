@@ -58,7 +58,7 @@ hermes-multitenancy-credentials = "hermes_multitenancy.credential_materializer:m
 multitenancy = "hermes_multitenancy"
 
 [tool.setuptools]
-packages = ["hermes_multitenancy", "hermes_multitenancy.sync"]
+packages = ["hermes_multitenancy", "hermes_multitenancy.card", "hermes_multitenancy.sync"]
 
 [tool.setuptools.package-data]
 hermes_multitenancy = ["plugin.yaml"]
