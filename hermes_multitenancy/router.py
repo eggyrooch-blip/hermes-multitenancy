@@ -3078,6 +3078,49 @@ def _event_platform_value(event: Any) -> Optional[str]:
     return str(value) if value else None
 
 
+def _scope_profile_skill_loader(profile_home: Optional[Path]) -> list[tuple[Any, str, Any, bool]]:
+    """Point upstream skill loader module caches at the routed profile."""
+    if profile_home is None:
+        return []
+    states: list[tuple[Any, str, Any, bool]] = []
+
+    def remember(module: Any, attr: str, value: Any) -> None:
+        states.append((module, attr, getattr(module, attr, None), hasattr(module, attr)))
+        setattr(module, attr, value)
+
+    try:
+        from tools import skills_tool  # type: ignore
+
+        remember(skills_tool, "HERMES_HOME", profile_home)
+        remember(skills_tool, "SKILLS_DIR", profile_home / "skills")
+    except Exception as exc:
+        logger.debug("multitenancy: profile skill loader scope skipped (%s)", exc)
+
+    try:
+        from agent import skill_commands  # type: ignore
+
+        # ``agent.skill_commands`` caches slash skills per process, while this
+        # router process serves many profiles.  Clear the cache inside the
+        # scoped context so `/skill` resolves against this routed profile.
+        remember(skill_commands, "_skill_commands", {})
+        remember(skill_commands, "_skill_commands_platform", None)
+    except Exception as exc:
+        logger.debug("multitenancy: skill command cache scope skipped (%s)", exc)
+
+    return states
+
+
+def _restore_profile_skill_loader(states: list[tuple[Any, str, Any, bool]]) -> None:
+    for module, attr, old_value, had_attr in reversed(states):
+        try:
+            if had_attr:
+                setattr(module, attr, old_value)
+            else:
+                delattr(module, attr)
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def _profile_gateway_context(
     gateway: Any,
@@ -3098,6 +3141,7 @@ async def _profile_gateway_context(
         old_session_key_for_source = getattr(gateway, "_session_key_for_source", None)
         if profile_home is not None:
             os.environ["HERMES_HOME"] = str(profile_home)
+        skill_loader_states = _scope_profile_skill_loader(profile_home)
         session_key = _multitenant_gateway_session_key(
             event,
             profile_name=profile_name,
@@ -3120,6 +3164,7 @@ async def _profile_gateway_context(
                     delattr(gateway, "_session_key_for_source")
                 except Exception:
                     pass
+            _restore_profile_skill_loader(skill_loader_states)
             if had_home:
                 os.environ["HERMES_HOME"] = old_home or ""
             else:

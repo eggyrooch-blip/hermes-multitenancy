@@ -824,6 +824,102 @@ async def test_group_skill_slash_with_adjacent_url_rewrites_into_agent_prompt(mo
 
 
 @pytest.mark.asyncio
+async def test_group_skill_slash_loads_skill_from_routed_profile_after_router_cache(monkeypatch, tmp_path):
+    """The router process may have imported skills_tool before routing to the group profile."""
+    import sys
+    from types import ModuleType
+
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy import router as router_mod
+
+    _user_inflight_tasks.clear()
+    router_home = tmp_path / "router"
+    group_home = tmp_path / "group"
+    (router_home / "skills").mkdir(parents=True)
+    skill_dir = group_home / "skills" / "Keep" / "kep-prd-analysis"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: kep-prd-analysis\ndescription: PRD analysis\n---\n"
+        "# KEP PRD Analysis\n\nloaded from routed group profile\n",
+        encoding="utf-8",
+    )
+
+    async def fake_group_route(*, chat_id, gateway):
+        return "group", group_home
+
+    monkeypatch.setattr(router_mod, "resolve_or_auto_provision_group_route", fake_group_route)
+
+    tools_pkg = ModuleType("tools")
+    skills_tool = ModuleType("tools.skills_tool")
+    skills_tool.HERMES_HOME = router_home
+    skills_tool.SKILLS_DIR = router_home / "skills"
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.skills_tool", skills_tool)
+
+    skill_commands = ModuleType("agent.skill_commands")
+
+    def get_skill_commands():
+        return {
+            "/kep-prd-analysis": {
+                "name": "kep-prd-analysis",
+                "skill_dir": str(skill_dir),
+            }
+        }
+
+    def resolve_skill_command_key(command):
+        return "/kep-prd-analysis" if command.replace("_", "-") == "kep-prd-analysis" else None
+
+    def build_skill_invocation_message(cmd_key, user_instruction="", task_id=None):
+        from tools import skills_tool as current_skills_tool
+
+        current_skill_dir = Path(get_skill_commands()[cmd_key]["skill_dir"])
+        try:
+            rel = current_skill_dir.relative_to(current_skills_tool.SKILLS_DIR)
+        except ValueError:
+            return "[Failed to load skill: kep-prd-analysis]"
+        return f"[skill:{rel} task:{task_id}] {user_instruction}"
+
+    skill_commands.get_skill_commands = get_skill_commands
+    skill_commands.resolve_skill_command_key = resolve_skill_command_key
+    skill_commands.build_skill_invocation_message = build_skill_invocation_message
+
+    agent_pkg = ModuleType("agent")
+    agent_pkg.skill_commands = skill_commands
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", skill_commands)
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.skill_utils",
+        SimpleNamespace(get_disabled_skill_names=lambda platform=None: set()),
+    )
+
+    seen = {}
+
+    class Pool:
+        async def dispatch(self, profile_name, home, event):
+            seen["profile_name"] = profile_name
+            seen["home"] = home
+            seen["text"] = event.text
+            return "agent ok"
+
+    monkeypatch.setattr(router_mod, "_get_pool", lambda: Pool())
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None): pass
+
+    event = _build_event("/kep-prd-analysis 260", user_id="ou_skill", chat_id="oc_group")
+    event.source.chat_type = "group"
+
+    await handle_async(event=event, gateway=SimpleNamespace(adapters={"feishu": Adapter()}))
+
+    assert seen["profile_name"] == "group"
+    assert seen["home"] == group_home
+    assert "[Failed to load skill" not in seen["text"]
+    assert "Keep/kep-prd-analysis" in seen["text"]
+
+
+@pytest.mark.asyncio
 async def test_hades_slash_alias_invokes_kep_hades_skill(monkeypatch, tmp_path):
     """Keep's historical /hades shorthand should load kep-hades-cli."""
     import sys
