@@ -47,11 +47,13 @@ def _headers(key: str, **overrides: str) -> dict[str, str]:
     timestamp = overrides.pop("timestamp", str(int(time.time())))
     identity = overrides.pop("identity", "user")
     auth_header = overrides.pop("auth_header", "Authorization")
+    method = overrides.pop("method", "GET")
     target = overrides.pop("target", "https://open.feishu.cn")
     host = overrides.pop("host", "open.feishu.cn")
     path_and_query = overrides.pop("path_and_query", "/open-apis/authen/v1/user_info")
     signature = _sign(
         key,
+        method=method,
         host=host,
         path_and_query=path_and_query,
         body_sha=body_sha,
@@ -623,6 +625,144 @@ def test_broker_missing_credential_error_is_redacted(monkeypatch, tmp_path: Path
 
     assert response.status == 503
     assert b"uat-secret" not in response.body
+
+
+def test_broker_rejects_personal_bot_im_history_before_token_lookup(tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=tmp_path / ".hermes",
+            profile_name="bob",
+            user_open_id="",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+            profile_kind="user",
+        ),
+        forwarder=lambda *_args, **_kwargs: pytest.fail("should not forward"),
+    )
+    path = "/open-apis/im/v1/chats?page_size=20"
+
+    response = broker.handle(
+        method="GET",
+        path_and_query=path,
+        headers=_headers("proxy-key", identity="bot", path_and_query=path),
+        body=b"",
+    )
+
+    assert response.status == 403
+    assert b"personal profile Feishu message read requires bound Feishu user identity" in response.body
+
+
+def test_broker_rejects_personal_bot_post_message_search_before_token_lookup(tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=tmp_path / ".hermes",
+            profile_name="bob",
+            user_open_id="",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+            profile_kind="user",
+        ),
+        forwarder=lambda *_args, **_kwargs: pytest.fail("should not forward"),
+    )
+    path = "/open-apis/im/v1/messages/search"
+    body = b"{}"
+    body_sha = _body_sha(body)
+
+    response = broker.handle(
+        method="POST",
+        path_and_query=path,
+        headers=_headers("proxy-key", identity="bot", method="POST", path_and_query=path, body_sha=body_sha),
+        body=body,
+    )
+
+    assert response.status == 403
+    assert b"personal profile Feishu message read requires bound Feishu user identity" in response.body
+
+
+def test_broker_rejects_group_bot_global_chat_list_before_token_lookup(tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=tmp_path / ".hermes",
+            profile_name="feishu_group_sales",
+            user_open_id="",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"bot"}),
+            profile_kind="group",
+            current_chat_id="oc_sales",
+        ),
+        forwarder=lambda *_args, **_kwargs: pytest.fail("should not forward"),
+    )
+    path = "/open-apis/im/v1/chats?page_size=20"
+
+    response = broker.handle(
+        method="GET",
+        path_and_query=path,
+        headers=_headers("proxy-key", identity="bot", path_and_query=path),
+        body=b"",
+    )
+
+    assert response.status == 403
+    assert b"group profile Feishu message read is limited to the current chat" in response.body
+
+
+def test_broker_allows_group_bot_current_chat_message_list(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_app_credential(shared)
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker._mint_tenant_access_token", lambda *_args, **_kwargs: "tat-secret")
+    captured: dict[str, object] = {}
+
+    def fake_forward(method, url, headers, body, timeout):
+        captured["method"] = method
+        captured["url"] = url
+        captured["headers"] = headers
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="feishu_group_sales",
+            user_open_id="",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"bot"}),
+            profile_kind="group",
+            current_chat_id="oc_sales",
+        ),
+        forwarder=fake_forward,
+    )
+    path = "/open-apis/im/v1/messages?container_id=oc_sales&container_id_type=chat&page_size=20"
+
+    response = broker.handle(
+        method="GET",
+        path_and_query=path,
+        headers=_headers("proxy-key", identity="bot", path_and_query=path),
+        body=b"",
+    )
+
+    assert response.status == 200
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith(path)
     assert b"refresh-secret" not in response.body
 
 

@@ -60,6 +60,8 @@ class LarkCliAuthBrokerContext:
     hmac_key: str
     allowed_identities: frozenset[str] = frozenset({"user"})
     request_timeout_seconds: float = 30.0
+    profile_kind: str = "user"
+    current_chat_id: str = ""
 
 
 Forwarder = Callable[[str, str, Mapping[str, str], bytes, float], BrokerResponse]
@@ -149,6 +151,14 @@ class LarkCliAuthBroker:
             return _error(403, "identity not allowed")
         if auth_header not in ALLOWED_AUTH_HEADERS:
             return _error(403, "auth-header not allowed")
+        im_policy_error = _im_read_policy_error(
+            self.context,
+            identity=identity,
+            method=method,
+            path_and_query=path_and_query,
+        )
+        if im_policy_error:
+            return _error(403, im_policy_error)
 
         try:
             token = self._resolve_token(identity)
@@ -317,6 +327,54 @@ def _first_token(payload: Mapping[str, object], keys: tuple[str, ...]) -> str:
         if value:
             return value
     raise PermissionError("credential payload does not contain a usable token")
+
+
+_IM_READ_PATH_PREFIXES = (
+    "/open-apis/im/v1/messages",
+    "/open-apis/im/v1/chats",
+    "/open-apis/im/v1/flags",
+    "/open-apis/im/v1/threads",
+)
+_IM_READ_EXACT_METHODS = {
+    ("POST", "/open-apis/im/v1/messages/search"),
+}
+
+
+def _im_read_policy_error(
+    context: LarkCliAuthBrokerContext,
+    *,
+    identity: str,
+    method: str,
+    path_and_query: str,
+) -> str | None:
+    method = method.upper()
+    parsed = urllib.parse.urlsplit(path_and_query)
+    path = parsed.path
+    if (method, path) not in _IM_READ_EXACT_METHODS and not (method == "GET" and path.startswith(_IM_READ_PATH_PREFIXES)):
+        return None
+
+    profile_kind = str(context.profile_kind or "user").strip().lower()
+    if profile_kind == "group":
+        query = urllib.parse.parse_qs(parsed.query)
+        container_id = (query.get("container_id") or [""])[0]
+        if (
+            identity == "bot"
+            and path == "/open-apis/im/v1/messages"
+            and container_id
+            and container_id == str(context.current_chat_id or "").strip()
+        ):
+            return None
+        return (
+            "group profile Feishu message read is limited to the current chat; "
+            "refusing global or cross-chat bot-visible IM history access"
+        )
+
+    if identity == "user" and str(context.user_open_id or "").strip():
+        return None
+    return (
+        "personal profile Feishu message read requires bound Feishu user identity; "
+        "refusing bot/app fallback for IM history"
+    )
 
 
 def _mint_tenant_access_token(payload: Mapping[str, object], *, timeout: float) -> str:

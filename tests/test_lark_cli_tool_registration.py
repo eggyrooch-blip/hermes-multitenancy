@@ -401,7 +401,7 @@ def test_lark_cli_tool_allows_group_profile_bot_write_with_sender_context(
     profile = tmp_path / "feishu_group_test"
     workspace = profile / "workspace"
     workspace.mkdir(parents=True)
-    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+    (profile / "group_profile.json").write_text('{"kind":"group","chat_id":"oc_group"}', encoding="utf-8")
     monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("WORKSPACE", str(workspace))
@@ -435,6 +435,327 @@ def test_lark_cli_tool_allows_group_profile_bot_write_with_sender_context(
     assert result["ok"] is True
     assert result["identity"] == "bot"
     assert captured["command"][-2:] == ["--as", "bot"]
+
+
+def test_lark_cli_tool_rejects_personal_im_read_without_bound_user_identity(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "bob"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+    monkeypatch.delenv("HERMES_FEISHU_USER_OPEN_ID", raising=False)
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("personal IM read must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["messages", "list", "--limit", "20"],
+            "identity": "user",
+            "risk": "read",
+            "reason": "查看用户最近的飞书消息",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+
+
+def test_lark_cli_tool_rejects_personal_im_read_with_bot_identity_even_when_sender_exists(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "bob"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_bob")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("personal IM bot read must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+chat-list", "--page-size", "20"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "查看最近群聊",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+
+
+def test_lark_cli_tool_rejects_personal_im_read_even_when_risk_is_mislabeled(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "bob"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_bob")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("mislabeled personal IM bot read must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+chat-list", "--page-size", "20"],
+            "identity": "bot",
+            "risk": "export",
+            "reason": "mislabeled read",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+
+
+def test_lark_cli_tool_rejects_personal_post_message_search_api(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "bob"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("personal IM search API must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["POST", "/open-apis/im/v1/messages/search", "--data", "{}"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "search messages",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+
+
+def test_lark_cli_tool_allows_personal_im_read_with_bound_user_identity(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"ok":true,"identity":"user","data":{"items":[]}}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+flag-list", "--page-size", "20"],
+            "identity": "user",
+            "risk": "read",
+            "reason": "查看用户收藏消息",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "user"
+    assert captured["command"][-2:] == ["--as", "user"]
+
+
+def test_lark_cli_tool_allows_group_profile_bot_im_read(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "feishu_group_test"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group","chat_id":"oc_group"}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"ok":true,"identity":"bot","data":{"items":[]}}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+chat-messages-list", "--chat-id", "oc_group"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "群 profile 查看当前群消息",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "bot"
+    assert captured["command"][-2:] == ["--as", "bot"]
+
+
+def test_lark_cli_tool_rejects_group_profile_global_chat_list(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "feishu_group_test"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group","chat_id":"oc_group"}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("group profile global chat list must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+chat-list", "--page-size", "20"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "列出 bot 所在群",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "group profile Feishu message read is limited to the current chat" in result["error"]
+
+
+def test_lark_cli_tool_rejects_group_profile_other_chat_messages(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "feishu_group_test"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    (profile / "group_profile.json").write_text('{"kind":"group","chat_id":"oc_current"}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("group profile other-chat read must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+chat-messages-list", "--chat-id", "oc_other"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "读取其它群历史",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "group profile Feishu message read is limited to the current chat" in result["error"]
 
 
 def test_lark_cli_tool_filters_non_business_update_notice(monkeypatch, tmp_path):

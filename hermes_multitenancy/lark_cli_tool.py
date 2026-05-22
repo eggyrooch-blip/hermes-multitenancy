@@ -233,6 +233,97 @@ def _is_group_profile(profile_home: Path | None) -> bool:
     return str(payload.get("kind") or "").strip().lower() == "group"
 
 
+def _group_profile_chat_id(profile_home: Path | None) -> str:
+    if profile_home is None:
+        return ""
+    marker = profile_home / "group_profile.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("chat_id") or "").strip()
+
+
+_PERSONAL_IM_READ_SHORTCUTS = frozenset(
+    {
+        ("messages", "list"),
+        ("im", "+chat-list"),
+        ("im", "+chat-messages-list"),
+        ("im", "+messages-search"),
+        ("im", "+flag-list"),
+        ("im", "+messages-mget"),
+        ("im", "+threads-messages-list"),
+    }
+)
+_IM_READ_API_PREFIXES = (
+    "/open-apis/im/v1/messages",
+    "/open-apis/im/v1/chats",
+    "/open-apis/im/v1/flags",
+    "/open-apis/im/v1/threads",
+)
+_IM_READ_API_EXACT_METHODS = {
+    ("POST", "/open-apis/im/v1/messages/search"),
+}
+
+
+def _shortcut_prefix(argv: list[str]) -> tuple[str, str] | None:
+    if len(argv) < 2:
+        return None
+    return (argv[0], argv[1])
+
+
+def _argv_option_value(argv: list[str], name: str) -> str:
+    prefix = name + "="
+    for idx, item in enumerate(argv):
+        if item == name and idx + 1 < len(argv):
+            return str(argv[idx + 1] or "").strip()
+        if item.startswith(prefix):
+            return item.split("=", 1)[1].strip()
+    return ""
+
+
+def _is_im_read_request(mode: str, argv: list[str]) -> bool:
+    if mode == "shortcut":
+        return _shortcut_prefix(argv) in _PERSONAL_IM_READ_SHORTCUTS
+    if mode == "api":
+        request = _api_request_from_argv(argv)
+        if not request:
+            return False
+        method, path = request
+        return (method, path) in _IM_READ_API_EXACT_METHODS or (method == "GET" and path.startswith(_IM_READ_API_PREFIXES))
+    return False
+
+
+def _group_current_chat_im_read_allowed(mode: str, argv: list[str], current_chat_id: str) -> bool:
+    if not current_chat_id:
+        return False
+    if mode == "shortcut" and _shortcut_prefix(argv) == ("im", "+chat-messages-list"):
+        return _argv_option_value(argv, "--chat-id") == current_chat_id
+    return False
+
+
+def _feishu_im_read_identity_error(env: dict[str, str], mode: str, argv: list[str], risk: str, identity: str) -> str | None:
+    del risk
+    if not _is_im_read_request(mode, argv):
+        return None
+    profile_home = _profile_home(env)
+    is_group = _is_group_profile(profile_home)
+    if is_group:
+        current_chat_id = _group_profile_chat_id(profile_home)
+        if _group_current_chat_im_read_allowed(mode, argv, current_chat_id):
+            return None
+        return (
+            "group profile Feishu message read is limited to the current chat; "
+            "refusing global or cross-chat bot-visible IM history access"
+        )
+    if identity == "user" and str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
+        return None
+    return (
+        "personal profile Feishu message read requires bound Feishu user identity; "
+        "refusing bot/app fallback for IM history"
+    )
+
+
 def _personal_user_write_identity_error(env: dict[str, str], risk: str, identity: str) -> str | None:
     if risk not in {"write", "admin"}:
         return None
@@ -430,6 +521,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     identity_error = _personal_user_write_identity_error(env, risk, identity)
     if identity_error:
         return tool_error(identity_error, mode=mode, command=argv, risk=risk, identity=identity)
+    im_read_error = _feishu_im_read_identity_error(env, mode, argv, risk, identity)
+    if im_read_error:
+        return tool_error(im_read_error, mode=mode, command=argv, risk=risk, identity=identity)
 
     cwd = str(workspace) if workspace is not None and workspace.exists() else None
     try:

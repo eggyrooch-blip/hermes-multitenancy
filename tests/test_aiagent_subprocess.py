@@ -2631,10 +2631,18 @@ def test_lark_cli_auth_broker_scope_forces_bot_for_group_profile(monkeypatch, tm
         def close(self):
             pass
 
-    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", lambda _context: FakeServer())
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
 
     with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
         assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+        assert seen["context"].profile_kind == "group"
+        assert seen["context"].current_chat_id == ""
 
 
 def test_lark_cli_auth_broker_scope_starts_for_group_without_sender(monkeypatch, tmp_path: Path):
@@ -2649,7 +2657,7 @@ def test_lark_cli_auth_broker_scope_starts_for_group_without_sender(monkeypatch,
     lark_cli.chmod(0o755)
     profile = shared_home / "profiles" / "feishu_group_abc"
     profile.mkdir(parents=True)
-    (profile / "group_profile.json").write_text('{"kind":"group"}', encoding="utf-8")
+    (profile / "group_profile.json").write_text('{"kind":"group","chat_id":"oc_group_abc"}', encoding="utf-8")
     monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
     seen: dict[str, object] = {}
 
@@ -2669,6 +2677,8 @@ def test_lark_cli_auth_broker_scope_starts_for_group_without_sender(monkeypatch,
         context = seen["context"]
         assert context.profile_name == "feishu_group_abc"
         assert context.user_open_id == ""
+        assert context.profile_kind == "group"
+        assert context.current_chat_id == "oc_group_abc"
         assert extra["HERMES_LARK_CLI_BIN"] == str(lark_cli)
         assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "bot"
 

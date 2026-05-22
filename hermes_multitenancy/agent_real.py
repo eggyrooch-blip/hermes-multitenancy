@@ -1277,6 +1277,15 @@ def _is_group_profile_home(profile_home: Path) -> bool:
     return str(payload.get("kind") or "").strip().lower() == "group"
 
 
+def _group_profile_chat_id(profile_home: Path) -> str:
+    marker = Path(profile_home).expanduser() / "group_profile.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(payload.get("chat_id") or "").strip()
+
+
 _LARK_CLI_SHARED_ENV_KEYS = frozenset(
     {
         "HERMES_MULTITENANCY_CREDENTIAL_KEY",
@@ -1424,6 +1433,8 @@ def _lark_cli_auth_broker_scope(
             user_open_id=sender_open_id,
             hmac_key=key,
             allowed_identities=allowed_identities,
+            profile_kind="group" if is_group_profile else "user",
+            current_chat_id=_group_profile_chat_id(profile_home) if is_group_profile else "",
         )
     )
     try:
