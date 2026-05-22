@@ -23,7 +23,7 @@ from .builder import (
     _render_stream_text,
     _to_cardkit2,
 )
-from .card_error import _finalize, _result
+from .card_error import UnavailableError, _finalize, _result
 from .cardkit_client import (
     _create_cardkit_card,
     _patch_interactive_message,
@@ -259,6 +259,8 @@ async def _update_streaming_card_reasoning(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
             logger.warning("multitenancy: Feishu CardKit reasoning update failed, falling back to full flush: %s", exc)
             state["card_id"] = None
     return await _flush_state(self, message_id, state)
@@ -289,6 +291,8 @@ async def _update_streaming_card_status(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
             logger.warning("multitenancy: Feishu CardKit status update failed, falling back to full flush: %s", exc)
             state["card_id"] = None
     return await _flush_state(self, message_id, state)
@@ -331,6 +335,8 @@ async def _update_streaming_card_tool_started(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
             logger.warning("multitenancy: Feishu CardKit tool update failed, falling back to full flush: %s", exc)
             state["card_id"] = None
     return await _flush_state(self, message_id, state)
@@ -374,6 +380,8 @@ async def _update_streaming_card_tool_completed(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
             logger.warning("multitenancy: Feishu CardKit tool update failed, falling back to full flush: %s", exc)
             state["card_id"] = None
     return await _flush_state(self, message_id, state)
@@ -430,6 +438,8 @@ async def _flush_state(
             _states(adapter).pop(str(message_id), None)
         return _result(bool(success), message_id=str(message_id), error=None if success else "card patch failed")
     except Exception as exc:
+        if isinstance(exc, UnavailableError):
+            UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
         logger.warning("multitenancy: Feishu CardKit compat patch failed: %s", exc)
         return _result(False, message_id=str(message_id), error=str(exc))
 
