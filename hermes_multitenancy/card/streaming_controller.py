@@ -60,6 +60,7 @@ from .tool_use_display import (
     _merge_raw_tool_intents,
     _render_tool_calls_section,
 )
+from hermes_multitenancy.card.unavailable_guard import UnavailableGuard
 
 # Preserve the legacy logger name so existing log filters / alerts / collectors
 # that match on logger name (hermes_multitenancy.feishu_cardkit_compat) keep
@@ -195,6 +196,8 @@ async def _update_streaming_card(
     finalize: bool = False,
 ) -> Any:
     del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
     formatted = _format(self, content)
     raw_tool_intents, visible_text = _extract_raw_tool_call_intents(formatted)
@@ -219,6 +222,8 @@ async def _abort_streaming_card(
     content: Optional[str] = None,
 ) -> Any:
     del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
     if content:
         state["content"] = _format(self, content)
@@ -237,6 +242,8 @@ async def _update_streaming_card_reasoning(
     content: str,
 ) -> Any:
     del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
     if not state.get("reasoning_started_at"):
         state["reasoning_started_at"] = time.monotonic()
@@ -265,6 +272,8 @@ async def _update_streaming_card_status(
     content: str,
 ) -> Any:
     del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
     formatted = _format(self, content)
     if _is_invisible_card_status(formatted):
         return _result(True, message_id=str(message_id))
@@ -300,6 +309,8 @@ async def _update_streaming_card_tool_started(
     args: Optional[dict[str, Any]] = None,
 ) -> Any:
     del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
     state["tools"].append(
         {
@@ -335,6 +346,8 @@ async def _update_streaming_card_tool_completed(
     is_error: bool = False,
 ) -> Any:
     del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
     name = str(tool_name or "tool")
     for tool in reversed(state["tools"]):
