@@ -472,7 +472,10 @@ def test_lark_cli_tool_rejects_personal_im_read_without_bound_user_identity(
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result.get("ok") is not True
-    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+    assert "飞书个人消息读取需要先完成本人授权" in result["error"]
+    assert "/feishu_auth" in result["error"]
+    assert "WebUI" in result["error"]
+    assert "refusing bot/app fallback" not in result["error"]
 
 
 def test_lark_cli_tool_rejects_personal_im_read_with_bot_identity_even_when_sender_exists(
@@ -510,7 +513,7 @@ def test_lark_cli_tool_rejects_personal_im_read_with_bot_identity_even_when_send
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result.get("ok") is not True
-    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+    assert "飞书个人消息读取需要先完成本人授权" in result["error"]
 
 
 def test_lark_cli_tool_rejects_personal_im_read_even_when_risk_is_mislabeled(
@@ -548,7 +551,7 @@ def test_lark_cli_tool_rejects_personal_im_read_even_when_risk_is_mislabeled(
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result.get("ok") is not True
-    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+    assert "飞书个人消息读取需要先完成本人授权" in result["error"]
 
 
 def test_lark_cli_tool_rejects_personal_post_message_search_api(
@@ -585,7 +588,7 @@ def test_lark_cli_tool_rejects_personal_post_message_search_api(
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result.get("ok") is not True
-    assert "personal profile Feishu message read requires bound Feishu user identity" in result["error"]
+    assert "飞书个人消息读取需要先完成本人授权" in result["error"]
 
 
 def test_lark_cli_tool_allows_personal_im_read_with_bound_user_identity(

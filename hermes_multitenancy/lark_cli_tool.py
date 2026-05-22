@@ -33,6 +33,11 @@ except ModuleNotFoundError:
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 120
 POLICY_PATH = Path(__file__).resolve().parents[1] / "config" / "lark_cli_policy.yaml"
+_PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED = (
+    "飞书个人消息读取需要先完成本人授权。"
+    "请在飞书私聊 Hermes 发送 `/feishu_auth`，"
+    "或在 WebUI「凭证」页点击 Lark-cli 的「授权/重新授权」。"
+)
 
 _SECRET_PATTERNS = [
     re.compile(r"(?i)(Authorization\s*[:=]\s*Bearer\s+)[^\s\"',}]+"),
@@ -318,10 +323,7 @@ def _feishu_im_read_identity_error(env: dict[str, str], mode: str, argv: list[st
         )
     if identity == "user" and str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
         return None
-    return (
-        "personal profile Feishu message read requires bound Feishu user identity; "
-        "refusing bot/app fallback for IM history"
-    )
+    return _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED
 
 
 def _personal_user_write_identity_error(env: dict[str, str], risk: str, identity: str) -> str | None:

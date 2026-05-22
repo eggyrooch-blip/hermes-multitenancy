@@ -654,7 +654,10 @@ def test_broker_rejects_personal_bot_im_history_before_token_lookup(tmp_path: Pa
     )
 
     assert response.status == 403
-    assert b"personal profile Feishu message read requires bound Feishu user identity" in response.body
+    assert "飞书个人消息读取需要先完成本人授权".encode("utf-8") in response.body
+    assert b"/feishu_auth" in response.body
+    assert b"WebUI" in response.body
+    assert b"refusing bot/app fallback" not in response.body
 
 
 def test_broker_rejects_personal_bot_post_message_search_before_token_lookup(tmp_path: Path):
@@ -686,7 +689,7 @@ def test_broker_rejects_personal_bot_post_message_search_before_token_lookup(tmp
     )
 
     assert response.status == 403
-    assert b"personal profile Feishu message read requires bound Feishu user identity" in response.body
+    assert "飞书个人消息读取需要先完成本人授权".encode("utf-8") in response.body
 
 
 def test_broker_rejects_group_bot_global_chat_list_before_token_lookup(tmp_path: Path):

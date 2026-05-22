@@ -43,6 +43,11 @@ HOP_BY_HOP_RESPONSE_HEADERS = frozenset(
         "content-length",
     }
 )
+_PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED = (
+    "飞书个人消息读取需要先完成本人授权。"
+    "请在飞书私聊 Hermes 发送 `/feishu_auth`，"
+    "或在 WebUI「凭证」页点击 Lark-cli 的「授权/重新授权」。"
+)
 
 
 @dataclass(frozen=True)
@@ -371,10 +376,7 @@ def _im_read_policy_error(
 
     if identity == "user" and str(context.user_open_id or "").strip():
         return None
-    return (
-        "personal profile Feishu message read requires bound Feishu user identity; "
-        "refusing bot/app fallback for IM history"
-    )
+    return _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED
 
 
 def _mint_tenant_access_token(payload: Mapping[str, object], *, timeout: float) -> str:
