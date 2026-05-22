@@ -30,6 +30,7 @@ SandboxAvailable = Callable[[], bool]
 
 _OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
 _AGENT_ID_HEADER = "X-Hermes-Agent-Id"
+_RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE = 32 * 1024 * 1024
 
 _runner: Any = None
 _site: Any = None
@@ -117,6 +118,31 @@ def _run_broker_port() -> int:
 
 def _run_broker_key() -> str:
     return os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_KEY", "").strip()
+
+
+def _positive_int_env(name: str) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("[multitenancy] ignoring invalid %s=%r", name, raw)
+        return None
+    if value <= 0:
+        logger.warning("[multitenancy] ignoring non-positive %s=%r", name, raw)
+        return None
+    return value
+
+
+def _run_broker_client_max_size() -> int:
+    configured_bytes = _positive_int_env("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES")
+    if configured_bytes is not None:
+        return configured_bytes
+    configured_mb = _positive_int_env("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB")
+    if configured_mb is not None:
+        return configured_mb * 1024 * 1024
+    return _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE
 
 
 def _owner_enforcement_enabled() -> bool:
@@ -1107,7 +1133,7 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI skill audit failed")
             return web.json_response({"error": str(exc)}, status=500)
 
-    app = web.Application()
+    app = web.Application(client_max_size=_run_broker_client_max_size())
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)

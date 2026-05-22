@@ -67,6 +67,118 @@ def test_webui_run_broker_endpoint_streams_channel_neutral_events():
     asyncio.run(runner())
 
 
+def test_webui_run_broker_accepts_image_sized_json_body(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB", raising=False)
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return "accepted large body"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                data=json.dumps({
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_webui",
+                    "content": "image follow-up",
+                    "session_id": "session-large-image",
+                    "metadata": {"input": "x" * (2 * 1024 * 1024)},
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert '"text": "accepted large body"' in body
+        assert len(seen) == 1
+        assert seen[0].metadata["input"].startswith("xxx")
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_client_max_size_defaults_to_32mb(monkeypatch):
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB", raising=False)
+
+    app = create_run_broker_app()
+
+    assert app._client_max_size == 32 * 1024 * 1024
+
+
+def test_webui_run_broker_client_max_size_can_be_overridden(monkeypatch):
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_MB", "8")
+
+    app = create_run_broker_app()
+
+    assert app._client_max_size == 8 * 1024 * 1024
+
+
+def test_webui_run_broker_rejects_body_over_configured_limit(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_CLIENT_MAX_SIZE_BYTES", "1024")
+
+    async def runner():
+        seen = []
+
+        async def dispatch(request):
+            seen.append(request)
+            return "should not run"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                data=json.dumps({
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_webui",
+                    "content": "x" * 2048,
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+
+        assert response.status == 400
+        assert "Request Entity Too Large" in body["error"]
+        assert seen == []
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 
