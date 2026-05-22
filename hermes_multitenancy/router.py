@@ -785,6 +785,8 @@ async def _deliver_profile_scoped_media_directives(
 
 def _thread_metadata_for_media_delivery(gateway: Any, event: Any) -> Optional[dict[str, Any]]:
     try:
+        if not _is_group_chat_type(_extract_chat_type(event)):
+            return None
         source = getattr(event, "source", None)
         reply_anchor = None
         anchor_fn = getattr(gateway, "_reply_anchor_for_event", None)

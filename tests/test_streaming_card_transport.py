@@ -43,6 +43,48 @@ def _assert_tool_panel(card_or_elements):
     return panel
 
 
+def test_thread_metadata_is_suppressed_for_dm_to_avoid_topic():
+    from hermes_multitenancy import router as router_mod
+
+    calls = []
+
+    class Gateway:
+        def _reply_anchor_for_event(self, event):
+            return "om_dm_anchor"
+
+        def _thread_metadata_for_source(self, source, reply_anchor):
+            calls.append((source.chat_type, reply_anchor))
+            return {"thread_id": "omt_dm_topic"}
+
+    event = SimpleNamespace(
+        message_id="om_dm_anchor",
+        source=SimpleNamespace(chat_type="dm"),
+    )
+
+    assert router_mod._thread_metadata_for_media_delivery(Gateway(), event) is None
+    assert calls == []
+
+
+def test_thread_metadata_is_preserved_for_group_replies():
+    from hermes_multitenancy import router as router_mod
+
+    class Gateway:
+        def _reply_anchor_for_event(self, event):
+            return "om_group_anchor"
+
+        def _thread_metadata_for_source(self, source, reply_anchor):
+            return {"thread_id": f"{source.chat_type}:{reply_anchor}"}
+
+    event = SimpleNamespace(
+        message_id="om_group_anchor",
+        source=SimpleNamespace(chat_type="group"),
+    )
+
+    assert router_mod._thread_metadata_for_media_delivery(Gateway(), event) == {
+        "thread_id": "group:om_group_anchor"
+    }
+
+
 class _CardCapableAdapter:
     def __init__(self):
         self.sent = []
