@@ -11,7 +11,6 @@ import json
 import re
 from typing import Any
 
-from hermes_multitenancy.card.sanitization import _clip
 from hermes_multitenancy.card.tool_use_config import _HIDDEN_TOOL_NAMES
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
@@ -78,59 +77,9 @@ def _render_tool_call_line(tool: dict[str, Any]) -> str:
     status = str(tool.get("status") or "running")
     extra = " running" if status == "running" else " failed" if status == "error" else ""
     if tool.get("duration") is not None:
-        extra = f" ({_format_tool_duration(tool['duration'])})"
-    if name == "terminal":
-        return f"- `{name}`{extra}"
-    args_summary = _format_tool_args_summary(tool.get("args"))
-    preview = str(tool.get("preview") or "").strip()
-    if args_summary:
-        return f"- `{name}`{extra}: {args_summary}"
-    if tool.get("duration") is None and preview and preview.lower() != "generating arguments":
-        extra = f": {_clip(preview, 160)}"
+        duration = f"({_format_tool_duration(tool['duration'])})"
+        extra = f" failed {duration}" if status == "error" else f" {duration}"
     return f"- `{name}`{extra}"
-
-
-def _format_tool_args_summary(args: Any) -> str:
-    if not isinstance(args, dict) or not args:
-        return ""
-    parts: list[str] = []
-    for key in sorted(args):
-        value = args.get(key)
-        key_text = str(key)
-        if re.search(r"(token|secret|password|passwd|credential|authorization)", key_text, re.IGNORECASE):
-            value_text = "[已隐藏]"
-        else:
-            value_text = _format_tool_arg_value(value)
-        if value_text:
-            parts.append(f"{key_text}={value_text}")
-        if len(parts) >= 4:
-            break
-    return _clip(", ".join(parts), 220)
-
-
-def _format_tool_arg_value(value: Any) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        items = [_format_tool_arg_value(item) for item in list(value)[:4]]
-        suffix = ", ..." if len(value) > 4 else ""
-        return "[" + ", ".join(item for item in items if item) + suffix + "]"
-    if isinstance(value, dict):
-        keys = list(value.keys())[:4]
-        inner = ", ".join(f"{key}:{_format_tool_arg_value(value.get(key))}" for key in keys)
-        if len(value) > 4:
-            inner += ", ..."
-        return "{" + inner + "}"
-    text = str(value).replace("\n", " ").strip()
-    if not text:
-        return ""
-    if any(char.isspace() for char in text) or "," in text:
-        return json.dumps(_clip(text, 120), ensure_ascii=False)
-    return _clip(text, 120)
 
 
 def _format_tool_duration(value: Any) -> str:

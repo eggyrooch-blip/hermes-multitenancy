@@ -17,12 +17,9 @@ from types import MethodType
 from typing import Any, Optional
 
 from hermes_multitenancy.card.builder import (
-    _REASONING_ELEMENT_ID,
-    _STATUS_ELEMENT_ID,
     _TOOLS_ELEMENT_ID,
     _render_cardkit_initial_card,
     _render_message_card,
-    _render_reasoning_stream_text,
     _render_stream_text,
     _to_cardkit2,
 )
@@ -231,11 +228,10 @@ async def _update_streaming_card_reasoning(
     state["reasoning"] = reasoning_text or answer_text
     if state.get("card_id"):
         try:
-            await _stream_cardkit_element(
+            await _stream_cardkit_content(
                 self,
                 str(state["card_id"]),
-                _REASONING_ELEMENT_ID,
-                _render_reasoning_stream_text(state),
+                _render_stream_text(state),
                 _next_sequence(state),
             )
             return _result(True, message_id=str(message_id))
@@ -253,14 +249,16 @@ async def _update_streaming_card_status(
     content: str,
 ) -> Any:
     del chat_id
+    formatted = _format(self, content)
+    if _is_invisible_card_status(formatted):
+        return _result(True, message_id=str(message_id))
     state = _state_for(self, message_id)
-    state["status"] = _format(self, content)
+    state["status"] = formatted
     if state.get("card_id"):
         try:
-            await _stream_cardkit_element(
+            await _stream_cardkit_content(
                 self,
                 str(state["card_id"]),
-                _STATUS_ELEMENT_ID,
                 str(state.get("status") or " "),
                 _next_sequence(state),
             )
@@ -269,6 +267,11 @@ async def _update_streaming_card_status(
             logger.warning("multitenancy: Feishu CardKit status update failed, falling back to full flush: %s", exc)
             state["card_id"] = None
     return await _flush_state(self, message_id, state)
+
+
+def _is_invisible_card_status(text: str) -> bool:
+    stripped = str(text or "").strip()
+    return stripped in {"", "\u200b", "\u200c", "\u200d", "\ufeff"}
 
 
 async def _update_streaming_card_tool_started(

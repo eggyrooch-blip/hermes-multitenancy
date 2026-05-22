@@ -490,7 +490,8 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
     running_card = adapter.card_patches[-1]["card"]
     _assert_tool_panel(running_card)
     rendered_running = _card_text(running_card)
-    assert "- `lark_cli`: GET /open-apis/authen/v1/user_info" in rendered_running
+    assert "- `lark_cli` running" in rendered_running
+    assert "GET /open-apis/authen/v1/user_info" not in rendered_running
 
     await adapter.update_streaming_card_tool_completed(
         chat_id="chat-1",
@@ -505,11 +506,11 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
     assert "`lark_cli` (420 ms)" in rendered_done
 
 
-def test_cardkit_compat_renders_tool_argument_summary():
-    asyncio.run(_run_cardkit_compat_renders_tool_argument_summary())
+def test_cardkit_compat_hides_tool_argument_summary():
+    asyncio.run(_run_cardkit_compat_hides_tool_argument_summary())
 
 
-async def _run_cardkit_compat_renders_tool_argument_summary():
+async def _run_cardkit_compat_hides_tool_argument_summary():
     from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
 
     adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
@@ -528,8 +529,8 @@ async def _run_cardkit_compat_renders_tool_argument_summary():
     rendered = _card_text(tool_card)
     assert "generating arguments" not in rendered
     assert "`execute_code` running" in rendered
-    assert "language=python" in rendered
-    assert "path=home/generated_art.png" in rendered
+    assert "language=python" not in rendered
+    assert "path=home/generated_art.png" not in rendered
 
 
 def test_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_rewrite():
@@ -579,7 +580,8 @@ async def _run_cardkit_compat_cardkit_streams_tool_and_reasoning_without_body_re
     ]
     assert any("- `terminal` running" in item for item in streamed_tools)
     assert all("python -c" not in item for item in streamed_tools)
-    assert any("我在检查参数" in item for item in streamed_reasoning)
+    assert streamed_reasoning == []
+    assert any("我在检查参数" in item for item in streamed_content)
     assert streamed_content[-1] == "最终结果"
 
 
@@ -867,11 +869,9 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
         element["element_id"]
         for element in initial_card["body"]["elements"]
         if "element_id" in element
-    ][:4] == [
+    ] == [
         "tool_calls",
         "streaming_content",
-        "reasoning_content",
-        "status_content",
     ]
     assert len(adapter.card_sends) == 1
     sent_payload = json.loads(adapter.card_sends[0]["payload"])
@@ -915,11 +915,15 @@ def test_cardkit_initial_card_has_delay_streaming_and_no_visible_thinking():
     assert config["summary"]["content"] == ""
     assert "Thinking" not in json.dumps(card, ensure_ascii=False)
     assert "思考" not in json.dumps(card, ensure_ascii=False)
-    assert [
+    element_ids = [
         element["element_id"]
         for element in card["body"]["elements"]
         if "element_id" in element
-    ][:2] == ["tool_calls", "streaming_content"]
+    ]
+    assert element_ids == ["tool_calls", "streaming_content"]
+    assert "status_content" not in element_ids
+    assert "reasoning_content" not in element_ids
+    assert "loading_icon" not in element_ids
 
 
 def test_stream_throttle_timing_matches_openclaw_lark():
@@ -1094,6 +1098,92 @@ async def _run_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
     assert "**Tool calls:**" not in final_text
     assert "`lark_cli` (400 ms)" in final_text
     assert "final answer" in final_text
+
+
+def test_cardkit_tool_rows_do_not_print_argument_details():
+    from hermes_multitenancy.card.tool_use_display import _render_tool_calls_section
+
+    rendered = _render_tool_calls_section(
+        [
+            {
+                "name": "web_search",
+                "status": "done",
+                "duration": 2.436,
+                "args": {"query": "北京天气 2026年5月22日", "limit": 3},
+            },
+            {
+                "name": "web_extract",
+                "status": "done",
+                "duration": 20.501,
+                "args": {
+                    "urls": [
+                        "https://www.accuweather.com/zh/cn/beijing/101924/daily-weather-forecast/101924"
+                    ]
+                },
+            },
+            {
+                "name": "lark_cli",
+                "status": "done",
+                "duration": 0.165,
+                "args": {
+                    "argv": ["POST", "/open-apis/docx/v1/documents"],
+                    "identity": "user",
+                    "reason": "创建飞书云文档写入天气信息",
+                },
+            },
+        ]
+    )
+
+    assert "`web_search` (2436 ms)" in rendered
+    assert "`web_extract` (20501 ms)" in rendered
+    assert "`lark_cli` (165 ms)" in rendered
+    assert "query=" not in rendered
+    assert "北京天气" not in rendered
+    assert "limit=3" not in rendered
+    assert "urls=" not in rendered
+    assert "accuweather.com" not in rendered
+    assert "argv=" not in rendered
+    assert "/open-apis/docx/v1/documents" not in rendered
+    assert "identity=" not in rendered
+    assert "reason=" not in rendered
+
+
+def test_cardkit_tool_rows_keep_failed_status_when_duration_present():
+    from hermes_multitenancy.card.tool_use_display import _render_tool_calls_section
+
+    rendered = _render_tool_calls_section(
+        [
+            {
+                "name": "lark_cli",
+                "status": "error",
+                "duration": 0.165,
+                "args": {"argv": ["POST", "/open-apis/docx/v1/documents"]},
+            }
+        ]
+    )
+
+    assert "`lark_cli` failed (165 ms)" in rendered
+    assert "argv=" not in rendered
+
+
+def test_cardkit_invisible_status_does_not_patch_fallback_card():
+    asyncio.run(_run_cardkit_invisible_status_does_not_patch_fallback_card())
+
+
+async def _run_cardkit_invisible_status_does_not_patch_fallback_card():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_CleanFeishuLikeAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    result = await adapter.update_streaming_card_status(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="\u200b",
+    )
+
+    assert result.success is True
+    assert adapter.card_patches == []
 
 
 def test_stream_into_feishu_skips_legacy_shared_consumer_without_card_methods(

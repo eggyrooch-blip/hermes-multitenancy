@@ -26,8 +26,6 @@ from hermes_multitenancy.card.tool_use_display import (
 )
 
 _TOOLS_ELEMENT_ID = "tool_calls"
-_REASONING_ELEMENT_ID = "reasoning_content"
-_STATUS_ELEMENT_ID = "status_content"
 _STREAMING_ELEMENT_ID = "streaming_content"
 
 
@@ -65,32 +63,6 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
                     "margin": "0px 0px 0px 0px",
                     "element_id": _STREAMING_ELEMENT_ID,
                 },
-                {
-                    "tag": "markdown",
-                    "content": "",
-                    "text_align": "left",
-                    "text_size": "notation",
-                    "margin": "0px 0px 0px 0px",
-                    "element_id": _REASONING_ELEMENT_ID,
-                },
-                {
-                    "tag": "markdown",
-                    "content": "",
-                    "text_align": "left",
-                    "text_size": "notation",
-                    "margin": "0px 0px 0px 0px",
-                    "element_id": _STATUS_ELEMENT_ID,
-                },
-                {
-                    "tag": "markdown",
-                    "content": " ",
-                    "icon": {
-                        "tag": "custom_icon",
-                        "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
-                        "size": "16px 16px",
-                    },
-                    "element_id": "loading_icon",
-                },
             ]
         },
     }
@@ -112,11 +84,6 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     else:
         parts.append(" ")
     return "\n\n".join(part for part in parts if part).strip() or " "
-
-
-def _render_reasoning_stream_text(state: dict[str, Any]) -> str:
-    reasoning = _clean_reasoning_prefix(str(state.get("reasoning") or "")).strip()
-    return f"💭 **Thought**\n\n{_clip(reasoning, 1200)}" if reasoning else " "
 
 
 def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
