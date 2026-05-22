@@ -11,6 +11,13 @@ from pathlib import Path
 import pytest
 
 
+async def _read_sse_data_line(response, *, timeout: float = 2.0):
+    while True:
+        line = await asyncio.wait_for(response.content.readline(), timeout=timeout)
+        if line.startswith(b"data: "):
+            return line
+
+
 def test_webui_run_broker_endpoint_streams_channel_neutral_events():
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -398,6 +405,171 @@ def test_webui_run_broker_default_dispatch_streams_thinking_separately(monkeypat
         assert body.count('"kind": "content"') == 1
         assert '"kind": "done"' in body
         assert '"kind": "done", "text": ""' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_default_dispatch_continues_after_sse_disconnect(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from aiohttp.client_exceptions import ClientConnectionResetError
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.run_models import RunEvent, RunRequest
+    from hermes_multitenancy.webui_broker_server import _default_dispatch_agent
+
+    consumed: list[str] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "tool_started", {"name": "delegate_task"}
+        consumed.append("tool_started")
+        yield "tool_completed", {"name": "delegate_task", "duration": 337.79, "is_error": False}
+        consumed.append("tool_completed")
+        yield "content", "final answer after delegate_task"
+        consumed.append("content")
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    emitted: list[str] = []
+
+    async def disconnected_emit(event: RunEvent):
+        emitted.append(event.kind)
+        if event.kind == "tool_completed":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        result = await _default_dispatch_agent(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="ou_webui",
+                content="long task",
+                session_id="session-webui",
+                requires_host_tools=True,
+            ),
+            emit_event=disconnected_emit,
+        )
+
+        assert result == ""
+        assert consumed == ["tool_started", "tool_completed", "content"]
+        assert emitted == ["tool_started", "tool_completed"]
+
+    asyncio.run(runner())
+
+
+def test_webui_disconnect_tolerant_emitter_propagates_cancellation():
+    from hermes_multitenancy.run_models import RunEvent
+    from hermes_multitenancy.webui_broker_server import _DisconnectTolerantEmitter
+
+    async def cancelled_emit(event: RunEvent):
+        raise asyncio.CancelledError()
+
+    async def runner():
+        emitter = _DisconnectTolerantEmitter(cancelled_emit)
+        with pytest.raises(asyncio.CancelledError):
+            await emitter.emit(RunEvent(kind="content", text="partial"))
+
+    asyncio.run(runner())
+
+
+def test_webui_disconnect_tolerant_emitter_reraises_non_transport_errors():
+    from hermes_multitenancy.run_models import RunEvent
+    from hermes_multitenancy.webui_broker_server import _DisconnectTolerantEmitter
+
+    async def failed_emit(event: RunEvent):
+        raise RuntimeError("unrelated write failure")
+
+    async def runner():
+        emitter = _DisconnectTolerantEmitter(failed_emit)
+        with pytest.raises(RuntimeError, match="unrelated write failure"):
+            await emitter.emit(RunEvent(kind="content", text="partial"))
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_http_client_disconnect_keeps_agent_running(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    client_disconnected = asyncio.Event()
+    stream_finished = asyncio.Event()
+    consumed: list[str] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "carol"
+        consumed.append("tool_started")
+        yield "tool_started", {"name": "delegate_task"}
+        consumed.append("tool_completed")
+        yield "tool_completed", {"name": "delegate_task", "duration": 337.79, "is_error": False}
+        await client_disconnected.wait()
+        consumed.append("content")
+        yield "content", "final answer after browser refresh"
+        consumed.append("after_content")
+        stream_finished.set()
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        response = None
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "carol",
+                "user_key": "ou_carol",
+                "content": "long delegate task",
+                "session_id": "mpgl63gwl57asf",
+                "requires_host_tools": True,
+            })
+            assert response.status == 200
+
+            first_line = await _read_sse_data_line(response)
+            second_line = await _read_sse_data_line(response)
+            assert b'"kind": "tool_started"' in first_line
+            assert b'"kind": "tool_completed"' in second_line
+
+            response.close()
+            client_disconnected.set()
+
+            await asyncio.wait_for(stream_finished.wait(), timeout=1.0)
+        finally:
+            client_disconnected.set()
+            if response is not None:
+                response.close()
+            await client.close()
+
+        assert consumed == ["tool_started", "tool_completed", "content", "after_content"]
 
     asyncio.run(runner())
 

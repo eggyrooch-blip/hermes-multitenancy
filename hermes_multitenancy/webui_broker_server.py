@@ -279,6 +279,36 @@ async def _maybe_await(value):
     return value
 
 
+def _is_client_transport_closed(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        return True
+    if exc.__class__.__name__ == "ClientConnectionResetError":
+        return True
+    # asyncio transports can surface closed SSE writes as a RuntimeError with this text.
+    return "Cannot write to closing transport" in str(exc)
+
+
+class _DisconnectTolerantEmitter:
+    def __init__(self, emit_event: EmitRunEvent) -> None:
+        self._emit_event = emit_event
+        self.disconnected = False
+
+    async def emit(self, event: RunEvent) -> bool:
+        if self.disconnected:
+            return False
+        try:
+            await _maybe_await(self._emit_event(event))
+            return True
+        except Exception as exc:
+            if _is_client_transport_closed(exc):
+                self.disconnected = True
+                logger.info(
+                    "[multitenancy] WebUI SSE client disconnected; continuing run without streaming"
+                )
+                return False
+            raise
+
+
 def _event_to_sse(event: RunEvent) -> str:
     data = {
         "kind": event.kind,
@@ -359,6 +389,7 @@ async def _default_dispatch_agent(
     if emit_event is None:
         return await router_mod._get_pool().dispatch(request.profile_name, profile_home, event)
 
+    emitter = _DisconnectTolerantEmitter(emit_event)
     content_parts: list[str] = []
     pending_media_text = ""
     token = _PROFILE_HOME_VAR.set(profile_home)
@@ -374,68 +405,58 @@ async def _default_dispatch_agent(
                 for text in text_items:
                     if text:
                         content_parts.append(text)
-                        await _maybe_await(
-                            emit_event(
-                                RunEvent(
-                                    kind="content",
-                                    text=text,
-                                    payload={"text": text},
-                                )
+                        await emitter.emit(
+                            RunEvent(
+                                kind="content",
+                                text=text,
+                                payload={"text": text},
                             )
                         )
                 continue
             if kind == "thinking":
                 text = str(payload or "")
                 if text:
-                    await _maybe_await(
-                        emit_event(
-                            RunEvent(
-                                kind="thinking",
-                                text=text,
-                                payload={"text": text},
-                            )
+                    await emitter.emit(
+                        RunEvent(
+                            kind="thinking",
+                            text=text,
+                            payload={"text": text},
                         )
                     )
                 continue
             if kind == "tool_started":
                 tool_payload = dict(payload or {}) if isinstance(payload, dict) else {"preview": payload}
-                await _maybe_await(
-                    emit_event(
-                        RunEvent(
-                            kind="tool_started",
-                            name=str(tool_payload.get("name") or ""),
-                            payload=tool_payload,
-                        )
+                await emitter.emit(
+                    RunEvent(
+                        kind="tool_started",
+                        name=str(tool_payload.get("name") or ""),
+                        payload=tool_payload,
                     )
                 )
                 continue
             if kind == "tool_completed":
                 tool_payload = dict(payload or {}) if isinstance(payload, dict) else {"output": payload}
-                await _maybe_await(
-                    emit_event(
-                        RunEvent(
-                            kind="tool_completed",
-                            name=str(tool_payload.get("name") or ""),
-                            payload=tool_payload,
-                        )
+                await emitter.emit(
+                    RunEvent(
+                        kind="tool_completed",
+                        name=str(tool_payload.get("name") or ""),
+                        payload=tool_payload,
                     )
                 )
                 continue
             if kind in {"approval_required", "approval_resolved"}:
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
-                await _maybe_await(emit_event(RunEvent(kind=kind, payload=event_payload)))
+                await emitter.emit(RunEvent(kind=kind, payload=event_payload))
 
         if pending_media_text:
             text = router_mod._webui_profile_scoped_media_response(pending_media_text, profile_home)
             if text:
                 content_parts.append(text)
-                await _maybe_await(
-                    emit_event(
-                        RunEvent(
-                            kind="content",
-                            text=text,
-                            payload={"text": text},
-                        )
+                await emitter.emit(
+                    RunEvent(
+                        kind="content",
+                        text=text,
+                        payload={"text": text},
                     )
                 )
 
@@ -531,12 +552,22 @@ def create_run_broker_app(
         )
         await response.prepare(request)
 
-        async def emit_event(event: RunEvent) -> None:
+        async def write_sse_event(event: RunEvent) -> None:
             await response.write(_event_to_sse(event).encode("utf-8"))
+
+        emitter = _DisconnectTolerantEmitter(write_sse_event)
+
+        async def emit_event(event: RunEvent) -> None:
+            await emitter.emit(event)
 
         if admission.duplicate:
             await emit_event(RunEvent(kind="done"))
-            await response.write_eof()
+            if not emitter.disconnected:
+                try:
+                    await response.write_eof()
+                except Exception as exc:
+                    if not _is_client_transport_closed(exc):
+                        raise
             return response
 
         broker_dispatch = dispatch_agent or (
@@ -556,7 +587,12 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI run broker request failed")
             await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
         finally:
-            await response.write_eof()
+            if not emitter.disconnected:
+                try:
+                    await response.write_eof()
+                except Exception as exc:
+                    if not _is_client_transport_closed(exc):
+                        raise
         return response
 
     async def handle_provision_profile(request):
