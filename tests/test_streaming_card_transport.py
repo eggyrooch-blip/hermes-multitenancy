@@ -316,7 +316,11 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
     monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
 
     adapter = _CardCapableAdapter()
-    event = SimpleNamespace(text="hi", message_id="om_source_1")
+    event = SimpleNamespace(
+        text="hi",
+        message_id="om_source_1",
+        source=SimpleNamespace(chat_type="group"),
+    )
 
     response = await router_mod._stream_into_feishu(
         adapter,
@@ -339,6 +343,48 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
         "content": "Hello world",
         "finalize": True,
     }
+
+
+def test_stream_into_feishu_does_not_reply_to_dm_message_to_avoid_topic(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_stream_into_feishu_does_not_reply_to_dm_message_to_avoid_topic(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+async def _run_stream_into_feishu_does_not_reply_to_dm_message_to_avoid_topic(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "Hello")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    adapter = _CardCapableAdapter()
+    event = SimpleNamespace(
+        text="hi",
+        message_id="om_dm_source",
+        source=SimpleNamespace(chat_type="dm"),
+    )
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "dm-chat",
+        "profile",
+        tmp_path,
+        event,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "Hello"
+    assert adapter.started == [
+        {"chat_id": "dm-chat", "reply_to": None, "metadata": None}
+    ]
 
 
 def test_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapter(
@@ -1289,11 +1335,19 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     created = []
 
     class RecordingConsumer:
-        def __init__(self, adapter, chat_id, config=None, metadata=None):
+        def __init__(
+            self,
+            adapter,
+            chat_id,
+            config=None,
+            metadata=None,
+            initial_reply_to_id=None,
+        ):
             self.adapter = adapter
             self.chat_id = chat_id
             self.config = config
             self.metadata = metadata
+            self.initial_reply_to_id = initial_reply_to_id
             self.deltas = []
             self.statuses = []
             self.reasoning = []
@@ -1348,7 +1402,11 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
         "chat-1",
         "profile",
         tmp_path,
-        SimpleNamespace(text="hi"),
+        SimpleNamespace(
+            text="hi",
+            message_id="om_shared_group",
+            source=SimpleNamespace(chat_type="group"),
+        ),
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -1357,6 +1415,7 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     consumer = created[0]
     assert consumer.adapter is adapter
     assert consumer.chat_id == "chat-1"
+    assert consumer.initial_reply_to_id == "om_shared_group"
     assert consumer.config.edit_interval <= 0.3
     assert consumer.config.buffer_threshold <= 40
     assert [
@@ -1402,10 +1461,18 @@ async def _run_shared_consumer_flushes_short_reasoning_before_first_content(
     created = []
 
     class RecordingConsumer:
-        def __init__(self, adapter, chat_id, config=None, metadata=None):
+        def __init__(
+            self,
+            adapter,
+            chat_id,
+            config=None,
+            metadata=None,
+            initial_reply_to_id=None,
+        ):
             self.reasoning = []
             self.statuses = []
             self.deltas = []
+            self.initial_reply_to_id = initial_reply_to_id
             self.tool_starts = []
             self.tool_completions = []
             self._done = asyncio.Event()
@@ -1494,11 +1561,19 @@ async def test_shared_consumer_stream_does_not_truncate_at_visible_limit(
     created = []
 
     class RecordingConsumer:
-        def __init__(self, adapter, chat_id, config=None, metadata=None):
+        def __init__(
+            self,
+            adapter,
+            chat_id,
+            config=None,
+            metadata=None,
+            initial_reply_to_id=None,
+        ):
             self.adapter = adapter
             self.chat_id = chat_id
             self.config = config
             self.metadata = metadata
+            self.initial_reply_to_id = initial_reply_to_id
             self.deltas = []
             self.statuses = []
             self.reasoning = []
@@ -1679,11 +1754,43 @@ async def _run_handle_async_keeps_processing_reaction_until_media_delivery_finis
 
     assert adapter.lifecycle == [
         ("start", "om_media_life"),
-        ("send_document", "om_media_life", "report.md"),
+        ("send_document", None, "report.md"),
         ("complete_deferred", "ProcessingOutcome.SUCCESS"),
     ]
 
     clear_spike_routes()
+
+
+def test_deliver_profile_scoped_media_preserves_group_reply_to(tmp_path):
+    asyncio.run(_run_deliver_profile_scoped_media_preserves_group_reply_to(tmp_path))
+
+
+async def _run_deliver_profile_scoped_media_preserves_group_reply_to(tmp_path):
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    source = tmp_path / "group-report.md"
+    source.write_text("# group report", encoding="utf-8")
+
+    adapter = _DeferredLifecycleMediaAdapter()
+    event = SimpleNamespace(
+        message_id="om_group_media",
+        source=SimpleNamespace(chat_id="group-chat", chat_type="group"),
+    )
+
+    delivered = await router_mod._deliver_profile_scoped_media_directives(
+        adapter,
+        event,
+        SimpleNamespace(),
+        f"MEDIA:{source}",
+        profile_home=profile_home,
+    )
+
+    assert delivered == 1
+    assert adapter.lifecycle == [
+        ("send_document", "om_group_media", "group-report.md"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1709,7 +1816,11 @@ async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
             "chat-1",
             "profile",
             tmp_path,
-            SimpleNamespace(text="hi", message_id="om_source_prime"),
+            SimpleNamespace(
+                text="hi",
+                message_id="om_source_prime",
+                source=SimpleNamespace(chat_type="group"),
+            ),
             messages=[{"role": "user", "content": "hi"}],
         )
     )
@@ -2246,7 +2357,11 @@ async def test_stream_into_feishu_falls_back_to_text_edit_when_card_start_fails(
         "chat-1",
         "profile",
         tmp_path,
-        SimpleNamespace(text="hi", message_id="om_source_fallback"),
+        SimpleNamespace(
+            text="hi",
+            message_id="om_source_fallback",
+            source=SimpleNamespace(chat_type="group"),
+        ),
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -2265,3 +2380,49 @@ async def test_stream_into_feishu_falls_back_to_text_edit_when_card_start_fails(
     assert adapter.edits[-1]["content"] == "fallback text"
     assert adapter.edits[-1]["finalize"] is True
     assert adapter.updates == []
+
+
+@pytest.mark.asyncio
+async def test_stream_into_feishu_text_fallback_omits_dm_reply_to(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    class FailingCardAdapter(_CardCapableAdapter):
+        async def start_streaming_card(self, *, chat_id, reply_to=None, metadata=None):
+            self.started.append(
+                {"chat_id": chat_id, "reply_to": reply_to, "metadata": metadata}
+            )
+            return SimpleNamespace(success=False, error="card disabled")
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", "fallback text")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    adapter = FailingCardAdapter()
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "dm-chat",
+        "profile",
+        tmp_path,
+        SimpleNamespace(
+            text="hi",
+            message_id="om_dm_fallback",
+            source=SimpleNamespace(chat_type="dm"),
+        ),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "fallback text"
+    assert adapter.started == [
+        {"chat_id": "dm-chat", "reply_to": None, "metadata": None}
+    ]
+    assert adapter.sent == [
+        {
+            "chat_id": "dm-chat",
+            "content": "\u200b",
+            "reply_to": None,
+            "metadata": None,
+        }
+    ]

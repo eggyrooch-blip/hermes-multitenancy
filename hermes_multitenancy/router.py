@@ -300,6 +300,17 @@ def _event_message_id(event: Any) -> Optional[str]:
     return None
 
 
+def _event_reply_to_message_id(event: Any) -> Optional[str]:
+    """Only group/topic chats should use Feishu reply_to.
+
+    In p2p/dm chats Feishu renders bot replies with ``reply_to`` as visible
+    topics, which makes a private chat look like it was posted into a group.
+    """
+    if not _is_group_chat_type(_extract_chat_type(event)):
+        return None
+    return _event_message_id(event)
+
+
 def _normalize_dedupe_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
@@ -714,7 +725,7 @@ async def _deliver_profile_scoped_media_directives(
     force_document = "[[as_document]]" in str(scoped_response or "")
     audio_as_voice = "[[audio_as_voice]]" in str(scoped_response or "")
     metadata = _thread_metadata_for_media_delivery(gateway, event)
-    reply_to = _event_message_id(event)
+    reply_to = _event_reply_to_message_id(event)
     delivered = 0
     seen: set[Path] = set()
     for match in _MEDIA_DIRECTIVE_RE.finditer(str(scoped_response or "")):
@@ -4736,6 +4747,7 @@ async def _stream_into_feishu_shared_consumer(
 
     stream_started_at = time.monotonic()
     metadata = _thread_metadata_for_media_delivery(gateway, event) if gateway is not None else None
+    reply_to = _event_reply_to_message_id(event)
     consumer = GatewayStreamConsumer(
         adapter,
         chat_id,
@@ -4745,6 +4757,7 @@ async def _stream_into_feishu_shared_consumer(
             cursor=" ▉",
         ),
         metadata=metadata,
+        initial_reply_to_id=reply_to,
     )
     required_consumer_methods = (
         "ensure_streaming_card_started",
@@ -5009,7 +5022,7 @@ async def _stream_into_feishu(
     from .runtime import _PROFILE_HOME_VAR
 
     stream_started_at = time.monotonic()
-    reply_to = _event_message_id(event)
+    reply_to = _event_reply_to_message_id(event)
     metadata = _thread_metadata_for_media_delivery(gateway, event) if gateway is not None else None
 
     # Without an adapter we can still produce text (used in unit tests).
