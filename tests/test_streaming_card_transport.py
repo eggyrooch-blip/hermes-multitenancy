@@ -23,6 +23,26 @@ def _card_text(card_or_elements):
     return "\n".join(part for part in parts if part)
 
 
+def _assert_tool_panel(card_or_elements):
+    """Pin the full Tool calls collapsible_panel contract on a tool-bearing card:
+    panel sits at elements[0], tag is collapsible_panel, expanded is False (closed
+    by default per openclaw layout), and the header title is exactly 'Tool calls'.
+
+    Returns the panel dict so callers can drill into ``panel['elements'][0]['content']``
+    when they need to assert the inner tool-rows text directly.
+    """
+    elements = (
+        card_or_elements.get("elements", card_or_elements)
+        if isinstance(card_or_elements, dict)
+        else card_or_elements
+    )
+    panel = elements[0]
+    assert panel["tag"] == "collapsible_panel"
+    assert panel["expanded"] is False
+    assert panel["header"]["title"]["content"] == "Tool calls"
+    return panel
+
+
 class _CardCapableAdapter:
     def __init__(self):
         self.sent = []
@@ -370,9 +390,8 @@ async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapt
     final_card = adapter.card_patches[-1]["card"]
     assert "header" not in final_card
     assert final_card["config"]["wide_screen_mode"] is True
+    _assert_tool_panel(final_card)
     rendered = _card_text(final_card)
-    assert final_card["elements"][0]["tag"] == "collapsible_panel"
-    assert final_card["elements"][0]["expanded"] is False
     assert "**Tool calls:**" not in rendered
     assert "`lark_cli` (300 ms)" in rendered
     assert "Hello from clean adapter" in rendered
@@ -422,6 +441,8 @@ async def _run_stream_into_feishu_updates_interactive_card_without_auth_patch_he
     final_card = json.loads(final_request.request_body.content)
     assert "header" not in final_card
     rendered = _card_text(final_card)
+    assert all(element.get("tag") == "markdown" for element in final_card["elements"])
+    assert final_card["elements"][-1]["tag"] == "markdown"
     assert "Updated through Feishu message.update" in rendered
     assert "Done (" in rendered
 
@@ -447,6 +468,8 @@ async def _run_cardkit_compat_initial_card_uses_compact_empty_placeholders():
     initial_card = json.loads(adapter.card_sends[0]["payload"])
     assert initial_card["config"]["wide_screen_mode"] is False
     elements = initial_card["elements"]
+    assert len(elements) == 1
+    assert all(element.get("tag") == "markdown" for element in elements)
     assert [element["content"] for element in elements] == ["..."]
     assert "Thinking" not in _card_text(elements)
 
@@ -464,7 +487,9 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
         preview="GET /open-apis/authen/v1/user_info",
     )
     assert adapter.card_patches
-    rendered_running = _card_text(adapter.card_patches[-1]["card"])
+    running_card = adapter.card_patches[-1]["card"]
+    _assert_tool_panel(running_card)
+    rendered_running = _card_text(running_card)
     assert "- `lark_cli`: GET /open-apis/authen/v1/user_info" in rendered_running
 
     await adapter.update_streaming_card_tool_completed(
@@ -474,7 +499,9 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
         duration=0.42,
         is_error=False,
     )
-    rendered_done = _card_text(adapter.card_patches[-1]["card"])
+    done_card = adapter.card_patches[-1]["card"]
+    _assert_tool_panel(done_card)
+    rendered_done = _card_text(done_card)
     assert "`lark_cli` (420 ms)" in rendered_done
 
 
@@ -496,7 +523,9 @@ async def _run_cardkit_compat_renders_tool_argument_summary():
         args={"language": "python", "path": "home/generated_art.png"},
     )
 
-    rendered = _card_text(adapter.card_patches[-1]["card"])
+    tool_card = adapter.card_patches[-1]["card"]
+    _assert_tool_panel(tool_card)
+    rendered = _card_text(tool_card)
     assert "generating arguments" not in rendered
     assert "`execute_code` running" in rendered
     assert "language=python" in rendered
@@ -635,10 +664,10 @@ async def _run_cardkit_compat_never_renders_raw_tool_call_xml():
     )
 
     final_card = adapter.card_patches[-1]["card"]
+    _assert_tool_panel(final_card)
     rendered = _card_text(final_card)
     assert "<tool_call>" not in rendered
     assert "lark-cli doc +create" not in rendered
-    assert final_card["elements"][0]["tag"] == "collapsible_panel"
     assert "**Tool calls:**" not in rendered
     assert "- `lark_cli` failed" in rendered
     assert "Done (" in rendered
@@ -682,6 +711,7 @@ async def _run_cardkit_compat_filters_tool_process_narration_from_final_body():
     )
 
     final_card = adapter.card_patches[-1]["card"]
+    _assert_tool_panel(final_card)
     rendered = _card_text(final_card)
     assert "我需要先找到" not in rendered
     assert "让我先获取" not in rendered
@@ -729,6 +759,7 @@ async def _run_cardkit_compat_collapses_argument_generation_tool_rows():
     )
 
     final_card = adapter.card_patches[-1]["card"]
+    _assert_tool_panel(final_card)
     rendered = _card_text(final_card)
     assert "generating arguments" not in rendered
     assert rendered.count("`lark_cli`") == 1
@@ -779,6 +810,9 @@ async def _run_cardkit_compat_hides_internal_skill_view_tool_rows():
     )
 
     final_card = adapter.card_patches[-1]["card"]
+    panel = _assert_tool_panel(final_card)
+    tool_panel_text = _card_text(panel)
+    assert "`skill_view`" not in tool_panel_text
     rendered = _card_text(final_card)
     assert "`skill_view`" not in rendered
     assert "- `lark_cli` (1159 ms)" in rendered
@@ -1055,8 +1089,8 @@ async def _run_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
     )
 
     final_card = json.loads(adapter.card_updates[-1].request_body.card["data"])
+    _assert_tool_panel(final_card["body"]["elements"])
     final_text = _card_text(final_card["body"]["elements"])
-    assert final_card["body"]["elements"][0]["tag"] == "collapsible_panel"
     assert "**Tool calls:**" not in final_text
     assert "`lark_cli` (400 ms)" in final_text
     assert "final answer" in final_text
@@ -1117,6 +1151,8 @@ async def _run_stream_into_feishu_skips_legacy_shared_consumer_without_card_meth
     assert adapter.card_sends[0]["msg_type"] == "interactive"
     final_card = adapter.card_patches[-1]["card"]
     assert "header" not in final_card
+    assert all(element.get("tag") == "markdown" for element in final_card["elements"])
+    assert final_card["elements"][-1]["tag"] == "markdown"
     rendered = _card_text(final_card)
     assert "Compat survives legacy consumer" in rendered
     assert "Done (" in rendered
@@ -1337,7 +1373,10 @@ async def _run_shared_consumer_flushes_short_reasoning_before_first_content(
     assert created[0].deltas == ["answer"]
 
 
-def test_stream_card_idle_status_keeps_three_visible_dots_while_refreshing():
+def test_stream_card_idle_status_emits_invisible_marker_while_refreshing():
+    """Idle heartbeat keeps the card refreshing via rotating zero-width markers
+    only — no visible waiting text (no `Thinking...`, no dots). The marker
+    cycles each tick so Feishu does not dedupe identical payloads."""
     from hermes_multitenancy import router as router_mod
 
     statuses = [router_mod._stream_card_idle_status(i) for i in range(1, 5)]
