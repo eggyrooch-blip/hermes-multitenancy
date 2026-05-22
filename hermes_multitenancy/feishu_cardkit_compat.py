@@ -542,7 +542,7 @@ def _build_patch_message_request(message_id: str, card: dict[str, Any]) -> Any:
 
 def _new_state() -> dict[str, Any]:
     return {
-        "status": "Hermes is preparing a response...",
+        "status": "Thinking...",
         "reasoning": "",
         "reasoning_started_at": None,
         "reasoning_elapsed": None,
@@ -632,6 +632,11 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
                 {
                     "tag": "markdown",
                     "content": " ",
+                    "icon": {
+                        "tag": "custom_icon",
+                        "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
+                        "size": "16px 16px",
+                    },
                     "element_id": "loading_icon",
                 },
             ]

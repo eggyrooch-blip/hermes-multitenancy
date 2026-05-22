@@ -2131,6 +2131,7 @@ async def test_post_stream_media_delivery_sends_chinese_markdown_filename_direct
     source.parent.mkdir(parents=True)
     source.write_text("report", encoding="utf-8")
     event = _build_event(chat_id="oc_chat")
+    event.message_id = "om_source_doc"
 
     class Adapter:
         def __init__(self):
@@ -2158,6 +2159,7 @@ async def test_post_stream_media_delivery_sends_chinese_markdown_filename_direct
             "chat_id": "oc_chat",
             "file_path": str(workspace_file.resolve()),
             "file_name": "技术方案_260.md",
+            "reply_to": "om_source_doc",
             "metadata": None,
         }
     ]

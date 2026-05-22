@@ -10,6 +10,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -713,6 +714,7 @@ async def _deliver_profile_scoped_media_directives(
     force_document = "[[as_document]]" in str(scoped_response or "")
     audio_as_voice = "[[audio_as_voice]]" in str(scoped_response or "")
     metadata = _thread_metadata_for_media_delivery(gateway, event)
+    reply_to = _event_message_id(event)
     delivered = 0
     seen: set[Path] = set()
     for match in _MEDIA_DIRECTIVE_RE.finditer(str(scoped_response or "")):
@@ -724,16 +726,32 @@ async def _deliver_profile_scoped_media_directives(
         ext = path.suffix.lower()
         try:
             if ext in _MEDIA_IMAGE_EXTENSIONS and not force_document and hasattr(adapter, "send_image_file"):
-                result = await adapter.send_image_file(chat_id=chat_id, image_path=str(path), metadata=metadata)
+                result = await adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=str(path),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
             elif ext in _MEDIA_VIDEO_EXTENSIONS and hasattr(adapter, "send_video"):
-                result = await adapter.send_video(chat_id=chat_id, video_path=str(path), metadata=metadata)
+                result = await adapter.send_video(
+                    chat_id=chat_id,
+                    video_path=str(path),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
             elif ext in _MEDIA_AUDIO_EXTENSIONS and audio_as_voice and hasattr(adapter, "send_voice"):
-                result = await adapter.send_voice(chat_id=chat_id, audio_path=str(path), metadata=metadata)
+                result = await adapter.send_voice(
+                    chat_id=chat_id,
+                    audio_path=str(path),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
             elif hasattr(adapter, "send_document"):
                 result = await adapter.send_document(
                     chat_id=chat_id,
                     file_path=str(path),
                     file_name=path.name,
+                    reply_to=reply_to,
                     metadata=metadata,
                 )
             else:
@@ -2198,9 +2216,15 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             if feishu_full:
                 # Streaming path — card stream when available; text edit fallback.
                 async def _dispatch_streaming(_request):
+                    stream_kwargs = {"messages": conversation}
+                    try:
+                        if "gateway" in inspect.signature(_stream_into_feishu).parameters:
+                            stream_kwargs["gateway"] = gateway
+                    except (TypeError, ValueError):
+                        stream_kwargs["gateway"] = gateway
                     stream_response = await _stream_into_feishu(
                         adapter, chat_id, profile_name, profile_home, agent_event,
-                        messages=conversation,
+                        **stream_kwargs,
                     )
                     if stream_response:
                         await _deliver_media_from_stream_response(
@@ -4384,14 +4408,20 @@ def _adapter_supports_streaming_card(adapter) -> bool:
     return bool(getattr(adapter, "SUPPORTS_STREAMING_CARD", False))
 
 
-async def _start_feishu_stream_target(adapter, chat_id) -> tuple[str, Optional[str]]:
+async def _start_feishu_stream_target(
+    adapter,
+    chat_id,
+    *,
+    reply_to: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> tuple[str, Optional[str]]:
     """Start a card stream when possible, otherwise create the text placeholder."""
     if _adapter_supports_streaming_card(adapter):
         starter = getattr(adapter, "start_streaming_card", None)
         updater = getattr(adapter, "update_streaming_card", None)
         if callable(starter) and callable(updater):
             try:
-                result = await starter(chat_id=chat_id, reply_to=None, metadata=None)
+                result = await starter(chat_id=chat_id, reply_to=reply_to, metadata=metadata)
             except Exception as exc:
                 logger.debug("multitenancy: start_streaming_card failed: %s", exc)
             else:
@@ -4404,7 +4434,7 @@ async def _start_feishu_stream_target(adapter, chat_id) -> tuple[str, Optional[s
                     getattr(result, "error", None),
                 )
 
-    placeholder_send = await adapter.send(chat_id, "...")
+    placeholder_send = await adapter.send(chat_id, "Thinking...", reply_to=reply_to, metadata=metadata)
     message_id = (
         placeholder_send.message_id
         if getattr(placeholder_send, "success", False)
@@ -4569,7 +4599,7 @@ _STREAM_CARDKIT_CONTENT_MIN_SECONDS = 0.2
 _STREAM_THINKING_MIN_SECONDS = 2.0
 _STREAM_CARD_REASONING_MIN_CHARS = 100
 _STREAM_CARD_REASONING_MIN_SECONDS = 2.0
-_STREAM_CARD_PRIME_STATUS = "Hermes 正在准备响应..."
+_STREAM_CARD_PRIME_STATUS = "Thinking..."
 _STREAM_CARD_IDLE_HEARTBEAT_SECONDS = 2.5
 _STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 _STREAM_ABORT_FALLBACK = "Aborted."
@@ -4606,7 +4636,14 @@ def _strip_stream_status_animation_markers(text: str) -> str:
 
 
 async def _stream_into_feishu_shared_consumer(
-    adapter, chat_id, profile_name, profile_home, event, *, messages: Optional[list[dict]] = None
+    adapter,
+    chat_id,
+    profile_name,
+    profile_home,
+    event,
+    *,
+    gateway: Any = None,
+    messages: Optional[list[dict]] = None,
 ) -> Optional[str]:
     """Stream Feishu card output through Hermes' shared GatewayStreamConsumer.
 
@@ -4634,6 +4671,7 @@ async def _stream_into_feishu_shared_consumer(
     from .runtime import _PROFILE_HOME_VAR
 
     stream_started_at = time.monotonic()
+    metadata = _thread_metadata_for_media_delivery(gateway, event) if gateway is not None else None
     consumer = GatewayStreamConsumer(
         adapter,
         chat_id,
@@ -4642,7 +4680,7 @@ async def _stream_into_feishu_shared_consumer(
             buffer_threshold=_STREAM_CARDKIT_CONTENT_MIN_CHARS,
             cursor=" ▉",
         ),
-        metadata=None,
+        metadata=metadata,
     )
     required_consumer_methods = (
         "ensure_streaming_card_started",
@@ -4881,7 +4919,14 @@ async def _stream_into_feishu_shared_consumer(
 
 
 async def _stream_into_feishu(
-    adapter, chat_id, profile_name, profile_home, event, *, messages: Optional[list[dict]] = None
+    adapter,
+    chat_id,
+    profile_name,
+    profile_home,
+    event,
+    *,
+    gateway: Any = None,
+    messages: Optional[list[dict]] = None,
 ) -> str:
     """Stream LLM tokens into Feishu.
 
@@ -4900,6 +4945,8 @@ async def _stream_into_feishu(
     from .runtime import _PROFILE_HOME_VAR
 
     stream_started_at = time.monotonic()
+    reply_to = _event_message_id(event)
+    metadata = _thread_metadata_for_media_delivery(gateway, event) if gateway is not None else None
 
     # Without an adapter we can still produce text (used in unit tests).
     if adapter is None:
@@ -4923,6 +4970,7 @@ async def _stream_into_feishu(
             profile_name,
             profile_home,
             event,
+            gateway=gateway,
             messages=messages,
         )
         if shared_response is not None:
@@ -5011,7 +5059,12 @@ async def _stream_into_feishu(
         nonlocal last_edit_time, last_render_len, terminal_update_sent
         if placeholder_id is not None:
             await _flush_current_segment(finalize=True)
-        stream_mode, placeholder_id = await _start_feishu_stream_target(adapter, chat_id)
+        stream_mode, placeholder_id = await _start_feishu_stream_target(
+            adapter,
+            chat_id,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
         terminal_update_sent = False
         content = ""
         content_started = False
@@ -5035,7 +5088,14 @@ async def _stream_into_feishu(
         # Create/send can complete remotely after this task is cancelled. Shield
         # it so we can still obtain the message_id and close the card instead of
         # leaving a Generating card behind.
-        start_task = asyncio.create_task(_start_feishu_stream_target(adapter, chat_id))
+        start_task = asyncio.create_task(
+            _start_feishu_stream_target(
+                adapter,
+                chat_id,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        )
         try:
             stream_mode, placeholder_id = await asyncio.shield(start_task)
         except asyncio.CancelledError:
@@ -5062,7 +5122,7 @@ async def _stream_into_feishu(
         if placeholder_id is None:
             # Couldn't get a message to edit — degrade to one-shot non-stream.
             text = await real_run_agent(event, profile_home, messages=messages)
-            await adapter.send(chat_id, text)
+            await adapter.send(chat_id, text, reply_to=reply_to, metadata=metadata)
             return text
 
         if stream_mode == "card":

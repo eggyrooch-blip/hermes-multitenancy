@@ -125,6 +125,12 @@ class _DeferredLifecycleCardAdapter(_CardCapableAdapter):
         self.lifecycle.append(("complete_deferred", str(outcome)))
 
 
+class _DeferredLifecycleMediaAdapter(_DeferredLifecycleCardAdapter):
+    async def send_document(self, **kwargs):
+        self.lifecycle.append(("send_document", kwargs.get("reply_to"), kwargs.get("file_name")))
+        return SimpleNamespace(success=True)
+
+
 class _CleanFeishuLikeAdapter:
     """Official-clean Feishu adapter shape: card patching exists, streaming surface does not."""
 
@@ -275,7 +281,7 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
     monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
 
     adapter = _CardCapableAdapter()
-    event = SimpleNamespace(text="hi")
+    event = SimpleNamespace(text="hi", message_id="om_source_1")
 
     response = await router_mod._stream_into_feishu(
         adapter,
@@ -288,7 +294,7 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
 
     assert response == "Hello world"
     assert adapter.started == [
-        {"chat_id": "chat-1", "reply_to": None, "metadata": None}
+        {"chat_id": "chat-1", "reply_to": "om_source_1", "metadata": None}
     ]
     assert adapter.sent == []
     assert adapter.edits == []
@@ -425,7 +431,7 @@ async def _run_cardkit_compat_initial_card_uses_compact_empty_placeholders():
     assert initial_card["config"]["wide_screen_mode"] is False
     elements = initial_card["elements"]
     assert [element["content"] for element in elements] == [
-        "Hermes is preparing a response..."
+        "Thinking..."
     ]
 
 
@@ -1160,7 +1166,7 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
     assert [
         router_mod._strip_stream_status_animation_markers(status)
         for status in consumer.statuses
-    ] == ["Hermes 正在准备响应."]
+    ] == ["Thinking."]
     assert consumer.reasoning == ["checking"]
     assert consumer.tool_starts == [
         {
@@ -1270,10 +1276,10 @@ def test_stream_card_idle_status_keeps_three_visible_dots_while_refreshing():
         router_mod._strip_stream_status_animation_markers(status)
         for status in statuses
     ] == [
-        "Hermes 正在准备响应.",
-        "Hermes 正在准备响应..",
-        "Hermes 正在准备响应...",
-        "Hermes 正在准备响应.",
+        "Thinking.",
+        "Thinking..",
+        "Thinking...",
+        "Thinking.",
     ]
 
 
@@ -1431,6 +1437,61 @@ async def test_handle_async_completes_deferred_processing_lifecycle(
     clear_spike_routes()
 
 
+def test_handle_async_keeps_processing_reaction_until_media_delivery_finishes(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _run_handle_async_keeps_processing_reaction_until_media_delivery_finishes(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+async def _run_handle_async_keeps_processing_reaction_until_media_delivery_finishes(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "profiles" / "ou_media_life"
+    profile_home.mkdir(parents=True)
+    source = profile_home / ".ai-docs" / "report.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# report", encoding="utf-8")
+    add_spike_route("ou_media_life", profile_home)
+
+    async def fake_stream_into_feishu(*args, **kwargs):
+        return f"方案已保存：{source}"
+
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream_into_feishu)
+
+    adapter = _DeferredLifecycleMediaAdapter()
+    gateway = SimpleNamespace(adapters={"feishu": adapter})
+    event = SimpleNamespace(
+        text="生成报告",
+        message_id="om_media_life",
+        source=SimpleNamespace(
+            chat_id="chat-life",
+            user_id="ou_media_life",
+            user_id_alt=None,
+            user_name="tester",
+            chat_type="dm",
+            platform=SimpleNamespace(value="feishu"),
+        ),
+    )
+
+    await router_mod.handle_async(event=event, gateway=gateway)
+
+    assert adapter.lifecycle == [
+        ("start", "om_media_life"),
+        ("send_document", "om_media_life", "report.md"),
+        ("complete_deferred", "ProcessingOutcome.SUCCESS"),
+    ]
+
+    clear_spike_routes()
+
+
 @pytest.mark.asyncio
 async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
     monkeypatch, tmp_path
@@ -1454,7 +1515,7 @@ async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
             "chat-1",
             "profile",
             tmp_path,
-            SimpleNamespace(text="hi"),
+            SimpleNamespace(text="hi", message_id="om_source_prime"),
             messages=[{"role": "user", "content": "hi"}],
         )
     )
@@ -1462,12 +1523,12 @@ async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
     await asyncio.wait_for(stream_entered.wait(), timeout=1)
 
     assert adapter.started == [
-        {"chat_id": "chat-1", "reply_to": None, "metadata": None}
+        {"chat_id": "chat-1", "reply_to": "om_source_prime", "metadata": None}
     ]
     assert len(adapter.status_updates) == 1
     assert router_mod._strip_stream_status_animation_markers(
         adapter.status_updates[0]["content"]
-    ) == "Hermes 正在准备响应."
+    ) == "Thinking."
     assert adapter.reasoning_updates == []
 
     release_stream.set()
@@ -1513,7 +1574,7 @@ async def test_stream_into_feishu_keeps_card_alive_while_agent_is_silent(
     assert [
         router_mod._strip_stream_status_animation_markers(update["content"])
         for update in adapter.status_updates[:2]
-    ] == ["Hermes 正在准备响应.", "Hermes 正在准备响应.."]
+    ] == ["Thinking.", "Thinking.."]
     assert adapter.reasoning_updates == []
 
     release_stream.set()
@@ -1570,7 +1631,7 @@ async def _run_stream_into_feishu_keeps_status_animating_after_tool_event(
     assert [
         router_mod._strip_stream_status_animation_markers(update["content"])
         for update in adapter.status_updates[:2]
-    ] == ["Hermes 正在准备响应.", "Hermes 正在准备响应.."]
+    ] == ["Thinking.", "Thinking.."]
     assert adapter.tool_starts[0]["tool_name"] == "execute_code"
 
     release_stream.set()
@@ -1770,7 +1831,7 @@ async def test_stream_into_feishu_aborts_card_when_cancelled_during_prime(
         async def update_streaming_card_status(
             self, *, chat_id, message_id, content
         ):
-            if content.startswith("Hermes 正在准备响应."):
+            if content.startswith("Thinking."):
                 self.prime_entered.set()
                 await self.release_prime.wait()
             return await super().update_streaming_card_status(
@@ -1831,7 +1892,7 @@ async def test_stream_into_feishu_updates_card_for_tool_and_reasoning_events(
         "chat-1",
         "profile",
         tmp_path,
-        SimpleNamespace(text="hi"),
+        SimpleNamespace(text="hi", message_id="om_source_tool"),
         messages=[{"role": "user", "content": "hi"}],
     )
 
@@ -1848,7 +1909,7 @@ async def test_stream_into_feishu_updates_card_for_tool_and_reasoning_events(
     assert len(adapter.status_updates) == 1
     assert router_mod._strip_stream_status_animation_markers(
         adapter.status_updates[0]["content"]
-    ) == "Hermes 正在准备响应."
+    ) == "Thinking."
     assert adapter.reasoning_updates == [
         {
             "chat_id": "chat-1",
@@ -1961,7 +2022,7 @@ def test_stream_into_feishu_streams_raw_reasoning_in_card(monkeypatch, tmp_path)
     assert [
         router_mod._strip_stream_status_animation_markers(item["content"])
         for item in adapter.status_updates
-    ] == ["Hermes 正在准备响应."]
+    ] == ["Thinking."]
     assert [item["content"] for item in adapter.reasoning_updates] == [
         "The user wants to update a Feishu record.",
     ]
@@ -1991,12 +2052,22 @@ async def test_stream_into_feishu_falls_back_to_text_edit_when_card_start_fails(
         "chat-1",
         "profile",
         tmp_path,
-        SimpleNamespace(text="hi"),
+        SimpleNamespace(text="hi", message_id="om_source_fallback"),
         messages=[{"role": "user", "content": "hi"}],
     )
 
     assert response == "fallback text"
-    assert [item["content"] for item in adapter.sent] == ["..."]
+    assert adapter.started == [
+        {"chat_id": "chat-1", "reply_to": "om_source_fallback", "metadata": None}
+    ]
+    assert adapter.sent == [
+        {
+            "chat_id": "chat-1",
+            "content": "Thinking...",
+            "reply_to": "om_source_fallback",
+            "metadata": None,
+        }
+    ]
     assert adapter.edits[-1]["content"] == "fallback text"
     assert adapter.edits[-1]["finalize"] is True
     assert adapter.updates == []
