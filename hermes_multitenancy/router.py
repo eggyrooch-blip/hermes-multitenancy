@@ -2346,7 +2346,8 @@ def _maybe_rewrite_skill_slash_command(
         if cmd_key is None:
             return False, None
 
-        skill_name = (skill_cmds.get(cmd_key) or {}).get("name", "")
+        skill_info = skill_cmds.get(cmd_key) or {}
+        skill_name = skill_info.get("name", "")
         platform = _event_platform_value(event)
         if platform and skill_name:
             try:
@@ -2361,17 +2362,25 @@ def _maybe_rewrite_skill_slash_command(
             except Exception as exc:
                 logger.debug("multitenancy: skill disabled check failed (%s)", exc)
 
-        msg = build_skill_invocation_message(
-            cmd_key,
-            args.strip(),
-            task_id=_multitenant_gateway_session_key(
-                event,
-                profile_name=profile_name,
-                sender=sender,
-                sender_alt=sender_alt,
-                chat_id=chat_id,
-            ),
-        )
+        old_skill_dir = skill_info.get("skill_dir")
+        relative_skill_dir = _profile_relative_skill_dir(skill_info, profile_home)
+        if relative_skill_dir:
+            skill_info["skill_dir"] = relative_skill_dir
+        try:
+            msg = build_skill_invocation_message(
+                cmd_key,
+                args.strip(),
+                task_id=_multitenant_gateway_session_key(
+                    event,
+                    profile_name=profile_name,
+                    sender=sender,
+                    sender_alt=sender_alt,
+                    chat_id=chat_id,
+                ),
+            )
+        finally:
+            if relative_skill_dir:
+                skill_info["skill_dir"] = old_skill_dir
         if not msg:
             return False, None
         logger.info("Hermes skill slash invocation: %s profile=%s", cmd_key, profile_name or "")
@@ -3076,6 +3085,21 @@ def _event_platform_value(event: Any) -> Optional[str]:
     platform = getattr(source, "platform", None) if source is not None else None
     value = getattr(platform, "value", platform)
     return str(value) if value else None
+
+
+def _profile_relative_skill_dir(skill_info: dict[str, Any], profile_home: Optional[Path]) -> Optional[str]:
+    if profile_home is None:
+        return None
+    raw_skill_dir = skill_info.get("skill_dir")
+    if not isinstance(raw_skill_dir, str) or not raw_skill_dir:
+        return None
+    try:
+        skill_dir = Path(raw_skill_dir)
+        if not skill_dir.is_absolute():
+            return None
+        return str(skill_dir.relative_to(profile_home / "skills"))
+    except Exception:
+        return None
 
 
 def _scope_profile_skill_loader(profile_home: Optional[Path]) -> list[tuple[Any, str, Any, bool]]:

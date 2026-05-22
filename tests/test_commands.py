@@ -836,13 +836,16 @@ async def test_group_skill_slash_loads_skill_from_routed_profile_after_router_ca
     router_home = tmp_path / "router"
     group_home = tmp_path / "group"
     (router_home / "skills").mkdir(parents=True)
-    skill_dir = group_home / "skills" / "Keep" / "kep-prd-analysis"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
+    shared_skill_dir = tmp_path / "shared-skills" / "Keep" / "kep-prd-analysis"
+    shared_skill_dir.mkdir(parents=True)
+    (shared_skill_dir / "SKILL.md").write_text(
         "---\nname: kep-prd-analysis\ndescription: PRD analysis\n---\n"
         "# KEP PRD Analysis\n\nloaded from routed group profile\n",
         encoding="utf-8",
     )
+    skill_dir = group_home / "skills" / "Keep" / "kep-prd-analysis"
+    skill_dir.parent.mkdir(parents=True)
+    skill_dir.symlink_to(shared_skill_dir, target_is_directory=True)
 
     async def fake_group_route(*, chat_id, gateway):
         return "group", group_home
@@ -858,13 +861,15 @@ async def test_group_skill_slash_loads_skill_from_routed_profile_after_router_ca
 
     skill_commands = ModuleType("agent.skill_commands")
 
-    def get_skill_commands():
-        return {
-            "/kep-prd-analysis": {
-                "name": "kep-prd-analysis",
-                "skill_dir": str(skill_dir),
-            }
+    command_cache = {
+        "/kep-prd-analysis": {
+            "name": "kep-prd-analysis",
+            "skill_dir": str(skill_dir),
         }
+    }
+
+    def get_skill_commands():
+        return command_cache
 
     def resolve_skill_command_key(command):
         return "/kep-prd-analysis" if command.replace("_", "-") == "kep-prd-analysis" else None
@@ -874,7 +879,10 @@ async def test_group_skill_slash_loads_skill_from_routed_profile_after_router_ca
 
         current_skill_dir = Path(get_skill_commands()[cmd_key]["skill_dir"])
         try:
-            rel = current_skill_dir.relative_to(current_skills_tool.SKILLS_DIR)
+            if current_skill_dir.is_absolute():
+                rel = current_skill_dir.resolve().relative_to(current_skills_tool.SKILLS_DIR.resolve())
+            else:
+                rel = current_skill_dir
         except ValueError:
             return "[Failed to load skill: kep-prd-analysis]"
         return f"[skill:{rel} task:{task_id}] {user_instruction}"
