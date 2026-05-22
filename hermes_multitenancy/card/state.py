@@ -79,6 +79,14 @@ def _new_state() -> dict[str, Any]:
         # FSM additions (additive, do not break callers that read finalized/aborted)
         "phase": PHASE_IDLE,
         "epoch": 0,
+        # Phase 6 footer observability — router merges metrics in via
+        # update_streaming_card_metrics; rendered in done footer when
+        # FOOTER_SHOW_METRICS env flag is true.
+        "tokens_in": None,
+        "tokens_out": None,
+        "cache_hit_pct": None,
+        "context_pct": None,
+        "model_name": None,
     }
 
 

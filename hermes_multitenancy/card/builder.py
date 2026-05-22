@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from .footer_config import get_show_metrics
 from .markdown_style import _optimize_markdown_style
 from .reasoning import (
     _clean_reasoning_prefix,
@@ -193,7 +194,42 @@ def _render_reasoning_panel(reasoning: str, state: dict[str, Any]) -> dict[str, 
 
 def _render_done_footer(state: dict[str, Any]) -> str:
     label = "Aborted" if state.get("aborted") else "Done"
-    return f"{label} ({_format_elapsed_since_start(state)})"
+    base = f"{label} ({_format_elapsed_since_start(state)})"
+    if not get_show_metrics():
+        return base
+    metrics = _format_metrics_line(state)
+    if not metrics:
+        return base
+    return f"{base}\n{metrics}"
+
+
+def _format_metrics_line(state: dict[str, Any]) -> str:
+    """Render the optional second-line footer with LLM observability fields.
+
+    Only the fields actually set on ``state`` are emitted; the line is empty
+    when none of ``tokens_in`` / ``tokens_out`` / ``cache_hit_pct`` /
+    ``context_pct`` / ``model_name`` is populated. Caller side gates rendering
+    via ``FOOTER_SHOW_METRICS`` env flag — this function does not re-check it.
+    """
+    parts: list[str] = []
+    tokens_in = state.get("tokens_in")
+    tokens_out = state.get("tokens_out")
+    if tokens_in is not None or tokens_out is not None:
+        in_text = f"↑{int(tokens_in)}" if isinstance(tokens_in, (int, float)) else ""
+        out_text = f"↓{int(tokens_out)}" if isinstance(tokens_out, (int, float)) else ""
+        token_segment = " ".join(part for part in (in_text, out_text) if part)
+        if token_segment:
+            parts.append(f"tokens {token_segment}")
+    cache_hit = state.get("cache_hit_pct")
+    if isinstance(cache_hit, (int, float)):
+        parts.append(f"cache {int(cache_hit)}%")
+    context_pct = state.get("context_pct")
+    if isinstance(context_pct, (int, float)):
+        parts.append(f"ctx {int(context_pct)}%")
+    model_name = state.get("model_name")
+    if isinstance(model_name, str) and model_name.strip():
+        parts.append(f"model {model_name.strip()}")
+    return " · ".join(parts)
 
 
 def _format_elapsed_since_start(state: dict[str, Any]) -> str:

@@ -87,6 +87,7 @@ def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
     adapter.update_streaming_card_status = MethodType(_update_streaming_card_status, adapter)
     adapter.update_streaming_card_tool_started = MethodType(_update_streaming_card_tool_started, adapter)
     adapter.update_streaming_card_tool_completed = MethodType(_update_streaming_card_tool_completed, adapter)
+    adapter.update_streaming_card_metrics = MethodType(_update_streaming_card_metrics, adapter)
     setattr(adapter, _INSTALLED_ATTR, True)
     logger.info("multitenancy: installed Feishu CardKit compat streaming surface")
     return adapter
@@ -232,6 +233,44 @@ async def _abort_streaming_card(
     state["finalized"] = True
     _transition(state, PHASE_ABORTED)
     return await _flush_state(self, message_id, state, final=True, pop=True)
+
+
+def _update_streaming_card_metrics(
+    self: Any,
+    *,
+    message_id: str,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    cache_hit_pct: Optional[float] = None,
+    context_pct: Optional[float] = None,
+    model_name: Optional[str] = None,
+) -> Any:
+    """Merge LLM observability metrics into the per-message state.
+
+    No API call is made — metrics are rendered onto the final card by
+    ``_render_done_footer`` at finalize time when ``FOOTER_SHOW_METRICS``
+    env flag is set. Synchronous: router.py can call without await.
+    Unknown ``message_id`` is a no-op (defensive against stale callers).
+    """
+    if not message_id:
+        return _result(False, error="missing message_id")
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
+    states = _states(self)
+    state = states.get(str(message_id))
+    if state is None:
+        return _result(False, message_id=str(message_id), error="unknown message_id")
+    if tokens_in is not None:
+        state["tokens_in"] = tokens_in
+    if tokens_out is not None:
+        state["tokens_out"] = tokens_out
+    if cache_hit_pct is not None:
+        state["cache_hit_pct"] = cache_hit_pct
+    if context_pct is not None:
+        state["context_pct"] = context_pct
+    if model_name is not None:
+        state["model_name"] = model_name
+    return _result(True, message_id=str(message_id))
 
 
 async def _update_streaming_card_reasoning(
