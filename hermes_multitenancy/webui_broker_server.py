@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ _RUN_BROKER_SHARED_ENV_KEYS = frozenset(
         "HERMES_LARK_CLI_STRICT_MODE",
     }
 )
+_pending_clarifies: dict[str, dict[str, Any]] = {}
 
 
 def _shared_home_from_env() -> Path:
@@ -345,6 +347,61 @@ def _event_to_sse(event: RunEvent) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _sanitize_clarify_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(payload)
+    cleaned.pop("response_path", None)
+    return cleaned
+
+
+def _register_pending_clarify(run_request: RunRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    clarify_id = str(payload.get("clarify_id") or "").strip()
+    response_path = str(payload.get("response_path") or "").strip()
+    if not clarify_id or not response_path:
+        return _sanitize_clarify_payload(payload)
+    _pending_clarifies[clarify_id] = {
+        "clarify_id": clarify_id,
+        "owner_open_id": str(run_request.user_key or "").strip(),
+        "profile_name": str(run_request.profile_name or "").strip(),
+        "session_id": str(run_request.session_id or "").strip(),
+        "response_path": response_path,
+        "created_at": time.time(),
+    }
+    return _sanitize_clarify_payload(payload)
+
+
+def _clear_pending_clarify(payload: dict[str, Any]) -> None:
+    clarify_id = str(payload.get("clarify_id") or "").strip()
+    if clarify_id:
+        _pending_clarifies.pop(clarify_id, None)
+
+
+def _write_pending_clarify_response(
+    *,
+    clarify_id: str,
+    owner_open_id: str,
+    profile_name: str,
+    session_id: str,
+    response_text: str,
+) -> bool:
+    pending = _pending_clarifies.get(clarify_id)
+    if pending is None:
+        return False
+    if str(pending.get("owner_open_id") or "") != owner_open_id:
+        return False
+    if str(pending.get("profile_name") or "") != profile_name:
+        return False
+    if str(pending.get("session_id") or "") != session_id:
+        return False
+
+    response_path = Path(str(pending.get("response_path") or ""))
+    response_path.parent.mkdir(parents=True, exist_ok=True)
+    response_path.write_text(
+        json.dumps({"response": response_text}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return True
+
+
 def _webui_current_datetime_instruction() -> str:
     now = datetime.now().astimezone()
     timezone = now.tzname() or str(now.astimezone().tzinfo)
@@ -473,6 +530,21 @@ async def _default_dispatch_agent(
             if kind in {"approval_required", "approval_resolved"}:
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
                 await emitter.emit(RunEvent(kind=kind, payload=event_payload))
+                continue
+            if kind == "clarify_required":
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
+                await emitter.emit(
+                    RunEvent(
+                        kind=kind,
+                        payload=_register_pending_clarify(request, event_payload),
+                    )
+                )
+                continue
+            if kind == "clarify_resolved":
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
+                _clear_pending_clarify(event_payload)
+                await emitter.emit(RunEvent(kind=kind, payload=_sanitize_clarify_payload(event_payload)))
+                continue
 
         if pending_media_text:
             text = router_mod._webui_profile_scoped_media_response(pending_media_text, profile_home)
@@ -620,6 +692,44 @@ def create_run_broker_app(
                     if not _is_client_transport_closed(exc):
                         raise
         return response
+
+    async def handle_clarify_respond(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        clarify_id = str(request.match_info.get("clarify_id") or "").strip()
+        if not clarify_id:
+            return web.json_response({"error": "clarify_id required"}, status=400)
+
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+
+        trusted_owner = _trusted_owner_from_request(request)
+        if not trusted_owner:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        response_text = str(payload.get("response") or payload.get("answer") or "").strip()
+
+        wrote = _write_pending_clarify_response(
+            clarify_id=clarify_id,
+            owner_open_id=trusted_owner,
+            profile_name=resolved_profile_name or "",
+            session_id=session_id,
+            response_text=response_text,
+        )
+        if not wrote:
+            return web.json_response({"error": "clarify request not found"}, status=404)
+        return web.json_response({"ok": True, "clarify_id": clarify_id})
 
     async def handle_provision_profile(request):
         if not _authorized(request):
@@ -1135,6 +1245,7 @@ def create_run_broker_app(
 
     app = web.Application(client_max_size=_run_broker_client_max_size())
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)

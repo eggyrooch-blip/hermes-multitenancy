@@ -2546,6 +2546,8 @@ async def _stream_aiagent_subprocess(
                 "tool_completed",
                 "approval_required",
                 "approval_resolved",
+                "clarify_required",
+                "clarify_resolved",
             }:
                 payload_data = {k: v for k, v in data.items() if k != "event"}
                 if event_name == "tool_started":
@@ -2806,6 +2808,99 @@ def _read_approval_choice(path: Path) -> Optional[str]:
         return "deny"
     choice = str(data.get("choice") or "").strip().lower()
     return choice if choice in {"once", "session", "always", "deny"} else "deny"
+
+
+def _clarify_bridge_timeout() -> float:
+    raw = os.getenv("HERMES_MULTITENANCY_CLARIFY_TIMEOUT")
+    if raw is None:
+        raw = os.getenv("HERMES_CLARIFY_TIMEOUT", "300")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _clarify_timeout_response(timeout_s: float) -> str:
+    return (
+        f"The user did not provide a response within {timeout_s:g}s. "
+        "Use your best judgement to make the choice and proceed."
+    )
+
+
+def _clarify_bridge_dir() -> Path:
+    raw = os.getenv("HERMES_MULTITENANCY_CLARIFY_DIR")
+    if raw:
+        root = Path(raw).expanduser()
+    else:
+        root = Path(tempfile.gettempdir()) / "hermes-multitenancy-clarify"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _read_clarify_response(path: Path) -> Optional[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("[multitenancy] clarify response read failed: %s", exc)
+        return ""
+    return str(data.get("response") or data.get("answer") or "").strip()
+
+
+def _configure_webui_clarify_bridge(event_sink, session_key: str):
+    """Return an AIAgent clarify callback for WebUI-scoped runs."""
+    if event_sink is None:
+        return None
+
+    clarify_dir = _clarify_bridge_dir()
+
+    def _emit_bridge_event(event_name: str, **payload: Any) -> None:
+        try:
+            event_sink(event_name, **payload)
+        except Exception:
+            logger.debug("[multitenancy] clarify bridge event emit failed", exc_info=True)
+
+    def _clarify_callback(question: Any, choices: Any = None) -> str:
+        clarify_id = f"clarify_{uuid.uuid4().hex}"
+        response_path = clarify_dir / f"{clarify_id}.json"
+        normalized_choices = []
+        if isinstance(choices, list):
+            normalized_choices = [str(choice).strip() for choice in choices if str(choice).strip()]
+        question_text = str(question or "").strip()
+        _emit_bridge_event(
+            "clarify_required",
+            clarify_id=clarify_id,
+            session_key=session_key,
+            question=question_text,
+            choices=normalized_choices,
+            response_path=str(response_path),
+        )
+
+        timeout_s = _clarify_bridge_timeout()
+        deadline = time.monotonic() + timeout_s
+        response: Optional[str] = None
+        timed_out = False
+        while True:
+            response = _read_clarify_response(response_path)
+            if response is not None:
+                break
+            if time.monotonic() >= deadline:
+                response = _clarify_timeout_response(timeout_s)
+                timed_out = True
+                break
+            time.sleep(0.1)
+
+        _emit_bridge_event(
+            "clarify_resolved",
+            clarify_id=clarify_id,
+            session_key=session_key,
+            response=str(response or ""),
+            timed_out=timed_out,
+        )
+        return str(response or "")
+
+    return _clarify_callback
 
 
 def _configure_gateway_approval_bridge(event_sink, session_key: str):
@@ -3158,6 +3253,12 @@ def _run_with_aiagent(
             if tool_name:
                 _emit("tool_started", name=str(tool_name), preview="generating arguments")
 
+        clarify_callback = (
+            _configure_webui_clarify_bridge(event_sink, str(gateway_session_key))
+            if platform_key == "webui"
+            else None
+        )
+
         agent_kwargs: dict[str, Any] = {
             # AIAgent expects the bare model name (e.g. "glm-5.1"), not the
             # provider-prefixed form. Provider was already used above to
@@ -3180,6 +3281,7 @@ def _run_with_aiagent(
             "tool_progress_callback": _tool_progress_event_callback,
             "stream_delta_callback": _stream_delta_event_callback if event_sink is not None else None,
             "reasoning_callback": _reasoning_event_callback if event_sink is not None else None,
+            "clarify_callback": clarify_callback,
             "tool_gen_callback": _tool_gen_event_callback if event_sink is not None else None,
         }
         if enabled_toolsets is not None:

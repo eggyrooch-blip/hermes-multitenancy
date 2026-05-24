@@ -173,7 +173,10 @@ def test_webui_run_broker_rejects_body_over_configured_limit(monkeypatch):
             await client.close()
 
         assert response.status == 400
-        assert "Request Entity Too Large" in body["error"]
+        assert (
+            "Request Entity Too Large" in body["error"]
+            or "Content Too Large" in body["error"]
+        )
         assert seen == []
 
     asyncio.run(runner())
@@ -231,6 +234,131 @@ def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_
         assert '"kind": "content"' in body
         assert '"text": "tool-backed answer"' in body
         assert '"kind": "done"' in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_clarify_response_is_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-owner",
+        profile_name="other_sync_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded.close()
+
+    response_path = tmp_path / "clarify-response.json"
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        assert profile_home == tmp_path / "profiles" / "owner_sync_profile"
+        assert event.raw_event["session_id"] == "session-webui"
+        yield "clarify_required", {
+            "session_key": "agent:profile:owner_sync_profile:platform:webui:session:session-webui",
+            "clarify_id": "clarify_1",
+            "question": "Which report style?",
+            "choices": ["brief", "detailed"],
+            "response_path": str(response_path),
+        }
+        for _ in range(20):
+            if response_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        answer = json.loads(response_path.read_text(encoding="utf-8"))["response"]
+        yield "clarify_resolved", {
+            "session_key": "agent:profile:owner_sync_profile:platform:webui:session:session-webui",
+            "clarify_id": "clarify_1",
+            "response": answer,
+        }
+        yield "content", f"answer:{answer}"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        run_response = None
+        try:
+            run_response = await client.post("/api/run-broker/runs", headers={
+                "X-Hermes-Owner-Open-Id": "ou_owner",
+            }, json={
+                "channel": "webui",
+                "profile_name": "spoofed_client_profile",
+                "user_key": "ou_spoofed",
+                "content": "make a report",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            first_line = await _read_sse_data_line(run_response)
+            clarify_event = json.loads(first_line[len(b"data: "):])
+
+            wrong_owner_response = await client.post(
+                "/api/run-broker/clarify/clarify_1/respond",
+                headers={"X-Hermes-Owner-Open-Id": "ou_other"},
+                json={
+                    "profile_name": "owner_sync_profile",
+                    "session_id": "session-webui",
+                    "response": "detailed",
+                },
+            )
+            wrong_owner_body = await wrong_owner_response.json()
+
+            right_owner_response = await client.post(
+                "/api/run-broker/clarify/clarify_1/respond",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "profile_name": "owner_sync_profile",
+                    "session_id": "session-webui",
+                    "response": "brief",
+                },
+            )
+            right_owner_body = await right_owner_response.json()
+            remaining_body = await run_response.text()
+        finally:
+            if run_response is not None:
+                run_response.close()
+            await client.close()
+            router_mod.override_routing_table(None)
+
+        assert run_response.status == 200
+        assert clarify_event["kind"] == "clarify_required"
+        assert clarify_event["payload"]["clarify_id"] == "clarify_1"
+        assert clarify_event["payload"]["question"] == "Which report style?"
+        assert "response_path" not in clarify_event["payload"]
+        assert wrong_owner_response.status == 404
+        assert wrong_owner_body == {"error": "clarify request not found"}
+        assert right_owner_response.status == 200
+        assert right_owner_body == {"ok": True, "clarify_id": "clarify_1"}
+        assert '"kind": "clarify_resolved"' in remaining_body
+        assert '"text": "answer:brief"' in remaining_body
 
     asyncio.run(runner())
 

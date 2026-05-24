@@ -718,6 +718,96 @@ async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypa
     ]
 
 
+def test_stream_aiagent_subprocess_forwards_child_clarify_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({
+                    "event": "clarify_required",
+                    "session_key": "agent:profile:coder:platform:webui:session:s1",
+                    "clarify_id": "clarify_1",
+                    "question": "Which report style?",
+                    "choices": ["brief", "detailed"],
+                    "response_path": "/tmp/clarify_1.json",
+                }).encode() + b"\n",
+                json.dumps({
+                    "event": "clarify_resolved",
+                    "session_key": "agent:profile:coder:platform:webui:session:s1",
+                    "clarify_id": "clarify_1",
+                    "response": "brief",
+                }).encode() + b"\n",
+                b'{"event": "done", "result": "ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        ("clarify_required", {
+            "session_key": "agent:profile:coder:platform:webui:session:s1",
+            "clarify_id": "clarify_1",
+            "question": "Which report style?",
+            "choices": ["brief", "detailed"],
+            "response_path": "/tmp/clarify_1.json",
+        }),
+        ("clarify_resolved", {
+            "session_key": "agent:profile:coder:platform:webui:session:s1",
+            "clarify_id": "clarify_1",
+            "response": "brief",
+        }),
+        ("done", "ok"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_status(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
@@ -1833,6 +1923,70 @@ def test_run_with_aiagent_bridges_gateway_approval_to_event_sink(monkeypatch, tm
     assert events[1]["event"] == "approval_resolved"
     assert events[1]["choice"] == "once"
     assert resolved == [("multitenancy:feishu:coder:oc_test:ou_test", "once")]
+
+
+def test_run_with_aiagent_bridges_webui_clarify_to_event_sink(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - clarify\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    clarify_dir = tmp_path / "clarify"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(clarify_dir))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_TIMEOUT", "1")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            answer = self.kwargs["clarify_callback"](
+                "Which report style?",
+                ["brief", "detailed"],
+            )
+            return {"final_response": f"picked:{answer}"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "clarify_required":
+            Path(payload["response_path"]).write_text(
+                json.dumps({"response": "brief"}),
+                encoding="utf-8",
+            )
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="make a report",
+            session_id="webui-session-1",
+        )
+    )
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    result = agent_real._run_with_aiagent(event, profile_home, event_sink=sink)
+
+    assert result == "picked:brief"
+    assert events[0]["event"] == "clarify_required"
+    assert events[0]["question"] == "Which report style?"
+    assert events[0]["choices"] == ["brief", "detailed"]
+    assert events[0]["session_key"] == "multitenancy:webui:coder:unknown:ou_owner"
+    assert events[1]["event"] == "clarify_resolved"
+    assert events[1]["response"] == "brief"
 
 
 def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
