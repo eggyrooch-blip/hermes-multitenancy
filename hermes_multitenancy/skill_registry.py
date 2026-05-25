@@ -108,6 +108,92 @@ def list_installed_skills(*, profile_home: Path) -> dict[str, dict[str, Any]]:
     return dict(sorted(result.items()))
 
 
+def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, Any]]:
+    """Return redacted slash-command metadata for one profile's installed skills."""
+    profile = Path(profile_home).expanduser()
+    skills_root = profile / "skills"
+    if not skills_root.is_dir():
+        return []
+
+    commands: list[dict[str, Any]] = []
+    for skill_md in _iter_skill_files(skills_root):
+        try:
+            rel = skill_md.parent.relative_to(skills_root)
+        except ValueError:
+            continue
+        meta = _read_skill_doc_metadata(skill_md)
+        name = _slash_command_name(meta.get("name") or rel.name)
+        if not name:
+            continue
+        category = rel.parts[0] if len(rel.parts) > 1 else ""
+        commands.append({
+            "name": name,
+            "slash": f"/{name}",
+            "title": meta.get("title") or name,
+            "description": meta.get("description") or "",
+            "source": "skill",
+            "type": "skill",
+            "category": category,
+        })
+    return sorted(commands, key=lambda item: (str(item.get("category") or ""), str(item.get("name") or "")))
+
+
+def _slash_command_name(value: Any) -> str:
+    raw = str(value or "").strip().lstrip("/")
+    if not raw:
+        return ""
+    return raw if all(ch.isalnum() or ch in {"-", "_"} for ch in raw) else ""
+
+
+def _read_skill_doc_metadata(path: Path) -> dict[str, str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+
+    frontmatter: dict[str, str] = {}
+    body = text
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end >= 0:
+            raw_frontmatter = text[4:end]
+            body = text[end + 4:]
+            frontmatter = _parse_simple_frontmatter(raw_frontmatter)
+
+    title = str(frontmatter.get("title") or "").strip()
+    description = str(frontmatter.get("description") or "").strip()
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#") and not title:
+            title = stripped.lstrip("#").strip()
+            continue
+        if not stripped.startswith("#") and not description:
+            description = stripped
+        if title and description:
+            break
+
+    return {
+        "name": str(frontmatter.get("name") or "").strip(),
+        "title": title,
+        "description": description,
+    }
+
+
+def _parse_simple_frontmatter(raw: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" not in line or line[:1].isspace():
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key in {"name", "title", "description"}:
+            result[key] = value
+    return result
+
+
 def audit_installed_skills(
     *,
     shared_home: Path,

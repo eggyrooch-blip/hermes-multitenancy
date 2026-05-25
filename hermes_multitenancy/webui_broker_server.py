@@ -815,6 +815,40 @@ def create_run_broker_app(
             "upstream_profile": effective_upstream_profile,
         })
 
+    async def handle_slash_commands(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        payload = {
+            "profile_name": request.query.get("profile_name") or request.query.get("profile"),
+            "agent_id": request.query.get("agent_id"),
+        }
+        resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+
+        profile_name = resolved_profile_name or payload.get("profile_name")
+        try:
+            profile_name = cron_api.validate_profile_name(str(profile_name or ""))
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+
+        try:
+            from .skill_registry import list_profile_skill_slash_commands
+
+            shared_home = _shared_home_from_env()
+            commands = list_profile_skill_slash_commands(
+                profile_home=shared_home / "profiles" / profile_name,
+            )
+            return web.json_response({
+                "ok": True,
+                "profile_name": profile_name,
+                "commands": commands,
+            })
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI slash registry failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_list_jobs(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1247,6 +1281,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
+    app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)

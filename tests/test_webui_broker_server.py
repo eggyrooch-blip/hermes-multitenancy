@@ -1372,6 +1372,155 @@ def test_webui_run_broker_owner_header_agent_id_resolves_owned_profile(tmp_path)
     asyncio.run(runner())
 
 
+def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    owner_skill = shared / "profiles" / "owned_agent_profile" / "skills" / "Keep" / "kep-prd-analysis"
+    victim_skill = shared / "profiles" / "victim_profile" / "skills" / "Private" / "secret-runbook"
+    owner_skill.mkdir(parents=True)
+    victim_skill.mkdir(parents=True)
+    (owner_skill / "SKILL.md").write_text(
+        "\n".join([
+            "---",
+            "name: kep-prd-analysis",
+            "description: PRD analysis helper",
+            "---",
+            "# KEP PRD Analysis",
+            "",
+            "Internal runbook body that must never be returned.",
+        ]),
+        encoding="utf-8",
+    )
+    (victim_skill / "SKILL.md").write_text("# Secret Runbook\nvictim-only command\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="agent-owned",
+        profile_name="owned_agent_profile",
+        open_id="agent-owned",
+        provenance="auto",
+    )
+    seeded.upsert(
+        user_id="victim-root",
+        profile_name="victim_profile",
+        open_id="ou_victim",
+        provenance="sync",
+    )
+    seeded._conn.execute(
+        "UPDATE multitenancy_routing SET owner_open_id = 'ou_owner' "
+        "WHERE user_id = 'agent-owned'"
+    )
+    seeded._conn.commit()
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands?profile_name=victim_profile",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_owner",
+                        "X-Hermes-Agent-Id": "agent-owned",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["ok"] is True
+        assert body["profile_name"] == "owned_agent_profile"
+        assert body["commands"] == [
+            {
+                "name": "kep-prd-analysis",
+                "slash": "/kep-prd-analysis",
+                "title": "KEP PRD Analysis",
+                "description": "PRD analysis helper",
+                "source": "skill",
+                "type": "skill",
+                "category": "Keep",
+            }
+        ]
+        encoded = json.dumps(body, ensure_ascii=False)
+        assert "secret-runbook" not in encoded
+        assert "victim-only" not in encoded
+        assert "Internal runbook body" not in encoded
+        assert str(shared) not in encoded
+
+    asyncio.run(runner())
+
+
+def test_webui_slash_registry_returns_empty_list_for_profile_without_skills(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "owner_sync_profile").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body == {"ok": True, "profile_name": "owner_sync_profile", "commands": []}
+
+    asyncio.run(runner())
+
+
 def test_webui_profile_provisioning_creates_owner_scoped_agent_route(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
