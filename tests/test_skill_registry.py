@@ -30,6 +30,40 @@ description: Calendar skill
     assert matches == [profile / "skills" / "lark-calendar" / "SKILL.md"]
 
 
+def test_profile_skill_slash_commands_do_not_fallback_metadata_to_body(tmp_path: Path):
+    from hermes_multitenancy.skill_registry import list_profile_skill_slash_commands
+
+    skill = tmp_path / ".hermes" / "profiles" / "alice" / "skills" / "internal" / "runbook"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "\n".join([
+            "---",
+            "name: runbook",
+            "---",
+            "# Internal Runbook",
+            "",
+            "INTERNAL_BODY_MARKER should not be registry metadata",
+        ]),
+        encoding="utf-8",
+    )
+
+    commands = list_profile_skill_slash_commands(profile_home=tmp_path / ".hermes" / "profiles" / "alice")
+
+    assert commands == [
+        {
+            "name": "runbook",
+            "slash": "/runbook",
+            "title": "runbook",
+            "description": "",
+            "source": "skill",
+            "type": "skill",
+            "category": "internal",
+        }
+    ]
+    assert "INTERNAL_BODY_MARKER" not in str(commands)
+    assert "Internal Runbook" not in str(commands)
+
+
 def test_install_shared_skill_for_profile_creates_personal_symlink(tmp_path: Path):
     from hermes_multitenancy.skill_registry import install_shared_skill_for_profile, list_installed_skills
 

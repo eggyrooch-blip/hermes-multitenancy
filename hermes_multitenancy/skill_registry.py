@@ -152,27 +152,14 @@ def _read_skill_doc_metadata(path: Path) -> dict[str, str]:
         return {}
 
     frontmatter: dict[str, str] = {}
-    body = text
     if text.startswith("---\n"):
         end = text.find("\n---", 4)
         if end >= 0:
             raw_frontmatter = text[4:end]
-            body = text[end + 4:]
             frontmatter = _parse_simple_frontmatter(raw_frontmatter)
 
     title = str(frontmatter.get("title") or "").strip()
     description = str(frontmatter.get("description") or "").strip()
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#") and not title:
-            title = stripped.lstrip("#").strip()
-            continue
-        if not stripped.startswith("#") and not description:
-            description = stripped
-        if title and description:
-            break
 
     return {
         "name": str(frontmatter.get("name") or "").strip(),

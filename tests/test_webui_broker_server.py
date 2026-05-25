@@ -1740,7 +1740,7 @@ def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, m
         assert body["commands"][-1] == {
             "name": "kep-prd-analysis",
             "slash": "/kep-prd-analysis",
-            "title": "KEP PRD Analysis",
+            "title": "kep-prd-analysis",
             "description": "PRD analysis helper",
             "source": "skill",
             "type": "skill",
@@ -1749,6 +1749,7 @@ def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, m
         encoded = json.dumps(body, ensure_ascii=False)
         assert "secret-runbook" not in encoded
         assert "victim-only" not in encoded
+        assert "KEP PRD Analysis" not in encoded
         assert "Internal runbook body" not in encoded
         assert str(shared) not in encoded
 
