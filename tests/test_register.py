@@ -75,7 +75,7 @@ def test_register_calls_register_hook_once():
     assert callable(cb)
 
 
-def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch):
+def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_path):
     """The WebUI broker sidecar is opt-in but wired during plugin register."""
     import hermes_multitenancy
 
@@ -85,6 +85,7 @@ def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch):
         def register_hook(self, name, cb):
             calls.append((name, cb))
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "multitenancy_router"))
     monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
     monkeypatch.setattr(
         hermes_multitenancy.webui_broker_server,

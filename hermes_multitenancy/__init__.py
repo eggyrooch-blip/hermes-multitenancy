@@ -24,6 +24,7 @@ from .cron_worker import (
 )
 from .router import on_pre_gateway_dispatch
 from . import webui_broker_server
+from .gateway_ownership import install_gateway_ownership_guard, is_router_profile_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +88,13 @@ def register(ctx) -> None:
         return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
 
     override_pool(_build_runtime_pool(_real_factory))
-    install_cron_runtime_patches()
-    install_gateway_startup_watcher()
-    from .group_inviter_hook import install_feishu_bot_added_hook
-    install_feishu_bot_added_hook()
-    webui_broker_server.ensure_run_broker_server_started()
+    install_gateway_ownership_guard()
+    if is_router_profile_runtime():
+        install_cron_runtime_patches()
+        install_gateway_startup_watcher()
+        from .group_inviter_hook import install_feishu_bot_added_hook
+        install_feishu_bot_added_hook()
+        webui_broker_server.ensure_run_broker_server_started()
 
     register_credential_status_tool(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
@@ -99,9 +102,10 @@ def register(ctx) -> None:
 
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
-    webui_broker_server.ensure_run_broker_server_started()
+    if is_router_profile_runtime():
+        webui_broker_server.ensure_run_broker_server_started()
     gateway = kwargs.get("gateway")
-    if gateway is not None:
+    if gateway is not None and is_router_profile_runtime():
         try:
             ensure_cron_worker_started(gateway)
         except Exception:
