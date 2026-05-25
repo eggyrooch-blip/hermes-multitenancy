@@ -300,6 +300,21 @@ def _event_message_id(event: Any) -> Optional[str]:
     return None
 
 
+_REACTION_SYNTHETIC_PREFIXES = ("reaction:added:", "reaction:removed:")
+
+
+def _is_reaction_synthetic_event(event: Any, text: str) -> bool:
+    """Return True for Feishu reaction events routed as synthetic text."""
+    if not isinstance(text, str):
+        return False
+    if not text.startswith(_REACTION_SYNTHETIC_PREFIXES):
+        return False
+    message_type = getattr(event, "message_type", None)
+    if message_type is None:
+        return True
+    return str(getattr(message_type, "name", message_type)).upper() == "TEXT"
+
+
 def _event_reply_to_message_id(event: Any) -> Optional[str]:
     """Only group/topic chats should use Feishu reply_to.
 
@@ -1982,6 +1997,16 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         if _is_feishu_open_id(sender):
             setattr(event, "sender_open_id", sender)
         text = getattr(event, "text", "") or ""
+
+        if _is_reaction_synthetic_event(event, text):
+            logger.info(
+                "multitenancy: skipping Feishu reaction synthetic event "
+                "text=%r message_id=%s chat_id=%s",
+                text,
+                _event_message_id(event) or "",
+                chat_id,
+            )
+            return
 
         sender_alt = getattr(source, "user_id_alt", None) if source else None
         if getattr(event, "media_urls", None):
