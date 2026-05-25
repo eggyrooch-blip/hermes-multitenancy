@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,68 @@ _RUN_BROKER_SHARED_ENV_KEYS = frozenset(
     }
 )
 _pending_clarifies: dict[str, dict[str, Any]] = {}
+_SESSION_COMMAND_RE = re.compile(r"^/([A-Za-z][\w-]*)(?:\s+([\s\S]*))?$")
+_SESSION_HISTORY_COMMANDS = frozenset({"new", "reset", "status"})
+_GOAL_COMMANDS = frozenset({"goal", "subgoal"})
+
+
+def _session_history_slash_commands() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "new",
+            "slash": "/new",
+            "title": "New session history",
+            "description": "Clear this profile's broker conversation memory for the current owner",
+            "source": "builtin",
+            "type": "session_history",
+            "category": "Session",
+        },
+        {
+            "name": "reset",
+            "slash": "/reset",
+            "title": "Reset session history",
+            "description": "Clear this profile's broker conversation memory for the current owner",
+            "source": "builtin",
+            "type": "session_history",
+            "category": "Session",
+        },
+        {
+            "name": "status",
+            "slash": "/status",
+            "title": "Session status",
+            "description": "Show current profile and broker history message count",
+            "source": "builtin",
+            "type": "session_history",
+            "category": "Session",
+        },
+        {
+            "name": "plan",
+            "slash": "/plan",
+            "title": "Plan",
+            "description": "Expand the profile's plan skill for the current request",
+            "source": "builtin",
+            "type": "skill",
+            "category": "Session",
+        },
+        {
+            "name": "goal",
+            "slash": "/goal",
+            "title": "Goal",
+            "description": "Set, inspect, pause, resume, or clear the active session goal",
+            "source": "builtin",
+            "type": "goal",
+            "category": "Session",
+        },
+        {
+            "name": "subgoal",
+            "slash": "/subgoal",
+            "title": "Subgoal",
+            "description": "List, add, or clear subgoals for the active session goal",
+            "source": "builtin",
+            "type": "goal",
+            "category": "Session",
+        },
+    ]
 
 
 def _shared_home_from_env() -> Path:
@@ -193,6 +256,290 @@ def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
 
 def _trusted_owner_from_request(request: Any) -> str:
     return str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+
+
+def _requested_profile_name(payload: dict[str, Any]) -> str:
+    raw = str(payload.get("profile_name") or payload.get("profile") or "").strip()
+    if not raw:
+        return ""
+    return cron_api.validate_profile_name(raw)
+
+
+def _assert_requested_profile_matches(*, resolved_profile_name: str, payload: dict[str, Any]) -> None:
+    requested = _requested_profile_name(payload)
+    if requested and requested != resolved_profile_name:
+        raise PermissionError(f"profile_name '{requested}' is not accessible for asserted owner")
+
+
+def _parse_session_history_command(raw: Any) -> tuple[str, str]:
+    text = str(raw or "").strip()
+    match = _SESSION_COMMAND_RE.match(text)
+    if not match:
+        raise ValueError("command must be a slash command")
+    name = match.group(1).lower().replace("_", "-")
+    return name, (match.group(2) or "").strip()
+
+
+def _dispatch_session_history_command(*, profile_name: str, user_key: str, command: Any) -> dict[str, Any]:
+    from . import router as router_mod
+
+    command_name, _args = _parse_session_history_command(command)
+    if command_name not in _SESSION_HISTORY_COMMANDS:
+        return {
+            "handled": False,
+            "command": command_name,
+            "action": "unsupported",
+            "message": f"not a supported Run Broker session-history command: /{command_name}",
+        }
+
+    key = router_mod._history_key(profile_name, user_key, None)
+    if command_name in {"new", "reset"}:
+        cleared = bool(router_mod._clear_history(key))
+        return {
+            "handled": True,
+            "command": command_name,
+            "type": "session_history",
+            "action": "reset",
+            "message": "会话历史已重置 ✅" if cleared else "会话历史已经为空。",
+            "history_count": 0,
+        }
+
+    history = router_mod._load_history(key)
+    return {
+        "handled": True,
+        "command": command_name,
+        "type": "session_history",
+        "action": "status",
+        "message": (
+            "状态: 空闲\n"
+            f"profile: {profile_name}\n"
+            f"会话历史: {len(history)} 条消息"
+        ),
+        "history_count": len(history),
+    }
+
+
+def _profile_home_for_name(profile_name: str) -> Path:
+    from . import router as router_mod
+
+    return router_mod._profile_name_to_home(profile_name)
+
+
+def _read_skill_name(skill_md: Path) -> str:
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end >= 0:
+            for line in text[4:end].splitlines():
+                if line.startswith("name:"):
+                    return line.split(":", 1)[1].strip().strip("'\"").lstrip("/")
+    return skill_md.parent.name
+
+
+def _find_plan_skill(profile_home: Path) -> tuple[Path, str] | None:
+    from . import skill_registry
+
+    roots = [profile_home / "skills", _shared_home_from_env() / "skills"]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for skill_md in skill_registry._iter_skill_files(root):
+            if _read_skill_name(skill_md).lower().replace("_", "-") == "plan":
+                try:
+                    return skill_md.parent, skill_md.read_text(encoding="utf-8")
+                except OSError:
+                    return None
+    return None
+
+
+def _with_profile_home(profile_home: Path, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    old_home = os.environ.get("HERMES_HOME")
+    had_home = "HERMES_HOME" in os.environ
+    os.environ["HERMES_HOME"] = str(profile_home)
+    try:
+        return fn()
+    finally:
+        if had_home:
+            os.environ["HERMES_HOME"] = old_home or ""
+        else:
+            os.environ.pop("HERMES_HOME", None)
+
+
+def _dispatch_plan_command(*, profile_name: str, command: Any) -> dict[str, Any]:
+    command_name, args = _parse_session_history_command(command)
+    if command_name != "plan":
+        raise ValueError("not a plan command")
+    profile_home = _profile_home_for_name(profile_name)
+    found = _find_plan_skill(profile_home)
+    if not found:
+        return {
+            "handled": False,
+            "command": "plan",
+            "action": "unsupported",
+            "message": "plan skill is not installed for this profile",
+        }
+    skill_dir, skill_text = found
+    prompt = "\n".join([
+        '[SYSTEM: The user invoked the "plan" skill. Follow the full skill instructions below.]',
+        "",
+        skill_text.strip(),
+        "",
+        f"[Skill directory: {skill_dir}]",
+        "Resolve relative paths against that directory.",
+        "",
+        f"User request: {args}",
+    ]).strip()
+    return {
+        "handled": True,
+        "command": "plan",
+        "type": "skill",
+        "action": "plan",
+        "message": prompt,
+    }
+
+
+def _goal_manager(session_id: str):
+    from hermes_cli.goals import GoalManager
+
+    return GoalManager(session_id)
+
+
+def _dispatch_goal_command(*, profile_name: str, session_id: str, command: Any) -> dict[str, Any]:
+    command_name, args = _parse_session_history_command(command)
+    if command_name not in _GOAL_COMMANDS:
+        raise ValueError("not a goal command")
+    profile_home = _profile_home_for_name(profile_name)
+
+    def run() -> dict[str, Any]:
+        manager = _goal_manager(session_id)
+        if command_name == "subgoal":
+            text = args.strip()
+            if not text or text.lower() in {"list", "status"}:
+                return {
+                    "handled": True,
+                    "command": "subgoal",
+                    "type": "goal",
+                    "action": "status",
+                    "message": manager.render_subgoals(),
+                }
+            if text.lower() == "clear":
+                count = manager.clear_subgoals()
+                return {
+                    "handled": True,
+                    "command": "subgoal",
+                    "type": "goal",
+                    "action": "clear",
+                    "message": f"Cleared {count} subgoal(s).",
+                }
+            added = manager.add_subgoal(text)
+            return {
+                "handled": True,
+                "command": "subgoal",
+                "type": "goal",
+                "action": "add",
+                "message": f"Subgoal added: {added}",
+            }
+
+        text = args.strip()
+        lower = text.lower()
+        if not text or lower == "status":
+            return {
+                "handled": True,
+                "command": "goal",
+                "type": "goal",
+                "action": "status",
+                "message": manager.status_line(),
+            }
+        if lower == "clear":
+            manager.clear()
+            return {
+                "handled": True,
+                "command": "goal",
+                "type": "goal",
+                "action": "clear",
+                "message": "Goal cleared.",
+                "clear_goal_continuations": True,
+            }
+        if lower == "pause":
+            manager.pause("user-paused")
+            return {
+                "handled": True,
+                "command": "goal",
+                "type": "goal",
+                "action": "pause",
+                "message": "Goal paused.",
+                "clear_goal_continuations": True,
+            }
+        if lower == "resume":
+            state = manager.resume()
+            prompt = manager.next_continuation_prompt() if state else None
+            return {
+                "handled": True,
+                "command": "goal",
+                "type": "goal",
+                "action": "resume",
+                "message": manager.status_line(),
+                "kickoff_prompt": prompt,
+                "max_turns": state.max_turns if state else None,
+            }
+
+        state = manager.set(text)
+        return {
+            "handled": True,
+            "command": "goal",
+            "type": "goal",
+            "action": "set",
+            "message": "Goal set.",
+            "kickoff_prompt": text,
+            "max_turns": state.max_turns,
+            "clear_goal_continuations": True,
+        }
+
+    return _with_profile_home(profile_home, run)
+
+
+def _dispatch_session_command(*, profile_name: str, user_key: str, session_id: str, command: Any) -> dict[str, Any]:
+    command_name, _args = _parse_session_history_command(command)
+    if command_name in _SESSION_HISTORY_COMMANDS:
+        return _dispatch_session_history_command(
+            profile_name=profile_name,
+            user_key=user_key,
+            command=command,
+        )
+    if command_name == "plan":
+        return _dispatch_plan_command(profile_name=profile_name, command=command)
+    if command_name in _GOAL_COMMANDS:
+        return _dispatch_goal_command(
+            profile_name=profile_name,
+            session_id=session_id,
+            command=command,
+        )
+    return {
+        "handled": False,
+        "command": command_name,
+        "action": "unsupported",
+        "message": f"not a supported Run Broker session command: /{command_name}",
+    }
+
+
+def _evaluate_goal_after_turn(*, profile_name: str, session_id: str, final_response: Any) -> dict[str, Any]:
+    profile_home = _profile_home_for_name(profile_name)
+    final_text = str(final_response or "").strip()
+
+    def run() -> dict[str, Any]:
+        manager = _goal_manager(session_id)
+        decision = manager.evaluate_after_turn(final_text, user_initiated=False)
+        state = manager.state
+        return {
+            "handled": True,
+            "active": bool(state and state.status == "active"),
+            **decision,
+        }
+
+    return _with_profile_home(profile_home, run)
 
 
 def _kanban_board_from_request(request: Any) -> str:
@@ -731,6 +1078,102 @@ def create_run_broker_app(
             return web.json_response({"error": "clarify request not found"}, status=404)
         return web.json_response({"ok": True, "clarify_id": clarify_id})
 
+    async def handle_session_command(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+        if not resolved_profile_name:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
+
+        trusted_owner = _trusted_owner_from_request(request)
+        if not trusted_owner:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
+
+        try:
+            _assert_requested_profile_matches(
+                resolved_profile_name=resolved_profile_name,
+                payload=payload,
+            )
+            session_id = str(payload.get("session_id") or "").strip()
+            if not session_id:
+                return web.json_response({"error": "session_id required"}, status=400)
+            raw_command = str(payload.get("command") or payload.get("text") or "").strip()
+            if not raw_command:
+                return web.json_response({"error": "command required"}, status=400)
+            result = _dispatch_session_command(
+                profile_name=resolved_profile_name,
+                user_key=trusted_owner,
+                session_id=session_id,
+                command=raw_command,
+            )
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        return web.json_response({
+            "ok": True,
+            "profile_name": resolved_profile_name,
+            "session_id": session_id,
+            **result,
+        })
+
+    async def handle_goal_evaluate(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+        if not resolved_profile_name:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
+
+        try:
+            _assert_requested_profile_matches(
+                resolved_profile_name=resolved_profile_name,
+                payload=payload,
+            )
+            session_id = str(payload.get("session_id") or "").strip()
+            if not session_id:
+                return web.json_response({"error": "session_id required"}, status=400)
+            result = _evaluate_goal_after_turn(
+                profile_name=resolved_profile_name,
+                session_id=session_id,
+                final_response=payload.get("final_response") or payload.get("response") or "",
+            )
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        return web.json_response({
+            "ok": True,
+            "profile_name": resolved_profile_name,
+            "session_id": session_id,
+            **result,
+        })
+
     async def handle_provision_profile(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -837,7 +1280,7 @@ def create_run_broker_app(
             from .skill_registry import list_profile_skill_slash_commands
 
             shared_home = _shared_home_from_env()
-            commands = list_profile_skill_slash_commands(
+            commands = _session_history_slash_commands() + list_profile_skill_slash_commands(
                 profile_home=shared_home / "profiles" / profile_name,
             )
             return web.json_response({
@@ -1280,6 +1723,8 @@ def create_run_broker_app(
     app = web.Application(client_max_size=_run_broker_client_max_size())
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
+    app.router.add_post("/api/run-broker/session-commands", handle_session_command)
+    app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)

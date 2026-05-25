@@ -363,6 +363,280 @@ def test_webui_run_broker_clarify_response_is_owner_scoped(monkeypatch, tmp_path
     asyncio.run(runner())
 
 
+def test_webui_run_broker_session_history_commands_are_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.sessions import SessionStore
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-owner",
+        profile_name="other_sync_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded.close()
+
+    store = SessionStore(tmp_path / "sessions.db")
+    store.append("owner_sync_profile", "ou_owner", "user", "hello")
+    store.append("owner_sync_profile", "ou_owner", "assistant", "hi")
+    store.append("other_sync_profile", "ou_other", "user", "private")
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        router_mod.override_session_store(store)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                wrong_owner_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_other"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/reset",
+                    },
+                )
+                wrong_owner_body = await wrong_owner_response.json()
+                status_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "session_id": "session-webui",
+                        "command": "/status",
+                    },
+                )
+                status_body = await status_response.json()
+                reset_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/reset",
+                    },
+                )
+                reset_body = await reset_response.json()
+            finally:
+                await client.close()
+            owner_count = store.count("owner_sync_profile", "ou_owner")
+            other_count = store.count("other_sync_profile", "ou_other")
+        finally:
+            router_mod.override_session_store(None)
+            router_mod.override_routing_table(None)
+
+        assert wrong_owner_response.status == 403
+        assert "asserted owner" in wrong_owner_body["error"]
+        assert status_response.status == 200
+        assert status_body["profile_name"] == "owner_sync_profile"
+        assert status_body["command"] == "status"
+        assert status_body["type"] == "session_history"
+        assert status_body["history_count"] == 2
+        assert "profile: owner_sync_profile" in status_body["message"]
+        assert reset_response.status == 200
+        assert reset_body["action"] == "reset"
+        assert reset_body["history_count"] == 0
+        assert owner_count == 0
+        assert other_count == 1
+        assert str(tmp_path) not in json.dumps(status_body)
+        assert str(tmp_path) not in json.dumps(reset_body)
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_session_command_expands_plan_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner_sync_profile"
+    skill_dir = profile_home / "skills" / "software-development" / "plan"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: plan\n---\nPLAN BODY\n", encoding="utf-8")
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile_name: tmp_path / "profiles" / profile_name)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "session_id": "session-webui",
+                        "command": "/plan build the feature",
+                    },
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert body["profile_name"] == "owner_sync_profile"
+        assert body["handled"] is True
+        assert body["command"] == "plan"
+        assert body["type"] == "skill"
+        assert body["action"] == "plan"
+        assert "PLAN BODY" in body["message"]
+        assert "User request: build the feature" in body["message"]
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_goal_set_and_evaluate_are_owner_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner_sync_profile"
+    profile_home.mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="other-owner",
+        profile_name="other_sync_profile",
+        open_id="ou_other",
+        provenance="sync",
+    )
+    seeded.close()
+
+    class FakeState:
+        goal = "fix the tests"
+        status = "active"
+        max_turns = 20
+
+    class FakeGoalManager:
+        state = FakeState()
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        def set(self, goal):
+            self.state.goal = goal
+            self.state.status = "active"
+            return self.state
+
+        def evaluate_after_turn(self, final_response, user_initiated=False):
+            return {
+                "status": "active",
+                "should_continue": True,
+                "continuation_prompt": f"[Continuing]\\nGoal: {self.state.goal}",
+                "verdict": "continue",
+                "reason": "more work remains",
+                "message": "Continuing toward goal.",
+            }
+
+    monkeypatch.setattr(broker_mod, "_goal_manager", lambda session_id: FakeGoalManager(session_id))
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile_name: tmp_path / "profiles" / profile_name)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                wrong_owner_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_other"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/goal fix the tests",
+                    },
+                )
+                wrong_owner_body = await wrong_owner_response.json()
+                set_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/goal fix the tests",
+                    },
+                )
+                set_body = await set_response.json()
+                evaluate_response = await client.post(
+                    "/api/run-broker/goals/evaluate",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "final_response": "not done yet",
+                    },
+                )
+                evaluate_body = await evaluate_response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert wrong_owner_response.status == 403
+        assert "asserted owner" in wrong_owner_body["error"]
+        assert set_response.status == 200
+        assert set_body["handled"] is True
+        assert set_body["command"] == "goal"
+        assert set_body["action"] == "set"
+        assert set_body["message"] == "Goal set."
+        assert set_body["kickoff_prompt"] == "fix the tests"
+        assert evaluate_response.status == 200
+        assert evaluate_body["handled"] is True
+        assert evaluate_body["status"] == "active"
+        assert evaluate_body["should_continue"] is True
+        assert evaluate_body["verdict"] == "continue"
+        assert evaluate_body["reason"] == "more work remains"
+        assert "Goal: fix the tests" in evaluate_body["continuation_prompt"]
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_streams_media_as_workspace_alias(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -1453,17 +1727,25 @@ def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, m
         assert response.status == 200
         assert body["ok"] is True
         assert body["profile_name"] == "owned_agent_profile"
-        assert body["commands"] == [
-            {
-                "name": "kep-prd-analysis",
-                "slash": "/kep-prd-analysis",
-                "title": "KEP PRD Analysis",
-                "description": "PRD analysis helper",
-                "source": "skill",
-                "type": "skill",
-                "category": "Keep",
-            }
+        assert [command["name"] for command in body["commands"][:6]] == [
+            "new",
+            "reset",
+            "status",
+            "plan",
+            "goal",
+            "subgoal",
         ]
+        assert all(command["type"] == "session_history" for command in body["commands"][:3])
+        assert [command["type"] for command in body["commands"][3:6]] == ["skill", "goal", "goal"]
+        assert body["commands"][-1] == {
+            "name": "kep-prd-analysis",
+            "slash": "/kep-prd-analysis",
+            "title": "KEP PRD Analysis",
+            "description": "PRD analysis helper",
+            "source": "skill",
+            "type": "skill",
+            "category": "Keep",
+        }
         encoded = json.dumps(body, ensure_ascii=False)
         assert "secret-runbook" not in encoded
         assert "victim-only" not in encoded
@@ -1516,7 +1798,24 @@ def test_webui_slash_registry_returns_empty_list_for_profile_without_skills(tmp_
             router_mod.override_routing_table(None)
 
         assert response.status == 200
-        assert body == {"ok": True, "profile_name": "owner_sync_profile", "commands": []}
+        assert body["ok"] is True
+        assert body["profile_name"] == "owner_sync_profile"
+        assert [command["name"] for command in body["commands"]] == [
+            "new",
+            "reset",
+            "status",
+            "plan",
+            "goal",
+            "subgoal",
+        ]
+        assert [command["type"] for command in body["commands"]] == [
+            "session_history",
+            "session_history",
+            "session_history",
+            "skill",
+            "goal",
+            "goal",
+        ]
 
     asyncio.run(runner())
 
