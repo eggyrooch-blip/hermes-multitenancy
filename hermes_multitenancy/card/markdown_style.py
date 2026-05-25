@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from hermes_multitenancy.card.sanitization import _strip_invalid_image_keys
+from .sanitization import _strip_invalid_image_keys
 
 _MARKDOWN_TABLE_MAX_NATIVE_COLUMNS = 4
 _MARKDOWN_TABLE_MAX_NATIVE_ROWS = 12

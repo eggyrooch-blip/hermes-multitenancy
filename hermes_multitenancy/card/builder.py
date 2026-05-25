@@ -10,15 +10,15 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from hermes_multitenancy.card.markdown_style import _optimize_markdown_style
-from hermes_multitenancy.card.reasoning import (
+from .markdown_style import _optimize_markdown_style
+from .reasoning import (
     _clean_reasoning_prefix,
     _format_reasoning_label,
     _split_reasoning_text,
     _strip_reasoning_tags,
 )
-from hermes_multitenancy.card.sanitization import _clip, _plain_summary
-from hermes_multitenancy.card.tool_use_display import (
+from .sanitization import _clip, _plain_summary
+from .tool_use_display import (
     _render_tool_calls_panel,
     _render_tool_calls_section,
     _strip_tool_call_blocks,

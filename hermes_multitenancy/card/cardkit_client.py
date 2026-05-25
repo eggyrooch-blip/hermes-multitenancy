@@ -12,7 +12,7 @@ import json
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from hermes_multitenancy.card.card_error import (
+from .card_error import (
     _extract_response_field,
     _raise_on_lark_error,
     _response_succeeded,

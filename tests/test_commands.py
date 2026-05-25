@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import pytest
 
@@ -372,6 +374,183 @@ async def test_feishu_auth_command_uses_profile_open_id_for_short_sender(monkeyp
     assert poll_tasks and poll_tasks[0]["session_id"] == "sess_auth"
 
     clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_command_sends_openclaw_style_interactive_card(monkeypatch, tmp_path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.router import handle_async, _user_inflight_tasks
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+    from hermes_multitenancy import router as router_mod
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+    profile_home = tmp_path / "auth_profile"
+    profile_home.mkdir()
+    add_spike_route("ou_auth", profile_home)
+
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "start_session",
+        lambda **_kwargs: {
+            "session_id": "sess_card",
+            "status": "pending",
+            "verification_uri": "https://accounts.feishu.cn/oauth/v1/device/verify?user_code=ABCD-1234",
+            "user_code": "ABCD-1234",
+            "expires_at": int(__import__("time").time()) + 600,
+            "interval": 3,
+        },
+    )
+    poll_tasks = []
+    monkeypatch.setattr(router_mod, "_start_feishu_auth_poll_task", lambda **kwargs: poll_tasks.append(kwargs))
+
+    text_sends = []
+    card_sends = []
+    created_cards = []
+
+    class _Card:
+        def create(self, request):
+            created_cards.append(json.loads(request.request_body.data))
+            return SimpleNamespace(code=0, data=SimpleNamespace(card_id="card-auth-1"))
+
+        def update(self, request):  # pragma: no cover - not used by this test
+            return SimpleNamespace(code=0)
+
+        def settings(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    class _CardElement:
+        def content(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    class Adapter:
+        def __init__(self):
+            self._client = SimpleNamespace(
+                cardkit=SimpleNamespace(
+                    v1=SimpleNamespace(card=_Card(), card_element=_CardElement())
+                )
+            )
+
+        async def send_typing(self, c): pass
+
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            text_sends.append(m)
+
+        async def _feishu_send_with_retry(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            card_sends.append((chat_id, msg_type, json.loads(payload)))
+            assert reply_to is None
+            assert metadata is None
+            return SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_auth_card"))
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await handle_async(event=_build_event("/feishu_auth wiki:wiki", user_id="ou_auth"), gateway=gateway)
+
+    assert not any("accounts.feishu.cn" in message for message in text_sends)
+    assert card_sends == [
+        (
+            "chat-cmd",
+            "interactive",
+            {"type": "card", "data": {"card_id": "card-auth-1"}},
+        )
+    ]
+    card = created_cards[0]
+    assert card["schema"] == "2.0"
+    assert card["header"]["template"] == "blue"
+    assert card["header"]["icon"]["token"] == "lock-chat_filled"
+    assert card["header"]["title"]["i18n_content"]["zh_cn"] == "请授权以继续当前操作"
+    body = json.dumps(card["body"], ensure_ascii=False)
+    assert "前往授权" in body
+    visible_body = json.dumps(
+        [
+            element
+            for element in card["body"]["elements"]
+            if element.get("tag") == "markdown"
+        ],
+        ensure_ascii=False,
+    )
+    assert "验证码" not in visible_body
+    assert "User code" not in visible_body
+    assert "ABCD-1234" not in visible_body
+    assert "10 分钟后失效" in body
+    multi_url = card["body"]["elements"][1]["columns"][0]["elements"][0]["multi_url"]
+    assert set(multi_url) == {"url", "pc_url", "android_url", "ios_url"}
+    assert all(url.startswith("https://accounts.feishu.cn/") for url in multi_url.values())
+    assert all("applink.feishu.cn" not in url for url in multi_url.values())
+    assert all("user_code=ABCD-1234" in unquote(url) for url in multi_url.values())
+    assert poll_tasks and poll_tasks[0]["auth_card"]["card_id"] == "card-auth-1"
+    assert poll_tasks[0]["auth_card"]["message_id"] == "om_auth_card"
+
+    clear_spike_routes()
+    _user_inflight_tasks.clear()
+
+
+@pytest.mark.asyncio
+async def test_feishu_auth_poll_success_updates_auth_card(monkeypatch):
+    from hermes_multitenancy import router as router_mod
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(router_mod.asyncio, "sleep", no_sleep)
+    from hermes_multitenancy import feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "poll_session", lambda **_kwargs: {"status": "success"})
+
+    updates = []
+    text_sends = []
+
+    class _Card:
+        def update(self, request):
+            updates.append(
+                {
+                    "card_id": request.card_id,
+                    "sequence": request.request_body.sequence,
+                    "card": json.loads(request.request_body.card["data"]),
+                }
+            )
+            return SimpleNamespace(code=0)
+
+        def create(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0, data=SimpleNamespace(card_id="unused"))
+
+        def settings(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    class _CardElement:
+        def content(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    class Adapter:
+        def __init__(self):
+            self._client = SimpleNamespace(
+                cardkit=SimpleNamespace(v1=SimpleNamespace(card=_Card(), card_element=_CardElement()))
+            )
+
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            text_sends.append(m)
+
+        async def _feishu_send_with_retry(self, **_kwargs):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await router_mod._poll_feishu_auth_session_until_done(
+        session_id="sess_card",
+        profile_name="auth_profile",
+        open_id="ou_auth_user",
+        chat_id="chat-cmd",
+        gateway=gateway,
+        event=_build_event("/feishu_auth"),
+        interval=1,
+        auth_card={"card_id": "card-auth-1", "message_id": "om_auth_card", "sequence": 1},
+    )
+
+    assert text_sends == []
+    assert updates[0]["card_id"] == "card-auth-1"
+    assert updates[0]["sequence"] == 2
+    assert updates[0]["card"]["header"]["template"] == "green"
+    rendered = json.dumps(updates[0]["card"], ensure_ascii=False)
+    assert "授权成功" in rendered
+    assert "lark_cli" in rendered
 
 
 # -- /status ----------------------------------------------------------------

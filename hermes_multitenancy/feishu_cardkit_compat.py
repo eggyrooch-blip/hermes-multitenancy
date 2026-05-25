@@ -7,9 +7,9 @@ keep working without a touch to ``router.py`` / ``agent_real.py`` / tests.
 """
 from __future__ import annotations
 
-from hermes_multitenancy.card import ensure_feishu_cardkit_streaming
-from hermes_multitenancy.card.builder import _render_cardkit_initial_card
-from hermes_multitenancy.card.markdown_style import _optimize_markdown_style
+from .card import ensure_feishu_cardkit_streaming
+from .card.builder import _render_cardkit_initial_card
+from .card.markdown_style import _optimize_markdown_style
 
 __all__ = [
     "ensure_feishu_cardkit_streaming",

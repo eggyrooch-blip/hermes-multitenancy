@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from hermes_multitenancy.card.tool_use_config import _HIDDEN_TOOL_NAMES
+from .tool_use_config import _HIDDEN_TOOL_NAMES
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
 

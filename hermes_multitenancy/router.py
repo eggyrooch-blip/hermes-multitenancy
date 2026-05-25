@@ -2513,7 +2513,7 @@ async def _handle_command(
         else:
             reply = "(未路由的用户) 没有历史可重置"
     elif cmd == "feishu-auth":
-        reply = _handle_feishu_auth_command(
+        await _handle_feishu_auth_command(
             args=_args,
             sender=sender,
             sender_alt=sender_alt,
@@ -2523,6 +2523,7 @@ async def _handle_command(
             gateway=gateway,
             event=event,
         )
+        return
     elif cmd == "help":
         reply = _gateway_help_text()
     else:
@@ -2554,7 +2555,7 @@ async def _handle_command(
         await _safe_call(adapter.send, chat_id, reply)
 
 
-def _handle_feishu_auth_command(
+async def _handle_feishu_auth_command(
     *,
     args: str,
     sender: str,
@@ -2564,11 +2565,13 @@ def _handle_feishu_auth_command(
     chat_id: str,
     gateway: Any,
     event: Any,
-) -> str:
+) -> None:
     """Start a multitenancy-owned Feishu UAT device-flow auth session."""
     del profile_home
     from . import feishu_uat_auth
+    from .feishu_auth_cards import auth_text_fallback, build_auth_card, send_auth_card
 
+    adapter = _get_feishu_adapter(gateway)
     open_id = (
         _normalize_feishu_open_id(sender)
         or _normalize_feishu_open_id(sender_alt)
@@ -2576,9 +2579,13 @@ def _handle_feishu_auth_command(
         or ""
     )
     if not _is_feishu_open_id(open_id):
-        return "无法启动飞书授权：当前消息没有可用的 sender open_id。"
+        if adapter is not None:
+            await _safe_call(adapter.send, chat_id, "无法启动飞书授权：当前消息没有可用的 sender open_id。")
+        return
     if not profile_name:
-        return "无法启动飞书授权：当前飞书用户还没有绑定 Hermes profile。"
+        if adapter is not None:
+            await _safe_call(adapter.send, chat_id, "无法启动飞书授权：当前飞书用户还没有绑定 Hermes profile。")
+        return
 
     scope = args.strip() or None
     try:
@@ -2588,9 +2595,32 @@ def _handle_feishu_auth_command(
             scope=scope,
         )
     except feishu_uat_auth.FeishuUatAuthError as exc:
-        return f"无法启动飞书授权：{exc.message}"
+        if adapter is not None:
+            await _safe_call(adapter.send, chat_id, f"无法启动飞书授权：{exc.message}")
+        return
 
     session_id = str(session.get("session_id") or "")
+    verification_uri = str(session.get("verification_uri") or "")
+    user_code = str(session.get("user_code") or "")
+    expires_at = float(session.get("expires_at") or 0)
+    expires_min = 10
+    if expires_at:
+        expires_min = max(1, int((expires_at - time.time() + 59) // 60))
+    auth_card = None
+    if adapter is not None:
+        card = build_auth_card(
+            verification_uri=verification_uri,
+            user_code=user_code,
+            expires_min=expires_min,
+            scope=scope,
+        )
+        auth_card = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
+        if auth_card is None:
+            await _safe_call(
+                adapter.send,
+                chat_id,
+                auth_text_fallback(verification_uri=verification_uri, user_code=user_code),
+            )
     _start_feishu_auth_poll_task(
         session_id=session_id,
         profile_name=profile_name,
@@ -2599,14 +2629,7 @@ def _handle_feishu_auth_command(
         gateway=gateway,
         event=event,
         interval=int(session.get("interval") or 3),
-    )
-    verification_uri = str(session.get("verification_uri") or "")
-    user_code = str(session.get("user_code") or "")
-    return (
-        "请打开下面链接完成飞书 UAT 授权：\n"
-        f"{verification_uri}\n\n"
-        f"验证码：`{user_code}`\n"
-        "完成后我会自动确认，并把 UAT 写入当前 Hermes profile。"
+        auth_card=auth_card,
     )
 
 
@@ -2645,6 +2668,7 @@ def _start_feishu_auth_poll_task(
     gateway: Any,
     event: Any,
     interval: int,
+    auth_card: Optional[dict[str, Any]] = None,
 ) -> None:
     if not session_id:
         return
@@ -2657,6 +2681,7 @@ def _start_feishu_auth_poll_task(
             gateway=gateway,
             event=event,
             interval=interval,
+            auth_card=auth_card,
         ),
         name=f"feishu-auth:{profile_name}:{open_id}:{session_id}",
     )
@@ -2672,8 +2697,15 @@ async def _poll_feishu_auth_session_until_done(
     gateway: Any,
     event: Any,
     interval: int,
+    auth_card: Optional[dict[str, Any]] = None,
 ) -> None:
     from . import feishu_uat_auth
+    from .feishu_auth_cards import (
+        build_auth_failed_card,
+        build_auth_identity_mismatch_card,
+        build_auth_success_card,
+        update_auth_card,
+    )
 
     adapter = _get_feishu_adapter(gateway)
     current_interval = max(int(interval or 3), 2)
@@ -2688,7 +2720,11 @@ async def _poll_feishu_auth_session_until_done(
             )
         except feishu_uat_auth.FeishuUatAuthError as exc:
             if adapter is not None:
-                await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{exc.message}")
+                message = str(exc.message or "")
+                card = build_auth_identity_mismatch_card() if "does not match" in message else build_auth_failed_card(message)
+                updated = await update_auth_card(adapter=adapter, auth_card=auth_card, card=card)
+                if not updated:
+                    await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{exc.message}")
             return
         status = str(session.get("status") or "")
         if status == "pending":
@@ -2697,12 +2733,19 @@ async def _poll_feishu_auth_session_until_done(
         if adapter is None:
             return
         if status == "success":
-            await _safe_call(adapter.send, chat_id, "✅ 飞书 UAT 授权完成，后续 lark_cli 将优先使用你的 user 身份。")
+            updated = await update_auth_card(adapter=adapter, auth_card=auth_card, card=build_auth_success_card())
+            if not updated:
+                await _safe_call(adapter.send, chat_id, "✅ 飞书 UAT 授权完成，后续 lark_cli 将优先使用你的 user 身份。")
         elif status == "expired":
-            await _safe_call(adapter.send, chat_id, "飞书 UAT 授权已过期，请重新发送 /feishu_auth。")
+            updated = await update_auth_card(adapter=adapter, auth_card=auth_card, card=build_auth_failed_card("expired"))
+            if not updated:
+                await _safe_call(adapter.send, chat_id, "飞书 UAT 授权已过期，请重新发送 /feishu_auth。")
         else:
             error = str(session.get("error") or status or "unknown error")
-            await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{error}")
+            card = build_auth_identity_mismatch_card() if "does not match" in error else build_auth_failed_card(error)
+            updated = await update_auth_card(adapter=adapter, auth_card=auth_card, card=card)
+            if not updated:
+                await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{error}")
         return
 
 

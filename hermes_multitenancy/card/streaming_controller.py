@@ -16,15 +16,15 @@ import time
 from types import MethodType
 from typing import Any, Optional
 
-from hermes_multitenancy.card.builder import (
+from .builder import (
     _TOOLS_ELEMENT_ID,
     _render_cardkit_initial_card,
     _render_message_card,
     _render_stream_text,
     _to_cardkit2,
 )
-from hermes_multitenancy.card.card_error import _finalize, _result
-from hermes_multitenancy.card.cardkit_client import (
+from .card_error import _finalize, _result
+from .cardkit_client import (
     _create_cardkit_card,
     _patch_interactive_message,
     _set_card_streaming_mode,
@@ -33,14 +33,14 @@ from hermes_multitenancy.card.cardkit_client import (
     _update_cardkit_card,
     _update_interactive_message,
 )
-from hermes_multitenancy.card.reasoning import _split_reasoning_text
-from hermes_multitenancy.card.reply_dispatcher import (
+from .reasoning import _split_reasoning_text
+from .reply_dispatcher import (
     _can_patch_interactive_message,
     _can_update_interactive_message,
     _can_use_cardkit,
 )
-from hermes_multitenancy.card.sanitization import _format
-from hermes_multitenancy.card.state import (
+from .sanitization import _format
+from .state import (
     _INSTALLED_ATTR,
     _STATE_ATTR,
     _new_state,
@@ -48,7 +48,7 @@ from hermes_multitenancy.card.state import (
     _state_for,
     _states,
 )
-from hermes_multitenancy.card.tool_use_display import (
+from .tool_use_display import (
     _extract_raw_tool_call_intents,
     _merge_raw_tool_intents,
     _render_tool_calls_section,
