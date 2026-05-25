@@ -43,6 +43,17 @@ def _assert_tool_panel(card_or_elements):
     return panel
 
 
+def _assert_loading_icon_element(element):
+    assert element["element_id"] == "loading_icon"
+    assert element["tag"] == "markdown"
+    assert element["content"] == " "
+    assert element["icon"] == {
+        "tag": "custom_icon",
+        "img_key": "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg",
+        "size": "16px 16px",
+    }
+
+
 def test_thread_metadata_is_suppressed_for_dm_to_avoid_topic():
     from hermes_multitenancy import router as router_mod
 
@@ -953,6 +964,10 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     assert initial_request.request_body.type == "card_json"
     assert initial_card["schema"] == "2.0"
     assert initial_card["config"]["streaming_mode"] is True
+    assert initial_card["config"]["summary"] == {
+        "content": "Processing...",
+        "i18n_content": {"zh_cn": "处理中...", "en_us": "Processing..."},
+    }
     assert [
         element["element_id"]
         for element in initial_card["body"]["elements"]
@@ -960,7 +975,9 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     ] == [
         "tool_calls",
         "streaming_content",
+        "loading_icon",
     ]
+    _assert_loading_icon_element(initial_card["body"]["elements"][-1])
     assert len(adapter.card_sends) == 1
     sent_payload = json.loads(adapter.card_sends[0]["payload"])
     assert sent_payload == {"type": "card", "data": {"card_id": "ck-1"}}
@@ -986,7 +1003,7 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     assert "Done (" in final_text
 
 
-def test_cardkit_initial_card_has_delay_streaming_and_no_visible_thinking():
+def test_cardkit_initial_card_has_delay_streaming_loading_and_no_visible_thinking():
     from hermes_multitenancy.feishu_cardkit_compat import _render_cardkit_initial_card
 
     card = _render_cardkit_initial_card()
@@ -1000,18 +1017,23 @@ def test_cardkit_initial_card_has_delay_streaming_and_no_visible_thinking():
         "ios": 100,
         "pc": 100,
     }
-    assert config["summary"]["content"] == ""
+    assert config["summary"] == {
+        "content": "Processing...",
+        "i18n_content": {"zh_cn": "处理中...", "en_us": "Processing..."},
+    }
     assert "Thinking" not in json.dumps(card, ensure_ascii=False)
     assert "思考" not in json.dumps(card, ensure_ascii=False)
+    assert "CARD DUMP" not in json.dumps(card, ensure_ascii=False)
+    assert "multitenancy DEBUG" not in json.dumps(card, ensure_ascii=False)
     element_ids = [
         element["element_id"]
         for element in card["body"]["elements"]
         if "element_id" in element
     ]
-    assert element_ids == ["tool_calls", "streaming_content"]
+    assert element_ids == ["tool_calls", "streaming_content", "loading_icon"]
     assert "status_content" not in element_ids
     assert "reasoning_content" not in element_ids
-    assert "loading_icon" not in element_ids
+    _assert_loading_icon_element(card["body"]["elements"][-1])
 
 
 def test_stream_throttle_timing_matches_openclaw_lark():

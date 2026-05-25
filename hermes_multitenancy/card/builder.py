@@ -1,9 +1,9 @@
 """Card JSON builders: initial CardKit v2 card, final v1-shape card, panels.
 
-Owns the element_id constants and the openclaw-style streaming_config
-(``print_strategy=delay``, ``print_frequency_ms=100``). Final card layout:
-tool panel (top) → status (while streaming) → reasoning panel → body markdown
-→ Done footer.
+Owns the element_id constants, the openclaw-style streaming_config
+(``print_strategy=delay``, ``print_frequency_ms=100``), and the initial
+loading indicator. Final card layout: tool panel (top) → status (while
+streaming) → reasoning panel → body markdown → Done footer.
 """
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ from hermes_multitenancy.card.tool_use_display import (
 
 _TOOLS_ELEMENT_ID = "tool_calls"
 _STREAMING_ELEMENT_ID = "streaming_content"
+_LOADING_ELEMENT_ID = "loading_icon"
+_LOADING_ICON_IMG_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
 
 
 def _render_cardkit_initial_card() -> dict[str, Any]:
@@ -41,8 +43,8 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
             },
             "locales": ["zh_cn", "en_us"],
             "summary": {
-                "content": "",
-                "i18n_content": {"zh_cn": "", "en_us": ""},
+                "content": "Processing...",
+                "i18n_content": {"zh_cn": "处理中...", "en_us": "Processing..."},
             },
         },
         "body": {
@@ -62,6 +64,16 @@ def _render_cardkit_initial_card() -> dict[str, Any]:
                     "text_size": "normal_v2",
                     "margin": "0px 0px 0px 0px",
                     "element_id": _STREAMING_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": " ",
+                    "icon": {
+                        "tag": "custom_icon",
+                        "img_key": _LOADING_ICON_IMG_KEY,
+                        "size": "16px 16px",
+                    },
+                    "element_id": _LOADING_ELEMENT_ID,
                 },
             ]
         },
