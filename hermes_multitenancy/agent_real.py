@@ -1903,10 +1903,10 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
         return []
     shared = shared_home.expanduser().resolve(strict=False)
     allowed_roots = [
-        (shared / "skills").resolve(strict=False),
-        (shared / "skill-releases").resolve(strict=False),
+        _absolute_path_without_following_final_symlink(shared / "skills"),
+        _absolute_path_without_following_final_symlink(shared / "skill-releases"),
     ]
-    targets: set[Path] = set()
+    bindings: set[tuple[Path, Path]] = set()
 
     for root, dirs, files in os.walk(skills_root, followlinks=False):
         root_path = Path(root)
@@ -1919,7 +1919,8 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
                 resolved = item.resolve(strict=True)
             except OSError:
                 continue
-            if not _is_safe_shared_skill_symlink_target(resolved, allowed_roots):
+            mount_path = _shared_skill_symlink_mount_path(item, allowed_roots)
+            if mount_path is None:
                 continue
             if resolved.is_dir() and not (resolved / "SKILL.md").is_file():
                 continue
@@ -1935,7 +1936,7 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
                     resolved,
                 )
                 continue
-            targets.add(resolved)
+            bindings.add((resolved, mount_path))
         dirs[:] = [
             name
             for name in dirs
@@ -1945,19 +1946,38 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
 
     args: list[str] = []
     created_dirs: set[Path] = set()
-    for target in sorted(targets, key=lambda p: str(p)):
-        for parent in _shared_skill_target_parent_dirs(target, shared):
+    for source, mount_path in sorted(bindings, key=lambda pair: (str(pair[1]), str(pair[0]))):
+        for parent in _shared_skill_target_parent_dirs(mount_path, shared):
             if parent in created_dirs:
                 continue
             args.extend(["--dir", str(parent)])
             created_dirs.add(parent)
-        args.extend(["--ro-bind", str(target), str(target)])
+        args.extend(["--ro-bind", str(source), str(mount_path)])
     return args
+
+
+def _shared_skill_symlink_mount_path(item: Path, allowed_roots: list[Path]) -> Path | None:
+    try:
+        raw_target = Path(os.readlink(item))
+    except OSError:
+        return None
+    if raw_target.is_absolute():
+        target = raw_target
+    else:
+        target = item.parent / raw_target
+    target = _absolute_path_without_following_final_symlink(target)
+    if _is_safe_shared_skill_symlink_target(target, allowed_roots):
+        return target
+    return None
+
+
+def _absolute_path_without_following_final_symlink(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
 def _is_safe_shared_skill_symlink_target(target: Path, allowed_roots: list[Path]) -> bool:
     try:
-        resolved = target.resolve(strict=True)
+        resolved = _absolute_path_without_following_final_symlink(target)
     except OSError:
         return False
     for root in allowed_roots:

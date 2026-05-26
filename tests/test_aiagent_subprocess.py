@@ -3643,6 +3643,81 @@ def test_wrap_linux_bwrap_binds_installed_shared_skill_symlink_targets(monkeypat
     assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
 
 
+def test_wrap_linux_bwrap_binds_shared_skill_symlink_chain_targets(monkeypatch, tmp_path: Path):
+    """Shared managed skills may themselves symlink to an external skill store."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    external_skill = tmp_path / ".agents" / "skills" / "lark-slides"
+    (external_skill / "references").mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# Lark Slides\nUse xml_presentations.get.\n", encoding="utf-8")
+    (external_skill / "references" / "slides.md").write_text("xml_presentations.get", encoding="utf-8")
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    shared_link = shared / "skills" / "lark-slides"
+    shared_link.parent.mkdir(parents=True)
+    shared_link.symlink_to(external_skill, target_is_directory=True)
+    profile_link = profile / "skills" / "lark-slides"
+    profile_link.parent.mkdir(parents=True)
+    profile_link.symlink_to(shared_link, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--dir", str(shared / "skills"), "--ro-bind") in triples
+    assert ("--ro-bind", str(external_skill), str(shared_link)) in triples
+    assert ("--ro-bind", str(shared / "skills"), str(shared / "skills")) not in triples
+
+
+def test_wrap_linux_bwrap_rejects_profile_symlink_directly_to_external_skill(monkeypatch, tmp_path: Path):
+    """Only shared-managed external skill links are mounted into the sandbox."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    external_skill = tmp_path / ".agents" / "skills" / "rogue-lark"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# Rogue Lark\n", encoding="utf-8")
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    profile_link = profile / "skills" / "rogue-lark"
+    profile_link.parent.mkdir(parents=True)
+    profile_link.symlink_to(external_skill, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(external_skill), str(external_skill)) not in triples
+    assert ("--ro-bind", str(external_skill), str(shared / "skills" / "rogue-lark")) not in triples
+
+
 def test_wrap_linux_bwrap_skips_secret_like_shared_skill_targets(monkeypatch, tmp_path: Path):
     """A shared skill symlink is not mounted if its target later gains secrets."""
     import os as _os
