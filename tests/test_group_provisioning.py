@@ -1031,3 +1031,91 @@ def test_group_env_atomic_no_tmp_left_behind(tmp_path):
     _write_group_profile_env(profile_home, shared, "oc_atomic")
     txt = (profile_home / ".env").read_text(encoding="utf-8")
     assert txt.count("FEISHU_HOME_CHANNEL=oc_atomic") == 1
+
+
+def test_ensure_auto_profile_writes_profile_local_env(tmp_path):
+    """Auto-provisioned user profiles must not symlink .env to shared secrets."""
+    from hermes_multitenancy.router import _ensure_auto_profile
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / ".env").write_text("HERMES_MULTITENANCY_CREDENTIAL_KEY=shared-secret\n", encoding="utf-8")
+    (shared / "auth.json").write_text("{}", encoding="utf-8")
+    profile_home = shared / "profiles" / "songtingting"
+
+    _ensure_auto_profile(
+        "songtingting",
+        profile_home,
+        route_key="ou_songtingting",
+        sender="ou_songtingting",
+    )
+
+    env_path = profile_home / ".env"
+    assert env_path.exists()
+    assert not env_path.is_symlink()
+    assert "shared-secret" not in env_path.read_text(encoding="utf-8")
+
+
+def test_repair_profile_local_env_backfills_shared_env_symlink(tmp_path):
+    """Backfill replaces only .env symlinks that point at shared .env."""
+    from hermes_multitenancy.router import repair_profile_local_envs
+
+    shared = tmp_path / ".hermes"
+    profiles = shared / "profiles"
+    user = profiles / "songtingting"
+    router = profiles / "multitenancy_router"
+    kept = profiles / "feishu_group_x"
+    created = profiles / "new_user"
+    external = profiles / "external_env"
+    external_target = tmp_path / "external.env"
+    for path in (shared, profiles, user, router, kept, created, external):
+        path.mkdir(parents=True, exist_ok=True)
+    shared_env = shared / ".env"
+    shared_env.write_text("HERMES_MULTITENANCY_CREDENTIAL_KEY=shared-secret\n", encoding="utf-8")
+    external_target.write_text("EXTERNAL=keep\n", encoding="utf-8")
+    (user / ".env").symlink_to(shared_env)
+    (router / ".env").symlink_to(shared_env)
+    (kept / ".env").write_text("FEISHU_HOME_CHANNEL=oc_keep\n", encoding="utf-8")
+    (external / ".env").symlink_to(external_target)
+    (user / "feishu_uat").mkdir()
+    (user / "feishu_uat" / "ou_songtingting.json").write_text('{"refresh_token":"keep"}', encoding="utf-8")
+
+    stats = repair_profile_local_envs(shared_home=shared)
+
+    assert stats["repaired"] == 1
+    assert stats["created"] == 1
+    assert stats["kept"] == 1
+    assert stats["skipped_service"] == 1
+    assert stats["skipped_non_shared_symlink"] == 1
+    assert (user / ".env").exists()
+    assert not (user / ".env").is_symlink()
+    assert (created / ".env").exists()
+    assert not (created / ".env").is_symlink()
+    assert "shared-secret" not in (user / ".env").read_text(encoding="utf-8")
+    assert (router / ".env").is_symlink()
+    assert (kept / ".env").read_text(encoding="utf-8") == "FEISHU_HOME_CHANNEL=oc_keep\n"
+    assert (external / ".env").is_symlink()
+    assert (user / "feishu_uat" / "ou_songtingting.json").read_text(encoding="utf-8") == '{"refresh_token":"keep"}'
+
+
+def test_repair_profile_local_env_dry_run_reports_plan_without_writing(tmp_path):
+    """Dry-run must not report applied repairs or mutate symlinks."""
+    from hermes_multitenancy.router import repair_profile_local_envs
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "songtingting"
+    missing = shared / "profiles" / "new_user"
+    profile.mkdir(parents=True)
+    missing.mkdir(parents=True)
+    shared_env = shared / ".env"
+    shared_env.write_text("SECRET=shared\n", encoding="utf-8")
+    (profile / ".env").symlink_to(shared_env)
+
+    stats = repair_profile_local_envs(shared_home=shared, dry_run=True)
+
+    assert stats["planned_repaired"] == 1
+    assert stats["planned_created"] == 1
+    assert stats["repaired"] == 0
+    assert stats["created"] == 0
+    assert (profile / ".env").is_symlink()
+    assert not (missing / ".env").exists()

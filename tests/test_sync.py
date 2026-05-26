@@ -316,9 +316,28 @@ def test_sync_cli_plan_skills_outputs_secret_free_json(capsys, tmp_path):
     assert code == 0
     parsed = json.loads(output)
     assert parsed["changed"] is True
+    assert parsed["secret_free"] is True
     assert parsed["counts"]["upstream_added"] == 1
     assert parsed["items"][0]["path"] == "lark-docs"
-    assert parsed["secret_free"] is True
+
+
+def test_sync_cli_repair_profile_env_replaces_shared_symlink(capsys, tmp_path):
+    from hermes_multitenancy.sync.cli import main
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (shared / ".env").write_text("HERMES_MULTITENANCY_CREDENTIAL_KEY=shared-secret\n", encoding="utf-8")
+    (profile / ".env").symlink_to(shared / ".env")
+
+    code = main(["repair-profile-env", "--home", str(shared)])
+    output = capsys.readouterr().out
+
+    assert code == 0
+    parsed = json.loads(output)
+    assert parsed["repaired"] == 1
+    assert not (profile / ".env").is_symlink()
+    assert "shared-secret" not in (profile / ".env").read_text(encoding="utf-8")
 
 
 def test_plan_profile_skill_sync_reads_org_default_skill_bundle(tmp_path):
@@ -1401,6 +1420,37 @@ def test_sync_profiles_creates_isolation_pivot_dirs(tmp_path):
     for sub in ("home", "workspace", "cache", "config", "state", "data", "tmp"):
         path = profile_home / sub
         assert path.is_dir(), f"{sub}/ missing — child subprocess would create it world-readable"
+
+
+def test_sync_profiles_materializes_profile_local_env_instead_of_shared_symlink(tmp_path):
+    """Org sync must backfill existing shared .env symlinks to local safe files."""
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / ".env").write_text("HERMES_MULTITENANCY_CREDENTIAL_KEY=shared-secret\n", encoding="utf-8")
+    (shared_home / "auth.json").write_text("{}", encoding="utf-8")
+    (shared_home / "config.yaml").write_text(
+        "model:\n  default: zai/glm-5.1\n",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    profile_home = profiles_root / "alice"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").symlink_to(shared_home / ".env")
+    (profile_home / "feishu_uat").mkdir()
+    (profile_home / "feishu_uat" / "ou_alice.json").write_text('{"refresh_token":"keep"}', encoding="utf-8")
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    assert (profile_home / ".env").exists()
+    assert not (profile_home / ".env").is_symlink()
+    assert "shared-secret" not in (profile_home / ".env").read_text(encoding="utf-8")
+    assert (profile_home / "feishu_uat" / "ou_alice.json").read_text(encoding="utf-8") == '{"refresh_token":"keep"}'
 
 
 def test_sync_profiles_chmods_profile_tree_to_0700(tmp_path):

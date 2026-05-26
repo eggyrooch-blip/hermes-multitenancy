@@ -673,8 +673,8 @@ def _sync_one_profile(
     if soul_changed:
         soul_path.write_text(desired_soul, encoding="utf-8")
 
-    for name in ("auth.json", ".env"):
-        _ensure_shared_profile_file(profile_home, shared_home, name)
+    _ensure_shared_profile_file(profile_home, shared_home, "auth.json")
+    env_changed = _ensure_profile_local_env(profile_home, shared_home)
 
     # Best-effort migration of the user's Feishu UAT token from the legacy
     # shared location into this profile's own feishu_uat/ dir. agent_real
@@ -686,7 +686,7 @@ def _sync_one_profile(
 
     if not existed:
         return "created"
-    return "updated" if soul_changed or config_changed or skills_changed else "kept"
+    return "updated" if soul_changed or config_changed or env_changed or skills_changed else "kept"
 
 
 def _sync_default_profile_skills(
@@ -1390,6 +1390,12 @@ def _ensure_shared_profile_file(profile_home: Path, shared_home: Path, name: str
     from ..router import _ensure_shared_profile_file as ensure
 
     ensure(profile_home, shared_home, name)
+
+
+def _ensure_profile_local_env(profile_home: Path, shared_home: Path) -> bool:
+    from ..router import ensure_profile_local_env as ensure
+
+    return ensure(profile_home, shared_home)
 
 
 def _desired_soul_text(existing: str, employee: Employee) -> str:

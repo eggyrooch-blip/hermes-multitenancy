@@ -4120,8 +4120,8 @@ def _ensure_auto_profile(
     else:
         _ensure_soul_guidance(soul_path, _LARK_CLI_SOUL_GUIDANCE)
 
-    for name in ("auth.json", ".env"):
-        _ensure_shared_profile_file(profile_home, shared_home, name)
+    _ensure_shared_profile_file(profile_home, shared_home, "auth.json")
+    ensure_profile_local_env(profile_home, shared_home)
     _sync_default_skills_for_profile(profile_home, shared_home)
 
 
@@ -4353,6 +4353,104 @@ def _ensure_shared_profile_file(profile_home: Path, shared_home: Path, name: str
         target.symlink_to(source)
     except OSError:
         shutil.copy2(source, target)
+
+
+def ensure_profile_local_env(profile_home: Path, shared_home: Path) -> bool:
+    """Ensure a tenant profile has a local .env, not a symlink to shared secrets.
+
+    User-scoped UAT and provider credentials are brokered separately; a tenant
+    ``.env`` exists for compatibility only and must not point at the service
+    root's secret-bearing ``.env``.
+    """
+    target = profile_home / ".env"
+    shared_env = shared_home / ".env"
+    if target.is_symlink() and not _symlink_points_to(target, shared_env):
+        return False
+    if target.exists() and not target.is_symlink():
+        _chmod_private_file(target)
+        return False
+    _write_empty_profile_env(target)
+    return True
+
+
+def repair_profile_local_envs(
+    *,
+    shared_home: Path | None = None,
+    profiles_root: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Backfill profile .env symlinks that point at the shared Hermes .env."""
+    root = (shared_home or Path(os.environ.get("HERMES_HOME", "~/.hermes"))).expanduser()
+    profiles = profiles_root or (root / "profiles")
+    stats = {
+        "scanned": 0,
+        "repaired": 0,
+        "created": 0,
+        "planned_repaired": 0,
+        "planned_created": 0,
+        "kept": 0,
+        "skipped_service": 0,
+        "skipped_non_shared_symlink": 0,
+        "errors": 0,
+    }
+    if not profiles.exists():
+        return stats
+    for profile_home in sorted(path for path in profiles.iterdir() if path.is_dir()):
+        stats["scanned"] += 1
+        if _is_service_profile(profile_home.name):
+            stats["skipped_service"] += 1
+            continue
+        target = profile_home / ".env"
+        if target.is_symlink() and not _symlink_points_to(target, root / ".env"):
+            stats["skipped_non_shared_symlink"] += 1
+            continue
+        if target.exists() and not target.is_symlink():
+            stats["kept"] += 1
+            continue
+        was_missing = not target.exists() and not target.is_symlink()
+        if dry_run:
+            if was_missing:
+                stats["planned_created"] += 1
+            else:
+                stats["planned_repaired"] += 1
+            continue
+        try:
+            ensure_profile_local_env(profile_home, root)
+        except OSError:
+            logger.exception("multitenancy: failed to repair profile .env profile=%s", profile_home.name)
+            stats["errors"] += 1
+            continue
+        if was_missing:
+            stats["created"] += 1
+        else:
+            stats["repaired"] += 1
+    return stats
+
+
+def _is_service_profile(profile_name: str) -> bool:
+    return profile_name == os.environ.get("HERMES_MULTITENANCY_ROUTER_PROFILE", "multitenancy_router")
+
+
+def _symlink_points_to(path: Path, expected: Path) -> bool:
+    try:
+        return path.resolve(strict=False) == expected.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def _write_empty_profile_env(target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+    tmp.write_text("", encoding="utf-8")
+    _chmod_private_file(tmp)
+    tmp.replace(target)
+
+
+def _chmod_private_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        logger.debug("multitenancy: failed to chmod private file %s", path, exc_info=True)
 
 
 def _profile_name_to_home(profile_name: str) -> Path:

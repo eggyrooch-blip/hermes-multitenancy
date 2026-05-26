@@ -67,6 +67,14 @@ def main(argv: list[str] | None = None) -> int:
     p_plan_skills.add_argument("--dept-name", default="", help="Department name for audience matching")
     p_plan_skills.add_argument("--upstream-profile-home", type=Path, default=None, help="Optional upstream profile home for child inheritance")
 
+    p_repair_env = sub.add_parser(
+        "repair-profile-env",
+        help="Replace ordinary profile .env symlinks to shared .env with local safe files",
+    )
+    p_repair_env.add_argument("--home", type=Path, default=None, help="Shared Hermes home (default: HERMES_HOME or ~/.hermes)")
+    p_repair_env.add_argument("--profiles-root", type=Path, default=None, help="Profiles root (default: <home>/profiles)")
+    p_repair_env.add_argument("--dry-run", action="store_true", help="Report changes without touching profile files")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "apply":
@@ -141,6 +149,17 @@ def main(argv: list[str] | None = None) -> int:
             home,
             employee,
             upstream_profile_home=args.upstream_profile_home,
+        )
+        print(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.cmd == "repair-profile-env":
+        from hermes_multitenancy.router import repair_profile_local_envs
+
+        stats = repair_profile_local_envs(
+            shared_home=args.home,
+            profiles_root=args.profiles_root,
+            dry_run=args.dry_run,
         )
         print(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
