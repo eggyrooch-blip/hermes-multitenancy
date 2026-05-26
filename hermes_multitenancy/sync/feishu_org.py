@@ -79,6 +79,7 @@ _SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd
 _SKILL_LINKED_DEP_DIRS = {"node_modules"}
 _SKILL_IGNORED_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
 _SHARED_SKILL_SYMLINK_PREFIXES = ("lark-",)
+_AUTO_DISTRIBUTE_SHARED_SKILL_PREFIXES = ("lark-",)
 _CHILD_SHAREABLE_TOKEN_POLICIES = {
     "none",
     "no-token",
@@ -889,6 +890,19 @@ def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[
             for rel_path in _default_profile_skill_paths(shared_home)
         )
     specs.extend(_skill_bundle_profile_specs(shared_home, employee))
+    specs_by_path = {str(spec["path"]): spec for spec in specs}
+    for rel_path in _shared_lark_skill_paths(shared_home):
+        specs_by_path.setdefault(
+            str(rel_path),
+            {
+                "path": rel_path,
+                "install_mode": "symlink",
+                "share_with_children": True,
+                "token_policy": "brokered",
+                "requires_token": False,
+            },
+        )
+    specs = list(specs_by_path.values())
     return sorted(specs, key=lambda item: str(item["path"]))
 
 
@@ -1136,6 +1150,19 @@ def _default_profile_skill_paths(shared_home: Path) -> list[Path]:
         if path is not None:
             result.append(path)
     return sorted(set(result), key=lambda p: str(p))
+
+
+def _shared_lark_skill_paths(shared_home: Path) -> list[Path]:
+    skills_root = shared_home / "skills"
+    if not skills_root.is_dir():
+        return []
+    result: list[Path] = []
+    for item in skills_root.iterdir():
+        if not item.name.startswith(_AUTO_DISTRIBUTE_SHARED_SKILL_PREFIXES):
+            continue
+        if (item.is_dir() or item.is_symlink()) and (item / "SKILL.md").is_file():
+            result.append(Path(item.name))
+    return sorted(result, key=lambda p: str(p))
 
 
 def _safe_skill_relative_path(value: Any) -> Optional[Path]:

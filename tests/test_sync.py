@@ -799,6 +799,118 @@ skills:
     assert not (carol_skills / "internal" / "user-only-cli").exists()
 
 
+def test_sync_profiles_always_distributes_available_lark_skills(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    business_source = shared_home / "skills" / "Keep" / "kep-hades-cli"
+    lark_slides = shared_home / "skills" / "lark-slides"
+    lark_wiki = shared_home / "skills" / "lark-wiki"
+    lark_drive = shared_home / "skills" / "lark-drive"
+    for source in (business_source, lark_slides, lark_wiki, lark_drive):
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(f"# {source.name}\n", encoding="utf-8")
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/kep-hades-cli
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {"od_ops": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    profile_skills = profiles_root / "alice" / "skills"
+    for name, source in {
+        "lark-slides": lark_slides,
+        "lark-wiki": lark_wiki,
+        "lark-drive": lark_drive,
+    }.items():
+        target = profile_skills / name
+        assert target.is_symlink()
+        assert target.resolve() == source.resolve()
+    manifest = json.loads((profile_skills / ".hermes-managed.json").read_text(encoding="utf-8"))
+    assert manifest["skills"]["lark-slides"]["source"] == str(lark_slides)
+    assert manifest["skills"]["lark-slides"]["install_mode"] == "symlink"
+    assert manifest["skills"]["lark-slides"]["share_with_children"] is True
+
+
+def test_sync_profiles_lark_auto_distribution_is_idempotent_and_preserves_personal(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    business_source = shared_home / "skills" / "Keep" / "kep-hades-cli"
+    lark_slides = shared_home / "skills" / "lark-slides"
+    for source in (business_source, lark_slides):
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(f"# {source.name}\n", encoding="utf-8")
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/kep-hades-cli
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {"od_ops": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    first = sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+    profile_skills = profiles_root / "alice" / "skills"
+    personal = profile_skills / "personal-tool"
+    personal.mkdir()
+    (personal / "SKILL.md").write_text("# Personal\n", encoding="utf-8")
+    second = sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    assert first["created"] == 1
+    assert second["kept"] == 1
+    assert (profile_skills / "lark-slides").is_symlink()
+    assert not (profile_skills / "lark-wiki").exists()
+    assert (personal / "SKILL.md").read_text(encoding="utf-8") == "# Personal\n"
+
+
+def test_sync_profiles_lark_auto_distribution_respects_secret_guard(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    lark_secret = shared_home / "skills" / "lark-secret"
+    lark_secret.mkdir(parents=True)
+    (lark_secret / "SKILL.md").write_text("# Lark Secret\n", encoding="utf-8")
+    (lark_secret / ".env").write_text("TOKEN=do-not-link\n", encoding="utf-8")
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_ops", name="Ops", leader_user_id="alice")],
+        {"od_ops": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    installed = profiles_root / "alice" / "skills" / "lark-secret"
+    assert installed.exists()
+    assert not installed.is_symlink()
+    assert (installed / "SKILL.md").exists()
+    assert not (installed / ".env").exists()
+    manifest = json.loads((installed.parent / ".hermes-managed.json").read_text(encoding="utf-8"))
+    entry = manifest["skills"]["lark-secret"]
+    assert entry["install_mode"] == "copy"
+    assert entry["requested_install_mode"] == "symlink"
+    assert entry["secret_guard"] == "copy_filtered"
+
+
 def test_sync_profiles_prunes_removed_managed_skill_but_preserves_self_installed(tmp_path):
     from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
 

@@ -307,6 +307,31 @@ def test_ensure_group_profile_inherits_default_skills(tmp_path):
     assert lark_target.resolve() == lark_source.resolve()
 
 
+def test_ensure_group_profile_receives_available_lark_skills(tmp_path):
+    from hermes_multitenancy.router import _ensure_group_profile
+
+    shared_home = tmp_path
+    lark_slides = shared_home / "skills" / "lark-slides"
+    lark_wiki = shared_home / "skills" / "lark-wiki"
+    for source in (lark_slides, lark_wiki):
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(f"# {source.name}\n", encoding="utf-8")
+    profile_home = shared_home / "profiles" / "feishu_group_x"
+
+    _ensure_group_profile(
+        profile_name="feishu_group_x",
+        profile_home=profile_home,
+        chat_id="oc_abc",
+        owner_open_id="ou_inviter",
+        display_label="owner-IT组",
+    )
+
+    for name, source in {"lark-slides": lark_slides, "lark-wiki": lark_wiki}.items():
+        target = profile_home / "skills" / name
+        assert target.is_symlink()
+        assert target.resolve() == source.resolve()
+
+
 def test_group_profile_inherits_owner_child_shareable_skills_not_tokens(tmp_path):
     from hermes_multitenancy import router as router_mod
     from hermes_multitenancy.router import _ensure_group_profile
