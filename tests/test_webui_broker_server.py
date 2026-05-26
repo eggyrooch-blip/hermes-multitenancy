@@ -513,9 +513,24 @@ def test_webui_run_broker_session_command_expands_plan_owner_scoped(monkeypatch,
         assert body["type"] == "skill"
         assert body["action"] == "plan"
         assert "PLAN BODY" in body["message"]
+        assert "relative output paths are relative to the active profile home" in body["message"]
         assert "User request: build the feature" in body["message"]
+        assert str(tmp_path) not in body["message"]
 
     asyncio.run(runner())
+
+
+def test_webui_run_broker_goal_done_matches_real_goal_manager_contract(monkeypatch, tmp_path: Path):
+    goals_mod = pytest.importorskip("hermes_cli.goals")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = goals_mod.GoalManager("session-webui-contract")
+    mark_done = getattr(manager, "mark_done", None)
+
+    assert callable(mark_done)
+    manager.set("fix the tests")
+    mark_done("user-completed")
+    assert manager.state.status == "done"
 
 
 def test_webui_run_broker_goal_set_and_evaluate_are_owner_scoped(monkeypatch, tmp_path: Path):
@@ -570,6 +585,11 @@ def test_webui_run_broker_goal_set_and_evaluate_are_owner_scoped(monkeypatch, tm
                 "message": "Continuing toward goal.",
             }
 
+        def mark_done(self, reason):
+            self.state.status = "done"
+            self.done_reason = reason
+            return self.state
+
     monkeypatch.setattr(broker_mod, "_goal_manager", lambda session_id: FakeGoalManager(session_id))
 
     async def runner():
@@ -613,6 +633,16 @@ def test_webui_run_broker_goal_set_and_evaluate_are_owner_scoped(monkeypatch, tm
                     },
                 )
                 evaluate_body = await evaluate_response.json()
+                done_response = await client.post(
+                    "/api/run-broker/session-commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={
+                        "profile_name": "owner_sync_profile",
+                        "session_id": "session-webui",
+                        "command": "/goal done",
+                    },
+                )
+                done_body = await done_response.json()
             finally:
                 await client.close()
         finally:
@@ -633,6 +663,12 @@ def test_webui_run_broker_goal_set_and_evaluate_are_owner_scoped(monkeypatch, tm
         assert evaluate_body["verdict"] == "continue"
         assert evaluate_body["reason"] == "more work remains"
         assert "Goal: fix the tests" in evaluate_body["continuation_prompt"]
+        assert done_response.status == 200
+        assert done_body["handled"] is True
+        assert done_body["command"] == "goal"
+        assert done_body["action"] == "done"
+        assert done_body["message"] == "Goal marked done."
+        assert done_body["clear_goal_continuations"] is True
 
     asyncio.run(runner())
 
@@ -1817,6 +1853,53 @@ def test_webui_slash_registry_returns_empty_list_for_profile_without_skills(tmp_
             "goal",
             "goal",
         ]
+
+    asyncio.run(runner())
+
+
+def test_webui_slash_registry_requires_owner_header(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "owner_sync_profile").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands?profile_name=owner_sync_profile",
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 403
+        assert body == {"error": "owner identity required (X-Hermes-Owner-Open-Id)"}
 
     asyncio.run(runner())
 

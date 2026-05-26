@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -355,17 +356,21 @@ def _find_plan_skill(profile_home: Path) -> tuple[Path, str] | None:
     return None
 
 
-def _with_profile_home(profile_home: Path, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    old_home = os.environ.get("HERMES_HOME")
-    had_home = "HERMES_HOME" in os.environ
-    os.environ["HERMES_HOME"] = str(profile_home)
-    try:
-        return fn()
-    finally:
-        if had_home:
-            os.environ["HERMES_HOME"] = old_home or ""
-        else:
-            os.environ.pop("HERMES_HOME", None)
+@asynccontextmanager
+async def _profile_home_context(profile_home: Path):
+    from .runtime import _get_env_lock
+
+    async with _get_env_lock():
+        old_home = os.environ.get("HERMES_HOME")
+        had_home = "HERMES_HOME" in os.environ
+        os.environ["HERMES_HOME"] = str(profile_home)
+        try:
+            yield
+        finally:
+            if had_home:
+                os.environ["HERMES_HOME"] = old_home or ""
+            else:
+                os.environ.pop("HERMES_HOME", None)
 
 
 def _dispatch_plan_command(*, profile_name: str, command: Any) -> dict[str, Any]:
@@ -381,14 +386,13 @@ def _dispatch_plan_command(*, profile_name: str, command: Any) -> dict[str, Any]
             "action": "unsupported",
             "message": "plan skill is not installed for this profile",
         }
-    skill_dir, skill_text = found
+    _skill_dir, skill_text = found
     prompt = "\n".join([
         '[SYSTEM: The user invoked the "plan" skill. Follow the full skill instructions below.]',
         "",
         skill_text.strip(),
         "",
-        f"[Skill directory: {skill_dir}]",
-        "Resolve relative paths against that directory.",
+        "[Skill source: profile-local plan skill; relative output paths are relative to the active profile home.]",
         "",
         f"User request: {args}",
     ]).strip()
@@ -407,7 +411,7 @@ def _goal_manager(session_id: str):
     return GoalManager(session_id)
 
 
-def _dispatch_goal_command(*, profile_name: str, session_id: str, command: Any) -> dict[str, Any]:
+async def _dispatch_goal_command(*, profile_name: str, session_id: str, command: Any) -> dict[str, Any]:
     command_name, args = _parse_session_history_command(command)
     if command_name not in _GOAL_COMMANDS:
         raise ValueError("not a goal command")
@@ -485,6 +489,19 @@ def _dispatch_goal_command(*, profile_name: str, session_id: str, command: Any) 
                 "kickoff_prompt": prompt,
                 "max_turns": state.max_turns if state else None,
             }
+        if lower in {"done", "complete"}:
+            mark_done = getattr(manager, "mark_done", None)
+            if not callable(mark_done):
+                raise ValueError("GoalManager does not support /goal done")
+            mark_done("user-completed")
+            return {
+                "handled": True,
+                "command": "goal",
+                "type": "goal",
+                "action": "done",
+                "message": "Goal marked done.",
+                "clear_goal_continuations": True,
+            }
 
         state = manager.set(text)
         return {
@@ -498,10 +515,11 @@ def _dispatch_goal_command(*, profile_name: str, session_id: str, command: Any) 
             "clear_goal_continuations": True,
         }
 
-    return _with_profile_home(profile_home, run)
+    async with _profile_home_context(profile_home):
+        return run()
 
 
-def _dispatch_session_command(*, profile_name: str, user_key: str, session_id: str, command: Any) -> dict[str, Any]:
+async def _dispatch_session_command(*, profile_name: str, user_key: str, session_id: str, command: Any) -> dict[str, Any]:
     command_name, _args = _parse_session_history_command(command)
     if command_name in _SESSION_HISTORY_COMMANDS:
         return _dispatch_session_history_command(
@@ -512,7 +530,7 @@ def _dispatch_session_command(*, profile_name: str, user_key: str, session_id: s
     if command_name == "plan":
         return _dispatch_plan_command(profile_name=profile_name, command=command)
     if command_name in _GOAL_COMMANDS:
-        return _dispatch_goal_command(
+        return await _dispatch_goal_command(
             profile_name=profile_name,
             session_id=session_id,
             command=command,
@@ -525,7 +543,7 @@ def _dispatch_session_command(*, profile_name: str, user_key: str, session_id: s
     }
 
 
-def _evaluate_goal_after_turn(*, profile_name: str, session_id: str, final_response: Any) -> dict[str, Any]:
+async def _evaluate_goal_after_turn(*, profile_name: str, session_id: str, final_response: Any) -> dict[str, Any]:
     profile_home = _profile_home_for_name(profile_name)
     final_text = str(final_response or "").strip()
 
@@ -539,7 +557,8 @@ def _evaluate_goal_after_turn(*, profile_name: str, session_id: str, final_respo
             **decision,
         }
 
-    return _with_profile_home(profile_home, run)
+    async with _profile_home_context(profile_home):
+        return run()
 
 
 def _kanban_board_from_request(request: Any) -> str:
@@ -1111,7 +1130,7 @@ def create_run_broker_app(
             raw_command = str(payload.get("command") or payload.get("text") or "").strip()
             if not raw_command:
                 return web.json_response({"error": "command required"}, status=400)
-            result = _dispatch_session_command(
+            result = await _dispatch_session_command(
                 profile_name=resolved_profile_name,
                 user_key=trusted_owner,
                 session_id=session_id,
@@ -1155,7 +1174,7 @@ def create_run_broker_app(
             session_id = str(payload.get("session_id") or "").strip()
             if not session_id:
                 return web.json_response({"error": "session_id required"}, status=400)
-            result = _evaluate_goal_after_turn(
+            result = await _evaluate_goal_after_turn(
                 profile_name=resolved_profile_name,
                 session_id=session_id,
                 final_response=payload.get("final_response") or payload.get("response") or "",
@@ -1269,8 +1288,12 @@ def create_run_broker_app(
         resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
         if resolution_error is not None:
             return web.json_response({"error": resolution_error}, status=403)
+        if not resolved_profile_name:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
 
-        profile_name = resolved_profile_name or payload.get("profile_name")
+        profile_name = resolved_profile_name
         try:
             profile_name = cron_api.validate_profile_name(str(profile_name or ""))
         except cron_api.CronApiError as exc:
