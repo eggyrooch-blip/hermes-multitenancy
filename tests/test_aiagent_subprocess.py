@@ -3124,6 +3124,58 @@ def test_aiagent_subprocess_env_scope_uses_webui_owner_uat_for_lark_cli_default(
         assert env["LARKSUITE_CLI_DEFAULT_AS"] == "user"
 
 
+def test_lark_cli_default_identity_refreshes_expired_but_refreshable_uat(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Expired access_token with live refresh_token must still select user identity."""
+    from hermes_multitenancy import agent_real, feishu_uat_auth
+
+    shared_home = tmp_path / ".hermes"
+    profile = shared_home / "profiles" / "songtingting"
+    uat_dir = profile / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    open_id = "ou_songtingting"
+    uat_path = uat_dir / f"{open_id}.json"
+    now_ms = int(time.time() * 1000)
+    uat_path.write_text(
+        json.dumps(
+            {
+                "app_id": "cli_public",
+                "user_open_id": open_id,
+                "access_token": "expired-access",
+                "refresh_token": "live-refresh",
+                "expires_at": now_ms - 60_000,
+                "refresh_expires_at": now_ms + 7 * 24 * 3600_000,
+                "scope": "im:message offline_access",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    refresh_calls: list[dict[str, object]] = []
+
+    def fake_refresh(**kwargs):
+        refresh_calls.append(kwargs)
+        refreshed = json.loads(uat_path.read_text(encoding="utf-8"))
+        refreshed["access_token"] = "fresh-access"
+        refreshed["expires_at"] = int(time.time() * 1000) + 3600_000
+        uat_path.write_text(json.dumps(refreshed), encoding="utf-8")
+        return refreshed
+
+    monkeypatch.setattr(feishu_uat_auth, "refresh_uat_if_needed", fake_refresh)
+
+    assert agent_real._lark_cli_default_identity(profile, open_id) == "user"
+    assert refresh_calls == [
+        {
+            "profile_name": "songtingting",
+            "open_id": open_id,
+            "shared_home": shared_home,
+            "headroom_seconds": 300,
+        }
+    ]
+
+
 def test_build_subprocess_env_extra_overrides_default_keys(tmp_path: Path):
     """`extra` parameter wins over defaults so callers can override per-spawn."""
     from hermes_multitenancy import agent_real

@@ -1348,6 +1348,20 @@ def _profile_has_lark_cli_user_credential(profile_home: Path, open_id: str) -> b
 
     shared_home = _resolve_shared_hermes_home(profile_home)
     try:
+        from .feishu_uat_auth import refresh_uat_if_needed
+
+        refreshed = refresh_uat_if_needed(
+            profile_name=Path(profile_home).name,
+            open_id=open_id,
+            shared_home=shared_home,
+            headroom_seconds=300,
+        )
+        if _payload_has_live_access_token(refreshed):
+            return True
+    except Exception:
+        pass
+
+    try:
         data = json.loads((Path(profile_home).expanduser() / "feishu_uat" / f"{open_id}.json").read_text(encoding="utf-8"))
         if _payload_has_live_access_token(data):
             return True

@@ -1,0 +1,228 @@
+"""Shared helpers for credential renewal hardening (L1/L2/L3/L4/L5).
+
+Single source of truth for:
+  * ``.needs_reauth`` marker filenames, reasons, and atomic writers
+  * UAT validation predicates (offline_access scope, non-empty refresh_token)
+  * UAT path enumeration (both legacy ``<shared>/feishu_uat/`` and per-profile
+    ``<shared>/profiles/<name>/feishu_uat/``)
+  * Fixture path filtering (never touch ``feishu_uat.fixtures.bak``)
+"""
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Optional
+
+REASON_EMPTY_REFRESH_TOKEN = "empty_refresh_token"
+REASON_SCOPE_STRIPPED_BY_FEISHU = "scope_stripped_by_feishu"
+REASON_ACCESS_TOKEN_EXPIRED = "access_token_expired"
+REASON_REFRESH_TOKEN_EXPIRED = "refresh_token_expired"
+REASON_REFRESH_REJECTED = "refresh_rejected"
+
+SCOPE_STRIPPED_REASONS = frozenset({REASON_SCOPE_STRIPPED_BY_FEISHU})
+
+FIXTURE_DIRNAMES = frozenset({"feishu_uat.fixtures.bak"})
+
+
+@dataclass(frozen=True)
+class UatLocation:
+    """One UAT file on disk plus the profile_name it's bound to (legacy → '')."""
+
+    path: Path
+    profile_name: str
+    open_id: str
+    legacy: bool
+
+
+def is_fixture_path(path: Path) -> bool:
+    """Return True if a UAT path lives inside a fixture or archived test directory."""
+    parts = path.parts
+    return any(p in FIXTURE_DIRNAMES for p in parts)
+
+
+def parse_scopes(raw: str | Iterable[str] | None) -> list[str]:
+    """Split a Feishu scope string into a deduped sorted list (whitespace-safe)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = raw.replace(",", " ").split()
+    else:
+        values = [str(item) for item in raw]
+    return sorted({value.strip() for value in values if value.strip()})
+
+
+def payload_has_offline_access(payload: dict[str, Any]) -> bool:
+    return "offline_access" in parse_scopes(payload.get("scope"))
+
+
+def payload_has_refresh_token(payload: dict[str, Any]) -> bool:
+    return bool(str(payload.get("refresh_token") or "").strip())
+
+
+def payload_has_access_token(payload: dict[str, Any]) -> bool:
+    return bool(str(payload.get("access_token") or "").strip())
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def payload_access_expired(payload: dict[str, Any], *, headroom_seconds: int = 0) -> bool:
+    expires_at = _as_int(
+        payload.get("expires_at") or payload.get("expire_at") or payload.get("access_token_expires_at")
+    )
+    if not expires_at:
+        return False
+    return _now_ms() >= expires_at - int(headroom_seconds) * 1000
+
+
+def payload_refresh_expired(payload: dict[str, Any]) -> bool:
+    refresh_expires_at = _as_int(payload.get("refresh_expires_at"))
+    if not refresh_expires_at:
+        return False
+    return refresh_expires_at <= _now_ms()
+
+
+def marker_path_for(uat_path: Path) -> Path:
+    """`<uat>.json` → `<uat>.json.needs_reauth` (sidecar in same dir)."""
+    return uat_path.with_name(uat_path.name + ".needs_reauth") if uat_path.suffix == ".json" else (
+        uat_path.with_name(uat_path.stem + ".needs_reauth")
+    )
+
+
+def marker_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
+    """Compute the canonical marker path used when only ``parent_dir`` + ``open_id`` are known."""
+    return parent_dir / f"{open_id}.needs_reauth"
+
+
+def write_needs_reauth_marker(
+    marker_path: Path,
+    *,
+    reason: str,
+    detail: str = "",
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """Atomic write of a `.needs_reauth` marker, mode 0600, idempotent."""
+    payload: dict[str, Any] = {
+        "reason": reason,
+        "ts": int(time.time()),
+    }
+    if detail:
+        payload["detail"] = detail
+    if extra:
+        payload.update({k: v for k, v in extra.items() if k not in payload})
+    marker_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = marker_path.with_name(f".{marker_path.name}.{secrets.token_hex(6)}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, marker_path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def read_needs_reauth_marker(marker_path: Path) -> Optional[dict[str, Any]]:
+    try:
+        data = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def clear_needs_reauth_marker(marker_path: Path) -> None:
+    """Remove a marker if present; quiet on failure (caller decides reaction)."""
+    try:
+        marker_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def iter_uat_locations(shared_home: Path) -> Iterator[UatLocation]:
+    """Yield every on-disk UAT JSON we care about — legacy + per-profile.
+
+    Excludes ``feishu_uat.fixtures.bak/`` so unit tests can leave fixtures in
+    place without tripping the audit.
+    """
+    legacy_dir = shared_home / "feishu_uat"
+    if legacy_dir.is_dir():
+        for entry in sorted(legacy_dir.iterdir()):
+            if entry.suffix != ".json":
+                continue
+            if is_fixture_path(entry):
+                continue
+            yield UatLocation(path=entry, profile_name="", open_id=entry.stem, legacy=True)
+
+    profiles_dir = shared_home / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir()):
+            if not profile_dir.is_dir():
+                continue
+            if is_fixture_path(profile_dir):
+                continue
+            uat_dir = profile_dir / "feishu_uat"
+            if not uat_dir.is_dir():
+                continue
+            for entry in sorted(uat_dir.iterdir()):
+                if entry.suffix != ".json":
+                    continue
+                if is_fixture_path(entry):
+                    continue
+                yield UatLocation(
+                    path=entry,
+                    profile_name=profile_dir.name,
+                    open_id=entry.stem,
+                    legacy=False,
+                )
+
+
+def classify_uat_payload(payload: dict[str, Any]) -> Optional[str]:
+    """Return a `.needs_reauth` reason if the payload is unusable; else None.
+
+    Order matters — most actionable reason first so the L3 notifier picks the
+    right recipient (scope_stripped_by_feishu escalates to owner).
+    """
+    if not payload_has_offline_access(payload):
+        return REASON_SCOPE_STRIPPED_BY_FEISHU
+    if not payload_has_refresh_token(payload):
+        return REASON_EMPTY_REFRESH_TOKEN
+    if payload_refresh_expired(payload):
+        return REASON_REFRESH_TOKEN_EXPIRED
+    if payload_access_expired(payload) and not payload_has_refresh_token(payload):
+        return REASON_ACCESS_TOKEN_EXPIRED
+    return None
+
+
+def find_marker_for_open_id(shared_home: Path, open_id: str) -> Optional[Path]:
+    """Return the most-recent marker file for ``open_id`` (legacy or per-profile)."""
+    candidates: list[Path] = []
+    legacy_marker = shared_home / "feishu_uat" / f"{open_id}.needs_reauth"
+    if legacy_marker.is_file():
+        candidates.append(legacy_marker)
+    profiles_dir = shared_home / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in profiles_dir.iterdir():
+            if not profile_dir.is_dir() or is_fixture_path(profile_dir):
+                continue
+            marker = profile_dir / "feishu_uat" / f"{open_id}.needs_reauth"
+            if marker.is_file():
+                candidates.append(marker)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)

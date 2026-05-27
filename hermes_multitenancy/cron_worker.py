@@ -24,15 +24,18 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
 
+from .credential_renewal_common import find_marker_for_open_id, read_needs_reauth_marker
 from .run_broker import RunBroker
 from .run_models import RunRequest
 
@@ -228,6 +231,9 @@ def _patch_cron_run_broker() -> None:
 
     @functools.wraps(original)
     def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+        deferred = _l4_check_needs_reauth_and_defer(job)
+        if deferred is not None:
+            return deferred
         if not _cron_run_broker_enabled():
             return original(job)
         return _run_job_through_broker(job, scheduler)
@@ -241,6 +247,81 @@ def _patch_cron_run_broker() -> None:
 def _current_profile_home() -> Path:
     raw = os.environ.get("HERMES_HOME", "").strip()
     return Path(raw).expanduser().resolve() if raw else Path.home() / ".hermes"
+
+
+def _resolve_shared_home() -> Path:
+    """The ``<shared>`` ancestor that owns multitenancy.db + legacy feishu_uat/.
+
+    Identical resolution rule to ``feishu_uat_auth.resolve_shared_home`` so L4
+    and L1 agree on which directory holds markers.
+    """
+    explicit = os.environ.get("HERMES_SHARED_HOME", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    profile_home = _current_profile_home()
+    parts = profile_home.parts
+    if len(parts) >= 2 and parts[-2] == "profiles":
+        return profile_home.parent.parent
+    return profile_home
+
+
+def _l4_check_needs_reauth_and_defer(
+    job: dict,
+) -> Optional[tuple[bool, str, str, Optional[str]]]:
+    """If owner_open_id has a fresh `.needs_reauth` marker, defer the job.
+
+    Returns ``(success=False, output_text, final_response, error)`` shaped like
+    ``cron.scheduler.run_job`` so the scheduler records the skip. Side effect:
+    writes ``<profile>/cron/output/<job_id>.deferred.json`` recording the
+    skip metadata for the audit trail. The L3 notifier still owns the
+    user-facing DM; L4 only refuses to enter the lark_cli policy black hole.
+    """
+    owner_open_id = str(job.get("owner_open_id") or "").strip()
+    if not owner_open_id.startswith("ou_"):
+        return None
+    shared_home = _resolve_shared_home()
+    marker = find_marker_for_open_id(shared_home, owner_open_id)
+    if marker is None:
+        return None
+    marker_body = read_needs_reauth_marker(marker) or {}
+    reason = str(marker_body.get("reason") or "unknown")
+
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job_id or "scheduled task")
+    deferred_payload = {
+        "deferred": True,
+        "reason": reason,
+        "marker_path": str(marker),
+        "marker_ts": int(marker_body.get("ts") or 0),
+        "deferred_ts": int(time.time()),
+        "job_id": job_id,
+        "owner_open_id": owner_open_id,
+    }
+    try:
+        profile_home = _current_profile_home()
+        output_dir = profile_home / "cron" / "output"
+        output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        deferred_path = output_dir / f"{job_id or 'unnamed'}.deferred.json"
+        deferred_path.write_text(
+            json.dumps(deferred_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.exception("[multitenancy] L4 failed to write deferred output for job=%s", job_id)
+    logger.warning(
+        "[multitenancy] L4 cron dispatch deferred job=%s owner=%s reason=%s",
+        job_id, owner_open_id, reason,
+    )
+    error_msg = f"deferred: feishu UAT needs reauth ({reason})"
+    output = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Status:** DEFERRED — feishu credential needs re-auth\n"
+        f"**Reason:** {reason}\n\n"
+        f"该任务已暂缓发送，因为 owner 的飞书 UAT 失效（{reason}）。"
+        f"待 owner 重新授权 / 管理员修正 app scope 后会自动恢复。"
+    )
+    return False, output, "", error_msg
 
 
 def _cron_user_key(job: dict, profile_name: str) -> str:

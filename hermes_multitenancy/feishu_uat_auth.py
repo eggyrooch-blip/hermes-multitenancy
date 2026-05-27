@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .credentials import CredentialStore
+from .credential_renewal_common import (
+    REASON_EMPTY_REFRESH_TOKEN,
+    REASON_SCOPE_STRIPPED_BY_FEISHU,
+    marker_path_for_open_id,
+    payload_has_offline_access,
+    payload_has_refresh_token,
+    write_needs_reauth_marker,
+)
 
 
 class FeishuUatAuthError(Exception):
@@ -501,6 +509,23 @@ def _token_payload(result: dict[str, Any], *, open_id: str, app_id: str, scope: 
 
 
 def _store_uat(shared_home: Path, profile_name: str, open_id: str, payload: dict[str, Any]) -> None:
+    """Persist a UAT after L1 write-time validation.
+
+    Refuses to overwrite a known-good UAT with a degraded one. Two ways a UAT
+    can be born broken: (a) Feishu didn't grant ``offline_access`` so no
+    refresh_token will ever come (app-config bug, owner-actionable), (b) the
+    response payload literally lacks ``refresh_token``. Either case writes a
+    `.needs_reauth` marker keyed by reason so the L3 notifier can route to the
+    right recipient — owner for scope_stripped (app config), end-user for
+    empty_refresh_token (re-auth).
+    """
+    rejection = _l1_validate_uat(payload)
+    if rejection is not None:
+        _l1_write_reject_marker(shared_home, profile_name, open_id, rejection)
+        raise FeishuUatAuthError(
+            f"UAT rejected by L1 write-time validation: {rejection['reason']}",
+            status=400,
+        )
     scopes = parse_scopes(payload.get("scope"))
     store = CredentialStore(shared_home / "multitenancy.db")
     try:
@@ -517,6 +542,44 @@ def _store_uat(shared_home: Path, profile_name: str, open_id: str, payload: dict
         store.close()
     target = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
     _atomic_write_json(target, payload)
+
+
+def _l1_validate_uat(payload: dict[str, Any]) -> Optional[dict[str, str]]:
+    """Return a rejection record `{reason, detail}` or None if the UAT is sound."""
+    if not payload_has_offline_access(payload):
+        return {
+            "reason": REASON_SCOPE_STRIPPED_BY_FEISHU,
+            "detail": "Feishu granted a UAT without offline_access; refresh_token will never arrive",
+        }
+    if not payload_has_refresh_token(payload):
+        return {
+            "reason": REASON_EMPTY_REFRESH_TOKEN,
+            "detail": "Feishu UAT payload has no refresh_token; cannot continue past access_token expiry",
+        }
+    return None
+
+
+def _l1_write_reject_marker(
+    shared_home: Path,
+    profile_name: str,
+    open_id: str,
+    rejection: dict[str, str],
+) -> None:
+    """Write `.needs_reauth` markers for both the profile and legacy paths."""
+    targets = [
+        shared_home / "profiles" / profile_name / "feishu_uat",
+        shared_home / "feishu_uat",
+    ]
+    for parent in targets:
+        try:
+            write_needs_reauth_marker(
+                marker_path_for_open_id(parent, open_id),
+                reason=rejection["reason"],
+                detail=rejection.get("detail", ""),
+                extra={"layer": "L1", "profile": profile_name},
+            )
+        except OSError:
+            continue
 
 
 def _load_best_uat_payload(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any] | None:
@@ -672,19 +735,41 @@ def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -
         raise FeishuUatAuthError(f"Feishu UAT refresh failed: code={data.get('code')} msg={msg}", status=401)
     if isinstance(data.get("data"), dict):
         data = data["data"]
-    return _normalise_refresh_response(data)
+    return _normalise_refresh_response(data, require_refresh_token=False)
 
 
-def _normalise_refresh_response(data: dict[str, Any]) -> dict[str, Any]:
+def _normalise_refresh_response(data: dict[str, Any], *, require_refresh_token: bool = True) -> dict[str, Any]:
+    """Refuse degraded refresh responses outright.
+
+    Initial grants must include a non-empty ``refresh_token``. Refresh grants
+    may omit a replacement refresh token; in that case the caller preserves the
+    existing one. An explicitly empty refresh_token is still treated as a
+    degraded response.
+    """
     access_token = str(data.get("access_token") or "").strip()
     if not access_token:
         raise FeishuUatAuthError("Feishu refresh response missing access_token", status=502)
+    has_refresh_token_field = "refresh_token" in data
+    refresh_token = str(data.get("refresh_token") or "").strip()
+    if not refresh_token:
+        if require_refresh_token or has_refresh_token_field:
+            raise FeishuUatAuthError(
+                "Feishu refresh response missing refresh_token (offline_access likely stripped by app config)",
+                status=502,
+            )
+        refresh_token = None
+    scope = str(data.get("scope") or "").strip()
+    if scope and "offline_access" not in parse_scopes(scope):
+        raise FeishuUatAuthError(
+            "Feishu refresh granted a scope without offline_access; future refreshes will fail",
+            status=502,
+        )
     return {
         "access_token": access_token,
-        "refresh_token": str(data.get("refresh_token") or "").strip() or None,
+        "refresh_token": refresh_token,
         "expires_in": int(data.get("expires_in") or 7200),
         "refresh_expires_in": _refresh_token_expires_in(data),
-        "scope": str(data.get("scope") or "").strip(),
+        "scope": scope,
         "token_type": str(data.get("token_type", "Bearer")).strip(),
     }
 
