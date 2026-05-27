@@ -231,6 +231,49 @@ def test_l3_open_id_from_marker_filename():
     assert notifier._open_id_from_marker(p2) == "ou_user_b"
 
 
+def test_l3_scan_defaults_to_dry_run_without_sending_dm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    marker_dir = tmp_path / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(marker_dir, "ou_user"),
+        reason=common.REASON_EMPTY_REFRESH_TOKEN,
+        detail="seeded by test",
+    )
+    sent: list[tuple[str, str, str]] = []
+
+    monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", raising=False)
+    monkeypatch.setattr(notifier, "_get_bot_token", lambda shared_home: "tenant-token")
+    monkeypatch.setattr(notifier, "_send_feishu_dm", lambda *args: sent.append(args) or True)
+
+    seen: dict[str, dict[str, Any]] = {}
+    changed = notifier._scan_once(tmp_path, seen)
+
+    assert changed is True
+    assert sent == []
+    assert seen["ou_user:empty_refresh_token"]["dry_run"] is True
+
+
+def test_l3_scan_sends_dm_only_when_explicitly_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    marker_dir = tmp_path / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(marker_dir, "ou_user"),
+        reason=common.REASON_EMPTY_REFRESH_TOKEN,
+        detail="seeded by test",
+    )
+    sent: list[tuple[str, str, str]] = []
+
+    monkeypatch.setenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", "1")
+    monkeypatch.setattr(notifier, "_get_bot_token", lambda shared_home: "tenant-token")
+    monkeypatch.setattr(notifier, "_send_feishu_dm", lambda *args: sent.append(args) or True)
+
+    seen: dict[str, dict[str, Any]] = {}
+    changed = notifier._scan_once(tmp_path, seen)
+
+    assert changed is True
+    assert len(sent) == 1
+    assert sent[0][1] == "ou_user"
+    assert seen["ou_user:empty_refresh_token"]["dry_run"] is False
+
+
 # ---------------------------------------------------------------------------
 # L4 — cron worker defers on marker
 # ---------------------------------------------------------------------------

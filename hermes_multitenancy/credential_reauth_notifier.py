@@ -94,6 +94,7 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
     changed = False
     bot_token = _get_bot_token(shared_home)
     owner_open_id = (os.environ.get("HERMES_CREDENTIAL_RENEWAL_OWNER_OPEN_ID") or "").strip()
+    send_enabled = (os.environ.get("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND") or "").strip() == "1"
 
     for marker in _iter_markers(shared_home):
         body = read_needs_reauth_marker(marker)
@@ -114,13 +115,6 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
             # Marker hasn't been refreshed since last send.
             continue
 
-        if bot_token is None:
-            logger.warning(
-                "[credential_reauth_notifier] would notify open_id=%s reason=%s but bot token unavailable",
-                open_id, reason,
-            )
-            continue
-
         recipient_open_id, message = _route_message(open_id, reason, owner_open_id, body)
         if not recipient_open_id:
             if reason == REASON_SCOPE_STRIPPED_BY_FEISHU and not owner_open_id:
@@ -130,9 +124,36 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
                     open_id,
                 )
             continue
+        if not send_enabled:
+            seen[key] = {
+                "notified_at": now,
+                "marker_ts": ts,
+                "reason": reason,
+                "dry_run": True,
+                "recipient_open_id": recipient_open_id,
+            }
+            changed = True
+            logger.warning(
+                "[credential_reauth_notifier] dry-run suppressed DM reason=%s subject=%s recipient=%s; "
+                "set HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND=1 to enable live sends",
+                reason, open_id, recipient_open_id,
+            )
+            continue
+        if bot_token is None:
+            logger.warning(
+                "[credential_reauth_notifier] would notify open_id=%s reason=%s but bot token unavailable",
+                open_id, reason,
+            )
+            continue
         ok = _send_feishu_dm(bot_token, recipient_open_id, message)
         if ok:
-            seen[key] = {"notified_at": now, "marker_ts": ts, "reason": reason}
+            seen[key] = {
+                "notified_at": now,
+                "marker_ts": ts,
+                "reason": reason,
+                "dry_run": False,
+                "recipient_open_id": recipient_open_id,
+            }
             changed = True
             logger.info(
                 "[credential_reauth_notifier] sent DM reason=%s subject=%s recipient=%s",
