@@ -192,6 +192,8 @@ def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_
     async def fake_stream_run_agent(event, profile_home, *, messages=None):
         assert profile_home == tmp_path / "profiles" / "owner"
         assert event.raw_event["session_id"] == "session-webui"
+        assert event.source.platform.value == "webui"
+        assert event.source.chat_type == "webui"
         yield "tool_started", {"name": "lark_cli", "preview": "contact --help"}
         yield "tool_completed", {"name": "lark_cli", "duration": 0.12, "is_error": False}
         yield "content", "tool-backed answer"

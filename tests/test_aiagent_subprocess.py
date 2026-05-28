@@ -808,6 +808,220 @@ def test_stream_aiagent_subprocess_forwards_child_clarify_events(monkeypatch, tm
     ]
 
 
+def test_stream_aiagent_subprocess_appends_conversation_audit_jsonl(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import sqlite3
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, "
+            "content TEXT, "
+            "reasoning TEXT, "
+            "tool_name TEXT, "
+            "tool_calls TEXT, "
+            "timestamp REAL NOT NULL)"
+        )
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({"event": "content", "text": "hello "}).encode() + b"\n",
+                json.dumps({"event": "content", "text": "world"}).encode() + b"\n",
+                json.dumps({
+                    "event": "tool_started",
+                    "name": "terminal",
+                    "preview": "echo ok",
+                    "args": {"command": "echo ok"},
+                }).encode() + b"\n",
+                b'{"event": "done", "result": "ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    audit_path = tmp_path / "conversation-audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), profile_home)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [
+        ("content", "hello "),
+        ("content", "world"),
+        ("tool_started", {
+            "name": "terminal",
+            "preview": "echo ok",
+            "args": {"command": "echo ok"},
+        }),
+        ("done", "ok"),
+    ]
+    rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+    assert [row["role"] for row in rows] == ["user", "assistant", "assistant"]
+    assert rows[0]["profile"] == "owner"
+    assert rows[0]["platform"] == "feishu"
+    assert rows[0]["chat_type"] == "dm"
+    assert rows[0]["content"] == "hello"
+    assert rows[1]["content"] == "hello world"
+    assert rows[1]["tool_name"] is None
+    assert rows[1]["finish_reason"] == "tool_calls"
+    assert rows[2]["content"] == ""
+    assert rows[2]["tool_name"] == "terminal"
+    assert json.loads(rows[2]["tool_calls"]) == {
+        "name": "terminal",
+        "args": {"command": "echo ok"},
+        "preview": "echo ok",
+    }
+
+
+def test_stream_aiagent_subprocess_audits_text_only_done_finish_reason(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import sqlite3
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, "
+            "content TEXT, "
+            "reasoning TEXT, "
+            "tool_name TEXT, "
+            "tool_calls TEXT, "
+            "timestamp REAL NOT NULL)"
+        )
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps({"event": "content", "text": "plain answer"}).encode() + b"\n",
+                b'{"event": "done", "result": "plain answer", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 124
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    audit_path = tmp_path / "conversation-audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), profile_home)
+        ]
+
+    assert asyncio.run(collect_events()) == [
+        ("content", "plain answer"),
+        ("done", "plain answer"),
+    ]
+    rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+    assert [row["role"] for row in rows] == ["user", "assistant"]
+    assert rows[1]["content"] == "plain answer"
+    assert rows[1]["finish_reason"] == "stop"
+    assert rows[1]["tool_calls"] is None
+
+
 @pytest.mark.asyncio
 async def test_stream_aiagent_subprocess_wait_heartbeat_emits_pre_first_event_status(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real

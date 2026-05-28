@@ -2308,6 +2308,20 @@ async def _stream_aiagent_subprocess(
     _state_db_path = profile_home / "state.db"
     _source_for_display = getattr(event, "source", None)
     _preserve_reasoning_in_state = _resolve_platform_value(_source_for_display) != "webui"
+    try:
+        from .conversation_audit import (
+            append_conversation_audit_event as _append_conversation_audit_event,
+            build_conversation_audit_context as _build_conversation_audit_context,
+        )
+        _audit_context = _build_conversation_audit_context(event, profile_home)
+    except Exception:
+        logger.exception("[multitenancy] conversation audit context init failed")
+        _append_conversation_audit_event = None
+        _audit_context = {
+            "profile_name": Path(profile_home).name,
+            "platform": _resolve_platform_value(_source_for_display),
+            "chat_type": "",
+        }
 
     # ── Session-boundary epoch ────────────────────────────────────────────
     # The canonical session_id is keyed only by (chat_id, user_id), so it
@@ -2379,11 +2393,39 @@ async def _stream_aiagent_subprocess(
 
         def __init__(self) -> None:
             self.active_assistant_id: Optional[int] = None
+            self.active_assistant_timestamp: Optional[float] = None
             self.assistant_content: str = ""
             self.assistant_reasoning: str = ""
             self.session_ensured: bool = False
             self.user_inserted: bool = False
             self.retagged: bool = False
+
+        def _audit(
+            self,
+            *,
+            message_id: int | str | None,
+            role: str,
+            content: str | None,
+            timestamp: float,
+            tool_name: str | None = None,
+            tool_calls: str | None = None,
+            finish_reason: str | None = None,
+        ) -> None:
+            if _append_conversation_audit_event is None:
+                return
+            _append_conversation_audit_event(
+                profile_name=str(_audit_context.get("profile_name") or ""),
+                platform=str(_audit_context.get("platform") or ""),
+                chat_type=str(_audit_context.get("chat_type") or ""),
+                session_id=str(session_id),
+                message_id=message_id,
+                role=role,
+                content=content,
+                timestamp=timestamp,
+                tool_name=tool_name,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+            )
 
         def _conn(self):
             return _sqlite3.connect(str(_state_db_path), timeout=2.0)
@@ -2414,12 +2456,20 @@ async def _stream_aiagent_subprocess(
             self.ensure_session()
             try:
                 with closing(self._conn()) as conn, conn:
-                    conn.execute(
+                    ts = _time.time()
+                    cur = conn.execute(
                         "INSERT INTO messages (session_id, role, content, timestamp) "
                         "VALUES (?, 'user', ?, ?)",
-                        (str(session_id), text or "", _time.time()),
+                        (str(session_id), text or "", ts),
                     )
+                    message_id = cur.lastrowid
                 self.user_inserted = True
+                self._audit(
+                    message_id=message_id,
+                    role="user",
+                    content=text or "",
+                    timestamp=ts,
+                )
             except Exception:
                 logger.exception("[multitenancy] mirror insert_user failed")
 
@@ -2434,6 +2484,7 @@ async def _stream_aiagent_subprocess(
             try:
                 with closing(self._conn()) as conn, conn:
                     if self.active_assistant_id is None:
+                        ts = _time.time()
                         cur = conn.execute(
                             "INSERT INTO messages (session_id, role, content, reasoning, timestamp) "
                             "VALUES (?, 'assistant', ?, ?, ?)",
@@ -2445,10 +2496,11 @@ async def _stream_aiagent_subprocess(
                                     self.assistant_reasoning,
                                     preserve_reasoning=_preserve_reasoning_in_state,
                                 ),
-                                _time.time(),
+                                ts,
                             ),
                         )
                         self.active_assistant_id = cur.lastrowid
+                        self.active_assistant_timestamp = ts
                     else:
                         conn.execute(
                             "UPDATE messages SET content=?, reasoning=? WHERE id=?",
@@ -2465,8 +2517,17 @@ async def _stream_aiagent_subprocess(
             except Exception:
                 logger.exception("[multitenancy] mirror upsert_assistant failed")
 
-        def seal_assistant(self) -> None:
+        def seal_assistant(self, finish_reason: str | None = None) -> None:
+            if self.active_assistant_id is not None:
+                self._audit(
+                    message_id=self.active_assistant_id,
+                    role="assistant",
+                    content=self.assistant_content,
+                    timestamp=self.active_assistant_timestamp or _time.time(),
+                    finish_reason=finish_reason,
+                )
             self.active_assistant_id = None
+            self.active_assistant_timestamp = None
             self.assistant_content = ""
             self.assistant_reasoning = ""
 
@@ -2484,11 +2545,21 @@ async def _stream_aiagent_subprocess(
                 payload = None
             try:
                 with closing(self._conn()) as conn, conn:
-                    conn.execute(
+                    ts = _time.time()
+                    cur = conn.execute(
                         "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
                         "VALUES (?, 'assistant', '', ?, ?, ?)",
-                        (str(session_id), str(tool_name), payload, _time.time()),
+                        (str(session_id), str(tool_name), payload, ts),
                     )
+                    message_id = cur.lastrowid
+                self._audit(
+                    message_id=message_id,
+                    role="assistant",
+                    content="",
+                    timestamp=ts,
+                    tool_name=str(tool_name),
+                    tool_calls=payload,
+                )
             except Exception:
                 logger.exception("[multitenancy] mirror insert_tool_call failed")
 
@@ -2647,7 +2718,7 @@ async def _stream_aiagent_subprocess(
                 # Seal any trailing assistant chunk, retag source to feishu,
                 # and dedupe against whatever Hermes core's own end-of-run
                 # write inserted.
-                _mirror.seal_assistant()
+                _mirror.seal_assistant(finish_reason="stop")
                 _mirror.retag_source()
                 _mirror.dedupe()
                 yield "done", str(data.get("result") or "")
@@ -2672,7 +2743,7 @@ async def _stream_aiagent_subprocess(
                     # mirror the tool invocation. First tool-start is also
                     # the safest moment to retag — Hermes core has had time
                     # to insert the sessions row by now.
-                    _mirror.seal_assistant()
+                    _mirror.seal_assistant(finish_reason="tool_calls")
                     _mirror.insert_tool_call(
                         str(payload_data.get("name") or ""),
                         payload_data.get("preview"),
