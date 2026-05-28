@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -716,6 +717,118 @@ async def test_stream_aiagent_subprocess_forwards_child_approval_events(monkeypa
         }),
         ("done", "ok"),
     ]
+
+
+def test_stream_aiagent_subprocess_initializes_state_db_schema_for_fresh_profile(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    state_db = profile_home / "state.db"
+    assert not state_db.exists()
+    initialized_paths: list[Path] = []
+
+    class FakeSessionDB:
+        def __init__(self, db_path):
+            initialized_paths.append(Path(db_path))
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS sessions ("
+                    "id TEXT PRIMARY KEY, source TEXT, started_at REAL)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS messages ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "session_id TEXT, role TEXT, content TEXT, reasoning TEXT, "
+                    "tool_name TEXT, tool_calls TEXT, timestamp REAL)"
+                )
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_state",
+        SimpleNamespace(SessionDB=FakeSessionDB),
+    )
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "hello back"}\n',
+                b'{"event": "done", "result": "hello back", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        event = _event()
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(event, profile_home)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [("content", "hello back"), ("done", "hello back")]
+    assert initialized_paths == [state_db]
+    assert state_db.exists()
+    with sqlite3.connect(state_db) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {"sessions", "messages"} <= tables
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+        event = _event()
+        assert conn.execute("SELECT role, content FROM messages ORDER BY id").fetchall() == [
+            ("user", event.text),
+            ("assistant", "hello back"),
+        ]
 
 
 def test_stream_aiagent_subprocess_forwards_child_clarify_events(monkeypatch, tmp_path: Path):

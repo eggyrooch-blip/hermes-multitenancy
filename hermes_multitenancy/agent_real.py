@@ -2431,8 +2431,7 @@ async def _stream_aiagent_subprocess(
             return _sqlite3.connect(str(_state_db_path), timeout=2.0)
 
         def ensure_session(self) -> None:
-            if self.session_ensured or not _state_db_path.exists():
-                self.session_ensured = True
+            if self.session_ensured:
                 return
             try:
                 from hermes_state import SessionDB
