@@ -21,6 +21,7 @@ from .cron_worker import (
     ensure_cron_worker_started,
     install_cron_runtime_patches,
     install_gateway_startup_watcher,
+    install_profile_native_cron_guard,
 )
 from .credential_audit import run_startup_audit
 from .credential_renewal_worker import ensure_renewal_worker_started
@@ -99,6 +100,8 @@ def register(ctx) -> None:
         install_feishu_bot_added_hook()
         webui_broker_server.ensure_run_broker_server_started()
         _start_credential_renewal_subsystem()
+    else:
+        install_profile_native_cron_guard()
 
     register_credential_status_tool(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)

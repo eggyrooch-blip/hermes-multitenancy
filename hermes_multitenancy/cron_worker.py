@@ -33,6 +33,8 @@ import threading
 import time
 import uuid
 import copy
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
@@ -51,6 +53,11 @@ _cron_module_patch_lock = threading.Lock()
 _runtime_patches_installed = False
 _gateway_watcher_installed = False
 _watcher_attr = "_hermes_multitenancy_cron_watch_scheduled"
+_CRON_VISIBLE_RESPONSE_INSTRUCTION = (
+    "\n\n[Multitenancy cron delivery override: Do not respond with [SILENT]. "
+    "If there is nothing new to report, explicitly say that this run completed "
+    "and no matching item needed a reminder.]"
+)
 
 
 def ensure_cron_worker_started(gateway: Any) -> None:
@@ -103,6 +110,49 @@ def install_cron_runtime_patches() -> None:
     _patch_cron_delivery_mirror()
     _patch_feishu_open_id_send()
     _runtime_patches_installed = True
+
+
+def install_profile_native_cron_guard() -> None:
+    """Prevent non-router profile gateways from executing profile cron jobs.
+
+    The router-owned multi-profile worker scans all profile cron stores with
+    live Feishu adapters and RunBroker credentials. A non-router profile gateway
+    may still import upstream ``cron.scheduler``; if it ticks the same profile
+    store it can bypass RunBroker and then fail delivery. In multitenancy
+    profile layouts, make that native tick yield to the router unless explicitly
+    re-enabled for emergency diagnostics.
+    """
+    try:
+        import cron.scheduler as scheduler
+    except Exception:
+        logger.exception("[multitenancy] failed to patch profile native cron guard")
+        return
+
+    original = getattr(scheduler, "tick", None)
+    if original is None or getattr(original, "_hermes_multitenancy_profile_guard", False):
+        return
+
+    @functools.wraps(original)
+    def tick(*args: Any, **kwargs: Any) -> int:
+        profile_home = _current_profile_home()
+        if profile_home.parent.name == "profiles" and profile_home.name != "multitenancy_router":
+            if not _profile_native_cron_enabled():
+                logger.info(
+                    "[multitenancy] profile native cron tick skipped for %s; router worker owns cron execution",
+                    profile_home.name,
+                )
+                return 0
+            logger.warning(
+                "[multitenancy] profile native cron tick escape enabled for %s; "
+                "this bypasses router-owned RunBroker cron execution",
+                profile_home.name,
+            )
+        return original(*args, **kwargs)
+
+    setattr(tick, "_hermes_multitenancy_profile_guard", True)
+    setattr(tick, "_hermes_multitenancy_original", original)
+    scheduler.tick = tick
+    logger.info("[multitenancy] patched profile native cron tick guard")
 
 
 def install_gateway_startup_watcher() -> None:
@@ -217,6 +267,13 @@ def _patch_scheduler_owner_open_id_delivery() -> None:
 
 def _cron_run_broker_enabled() -> bool:
     value = os.environ.get("HERMES_MULTITENANCY_CRON_RUN_BROKER", "").strip().lower()
+    if not value:
+        return True
+    return value in {"1", "true", "yes", "on"}
+
+
+def _profile_native_cron_enabled() -> bool:
+    value = os.environ.get("HERMES_MULTITENANCY_PROFILE_NATIVE_CRON", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -594,6 +651,25 @@ def _build_cron_event(request: RunRequest) -> Any:
     )
 
 
+def _force_visible_cron_prompt(prompt: str) -> str:
+    text = str(prompt or "")
+    if "Do not respond with [SILENT]" in text:
+        return text
+    return text + _CRON_VISIBLE_RESPONSE_INSTRUCTION
+
+
+def _cron_response_is_silent(content: str) -> bool:
+    return "[SILENT]" in str(content or "").strip().upper()
+
+
+def _visible_cron_response(job: dict, content: str) -> str:
+    text = str(content or "").strip()
+    if text and not _cron_response_is_silent(text):
+        return text
+    job_name = str(job.get("name") or job.get("id") or "定时任务")
+    return f"定时任务「{job_name}」已执行完成：本次没有发现需要提醒的事项。"
+
+
 async def _dispatch_cron_request(request: RunRequest, profile_home: Path) -> str:
     from . import router
 
@@ -608,7 +684,7 @@ def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, 
     job_name = str(job.get("name") or job_id or "scheduled task")
     try:
         build_prompt = getattr(scheduler, "_build_job_prompt")
-        prompt = build_prompt(job, prerun_script=None)
+        prompt = _force_visible_cron_prompt(build_prompt(job, prerun_script=None))
         request = _build_cron_run_request(job, profile_home=profile_home, prompt=prompt)
         broker = RunBroker(
             dispatch_agent=lambda run_request: _dispatch_cron_request(run_request, profile_home),
@@ -616,7 +692,7 @@ def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, 
             in {"1", "true", "yes", "on"},
         )
         result = asyncio.run(broker.run(request))
-        final_response = result.content
+        final_response = _visible_cron_response(job, result.content)
         output = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
@@ -633,6 +709,99 @@ def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, 
             f"Error: {error}"
         )
         return False, output, "", error
+
+
+def _run_broker_base_url() -> str:
+    explicit = (
+        os.environ.get("HERMES_RUN_BROKER_URL")
+        or os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_URL")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit.rstrip("/")
+    host = os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_PORT", "8766").strip() or "8766"
+    return f"http://{host}:{port}"
+
+
+def _dotenv_lookup(path: Path, keys: set[str]) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip() in keys:
+            return value.strip().strip("'\"")
+    return ""
+
+
+def _run_broker_key_for_profile(profile_home: Path) -> str:
+    value = (
+        os.environ.get("HERMES_RUN_BROKER_KEY")
+        or os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_KEY")
+        or ""
+    ).strip()
+    if value:
+        return value
+    shared_home = _shared_home_for_profile(profile_home)
+    return _dotenv_lookup(
+        shared_home / ".env",
+        {"HERMES_RUN_BROKER_KEY", "HERMES_MULTITENANCY_RUN_BROKER_KEY"},
+    ).strip()
+
+
+def trigger_profile_cron_job_via_run_broker(
+    *,
+    job_id: str,
+    profile_home: Path,
+    owner_open_id: str,
+) -> dict[str, Any]:
+    """Forward native cronjob(action=run) to the router-owned RunBroker API."""
+    profile_home = Path(profile_home).expanduser().resolve()
+    profile_name = profile_home.name
+    owner = str(owner_open_id or "").strip()
+    if not _is_feishu_open_id(owner):
+        raise RuntimeError("cron owner_open_id is required for RunBroker trigger")
+    job = str(job_id or "").strip()
+    if not job:
+        raise RuntimeError("cron job_id is required for RunBroker trigger")
+
+    url = f"{_run_broker_base_url()}/api/run-broker/jobs/{job}/run"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hermes-Profile": profile_name,
+        "X-Hermes-User-Key": owner,
+    }
+    key = _run_broker_key_for_profile(profile_home)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    data = b"{}"
+    req = urllib_request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib_request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"RunBroker cron trigger failed ({exc.code}): {body}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"RunBroker cron trigger failed: {exc}") from exc
+
+    try:
+        payload = json.loads(body or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"RunBroker cron trigger returned invalid JSON: {body[:200]}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("RunBroker cron trigger returned invalid payload")
+    if payload.get("error"):
+        raise RuntimeError(f"RunBroker cron trigger failed: {payload.get('error')}")
+    result = payload.get("job") or payload
+    if not isinstance(result, dict):
+        raise RuntimeError("RunBroker cron trigger response did not include a job")
+    return result
 
 
 def _patch_cron_delivery_mirror() -> None:

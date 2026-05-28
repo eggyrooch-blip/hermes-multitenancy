@@ -735,7 +735,7 @@ def test_cron_delivery_patch_resolves_owner_open_id(monkeypatch):
 
 
 def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
-    """Opt-in cron run patch should execute due jobs through RunBroker."""
+    """Cron run patch should execute due jobs through RunBroker by default."""
     import sys
     import types
 
@@ -756,7 +756,7 @@ def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)
     monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
-    monkeypatch.setenv("HERMES_MULTITENANCY_CRON_RUN_BROKER", "1")
+    monkeypatch.delenv("HERMES_MULTITENANCY_CRON_RUN_BROKER", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "owner"))
 
     class FakeBroker:
@@ -790,13 +790,153 @@ def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
     assert request.channel == "cron"
     assert request.profile_name == "owner"
     assert request.user_key == "ou_owner"
-    assert request.content == "cron prompt: summarize"
+    assert request.content.startswith("cron prompt: summarize")
+    assert "Do not respond with [SILENT]" in request.content
     assert request.session_id == "cron:job123"
     assert request.credential_subject == "ou_owner"
     assert request.requires_host_tools is True
     assert request.metadata["job_id"] == "job123"
     assert request.metadata["model"] == "gpt-5.4"
     assert request.metadata["provider"] == "openai"
+
+
+def test_cron_run_broker_patch_makes_silent_response_visible(monkeypatch, tmp_path):
+    """Cron delivery must stay visible even when upstream prompt asks for [SILENT]."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+
+    def original_run_job(_job):
+        raise AssertionError("legacy cron run_job should not execute")
+
+    scheduler.run_job = original_run_job
+    scheduler._build_job_prompt = lambda job, prerun_script=None: f"cron prompt: {job['prompt']}"
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.delenv("HERMES_MULTITENANCY_CRON_RUN_BROKER", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "owner"))
+
+    class FakeBroker:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def run(self, request):
+            assert "Do not respond with [SILENT]" in request.content
+            return types.SimpleNamespace(content="  [silent].  ", duplicate=False, run_id="run_cron_1")
+
+    monkeypatch.setattr(cron_worker, "RunBroker", FakeBroker)
+    cron_worker._patch_cron_run_broker()
+
+    success, output, final_response, error = scheduler.run_job({
+        "id": "job123",
+        "name": "Daily summary",
+        "prompt": "summarize",
+        "deliver": "feishu",
+        "owner_open_id": "ou_owner",
+        "owner_profile": "owner",
+    })
+
+    assert success is True
+    assert error is None
+    assert "[SILENT]" not in final_response
+    assert "本次没有发现需要提醒的事项" in final_response
+    assert "**Run Path:** RunBroker" in output
+
+
+def test_profile_native_cron_tick_guard_yields_to_router(monkeypatch):
+    """Non-router profile gateways must not execute cron jobs natively."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    calls = []
+
+    def original_tick(*_args, **_kwargs):
+        calls.append("tick")
+        return 1
+
+    scheduler.tick = original_tick
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes/profiles/owner")
+    monkeypatch.delenv("HERMES_MULTITENANCY_PROFILE_NATIVE_CRON", raising=False)
+
+    cron_worker.install_profile_native_cron_guard()
+
+    assert scheduler.tick(verbose=False) == 0
+    assert calls == []
+
+
+def test_profile_native_cron_tick_escape_logs_warning(monkeypatch, caplog):
+    """Emergency native cron escape should be auditable in logs."""
+    import sys
+    import types
+    import logging
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    calls = []
+
+    def original_tick(*_args, **_kwargs):
+        calls.append("tick")
+        return 1
+
+    scheduler.tick = original_tick
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes/profiles/owner")
+    monkeypatch.setenv("HERMES_MULTITENANCY_PROFILE_NATIVE_CRON", "1")
+
+    cron_worker.install_profile_native_cron_guard()
+
+    with caplog.at_level(logging.WARNING):
+        assert scheduler.tick(verbose=False) == 1
+
+    assert calls == ["tick"]
+    assert "profile native cron tick escape enabled for owner" in caplog.text
+
+
+def test_cron_run_broker_trigger_http_error_is_loud(monkeypatch, tmp_path):
+    """Manual trigger forwarder must raise a visible error on broker auth/config failure."""
+    import io
+    from urllib.error import HTTPError
+
+    from hermes_multitenancy import cron_worker
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+    def fail_urlopen(_request, timeout=15):
+        assert timeout == 15
+        raise HTTPError(
+            url="http://127.0.0.1:8766/api/run-broker/jobs/job123/run",
+            code=401,
+            msg="Unauthorized",
+            hdrs={},
+            fp=io.BytesIO(b'{"error":"unauthorized"}'),
+        )
+
+    monkeypatch.setattr(cron_worker.urllib_request, "urlopen", fail_urlopen)
+
+    with pytest.raises(RuntimeError, match='RunBroker cron trigger failed \\(401\\): {"error":"unauthorized"}'):
+        cron_worker.trigger_profile_cron_job_via_run_broker(
+            job_id="job123",
+            profile_home=profile_home,
+            owner_open_id="ou_owner",
+        )
 
 
 def test_cron_run_request_rejects_missing_owner_and_router_profile(tmp_path):

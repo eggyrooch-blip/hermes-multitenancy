@@ -1163,6 +1163,82 @@ def test_configure_cron_home_patches_native_cronjob_create_with_owner(
     assert stored["job"]["owner_open_id"] == "ou_owner"
 
 
+def test_configure_cron_home_patches_native_cronjob_run_to_broker(
+    monkeypatch, tmp_path: Path
+):
+    """Native cronjob(action=run) should forward to router RunBroker jobs API."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import cron_worker
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    shared_home = tmp_path / ".hermes"
+    profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    tools_pkg = types.ModuleType("tools")
+    cronjob_tools = types.ModuleType("tools.cronjob_tools")
+    forwarded: list[dict[str, object]] = []
+
+    def create_job(**kwargs):
+        return {"id": "job123", **kwargs}
+
+    def update_job(job_id, updates):
+        return {"id": job_id, **updates}
+
+    def trigger_job(_job_id):
+        raise AssertionError("native cron trigger_job must not run locally")
+
+    def resolve_job_ref(job_id):
+        assert job_id == "job123"
+        return {
+            "id": "job123",
+            "name": "cron canary",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "owner",
+        }
+
+    def fake_forward(*, job_id, profile_home, owner_open_id):
+        forwarded.append({
+            "job_id": job_id,
+            "profile_home": profile_home,
+            "owner_open_id": owner_open_id,
+        })
+        return {
+            "id": job_id,
+            "name": "cron canary",
+            "owner_open_id": owner_open_id,
+            "owner_profile": profile_home.name,
+            "next_run_at": "now",
+        }
+
+    cronjob_tools.create_job = create_job
+    cronjob_tools.update_job = update_job
+    cronjob_tools.trigger_job = trigger_job
+    cronjob_tools.resolve_job_ref = resolve_job_ref
+    cron_pkg.jobs = cron_jobs
+    tools_pkg.cronjob_tools = cronjob_tools
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(cron_worker, "trigger_profile_cron_job_via_run_broker", fake_forward)
+
+    agent_real._configure_cron_home(shared_home)
+
+    job = cronjob_tools.trigger_job("job123")
+
+    assert job["owner_open_id"] == "ou_owner"
+    assert forwarded == [{
+        "job_id": "job123",
+        "profile_home": profile_home,
+        "owner_open_id": "ou_owner",
+    }]
+
+
 def test_configure_cron_home_binds_shared_in_legacy_layout(monkeypatch, tmp_path: Path):
     """Outside the multitenancy nested layout (e.g. single-profile or legacy
     deployments) the function still rebinds cron paths to the shared store."""

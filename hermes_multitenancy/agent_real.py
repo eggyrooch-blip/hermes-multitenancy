@@ -858,6 +858,7 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
 
     original_create_job = getattr(cronjob_tools, "create_job", None)
     original_update_job = getattr(cronjob_tools, "update_job", None)
+    original_trigger_job = getattr(cronjob_tools, "trigger_job", None)
     if original_create_job is None or original_update_job is None:
         return
 
@@ -895,8 +896,29 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
         refreshed = original_update_job(job_id, owner_updates)
         return refreshed or {**job, **owner_updates}
 
+    def trigger_job_via_run_broker(job_id: str) -> Any:
+        from . import cron_worker
+
+        resolver = getattr(cronjob_tools, "resolve_job_ref", None)
+        job = resolver(job_id) if callable(resolver) else None
+        if not isinstance(job, dict):
+            raise RuntimeError(
+                f"Cron job '{job_id}' not found. Use cronjob(action='list') to inspect jobs."
+            )
+        updates = _owner_updates(job)
+        owner_open_id = str(job.get("owner_open_id") or updates.get("owner_open_id") or "").strip()
+        if not owner_open_id.startswith("ou_"):
+            raise RuntimeError("cron owner_open_id is required for RunBroker trigger")
+        return cron_worker.trigger_profile_cron_job_via_run_broker(
+            job_id=str(job.get("id") or job_id),
+            profile_home=_profile_home(),
+            owner_open_id=owner_open_id,
+        )
+
     cronjob_tools.create_job = create_job_with_owner
     cronjob_tools.update_job = update_job_with_owner
+    if original_trigger_job is not None:
+        cronjob_tools.trigger_job = trigger_job_via_run_broker
     cronjob_tools._hermes_multitenancy_owner_patch = True
     logger.info("[multitenancy] patched native cronjob tool owner context")
 
