@@ -832,6 +832,83 @@ def test_cron_run_request_rejects_missing_owner_and_router_profile(tmp_path):
         )
 
 
+def test_cron_owner_context_backfill_repairs_legacy_feishu_job(tmp_path):
+    """Legacy Feishu cron jobs created before owner fields are repaired without running."""
+    from hermes_multitenancy import cron_worker
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "owner"
+    cron_dir = profile_home / "cron"
+    cron_dir.mkdir(parents=True)
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    jobs_file = cron_dir / "jobs.json"
+    jobs_file.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "job123",
+                        "name": "IT双周会前一天提醒",
+                        "prompt": "summarize",
+                        "deliver": "feishu",
+                        "origin": {"platform": "feishu", "chat_id": "oc_dm"},
+                        "next_run_at": "2026-05-28T10:00:00+08:00",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = cron_worker.backfill_cron_owner_context_for_profile(profile_home)
+    repaired = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+
+    assert result["checked"] == 1
+    assert result["updated"] == 1
+    assert repaired["owner_open_id"] == "ou_owner"
+    assert repaired["owner_profile"] == "owner"
+    assert repaired["prompt"] == "summarize"
+    assert repaired["next_run_at"] == "2026-05-28T10:00:00+08:00"
+
+    plan = cron_worker.plan_cron_bridge_run(repaired, profile_home=profile_home, due=True)
+    assert plan["would_execute"] is True
+    assert plan["problems"] == []
+    assert plan["deliver_target"] == {"platform": "feishu", "chat_id": "ou_owner", "thread_id": None}
+
+
+def test_cron_plan_infers_owner_without_persisting_when_route_exists(tmp_path):
+    """RunBroker planning can repair old in-memory job dicts before JSON backfill runs."""
+    from hermes_multitenancy import cron_worker
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+
+    plan = cron_worker.plan_cron_bridge_run(
+        {
+            "id": "job123",
+            "name": "legacy",
+            "prompt": "summarize",
+            "deliver": "feishu",
+        },
+        profile_home=profile_home,
+        due=True,
+        shadow=True,
+    )
+
+    assert plan["would_execute"] is True
+    assert plan["user_key"] == "ou_owner"
+    assert plan["credential_subject"] == "ou_owner"
+    assert plan["deliver_target"] == {"platform": "feishu", "chat_id": "ou_owner", "thread_id": None}
+    assert plan["problems"] == []
+
+
 def test_cron_bridge_shadow_plan_is_secret_free_and_non_executing(tmp_path):
     """Shadow mode should explain the cron route without dispatching or leaking secrets."""
     from hermes_multitenancy import cron_worker

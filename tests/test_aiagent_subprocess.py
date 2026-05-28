@@ -1116,6 +1116,53 @@ def test_configure_cron_home_skips_binding_in_multitenancy_layout(monkeypatch, t
     assert cron_jobs.OUTPUT_DIR is sentinel_output
 
 
+def test_configure_cron_home_patches_native_cronjob_create_with_owner(
+    monkeypatch, tmp_path: Path
+):
+    """Feishu-created native cron jobs persist owner context at creation time."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "owner"
+    shared_home = tmp_path / ".hermes"
+    profile_home.mkdir(parents=True)
+    shared_home.mkdir(exist_ok=True)
+
+    cron_pkg = types.ModuleType("cron")
+    cron_jobs = types.ModuleType("cron.jobs")
+    tools_pkg = types.ModuleType("tools")
+    cronjob_tools = types.ModuleType("tools.cronjob_tools")
+    stored: dict[str, object] = {}
+
+    def create_job(**kwargs):
+        stored["job"] = {"id": "job123", **kwargs}
+        return dict(stored["job"])
+
+    def update_job(job_id, updates):
+        assert job_id == "job123"
+        stored["job"].update(updates)
+        return dict(stored["job"])
+
+    cronjob_tools.create_job = create_job
+    cronjob_tools.update_job = update_job
+    cron_pkg.jobs = cron_jobs
+    tools_pkg.cronjob_tools = cronjob_tools
+
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_owner")
+
+    agent_real._configure_cron_home(shared_home)
+
+    job = cronjob_tools.create_job(prompt="check calendar", schedule="0 10 * * *", deliver="feishu")
+
+    assert job["owner_open_id"] == "ou_owner"
+    assert job["owner_profile"] == "owner"
+    assert stored["job"]["owner_open_id"] == "ou_owner"
+
+
 def test_configure_cron_home_binds_shared_in_legacy_layout(monkeypatch, tmp_path: Path):
     """Outside the multitenancy nested layout (e.g. single-profile or legacy
     deployments) the function still rebinds cron paths to the shared store."""

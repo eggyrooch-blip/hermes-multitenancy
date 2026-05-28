@@ -31,6 +31,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import copy
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
@@ -265,6 +266,146 @@ def _resolve_shared_home() -> Path:
     return profile_home
 
 
+def _is_feishu_open_id(value: Any) -> bool:
+    return str(value or "").strip().startswith("ou_")
+
+
+def _shared_home_for_profile(profile_home: Path) -> Path:
+    profile_home = Path(profile_home).expanduser().resolve()
+    if profile_home.parent.name == "profiles":
+        return profile_home.parent.parent
+    return _resolve_shared_home()
+
+
+def _routing_owner_for_profile(profile_home: Path) -> tuple[str, str]:
+    """Infer (owner_open_id, owner_profile) from the active routing table."""
+    profile_home = Path(profile_home).expanduser().resolve()
+    shared_home = _shared_home_for_profile(profile_home)
+    db_path = shared_home / "multitenancy.db"
+    if not db_path.is_file():
+        return "", ""
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT open_id, owner_open_id, profile_name, kind, provenance "
+                "FROM multitenancy_routing "
+                "WHERE profile_name = ? AND active = 1 "
+                "ORDER BY (kind = 'user') DESC, (provenance = 'sync') DESC, updated_at DESC "
+                "LIMIT 1",
+                (profile_home.name,),
+            ).fetchone()
+            if row is None:
+                return "", ""
+            owner = str(row["owner_open_id"] or row["open_id"] or "").strip()
+            owner_profile = str(row["profile_name"] or profile_home.name).strip()
+            return (owner if _is_feishu_open_id(owner) else "", owner_profile)
+    except Exception:
+        logger.debug("[multitenancy] cron owner route lookup failed", exc_info=True)
+        return "", ""
+
+
+def _session_owner_open_id() -> str:
+    for key in ("HERMES_FEISHU_USER_OPEN_ID", "HERMES_SESSION_USER_ID"):
+        value = str(os.environ.get(key) or "").strip()
+        if _is_feishu_open_id(value):
+            return value
+    return ""
+
+
+def infer_cron_owner_context(job: dict, *, profile_home: Path) -> dict[str, str]:
+    """Return inferred owner context for a cron job without mutating it."""
+    owner = str(job.get("owner_open_id") or "").strip()
+    owner_profile = str(job.get("owner_profile") or "").strip()
+    if not _is_feishu_open_id(owner):
+        owner = _session_owner_open_id()
+    if not _is_feishu_open_id(owner):
+        owner, routed_profile = _routing_owner_for_profile(profile_home)
+        if not owner_profile:
+            owner_profile = routed_profile
+    if not _is_feishu_open_id(owner):
+        return {}
+    if not owner_profile:
+        owner_profile = Path(profile_home).expanduser().name
+    return {"owner_open_id": owner, "owner_profile": owner_profile}
+
+
+def with_cron_owner_context(job: dict, *, profile_home: Path) -> dict:
+    """Return a copy of ``job`` with inferred owner context filled in."""
+    context = infer_cron_owner_context(job, profile_home=profile_home)
+    if not context:
+        return dict(job)
+    updated = dict(job)
+    updated.setdefault("owner_open_id", context["owner_open_id"])
+    updated.setdefault("owner_profile", context["owner_profile"])
+    if not _is_feishu_open_id(updated.get("owner_open_id")):
+        updated["owner_open_id"] = context["owner_open_id"]
+    if not str(updated.get("owner_profile") or "").strip():
+        updated["owner_profile"] = context["owner_profile"]
+    return updated
+
+
+def backfill_cron_owner_context_for_profile(profile_home: Path) -> dict[str, Any]:
+    """Persist missing owner fields for legacy profile cron jobs.
+
+    This is metadata-only: it never changes prompt/schedule/enabled/run state and
+    never executes or delivers a job.
+    """
+    profile_home = Path(profile_home).expanduser().resolve()
+    jobs_file = profile_home / "cron" / "jobs.json"
+    if not jobs_file.is_file():
+        return {"checked": 0, "updated": 0, "path": str(jobs_file)}
+    try:
+        raw = json.loads(jobs_file.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("[multitenancy] failed to read cron jobs for owner backfill: %s", jobs_file)
+        return {"checked": 0, "updated": 0, "path": str(jobs_file), "error": "read_failed"}
+    if isinstance(raw, dict):
+        jobs = raw.get("jobs")
+    else:
+        jobs = raw
+    if not isinstance(jobs, list):
+        return {"checked": 0, "updated": 0, "path": str(jobs_file), "error": "invalid_shape"}
+
+    changed = False
+    updated_count = 0
+    new_jobs = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            new_jobs.append(job)
+            continue
+        checked_job = with_cron_owner_context(job, profile_home=profile_home)
+        if (
+            checked_job.get("owner_open_id") != job.get("owner_open_id")
+            or checked_job.get("owner_profile") != job.get("owner_profile")
+        ):
+            changed = True
+            updated_count += 1
+            logger.info(
+                "[multitenancy] backfilled cron owner context profile=%s job=%s owner=%s",
+                profile_home.name,
+                checked_job.get("id") or "",
+                checked_job.get("owner_open_id") or "",
+            )
+        new_jobs.append(checked_job)
+
+    if not changed:
+        return {"checked": len(jobs), "updated": 0, "path": str(jobs_file)}
+    new_raw = copy.deepcopy(raw)
+    if isinstance(new_raw, dict):
+        new_raw["jobs"] = new_jobs
+    else:
+        new_raw = new_jobs
+    tmp = jobs_file.with_suffix(jobs_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(new_raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, jobs_file)
+    try:
+        os.chmod(jobs_file, 0o600)
+    except OSError:
+        pass
+    return {"checked": len(jobs), "updated": updated_count, "path": str(jobs_file)}
+
+
 def _l4_check_needs_reauth_and_defer(
     job: dict,
 ) -> Optional[tuple[bool, str, str, Optional[str]]]:
@@ -332,6 +473,7 @@ def _cron_user_key(job: dict, profile_name: str) -> str:
 
 
 def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> RunRequest:
+    job = with_cron_owner_context(job, profile_home=profile_home)
     profile_name = str(job.get("owner_profile") or "").strip() or profile_home.name
     if profile_name == "multitenancy_router":
         raise ValueError("cron owner_profile must not be multitenancy_router")
@@ -390,22 +532,23 @@ def plan_cron_bridge_run(
     job_id = str(job.get("id") or "").strip()
     problems: list[str] = []
     request: Optional[RunRequest] = None
+    planned_job = with_cron_owner_context(job, profile_home=profile_home)
     try:
         request = _build_cron_run_request(
-            job,
+            planned_job,
             profile_home=profile_home,
             prompt=str(job.get("prompt") or "cron bridge shadow prompt"),
         )
     except Exception as exc:
         problems.append(str(exc))
 
-    profile_name = request.profile_name if request is not None else str(job.get("owner_profile") or profile_home.name)
-    user_key = request.user_key if request is not None else str(job.get("owner_open_id") or "")
+    profile_name = request.profile_name if request is not None else str(planned_job.get("owner_profile") or profile_home.name)
+    user_key = request.user_key if request is not None else str(planned_job.get("owner_open_id") or "")
     enabled = bool(job.get("enabled", True)) and str(job.get("state") or "scheduled").strip().lower() != "paused"
     due_value = bool(due) if due is not None else enabled
     would_execute = bool(request is not None and enabled and due_value and not problems)
-    deliver_target = _cron_deliver_target(job, user_key) if request is not None else None
-    if would_execute and str(job.get("deliver") or "feishu").strip().lower() != "local" and deliver_target is None:
+    deliver_target = _cron_deliver_target(planned_job, user_key) if request is not None else None
+    if would_execute and str(planned_job.get("deliver") or "feishu").strip().lower() != "local" and deliver_target is None:
         problems.append("cron deliver target could not be resolved")
         would_execute = False
 
@@ -420,7 +563,7 @@ def plan_cron_bridge_run(
         "channel": "cron",
         "session_id": request.session_id if request is not None else None,
         "idempotency_key": request.effective_idempotency_key if request is not None else None,
-        "deliver": job.get("deliver") or "feishu",
+        "deliver": planned_job.get("deliver") or "feishu",
         "deliver_target": deliver_target,
         "next_run_at": job.get("next_run_at") or job.get("next_run"),
         "enabled": enabled,
@@ -459,6 +602,7 @@ async def _dispatch_cron_request(request: RunRequest, profile_home: Path) -> str
 
 def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, Optional[str]]:
     profile_home = _current_profile_home()
+    job = with_cron_owner_context(job, profile_home=profile_home)
     job_id = str(job.get("id") or "")
     job_name = str(job.get("name") or job_id or "scheduled task")
     try:
@@ -683,6 +827,7 @@ def _multiprofile_cron_worker(
                 jobs_file = profile_dir / "cron" / "jobs.json"
                 if not jobs_file.exists():
                     continue
+                backfill_cron_owner_context_for_profile(profile_dir)
                 _tick_one_profile(
                     cron_jobs,
                     cron_scheduler,

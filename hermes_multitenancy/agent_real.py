@@ -793,6 +793,7 @@ def _configure_cron_home(shared_home: Path) -> None:
     if current_home:
         current_path = Path(current_home).expanduser()
         if current_path.parent.name == "profiles":
+            _install_profile_cron_owner_patch(current_path)
             logger.info(
                 "[multitenancy] cron jobs stay in profile-default location: %s/cron/",
                 current_path,
@@ -832,6 +833,7 @@ def _configure_cron_home(shared_home: Path) -> None:
             return None
 
         cronjob_tools._validate_cron_script_path = _validate_shared_cron_script_path
+        _install_profile_cron_owner_patch(shared_home)
         logger.info("[multitenancy] cron jobs bound to shared Hermes home: %s", cron_jobs.JOBS_FILE)
     except Exception as exc:
         logger.warning("[multitenancy] failed to bind cron jobs to shared Hermes home: %s", exc)
@@ -840,6 +842,63 @@ def _configure_cron_home(shared_home: Path) -> None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = old_home
+
+
+def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
+    """Patch native cronjob tools so Feishu-created jobs persist owner context."""
+    import importlib
+
+    try:
+        cronjob_tools = importlib.import_module("tools.cronjob_tools")
+    except Exception:
+        logger.debug("[multitenancy] cronjob owner patch skipped", exc_info=True)
+        return
+    if getattr(cronjob_tools, "_hermes_multitenancy_owner_patch", False):
+        return
+
+    original_create_job = getattr(cronjob_tools, "create_job", None)
+    original_update_job = getattr(cronjob_tools, "update_job", None)
+    if original_create_job is None or original_update_job is None:
+        return
+
+    def _profile_home() -> Path:
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        return Path(raw).expanduser() if raw else Path(default_profile_home).expanduser()
+
+    def _owner_updates(job: dict) -> dict[str, str]:
+        from .cron_worker import infer_cron_owner_context
+
+        return infer_cron_owner_context(job, profile_home=_profile_home())
+
+    def create_job_with_owner(*args: Any, **kwargs: Any) -> Any:
+        job = original_create_job(*args, **kwargs)
+        if not isinstance(job, dict):
+            return job
+        updates = _owner_updates(job)
+        if not updates:
+            return job
+        updated = original_update_job(job["id"], updates)
+        return updated or {**job, **updates}
+
+    def update_job_with_owner(job_id: str, updates: dict[str, Any]) -> Any:
+        job = original_update_job(job_id, updates)
+        if not isinstance(job, dict):
+            return job
+        owner_updates = _owner_updates(job)
+        if not owner_updates:
+            return job
+        if (
+            job.get("owner_open_id") == owner_updates.get("owner_open_id")
+            and job.get("owner_profile") == owner_updates.get("owner_profile")
+        ):
+            return job
+        refreshed = original_update_job(job_id, owner_updates)
+        return refreshed or {**job, **owner_updates}
+
+    cronjob_tools.create_job = create_job_with_owner
+    cronjob_tools.update_job = update_job_with_owner
+    cronjob_tools._hermes_multitenancy_owner_patch = True
+    logger.info("[multitenancy] patched native cronjob tool owner context")
 
 
 def _log_aiagent_tool_progress(
