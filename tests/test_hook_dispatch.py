@@ -988,6 +988,207 @@ def test_cron_delivery_mirror_persists_owner_context(tmp_path, monkeypatch):
         store.close()
 
 
+def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missing(monkeypatch):
+    """Multitenancy Feishu cron delivery must use the live adapter when native config lacks Feishu."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    sent = []
+
+    def original_deliver(_job, _content, adapters=None, loop=None):
+        return "platform 'feishu' not configured/enabled"
+
+    def resolve_targets(_job):
+        return [{"platform": "feishu", "chat_id": "oc_target", "thread_id": None}]
+
+    scheduler._deliver_result = original_deliver
+    scheduler._resolve_delivery_targets = resolve_targets
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    class Adapter:
+        async def send(self, chat_id, text, metadata=None):
+            sent.append((chat_id, text, metadata))
+            return types.SimpleNamespace(success=True)
+
+    def run_now(coro, _loop):
+        result = asyncio.run(coro)
+        return types.SimpleNamespace(result=lambda timeout=None: result, cancel=lambda: None)
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "name": "IT reminder", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        "cron body",
+        adapters={"feishu": Adapter()},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error is None
+    assert len(sent) == 1
+    assert sent[0][0] == "oc_target"
+    assert "Cronjob Response: IT reminder" in sent[0][1]
+    assert "cron body" in sent[0][1]
+
+
+def test_cron_delivery_patch_does_not_double_send_after_native_success(monkeypatch):
+    """Native delivery success must stay the only send path."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    sent = []
+
+    scheduler._deliver_result = lambda _job, _content, adapters=None, loop=None: None
+    scheduler._resolve_delivery_targets = lambda _job: [{"platform": "feishu", "chat_id": "oc_target"}]
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    class Adapter:
+        async def send(self, chat_id, text, metadata=None):
+            sent.append((chat_id, text, metadata))
+            return types.SimpleNamespace(success=True)
+
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "name": "Daily digest", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        "cron body",
+        adapters={"feishu": Adapter()},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error is None
+    assert sent == []
+
+
+def test_cron_delivery_patch_preserves_error_without_live_adapter(monkeypatch):
+    """Missing live adapter is not hidden as a successful cron delivery."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    original_error = "platform 'feishu' not configured/enabled"
+    scheduler._deliver_result = lambda _job, _content, adapters=None, loop=None: original_error
+    scheduler._resolve_delivery_targets = lambda _job: [{"platform": "feishu", "chat_id": "oc_target"}]
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "name": "Daily digest", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        "cron body",
+        adapters={},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert original_error in error
+    assert "feishu live adapter unavailable" in error
+
+
+def test_cron_delivery_patch_filters_thread_id_for_feishu_dm(monkeypatch):
+    """Fallback must not pass stale thread_id metadata to Feishu open_id DMs."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    sent = []
+
+    scheduler._deliver_result = lambda _job, _content, adapters=None, loop=None: "platform 'feishu' not configured/enabled"
+    scheduler._resolve_delivery_targets = lambda _job: [{"platform": "feishu", "chat_id": "ou_owner", "thread_id": "omt_stale"}]
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    class Adapter:
+        async def send(self, chat_id, text, metadata=None):
+            sent.append((chat_id, metadata))
+            return types.SimpleNamespace(success=True)
+
+    def run_now(coro, _loop):
+        result = asyncio.run(coro)
+        return types.SimpleNamespace(result=lambda timeout=None: result, cancel=lambda: None)
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "name": "Daily digest", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        "cron body",
+        adapters={"feishu": Adapter()},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error is None
+    assert sent == [("ou_owner", None)]
+
+
+def test_cron_delivery_patch_handles_media_branch_without_name_error(monkeypatch):
+    """A successful media fallback must not fail because of local bookkeeping."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    sent = []
+    media_sent = []
+
+    scheduler._deliver_result = lambda _job, _content, adapters=None, loop=None: "platform 'feishu' not configured/enabled"
+    scheduler._resolve_delivery_targets = lambda _job: [{"platform": "feishu", "chat_id": "oc_target", "thread_id": None}]
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setattr(cron_worker, "_cron_delivery_payload_for_adapter", lambda _job, _content: ("text body", [("/tmp/a.png", False)]))
+    monkeypatch.setattr(
+        cron_worker,
+        "_send_media_files_via_live_adapter",
+        lambda _adapter, chat_id, media_files, _metadata, _loop, _job: media_sent.append((chat_id, media_files)) or None,
+    )
+
+    class Adapter:
+        async def send(self, chat_id, text, metadata=None):
+            sent.append((chat_id, text, metadata))
+            return types.SimpleNamespace(success=True)
+
+    def run_now(coro, _loop):
+        result = asyncio.run(coro)
+        return types.SimpleNamespace(result=lambda timeout=None: result, cancel=lambda: None)
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "name": "Media digest", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        "cron body",
+        adapters={"feishu": Adapter()},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error is None
+    assert sent == [("oc_target", "text body", None)]
+    assert media_sent == [("oc_target", [("/tmp/a.png", False)])]
+
+
 def test_cron_worker_reads_active_profiles_from_routing_db(tmp_path):
     """Inactive historical profiles should not be scanned for cron jobs."""
     import sqlite3

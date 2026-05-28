@@ -23,6 +23,7 @@ a duplicate-tick attempt that resolves into a no-op.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FuturesTimeout
 import functools
 import json
 import logging
@@ -648,6 +649,23 @@ def _patch_cron_delivery_mirror() -> None:
     @functools.wraps(original)
     def deliver_result(job: dict, content: str, adapters: Any = None, loop: Any = None) -> Optional[str]:
         error = original(job, content, adapters=adapters, loop=loop)
+        if error is not None and _is_feishu_platform_config_error(error):
+            live_error = _deliver_cron_feishu_via_live_adapter(
+                scheduler,
+                job,
+                content,
+                adapters=adapters,
+                loop=loop,
+            )
+            if live_error is None:
+                _mirror_cron_delivery_to_owner(job, content)
+                return None
+            logger.warning(
+                "[multitenancy] cron live Feishu delivery fallback failed job=%s: %s",
+                job.get("id", "?"),
+                live_error,
+            )
+            return f"{error}; live Feishu fallback failed: {live_error}"
         if error is None:
             _mirror_cron_delivery_to_owner(job, content)
         return error
@@ -655,6 +673,203 @@ def _patch_cron_delivery_mirror() -> None:
     setattr(deliver_result, "_hermes_multitenancy_patched", True)
     scheduler._deliver_result = deliver_result
     logger.info("[multitenancy] patched cron delivery mirror to owner session")
+
+
+def _is_feishu_platform_config_error(error: object) -> bool:
+    text = str(error or "").lower()
+    return "platform 'feishu' not configured/enabled" in text
+
+
+def _deliver_cron_feishu_via_live_adapter(
+    scheduler: Any,
+    job: dict,
+    content: str,
+    *,
+    adapters: Any = None,
+    loop: Any = None,
+) -> Optional[str]:
+    """Fallback for multitenancy gateways where Feishu exists only as a live adapter."""
+    if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
+        return "feishu live adapter unavailable"
+    try:
+        targets = scheduler._resolve_delivery_targets(job)
+    except Exception as exc:
+        return f"failed to resolve feishu delivery target: {exc}"
+
+    feishu_targets = [
+        target for target in targets
+        if str(target.get("platform") or "").strip().lower() == "feishu"
+    ]
+    if not feishu_targets:
+        return "no feishu delivery target resolved"
+
+    adapter = _adapter_for_platform(adapters, "feishu")
+    if adapter is None:
+        return "feishu live adapter unavailable"
+
+    text_to_send, media_files = _cron_delivery_payload_for_adapter(job, content)
+    errors: list[str] = []
+    for target in feishu_targets:
+        chat_id = str(target.get("chat_id") or "").strip()
+        if not chat_id:
+            errors.append("missing feishu chat_id")
+            continue
+        thread_id = target.get("thread_id")
+        metadata = _feishu_delivery_metadata(chat_id, thread_id)
+        try:
+            if text_to_send:
+                future, schedule_error = _schedule_on_gateway_loop(
+                    adapter.send(chat_id, text_to_send, metadata=metadata),
+                    loop,
+                )
+                if schedule_error:
+                    errors.append(schedule_error)
+                    continue
+                if future is None:
+                    errors.append(f"feishu live adapter loop unavailable for {chat_id}")
+                    continue
+                try:
+                    result = future.result(timeout=15)
+                except FuturesTimeout:
+                    future.cancel()
+                    raise
+                if result and not getattr(result, "success", True):
+                    errors.append(
+                        f"feishu live adapter send failed for {chat_id}: "
+                        f"{getattr(result, 'error', 'unknown')}"
+                    )
+                    continue
+            if media_files:
+                media_error = _send_media_files_via_live_adapter(
+                    adapter,
+                    chat_id,
+                    media_files,
+                    metadata,
+                    loop,
+                    job,
+                )
+                if media_error:
+                    errors.append(media_error)
+                    continue
+            logger.info(
+                "[multitenancy] cron delivered to feishu:%s via live adapter job=%s",
+                chat_id,
+                job.get("id", "?"),
+            )
+        except Exception as exc:
+            errors.append(f"feishu live adapter delivery to {chat_id} failed: {exc}")
+    return "; ".join(errors) if errors else None
+
+
+def _schedule_on_gateway_loop(coro: Any, loop: Any) -> tuple[Any, Optional[str]]:
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+    except Exception as exc:
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        return None, f"safe_schedule_threadsafe unavailable: {exc}"
+    try:
+        return safe_schedule_threadsafe(coro, loop), None
+    except Exception as exc:
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        return None, f"failed to schedule Feishu live adapter send: {exc}"
+
+
+def _feishu_delivery_metadata(chat_id: str, thread_id: Any) -> Optional[dict]:
+    if not thread_id:
+        return None
+    # Feishu DMs (`ou_...`) should not receive topic metadata; stale thread_id
+    # can create visible topic replies in one-to-one chats.
+    if str(chat_id).startswith("ou_"):
+        return None
+    return {"thread_id": thread_id}
+
+
+def _adapter_for_platform(adapters: Any, platform_name: str) -> Any:
+    if not adapters:
+        return None
+    target = platform_name.lower()
+    try:
+        from gateway.config import Platform
+
+        platform = Platform(target)
+        adapter = adapters.get(platform)
+        if adapter is not None:
+            return adapter
+    except Exception:
+        pass
+    for key, adapter in adapters.items():
+        candidates = {
+            str(key).lower(),
+            str(getattr(key, "value", "")).lower(),
+            str(getattr(key, "name", "")).lower(),
+        }
+        if target in candidates or any(candidate.endswith(f".{target}") for candidate in candidates):
+            return adapter
+    return None
+
+
+def _cron_delivery_payload_for_adapter(job: dict, content: str) -> tuple[str, list]:
+    wrap_response = True
+    try:
+        from cron.config import load_config
+
+        user_cfg = load_config()
+        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+    except Exception:
+        pass
+
+    if wrap_response:
+        task_name = job.get("name", job.get("id", "scheduled task"))
+        job_id = job.get("id", "")
+        delivery_content = (
+            f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job_id})\n"
+            f"-------------\n\n"
+            f"{content}\n\n"
+            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+        )
+    else:
+        delivery_content = content
+
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media_files, cleaned = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        return cleaned.strip(), media_files
+    except Exception:
+        return delivery_content.strip(), []
+
+
+def _send_media_files_via_live_adapter(
+    adapter: Any,
+    chat_id: str,
+    media_files: list,
+    metadata: Optional[dict],
+    loop: Any,
+    job: dict,
+) -> Optional[str]:
+    try:
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        scheduler._send_media_via_adapter(
+            adapter,
+            chat_id,
+            media_files,
+            metadata,
+            loop,
+            job,
+            platform=Platform("feishu"),
+        )
+        return None
+    except Exception:
+        logger.warning("[multitenancy] cron media delivery via live Feishu adapter failed", exc_info=True)
+        return f"cron media delivery via live Feishu adapter failed job={job.get('id', '?')}"
 
 
 def _mirror_cron_delivery_to_owner(job: dict, content: str) -> None:
