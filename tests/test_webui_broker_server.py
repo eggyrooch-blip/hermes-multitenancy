@@ -1164,6 +1164,39 @@ def test_webui_run_broker_endpoint_rejects_missing_bearer_key(monkeypatch):
     asyncio.run(runner())
 
 
+def test_webui_run_broker_health_endpoint_requires_bearer_and_no_owner(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            missing = await client.get("/api/run-broker/health")
+            authorized = await client.get("/api/run-broker/health", headers={
+                "Authorization": "Bearer broker-secret",
+            })
+            body = await authorized.json()
+        finally:
+            await client.close()
+
+        assert missing.status == 401
+        assert authorized.status == 200
+        assert body == {
+            "ok": True,
+            "service": "hermes-multitenancy-run-broker",
+        }
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_event_preserves_webui_session_boundary():
     from hermes_multitenancy.agent_real import _resolve_aiagent_session_id
     from hermes_multitenancy.webui_broker_server import _build_webui_event

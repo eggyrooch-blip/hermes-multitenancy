@@ -1743,7 +1743,16 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI skill audit failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_health(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response({
+            "ok": True,
+            "service": "hermes-multitenancy-run-broker",
+        })
+
     app = web.Application(client_max_size=_run_broker_client_max_size())
+    app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/session-commands", handle_session_command)
