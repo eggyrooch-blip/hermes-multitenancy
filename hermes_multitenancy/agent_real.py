@@ -1205,7 +1205,9 @@ def _build_subprocess_env(
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
-    env.update(_lark_cli_sidecar_env_for_aiagent(profile_home))
+    lark_cli_env = _lark_cli_sidecar_env_for_aiagent(profile_home)
+    env.update(lark_cli_env)
+    env.update(_force_env_for_terminal_passthrough(lark_cli_env))
     env.update(_browser_env_for_aiagent(profile_home))
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"

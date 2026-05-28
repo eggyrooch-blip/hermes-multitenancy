@@ -2791,6 +2791,34 @@ def test_build_subprocess_env_wires_lark_cli_sidecar_without_tokens(monkeypatch,
     assert "FEISHU_UAT_ACCESS_TOKEN" not in env
 
 
+def test_build_subprocess_env_force_passes_lark_cli_sidecar_to_terminal(monkeypatch, tmp_path: Path):
+    """Terminal-run lark-cli must receive authsidecar env after Hermes' env scrub."""
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_LARK_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("HERMES_LARK_CLI_PROXY_KEY", "short-lived-key")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["_HERMES_FORCE_HERMES_LARK_CLI_BIN"] == str(lark_cli)
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:16384"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_PROXY_KEY"] == "short-lived-key"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_APP_ID"] == "cli_public"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_BRAND"] == "feishu"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_DEFAULT_AS"] == "bot"
+    assert env["_HERMES_FORCE_LARKSUITE_CLI_STRICT_MODE"] == "off"
+
+
 def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch, tmp_path: Path):
     """Each AIAgent run gets a short-lived sidecar key and localhost broker."""
     from hermes_multitenancy import agent_real
