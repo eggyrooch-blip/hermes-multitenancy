@@ -76,6 +76,31 @@ _PROFILE_DIRS = [
 ]
 _SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
 _SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
+_SKILL_SOURCE_FILE_SUFFIXES = (
+    ".py",
+    ".pyi",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".rb",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".php",
+    ".pl",
+    ".lua",
+    ".md",
+    ".txt",
+)
 _SKILL_LINKED_DEP_DIRS = {"node_modules"}
 _SKILL_IGNORED_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
 _SHARED_SKILL_SYMLINK_PREFIXES = ("lark-",)
@@ -1365,6 +1390,8 @@ def _is_secret_skill_file(rel_path: Path) -> bool:
         return True
     if name.endswith((".token", ".secret", ".key")):
         return True
+    if name.endswith(_SKILL_SOURCE_FILE_SUFFIXES):
+        return False
     return any(part in name for part in _SKILL_SECRET_NAME_PARTS)
 
 

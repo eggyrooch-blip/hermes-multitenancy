@@ -4340,3 +4340,40 @@ def test_bwrap_default_args_masks_profile_and_shared_secret_files():
         "/probe/shared/auth.json",
     ):
         assert ("--ro-bind-try", "/dev/null", secret_path) in triples
+
+
+def test_wrap_linux_bwrap_binds_token_named_source_script_skill(monkeypatch, tmp_path: Path):
+    """Runtime helper source files are not credential files just because their name contains token."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "skills" / "Keep" / "keep-login-skill"
+    scripts = skill_source / "scripts"
+    scripts.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Keep Login Skill\n", encoding="utf-8")
+    (scripts / "get_bearer_token.py").write_text("print('runtime helper')\n", encoding="utf-8")
+    skill_link = profile / "skills" / "Keep" / "keep-login-skill"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+
+

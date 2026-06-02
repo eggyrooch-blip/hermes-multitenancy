@@ -1175,6 +1175,43 @@ skills:
     assert entry["secret_guard"] == "copy_filtered"
 
 
+def test_symlink_distribution_keeps_token_named_source_scripts(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    skill_source = shared_home / "skills" / "Keep" / "keep-login-skill"
+    scripts_dir = skill_source / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# Keep Login Skill\n", encoding="utf-8")
+    (scripts_dir / "get_bearer_token.py").write_text("print('runtime helper')\n", encoding="utf-8")
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: Keep/keep-login-skill
+    audience: all
+    install_mode: symlink
+    token_policy: user_oauth
+    requires_token: true
+""",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_root", name="Root")],
+        {"od_root": [DepartmentUser(open_id="ou_a", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    installed = profiles_root / "alice" / "skills" / "Keep" / "keep-login-skill"
+    assert installed.is_symlink()
+    assert (installed / "scripts" / "get_bearer_token.py").exists()
+    manifest = json.loads((installed.parent.parent / ".hermes-managed.json").read_text(encoding="utf-8"))
+    entry = manifest["skills"]["Keep/keep-login-skill"]
+    assert entry["install_mode"] == "symlink"
+    assert "secret_guard" not in entry
+
+
 def test_sync_feishu_org_dry_run_does_not_write_profiles_or_db(tmp_path):
     from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.sync import Department, DepartmentUser, sync_feishu_org

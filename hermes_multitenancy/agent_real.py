@@ -1838,6 +1838,31 @@ _BWRAP_ARGS_FILE = Path(__file__).parent / "sandbox" / "bwrap-default.args"
 _SANDBOX_SKILL_IGNORED_DIRS = {".git", ".github", ".hub", ".archive", "__pycache__"}
 _SANDBOX_SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
 _SANDBOX_SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
+_SANDBOX_SKILL_SOURCE_FILE_SUFFIXES = (
+    ".py",
+    ".pyi",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".rb",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".php",
+    ".pl",
+    ".lua",
+    ".md",
+    ".txt",
+)
 
 
 def _resolve_hermes_agent_repo() -> Path:
@@ -2123,6 +2148,8 @@ def _is_sandbox_secret_skill_file(rel_path: str | Path) -> bool:
         return True
     if name.endswith((".token", ".secret", ".key")):
         return True
+    if name.endswith(_SANDBOX_SKILL_SOURCE_FILE_SUFFIXES):
+        return False
     return any(part in name for part in _SANDBOX_SKILL_SECRET_NAME_PARTS)
 
 

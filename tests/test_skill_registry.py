@@ -129,6 +129,32 @@ def test_install_shared_skill_copies_filtered_tree_when_source_contains_secret_f
     assert installed["hub/secret-tool"]["secret_guard"] == "copy_filtered"
 
 
+def test_install_shared_skill_symlinks_token_named_source_scripts(tmp_path: Path):
+    from hermes_multitenancy.skill_registry import install_shared_skill_for_profile, list_installed_skills
+
+    shared = tmp_path / ".hermes"
+    source = shared / "skills" / "Keep" / "keep-login-skill"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# Keep Login Skill\n", encoding="utf-8")
+    (scripts / "get_bearer_token.py").write_text("print('runtime helper')\n", encoding="utf-8")
+    profile = shared / "profiles" / "alice"
+
+    result = install_shared_skill_for_profile(
+        shared_home=shared,
+        profile_home=profile,
+        skill_path="Keep/keep-login-skill",
+    )
+
+    target = profile / "skills" / "Keep" / "keep-login-skill"
+    assert result["install_mode"] == "symlink"
+    assert "secret_guard" not in result
+    assert target.is_symlink()
+    assert (target / "scripts" / "get_bearer_token.py").exists()
+    installed = list_installed_skills(profile_home=profile)
+    assert installed["Keep/keep-login-skill"]["install_mode"] == "symlink"
+
+
 def test_install_shared_skill_rejects_unsafe_path(tmp_path: Path):
     from hermes_multitenancy.skill_registry import install_shared_skill_for_profile
 
