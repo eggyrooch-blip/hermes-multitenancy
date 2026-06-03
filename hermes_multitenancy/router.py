@@ -4910,7 +4910,7 @@ async def _stream_into_feishu_shared_consumer(
         return None
 
     import time
-    from .agent_real import _sanitize_metrics_event_payload, stream_run_agent, real_run_agent
+    from .agent_real import stream_run_agent, real_run_agent
     from .runtime import _PROFILE_HOME_VAR
 
     stream_started_at = time.monotonic()
@@ -4946,7 +4946,6 @@ async def _stream_into_feishu_shared_consumer(
     content_delta_seen = False
     content = ""
     thinking = ""
-    captured_metrics: Optional[dict[str, Any]] = None
     last_reasoning_edit = 0.0
     last_reasoning_len = 0
 
@@ -5097,10 +5096,6 @@ async def _stream_into_feishu_shared_consumer(
                             _clear_pending_approval(delta)
                         continue
 
-                    if kind == "metrics":
-                        captured_metrics = _sanitize_metrics_event_payload(delta)
-                        continue
-
                     if kind == "done":
                         continue
 
@@ -5141,15 +5136,6 @@ async def _stream_into_feishu_shared_consumer(
         full = content if content else (thinking if thinking else "(empty response)")
         if not content_delta_seen:
             consumer.on_delta(_clean_stream_display_text(full, profile_home))
-
-        if captured_metrics and consumer.message_id and callable(getattr(adapter, "update_streaming_card_metrics", None)):
-            try:
-                adapter.update_streaming_card_metrics(
-                    message_id=consumer.message_id,
-                    **captured_metrics,
-                )
-            except Exception as exc:
-                logger.debug("multitenancy: footer metrics merge failed: %s", exc)
 
         await _finish_consumer()
         terminal_update_sent = True
