@@ -1743,6 +1743,106 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI skill audit failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_skillhub_event(request):
+        """Ingress for AiDock SkillHub webhooks (skill.install_approved, etc.).
+
+        Validates, deduplicates and persists the event, then acks. Actual skill
+        materialization (download/router-install/symlink/callback) is the next
+        phase — accepted events land as ``queued`` for a downstream worker.
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import skillhub_events
+
+        raw = await request.read()
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error_code": "INVALID_JSON",
+                    "message": "request body is not valid JSON",
+                    "retryable": False,
+                },
+                status=400,
+            )
+
+        raw_body = raw.decode("utf-8")
+        try:
+            event = skillhub_events.normalize_event(payload, raw_body=raw_body)
+        except skillhub_events.SkillhubEventError as exc:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error_code": exc.error_code,
+                    "message": str(exc),
+                    "retryable": False,
+                },
+                status=400,
+            )
+
+        # Optional HMAC signature gate. Mirrors _authorized: when no secret is
+        # configured (dev), the gate is open; when a secret IS set, a missing or
+        # bad signature is rejected.
+        secret = os.environ.get("HERMES_SKILLHUB_WEBHOOK_SECRET", "").strip()
+        signature_verified = False
+        if secret:
+            timestamp = str(request.headers.get("X-AiDock-Timestamp", "") or "").strip()
+            provided = str(request.headers.get("X-AiDock-Signature", "") or "").strip()
+            if not skillhub_events.verify_signature(
+                secret, timestamp, event["event_id"], raw_body, provided
+            ):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "event_id": event["event_id"],
+                        "error_code": "INVALID_SIGNATURE",
+                        "message": "signature verification failed",
+                        "retryable": False,
+                    },
+                    status=401,
+                )
+            signature_verified = True
+
+        try:
+            store = skillhub_events.get_event_store()
+            status, duplicate = store.record(
+                event, raw_payload=raw_body, signature_verified=signature_verified
+            )
+        except Exception:
+            logger.exception("[multitenancy] SkillHub event persist failed")
+            return web.json_response(
+                {
+                    "ok": False,
+                    "event_id": event["event_id"],
+                    "error_code": "INTERNAL_ERROR",
+                    "message": "failed to persist event",
+                    "retryable": True,
+                },
+                status=500,
+            )
+
+        logger.info(
+            "[multitenancy] SkillHub event received event_id=%s type=%s skill=%s release=%s dup=%s",
+            event["event_id"],
+            event["event_type"],
+            event["skill_code"],
+            event.get("release_id"),
+            duplicate,
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "event_id": event["event_id"],
+                "event_type": event["event_type"],
+                "skill_code": event["skill_code"],
+                "accepted": True,
+                "duplicate": duplicate,
+                "status": status,
+            }
+        )
+
     async def handle_health(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1772,6 +1872,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/kanban/dispatch", handle_kanban_dispatch)
     app.router.add_post("/api/run-broker/skills/install", handle_skillhub_install)
     app.router.add_get("/api/run-broker/skills/audit", handle_skill_audit)
+    app.router.add_post("/api/run-broker/skillhub/events", handle_skillhub_event)
     app.router.add_get("/api/run-broker/jobs", handle_list_jobs)
     app.router.add_post("/api/run-broker/jobs", handle_create_job)
     app.router.add_get("/api/run-broker/jobs/{job_id}/plan", handle_plan_job)
