@@ -170,6 +170,80 @@ async def stream_run_agent(  # type: ignore[override]
         yield kind, text
 
 
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not number == number or number in {float("inf"), float("-inf")}:
+        return None
+    return number
+
+
+def _sanitize_metrics_event_payload(payload: Any) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    result: dict[str, Any] = {}
+
+    tokens_in = _coerce_optional_int(data.get("tokens_in"))
+    if tokens_in is not None:
+        result["tokens_in"] = tokens_in
+
+    tokens_out = _coerce_optional_int(data.get("tokens_out"))
+    if tokens_out is not None:
+        result["tokens_out"] = tokens_out
+
+    cache_hit_pct = _coerce_optional_float(data.get("cache_hit_pct"))
+    if cache_hit_pct is not None:
+        result["cache_hit_pct"] = cache_hit_pct
+
+    context_pct = _coerce_optional_float(data.get("context_pct"))
+    if context_pct is not None:
+        result["context_pct"] = context_pct
+
+    model_name = data.get("model_name")
+    if model_name is not None:
+        model_text = str(model_name).strip()
+        if model_text:
+            result["model_name"] = model_text
+
+    return result
+
+
+def _build_aiagent_metrics_payload(result: Any) -> dict[str, Any]:
+    data = result if isinstance(result, dict) else {}
+    prompt_tokens = _coerce_optional_int(data.get("prompt_tokens"))
+    input_tokens = _coerce_optional_int(data.get("input_tokens"))
+    completion_tokens = _coerce_optional_int(data.get("completion_tokens"))
+    output_tokens = _coerce_optional_int(data.get("output_tokens"))
+    cache_read_tokens = _coerce_optional_int(data.get("cache_read_tokens"))
+
+    tokens_in = prompt_tokens if prompt_tokens is not None else input_tokens
+    tokens_out = completion_tokens if completion_tokens is not None else output_tokens
+    cache_hit_pct: Optional[float] = None
+    if prompt_tokens is not None and prompt_tokens > 0 and cache_read_tokens is not None:
+        cache_hit_pct = (float(cache_read_tokens) / float(prompt_tokens)) * 100.0
+
+    model_name = str(data.get("model") or "").strip() or None
+    return {
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cache_hit_pct": cache_hit_pct,
+        "context_pct": None,
+        "model_name": model_name,
+    }
+
+
 def _normalize_reasoning_compare(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -2755,6 +2829,9 @@ async def _stream_aiagent_subprocess(
             elif event_name == "thinking":
                 _mirror.upsert_assistant("", str(data.get("text") or ""))
                 yield "thinking", str(data.get("text") or "")
+            elif event_name == "metrics":
+                payload_data = _sanitize_metrics_event_payload({k: v for k, v in data.items() if k != "event"})
+                yield "metrics", payload_data
             elif event_name in {
                 "tool_started",
                 "tool_completed",
@@ -3537,6 +3614,20 @@ def _run_with_aiagent(
                 except Exception:
                     pass
             _retag_source_now("finally-post-close")
+
+    if event_sink is not None:
+        try:
+            metrics = _build_aiagent_metrics_payload(result)
+            # Only emit when at least one real metric is present, so runs
+            # without usage data (e.g. fakes/early exits) don't push an empty
+            # metrics event into the stream.
+            if any(
+                metrics.get(k) is not None
+                for k in ("tokens_in", "tokens_out", "cache_hit_pct", "model_name")
+            ):
+                _emit("metrics", **metrics)
+        except Exception as exc:
+            logger.debug("[multitenancy] failed to emit AIAgent metrics: %s", exc)
 
     return (result or {}).get("final_response", "") or ""
 
