@@ -1,11 +1,20 @@
 """Every markdown table must leave native `|---|` form so core never forces the
 whole message to plain text (which drops the card). Narrow → aligned code block,
 wide → vertical key-value list."""
+import re
+
+import pytest
+
 from hermes_multitenancy.card.markdown_style import (
     _optimize_markdown_style,
     _render_markdown_table_for_card,
     _render_markdown_table_kv_list,
 )
+
+# EXACT core regex (hermes-agent gateway/platforms/feishu.py): if this matches the
+# outbound content, core forces the whole message to plain text and the card is
+# dropped. The whole point of this slug is that it must NEVER match our output.
+_CORE_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 
 NARROW = ["| 字段 | 值 |", "| --- | --- |", "| 状态 | online |", "| ID | 69df |"]
 WIDE = [
@@ -75,3 +84,20 @@ def test_code_fence_pseudo_table_untouched():
     text = "```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```"
     out = _optimize_markdown_style(text, card_version=2)
     assert "| 1 | 2 |" in out                 # fenced content preserved verbatim
+
+
+@pytest.mark.parametrize("table", [
+    NARROW,                                              # narrow 2-col
+    WIDE,                                                # wide 6-col
+    ["| 值 |", "| --- |", "| online |"],                # single column
+    ["| a | b |", "| -- | -- |", "| 1 | 2 |"],          # 2-dash separator
+    ["| a | b |", "| :--- | ---: |", "| 1 | 2 |"],      # colon-aligned
+    ["| a | b | c | d | e | f |", "| - | - | - | - | - | - |", "| 1 | 2 | 3 | 4 | 5 | 6 |"],  # 1-dash wide
+], ids=["narrow", "wide", "single-col", "2-dash", "colon", "1-dash-wide"])
+def test_core_regex_never_matches_after_optimize(table):
+    """The decisive guarantee: after our optimize, core's table regex must NOT
+    match — otherwise core forces plain text and drops the card. Checked both
+    with leading prose and at string start."""
+    for text in ("\n".join(table), "前言\n\n" + "\n".join(table)):
+        out = _optimize_markdown_style(text, card_version=2)
+        assert _CORE_TABLE_RE.search(out) is None, f"core still forces plaintext:\n{out!r}"

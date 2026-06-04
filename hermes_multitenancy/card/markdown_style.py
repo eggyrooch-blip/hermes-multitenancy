@@ -106,7 +106,11 @@ def _is_markdown_table_separator(line: str) -> bool:
     if not _is_markdown_table_row(line):
         return False
     cells = _split_markdown_table_row(line)
-    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+    # Match core's tolerance (gateway/platforms/feishu.py forces plain text on
+    # `^\|.*\|\n\|[-|: ]+\|`): a 2-dash (or even 1-dash) separator counts. We must
+    # detect every table core would, otherwise the undetected one leaks native and
+    # still loses the card.
+    return bool(cells) and all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells)
 
 
 def _split_markdown_table_row(line: str) -> list[str]:
@@ -137,7 +141,12 @@ def _render_markdown_table_code_block(block_lines: list[str]) -> str:
     rendered: list[str] = []
     for row_index, row in enumerate(normalized_rows):
         if row_index == 1:
-            cells = ["-" * width for width in widths]
+            # Use box-drawing U+2500 (─), NOT ASCII '-', for the header divider.
+            # core's table regex second line is `\|[-|: ]+\|` (ASCII only) and is
+            # run MULTILINE on raw content WITHOUT stripping ``` fences — an ASCII
+            # `| --- |` line inside the code block would still trip it and drop the
+            # card. '─' is outside [-|: ] so the fenced table no longer matches.
+            cells = ["─" * width for width in widths]
         else:
             cells = [cell.ljust(widths[column]) for column, cell in enumerate(row)]
         rendered.append("| " + " | ".join(cells) + " |")
