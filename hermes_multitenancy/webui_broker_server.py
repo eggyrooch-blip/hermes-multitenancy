@@ -259,6 +259,26 @@ def _skillhub_authorized(request: Any) -> bool:
     return False
 
 
+async def _read_capped_body(request: Any, cap: int) -> Optional[bytes]:
+    """Read the request body incrementally, returning None if it exceeds ``cap``.
+
+    Streaming from ``request.content`` (rather than ``request.read()``) means a
+    chunked / no-Content-Length body cannot force buffering up to the app-level
+    ``client_max_size`` (32MB) before the size check runs.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await request.content.read(65536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > cap:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _default_sandbox_available() -> bool:
     value = os.environ.get("HERMES_USE_SANDBOX", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -1787,22 +1807,9 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         from . import skillhub_events
 
-        # Reject oversize bodies before buffering the whole request.
-        if (
-            request.content_length is not None
-            and request.content_length > _SKILLHUB_MAX_BODY_BYTES
-        ):
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error_code": "PAYLOAD_TOO_LARGE",
-                    "message": f"body exceeds {_SKILLHUB_MAX_BODY_BYTES} bytes",
-                    "retryable": False,
-                },
-                status=413,
-            )
-        raw = await request.read()
-        if len(raw) > _SKILLHUB_MAX_BODY_BYTES:
+        # Read with a hard cap (streams, so chunked bodies can't force a 32MB buffer).
+        raw = await _read_capped_body(request, _SKILLHUB_MAX_BODY_BYTES)
+        if raw is None:
             return web.json_response(
                 {
                     "ok": False,

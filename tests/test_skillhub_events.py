@@ -299,6 +299,36 @@ def test_endpoint_rejects_oversize_body():
     assert skillhub_events.get_event_store().count() == 0
 
 
+def test_endpoint_rejects_oversize_chunked_body():
+    # Chunked (no Content-Length) body must also be capped — the streaming read
+    # must bail before buffering up to the app-level 32MB limit.
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def big_stream():
+        for _ in range(6):
+            yield b"A" * 65536  # ~384KB total, > 256KB cap, sent chunked
+
+    async def runner():
+        client = TestClient(TestServer(_make_app()))
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/run-broker/skillhub/events",
+                data=big_stream(),
+                headers={
+                    "Authorization": f"Bearer {TEST_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            return resp.status, await resp.json()
+        finally:
+            await client.close()
+
+    status, body = asyncio.run(runner())
+    assert status == 413
+    assert body["error_code"] == "PAYLOAD_TOO_LARGE"
+
+
 def test_endpoint_accepts_valid_signature(monkeypatch):
     monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_SECRET", "topsecret")
     raw = json.dumps(WANGKEJIE_PAYLOAD)

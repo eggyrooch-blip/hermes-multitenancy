@@ -96,9 +96,9 @@ curl -s -X POST https://hermes.example.com/api/run-broker/skillhub/events \
 
 1. `audience.users[].profile_id` 里的值，和 Hermes 的 profile 名怎么映射？（你早先发过 `profile-owner` + `ldap`）
 2. 你那边的 **callback endpoint**（Hermes 装完回传状态用）地址 + 鉴权，方便我下一期对接。
-3. 鉴权用哪种：dev 先裸 POST？正式期上 HMAC 还是 Bearer？
+3. 鉴权已定：**固定 Bearer key**（专用 key，我私发给你，不用 HMAC）。
 
 ## 7. 本期边界
 
-- ✅ 已交付：接口可收 / 校验 / 去重 / 入库（表 `skillhub_events`）/ 回执，14 个单测 + 真实 curl 通过。
+- ✅ 已交付：接口可收 / 校验 / 去重 / 入库（表 `skillhub_events`）/ 回执，19 个单测 + 真实 curl 通过。
 - ⏭️ 下一期：下载 zip → 校验 checksum → 装进 router 托管库 → 给 profile 建 symlink → 归 kep-cli 凭证 → callback 回传你。
