@@ -14,10 +14,13 @@ Status vocabulary (matches the WebUI ``SkillCredentialState``):
     authenticated  — a valid credential is present / live status confirmed login
     configured     — a credential is readable but not an interactive login (gitlab)
     needs_auth     — installed but no/!valid credential → user should auth
-    expired        — credential present but past its expiry (lark/keep additive)
     unknown        — credential material exists but validity cannot be confirmed here
     missing        — the tool/credential is not installed for the profile
     error          — status read failed unexpectedly
+
+The vocabulary is exactly the WebUI ``SkillCredentialState`` set (no ``expired``
+— an expired credential collapses to ``needs_auth``; the remaining validity is
+carried by the additive ``expires_at`` field for the Feishu card to render).
 
 Subprocess-backed readers (feishu-project via ``meegle``, kep-cli via
 ``kep-auth``) degrade gracefully when the binary is absent — exactly like the
@@ -60,7 +63,6 @@ _TITLES = {
 S_AUTHENTICATED = "authenticated"
 S_CONFIGURED = "configured"
 S_NEEDS_AUTH = "needs_auth"
-S_EXPIRED = "expired"
 S_UNKNOWN = "unknown"
 S_MISSING = "missing"
 S_ERROR = "error"
