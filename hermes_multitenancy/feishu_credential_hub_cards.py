@@ -20,10 +20,12 @@ _LOCALES = ["zh_cn", "en_us"]
 # status → (emoji, zh label, en label, color)
 _STATUS_BADGE = {
     "authenticated": ("✅", "已认证", "Authenticated", "green"),
+    "configured": ("✅", "Token 可读", "Configured", "green"),
     "needs_auth": ("⚠️", "未认证", "Not authenticated", "orange"),
     "expired": ("⏰", "已过期", "Expired", "red"),
     "missing": ("⚪", "未安装", "Not installed", "grey"),
     "unknown": ("🔍", "待验证", "Unverified", "grey"),
+    "error": ("❗", "检测失败", "Error", "red"),
 }
 
 
