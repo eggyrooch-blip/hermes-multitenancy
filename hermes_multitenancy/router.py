@@ -2779,7 +2779,7 @@ async def _handle_auth_command(
     background poll). keep-record / kep-cli report live status; their in-Feishu
     auth-start is a follow-up slice.
     """
-    del profile_home, event
+    del event
     from . import credential_hub, feishu_uat_auth
     from .feishu_auth_cards import send_auth_card
     from .feishu_credential_hub_cards import build_hub_card
@@ -2800,10 +2800,14 @@ async def _handle_auth_command(
             await _safe_call(adapter.send, chat_id, "无法打开凭证中心：当前飞书用户还没有绑定 Hermes profile。")
         return
 
+    # Use the router's authoritative profile home when available so the hub
+    # reads the same dotfile root the agent runtime writes to.
+    home_dir = (Path(profile_home) / "home") if profile_home else None
     rows = await asyncio.to_thread(
         credential_hub.collect_credential_statuses,
         profile_name=profile_name,
         open_id=open_id,
+        home_dir=home_dir,
     )
 
     auth_urls: dict[str, str] = {}
@@ -2813,14 +2817,21 @@ async def _handle_auth_command(
 
     lark_row = next((r for r in rows if r.id == credential_hub.LARK_CLI), None)
     if lark_row is not None and not lark_row.authenticated:
-        # Reuse the proven device-flow path to mint the lark-cli authorize URL.
+        # Reuse an existing live device-flow session for this user (set by a
+        # prior /auth or /feishu_auth) instead of minting a second device code.
         try:
             session = await asyncio.to_thread(
-                feishu_uat_auth.start_session,
+                feishu_uat_auth.find_active_session,
                 profile_name=profile_name,
                 open_id=open_id,
-                scope=(args.strip() or None),
             )
+            if not session:
+                session = await asyncio.to_thread(
+                    feishu_uat_auth.start_session,
+                    profile_name=profile_name,
+                    open_id=open_id,
+                    scope=(args.strip() or None),
+                )
             verification_uri = str(session.get("verification_uri") or "")
             if verification_uri:
                 auth_urls[credential_hub.LARK_CLI] = verification_uri

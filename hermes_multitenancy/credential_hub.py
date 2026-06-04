@@ -196,17 +196,24 @@ def collect_credential_statuses(
     profile_name: str,
     open_id: str,
     shared_home: Optional[Path] = None,
+    home_dir: Optional[Path] = None,
 ) -> list[CredentialRow]:
-    """Aggregate per-credential status for one profile/open_id, in display order."""
+    """Aggregate per-credential status for one profile/open_id, in display order.
+
+    ``home_dir`` is the profile's HOME-redirect dir (where per-profile tools
+    drop dotfiles). Callers that already know it (the router has the
+    authoritative ``profile_home``) should pass it; otherwise it is derived from
+    ``shared_home`` — which honors ``HERMES_SHARED_HOME``/``HERMES_HOME``.
+    """
     from . import feishu_uat_auth
 
     shared = Path(shared_home) if shared_home else feishu_uat_auth.resolve_shared_home()
-    home_dir = profile_home_dir(shared, profile_name)
+    home = Path(home_dir) if home_dir else profile_home_dir(shared, profile_name)
 
     rows = {
         LARK_CLI: lark_cli_status(profile_name=profile_name, open_id=open_id, shared_home=shared),
-        KEEP_RECORD: keep_record_status(home_dir=home_dir),
-        KEP_CLI: kep_cli_status(home_dir=home_dir),
+        KEEP_RECORD: keep_record_status(home_dir=home),
+        KEP_CLI: kep_cli_status(home_dir=home),
     }
     return [rows[cid] for cid in CREDENTIAL_ORDER]
 

@@ -1,8 +1,10 @@
 """Credential hub (`/auth`) — status aggregation + card rendering.
 
-multitenancy is the single convergence point (归口) for credential status;
-the Feishu /auth card and the WebUI CredentialsView are two paths over this
-same aggregation. These tests pin the read layer + card structure.
+`credential_hub` is the Feishu-side credential-status aggregation in
+multitenancy (the intended 归口). Full convergence — hermes-web-ui reading the
+same endpoint + credential-set parity — is a follow-up slice. These tests pin
+the read layer, card structure, home-dir threading, and device-flow session
+reuse.
 """
 from __future__ import annotations
 
@@ -150,6 +152,61 @@ def test_collect_returns_all_three_in_order(monkeypatch, tmp_path):
     assert rows[0].status == "authenticated"
     assert rows[1].status == "authenticated"
     assert rows[2].status == "needs_auth"
+
+
+def test_collect_uses_explicit_home_dir_over_shared(monkeypatch, tmp_path):
+    """M1: an explicit home_dir wins over the shared_home-derived path."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(
+        feishu_uat_auth, "credential_status", lambda **kw: {"status": "missing"}
+    )
+    # keepai lives under the EXPLICIT home dir, not under shared/profiles/...
+    explicit_home = tmp_path / "weird_root" / "home"
+    explicit_home.mkdir(parents=True)
+    _write_keepai(explicit_home, expired_ms=int(time.time() * 1000) + 1000)
+
+    rows = credential_hub.collect_credential_statuses(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=tmp_path,  # would derive a DIFFERENT, empty home
+        home_dir=explicit_home,
+    )
+    keep = next(r for r in rows if r.id == "keep-record")
+    assert keep.status == "authenticated"  # found via explicit home_dir
+
+
+# -- device-flow session reuse (C2) ------------------------------------------
+
+
+def test_find_active_session_reuses_pending_and_skips_terminal(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth as fa
+
+    now = int(time.time())
+    sessions = {
+        "pending-ok": fa.FeishuAuthSession(
+            session_id="pending-ok", profile_name="owner", open_id="ou_owner",
+            device_code="d", user_code="u", verification_uri="https://x",
+            scope="", client_id="c", client_secret="s",
+            expires_at=now + 600, interval=3, status="pending",
+        ),
+        "other-user": fa.FeishuAuthSession(
+            session_id="other-user", profile_name="owner", open_id="ou_other",
+            device_code="d", user_code="u", verification_uri="https://y",
+            scope="", client_id="c", client_secret="s",
+            expires_at=now + 600, interval=3, status="pending",
+        ),
+    }
+    monkeypatch.setattr(fa, "_sessions", sessions)
+    found = fa.find_active_session(profile_name="owner", open_id="ou_owner")
+    assert found is not None and found["session_id"] == "pending-ok"
+
+    # terminal/expired sessions are not reused
+    sessions["pending-ok"].status = "success"
+    assert fa.find_active_session(profile_name="owner", open_id="ou_owner") is None
+    sessions["pending-ok"].status = "pending"
+    sessions["pending-ok"].expires_at = now - 1
+    assert fa.find_active_session(profile_name="owner", open_id="ou_owner") is None
 
 
 # -- expiry rendering --------------------------------------------------------

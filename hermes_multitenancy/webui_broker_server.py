@@ -1515,10 +1515,14 @@ def create_run_broker_app(
     async def handle_credential_hub(request):
         """Aggregated, redacted credential status for one tenant.
 
-        This is the single convergence point (归口) for credential status in
-        multitenancy. Both access paths consume it: the Feishu ``/auth`` card
-        (in-process) and the hermes-web-ui CredentialsView (over this HTTP
-        endpoint). The two surfaces are just different paths over one core.
+        Intended convergence point (归口) for credential status in
+        multitenancy: the Feishu ``/auth`` card already consumes the same
+        ``credential_hub`` aggregation in-process. Full convergence still
+        requires hermes-web-ui's ``skill-credentials.ts`` to read THIS endpoint
+        instead of computing status independently, and the hub to reach parity
+        with the WebUI's credential set (currently 3 vs 5). Until then this is
+        an additional reader, not yet the sole source of truth — see
+        ``.ftask/auth-cred-hub/SPEC.md``.
         """
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)

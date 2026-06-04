@@ -337,6 +337,28 @@ def start_session(
     return _session_public(session)
 
 
+def find_active_session(
+    *,
+    profile_name: str,
+    open_id: str,
+) -> dict[str, Any] | None:
+    """Return a still-pending, non-expired device-flow session for this user.
+
+    Lets callers reuse one live device code per ``(profile_name, open_id)``
+    instead of minting a second concurrent session — e.g. ``/auth`` reuses a
+    session already started by ``/feishu_auth`` (or a prior ``/auth``) so the
+    two cards/pollers don't race two device codes for the same user.
+    """
+    now = int(time.time())
+    for session in _sessions.values():
+        if session.profile_name != profile_name or session.open_id != open_id:
+            continue
+        if session.status != "pending" or now >= session.expires_at:
+            continue
+        return _session_public(session)
+    return None
+
+
 def poll_session(
     *,
     session_id: str,
