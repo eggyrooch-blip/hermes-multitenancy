@@ -1530,7 +1530,10 @@ def create_run_broker_app(
 
         try:
             profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
-            rows = credential_hub.collect_credential_statuses(
+            # Offload to a thread: the aggregation may shell out to meegle/kep-auth
+            # (subprocess), which must not block the aiohttp event loop.
+            rows = await asyncio.to_thread(
+                credential_hub.collect_credential_statuses,
                 profile_name=profile_name,
                 open_id=user_key,
             )

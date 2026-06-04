@@ -141,17 +141,32 @@ def test_kep_cli_authenticated_via_live_status(monkeypatch, tmp_path):
 def test_feishu_project_missing_when_no_cli(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub
 
-    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda: None)
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    monkeypatch.setattr(credential_hub.shutil, "which", lambda n: None)  # no npx either
     row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
     assert row.id == "feishu-project"
     assert row.status == "missing"
     assert row.installed is False
 
 
+def test_feishu_project_npx_only_not_run_for_status(monkeypatch, tmp_path):
+    """M5: npx-only + execution gated off → installed via npx presence, no run."""
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    monkeypatch.setattr(credential_hub.shutil, "which", lambda n: "/usr/bin/npx" if n == "npx" else None)
+    called = {"ran": False}
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: called.__setitem__("ran", True) or None)
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.installed is True
+    assert row.status == "needs_auth"
+    assert called["ran"] is False  # npx must NOT be executed for a status read
+
+
 def test_feishu_project_authenticated(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub
 
-    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda: ["meegle"])
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
 
     class _Proc:
         returncode = 0
@@ -167,7 +182,7 @@ def test_feishu_project_authenticated(monkeypatch, tmp_path):
 def test_feishu_project_needs_auth_when_not_authed(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub
 
-    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda: ["meegle"])
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
 
     class _Proc:
         returncode = 0
@@ -234,6 +249,86 @@ def test_lark_cli_status_degrades_on_error(monkeypatch, tmp_path):
     assert row.status == "unknown"
 
 
+def test_lark_cli_authenticated_via_file_cache_when_db_missing(monkeypatch, tmp_path):
+    """C1 parity: DB says missing but feishu_uat/*.json cache is valid → authenticated."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "missing", "lark_cli": {}})
+    uat = tmp_path / "feishu_uat"
+    uat.mkdir()
+    (uat / "ou_x.json").write_text(
+        json.dumps({"access_token": "tok", "expires_at": int(time.time() * 1000) + 3600_000}),
+        encoding="utf-8",
+    )
+    row = credential_hub.lark_cli_status(
+        profile_name="s", open_id="ou_s", shared_home=tmp_path, profile_dir=tmp_path
+    )
+    assert row.status == "authenticated"
+
+
+def test_lark_cli_authenticated_via_default_identity_user(monkeypatch, tmp_path):
+    """C1 parity: DB missing, no file cache, but lark_cli.default_identity == user."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "missing", "lark_cli": {"default_identity": "user"}})
+    row = credential_hub.lark_cli_status(
+        profile_name="s", open_id="ou_s", shared_home=tmp_path, profile_dir=tmp_path
+    )
+    assert row.status == "authenticated"
+    assert row.default_identity == "user"
+
+
+def test_lark_cli_file_cache_ignores_expired_token(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status",
+                        lambda **kw: {"status": "missing", "lark_cli": {}})
+    uat = tmp_path / "feishu_uat"
+    uat.mkdir()
+    (uat / "ou_x.json").write_text(
+        json.dumps({"access_token": "tok", "expires_at": int(time.time() * 1000) - 1000}),
+        encoding="utf-8",
+    )
+    row = credential_hub.lark_cli_status(
+        profile_name="s", open_id="ou_s", shared_home=tmp_path, profile_dir=tmp_path
+    )
+    assert row.status == "needs_auth"  # expired cache must not count as connected
+
+
+# -- requirement detection parity (M4) ---------------------------------------
+
+
+def test_skillhub_sourced_skill_requires_kep_cli(tmp_path):
+    """M4: a SkillHub-sourced skill forces kep-cli requirement even w/o kep text."""
+    from hermes_multitenancy import credential_hub
+
+    skills_root = tmp_path / "skills"
+    (skills_root / ".hub").mkdir(parents=True)
+    (skills_root / ".hub" / "lock.json").write_text(
+        json.dumps({"installed": {"some-hub-skill": {"version": "1.0.0"}}}), encoding="utf-8"
+    )
+    sk = skills_root / "some-hub-skill"
+    sk.mkdir()
+    (sk / "SKILL.md").write_text("name: some-hub-skill\njust a normal skill\n", encoding="utf-8")
+
+    scanned = credential_hub.scan_profile_skills(tmp_path)
+    hub_skill = next(s for s in scanned if s.name == "some-hub-skill")
+    assert hub_skill.source == "hub"
+    assert "kep-cli" in credential_hub.detect_skill_requirements(hub_skill)
+
+
+def test_requirement_patterns_cover_proximity_and_oauth(tmp_path):
+    """M4: ported TS patterns — lark proximity + gitlab oauth2 inline form."""
+    from hermes_multitenancy.credential_hub import _ProfileSkill, detect_skill_requirements
+
+    lark = _ProfileSkill(name="x", text="this uses feishu docx export", tags=[])
+    assert "lark-cli" in detect_skill_requirements(lark)
+    gl = _ProfileSkill(name="y", text="clone via oauth2:${gitlab_token}@host", tags=[])
+    assert "gitlab" in detect_skill_requirements(gl)
+
+
 # -- aggregation -------------------------------------------------------------
 
 
@@ -242,7 +337,7 @@ def test_collect_returns_all_five_in_order(monkeypatch, tmp_path):
 
     monkeypatch.setattr(feishu_uat_auth, "credential_status",
                         lambda **kw: {"status": "valid", "expires_at": int(time.time() * 1000) + 1000})
-    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda: None)
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
     home = tmp_path / "profiles" / "owner" / "home"
     home.mkdir(parents=True)
     rows = credential_hub.collect_credential_statuses(
@@ -261,7 +356,7 @@ def test_collect_uses_explicit_home_dir_over_shared(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub, feishu_uat_auth
 
     monkeypatch.setattr(feishu_uat_auth, "credential_status", lambda **kw: {"status": "missing"})
-    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda: None)
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
     explicit_home = tmp_path / "weird_root" / "home"
     explicit_home.mkdir(parents=True)
     # keep-record skill installed under profile_dir (= explicit_home.parent)

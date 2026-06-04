@@ -186,6 +186,24 @@ class _ProfileSkill:
     name: str
     text: str
     tags: list[str]
+    source: Optional[str] = None  # 'hub' when installed via SkillHub provenance
+
+
+def _skillhub_installed_names(skills_root: Path) -> set[str]:
+    """Names installed via SkillHub — mirrors readSkillHubInstalledNames."""
+    names: set[str] = set()
+    for rel in (Path(".hub") / "lock.json", Path(".hermes-skillhub.json")):
+        raw = _read_small_text(skills_root / rel)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        installed = data.get("installed")
+        if isinstance(installed, dict):
+            names.update(k for k in installed.keys() if k)
+    return names
 
 
 def scan_profile_skills(profile_dir: Path) -> list[_ProfileSkill]:
@@ -194,6 +212,7 @@ def scan_profile_skills(profile_dir: Path) -> list[_ProfileSkill]:
     out: list[_ProfileSkill] = []
     if not root.is_dir():
         return out
+    hub_names = _skillhub_installed_names(root)
 
     def visit(d: Path, depth: int) -> None:
         if depth > 8:
@@ -218,7 +237,10 @@ def scan_profile_skills(profile_dir: Path) -> list[_ProfileSkill]:
                 if not text:
                     continue
                 skill_name = _parse_skill_name(text) or Path(entry.path).parent.name
-                out.append(_ProfileSkill(name=skill_name, text=text, tags=_parse_skill_tags(text)))
+                dir_name = Path(entry.path).parent.name
+                source = "hub" if (skill_name in hub_names or dir_name in hub_names) else None
+                out.append(_ProfileSkill(name=skill_name, text=text,
+                                         tags=_parse_skill_tags(text), source=source))
 
     visit(root, 0)
     return out
@@ -239,6 +261,7 @@ def _parse_skill_tags(text: str) -> list[str]:
 def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
     """Which credential ids a skill needs (mirrors detectSkillCredentialRequirements)."""
     text = f"{skill.name}\n{chr(10).join(skill.tags)}\n{skill.text}".lower()
+    source = str(skill.source or "").strip().lower()
     required: list[str] = []
 
     if any(p.search(text) for p in (
@@ -246,6 +269,9 @@ def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
         re.compile(r"\blarksuite\b"),
         re.compile(r"open\.feishu\.cn"),
         re.compile(r"feishu\.cn/(docx|docs|sheets|wiki|base|minutes|file)"),
+        re.compile(r"\bwiki:wiki:readonly\b"),
+        re.compile(r"\b(feishu|lark|larksuite)\b.{0,80}\b(docx|docs|base|sheets?|bitable|wiki)\b"),
+        re.compile(r"\b(docx|docs|base|sheets?|bitable|wiki)\b.{0,80}\b(feishu|lark|larksuite)\b"),
         re.compile(r"\b(im:message|contact:user|drive:drive|wiki:wiki)\b"),
     )):
         required.append(LARK_CLI)
@@ -257,11 +283,17 @@ def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
     )):
         required.append(FEISHU_PROJECT)
 
-    if any(p.search(text) for p in (
+    # SkillHub-sourced skills always need kep-cli (parity with the TS hubSourced short-circuit).
+    hub_sourced = source in ("hub", "aidock-skillhub")
+    if hub_sourced or any(p.search(text) for p in (
         re.compile(r"\bkep[-_ ]?cli\b"), re.compile(r"\bkep[-_ ]?auth\b"),
         re.compile(r"\baidock\b"), re.compile(r"\bskillhub\b"),
+        re.compile(r"\bkeep[-_ ]?login\b"), re.compile(r"\bproxy[-_ ]?cms\b"),
         re.compile(r"proxy\.cms\.(pre\.)?example\.com"),
-        re.compile(r"\bkep_profile\b"),
+        re.compile(r"ark\.example\.com/aidock-cms"),
+        re.compile(r"skill/zipfile"),
+        re.compile(r"\bkep_profile\b"), re.compile(r"\bkep_no_auto_login\b"),
+        re.compile(r"bearer\s+token.*example"),
     )):
         required.append(KEP_CLI)
 
@@ -273,6 +305,7 @@ def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
 
     if any(p.search(text) for p in (
         re.compile(r"\bgitlab_token\b"), re.compile(r"gitlab\.example\.com"),
+        re.compile(r"oauth2:\$\{?gitlab_token\}?@"),
     )):
         required.append(GITLAB)
 
@@ -291,9 +324,17 @@ def _requirements_by_id(skills: list[_ProfileSkill]) -> dict[str, list[str]]:
     return out
 
 
-def _has_skill(skills: list[_ProfileSkill], *, name: str | None = None, needles: tuple[str, ...] = ()) -> bool:
+def _has_skill(
+    skills: list[_ProfileSkill],
+    *,
+    name: str | None = None,
+    tags: tuple[str, ...] = (),
+    needles: tuple[str, ...] = (),
+) -> bool:
     for skill in skills:
         if name and skill.name == name:
+            return True
+        if tags and any(t in skill.tags for t in tags):
             return True
         low = skill.text.lower()
         if needles and all(n in low for n in needles):
@@ -304,14 +345,53 @@ def _has_skill(skills: list[_ProfileSkill], *, name: str | None = None, needles:
 # --- per-tool readers -------------------------------------------------------
 
 
+def _local_feishu_uat(profile_dir: Path) -> tuple[bool, Optional[int]]:
+    """Mirror the WebUI localFeishuUatStatus: read ``<profile_dir>/feishu_uat/*.json``.
+
+    Returns (connected, latest_expires_at_ms). Connected iff some cache file has a
+    non-empty access_token AND (no expiry OR expiry > now + 60s).
+    """
+    d = Path(profile_dir) / "feishu_uat"
+    connected = False
+    latest_exp: Optional[int] = None
+    try:
+        names = [p for p in d.iterdir() if p.name.endswith(".json")]
+    except OSError:
+        return False, None
+    for path in names:
+        raw = _read_small_text(path)
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        token = parsed.get("access_token")
+        exp = parsed.get("expires_at")
+        try:
+            exp_i = int(exp) if exp else 0
+        except (ValueError, TypeError):
+            exp_i = 0
+        if exp_i and (latest_exp is None or exp_i > latest_exp):
+            latest_exp = exp_i
+        if isinstance(token, str) and token and (not exp_i or exp_i > _now_ms() + 60_000):
+            connected = True
+    return connected, latest_exp
+
+
 def lark_cli_status(
     *,
     profile_name: str,
     open_id: str,
     shared_home: Path,
+    profile_dir: Optional[Path] = None,
     required_by: Optional[list[str]] = None,
 ) -> CredentialRow:
-    """lark-cli/feishu UAT — reuses the canonical feishu reader."""
+    """lark-cli/feishu UAT — mirrors the WebUI larkCliStatus 3-way OR.
+
+    authenticated iff DB status 'valid' OR local feishu_uat/*.json file-cache is
+    connected OR lark_cli.default_identity == 'user' (parity with skill-credentials.ts).
+    """
     from . import feishu_uat_auth
 
     row = CredentialRow(
@@ -330,31 +410,47 @@ def lark_cli_status(
         return row
 
     raw_status = str(raw.get("status") or "")
+    lark = raw.get("lark_cli") or {}
+    default_identity = lark.get("default_identity")
     expires_at = raw.get("expires_at")
     row.expires_at = int(expires_at) if expires_at else None
-    # Status vocab must match the WebUI SkillCredentialState (no 'expired'):
-    # expired collapses to needs_auth; expiry detail rides on expires_at.
-    if raw_status == "valid":
-        row.status, row.detail = S_AUTHENTICATED, "Lark-cli 已完成用户授权。"
-        row.default_identity = "user"
+
+    p_dir = Path(profile_dir) if profile_dir else (Path(shared_home) / "profiles" / profile_name)
+    local_connected, local_exp = _local_feishu_uat(p_dir)
+    if local_exp and not row.expires_at:
+        row.expires_at = local_exp
+
+    # Status vocab matches the WebUI SkillCredentialState (no 'expired'):
+    connected = raw_status == "valid" or local_connected or default_identity == "user"
+    if connected:
+        row.status = S_AUTHENTICATED
+        row.default_identity = default_identity or ("user" if local_connected else None)
+        row.detail = "Lark-cli 已完成用户授权。"
         row.action["label"] = "重新授权"
-    elif raw_status == "expired":
-        row.status, row.detail = S_NEEDS_AUTH, "Lark-cli 授权已过期，请重新授权。"
-        row.action["label"] = "重新授权"
-    elif raw_status in ("missing", "scope_missing"):
+    elif raw_status in ("missing", "scope_missing", "expired"):
         row.status, row.detail = S_NEEDS_AUTH, "Lark-cli 需要用户授权后才能访问私有飞书资源。"
     else:
         row.status, row.detail = S_UNKNOWN, "Lark-cli 状态待验证。"
     return row
 
 
-def _meegle_invocation() -> Optional[list[str]]:
+def _meegle_allow_npx_status() -> bool:
+    """Mirror shouldAllowNpxForMeegleStatus — gate npx execution for status reads."""
+    override = os.environ.get("HERMES_MEEGLE_STATUS_ALLOW_NPX", "").strip().lower()
+    if override:
+        return override not in ("0", "false", "no", "off")
+    return True  # WebUI default (NODE_ENV !== 'test')
+
+
+def _meegle_invocation(*, allow_npx: bool = True) -> Optional[list[str]]:
     explicit = os.environ.get("HERMES_MEEGLE_BIN", "").strip()
     if explicit:
         return [explicit]
     direct = shutil.which("meegle")
     if direct:
         return [direct]
+    if not allow_npx:
+        return None
     npx = shutil.which("npx")
     if npx:
         return [npx, "-y", "@lark-project/meegle"]
@@ -375,9 +471,16 @@ def feishu_project_status(
         installed=False, status=S_MISSING, required_by=required_by or [],
         action={"kind": "oauth_url", "label": "授权"},
     )
-    inv = _meegle_invocation()
+    inv = _meegle_invocation(allow_npx=_meegle_allow_npx_status())
     if inv is None:
-        row.detail = "飞书项目 CLI 未安装，无法授权或调用飞书项目能力。"
+        # npx-only but npx execution is disabled for status (or no CLI at all).
+        # Mirror the WebUI: available iff npx is present, without running it.
+        if shutil.which("npx"):
+            row.installed = True
+            row.status = S_NEEDS_AUTH
+            row.detail = "飞书项目需要授权后才能查询和更新工作项。"
+        else:
+            row.detail = "飞书项目 CLI 未安装，无法授权或调用飞书项目能力。"
         return row
 
     host = os.environ.get("HERMES_MEEGLE_HOST", _MEEGLE_DEFAULT_HOST).strip() or _MEEGLE_DEFAULT_HOST
@@ -519,6 +622,9 @@ def kep_cli_status(
             elif re.search(r"logged\s*in|state:\s*(valid|logged\s*in)", out):
                 live = "logged_in"
                 account = _parse_kep_account(f"{proc.stdout}\n{proc.stderr}")
+            elif proc.returncode == 3 or re.search(r"unauthorized|401", out):
+                # WebUI maps exit-3 / 401 in the error path to not_logged_in.
+                live = "not_logged_in"
 
     if live == "logged_in":
         row.status, row.account_hint = S_AUTHENTICATED, account
@@ -593,11 +699,14 @@ def collect_credential_statuses(
     skills = scan_profile_skills(p_dir)
     req = _requirements_by_id(skills)
     keep_installed = _has_skill(skills, name=KEEP_RECORD, needles=("keep_auth_token", "get_qrcode"))
-    kep_installed = bool(req.get(KEP_CLI)) or _has_skill(skills, name="kep-hades-cli", needles=("kep-auth", "--env online"))
+    kep_installed = bool(req.get(KEP_CLI)) or _has_skill(
+        skills, name="kep-hades-cli", tags=("kep-cli",), needles=("kep-auth", "--env online")
+    )
     gitlab_installed = _has_skill(skills, name="kep-prd-analysis", needles=("gitlab_token",))
 
     return [
-        lark_cli_status(profile_name=profile_name, open_id=open_id, shared_home=shared, required_by=req.get(LARK_CLI)),
+        lark_cli_status(profile_name=profile_name, open_id=open_id, shared_home=shared,
+                        profile_dir=p_dir, required_by=req.get(LARK_CLI)),
         feishu_project_status(profile_dir=p_dir, profile_name=profile_name, required_by=req.get(FEISHU_PROJECT)),
         keep_record_status(home_dir=home, installed=keep_installed),
         kep_cli_status(profile_dir=p_dir, home_dir=home, profile_name=profile_name, shared_home=shared,
