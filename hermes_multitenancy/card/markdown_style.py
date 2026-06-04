@@ -89,10 +89,22 @@ def _degrade_limited_markdown_tables(text: str, stash_code_text: Any) -> str:
     return "\n".join(result)
 
 
+# core (gateway/platforms/feishu.py) forces the whole message to plain text when
+# `^\|.*\|\n\|[-|: ]+\|` (MULTILINE, no ``` stripping) matches the outbound
+# content. We mirror those two line conditions EXACTLY so we detect — and degrade
+# — every block core would catch. Earlier rounds leaked the card by under-matching
+# (e.g. requiring "all cells are dashes" when core fires on a single first cell of
+# `[-: ]`, colon-only, blank, or a missing trailing pipe). Matched on the RAW line
+# (no strip): a leading space already defeats core's `^\|`, and so it should defeat
+# ours too — that symmetry is what makes the indented code-block output safe.
+_CORE_TABLE_LINE1 = re.compile(r"^\|.*\|")
+_CORE_TABLE_LINE2 = re.compile(r"^\|[-|: ]+\|")
+
+
 def _is_markdown_table_start(lines: list[str], index: int) -> bool:
     return (
         index + 1 < len(lines)
-        and _is_markdown_table_row(lines[index])
+        and _CORE_TABLE_LINE1.match(str(lines[index] or "")) is not None
         and _is_markdown_table_separator(lines[index + 1])
     )
 
@@ -103,14 +115,10 @@ def _is_markdown_table_row(line: str) -> bool:
 
 
 def _is_markdown_table_separator(line: str) -> bool:
-    if not _is_markdown_table_row(line):
-        return False
-    cells = _split_markdown_table_row(line)
-    # Match core's tolerance (gateway/platforms/feishu.py forces plain text on
-    # `^\|.*\|\n\|[-|: ]+\|`): a 2-dash (or even 1-dash) separator counts. We must
-    # detect every table core would, otherwise the undetected one leaks native and
-    # still loses the card.
-    return bool(cells) and all(re.fullmatch(r":?-+:?", cell.strip()) for cell in cells)
+    # core's second line: `\|[-|: ]+\|` anchored at the start of the raw line. NOT
+    # "every cell is dashes" — core also fires when only the FIRST cell is
+    # dash/colon/space (the rest can be data) and even without a trailing pipe.
+    return _CORE_TABLE_LINE2.match(str(line or "")) is not None
 
 
 def _split_markdown_table_row(line: str) -> list[str]:

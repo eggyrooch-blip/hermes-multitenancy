@@ -95,7 +95,18 @@ def test_code_fence_pseudo_table_untouched():
     ["| a | b | c | d | e | f |", "| - | - | - | - | - | - |", "| 1 | 2 | 3 | 4 | 5 | 6 |"],  # 1-dash wide
     ["| 语法 | 说明 |", "| --- | --- |", "| - | 列表项 |", "| : | 对齐 |"],  # data cells that are only dash/colon
     ["| a | b |", "| --- | --- |", "|   | 空首格 |"],   # blank first data cell
-], ids=["narrow", "wide", "single-col", "2-dash", "colon", "1-dash-wide", "dash-data-cells", "blank-first-cell"])
+    ["| a | b |", "| - | hello world |", "| 1 | 2 |"],  # first sep cell dash, rest DATA (core fires!)
+    ["| a | b |", "| : | : |", "| 1 | 2 |"],            # colon-only separator
+    ["| a | b |", "|   |   |", "| 1 | 2 |"],            # blank-cell separator (core matches spaces)
+    ["| a | b |", "| - | : |", "| 1 | 2 |"],            # mixed dash/colon separator
+    ["| a | b |", "| - | hello", "| 1 | 2 |"],          # separator line w/o trailing pipe
+    ["| a | b | 注", "| --- | --- |", "| 1 | 2 |"],     # header line w/ trailing text after last pipe
+    ["| hello | - |", "| 1 | 2 |"],                     # first cell DATA → core safe; must stay safe
+], ids=[
+    "narrow", "wide", "single-col", "2-dash", "colon", "1-dash-wide",
+    "dash-data-cells", "blank-first-cell", "first-dash-rest-data", "colon-only-sep",
+    "blank-sep", "mixed-sep", "no-trailing-pipe", "trailing-text-line1", "first-data-rest-dash",
+])
 def test_core_regex_never_matches_after_optimize(table):
     """The decisive guarantee: after our optimize, core's table regex must NOT
     match — otherwise core forces plain text and drops the card. Checked both
