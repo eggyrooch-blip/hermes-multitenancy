@@ -93,7 +93,9 @@ def test_code_fence_pseudo_table_untouched():
     ["| a | b |", "| -- | -- |", "| 1 | 2 |"],          # 2-dash separator
     ["| a | b |", "| :--- | ---: |", "| 1 | 2 |"],      # colon-aligned
     ["| a | b | c | d | e | f |", "| - | - | - | - | - | - |", "| 1 | 2 | 3 | 4 | 5 | 6 |"],  # 1-dash wide
-], ids=["narrow", "wide", "single-col", "2-dash", "colon", "1-dash-wide"])
+    ["| 语法 | 说明 |", "| --- | --- |", "| - | 列表项 |", "| : | 对齐 |"],  # data cells that are only dash/colon
+    ["| a | b |", "| --- | --- |", "|   | 空首格 |"],   # blank first data cell
+], ids=["narrow", "wide", "single-col", "2-dash", "colon", "1-dash-wide", "dash-data-cells", "blank-first-cell"])
 def test_core_regex_never_matches_after_optimize(table):
     """The decisive guarantee: after our optimize, core's table regex must NOT
     match — otherwise core forces plain text and drops the card. Checked both

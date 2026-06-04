@@ -129,28 +129,30 @@ def _render_markdown_table_code_block(block_lines: list[str]) -> str:
         if _is_markdown_table_row(line)
     ]
     if len(rows) < 2:
-        return "```\n" + "\n".join(block_lines) + "\n```"
+        body = list(block_lines)
+    else:
+        column_count = max(len(row) for row in rows)
+        normalized_rows = [row + [""] * (column_count - len(row)) for row in rows]
+        widths = [
+            max(3, *(len(row[column]) for row in normalized_rows))
+            for column in range(column_count)
+        ]
+        body = []
+        for row_index, row in enumerate(normalized_rows):
+            if row_index == 1:
+                cells = ["-" * width for width in widths]
+            else:
+                cells = [cell.ljust(widths[column]) for column, cell in enumerate(row)]
+            body.append("| " + " | ".join(cells) + " |")
 
-    column_count = max(len(row) for row in rows)
-    normalized_rows = [row + [""] * (column_count - len(row)) for row in rows]
-    widths = [
-        max(3, *(len(row[column]) for row in normalized_rows))
-        for column in range(column_count)
-    ]
-
-    rendered: list[str] = []
-    for row_index, row in enumerate(normalized_rows):
-        if row_index == 1:
-            # Use box-drawing U+2500 (─), NOT ASCII '-', for the header divider.
-            # core's table regex second line is `\|[-|: ]+\|` (ASCII only) and is
-            # run MULTILINE on raw content WITHOUT stripping ``` fences — an ASCII
-            # `| --- |` line inside the code block would still trip it and drop the
-            # card. '─' is outside [-|: ] so the fenced table no longer matches.
-            cells = ["─" * width for width in widths]
-        else:
-            cells = [cell.ljust(widths[column]) for column, cell in enumerate(row)]
-        rendered.append("| " + " | ".join(cells) + " |")
-    return "```\n" + "\n".join(rendered) + "\n```"
+    # Indent EVERY line by one space so no line starts with '|'. core's table
+    # regex is `^\|.*\|\n\|[-|: ]+\|` (MULTILINE, re.search, NO ``` fence stripping):
+    # the leading space defeats the `^\|` anchor for every line — the separator
+    # AND any data row whose cells are only dashes/colons (e.g. a table that
+    # documents markdown). So a fenced table can never trip core and drop the
+    # card, while the ``` fence keeps it visually tabular.
+    indented = "\n".join(" " + line for line in body)
+    return "```\n" + indented + "\n```"
 
 
 def _render_markdown_table_for_card(block_lines: list[str], stash_code_text: Any) -> str:
