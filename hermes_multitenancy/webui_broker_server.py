@@ -34,6 +34,10 @@ SandboxAvailable = Callable[[], bool]
 _OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
 _AGENT_ID_HEADER = "X-Hermes-Agent-Id"
 _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE = 32 * 1024 * 1024
+# Public SkillHub webhook bodies are small JSON envelopes; cap hard to avoid
+# disk-fill / DoS on an internet-exposed route (the 32MB broker default is for
+# WebUI run submissions, not webhooks).
+_SKILLHUB_MAX_BODY_BYTES = 256 * 1024
 
 _runner: Any = None
 _site: Any = None
@@ -227,21 +231,32 @@ def _authorized(request: Any) -> bool:
 
 
 def _skillhub_authorized(request: Any) -> bool:
-    """Auth for the SkillHub webhook ingress.
+    """Auth for the SkillHub webhook ingress — **fail-closed**.
 
-    Accepts a dedicated ``HERMES_SKILLHUB_WEBHOOK_KEY`` (a fixed Bearer token we
-    hand to the AiDock side) so the broker's master key never has to be shared
-    with an external caller. Falls back to the normal master-key check, which
-    keeps the dev-friendly "no key configured → open" behavior of ``_authorized``.
+    This route is exposed to the public internet (via the reverse proxy), so it
+    does NOT inherit ``_authorized``'s dev-friendly "no key configured → open"
+    behavior. Rules:
+
+    * Accept a dedicated ``HERMES_SKILLHUB_WEBHOOK_KEY`` (the fixed Bearer token
+      handed to the AiDock side) so the master broker key is never shared.
+    * Also accept the master ``HERMES_MULTITENANCY_RUN_BROKER_KEY`` (single-key
+      / internal-caller setups).
+    * If NEITHER key is configured, refuse — never serve this route unauthenticated.
     """
     dedicated = os.environ.get("HERMES_SKILLHUB_WEBHOOK_KEY", "").strip()
-    if dedicated:
-        header = request.headers.get("Authorization", "")
-        prefix = "Bearer "
-        token = header[len(prefix):].strip() if header.startswith(prefix) else ""
-        if token and hmac.compare_digest(token, dedicated):
-            return True
-    return _authorized(request)
+    master = _run_broker_key()
+    if not dedicated and not master:
+        return False  # public route must never be open
+    header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    token = header[len(prefix):].strip() if header.startswith(prefix) else ""
+    if not token:
+        return False
+    if dedicated and hmac.compare_digest(token, dedicated):
+        return True
+    if master and hmac.compare_digest(token, master):
+        return True
+    return False
 
 
 def _default_sandbox_available() -> bool:
@@ -1772,7 +1787,31 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         from . import skillhub_events
 
+        # Reject oversize bodies before buffering the whole request.
+        if (
+            request.content_length is not None
+            and request.content_length > _SKILLHUB_MAX_BODY_BYTES
+        ):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error_code": "PAYLOAD_TOO_LARGE",
+                    "message": f"body exceeds {_SKILLHUB_MAX_BODY_BYTES} bytes",
+                    "retryable": False,
+                },
+                status=413,
+            )
         raw = await request.read()
+        if len(raw) > _SKILLHUB_MAX_BODY_BYTES:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error_code": "PAYLOAD_TOO_LARGE",
+                    "message": f"body exceeds {_SKILLHUB_MAX_BODY_BYTES} bytes",
+                    "retryable": False,
+                },
+                status=413,
+            )
         try:
             payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:

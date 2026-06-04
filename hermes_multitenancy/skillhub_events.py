@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -210,6 +211,9 @@ class SkillhubEventStore:
         self._conn.executescript("PRAGMA journal_mode=WAL;")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # The connection is shared (check_same_thread=False) across the aiohttp
+        # event loop and the cron worker thread; serialize writes.
+        self._lock = threading.Lock()
 
     def record(
         self,
@@ -225,40 +229,43 @@ class SkillhubEventStore:
         for safe webhook retries.
         """
         event_id = event["event_id"]
-        existing = self._conn.execute(
-            "SELECT status FROM skillhub_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        if existing is not None:
-            return str(existing["status"]), True
-
         status = "queued" if event.get("known_type", False) else "queued_unknown_type"
         now = int(time.time())
-        self._conn.execute(
-            "INSERT INTO skillhub_events"
-            " (event_id, event_type, skill_code, release_id, version, download_url,"
-            "  checksum_sha256, skill_status, auth_type, audience_json, raw_payload,"
-            "  status, signature_verified, received_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                event_id,
-                event["event_type"],
-                event["skill_code"],
-                event.get("release_id"),
-                event.get("version"),
-                event.get("download_url"),
-                event.get("checksum_sha256"),
-                event.get("skill_status"),
-                event.get("auth_type"),
-                json.dumps(event.get("audience") or {}, ensure_ascii=False),
-                raw_payload,
-                status,
-                1 if signature_verified else 0,
-                now,
-                now,
-            ),
-        )
-        self._conn.commit()
-        return status, False
+        with self._lock:
+            # Atomic idempotency: INSERT OR IGNORE collapses a duplicate event_id
+            # to a no-op (rowcount 0) instead of racing SELECT-then-INSERT into an
+            # IntegrityError under concurrent access.
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO skillhub_events"
+                " (event_id, event_type, skill_code, release_id, version, download_url,"
+                "  checksum_sha256, skill_status, auth_type, audience_json, raw_payload,"
+                "  status, signature_verified, received_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event_id,
+                    event["event_type"],
+                    event["skill_code"],
+                    event.get("release_id"),
+                    event.get("version"),
+                    event.get("download_url"),
+                    event.get("checksum_sha256"),
+                    event.get("skill_status"),
+                    event.get("auth_type"),
+                    json.dumps(event.get("audience") or {}, ensure_ascii=False),
+                    raw_payload,
+                    status,
+                    1 if signature_verified else 0,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                row = self._conn.execute(
+                    "SELECT status FROM skillhub_events WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                return (str(row["status"]) if row is not None else status), True
+            return status, False
 
     def get(self, event_id: str) -> Optional[dict[str, Any]]:
         row = self._conn.execute(

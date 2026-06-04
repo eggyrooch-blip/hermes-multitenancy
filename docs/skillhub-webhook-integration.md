@@ -7,24 +7,23 @@
 ## 1. 接口
 
 ```
-POST /api/run-broker/skillhub/events
+POST https://hermes.example.com/api/run-broker/skillhub/events
 Content-Type: application/json
 ```
 
-- 开发环境监听：`127.0.0.1:8766`（Hermes run-broker sidecar，可用 `HERMES_MULTITENANCY_RUN_BROKER_PORT` 改）。
-- ⚠️ 公网联调：broker 默认只绑 localhost。你那边要从外部打进来，需要 Hermes 侧加反代/内网可达地址——这个我们定联调时给你一个可达 URL。先用这个路径和契约对齐。
+- 走 **443 / HTTPS**,域名 `hermes.example.com`(证书是 `*.example.com`,**别用 IP**,IP 会证书不匹配)。
+- 前面是 Caddy 反代,只把这一条路径转发到内部 run-broker(:8766);其它 run-broker 路径不对外。
 
-## 2. 鉴权（dev 期可先不配）
+## 2. 鉴权（固定 Bearer key，**必填**）
 
-两层，都可选，按你方便选：
+这条接口对公网开放,所以是**fail-closed**:没有配置任何 key 时直接拒绝,绝不裸奔。
 
-1. **Bearer（最简单）**：若 Hermes 配了 `HERMES_MULTITENANCY_RUN_BROKER_KEY`，请带
-   `Authorization: Bearer <key>`。dev 期没配则免鉴权直接通。
-2. **HMAC 签名（更安全，推荐正式期用）**：若 Hermes 配了 `HERMES_SKILLHUB_WEBHOOK_SECRET`，请带：
-   - `X-AiDock-Timestamp: <unix秒>`
-   - `X-AiDock-Signature: sha256=<hex>`
-   - 签名构造：`HMAC_SHA256(secret, timestamp + "." + event_id + "." + 原始body)`
-   - 没配 secret 时此校验自动跳过（dev 友好）。
+- **请带固定 Bearer key**:`Authorization: Bearer <key>`。
+- 我会给你一个**专用 key**(`HERMES_SKILLHUB_WEBHOOK_KEY`),只用于这条接口——不是 Hermes 主 key,泄了也只影响这一条。
+- key 我单独私发给你,**不写在本文档里**。
+- (可选,正式期可加)HMAC 签名:若双方约定 `HERMES_SKILLHUB_WEBHOOK_SECRET`,带 `X-AiDock-Timestamp` + `X-AiDock-Signature: sha256=<hex>`,签名 = `HMAC_SHA256(secret, timestamp + "." + event_id + "." + 原始body)`。当前内网走固定 key,这步先不用。
+
+> body 限制:webhook 包体上限 **256KB**(超了返回 413),正常 JSON 远小于此。
 
 ## 3. 请求体（你现在推的格式我已兼容）
 
@@ -87,8 +86,9 @@ Content-Type: application/json
 ## 5. 联调 curl（已在本地实测通过）
 
 ```bash
-curl -s -X POST http://127.0.0.1:8766/api/run-broker/skillhub/events \
+curl -s -X POST https://hermes.example.com/api/run-broker/skillhub/events \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <你的专用key>" \
   -d '{"event_type":"skill.install_approved","skill_code":"daily-breaking","release_id":"rel_001","version":"1.0.3","download_url":"https://example.invalid/1.0.3.zip","skill_status":"active","audience":{"auth_type":"auth","users":[{"profile_id":"profile-owner"}]}}'
 ```
 

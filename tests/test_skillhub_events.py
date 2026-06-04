@@ -49,9 +49,17 @@ PRD_ENVELOPE = {
 }
 
 
+TEST_KEY = "test-skillhub-key"
+
+
 @pytest.fixture(autouse=True)
-def _fresh_event_store():
-    """Each test gets an isolated in-memory event store."""
+def _fresh_event_store(monkeypatch):
+    """Each test gets an isolated in-memory store + a configured webhook key.
+
+    The endpoint is fail-closed, so a key MUST be configured for it to serve at
+    all; tests send TEST_KEY by default via ``_post``.
+    """
+    monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_KEY", TEST_KEY)
     skillhub_events.override_event_store(":memory:")
     yield
     skillhub_events.override_event_store(":memory:")
@@ -152,17 +160,21 @@ def _make_app():
     return create_run_broker_app()
 
 
-def _post(path, *, json_body=None, raw=None, headers=None):
+def _post(path, *, json_body=None, raw=None, headers=None, token=TEST_KEY):
     from aiohttp.test_utils import TestClient, TestServer
+
+    final_headers = dict(headers or {})
+    if token is not None and "Authorization" not in final_headers:
+        final_headers["Authorization"] = f"Bearer {token}"
 
     async def runner():
         client = TestClient(TestServer(_make_app()))
         await client.start_server()
         try:
             if raw is not None:
-                resp = await client.post(path, data=raw, headers=headers)
+                resp = await client.post(path, data=raw, headers=final_headers)
             else:
-                resp = await client.post(path, json=json_body, headers=headers)
+                resp = await client.post(path, json=json_body, headers=final_headers)
             body = await resp.json()
             return resp.status, body
         finally:
@@ -230,7 +242,7 @@ def test_endpoint_dedicated_key_accepts_and_rejects(monkeypatch):
     ok_status, ok_body = _post(
         "/api/run-broker/skillhub/events",
         json_body=WANGKEJIE_PAYLOAD,
-        headers={"Authorization": "Bearer wkj-fixed-key"},
+        token="wkj-fixed-key",
     )
     assert ok_status == 200
     assert ok_body["status"] == "queued"
@@ -238,11 +250,13 @@ def test_endpoint_dedicated_key_accepts_and_rejects(monkeypatch):
     bad_status, _ = _post(
         "/api/run-broker/skillhub/events",
         json_body=WANGKEJIE_PAYLOAD,
-        headers={"Authorization": "Bearer wrong-key"},
+        token="wrong-key",
     )
     assert bad_status == 401
 
-    missing_status, _ = _post("/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD)
+    missing_status, _ = _post(
+        "/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD, token=None
+    )
     assert missing_status == 401
 
 
@@ -256,6 +270,33 @@ def test_endpoint_master_key_still_works_for_skillhub(monkeypatch):
         headers={"Authorization": "Bearer master-key"},
     )
     assert status == 200
+
+
+def test_endpoint_fail_closed_when_no_key_configured(monkeypatch):
+    # Public route must NOT be open when neither key is configured.
+    monkeypatch.delenv("HERMES_SKILLHUB_WEBHOOK_KEY", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    # Even with a bearer token, no configured key → refuse.
+    status, _ = _post(
+        "/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD, token="anything"
+    )
+    assert status == 401
+    no_token_status, _ = _post(
+        "/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD, token=None
+    )
+    assert no_token_status == 401
+
+
+def test_endpoint_rejects_oversize_body():
+    big = {
+        "event_type": "skill.install_approved",
+        "skill_code": "x",
+        "blob": "A" * (300 * 1024),
+    }
+    status, body = _post("/api/run-broker/skillhub/events", json_body=big)
+    assert status == 413
+    assert body["error_code"] == "PAYLOAD_TOO_LARGE"
+    assert skillhub_events.get_event_store().count() == 0
 
 
 def test_endpoint_accepts_valid_signature(monkeypatch):
