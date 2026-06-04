@@ -19,6 +19,9 @@ _FALLBACK_ALIASES = {
     "feishu_reauth": "feishu-auth",
     "feishu-auth": "feishu-auth",
     "feishu-reauth": "feishu-auth",
+    "auth": "auth",
+    "creds": "auth",
+    "credentials": "auth",
     "provider": "model",
     "reset": "new",
     "bg": "background",
@@ -34,6 +37,7 @@ _FALLBACK_GATEWAY_COMMANDS = frozenset(
     {
         "agents",
         "approve",
+        "auth",
         "background",
         "branch",
         "commands",

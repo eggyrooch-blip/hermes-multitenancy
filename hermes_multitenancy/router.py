@@ -2524,6 +2524,18 @@ async def _handle_command(
             event=event,
         )
         return
+    elif cmd == "auth":
+        await _handle_auth_command(
+            args=_args,
+            sender=sender,
+            sender_alt=sender_alt,
+            profile_name=profile_name,
+            profile_home=profile_home,
+            chat_id=chat_id,
+            gateway=gateway,
+            event=event,
+        )
+        return
     elif cmd == "help":
         reply = _gateway_help_text()
     else:
@@ -2747,6 +2759,193 @@ async def _poll_feishu_auth_session_until_done(
             if not updated:
                 await _safe_call(adapter.send, chat_id, f"飞书 UAT 授权失败：{error}")
         return
+
+
+async def _handle_auth_command(
+    *,
+    args: str,
+    sender: str,
+    sender_alt: Optional[str],
+    profile_name: Optional[str],
+    profile_home: Optional[Path],
+    chat_id: str,
+    gateway: Any,
+    event: Any,
+) -> None:
+    """Render the ``/auth`` credential hub — a collection card of all credentials.
+
+    ``/feishu_auth`` is the lark-cli/feishu row of this hub. lark-cli is wired
+    end-to-end here (reuses the device-flow session to mint its authorize URL +
+    background poll). keep-record / kep-cli report live status; their in-Feishu
+    auth-start is a follow-up slice.
+    """
+    del profile_home, event
+    from . import credential_hub, feishu_uat_auth
+    from .feishu_auth_cards import send_auth_card
+    from .feishu_credential_hub_cards import build_hub_card
+
+    adapter = _get_feishu_adapter(gateway)
+    open_id = (
+        _normalize_feishu_open_id(sender)
+        or _normalize_feishu_open_id(sender_alt)
+        or _profile_open_id_for_auth(profile_name)
+        or ""
+    )
+    if not _is_feishu_open_id(open_id):
+        if adapter is not None:
+            await _safe_call(adapter.send, chat_id, "无法打开凭证中心：当前消息没有可用的 sender open_id。")
+        return
+    if not profile_name:
+        if adapter is not None:
+            await _safe_call(adapter.send, chat_id, "无法打开凭证中心：当前飞书用户还没有绑定 Hermes profile。")
+        return
+
+    rows = await asyncio.to_thread(
+        credential_hub.collect_credential_statuses,
+        profile_name=profile_name,
+        open_id=open_id,
+    )
+
+    auth_urls: dict[str, str] = {}
+    pending_note: dict[str, str] = {}
+    lark_session_id = ""
+    lark_interval = 3
+
+    lark_row = next((r for r in rows if r.id == credential_hub.LARK_CLI), None)
+    if lark_row is not None and not lark_row.authenticated:
+        # Reuse the proven device-flow path to mint the lark-cli authorize URL.
+        try:
+            session = await asyncio.to_thread(
+                feishu_uat_auth.start_session,
+                profile_name=profile_name,
+                open_id=open_id,
+                scope=(args.strip() or None),
+            )
+            verification_uri = str(session.get("verification_uri") or "")
+            if verification_uri:
+                auth_urls[credential_hub.LARK_CLI] = verification_uri
+                lark_session_id = str(session.get("session_id") or "")
+                lark_interval = int(session.get("interval") or 3)
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            pending_note[credential_hub.LARK_CLI] = f"暂时无法发起授权：{exc.message}"
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("multitenancy: /auth lark session start failed (%s)", exc)
+            pending_note[credential_hub.LARK_CLI] = "暂时无法发起授权，请稍后重试。"
+
+    # keep-record / kep-cli in-Feishu auth-start lands in a follow-up slice.
+    for cid in (credential_hub.KEEP_RECORD, credential_hub.KEP_CLI):
+        row = next((r for r in rows if r.id == cid), None)
+        if row is not None and not row.authenticated and cid not in auth_urls:
+            pending_note.setdefault(cid, "飞书内认证即将开放，当前可在 WebUI 凭证页完成。")
+
+    if adapter is None:
+        return
+
+    card = build_hub_card(rows=rows, auth_urls=auth_urls, pending_note=pending_note)
+    hub_card = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
+    if hub_card is None:
+        lines = ["凭证中心："]
+        for row in rows:
+            mark = "✅ 已认证" if row.authenticated else "⚠️ 未认证"
+            lines.append(f"- {row.title}: {mark}")
+        url = auth_urls.get(credential_hub.LARK_CLI)
+        if url:
+            lines.append(f"\nLark-cli 授权链接：{url}")
+        await _safe_call(adapter.send, chat_id, "\n".join(lines))
+        return
+
+    if lark_session_id:
+        _start_auth_hub_poll_task(
+            session_id=lark_session_id,
+            profile_name=profile_name,
+            open_id=open_id,
+            chat_id=chat_id,
+            gateway=gateway,
+            interval=lark_interval,
+            hub_card=hub_card,
+            pending_note=pending_note,
+        )
+
+
+def _start_auth_hub_poll_task(
+    *,
+    session_id: str,
+    profile_name: str,
+    open_id: str,
+    chat_id: str,
+    gateway: Any,
+    interval: int,
+    hub_card: dict[str, Any],
+    pending_note: dict[str, str],
+) -> None:
+    if not session_id:
+        return
+    task = asyncio.create_task(
+        _poll_auth_hub_until_done(
+            session_id=session_id,
+            profile_name=profile_name,
+            open_id=open_id,
+            chat_id=chat_id,
+            gateway=gateway,
+            interval=interval,
+            hub_card=hub_card,
+            pending_note=pending_note,
+        ),
+        name=f"auth-hub:{profile_name}:{open_id}:{session_id}",
+    )
+    task.add_done_callback(lambda t: logger.debug("auth hub poll task ended: %s", t.get_name()))
+
+
+async def _poll_auth_hub_until_done(
+    *,
+    session_id: str,
+    profile_name: str,
+    open_id: str,
+    chat_id: str,
+    gateway: Any,
+    interval: int,
+    hub_card: dict[str, Any],
+    pending_note: dict[str, str],
+) -> None:
+    """Poll the lark-cli device-flow session; on terminal state re-render the hub."""
+    from . import credential_hub, feishu_uat_auth
+    from .feishu_auth_cards import update_auth_card
+    from .feishu_credential_hub_cards import build_hub_card
+
+    adapter = _get_feishu_adapter(gateway)
+    current_interval = max(int(interval or 3), 2)
+    while True:
+        await asyncio.sleep(current_interval)
+        try:
+            session = await asyncio.to_thread(
+                feishu_uat_auth.poll_session,
+                session_id=session_id,
+                profile_name=profile_name,
+                open_id=open_id,
+            )
+        except feishu_uat_auth.FeishuUatAuthError:
+            break
+        status = str(session.get("status") or "")
+        if status == "pending":
+            current_interval = max(int(session.get("interval") or current_interval), 2)
+            continue
+        break
+
+    if adapter is None:
+        return
+    # Re-render the whole hub with fresh statuses (lark-cli now reflects result).
+    try:
+        rows = await asyncio.to_thread(
+            credential_hub.collect_credential_statuses,
+            profile_name=profile_name,
+            open_id=open_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("multitenancy: /auth hub refresh failed (%s)", exc)
+        return
+    refreshed_note = {k: v for k, v in pending_note.items() if k != credential_hub.LARK_CLI}
+    card = build_hub_card(rows=rows, auth_urls={}, pending_note=refreshed_note)
+    await update_auth_card(adapter=adapter, auth_card=hub_card, card=card)
 
 
 def _handle_pending_approval_command(

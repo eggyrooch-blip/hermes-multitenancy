@@ -1512,6 +1512,37 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI Feishu UAT status failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_credential_hub(request):
+        """Aggregated, redacted credential status for one tenant.
+
+        This is the single convergence point (归口) for credential status in
+        multitenancy. Both access paths consume it: the Feishu ``/auth`` card
+        (in-process) and the hermes-web-ui CredentialsView (over this HTTP
+        endpoint). The two surfaces are just different paths over one core.
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import credential_hub
+
+        try:
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            rows = credential_hub.collect_credential_statuses(
+                profile_name=profile_name,
+                open_id=user_key,
+            )
+            return web.json_response(
+                {
+                    "profile_name": profile_name,
+                    "subject_id": user_key,
+                    "credentials": [row.to_dict() for row in rows],
+                }
+            )
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI credential hub failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_feishu_auth_start(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1924,6 +1955,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
+    app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
     app.router.add_delete("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_cancel)
