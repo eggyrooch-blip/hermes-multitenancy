@@ -3222,6 +3222,27 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
     return _cleanup
 
 
+def _finalize_aiagent_result(result: Optional[dict]) -> str:
+    """Turn the core conversation result into the user-facing reply string.
+
+    Dead-air fix: core's conversation_loop returns ``{failed:True, error:...}``
+    (and ``final_response=None``) on a non-retryable failure, e.g. a provider
+    HTTP 400. Silently flattening that to ``""`` hid the failure, so
+    ``real_run_agent``'s legacy fallback and the router's "⚠️ 模型暂时不可用"
+    message could never fire — the user got complete silence in Feishu.
+
+    Raise on a failed/empty turn so those existing fallbacks activate; return
+    the text on success. A genuine empty-but-successful turn (``final_response``
+    is ``""`` with no ``failed`` flag) still returns ``""`` unchanged.
+    """
+    res = result or {}
+    final_response = res.get("final_response")
+    if res.get("failed") or final_response is None:
+        err = res.get("error") or "agent turn failed without a final response"
+        raise RuntimeError(f"AIAgent turn failed: {err}")
+    return final_response or ""
+
+
 def _run_with_aiagent(
     event: Any,
     profile_home: Path,
@@ -3538,7 +3559,7 @@ def _run_with_aiagent(
                     pass
             _retag_source_now("finally-post-close")
 
-    return (result or {}).get("final_response", "") or ""
+    return _finalize_aiagent_result(result)
 
 
 def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
