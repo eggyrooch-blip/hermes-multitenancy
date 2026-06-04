@@ -11,10 +11,15 @@ from typing import Any
 
 from .sanitization import _strip_invalid_image_keys
 
-_MARKDOWN_TABLE_MAX_NATIVE_COLUMNS = 4
-_MARKDOWN_TABLE_MAX_NATIVE_ROWS = 12
-_MARKDOWN_TABLE_MAX_NATIVE_CHARS = 1200
-_MARKDOWN_TABLE_MAX_NATIVE_LINE_CHARS = 120
+# Boundary between the two card-safe shapes a table degrades into. A narrow
+# table renders as an aligned monospace code block (clean, compact in the card);
+# a wide one (too many columns or a too-long rendered line that would wrap into a
+# mess on mobile) renders as a vertical key-value list instead. Either way the
+# native ``|---|`` table form never reaches core, which would otherwise force the
+# whole message to plain text and drop the card (feishu.py — md cards can't render
+# tables).
+_TABLE_CODEBLOCK_MAX_COLUMNS = 5
+_TABLE_CODEBLOCK_MAX_LINE_CHARS = 100
 
 
 def _optimize_markdown_style(text: str, card_version: int = 2) -> str:
@@ -59,7 +64,14 @@ def _optimize_markdown_style_inner(text: str, card_version: int = 2) -> str:
 
 
 def _degrade_limited_markdown_tables(text: str, stash_code_text: Any) -> str:
-    """Downgrade oversized markdown tables using openclaw-lark's code-mode shape."""
+    """Convert EVERY markdown table into a card-safe shape.
+
+    Any native ``|---|`` table that survives to core makes core force the whole
+    message to plain text (md cards can't render tables), dropping the card. So
+    every table is degraded before core sees it: narrow → aligned code block,
+    wide → vertical key-value list. (Previously only *oversized* tables were
+    degraded; small ones leaked through and silently lost the card.)
+    """
     lines = str(text or "").splitlines()
     result: list[str] = []
     index = 0
@@ -69,10 +81,7 @@ def _degrade_limited_markdown_tables(text: str, stash_code_text: Any) -> str:
             while end < len(lines) and _is_markdown_table_row(lines[end]):
                 end += 1
             block_lines = lines[index:end]
-            if _should_degrade_markdown_table(block_lines):
-                result.append(stash_code_text(_render_markdown_table_code_block(block_lines)))
-            else:
-                result.extend(block_lines)
+            result.append(_render_markdown_table_for_card(block_lines, stash_code_text))
             index = end
             continue
         result.append(lines[index])
@@ -109,18 +118,6 @@ def _split_markdown_table_row(line: str) -> list[str]:
     return [cell.strip() for cell in stripped.split("|")]
 
 
-def _should_degrade_markdown_table(block_lines: list[str]) -> bool:
-    rows = [_split_markdown_table_row(line) for line in block_lines if _is_markdown_table_row(line)]
-    columns = max((len(row) for row in rows), default=0)
-    data_rows = max(0, len(rows) - 2)
-    return (
-        columns > _MARKDOWN_TABLE_MAX_NATIVE_COLUMNS
-        or data_rows > _MARKDOWN_TABLE_MAX_NATIVE_ROWS
-        or sum(len(line) for line in block_lines) > _MARKDOWN_TABLE_MAX_NATIVE_CHARS
-        or any(len(line) > _MARKDOWN_TABLE_MAX_NATIVE_LINE_CHARS for line in block_lines)
-    )
-
-
 def _render_markdown_table_code_block(block_lines: list[str]) -> str:
     rows = [
         [_plain_table_cell(cell) for cell in _split_markdown_table_row(line)]
@@ -145,6 +142,61 @@ def _render_markdown_table_code_block(block_lines: list[str]) -> str:
             cells = [cell.ljust(widths[column]) for column, cell in enumerate(row)]
         rendered.append("| " + " | ".join(cells) + " |")
     return "```\n" + "\n".join(rendered) + "\n```"
+
+
+def _render_markdown_table_for_card(block_lines: list[str], stash_code_text: Any) -> str:
+    """Pick a card-safe shape for one table block.
+
+    Narrow (few columns AND no overly-long rendered line) → aligned monospace
+    code block, stashed so the card renders it verbatim. Wide → vertical
+    key-value list (``- **header**：value`` bullets) which reads cleanly on
+    mobile and carries no table syntax. Degenerate header-only tables keep the
+    aligned code-block form.
+    """
+    rows = [
+        _split_markdown_table_row(line)
+        for line in block_lines
+        if _is_markdown_table_row(line)
+    ]
+    columns = max((len(row) for row in rows), default=0)
+    code_block = _render_markdown_table_code_block(block_lines)
+    inner_lines = code_block.split("\n")[1:-1]  # drop the ``` fences
+    max_line = max((len(line) for line in inner_lines), default=0)
+    if columns <= _TABLE_CODEBLOCK_MAX_COLUMNS and max_line <= _TABLE_CODEBLOCK_MAX_LINE_CHARS:
+        return stash_code_text(code_block)
+    kv = _render_markdown_table_kv_list(block_lines)
+    return kv if kv else stash_code_text(code_block)
+
+
+def _render_markdown_table_kv_list(block_lines: list[str]) -> str:
+    """Render a table as vertical key-value bullets — no ``|---|`` table syntax.
+
+    Each data row becomes a ``- **header**：value`` block; rows are separated by a
+    blank line. Empty cells are skipped. Returns ``""`` when there is no data row
+    (caller then keeps the code-block form).
+    """
+    rows = [
+        [_plain_table_cell(cell) for cell in _split_markdown_table_row(line)]
+        for line in block_lines
+        if _is_markdown_table_row(line)
+    ]
+    if len(rows) < 3:  # header + separator + at least one data row
+        return ""
+    column_count = max(len(row) for row in rows)
+    headers = rows[0] + [""] * (column_count - len(rows[0]))
+    blocks: list[str] = []
+    for row in rows[2:]:  # skip header (0) + separator (1)
+        row = row + [""] * (column_count - len(row))
+        out: list[str] = []
+        for col in range(column_count):
+            head = headers[col].strip()
+            val = row[col].strip()
+            if not val:
+                continue
+            out.append(f"- **{head}**：{val}" if head else f"- {val}")
+        if out:
+            blocks.append("\n".join(out))
+    return "\n\n".join(blocks)
 
 
 def _plain_table_cell(value: str) -> str:
