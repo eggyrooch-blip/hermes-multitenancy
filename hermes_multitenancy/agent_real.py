@@ -465,6 +465,41 @@ def _resolve_api_key(
     return None
 
 
+def _resolve_custom_provider_api_key(
+    config: dict[str, Any],
+    provider: str,
+) -> Optional[str]:
+    """Inline ``api_key`` for a ``custom:<name>`` provider from config.yaml.
+
+    ``_resolve_api_key`` only checks env vars + auth.json's inline tokens.
+    Multi-tenant profiles configure their LLM via the ``custom_providers:`` list
+    (the model migration to litellm.sre stores the key inline there; the secret
+    in auth.json's credential_pool lives in an encrypted vault, NOT as an inline
+    access_token), so ``_resolve_api_key`` returned None and every turn raised
+    "no API key for primary provider 'custom:...'". Match the custom provider by
+    its ``custom:<normalized-name>`` slug or by base_url and return the inline key.
+    """
+    if not provider or not provider.lower().startswith("custom"):
+        return None
+    custom_providers = config.get("custom_providers")
+    if not isinstance(custom_providers, list):
+        return None
+    want_name = provider.split(":", 1)[1].strip().lower() if ":" in provider else ""
+    model_base_url = str((config.get("model") or {}).get("base_url") or "").strip().rstrip("/")
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip().lower().replace(" ", "-")
+        base_url = str(
+            entry.get("base_url") or entry.get("url") or entry.get("api") or ""
+        ).strip().rstrip("/")
+        if (want_name and name == want_name) or (model_base_url and base_url == model_base_url):
+            key = str(entry.get("api_key") or "").strip()
+            if key:
+                return key
+    return None
+
+
 def _resolve_base_url(
     provider: str,
     is_primary: bool,
@@ -3279,7 +3314,7 @@ def _run_with_aiagent(
     fallback_models = config.get("fallback") or []
 
     provider, model_only = _split_model_spec(primary)
-    api_key = _resolve_api_key(provider, env_overrides, auth)
+    api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
     if not api_key:
         raise RuntimeError(f"no API key for primary provider {provider!r}")
 
