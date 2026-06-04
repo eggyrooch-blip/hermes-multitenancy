@@ -28,6 +28,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -109,6 +110,7 @@ def install_cron_runtime_patches() -> None:
     _patch_scheduler_owner_open_id_delivery()
     _patch_cron_delivery_mirror()
     _patch_feishu_open_id_send()
+    _patch_feishu_outbound_link_render()
     _runtime_patches_installed = True
 
 
@@ -1137,6 +1139,62 @@ def _patch_feishu_open_id_send() -> None:
     setattr(send_raw_message, "_hermes_multitenancy_patched", True)
     FeishuAdapter._send_raw_message = send_raw_message
     logger.info("[multitenancy] patched Feishu delivery for user open_id targets")
+
+
+# Matches a markdown link: [label](url)
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _linkify_markdown_links_in_text(text: str) -> str:
+    """Rewrite ``[label](url)`` -> ``label (url)`` so bare URLs survive.
+
+    Feishu auto-linkifies bare URLs in plain-text messages but does NOT render
+    markdown link syntax. Upstream ``_build_outbound_payload`` force-sends any
+    table-containing content as raw plain text, so ``[label](url)`` arrives
+    literally and is not clickable. Converting to ``label (url)`` exposes the
+    bare URL, which Feishu turns into a working link.
+    """
+    return _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", text)
+
+
+def _patch_feishu_outbound_link_render() -> None:
+    """Make markdown links clickable in Feishu plain-text (table) messages.
+
+    Wraps ``FeishuAdapter._build_outbound_payload`` without modifying Hermes
+    source. When the core builder returns a ``"text"`` payload (which it does
+    for any markdown-table content), rewrite ``[label](url)`` to ``label (url)``
+    so the bare URL is auto-linkified by Feishu. ``"post"`` payloads already
+    render markdown links and are left untouched.
+    """
+    try:
+        from gateway.platforms.feishu import FeishuAdapter
+    except Exception:
+        logger.exception("[multitenancy] failed to patch Feishu outbound link render")
+        return
+
+    original = getattr(FeishuAdapter, "_build_outbound_payload", None)
+    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+        return
+
+    @functools.wraps(original)
+    def build_outbound_payload(self: Any, content: str) -> tuple[str, str]:
+        msg_type, payload = original(self, content)
+        if msg_type != "text":
+            return msg_type, payload
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return msg_type, payload
+        text = data.get("text") if isinstance(data, dict) else None
+        if isinstance(text, str) and _MD_LINK_RE.search(text):
+            data["text"] = _linkify_markdown_links_in_text(text)
+            payload = json.dumps(data, ensure_ascii=False)
+        return msg_type, payload
+
+    setattr(build_outbound_payload, "_hermes_multitenancy_patched", True)
+    setattr(build_outbound_payload, "_hermes_multitenancy_original", original)
+    FeishuAdapter._build_outbound_payload = build_outbound_payload
+    logger.info("[multitenancy] patched Feishu outbound payload to linkify markdown links in text mode")
 
 
 def _feishu_response_message_id(response: Any) -> Optional[str]:
