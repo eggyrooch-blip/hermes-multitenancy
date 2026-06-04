@@ -412,8 +412,13 @@ def lark_cli_status(
     raw_status = str(raw.get("status") or "")
     lark = raw.get("lark_cli") or {}
     default_identity = lark.get("default_identity")
-    expires_at = raw.get("expires_at")
-    row.expires_at = int(expires_at) if expires_at else None
+    # Display the REFRESH window, not the ~1h access token: the access token is
+    # auto-renewed via the refresh token (refresh_uat_if_needed), so the user
+    # only needs to re-auth when the refresh token expires (~30 days). Showing
+    # the 1h access expiry alarms users into thinking it's about to break.
+    access_exp = raw.get("expires_at")
+    refresh_exp = raw.get("refresh_expires_at")
+    row.expires_at = int(refresh_exp) if refresh_exp else (int(access_exp) if access_exp else None)
 
     p_dir = Path(profile_dir) if profile_dir else (Path(shared_home) / "profiles" / profile_name)
     local_connected, local_exp = _local_feishu_uat(p_dir)
@@ -425,7 +430,7 @@ def lark_cli_status(
     if connected:
         row.status = S_AUTHENTICATED
         row.default_identity = default_identity or ("user" if local_connected else None)
-        row.detail = "Lark-cli 已完成用户授权。"
+        row.detail = "Lark-cli 已完成用户授权（访问令牌自动续期，到期前无需重新授权）。"
         row.action["label"] = "重新授权"
     elif raw_status in ("missing", "scope_missing", "expired"):
         row.status, row.detail = S_NEEDS_AUTH, "Lark-cli 需要用户授权后才能访问私有飞书资源。"

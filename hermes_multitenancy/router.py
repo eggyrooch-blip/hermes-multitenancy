@@ -2843,16 +2843,48 @@ async def _handle_auth_command(
             logger.debug("multitenancy: /auth lark session start failed (%s)", exc)
             pending_note[credential_hub.LARK_CLI] = "暂时无法发起授权，请稍后重试。"
 
-    # keep-record / kep-cli in-Feishu auth-start lands in a follow-up slice.
-    for cid in (credential_hub.KEEP_RECORD, credential_hub.KEP_CLI):
-        row = next((r for r in rows if r.id == cid), None)
-        if row is not None and not row.authenticated and cid not in auth_urls:
-            pending_note.setdefault(cid, "飞书内认证即将开放，当前可在 WebUI 凭证页完成。")
+    # keep-record (QR image, scan) + kep-cli (web login) in-Feishu auth-start.
+    from . import credential_hub_auth as cha
+
+    shared = feishu_uat_auth.resolve_shared_home()
+    pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
+    qr_image_keys: dict[str, str] = {}
+    flows: dict[str, dict[str, Any]] = {}
+    if lark_session_id:
+        flows[credential_hub.LARK_CLI] = {"kind": "lark", "session_id": lark_session_id, "interval": lark_interval}
+
+    keep_row = next((r for r in rows if r.id == credential_hub.KEEP_RECORD), None)
+    if keep_row is not None and not keep_row.authenticated:
+        try:
+            qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
+            image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
+            qr_image_keys[credential_hub.KEEP_RECORD] = image_key
+            flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
+        except cha.HubAuthError as exc:
+            pending_note.setdefault(credential_hub.KEEP_RECORD,
+                                    f"扫码认证暂不可用：{exc.message}" if exc.status != 404 else "Keep-record 未安装。")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("multitenancy: /auth keep-record QR start failed (%s)", exc)
+            pending_note.setdefault(credential_hub.KEEP_RECORD, "扫码认证暂时不可用，请稍后重试。")
+
+    kep_row = next((r for r in rows if r.id == credential_hub.KEP_CLI), None)
+    if kep_row is not None and not kep_row.authenticated:
+        try:
+            login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared)
+            auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
+            _KEP_LOGIN_PROCS.add(login.get("_proc"))  # keep the login process alive for the callback
+            flows[credential_hub.KEP_CLI] = {"kind": "kep"}
+        except cha.HubAuthError as exc:
+            pending_note.setdefault(credential_hub.KEP_CLI,
+                                    f"认证暂不可用：{exc.message}" if exc.status != 404 else "kep-cli 未安装。")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("multitenancy: /auth kep-cli login start failed (%s)", exc)
+            pending_note.setdefault(credential_hub.KEP_CLI, "认证暂时不可用，请稍后重试。")
 
     if adapter is None:
         return
 
-    card = build_hub_card(rows=rows, auth_urls=auth_urls, pending_note=pending_note)
+    card = build_hub_card(rows=rows, auth_urls=auth_urls, pending_note=pending_note, qr_image_keys=qr_image_keys)
     hub_card = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
     if hub_card is None:
         lines = ["凭证中心："]
@@ -2865,98 +2897,119 @@ async def _handle_auth_command(
         await _safe_call(adapter.send, chat_id, "\n".join(lines))
         return
 
-    if lark_session_id:
-        _start_auth_hub_poll_task(
-            session_id=lark_session_id,
+    if flows:
+        _start_hub_flow_poll(
             profile_name=profile_name,
             open_id=open_id,
+            profile_dir=pdir,
+            shared_home=shared,
             chat_id=chat_id,
             gateway=gateway,
-            interval=lark_interval,
             hub_card=hub_card,
-            pending_note=pending_note,
+            flows=flows,
         )
 
 
-def _start_auth_hub_poll_task(
+# Keep started kep-auth login subprocesses alive until their OAuth callback
+# lands (a GC'd Popen would kill the login mid-flow). Cleared opportunistically.
+_KEP_LOGIN_PROCS: set[Any] = set()
+
+
+def _start_hub_flow_poll(
     *,
-    session_id: str,
     profile_name: str,
     open_id: str,
+    profile_dir: Path,
+    shared_home: Path,
     chat_id: str,
     gateway: Any,
-    interval: int,
     hub_card: dict[str, Any],
-    pending_note: dict[str, str],
+    flows: dict[str, dict[str, Any]],
 ) -> None:
-    if not session_id:
+    if not flows:
         return
     task = asyncio.create_task(
-        _poll_auth_hub_until_done(
-            session_id=session_id,
+        _poll_hub_flows(
             profile_name=profile_name,
             open_id=open_id,
+            profile_dir=profile_dir,
+            shared_home=shared_home,
             chat_id=chat_id,
             gateway=gateway,
-            interval=interval,
             hub_card=hub_card,
-            pending_note=pending_note,
+            flows=flows,
         ),
-        name=f"auth-hub:{profile_name}:{open_id}:{session_id}",
+        name=f"auth-hub:{profile_name}:{open_id}:{','.join(sorted(flows))}",
     )
     task.add_done_callback(lambda t: logger.debug("auth hub poll task ended: %s", t.get_name()))
 
 
-async def _poll_auth_hub_until_done(
+async def _poll_hub_flows(
     *,
-    session_id: str,
     profile_name: str,
     open_id: str,
+    profile_dir: Path,
+    shared_home: Path,
     chat_id: str,
     gateway: Any,
-    interval: int,
     hub_card: dict[str, Any],
-    pending_note: dict[str, str],
+    flows: dict[str, dict[str, Any]],
 ) -> None:
-    """Poll the lark-cli device-flow session; on terminal state re-render the hub."""
-    from . import credential_hub, feishu_uat_auth
+    """Poll every started auth flow (lark device-flow, keep-record QR, kep-cli
+    login) until terminal or the overall deadline; re-render the hub card on
+    each completion so the user sees rows flip to 已认证 in place."""
+    from . import credential_hub, credential_hub_auth as cha, feishu_uat_auth
     from .feishu_auth_cards import update_auth_card
     from .feishu_credential_hub_cards import build_hub_card
 
     adapter = _get_feishu_adapter(gateway)
-    current_interval = max(int(interval or 3), 2)
-    while True:
-        await asyncio.sleep(current_interval)
-        try:
-            session = await asyncio.to_thread(
-                feishu_uat_auth.poll_session,
-                session_id=session_id,
-                profile_name=profile_name,
-                open_id=open_id,
-            )
-        except feishu_uat_auth.FeishuUatAuthError:
-            break
-        status = str(session.get("status") or "")
-        if status == "pending":
-            current_interval = max(int(session.get("interval") or current_interval), 2)
-            continue
-        break
-
     if adapter is None:
         return
-    # Re-render the whole hub with fresh statuses (lark-cli now reflects result).
-    try:
-        rows = await asyncio.to_thread(
-            credential_hub.collect_credential_statuses,
-            profile_name=profile_name,
-            open_id=open_id,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("multitenancy: /auth hub refresh failed (%s)", exc)
-        return
-    refreshed_note = {k: v for k, v in pending_note.items() if k != credential_hub.LARK_CLI}
-    card = build_hub_card(rows=rows, auth_urls={}, pending_note=refreshed_note)
-    await update_auth_card(adapter=adapter, auth_card=hub_card, card=card)
+
+    async def _rerender() -> None:
+        try:
+            rows = await asyncio.to_thread(
+                credential_hub.collect_credential_statuses,
+                profile_name=profile_name, open_id=open_id, home_dir=profile_dir / "home",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("multitenancy: /auth hub refresh failed (%s)", exc)
+            return
+        await update_auth_card(adapter=adapter, auth_card=hub_card,
+                               card=build_hub_card(rows=rows, auth_urls={}, pending_note={}, qr_image_keys={}))
+
+    pending = dict(flows)
+    # Device/QR/OAuth windows are ~minutes; 80 iterations × ~3s + keep's ~15s
+    # blocking poll covers it. Each flow drops out on terminal state or error.
+    for _ in range(80):
+        if not pending:
+            break
+        done: list[str] = []
+        for cid, desc in list(pending.items()):
+            try:
+                if desc["kind"] == "lark":
+                    s = await asyncio.to_thread(feishu_uat_auth.poll_session,
+                                                session_id=desc["session_id"],
+                                                profile_name=profile_name, open_id=open_id)
+                    if str(s.get("status") or "") != "pending":
+                        done.append(cid)
+                elif desc["kind"] == "keep":
+                    r = await asyncio.to_thread(cha.poll_keep_record_once, profile_dir, desc["qrcode_id"])
+                    if r.get("status") == "authorized":
+                        done.append(cid)
+                elif desc["kind"] == "kep":
+                    if await asyncio.to_thread(cha.kep_cli_logged_in, profile_dir, profile_name, shared_home):
+                        done.append(cid)
+            except Exception as exc:  # stop polling a broken flow
+                logger.debug("multitenancy: /auth flow %s poll error (%s)", cid, exc)
+                done.append(cid)
+        for cid in done:
+            pending.pop(cid, None)
+        if done:
+            await _rerender()
+        if pending:
+            await asyncio.sleep(3)
+    await _rerender()
 
 
 def _handle_pending_approval_command(

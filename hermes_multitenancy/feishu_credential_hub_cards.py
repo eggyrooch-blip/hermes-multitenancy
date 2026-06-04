@@ -90,21 +90,31 @@ def _auth_button(url: str, *, label_zh: str = "前往授权", label_en: str = "A
     }
 
 
+def _qr_image(img_key: str, *, label_zh: str = "请使用对应 App 扫码认证", label_en: str = "Scan to authenticate") -> list[dict[str, Any]]:
+    return [
+        {"tag": "img", "img_key": img_key, "alt": _plain_i18n(label_zh, label_en), "mode": "fit_horizontal", "preview": True},
+        {"tag": "markdown", "content": label_en, "i18n_content": _i18n(label_zh, label_en), "text_size": "notation"},
+    ]
+
+
 def build_hub_card(
     *,
     rows: list[CredentialRow],
     auth_urls: Optional[dict[str, str]] = None,
     pending_note: Optional[dict[str, str]] = None,
+    qr_image_keys: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """Build the credential-hub card.
 
-    ``auth_urls`` maps credential id → a verification/authorize URL. A row gets
-    a button only when (a) it is not already authenticated AND (b) an URL is
-    provided. ``pending_note`` maps credential id → a short zh note shown when a
-    not-yet-wired tool needs auth (e.g. "请在 WebUI 完成").
+    ``auth_urls`` maps credential id → a verification/authorize URL → renders a
+    button (lark-cli, kep-cli — "弹出网页确认授权"). ``qr_image_keys`` maps
+    credential id → a Feishu image_key → renders an inline QR image to scan
+    (keep-record). ``pending_note`` maps credential id → a short zh note for a
+    not-yet-startable tool. A row only gets an entry-point when not authenticated.
     """
     auth_urls = auth_urls or {}
     pending_note = pending_note or {}
+    qr_image_keys = qr_image_keys or {}
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
@@ -121,7 +131,10 @@ def build_hub_card(
     for idx, row in enumerate(rows):
         elements.append(_row_markdown(row))
         url = auth_urls.get(row.id)
-        if not row.authenticated and url:
+        qr = qr_image_keys.get(row.id)
+        if not row.authenticated and qr:
+            elements.extend(_qr_image(qr))
+        elif not row.authenticated and url:
             elements.append(_auth_button(url))
         elif not row.authenticated and pending_note.get(row.id):
             note = pending_note[row.id]
