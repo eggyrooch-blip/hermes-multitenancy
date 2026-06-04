@@ -479,7 +479,12 @@ def _resolve_custom_provider_api_key(
     "no API key for primary provider 'custom:...'". Match the custom provider by
     its ``custom:<normalized-name>`` slug or by base_url and return the inline key.
     """
-    if not provider or not provider.lower().startswith("custom"):
+    # Only the custom-provider family. The vault-based credential_pool resolver
+    # is intentionally NOT used here: the encrypted vault is masked inside the
+    # bwrap sandbox where this runs, so the inline config.yaml key is the only
+    # one readable in-context. Revisit if the vault-in-sandbox masking is fixed.
+    pl = provider.lower() if provider else ""
+    if not (pl == "custom" or pl.startswith("custom:")):
         return None
     custom_providers = config.get("custom_providers")
     if not isinstance(custom_providers, list):
@@ -493,7 +498,14 @@ def _resolve_custom_provider_api_key(
         base_url = str(
             entry.get("base_url") or entry.get("url") or entry.get("api") or ""
         ).strip().rstrip("/")
-        if (want_name and name == want_name) or (model_base_url and base_url == model_base_url):
+        # When the provider carries a :name slug, match by name ONLY — never by
+        # base_url, which is the default model's URL and would wrongly match a
+        # different entry. Bare "custom" (no slug) falls back to base_url.
+        if want_name:
+            matched = name == want_name
+        else:
+            matched = bool(model_base_url) and base_url == model_base_url
+        if matched:
             key = str(entry.get("api_key") or "").strip()
             if key:
                 return key
