@@ -1141,8 +1141,9 @@ def _patch_feishu_open_id_send() -> None:
     logger.info("[multitenancy] patched Feishu delivery for user open_id targets")
 
 
-# Matches a markdown link: [label](url)
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Matches a markdown link ``[label](url)`` but NOT an image ``![label](url)``
+# (the ``(?<!!)`` lookbehind skips the image form so we don't emit ``!label``).
+_MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
 
 
 def _linkify_markdown_links_in_text(text: str) -> str:
@@ -1153,6 +1154,14 @@ def _linkify_markdown_links_in_text(text: str) -> str:
     table-containing content as raw plain text, so ``[label](url)`` arrives
     literally and is not clickable. Converting to ``label (url)`` exposes the
     bare URL, which Feishu turns into a working link.
+
+    Known edges (acceptable for the social-radar report, whose URLs are
+    percent-encoded and contain no literal ``)`` or images):
+    - This is a regex, not a full markdown parser; a URL containing a literal
+      ``)`` would be truncated at the first paren.
+    - A ``[label](url)`` split across upstream message-truncation chunks is not
+      repaired (the split happens before this runs); report rows are short so
+      this does not occur in practice.
     """
     return _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", text)
 

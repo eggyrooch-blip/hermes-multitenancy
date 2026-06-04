@@ -33,6 +33,12 @@ def test_linkify_converts_markdown_link_to_bare_url():
     assert "](" not in out  # no leftover markdown link syntax
 
 
+def test_linkify_leaves_image_syntax_untouched():
+    # Markdown images ![alt](url) must NOT become "!alt (url)".
+    src = "![cover](https://img.example.com/a.png)"
+    assert _linkify_markdown_links_in_text(src) == src
+
+
 def _install_fake_feishu(build_impl):
     class FakeFeishuAdapter:
         _build_outbound_payload = build_impl
