@@ -221,6 +221,43 @@ def test_endpoint_signature_required_when_secret_set(monkeypatch):
     assert body["error_code"] == "INVALID_SIGNATURE"
 
 
+def test_endpoint_dedicated_key_accepts_and_rejects(monkeypatch):
+    # Both a dedicated skillhub key AND a master broker key are set, so the
+    # "no key → open" fallback cannot mask a bad token.
+    monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_KEY", "wkj-fixed-key")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key")
+
+    ok_status, ok_body = _post(
+        "/api/run-broker/skillhub/events",
+        json_body=WANGKEJIE_PAYLOAD,
+        headers={"Authorization": "Bearer wkj-fixed-key"},
+    )
+    assert ok_status == 200
+    assert ok_body["status"] == "queued"
+
+    bad_status, _ = _post(
+        "/api/run-broker/skillhub/events",
+        json_body=WANGKEJIE_PAYLOAD,
+        headers={"Authorization": "Bearer wrong-key"},
+    )
+    assert bad_status == 401
+
+    missing_status, _ = _post("/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD)
+    assert missing_status == 401
+
+
+def test_endpoint_master_key_still_works_for_skillhub(monkeypatch):
+    # A caller holding the master broker key is also accepted (single-key setups).
+    monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_KEY", "wkj-fixed-key")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key")
+    status, _ = _post(
+        "/api/run-broker/skillhub/events",
+        json_body=WANGKEJIE_PAYLOAD,
+        headers={"Authorization": "Bearer master-key"},
+    )
+    assert status == 200
+
+
 def test_endpoint_accepts_valid_signature(monkeypatch):
     monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_SECRET", "topsecret")
     raw = json.dumps(WANGKEJIE_PAYLOAD)

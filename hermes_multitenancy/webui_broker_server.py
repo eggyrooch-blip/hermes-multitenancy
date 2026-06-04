@@ -226,6 +226,24 @@ def _authorized(request: Any) -> bool:
     return hmac.compare_digest(header[len(prefix):].strip(), expected)
 
 
+def _skillhub_authorized(request: Any) -> bool:
+    """Auth for the SkillHub webhook ingress.
+
+    Accepts a dedicated ``HERMES_SKILLHUB_WEBHOOK_KEY`` (a fixed Bearer token we
+    hand to the AiDock side) so the broker's master key never has to be shared
+    with an external caller. Falls back to the normal master-key check, which
+    keeps the dev-friendly "no key configured → open" behavior of ``_authorized``.
+    """
+    dedicated = os.environ.get("HERMES_SKILLHUB_WEBHOOK_KEY", "").strip()
+    if dedicated:
+        header = request.headers.get("Authorization", "")
+        prefix = "Bearer "
+        token = header[len(prefix):].strip() if header.startswith(prefix) else ""
+        if token and hmac.compare_digest(token, dedicated):
+            return True
+    return _authorized(request)
+
+
 def _default_sandbox_available() -> bool:
     value = os.environ.get("HERMES_USE_SANDBOX", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -1750,7 +1768,7 @@ def create_run_broker_app(
         materialization (download/router-install/symlink/callback) is the next
         phase — accepted events land as ``queued`` for a downstream worker.
         """
-        if not _authorized(request):
+        if not _skillhub_authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         from . import skillhub_events
 
