@@ -879,6 +879,27 @@ def _deliver_cron_feishu_via_live_adapter(
         return "feishu live adapter unavailable"
 
     text_to_send, media_files = _cron_delivery_payload_for_adapter(job, content)
+
+    # Cron deliveries historically go out as plain text via ``adapter.send``,
+    # which flattens markdown (bullets/bold/links) — unlike normal replies that
+    # stream as interactive CardKit cards. When enabled, render a simple
+    # interactive card so scheduled-task output looks like a normal reply.
+    card: Optional[dict] = None
+    if (
+        text_to_send
+        and _cron_card_response_enabled()
+        and callable(getattr(adapter, "_feishu_send_with_retry", None))
+    ):
+        try:
+            card, card_media = _build_cron_card(job, content)
+            if card is not None:
+                # Card and text paths extract media from the same content; keep
+                # one media list so a card→text fallback never double-sends.
+                media_files = card_media
+        except Exception:
+            logger.warning("[multitenancy] cron card build failed; using text", exc_info=True)
+            card = None
+
     errors: list[str] = []
     for target in feishu_targets:
         chat_id = str(target.get("chat_id") or "").strip()
@@ -888,7 +909,26 @@ def _deliver_cron_feishu_via_live_adapter(
         thread_id = target.get("thread_id")
         metadata = _feishu_delivery_metadata(chat_id, thread_id)
         try:
-            if text_to_send:
+            sent_payload = False
+            if card is not None:
+                card_error = _send_cron_card_via_live_adapter(
+                    adapter, chat_id, card, metadata, loop
+                )
+                if card_error is None:
+                    sent_payload = True
+                    logger.info(
+                        "[multitenancy] cron delivered card to feishu:%s job=%s",
+                        chat_id,
+                        job.get("id", "?"),
+                    )
+                else:
+                    logger.warning(
+                        "[multitenancy] cron card send failed for %s (%s); "
+                        "falling back to plain text",
+                        chat_id,
+                        card_error,
+                    )
+            if text_to_send and not sent_payload:
                 future, schedule_error = _schedule_on_gateway_loop(
                     adapter.send(chat_id, text_to_send, metadata=metadata),
                     loop,
@@ -1014,6 +1054,124 @@ def _cron_delivery_payload_for_adapter(job: dict, content: str) -> tuple[str, li
         return cleaned.strip(), media_files
     except Exception:
         return delivery_content.strip(), []
+
+
+def _cron_card_response_enabled() -> bool:
+    """Whether cron deliveries should render as interactive cards (default on)."""
+    try:
+        from cron.config import load_config
+
+        return bool(load_config().get("cron", {}).get("card_response", True))
+    except Exception:
+        return True
+
+
+def _build_cron_card(job: dict, content: str) -> tuple[Optional[dict[str, Any]], list]:
+    """Build a simple Feishu interactive card for a cron delivery.
+
+    Returns ``(card, media_files)``. ``card`` is ``None`` when the body is empty
+    (caller then falls back to the plain-text path). Layout mirrors the
+    ``wrap_response`` text form — header (task name), markdown body, and a
+    "stop this job" footer — but renders markdown as a real card so bullets,
+    bold, and links are no longer flattened.
+    """
+    wrap_response = True
+    try:
+        from cron.config import load_config
+
+        wrap_response = load_config().get("cron", {}).get("wrap_response", True)
+    except Exception:
+        pass
+
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media_files, cleaned = BasePlatformAdapter.extract_media(content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        body = cleaned.strip()
+    except Exception:
+        body = content.strip()
+        media_files = []
+
+    if not body:
+        return None, media_files
+
+    try:
+        from .card.markdown_style import _optimize_markdown_style
+        from .card.sanitization import _plain_summary
+
+        body_md = _optimize_markdown_style(body)
+        summary = _plain_summary(body)
+    except Exception:
+        body_md = body
+        summary = "Hermes"
+
+    task_name = str(job.get("name") or job.get("id") or "Scheduled task")
+
+    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": body_md}]
+    if wrap_response:
+        stop_hint = (
+            "To stop or manage this job, send me a new message "
+            f'(e.g. "stop reminder {task_name}").'
+        )
+        elements.append({"tag": "hr"})
+        elements.append(
+            {"tag": "markdown", "content": stop_hint, "text_size": "notation"}
+        )
+
+    card: dict[str, Any] = {
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": True,
+            "locales": ["zh_cn", "en_us"],
+            "summary": {"content": summary},
+        },
+        "elements": elements,
+    }
+    if wrap_response:
+        card["header"] = {
+            "title": {"tag": "plain_text", "content": f"⏰ {task_name}"},
+            "template": "blue",
+        }
+    return card, media_files
+
+
+def _send_cron_card_via_live_adapter(
+    adapter: Any,
+    chat_id: str,
+    card: dict[str, Any],
+    metadata: Optional[dict],
+    loop: Any,
+) -> Optional[str]:
+    """Send one interactive card on the gateway loop. Returns error str or None."""
+    try:
+        payload = json.dumps(card, ensure_ascii=False)
+    except Exception as exc:
+        return f"card serialize failed: {exc}"
+
+    coro = adapter._feishu_send_with_retry(
+        chat_id=chat_id,
+        msg_type="interactive",
+        payload=payload,
+        reply_to=None,
+        metadata=metadata,
+    )
+    future, schedule_error = _schedule_on_gateway_loop(coro, loop)
+    if schedule_error:
+        return schedule_error
+    if future is None:
+        return f"feishu live adapter loop unavailable for {chat_id}"
+    try:
+        result = future.result(timeout=15)
+    except FuturesTimeout:
+        future.cancel()
+        return f"feishu card send timed out for {chat_id}"
+    if result is not None and not getattr(result, "success", True):
+        return (
+            f"feishu card send failed for {chat_id}: "
+            f"{getattr(result, 'error', 'unknown')}"
+        )
+    return None
 
 
 def _send_media_files_via_live_adapter(
