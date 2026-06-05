@@ -2853,17 +2853,21 @@ async def _handle_auth_command(
     pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
     qr_image_keys: dict[str, str] = {}
     flows: dict[str, dict[str, Any]] = {}
-    if lark_session_id and lark_row is not None and not lark_row.authenticated:
+    # Every started flow is polled (including re-auth on already-authenticated
+    # rows) so the user gets explicit "认证成功/失败" feedback. Each flow keys off
+    # THIS attempt (lark session_id / keep qrcode_id / kep login proc), so a
+    # re-auth never reports a false instant success from prior credentials.
+    if lark_session_id and lark_row is not None:
         flows[credential_hub.LARK_CLI] = {"kind": "lark", "session_id": lark_session_id, "interval": lark_interval}
 
     keep_row = next((r for r in rows if r.id == credential_hub.KEEP_RECORD), None)
     if keep_row is not None and keep_row.installed:
         try:
             qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
-            image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
-            qr_image_keys[credential_hub.KEEP_RECORD] = image_key
-            if not keep_row.authenticated:
-                flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
+            # URL button → opens the Keep QR page (scan with Keep app); background
+            # login-wait poll → persist → 认证成功 feedback.
+            auth_urls[credential_hub.KEEP_RECORD] = qr.get("redirect_url") or qr["qrcode_url"]
+            flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
         except cha.HubAuthError as exc:
             pending_note.setdefault(credential_hub.KEEP_RECORD,
                                     f"扫码认证暂不可用：{exc.message}" if exc.status != 404 else "Keep-record 未安装。")
@@ -2876,9 +2880,9 @@ async def _handle_auth_command(
         try:
             login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared)
             auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
-            _track_kep_login_proc(login.get("_proc"))  # keep alive for the callback; prune finished
-            if not kep_row.authenticated:
-                flows[credential_hub.KEP_CLI] = {"kind": "kep"}
+            proc = login.get("_proc")
+            _track_kep_login_proc(proc)  # keep alive for the OAuth callback; prune finished
+            flows[credential_hub.KEP_CLI] = {"kind": "kep", "proc": proc}
         except cha.HubAuthError as exc:
             pending_note.setdefault(credential_hub.KEP_CLI,
                                     f"认证暂不可用：{exc.message}" if exc.status != 404 else "kep-cli 未安装。")
@@ -2993,37 +2997,56 @@ async def _poll_hub_flows(
         await update_auth_card(adapter=adapter, auth_card=hub_card,
                                card=build_hub_card(rows=rows, auth_urls={}, pending_note={}, qr_image_keys={}))
 
+    titles = {credential_hub.LARK_CLI: "Lark-cli", credential_hub.KEEP_RECORD: "Keep-record",
+              credential_hub.KEP_CLI: "kep-cli"}
     pending = dict(flows)
-    # Device/QR/OAuth windows are ~minutes; 80 iterations × ~3s + keep's ~15s
-    # blocking poll covers it. Each flow drops out on terminal state or error.
-    for _ in range(80):
+    # Each flow keys off THIS attempt so re-auth on an already-authed credential
+    # reports real completion, not a stale "already logged in". ~40 iterations;
+    # keep's login-wait blocks ~15s/iter (QR window is minutes).
+    for _ in range(40):
         if not pending:
             break
-        done: list[str] = []
+        done: dict[str, bool] = {}  # cid -> succeeded
         for cid, desc in list(pending.items()):
             try:
                 if desc["kind"] == "lark":
                     s = await asyncio.to_thread(feishu_uat_auth.poll_session,
                                                 session_id=desc["session_id"],
                                                 profile_name=profile_name, open_id=open_id)
-                    if str(s.get("status") or "") != "pending":
-                        done.append(cid)
+                    st = str(s.get("status") or "")
+                    if st != "pending":
+                        done[cid] = (st == "success")
                 elif desc["kind"] == "keep":
                     r = await asyncio.to_thread(cha.poll_keep_record_once, profile_dir, desc["qrcode_id"])
                     if r.get("status") == "authorized":
-                        done.append(cid)
+                        done[cid] = True
                 elif desc["kind"] == "kep":
-                    if await asyncio.to_thread(cha.kep_cli_logged_in, profile_dir, profile_name, shared_home):
-                        done.append(cid)
+                    proc = desc.get("proc")
+                    rc = proc.poll() if proc is not None else 0
+                    if rc is not None:  # login proc exited → verify it logged in
+                        ok = await asyncio.to_thread(cha.kep_cli_logged_in, profile_dir, profile_name, shared_home)
+                        done[cid] = bool(rc == 0 and ok)
             except Exception as exc:  # stop polling a broken flow
                 logger.debug("multitenancy: /auth flow %s poll error (%s)", cid, exc)
-                done.append(cid)
-        for cid in done:
+                done[cid] = False
+        for cid, ok in done.items():
             pending.pop(cid, None)
         if done:
             await _rerender()
+            for cid, ok in done.items():
+                title = titles.get(cid, cid)
+                msg = f"✅ {title} 认证成功" if ok else f"⚠️ {title} 认证未完成，可重新发送 /auth 重试"
+                await _safe_call(adapter.send, chat_id, msg)
         if pending:
             await asyncio.sleep(3)
+    # Un-acted flows: kill any lingering kep login proc so it doesn't run forever.
+    for desc in pending.values():
+        proc = desc.get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     await _rerender()
 
 
