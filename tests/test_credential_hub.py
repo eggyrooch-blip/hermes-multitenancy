@@ -441,10 +441,14 @@ def test_build_hub_card_structure_and_buttons():
     assert "Token 可读" in blob  # configured badge renders
 
 
-def test_build_hub_card_no_button_when_authenticated():
+def test_build_hub_card_reauth_button_when_authenticated():
+    """Authenticated rows DO get a re-auth button (so users can re-trigger)."""
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
-    rows = [CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True, status="authenticated")]
+    rows = [CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True,
+                          status="authenticated", action={"kind": "feishu_device_flow", "label": "重新授权"})]
     card = build_hub_card(rows=rows, auth_urls={"lark-cli": "https://x/y"})
-    assert "https://x/y" not in repr(card)
+    blob = repr(card)
+    assert "https://x/y" in blob  # re-auth button present even when authenticated
+    assert "重新授权" in blob

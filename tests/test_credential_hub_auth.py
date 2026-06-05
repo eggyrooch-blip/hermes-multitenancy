@@ -133,11 +133,14 @@ def test_hub_card_renders_qr_image_for_keep_record():
     assert "扫码" in blob
 
 
-def test_hub_card_no_qr_when_authenticated():
+def test_hub_card_reauth_qr_when_authenticated():
+    """Authenticated keep-record still offers a re-scan QR (重新扫码认证)."""
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep",
                           installed=True, status="authenticated")]
     card = build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_v3_demo"})
-    assert "img_v3_demo" not in json.dumps(card, ensure_ascii=False)
+    blob = json.dumps(card, ensure_ascii=False)
+    assert "img_v3_demo" in blob  # re-scan QR present even when authenticated
+    assert "重新扫码认证" in blob

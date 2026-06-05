@@ -132,10 +132,15 @@ def build_hub_card(
         elements.append(_row_markdown(row))
         url = auth_urls.get(row.id)
         qr = qr_image_keys.get(row.id)
-        if not row.authenticated and qr:
-            elements.extend(_qr_image(qr))
-        elif not row.authenticated and url:
-            elements.append(_auth_button(url))
+        # An auth entry is shown whenever one is available — including for
+        # already-authenticated rows (labeled "重新…") so users can re-trigger
+        # the flow to re-authorize or to verify it works.
+        btn_label = (row.action or {}).get("label") or "前往授权"
+        if qr:
+            scan_zh = "重新扫码认证" if row.authenticated else "请使用对应 App 扫码认证"
+            elements.extend(_qr_image(qr, label_zh=scan_zh))
+        elif url:
+            elements.append(_auth_button(url, label_zh=btn_label))
         elif not row.authenticated and pending_note.get(row.id):
             note = pending_note[row.id]
             elements.append(

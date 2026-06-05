@@ -2816,7 +2816,10 @@ async def _handle_auth_command(
     lark_interval = 3
 
     lark_row = next((r for r in rows if r.id == credential_hub.LARK_CLI), None)
-    if lark_row is not None and not lark_row.authenticated:
+    # Always mint an auth entry (even when authenticated) so the card offers a
+    # "重新授权" button — users (and acceptance testing) need to re-trigger the
+    # flow on demand. Only NOT-yet-authenticated rows are polled for auto-refresh.
+    if lark_row is not None:
         # Reuse an existing live device-flow session for this user (set by a
         # prior /auth or /feishu_auth) instead of minting a second device code.
         try:
@@ -2850,16 +2853,17 @@ async def _handle_auth_command(
     pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
     qr_image_keys: dict[str, str] = {}
     flows: dict[str, dict[str, Any]] = {}
-    if lark_session_id:
+    if lark_session_id and lark_row is not None and not lark_row.authenticated:
         flows[credential_hub.LARK_CLI] = {"kind": "lark", "session_id": lark_session_id, "interval": lark_interval}
 
     keep_row = next((r for r in rows if r.id == credential_hub.KEEP_RECORD), None)
-    if keep_row is not None and not keep_row.authenticated:
+    if keep_row is not None and keep_row.installed:
         try:
             qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
             image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
             qr_image_keys[credential_hub.KEEP_RECORD] = image_key
-            flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
+            if not keep_row.authenticated:
+                flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
         except cha.HubAuthError as exc:
             pending_note.setdefault(credential_hub.KEEP_RECORD,
                                     f"扫码认证暂不可用：{exc.message}" if exc.status != 404 else "Keep-record 未安装。")
@@ -2868,12 +2872,13 @@ async def _handle_auth_command(
             pending_note.setdefault(credential_hub.KEEP_RECORD, "扫码认证暂时不可用，请稍后重试。")
 
     kep_row = next((r for r in rows if r.id == credential_hub.KEP_CLI), None)
-    if kep_row is not None and not kep_row.authenticated:
+    if kep_row is not None and kep_row.installed:
         try:
             login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared)
             auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
-            _KEP_LOGIN_PROCS.add(login.get("_proc"))  # keep the login process alive for the callback
-            flows[credential_hub.KEP_CLI] = {"kind": "kep"}
+            _track_kep_login_proc(login.get("_proc"))  # keep alive for the callback; prune finished
+            if not kep_row.authenticated:
+                flows[credential_hub.KEP_CLI] = {"kind": "kep"}
         except cha.HubAuthError as exc:
             pending_note.setdefault(credential_hub.KEP_CLI,
                                     f"认证暂不可用：{exc.message}" if exc.status != 404 else "kep-cli 未安装。")
@@ -2911,8 +2916,18 @@ async def _handle_auth_command(
 
 
 # Keep started kep-auth login subprocesses alive until their OAuth callback
-# lands (a GC'd Popen would kill the login mid-flow). Cleared opportunistically.
+# lands (a GC'd Popen would kill the login mid-flow).
 _KEP_LOGIN_PROCS: set[Any] = set()
+
+
+def _track_kep_login_proc(proc: Any) -> None:
+    """Hold a reference to a live kep-auth login proc; prune finished ones so the
+    set doesn't grow unbounded across /auth invocations."""
+    if proc is None:
+        return
+    for old in [p for p in _KEP_LOGIN_PROCS if getattr(p, "poll", lambda: 0)() is not None]:
+        _KEP_LOGIN_PROCS.discard(old)
+    _KEP_LOGIN_PROCS.add(proc)
 
 
 def _start_hub_flow_poll(
