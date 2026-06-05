@@ -2876,14 +2876,31 @@ async def _handle_auth_command(
             logger.debug("multitenancy: /auth keep-record QR start failed (%s)", exc)
             pending_note.setdefault(credential_hub.KEEP_RECORD, "扫码认证暂时不可用，请稍后重试。")
 
-    # kep-cli: the OAuth callback is http://localhost:<port> on the router host —
-    # Feishu's in-app browser can't reach it (it bounces to the Feishu app), so a
-    # plain URL button is broken for mobile/remote. Disabled in-Feishu until the
-    # public-callback rewrite lands; status still shown, auth via WebUI for now.
+    # kep-cli: kep-auth's OAuth callback is http://localhost:<port> on the router
+    # host, which Feishu's in-app browser can't reach. With a public callback
+    # origin configured we rewrite it to a public run-broker endpoint that
+    # forwards to that localhost server; without one we keep the button disabled
+    # (auth via WebUI) rather than hand the user a button that bounces.
     kep_row = next((r for r in rows if r.id == credential_hub.KEP_CLI), None)
-    if kep_row is not None and kep_row.installed and not kep_row.authenticated:
-        pending_note.setdefault(credential_hub.KEP_CLI,
-                                "kep-cli 飞书内认证开发中（OAuth 回调需公网地址），暂请在 WebUI 凭证页完成。")
+    if kep_row is not None and kep_row.installed:
+        kep_origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip()
+        if kep_origin:
+            try:
+                login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared,
+                                                public_origin=kep_origin)
+                auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
+                proc = login.get("_proc")
+                _track_kep_login_proc(proc)
+                flows[credential_hub.KEP_CLI] = {"kind": "kep", "proc": proc}
+            except cha.HubAuthError as exc:
+                pending_note.setdefault(credential_hub.KEP_CLI,
+                                        f"认证暂不可用：{exc.message}" if exc.status != 404 else "kep-cli 未安装。")
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("multitenancy: /auth kep-cli login start failed (%s)", exc)
+                pending_note.setdefault(credential_hub.KEP_CLI, "认证暂时不可用，请稍后重试。")
+        elif not kep_row.authenticated:
+            pending_note.setdefault(credential_hub.KEP_CLI,
+                                    "kep-cli 飞书内认证需配置公网回调（HERMES_PUBLIC_CALLBACK_ORIGIN），暂请在 WebUI 完成。")
 
     if adapter is None:
         return

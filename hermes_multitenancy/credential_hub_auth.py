@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
@@ -235,7 +236,96 @@ def _kep_login_env(profile_dir: Path, profile_name: str) -> dict[str, str]:
     return env
 
 
-def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path) -> dict[str, Any]:
+# --- kep-cli public OAuth callback (Feishu's in-app browser can't reach the
+# localhost callback kep-auth opens; rewrite it to a publicly-reachable run-broker
+# endpoint that forwards to that localhost server). Ports the WebUI's mechanism. ---
+
+_KEP_CALLBACK_TTL_MS = 10 * 60 * 1000
+_kep_callbacks: dict[str, dict[str, Any]] = {}  # sid -> {local_callback_url, created_at}
+
+
+def _now_ms() -> int:
+    import time
+    return int(time.time() * 1000)
+
+
+def _prune_kep_callbacks() -> None:
+    now = _now_ms()
+    for sid in [s for s, v in _kep_callbacks.items() if now - v.get("created_at", 0) > _KEP_CALLBACK_TTL_MS]:
+        _kep_callbacks.pop(sid, None)
+
+
+def _normalize_public_origin(raw: Optional[str]) -> str:
+    from urllib.parse import urlparse
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    try:
+        u = urlparse(value)
+        if u.scheme not in ("http", "https") or not u.netloc:
+            return ""
+        return f"{u.scheme}://{u.netloc}"
+    except Exception:
+        return ""
+
+
+def _is_local_callback(url: str) -> bool:
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    if u.scheme != "http" or u.username or u.password:
+        return False
+    return (u.hostname or "") in ("localhost", "127.0.0.1", "::1")
+
+
+def rewrite_kep_verification_uri(raw_uri: str, *, public_origin: str) -> str:
+    """Replace kep-auth's localhost response_url with a public run-broker callback.
+
+    Returns the original URI unchanged when no public_origin is configured (then
+    the localhost callback stands — only usable when the browser is on the router
+    host, which Feishu's in-app browser is not).
+    """
+    import secrets
+    from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+    origin = _normalize_public_origin(public_origin)
+    if not origin:
+        return raw_uri
+    parts = urlparse(raw_uri)
+    qs = dict(parse_qsl(parts.query, keep_blank_values=True))
+    local_cb = qs.get("response_url")
+    if not local_cb:
+        return raw_uri
+    if not _is_local_callback(local_cb):
+        raise HubAuthError("kep-auth returned an unsafe OAuth callback URL", status=502)
+    _prune_kep_callbacks()
+    sid = secrets.token_urlsafe(18)
+    _kep_callbacks[sid] = {"local_callback_url": local_cb, "created_at": _now_ms()}
+    qs["response_url"] = f"{origin}/api/run-broker/credentials/kep-cli/callback/{sid}"
+    new = parts._replace(query=urlencode(qs))
+    return urlunparse(new)
+
+
+def complete_kep_callback(session_id: str, query: str) -> str:
+    """Forward the OAuth result to the stored localhost kep-auth server."""
+    _prune_kep_callbacks()
+    sid = str(session_id or "").strip()
+    sess = _kep_callbacks.pop(sid, None)
+    if not sess:
+        raise HubAuthError("kep-cli auth session was not found or has expired", status=404)
+    from urllib.parse import urlparse, urlunparse
+    parts = urlparse(sess["local_callback_url"])
+    target = urlunparse(parts._replace(query=query or ""))
+    try:
+        with urllib.request.urlopen(target, timeout=15) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        raise HubAuthError(body or f"kep-auth local callback returned HTTP {exc.code}", status=502) from exc
+    except Exception as exc:
+        raise HubAuthError(f"kep-auth local callback failed: {exc}", status=502) from exc
+
+
+def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path,
+                        *, public_origin: Optional[str] = None) -> dict[str, Any]:
     """Spawn ``kep-auth login`` and capture the OAuth verification URL from output.
 
     The login process is left running (it waits for the OAuth callback); the
@@ -276,6 +366,17 @@ def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path)
         except Exception:
             pass
         raise HubAuthError("kep-auth login did not return an authorization URL", status=502)
+    # Rewrite the localhost callback → public run-broker callback when a public
+    # origin is configured (so Feishu's in-app browser can complete the OAuth).
+    if public_origin:
+        try:
+            url = rewrite_kep_verification_uri(url, public_origin=public_origin)
+        except HubAuthError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
     return {"verification_uri": url, "_proc": proc}
 
 

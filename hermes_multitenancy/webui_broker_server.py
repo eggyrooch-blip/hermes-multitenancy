@@ -1550,6 +1550,29 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI credential hub failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_kep_cli_callback(request):
+        """Public OAuth callback for kep-cli in-Feishu auth: forwards the OAuth
+        result to the kep-auth localhost server (same host). Intentionally NOT
+        bearer-auth'd — it is hit by the user's browser after authorizing, keyed
+        by an unguessable one-time session id. Returns a small HTML page."""
+        from . import credential_hub_auth as cha
+
+        sid = request.match_info.get("session_id", "")
+        try:
+            await asyncio.to_thread(cha.complete_kep_callback, sid, request.query_string)
+        except cha.HubAuthError as exc:
+            return web.Response(
+                text=f"<html><body style='font-family:sans-serif'>认证未完成：{exc.message}<br>可重新发送 /auth 重试。</body></html>",
+                content_type="text/html", status=exc.status,
+            )
+        except Exception as exc:
+            logger.exception("[multitenancy] kep-cli callback failed")
+            return web.Response(text=f"认证出错：{exc}", content_type="text/html", status=500)
+        return web.Response(
+            text="<html><body style='font-family:sans-serif'>✅ kep-cli 认证成功，可关闭本页面，返回飞书查看结果。</body></html>",
+            content_type="text/html",
+        )
+
     async def handle_feishu_auth_start(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1963,6 +1986,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
+    app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
     app.router.add_delete("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_cancel)
