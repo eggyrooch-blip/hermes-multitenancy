@@ -2916,6 +2916,7 @@ async def _handle_auth_command(
             gateway=gateway,
             hub_card=hub_card,
             flows=flows,
+            auth_urls=auth_urls,
         )
 
 
@@ -2944,6 +2945,7 @@ def _start_hub_flow_poll(
     gateway: Any,
     hub_card: dict[str, Any],
     flows: dict[str, dict[str, Any]],
+    auth_urls: dict[str, str],
 ) -> None:
     if not flows:
         return
@@ -2957,6 +2959,7 @@ def _start_hub_flow_poll(
             gateway=gateway,
             hub_card=hub_card,
             flows=flows,
+            auth_urls=auth_urls,
         ),
         name=f"auth-hub:{profile_name}:{open_id}:{','.join(sorted(flows))}",
     )
@@ -2973,10 +2976,13 @@ async def _poll_hub_flows(
     gateway: Any,
     hub_card: dict[str, Any],
     flows: dict[str, dict[str, Any]],
+    auth_urls: dict[str, str],
 ) -> None:
-    """Poll every started auth flow (lark device-flow, keep-record QR, kep-cli
-    login) until terminal or the overall deadline; re-render the hub card on
-    each completion so the user sees rows flip to 已认证 in place."""
+    """Poll the started auth flows. ONLY a credential the user actually completes
+    produces feedback: its row flips to ✅已认证 via an in-place card update, and
+    its button is dropped — every OTHER credential's button is preserved. Flows
+    the user never acts on stay silent (no "未完成" noise); a failed attempt keeps
+    its button so the user can retry."""
     from . import credential_hub, credential_hub_auth as cha, feishu_uat_auth
     from .feishu_auth_cards import update_auth_card
     from .feishu_credential_hub_cards import build_hub_card
@@ -2984,6 +2990,10 @@ async def _poll_hub_flows(
     adapter = _get_feishu_adapter(gateway)
     if adapter is None:
         return
+
+    # Buttons still offered on re-render. A credential drops out only once it
+    # SUCCEEDS — so re-rendering after one completion keeps the others' buttons.
+    remaining_urls = dict(auth_urls or {})
 
     async def _rerender() -> None:
         try:
@@ -2995,18 +3005,17 @@ async def _poll_hub_flows(
             logger.debug("multitenancy: /auth hub refresh failed (%s)", exc)
             return
         await update_auth_card(adapter=adapter, auth_card=hub_card,
-                               card=build_hub_card(rows=rows, auth_urls={}, pending_note={}, qr_image_keys={}))
+                               card=build_hub_card(rows=rows, auth_urls=remaining_urls,
+                                                   pending_note={}, qr_image_keys={}))
 
-    titles = {credential_hub.LARK_CLI: "Lark-cli", credential_hub.KEEP_RECORD: "Keep-record",
-              credential_hub.KEP_CLI: "kep-cli"}
     pending = dict(flows)
-    # Each flow keys off THIS attempt so re-auth on an already-authed credential
+    # Each flow keys off THIS attempt so re-auth of an already-authed credential
     # reports real completion, not a stale "already logged in". ~40 iterations;
     # keep's login-wait blocks ~15s/iter (QR window is minutes).
     for _ in range(40):
         if not pending:
             break
-        done: dict[str, bool] = {}  # cid -> succeeded
+        succeeded: list[str] = []
         for cid, desc in list(pending.items()):
             try:
                 if desc["kind"] == "lark":
@@ -3014,29 +3023,30 @@ async def _poll_hub_flows(
                                                 session_id=desc["session_id"],
                                                 profile_name=profile_name, open_id=open_id)
                     st = str(s.get("status") or "")
-                    if st != "pending":
-                        done[cid] = (st == "success")
+                    if st == "success":
+                        succeeded.append(cid); pending.pop(cid, None)
+                    elif st != "pending":  # expired/error: stop polling, keep button for retry
+                        pending.pop(cid, None)
                 elif desc["kind"] == "keep":
                     r = await asyncio.to_thread(cha.poll_keep_record_once, profile_dir, desc["qrcode_id"])
                     if r.get("status") == "authorized":
-                        done[cid] = True
+                        succeeded.append(cid); pending.pop(cid, None)
+                    # not-yet-scanned → still pending; keep polling, no message
                 elif desc["kind"] == "kep":
                     proc = desc.get("proc")
                     rc = proc.poll() if proc is not None else 0
-                    if rc is not None:  # login proc exited → verify it logged in
+                    if rc is not None:  # login proc exited
                         ok = await asyncio.to_thread(cha.kep_cli_logged_in, profile_dir, profile_name, shared_home)
-                        done[cid] = bool(rc == 0 and ok)
-            except Exception as exc:  # stop polling a broken flow
+                        if rc == 0 and ok:
+                            succeeded.append(cid)
+                        pending.pop(cid, None)  # proc finished either way; keep button if it failed
+            except Exception as exc:  # stop polling a broken flow; keep its button, stay silent
                 logger.debug("multitenancy: /auth flow %s poll error (%s)", cid, exc)
-                done[cid] = False
-        for cid, ok in done.items():
-            pending.pop(cid, None)
-        if done:
-            await _rerender()
-            for cid, ok in done.items():
-                title = titles.get(cid, cid)
-                msg = f"✅ {title} 认证成功" if ok else f"⚠️ {title} 认证未完成，可重新发送 /auth 重试"
-                await _safe_call(adapter.send, chat_id, msg)
+                pending.pop(cid, None)
+        if succeeded:
+            for cid in succeeded:
+                remaining_urls.pop(cid, None)  # drop only the completed credential's button
+            await _rerender()  # in-place: completed row → ✅已认证, other buttons preserved
         if pending:
             await asyncio.sleep(3)
     # Un-acted flows: kill any lingering kep login proc so it doesn't run forever.
@@ -3047,7 +3057,6 @@ async def _poll_hub_flows(
                 proc.kill()
             except Exception:
                 pass
-    await _rerender()
 
 
 def _handle_pending_approval_command(
