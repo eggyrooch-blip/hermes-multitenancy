@@ -1143,35 +1143,77 @@ def _send_cron_card_via_live_adapter(
     metadata: Optional[dict],
     loop: Any,
 ) -> Optional[str]:
-    """Send one interactive card on the gateway loop. Returns error str or None."""
+    """Send one interactive card on the gateway loop. Returns error str or None.
+
+    This MUST NEVER raise: any failure (serialize, synchronous adapter raise,
+    scheduling, timeout, coroutine exception, non-success response) is returned
+    as an error string so the caller can fall back to the plain-text path. An
+    escaped exception here would skip the text fallback and silently drop the
+    cron delivery.
+    """
     try:
         payload = json.dumps(card, ensure_ascii=False)
     except Exception as exc:
         return f"card serialize failed: {exc}"
 
-    coro = adapter._feishu_send_with_retry(
-        chat_id=chat_id,
-        msg_type="interactive",
-        payload=payload,
-        reply_to=None,
-        metadata=metadata,
-    )
-    future, schedule_error = _schedule_on_gateway_loop(coro, loop)
-    if schedule_error:
-        return schedule_error
-    if future is None:
-        return f"feishu live adapter loop unavailable for {chat_id}"
     try:
-        result = future.result(timeout=15)
-    except FuturesTimeout:
-        future.cancel()
-        return f"feishu card send timed out for {chat_id}"
-    if result is not None and not getattr(result, "success", True):
-        return (
-            f"feishu card send failed for {chat_id}: "
-            f"{getattr(result, 'error', 'unknown')}"
+        # ``_feishu_send_with_retry`` may raise synchronously while building the
+        # coroutine; keep it inside the guard.
+        coro = adapter._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="interactive",
+            payload=payload,
+            reply_to=None,
+            metadata=metadata,
         )
-    return None
+        future, schedule_error = _schedule_on_gateway_loop(coro, loop)
+        if schedule_error:
+            return schedule_error
+        if future is None:
+            return f"feishu live adapter loop unavailable for {chat_id}"
+        try:
+            response = future.result(timeout=15)
+        except FuturesTimeout:
+            future.cancel()
+            return f"feishu card send timed out for {chat_id}"
+        # Normalize the raw adapter response the same way the streaming-card
+        # paths do; a bare response has no ``.success`` attribute, so the naive
+        # ``getattr(result, "success", True)`` would treat a failed send (code
+        # != 0, no message_id) as success and skip the text fallback.
+        result = _finalize_card_send_response(adapter, response)
+        if result is not None and not getattr(result, "success", True):
+            return (
+                f"feishu card send failed for {chat_id}: "
+                f"{getattr(result, 'error', 'unknown')}"
+            )
+        return None
+    except Exception as exc:
+        return f"feishu card send raised for {chat_id}: {exc}"
+
+
+def _finalize_card_send_response(adapter: Any, response: Any) -> Any:
+    """Normalize a raw Feishu send response into a result with ``.success``.
+
+    Reuses the plugin's card finalizer when importable; otherwise falls back to
+    a permissive check (a response carrying a message_id / code 0 is success)
+    so delivery is not falsely reported as failed when the helper is absent.
+    """
+    try:
+        from .card.card_error import _finalize
+
+        return _finalize(adapter, response, "cron card send failed")
+    except Exception:
+        message_id = None
+        for source in (response, getattr(response, "data", None)):
+            if isinstance(source, dict):
+                message_id = source.get("message_id")
+            else:
+                message_id = getattr(source, "message_id", None)
+            if message_id:
+                break
+        code = getattr(response, "code", None)
+        ok = bool(message_id) or code in (None, 0)
+        return SimpleNamespace(success=ok, error=None if ok else "cron card send failed")
 
 
 def _send_media_files_via_live_adapter(

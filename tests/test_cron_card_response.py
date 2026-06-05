@@ -92,15 +92,50 @@ def test_send_cron_card_uses_interactive_msg_type(monkeypatch):
     assert json.loads(captured["payload"]) == card
 
 
-def test_send_cron_card_returns_error_on_failure(monkeypatch):
+def test_send_cron_card_detects_non_success_response(monkeypatch):
+    # A raw Feishu response with code != 0 and no message_id must be detected
+    # as a failure (via _finalize), NOT silently treated as success — else the
+    # caller skips the plain-text fallback and the delivery is dropped.
     adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: "coro")
     monkeypatch.setattr(
         cron_worker,
         "_schedule_on_gateway_loop",
-        lambda coro, loop: (_FakeFuture(SimpleNamespace(success=False, error="boom")), None),
+        lambda coro, loop: (_FakeFuture({"code": 230001, "msg": "invalid"}), None),
     )
     err = _send_cron_card_via_live_adapter(adapter, "ou_abc", {"elements": []}, None, object())
-    assert err is not None and "boom" in err
+    assert err is not None  # failure surfaced so caller can fall back to text
+
+
+class _RaiseFuture:
+    def result(self, timeout=None):
+        raise RuntimeError("coroutine blew up")
+
+    def cancel(self):
+        pass
+
+
+def test_send_cron_card_contains_synchronous_adapter_raise(monkeypatch):
+    # If _feishu_send_with_retry raises SYNCHRONOUSLY while building the coro,
+    # the helper must return an error string, never propagate — a raise here
+    # would skip the text fallback in the caller and drop the delivery.
+    def boom(**kwargs):
+        raise RuntimeError("sync adapter explosion")
+
+    adapter = SimpleNamespace(_feishu_send_with_retry=boom)
+    err = _send_cron_card_via_live_adapter(adapter, "ou_abc", {"elements": []}, None, object())
+    assert err is not None and "sync adapter explosion" in err
+
+
+def test_send_cron_card_contains_coroutine_raise(monkeypatch):
+    # A non-timeout exception from future.result() must be contained too.
+    adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: "coro")
+    monkeypatch.setattr(
+        cron_worker,
+        "_schedule_on_gateway_loop",
+        lambda coro, loop: (_RaiseFuture(), None),
+    )
+    err = _send_cron_card_via_live_adapter(adapter, "ou_abc", {"elements": []}, None, object())
+    assert err is not None and "coroutine blew up" in err
 
 
 # --------------------------------------------------------------------------- #
