@@ -206,6 +206,35 @@ def _kep_env(profile_dir: Path, profile_name: str) -> dict[str, str]:
     }
 
 
+def _ensure_no_browser_dir() -> Path:
+    """A dir holding no-op `open`/`xdg-open`/`www-browser` shims.
+
+    kep-auth uses github.com/pkg/browser, which auto-launches a browser when
+    `kep-auth login` runs. On a desktop router host that pops a window the
+    instant /auth is sent — before the user clicks anything. Prepending this dir
+    to PATH (+ BROWSER) makes the "open" a no-op: the URL is still printed (we
+    capture it for the card button) and the localhost callback server still runs,
+    so the page only opens when the user clicks the button.
+    """
+    d = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-credhub-nobrowser"
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("open", "xdg-open", "www-browser", "x-www-browser"):
+        shim = d / name
+        if not shim.exists():
+            shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            shim.chmod(0o755)
+    return d
+
+
+def _kep_login_env(profile_dir: Path, profile_name: str) -> dict[str, str]:
+    """Login env with the browser-open suppressed (no popup on /auth render)."""
+    env = _kep_env(profile_dir, profile_name)
+    nobrowser = _ensure_no_browser_dir()
+    env["PATH"] = f"{nobrowser}{os.pathsep}{env.get('PATH', '')}"
+    env["BROWSER"] = str(nobrowser / "open")
+    return env
+
+
 def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path) -> dict[str, Any]:
     """Spawn ``kep-auth login`` and capture the OAuth verification URL from output.
 
@@ -219,7 +248,7 @@ def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path)
     try:
         proc = subprocess.Popen(
             [bin_path, "--profile", profile_name, "--env", "online", "login"],
-            cwd=str(profile_dir), env=_kep_env(profile_dir, profile_name),
+            cwd=str(profile_dir), env=_kep_login_env(profile_dir, profile_name),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
     except FileNotFoundError as exc:
