@@ -2851,14 +2851,9 @@ async def _handle_hub_card_action(
     chat_id: str,
     gateway: Any,
 ) -> bool:
-    """Handle a credential-hub button click delivered as a synthetic /card command
-    (text: ``card <tag> {value-json}``). Starts the credential's flow and sends
-    the QR/URL card, then polls and pushes a 认证成功 card. Returns True if the
-    action was ours (hub_action == "auth")."""
+    """Synthetic /card-command entry (kept as a fallback / for tests). The real
+    button click is handled by the card-action monkeypatch → _run_hub_auth_flow."""
     import json as _json
-    from . import credential_hub as ch, credential_hub_auth as cha, feishu_uat_auth
-    from .feishu_auth_cards import send_auth_card
-    from .feishu_credential_hub_cards import build_qr_card, build_url_card
 
     value: dict[str, Any] = {}
     brace = args.find("{")
@@ -2869,12 +2864,9 @@ async def _handle_hub_card_action(
                 value = parsed
         except Exception:
             value = {}
-    logger.info("multitenancy: /card action args=%r parsed=%r", args, value)
     if value.get("hub_action") != "auth":
         return False
     cred = str(value.get("cred") or "")
-    logger.info("multitenancy: /card hub auth cred=%r", cred)
-
     adapter = _get_feishu_adapter(gateway)
     open_id = (
         _normalize_feishu_open_id(sender)
@@ -2884,9 +2876,44 @@ async def _handle_hub_card_action(
     )
     if adapter is None or not _is_feishu_open_id(open_id) or not profile_name:
         return True
+    await _run_hub_auth_flow(adapter=adapter, cred=cred, chat_id=chat_id, open_id=open_id,
+                             profile_name=profile_name, profile_home=profile_home)
+    return True
+
+
+async def hub_card_action_from_event(adapter: Any, data: Any) -> bool:
+    """Entry for the card-action monkeypatch: a real button click. Extracts the
+    operator + chat from the card-action event, resolves the profile, and runs
+    the credential's auth flow. Returns True if it was a hub auth action."""
+    event = getattr(data, "event", None)
+    action = getattr(event, "action", None)
+    value = getattr(action, "value", {}) or {}
+    if not isinstance(value, dict) or value.get("hub_action") != "auth":
+        return False
+    cred = str(value.get("cred") or "")
+    context = getattr(event, "context", None)
+    chat_id = str(getattr(context, "open_chat_id", "") or "")
+    operator = getattr(event, "operator", None)
+    open_id = str(getattr(operator, "open_id", "") or "")
+    if not chat_id or not _is_feishu_open_id(open_id):
+        return True
+    profile_name, profile_home = await asyncio.to_thread(_resolve_route, open_id)
+    if not profile_name:
+        await _safe_call(adapter.send, chat_id, "无法认证：当前飞书用户还没有绑定 Hermes profile。")
+        return True
+    await _run_hub_auth_flow(adapter=adapter, cred=cred, chat_id=chat_id, open_id=open_id,
+                             profile_name=profile_name, profile_home=profile_home)
+    return True
+
+
+async def _run_hub_auth_flow(*, adapter, cred, chat_id, open_id, profile_name, profile_home) -> None:
+    """Start one credential's auth flow: send its QR/URL card + poll → 认证成功."""
+    from . import credential_hub as ch, credential_hub_auth as cha, feishu_uat_auth
+    from .feishu_auth_cards import send_auth_card
+    from .feishu_credential_hub_cards import build_qr_card, build_url_card
+
     shared = feishu_uat_auth.resolve_shared_home()
     pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
-
     try:
         if cred == ch.LARK_CLI:
             session = await asyncio.to_thread(feishu_uat_auth.find_active_session,
@@ -2897,16 +2924,16 @@ async def _handle_hub_card_action(
             await send_auth_card(adapter=adapter, chat_id=chat_id,
                                  card=build_url_card("Lark-cli", str(session.get("verification_uri") or ""),
                                                      label_zh="前往授权"))
-            _start_single_flow_poll(profile_name=profile_name, open_id=open_id, profile_dir=pdir,
-                                    shared_home=shared, chat_id=chat_id, gateway=gateway, cred=cred,
+            _start_single_flow_poll(adapter=adapter, profile_name=profile_name, open_id=open_id, profile_dir=pdir,
+                                    shared_home=shared, chat_id=chat_id, cred=cred,
                                     flow={"kind": "lark", "session_id": str(session.get("session_id") or "")})
         elif cred == ch.KEEP_RECORD:
             qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
             image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
             await send_auth_card(adapter=adapter, chat_id=chat_id,
                                  card=build_qr_card("Keep-record", image_key))
-            _start_single_flow_poll(profile_name=profile_name, open_id=open_id, profile_dir=pdir,
-                                    shared_home=shared, chat_id=chat_id, gateway=gateway, cred=cred,
+            _start_single_flow_poll(adapter=adapter, profile_name=profile_name, open_id=open_id, profile_dir=pdir,
+                                    shared_home=shared, chat_id=chat_id, cred=cred,
                                     flow={"kind": "keep", "qrcode_id": qr["qrcode_id"]})
         elif cred == ch.KEP_CLI:
             origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip() or None
@@ -2916,36 +2943,32 @@ async def _handle_hub_card_action(
             _track_kep_login_proc(proc)
             await send_auth_card(adapter=adapter, chat_id=chat_id,
                                  card=build_url_card("kep-cli", login["verification_uri"], label_zh="前往登录"))
-            _start_single_flow_poll(profile_name=profile_name, open_id=open_id, profile_dir=pdir,
-                                    shared_home=shared, chat_id=chat_id, gateway=gateway, cred=cred,
+            _start_single_flow_poll(adapter=adapter, profile_name=profile_name, open_id=open_id, profile_dir=pdir,
+                                    shared_home=shared, chat_id=chat_id, cred=cred,
                                     flow={"kind": "kep", "proc": proc})
-        else:
-            return True
     except cha.HubAuthError as exc:
         await _safe_call(adapter.send, chat_id, f"认证暂不可用：{exc.message}")
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("multitenancy: /card hub action %s failed (%s)", cred, exc)
+        logger.debug("multitenancy: hub auth flow %s failed (%s)", cred, exc)
         await _safe_call(adapter.send, chat_id, "认证暂时不可用，请稍后重试。")
-    return True
 
 
-def _start_single_flow_poll(*, profile_name, open_id, profile_dir, shared_home, chat_id, gateway, cred, flow) -> None:
+def _start_single_flow_poll(*, adapter, profile_name, open_id, profile_dir, shared_home, chat_id, cred, flow) -> None:
     task = asyncio.create_task(
-        _poll_single_flow(profile_name=profile_name, open_id=open_id, profile_dir=profile_dir,
-                          shared_home=shared_home, chat_id=chat_id, gateway=gateway, cred=cred, flow=flow),
+        _poll_single_flow(adapter=adapter, profile_name=profile_name, open_id=open_id, profile_dir=profile_dir,
+                          shared_home=shared_home, chat_id=chat_id, cred=cred, flow=flow),
         name=f"auth-card:{cred}:{profile_name}:{open_id}",
     )
     task.add_done_callback(lambda t: logger.debug("auth card poll ended: %s", t.get_name()))
 
 
-async def _poll_single_flow(*, profile_name, open_id, profile_dir, shared_home, chat_id, gateway, cred, flow) -> None:
+async def _poll_single_flow(*, adapter, profile_name, open_id, profile_dir, shared_home, chat_id, cred, flow) -> None:
     """Poll one credential's auth attempt; push a 认证成功 card on success. Silent
     on timeout/failure (button stays on the hub card for retry)."""
     from . import credential_hub as ch, credential_hub_auth as cha, feishu_uat_auth
     from .feishu_auth_cards import send_auth_card
     from .feishu_credential_hub_cards import build_success_card
 
-    adapter = _get_feishu_adapter(gateway)
     if adapter is None:
         return
     titles = {ch.LARK_CLI: "Lark-cli", ch.KEEP_RECORD: "Keep-record", ch.KEP_CLI: "kep-cli"}
