@@ -97,6 +97,27 @@ def _qr_image(img_key: str, *, label_zh: str = "请使用对应 App 扫码认证
     ]
 
 
+def build_success_card(title: str, *, expiry_zh: str = "") -> dict[str, Any]:
+    """A small green '✅ <title> 认证成功' card pushed when an auth flow completes."""
+    body_zh = f"**{title}** 认证成功 ✅"
+    body_en = f"**{title}** authenticated ✅"
+    if expiry_zh:
+        body_zh += f"\n\n<font color='grey'>{expiry_zh}</font>"
+        body_en += f"\n\n<font color='grey'>{expiry_zh}</font>"
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": False, "update_multi": True, "locales": _LOCALES},
+        "header": {
+            "title": _plain_i18n("认证成功", "Authenticated"),
+            "subtitle": {"tag": "plain_text", "content": ""},
+            "template": "green",
+            "padding": "12px 12px 12px 12px",
+            "icon": {"tag": "standard_icon", "token": "yes_filled"},
+        },
+        "body": {"elements": [{"tag": "markdown", "content": body_en, "i18n_content": _i18n(body_zh, body_en)}]},
+    }
+
+
 def build_hub_card(
     *,
     rows: list[CredentialRow],

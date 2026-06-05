@@ -2864,9 +2864,10 @@ async def _handle_auth_command(
     if keep_row is not None and keep_row.installed:
         try:
             qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
-            # URL button → opens the Keep QR page (scan with Keep app); background
-            # login-wait poll → persist → 认证成功 feedback.
-            auth_urls[credential_hub.KEEP_RECORD] = qr.get("redirect_url") or qr["qrcode_url"]
+            # Embed the real QR IMAGE in the card (the login page doesn't render a
+            # scannable QR). Scan with Keep app → background login-wait → 认证成功.
+            image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
+            qr_image_keys[credential_hub.KEEP_RECORD] = image_key
             flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
         except cha.HubAuthError as exc:
             pending_note.setdefault(credential_hub.KEEP_RECORD,
@@ -2875,20 +2876,14 @@ async def _handle_auth_command(
             logger.debug("multitenancy: /auth keep-record QR start failed (%s)", exc)
             pending_note.setdefault(credential_hub.KEEP_RECORD, "扫码认证暂时不可用，请稍后重试。")
 
+    # kep-cli: the OAuth callback is http://localhost:<port> on the router host —
+    # Feishu's in-app browser can't reach it (it bounces to the Feishu app), so a
+    # plain URL button is broken for mobile/remote. Disabled in-Feishu until the
+    # public-callback rewrite lands; status still shown, auth via WebUI for now.
     kep_row = next((r for r in rows if r.id == credential_hub.KEP_CLI), None)
-    if kep_row is not None and kep_row.installed:
-        try:
-            login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared)
-            auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
-            proc = login.get("_proc")
-            _track_kep_login_proc(proc)  # keep alive for the OAuth callback; prune finished
-            flows[credential_hub.KEP_CLI] = {"kind": "kep", "proc": proc}
-        except cha.HubAuthError as exc:
-            pending_note.setdefault(credential_hub.KEP_CLI,
-                                    f"认证暂不可用：{exc.message}" if exc.status != 404 else "kep-cli 未安装。")
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("multitenancy: /auth kep-cli login start failed (%s)", exc)
-            pending_note.setdefault(credential_hub.KEP_CLI, "认证暂时不可用，请稍后重试。")
+    if kep_row is not None and kep_row.installed and not kep_row.authenticated:
+        pending_note.setdefault(credential_hub.KEP_CLI,
+                                "kep-cli 飞书内认证开发中（OAuth 回调需公网地址），暂请在 WebUI 凭证页完成。")
 
     if adapter is None:
         return
@@ -2917,6 +2912,7 @@ async def _handle_auth_command(
             hub_card=hub_card,
             flows=flows,
             auth_urls=auth_urls,
+            qr_image_keys=qr_image_keys,
         )
 
 
@@ -2946,6 +2942,7 @@ def _start_hub_flow_poll(
     hub_card: dict[str, Any],
     flows: dict[str, dict[str, Any]],
     auth_urls: dict[str, str],
+    qr_image_keys: dict[str, str],
 ) -> None:
     if not flows:
         return
@@ -2960,6 +2957,7 @@ def _start_hub_flow_poll(
             hub_card=hub_card,
             flows=flows,
             auth_urls=auth_urls,
+            qr_image_keys=qr_image_keys,
         ),
         name=f"auth-hub:{profile_name}:{open_id}:{','.join(sorted(flows))}",
     )
@@ -2977,6 +2975,7 @@ async def _poll_hub_flows(
     hub_card: dict[str, Any],
     flows: dict[str, dict[str, Any]],
     auth_urls: dict[str, str],
+    qr_image_keys: dict[str, str],
 ) -> None:
     """Poll the started auth flows. ONLY a credential the user actually completes
     produces feedback: its row flips to ✅已认证 via an in-place card update, and
@@ -2984,29 +2983,34 @@ async def _poll_hub_flows(
     the user never acts on stay silent (no "未完成" noise); a failed attempt keeps
     its button so the user can retry."""
     from . import credential_hub, credential_hub_auth as cha, feishu_uat_auth
-    from .feishu_auth_cards import update_auth_card
-    from .feishu_credential_hub_cards import build_hub_card
+    from .feishu_auth_cards import send_auth_card, update_auth_card
+    from .feishu_credential_hub_cards import build_hub_card, build_success_card
 
     adapter = _get_feishu_adapter(gateway)
     if adapter is None:
         return
 
-    # Buttons still offered on re-render. A credential drops out only once it
-    # SUCCEEDS — so re-rendering after one completion keeps the others' buttons.
+    titles = {credential_hub.LARK_CLI: "Lark-cli", credential_hub.FEISHU_PROJECT: "飞书项目",
+              credential_hub.KEEP_RECORD: "Keep-record", credential_hub.KEP_CLI: "kep-cli"}
+    # Entries still offered on re-render. A credential drops out only once it
+    # SUCCEEDS — so re-rendering after one completion keeps the others' buttons/QRs.
     remaining_urls = dict(auth_urls or {})
+    remaining_qr = dict(qr_image_keys or {})
 
-    async def _rerender() -> None:
+    async def _fresh_rows() -> list:
         try:
-            rows = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 credential_hub.collect_credential_statuses,
                 profile_name=profile_name, open_id=open_id, home_dir=profile_dir / "home",
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("multitenancy: /auth hub refresh failed (%s)", exc)
-            return
+            return []
+
+    async def _rerender(rows: list) -> None:
         await update_auth_card(adapter=adapter, auth_card=hub_card,
                                card=build_hub_card(rows=rows, auth_urls=remaining_urls,
-                                                   pending_note={}, qr_image_keys={}))
+                                                   pending_note={}, qr_image_keys=remaining_qr))
 
     pending = dict(flows)
     # Each flow keys off THIS attempt so re-auth of an already-authed credential
@@ -3045,8 +3049,17 @@ async def _poll_hub_flows(
                 pending.pop(cid, None)
         if succeeded:
             for cid in succeeded:
-                remaining_urls.pop(cid, None)  # drop only the completed credential's button
-            await _rerender()  # in-place: completed row → ✅已认证, other buttons preserved
+                remaining_urls.pop(cid, None)  # drop only the completed credential's entry
+                remaining_qr.pop(cid, None)
+            rows = await _fresh_rows()
+            # Push a green 认证成功 card per completed credential (card-style feedback)…
+            for cid in succeeded:
+                row = next((r for r in rows if r.id == cid), None)
+                expiry = credential_hub.human_expiry(row.expires_at) if row else ""
+                await send_auth_card(adapter=adapter, chat_id=chat_id,
+                                     card=build_success_card(titles.get(cid, cid), expiry_zh=expiry))
+            # …and update the hub in place (completed row → ✅已认证, other buttons kept).
+            await _rerender(rows)
         if pending:
             await asyncio.sleep(3)
     # Un-acted flows: kill any lingering kep login proc so it doesn't run forever.
