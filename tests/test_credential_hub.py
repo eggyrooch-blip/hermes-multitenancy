@@ -419,7 +419,9 @@ def test_human_expiry_phrases():
 # -- card builder ------------------------------------------------------------
 
 
-def test_build_hub_card_structure_and_buttons():
+def test_build_hub_card_callback_buttons():
+    """Interactive creds get CALLBACK buttons (click → /card); gitlab does not."""
+    import json
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
@@ -429,26 +431,34 @@ def test_build_hub_card_structure_and_buttons():
                       status="authenticated", expires_at=1_000_000_000_000),
         CredentialRow(id="gitlab", title="GitLab", provider="gitlab", installed=True, status="configured"),
     ]
-    card = build_hub_card(
-        rows=rows,
-        auth_urls={"lark-cli": "https://example.com/authorize"},
-        pending_note={"keep-record": "飞书内认证即将开放"},
-    )
+    card = build_hub_card(rows=rows)
     assert card["schema"] == "2.0"
-    blob = repr(card)
+    blob = json.dumps(card, ensure_ascii=False)
     assert "Lark-cli" in blob and "Keep-record" in blob and "GitLab" in blob
-    assert "https://example.com/authorize" in blob  # needs_auth + url → button
-    assert "Token 可读" in blob  # configured badge renders
+    assert '"callback"' in blob  # callback buttons, not URL buttons
+    assert '"hub_action": "auth"' in blob
+    assert '"cred": "lark-cli"' in blob and '"cred": "keep-record"' in blob
+    assert '"cred": "gitlab"' not in blob  # gitlab is not interactive → no button
+    assert "Token 可读" in blob
 
 
-def test_build_hub_card_reauth_button_when_authenticated():
-    """Authenticated rows DO get a re-auth button (so users can re-trigger)."""
+def test_build_hub_card_reauth_callback_when_authenticated():
+    """Authenticated interactive rows still get a 重新认证 callback button."""
+    import json
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True,
                           status="authenticated", action={"kind": "feishu_device_flow", "label": "重新授权"})]
-    card = build_hub_card(rows=rows, auth_urls={"lark-cli": "https://x/y"})
-    blob = repr(card)
-    assert "https://x/y" in blob  # re-auth button present even when authenticated
+    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)
+    assert '"hub_action": "auth"' in blob and '"cred": "lark-cli"' in blob
     assert "重新授权" in blob
+
+
+def test_qr_and_url_card_builders():
+    import json
+    from hermes_multitenancy.feishu_credential_hub_cards import build_qr_card, build_url_card
+    qr = json.dumps(build_qr_card("Keep-record", "img_v3_demo"), ensure_ascii=False)
+    assert '"tag": "img"' in qr and "img_v3_demo" in qr and "扫码" in qr
+    url = json.dumps(build_url_card("kep-cli", "https://auth.example.com/x", label_zh="前往登录"), ensure_ascii=False)
+    assert "https://auth.example.com/x" in url and "前往登录" in url

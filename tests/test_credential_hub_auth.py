@@ -120,27 +120,24 @@ def test_kep_cli_logged_in_no_binary_false(tmp_path, monkeypatch):
 # -- card: QR image element --------------------------------------------------
 
 
-def test_hub_card_renders_qr_image_for_keep_record():
+def test_hub_card_keep_record_callback_button():
+    """keep-record on the hub card is a CALLBACK button (QR is sent after click)."""
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep",
                           installed=True, status="needs_auth")]
-    card = build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_v3_demo"})
-    blob = json.dumps(card, ensure_ascii=False)
-    assert '"tag": "img"' in blob
-    assert "img_v3_demo" in blob
-    assert "扫码" in blob
+    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)
+    assert '"callback"' in blob
+    assert '"cred": "keep-record"' in blob
+    assert '"tag": "img"' not in blob  # no embedded QR in the hub card; sent on click
 
 
-def test_hub_card_reauth_qr_when_authenticated():
-    """Authenticated keep-record still offers a re-scan QR (重新扫码认证)."""
+def test_hub_card_keep_record_reauth_callback_when_authenticated():
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep",
                           installed=True, status="authenticated")]
-    card = build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_v3_demo"})
-    blob = json.dumps(card, ensure_ascii=False)
-    assert "img_v3_demo" in blob  # re-scan QR present even when authenticated
-    assert "重新扫码认证" in blob
+    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)
+    assert '"cred": "keep-record"' in blob  # re-auth callback present when authenticated

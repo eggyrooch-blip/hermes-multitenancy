@@ -2536,6 +2536,22 @@ async def _handle_command(
             event=event,
         )
         return
+    elif cmd == "card":
+        # Synthetic command from a card button click (core routes card actions as
+        # "/card <tag> <value-json>"). Handle our credential-hub auth actions.
+        handled = await _handle_hub_card_action(
+            args=_args,
+            sender=sender,
+            sender_alt=sender_alt,
+            profile_name=profile_name,
+            profile_home=profile_home,
+            chat_id=chat_id,
+            gateway=gateway,
+        )
+        if handled:
+            return
+        # Not ours → ignore silently (other card actions are core's concern).
+        return
     elif cmd == "help":
         reply = _gateway_help_text()
     else:
@@ -2810,127 +2826,172 @@ async def _handle_auth_command(
         home_dir=home_dir,
     )
 
-    auth_urls: dict[str, str] = {}
-    pending_note: dict[str, str] = {}
-    lark_session_id = ""
-    lark_interval = 3
-
-    lark_row = next((r for r in rows if r.id == credential_hub.LARK_CLI), None)
-    # Always mint an auth entry (even when authenticated) so the card offers a
-    # "重新授权" button — users (and acceptance testing) need to re-trigger the
-    # flow on demand. Only NOT-yet-authenticated rows are polled for auto-refresh.
-    if lark_row is not None:
-        # Reuse an existing live device-flow session for this user (set by a
-        # prior /auth or /feishu_auth) instead of minting a second device code.
-        try:
-            session = await asyncio.to_thread(
-                feishu_uat_auth.find_active_session,
-                profile_name=profile_name,
-                open_id=open_id,
-            )
-            if not session:
-                session = await asyncio.to_thread(
-                    feishu_uat_auth.start_session,
-                    profile_name=profile_name,
-                    open_id=open_id,
-                    scope=(args.strip() or None),
-                )
-            verification_uri = str(session.get("verification_uri") or "")
-            if verification_uri:
-                auth_urls[credential_hub.LARK_CLI] = verification_uri
-                lark_session_id = str(session.get("session_id") or "")
-                lark_interval = int(session.get("interval") or 3)
-        except feishu_uat_auth.FeishuUatAuthError as exc:
-            pending_note[credential_hub.LARK_CLI] = f"暂时无法发起授权：{exc.message}"
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("multitenancy: /auth lark session start failed (%s)", exc)
-            pending_note[credential_hub.LARK_CLI] = "暂时无法发起授权，请稍后重试。"
-
-    # keep-record (QR image, scan) + kep-cli (web login) in-Feishu auth-start.
-    from . import credential_hub_auth as cha
-
-    shared = feishu_uat_auth.resolve_shared_home()
-    pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
-    qr_image_keys: dict[str, str] = {}
-    flows: dict[str, dict[str, Any]] = {}
-    # Every started flow is polled (including re-auth on already-authenticated
-    # rows) so the user gets explicit "认证成功/失败" feedback. Each flow keys off
-    # THIS attempt (lark session_id / keep qrcode_id / kep login proc), so a
-    # re-auth never reports a false instant success from prior credentials.
-    if lark_session_id and lark_row is not None:
-        flows[credential_hub.LARK_CLI] = {"kind": "lark", "session_id": lark_session_id, "interval": lark_interval}
-
-    keep_row = next((r for r in rows if r.id == credential_hub.KEEP_RECORD), None)
-    if keep_row is not None and keep_row.installed:
-        try:
-            qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
-            # Embed the real QR IMAGE in the card (the login page doesn't render a
-            # scannable QR). Scan with Keep app → background login-wait → 认证成功.
-            image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
-            qr_image_keys[credential_hub.KEEP_RECORD] = image_key
-            flows[credential_hub.KEEP_RECORD] = {"kind": "keep", "qrcode_id": qr["qrcode_id"]}
-        except cha.HubAuthError as exc:
-            pending_note.setdefault(credential_hub.KEEP_RECORD,
-                                    f"扫码认证暂不可用：{exc.message}" if exc.status != 404 else "Keep-record 未安装。")
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("multitenancy: /auth keep-record QR start failed (%s)", exc)
-            pending_note.setdefault(credential_hub.KEEP_RECORD, "扫码认证暂时不可用，请稍后重试。")
-
-    # kep-cli: kep-auth's OAuth callback is http://localhost:<port> on the router
-    # host, which Feishu's in-app browser can't reach. With a public callback
-    # origin configured we rewrite it to a public run-broker endpoint that
-    # forwards to that localhost server; without one we keep the button disabled
-    # (auth via WebUI) rather than hand the user a button that bounces.
-    kep_row = next((r for r in rows if r.id == credential_hub.KEP_CLI), None)
-    if kep_row is not None and kep_row.installed:
-        kep_origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip()
-        if kep_origin:
-            try:
-                login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared,
-                                                public_origin=kep_origin)
-                auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
-                proc = login.get("_proc")
-                _track_kep_login_proc(proc)
-                flows[credential_hub.KEP_CLI] = {"kind": "kep", "proc": proc}
-            except cha.HubAuthError as exc:
-                pending_note.setdefault(credential_hub.KEP_CLI,
-                                        f"认证暂不可用：{exc.message}" if exc.status != 404 else "kep-cli 未安装。")
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("multitenancy: /auth kep-cli login start failed (%s)", exc)
-                pending_note.setdefault(credential_hub.KEP_CLI, "认证暂时不可用，请稍后重试。")
-        elif not kep_row.authenticated:
-            pending_note.setdefault(credential_hub.KEP_CLI,
-                                    "kep-cli 飞书内认证需配置公网回调（HERMES_PUBLIC_CALLBACK_ORIGIN），暂请在 WebUI 完成。")
-
     if adapter is None:
         return
 
-    card = build_hub_card(rows=rows, auth_urls=auth_urls, pending_note=pending_note, qr_image_keys=qr_image_keys)
-    hub_card = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
-    if hub_card is None:
-        lines = ["凭证中心："]
-        for row in rows:
-            mark = "✅ 已认证" if row.authenticated else "⚠️ 未认证"
-            lines.append(f"- {row.title}: {mark}")
-        url = auth_urls.get(credential_hub.LARK_CLI)
-        if url:
-            lines.append(f"\nLark-cli 授权链接：{url}")
+    # /auth just renders status + callback buttons. No flow is started here — a
+    # click delivers a synthetic /card COMMAND that _handle_hub_card_action picks
+    # up and runs that credential's flow. (Click → flow → feedback, in-process.)
+    card = build_hub_card(rows=rows)
+    sent = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
+    if sent is None:
+        lines = ["凭证中心："] + [
+            f"- {row.title}: {'✅ 已认证' if row.authenticated else '⚠️ 未认证'}" for row in rows
+        ]
         await _safe_call(adapter.send, chat_id, "\n".join(lines))
-        return
 
-    if flows:
-        _start_hub_flow_poll(
-            profile_name=profile_name,
-            open_id=open_id,
-            profile_dir=pdir,
-            shared_home=shared,
-            chat_id=chat_id,
-            gateway=gateway,
-            hub_card=hub_card,
-            flows=flows,
-            auth_urls=auth_urls,
-            qr_image_keys=qr_image_keys,
-        )
+
+async def _handle_hub_card_action(
+    *,
+    args: str,
+    sender: str,
+    sender_alt: Optional[str],
+    profile_name: Optional[str],
+    profile_home: Optional[Path],
+    chat_id: str,
+    gateway: Any,
+) -> bool:
+    """Handle a credential-hub button click delivered as a synthetic /card command
+    (text: ``card <tag> {value-json}``). Starts the credential's flow and sends
+    the QR/URL card, then polls and pushes a 认证成功 card. Returns True if the
+    action was ours (hub_action == "auth")."""
+    import json as _json
+    from . import credential_hub as ch, credential_hub_auth as cha, feishu_uat_auth
+    from .feishu_auth_cards import send_auth_card
+    from .feishu_credential_hub_cards import build_qr_card, build_url_card
+
+    value: dict[str, Any] = {}
+    brace = args.find("{")
+    if brace >= 0:
+        try:
+            parsed = _json.loads(args[brace:])
+            if isinstance(parsed, dict):
+                value = parsed
+        except Exception:
+            value = {}
+    logger.info("multitenancy: /card action args=%r parsed=%r", args, value)
+    if value.get("hub_action") != "auth":
+        return False
+    cred = str(value.get("cred") or "")
+    logger.info("multitenancy: /card hub auth cred=%r", cred)
+
+    adapter = _get_feishu_adapter(gateway)
+    open_id = (
+        _normalize_feishu_open_id(sender)
+        or _normalize_feishu_open_id(sender_alt)
+        or _profile_open_id_for_auth(profile_name)
+        or ""
+    )
+    if adapter is None or not _is_feishu_open_id(open_id) or not profile_name:
+        return True
+    shared = feishu_uat_auth.resolve_shared_home()
+    pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
+
+    try:
+        if cred == ch.LARK_CLI:
+            session = await asyncio.to_thread(feishu_uat_auth.find_active_session,
+                                              profile_name=profile_name, open_id=open_id)
+            if not session:
+                session = await asyncio.to_thread(feishu_uat_auth.start_session,
+                                                  profile_name=profile_name, open_id=open_id)
+            await send_auth_card(adapter=adapter, chat_id=chat_id,
+                                 card=build_url_card("Lark-cli", str(session.get("verification_uri") or ""),
+                                                     label_zh="前往授权"))
+            _start_single_flow_poll(profile_name=profile_name, open_id=open_id, profile_dir=pdir,
+                                    shared_home=shared, chat_id=chat_id, gateway=gateway, cred=cred,
+                                    flow={"kind": "lark", "session_id": str(session.get("session_id") or "")})
+        elif cred == ch.KEEP_RECORD:
+            qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
+            image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
+            await send_auth_card(adapter=adapter, chat_id=chat_id,
+                                 card=build_qr_card("Keep-record", image_key))
+            _start_single_flow_poll(profile_name=profile_name, open_id=open_id, profile_dir=pdir,
+                                    shared_home=shared, chat_id=chat_id, gateway=gateway, cred=cred,
+                                    flow={"kind": "keep", "qrcode_id": qr["qrcode_id"]})
+        elif cred == ch.KEP_CLI:
+            origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip() or None
+            login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared,
+                                            public_origin=origin)
+            proc = login.get("_proc")
+            _track_kep_login_proc(proc)
+            await send_auth_card(adapter=adapter, chat_id=chat_id,
+                                 card=build_url_card("kep-cli", login["verification_uri"], label_zh="前往登录"))
+            _start_single_flow_poll(profile_name=profile_name, open_id=open_id, profile_dir=pdir,
+                                    shared_home=shared, chat_id=chat_id, gateway=gateway, cred=cred,
+                                    flow={"kind": "kep", "proc": proc})
+        else:
+            return True
+    except cha.HubAuthError as exc:
+        await _safe_call(adapter.send, chat_id, f"认证暂不可用：{exc.message}")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("multitenancy: /card hub action %s failed (%s)", cred, exc)
+        await _safe_call(adapter.send, chat_id, "认证暂时不可用，请稍后重试。")
+    return True
+
+
+def _start_single_flow_poll(*, profile_name, open_id, profile_dir, shared_home, chat_id, gateway, cred, flow) -> None:
+    task = asyncio.create_task(
+        _poll_single_flow(profile_name=profile_name, open_id=open_id, profile_dir=profile_dir,
+                          shared_home=shared_home, chat_id=chat_id, gateway=gateway, cred=cred, flow=flow),
+        name=f"auth-card:{cred}:{profile_name}:{open_id}",
+    )
+    task.add_done_callback(lambda t: logger.debug("auth card poll ended: %s", t.get_name()))
+
+
+async def _poll_single_flow(*, profile_name, open_id, profile_dir, shared_home, chat_id, gateway, cred, flow) -> None:
+    """Poll one credential's auth attempt; push a 认证成功 card on success. Silent
+    on timeout/failure (button stays on the hub card for retry)."""
+    from . import credential_hub as ch, credential_hub_auth as cha, feishu_uat_auth
+    from .feishu_auth_cards import send_auth_card
+    from .feishu_credential_hub_cards import build_success_card
+
+    adapter = _get_feishu_adapter(gateway)
+    if adapter is None:
+        return
+    titles = {ch.LARK_CLI: "Lark-cli", ch.KEEP_RECORD: "Keep-record", ch.KEP_CLI: "kep-cli"}
+    ok = False
+    for _ in range(40):
+        try:
+            if flow["kind"] == "lark":
+                s = await asyncio.to_thread(feishu_uat_auth.poll_session, session_id=flow["session_id"],
+                                            profile_name=profile_name, open_id=open_id)
+                st = str(s.get("status") or "")
+                if st == "success":
+                    ok = True; break
+                if st != "pending":
+                    break
+            elif flow["kind"] == "keep":
+                r = await asyncio.to_thread(cha.poll_keep_record_once, profile_dir, flow["qrcode_id"])
+                if r.get("status") == "authorized":
+                    ok = True; break
+            elif flow["kind"] == "kep":
+                proc = flow.get("proc")
+                rc = proc.poll() if proc is not None else 0
+                if rc is not None:
+                    ok = bool(rc == 0 and await asyncio.to_thread(
+                        cha.kep_cli_logged_in, profile_dir, profile_name, shared_home))
+                    break
+        except Exception as exc:
+            logger.debug("multitenancy: /card poll %s error (%s)", cred, exc)
+            break
+        await asyncio.sleep(3)
+    proc = flow.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    if ok:
+        expiry = ""
+        try:
+            rows = await asyncio.to_thread(ch.collect_credential_statuses, profile_name=profile_name,
+                                           open_id=open_id, home_dir=profile_dir / "home")
+            row = next((r for r in rows if r.id == cred), None)
+            expiry = ch.human_expiry(row.expires_at) if row else ""
+        except Exception:
+            pass
+        await send_auth_card(adapter=adapter, chat_id=chat_id,
+                             card=build_success_card(titles.get(cred, cred), expiry_zh=expiry))
 
 
 # Keep started kep-auth login subprocesses alive until their OAuth callback

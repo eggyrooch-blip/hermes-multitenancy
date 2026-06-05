@@ -38,6 +38,7 @@ _FALLBACK_GATEWAY_COMMANDS = frozenset(
         "agents",
         "approve",
         "auth",
+        "card",
         "background",
         "branch",
         "commands",

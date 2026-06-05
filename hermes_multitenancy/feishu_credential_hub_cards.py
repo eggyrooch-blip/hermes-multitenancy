@@ -17,6 +17,9 @@ from .credential_hub import CredentialRow, human_expiry
 
 _LOCALES = ["zh_cn", "en_us"]
 
+# Credentials with an in-Feishu auth flow → get a callback button on the hub card.
+_INTERACTIVE_CREDS = {"lark-cli", "keep-record", "kep-cli"}
+
 # status → (emoji, zh label, en label, color)
 _STATUS_BADGE = {
     "authenticated": ("✅", "已认证", "Authenticated", "green"),
@@ -97,6 +100,64 @@ def _qr_image(img_key: str, *, label_zh: str = "请使用对应 App 扫码认证
     ]
 
 
+def _callback_button(*, label_zh: str, label_en: str, value: dict[str, Any]) -> dict[str, Any]:
+    """A card button whose click is delivered to multitenancy over the WS as a
+    synthetic /card COMMAND (carrying ``value``) — no URL, no browser, no tunnel."""
+    return {
+        "tag": "column_set", "flex_mode": "none", "horizontal_align": "right",
+        "columns": [{
+            "tag": "column", "width": "auto",
+            "elements": [{
+                "tag": "button", "text": _plain_i18n(label_zh, label_en),
+                "type": "primary", "size": "small",
+                "behaviors": [{"type": "callback", "value": value}],
+            }],
+        }],
+    }
+
+
+def build_qr_card(title: str, image_key: str, *, hint_zh: str = "请用对应 App 扫码完成认证") -> dict[str, Any]:
+    """A card showing a scannable QR image (sent after the user clicks 认证)."""
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": False, "update_multi": True, "locales": _LOCALES},
+        "header": {
+            "title": _plain_i18n(f"{title} 扫码认证", f"{title} — scan to authenticate"),
+            "subtitle": {"tag": "plain_text", "content": ""},
+            "template": "blue", "padding": "12px 12px 12px 12px",
+            "icon": {"tag": "standard_icon", "token": "lock-chat_filled"},
+        },
+        "body": {"elements": [
+            {"tag": "img", "img_key": image_key, "alt": _plain_i18n(hint_zh, "Scan to authenticate"),
+             "mode": "fit_horizontal", "preview": True},
+            {"tag": "markdown", "content": hint_zh, "i18n_content": _i18n(hint_zh, "Scan to authenticate"),
+             "text_size": "notation"},
+        ]},
+    }
+
+
+def build_url_card(title: str, url: str, *, label_zh: str = "前往认证", label_en: str = "Authorize") -> dict[str, Any]:
+    """A card with a 前往认证 URL button (sent after the user clicks 认证)."""
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": False, "update_multi": True, "locales": _LOCALES},
+        "header": {
+            "title": _plain_i18n(f"{title} 认证", f"{title} authentication"),
+            "subtitle": {"tag": "plain_text", "content": ""},
+            "template": "blue", "padding": "12px 12px 12px 12px",
+            "icon": {"tag": "standard_icon", "token": "lock-chat_filled"},
+        },
+        "body": {"elements": [
+            {"tag": "markdown",
+             "content": "Open the page below to authorize, then come back.",
+             "i18n_content": _i18n("点开下方链接完成授权，完成后返回飞书查看结果。",
+                                   "Open the page below to authorize, then come back."),
+             "text_size": "normal"},
+            _auth_button(url, label_zh=label_zh, label_en=label_en),
+        ]},
+    }
+
+
 def build_success_card(title: str, *, expiry_zh: str = "") -> dict[str, Any]:
     """A small green '✅ <title> 认证成功' card pushed when an auth flow completes."""
     body_zh = f"**{title}** 认证成功 ✅"
@@ -151,27 +212,20 @@ def build_hub_card(
 
     for idx, row in enumerate(rows):
         elements.append(_row_markdown(row))
-        url = auth_urls.get(row.id)
-        qr = qr_image_keys.get(row.id)
-        # An auth entry is shown whenever one is available — including for
-        # already-authenticated rows (labeled "重新…") so users can re-trigger
-        # the flow to re-authorize or to verify it works.
-        btn_label = (row.action or {}).get("label") or "前往授权"
-        if qr:
-            scan_zh = "重新扫码认证" if row.authenticated else "请使用对应 App 扫码认证"
-            elements.extend(_qr_image(qr, label_zh=scan_zh))
-        elif url:
-            elements.append(_auth_button(url, label_zh=btn_label))
+        # Interactive credentials get a CALLBACK button (click → synthetic /card
+        # COMMAND → multitenancy starts that flow and sends the QR/URL card).
+        # Authenticated rows still get a "重新认证" button so users can re-trigger.
+        if row.id in _INTERACTIVE_CREDS:
+            label_zh = (row.action or {}).get("label") or ("重新认证" if row.authenticated else "认证")
+            elements.append(_callback_button(
+                label_zh=label_zh,
+                label_en="Re-authenticate" if row.authenticated else "Authenticate",
+                value={"hub_action": "auth", "cred": row.id},
+            ))
         elif not row.authenticated and pending_note.get(row.id):
             note = pending_note[row.id]
-            elements.append(
-                {
-                    "tag": "markdown",
-                    "content": note,
-                    "i18n_content": _i18n(note, note),
-                    "text_size": "notation",
-                }
-            )
+            elements.append({"tag": "markdown", "content": note,
+                             "i18n_content": _i18n(note, note), "text_size": "notation"})
         if idx != len(rows) - 1:
             elements.append({"tag": "hr"})
 
