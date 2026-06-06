@@ -1345,6 +1345,113 @@ def _linkify_markdown_links_in_text(text: str) -> str:
     return _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", text)
 
 
+# Feishu's card ``markdown`` element renders bold / lists / links / emoji, but
+# NOT ``#`` headings or GFM pipe tables (verified empirically on prod tenant).
+# Like openclaw-lark's outbound path, we CONVERT those to the renderable subset
+# before placing the content in a card, instead of dumping raw markdown.
+_HEADING_RE = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
+_TABLE_ROW_RE = re.compile(r"(?m)^\s*\|.*\|\s*$")
+_LIST_ITEM_RE = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d+\.)[ \t]+\S")
+
+
+def _split_table_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _convert_md_tables_for_card(text: str) -> str:
+    """Convert GFM pipe tables to bullet lines (Feishu cards don't render tables).
+
+    2-column tables (the common key/value shape, e.g. weather) become
+    ``- **key**：value``; wider tables become ``- **c0** · h1: c1 · h2: c2``.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if (
+            _TABLE_ROW_RE.match(line)
+            and i + 1 < n
+            and _TABLE_SEP_RE.match(lines[i + 1])
+        ):
+            header = _split_table_row(line)
+            j = i + 2
+            rows: list[list[str]] = []
+            while j < n and _TABLE_ROW_RE.match(lines[j]):
+                rows.append(_split_table_row(lines[j]))
+                j += 1
+            for r in rows:
+                if len(header) == 2 and len(r) >= 2:
+                    out.append(f"- **{r[0]}**：{r[1]}")
+                else:
+                    parts: list[str] = []
+                    for k, cell in enumerate(r):
+                        if k == 0:
+                            parts.append(f"**{cell}**")
+                        else:
+                            h = header[k] if k < len(header) else ""
+                            parts.append(f"{h + ': ' if h else ''}{cell}")
+                    out.append("- " + " · ".join(p for p in parts if p))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _cardify_markdown_for_feishu(text: str) -> str:
+    """Render markdown into the subset a Feishu card ``markdown`` element shows.
+
+    Headings -> bold; pipe tables -> bullet lines. Bold / lists / links / emoji
+    are already rendered by the card, so they pass through unchanged.
+    """
+    converted = _HEADING_RE.sub(lambda m: f"**{m.group(1).strip()}**", text)
+    converted = _convert_md_tables_for_card(converted)
+    return converted
+
+
+def _is_rich_outbound_markdown(text: str) -> bool:
+    """Rich content that renders badly as flattened plain text — upgrade to card.
+
+    True when the text has a markdown heading, a pipe table, or >=2 list items.
+    Single-line / simple text is left as-is so a one-liner never becomes a card.
+    """
+    if _HEADING_RE.search(text):
+        return True
+    # table = a pipe row immediately followed by a separator row
+    lines = text.split("\n")
+    for idx in range(len(lines) - 1):
+        if _TABLE_ROW_RE.match(lines[idx]) and _TABLE_SEP_RE.match(lines[idx + 1]):
+            return True
+    return len(_LIST_ITEM_RE.findall(text)) >= 2
+
+
+def _render_outbound_text_card(content: str) -> dict[str, Any]:
+    """Build a Feishu interactive card that renders ``content`` as markdown."""
+    body = _cardify_markdown_for_feishu(content)
+    try:
+        from .card.markdown_style import _optimize_markdown_style
+
+        body = _optimize_markdown_style(body)
+    except Exception:
+        pass
+    return {
+        "config": {
+            "wide_screen_mode": True,
+            "update_multi": True,
+            "locales": ["zh_cn", "en_us"],
+        },
+        "elements": [{"tag": "markdown", "content": body}],
+    }
+
+
 def _patch_feishu_outbound_link_render() -> None:
     """Make markdown links clickable in Feishu plain-text (table) messages.
 
@@ -1367,6 +1474,12 @@ def _patch_feishu_outbound_link_render() -> None:
     @functools.wraps(original)
     def build_outbound_payload(self: Any, content: str) -> tuple[str, str]:
         msg_type, payload = original(self, content)
+        # Core returns "text" (flattened plain text) for table content and other
+        # cases. Rich markdown (headings / tables / lists) renders badly there,
+        # so — like openclaw-lark — upgrade it to an interactive card whose
+        # markdown element renders it properly. Non-rich text keeps the existing
+        # clickable-link rewrite. Any failure falls back to the original payload,
+        # so a delivery is never dropped.
         if msg_type != "text":
             return msg_type, payload
         try:
@@ -1374,7 +1487,18 @@ def _patch_feishu_outbound_link_render() -> None:
         except Exception:
             return msg_type, payload
         text = data.get("text") if isinstance(data, dict) else None
-        if isinstance(text, str) and _MD_LINK_RE.search(text):
+        if not isinstance(text, str):
+            return msg_type, payload
+        if _cron_card_response_enabled() and _is_rich_outbound_markdown(text):
+            try:
+                card = _render_outbound_text_card(text)
+                return "interactive", json.dumps(card, ensure_ascii=False)
+            except Exception:
+                logger.warning(
+                    "[multitenancy] outbound card render failed; using plain text",
+                    exc_info=True,
+                )
+        if _MD_LINK_RE.search(text):
             data["text"] = _linkify_markdown_links_in_text(text)
             payload = json.dumps(data, ensure_ascii=False)
         return msg_type, payload
