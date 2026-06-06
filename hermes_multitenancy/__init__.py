@@ -98,8 +98,6 @@ def register(ctx) -> None:
         install_gateway_startup_watcher()
         from .group_inviter_hook import install_feishu_bot_added_hook
         install_feishu_bot_added_hook()
-        from .card_action_hook import install_card_action_hook
-        install_card_action_hook()
         webui_broker_server.ensure_run_broker_server_started()
         _start_credential_renewal_subsystem()
     else:

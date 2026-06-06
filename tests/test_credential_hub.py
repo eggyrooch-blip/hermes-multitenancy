@@ -419,40 +419,68 @@ def test_human_expiry_phrases():
 # -- card builder ------------------------------------------------------------
 
 
-def test_build_hub_card_callback_buttons():
-    """Interactive creds get CALLBACK buttons (click → /card); gitlab does not."""
+def test_build_hub_card_renders_pregenerated_entries():
+    """方案B：hub card 直接嵌入预生成 URL / QR，不再输出 callback."""
     import json
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [
         CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True, status="needs_auth"),
-        CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True,
-                      status="authenticated", expires_at=1_000_000_000_000),
-        CredentialRow(id="gitlab", title="GitLab", provider="gitlab", installed=True, status="configured"),
+        CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True, status="needs_auth"),
+        CredentialRow(id="gitlab", title="GitLab", provider="gitlab", installed=False, status="missing"),
     ]
-    card = build_hub_card(rows=rows)
+    card = build_hub_card(
+        rows=rows,
+        auth_urls={"lark-cli": "https://x/lark"},
+        qr_image_keys={"keep-record": "img_k"},
+    )
     assert card["schema"] == "2.0"
     blob = json.dumps(card, ensure_ascii=False)
     assert "Lark-cli" in blob and "Keep-record" in blob and "GitLab" in blob
-    assert '"callback"' in blob  # callback buttons, not URL buttons
-    assert '"hub_action": "auth"' in blob
-    assert '"cred": "lark-cli"' in blob and '"cred": "keep-record"' in blob
-    assert '"cred": "gitlab"' not in blob  # gitlab is not interactive → no button
-    assert "Token 可读" in blob
+    assert "https://x/lark" in blob
+    assert '"multi_url"' in blob
+    assert "img_k" in blob
+    assert '"tag": "img"' in blob
+    assert '"callback"' not in blob
+    assert '"cred"' not in blob
+    assert blob.count('"multi_url"') == 1
+    assert blob.count('"tag": "img"') == 1
 
 
-def test_build_hub_card_reauth_callback_when_authenticated():
-    """Authenticated interactive rows still get a 重新认证 callback button."""
+def test_build_hub_card_authenticated_row_has_no_entry():
     import json
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="lark-cli", title="Lark-cli", provider="lark", installed=True,
                           status="authenticated", action={"kind": "feishu_device_flow", "label": "重新授权"})]
-    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)
-    assert '"hub_action": "auth"' in blob and '"cred": "lark-cli"' in blob
-    assert "重新授权" in blob
+    blob = json.dumps(build_hub_card(rows=rows, auth_urls={"lark-cli": "https://x"}), ensure_ascii=False)
+    assert "已认证" in blob
+    assert '"multi_url"' not in blob
+    assert '"tag": "img"' not in blob
+    assert '"callback"' not in blob
+
+
+def test_filter_hub_rows_for_auth_keeps_only_three_mvp_creds():
+    import json
+    from hermes_multitenancy import router
+    from hermes_multitenancy.credential_hub import CredentialRow, CREDENTIAL_ORDER
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [
+        CredentialRow(id=cid, title=cid, provider=cid, installed=True, status="needs_auth")
+        for cid in CREDENTIAL_ORDER
+    ]
+    filtered = router._filter_hub_rows_for_auth(rows)
+
+    assert [row.id for row in filtered] == ["lark-cli", "keep-record", "kep-cli"]
+    assert "gitlab" not in [row.id for row in filtered]
+    assert "feishu-project" not in [row.id for row in filtered]
+
+    blob = json.dumps(build_hub_card(rows=filtered), ensure_ascii=False)
+    assert "GitLab" not in blob
+    assert "飞书项目" not in blob
 
 
 def test_qr_and_url_card_builders():

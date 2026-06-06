@@ -1,9 +1,9 @@
 """Feishu interactive card for the ``/auth`` credential hub.
 
-Renders ONE OpenClaw v2 card listing every credential (lark-cli, keep-record,
-kep-cli) with a status badge, expiry, and — when the tool's auth flow is wired
-and a credential is needed — an inline "前往授权" URL button. This mirrors the
-WebUI ``CredentialsView.vue`` collection so Feishu-only users can self-serve.
+Renders ONE OpenClaw v2 card listing every credential row with a status badge,
+expiry, and any pre-generated auth entry embedded directly in the hub card
+(static authorize URL button or inline scannable QR). This mirrors the WebUI
+``CredentialsView.vue`` collection so Feishu-only users can self-serve.
 
 Style intentionally matches ``feishu_auth_cards`` (schema 2.0, blue header,
 ``column_set`` right-aligned buttons) so ``/feishu_auth`` reads as one row of
@@ -16,9 +16,6 @@ from typing import Any, Optional
 from .credential_hub import CredentialRow, human_expiry
 
 _LOCALES = ["zh_cn", "en_us"]
-
-# Credentials with an in-Feishu auth flow → get a callback button on the hub card.
-_INTERACTIVE_CREDS = {"lark-cli", "keep-record", "kep-cli"}
 
 # status → (emoji, zh label, en label, color)
 _STATUS_BADGE = {
@@ -100,22 +97,6 @@ def _qr_image(img_key: str, *, label_zh: str = "请使用对应 App 扫码认证
     ]
 
 
-def _callback_button(*, label_zh: str, label_en: str, value: dict[str, Any]) -> dict[str, Any]:
-    """A card button whose click is delivered to multitenancy over the WS as a
-    synthetic /card COMMAND (carrying ``value``) — no URL, no browser, no tunnel."""
-    return {
-        "tag": "column_set", "flex_mode": "none", "horizontal_align": "right",
-        "columns": [{
-            "tag": "column", "width": "auto",
-            "elements": [{
-                "tag": "button", "text": _plain_i18n(label_zh, label_en),
-                "type": "primary", "size": "small",
-                "behaviors": [{"type": "callback", "value": value}],
-            }],
-        }],
-    }
-
-
 def build_qr_card(title: str, image_key: str, *, hint_zh: str = "请用对应 App 扫码完成认证") -> dict[str, Any]:
     """A card showing a scannable QR image (sent after the user clicks 认证)."""
     return {
@@ -185,20 +166,18 @@ def build_hub_card(
     auth_urls: Optional[dict[str, str]] = None,
     pending_note: Optional[dict[str, str]] = None,
     qr_image_keys: Optional[dict[str, str]] = None,
-    interactive_creds: Optional[set] = None,
 ) -> dict[str, Any]:
     """Build the credential-hub card.
 
     ``auth_urls`` maps credential id → a verification/authorize URL → renders a
-    button (lark-cli, kep-cli — "弹出网页确认授权"). ``qr_image_keys`` maps
-    credential id → a Feishu image_key → renders an inline QR image to scan
-    (keep-record). ``pending_note`` maps credential id → a short zh note for a
-    not-yet-startable tool. A row only gets an entry-point when not authenticated.
+    button (lark-cli, kep-cli). ``qr_image_keys`` maps credential id → a Feishu
+    image_key → renders an inline QR image to scan (keep-record).
+    ``pending_note`` maps credential id → a short zh note for a not-yet-startable
+    tool. Entry points are embedded at render time; there is no callback button.
     """
     auth_urls = auth_urls or {}
     pending_note = pending_note or {}
     qr_image_keys = qr_image_keys or {}
-    interactive = _INTERACTIVE_CREDS if interactive_creds is None else interactive_creds
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
@@ -214,16 +193,10 @@ def build_hub_card(
 
     for idx, row in enumerate(rows):
         elements.append(_row_markdown(row))
-        # Interactive credentials get a CALLBACK button (click → synthetic /card
-        # COMMAND → multitenancy starts that flow and sends the QR/URL card).
-        # Authenticated rows still get a "重新认证" button so users can re-trigger.
-        if row.id in interactive:
-            label_zh = (row.action or {}).get("label") or ("重新认证" if row.authenticated else "认证")
-            elements.append(_callback_button(
-                label_zh=label_zh,
-                label_en="Re-authenticate" if row.authenticated else "Authenticate",
-                value={"hub_action": "auth", "cred": row.id},
-            ))
+        if (not row.authenticated) and row.id in qr_image_keys:
+            elements.extend(_qr_image(qr_image_keys[row.id]))
+        elif (not row.authenticated) and row.id in auth_urls:
+            elements.append(_auth_button(auth_urls[row.id]))
         elif not row.authenticated and pending_note.get(row.id):
             note = pending_note[row.id]
             elements.append({"tag": "markdown", "content": note,

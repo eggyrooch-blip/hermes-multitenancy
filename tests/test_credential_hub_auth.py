@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -120,24 +121,107 @@ def test_kep_cli_logged_in_no_binary_false(tmp_path, monkeypatch):
 # -- card: QR image element --------------------------------------------------
 
 
-def test_hub_card_keep_record_callback_button():
-    """keep-record on the hub card is a CALLBACK button (QR is sent after click)."""
+def test_hub_card_keep_record_inline_qr():
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep",
                           installed=True, status="needs_auth")]
-    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)
-    assert '"callback"' in blob
-    assert '"cred": "keep-record"' in blob
-    assert '"tag": "img"' not in blob  # no embedded QR in the hub card; sent on click
+    blob = json.dumps(build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_k"}), ensure_ascii=False)
+    assert '"tag": "img"' in blob
+    assert "img_k" in blob
+    assert '"callback"' not in blob
 
 
-def test_hub_card_keep_record_reauth_callback_when_authenticated():
+def test_hub_card_keep_record_authenticated_has_no_entry():
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep",
                           installed=True, status="authenticated")]
     blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)
-    assert '"cred": "keep-record"' in blob  # re-auth callback present when authenticated
+    assert "已认证" in blob
+    assert '"tag": "img"' not in blob
+    assert '"callback"' not in blob
+
+
+@pytest.mark.asyncio
+async def test_poll_hub_flows_rerenders_after_lark_success(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_auth_cards, feishu_uat_auth
+    from hermes_multitenancy import feishu_credential_hub_cards as hub_cards
+    from hermes_multitenancy import router as router_mod
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(router_mod.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _gateway: object())
+    monkeypatch.setattr(feishu_uat_auth, "poll_session", lambda **_kwargs: {"status": "success"})
+
+    rerenders = []
+    success_cards = []
+    updates = []
+
+    def fake_collect_credential_statuses(*, profile_name, open_id, home_dir):
+        assert profile_name == "owner"
+        assert open_id == "ou_owner"
+        assert home_dir == tmp_path / "home"
+        return [
+            credential_hub.CredentialRow(
+                id=credential_hub.LARK_CLI,
+                title="Lark-cli",
+                provider="lark",
+                installed=True,
+                status="authenticated",
+                expires_at=1_800_000_000_000,
+            )
+        ]
+
+    def fake_build_hub_card(*, rows, auth_urls=None, pending_note=None, qr_image_keys=None):
+        rerenders.append(
+            {
+                "rows": rows,
+                "auth_urls": dict(auth_urls or {}),
+                "pending_note": dict(pending_note or {}),
+                "qr_image_keys": dict(qr_image_keys or {}),
+            }
+        )
+        return {"schema": "2.0", "body": {"elements": []}}
+
+    async def fake_update_auth_card(*, adapter, auth_card, card):
+        updates.append({"adapter": adapter, "auth_card": auth_card, "card": card})
+        return True
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        success_cards.append({"adapter": adapter, "chat_id": chat_id, "card": card, "metadata": metadata})
+        return {"message_id": "om_success"}
+
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect_credential_statuses)
+    monkeypatch.setattr(hub_cards, "build_hub_card", fake_build_hub_card)
+    monkeypatch.setattr(feishu_auth_cards, "update_auth_card", fake_update_auth_card)
+    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
+
+    await router_mod._poll_hub_flows(
+        profile_name="owner",
+        open_id="ou_owner",
+        profile_dir=Path(tmp_path),
+        shared_home=Path(tmp_path / "shared"),
+        chat_id="oc_chat",
+        gateway=object(),
+        hub_card={"message_id": "om_hub"},
+        flows={credential_hub.LARK_CLI: {"kind": "lark", "session_id": "sess_1"}},
+        auth_urls={credential_hub.LARK_CLI: "https://auth.example.com/lark"},
+        qr_image_keys={},
+    )
+
+    assert len(updates) == 1
+    assert len(rerenders) == 1
+    assert rerenders[0]["auth_urls"] == {}
+    assert rerenders[0]["qr_image_keys"] == {}
+    assert rerenders[0]["pending_note"] == {}
+    assert [row.id for row in rerenders[0]["rows"]] == [credential_hub.LARK_CLI]
+    assert len(success_cards) == 1
+    assert success_cards[0]["card"]["header"]["template"] == "green"
+    success_blob = json.dumps(success_cards[0]["card"], ensure_ascii=False)
+    assert "认证成功" in success_blob
+    assert "Lark-cli" in success_blob
