@@ -1544,10 +1544,33 @@ def _try_deliver_cron_feishu_streaming_card(
         return None
 
     adapter = _adapter_for_platform(adapters, "feishu")
+    if adapter is not None:
+        # The CardKit streaming surface is installed lazily on the gateway's
+        # Feishu adapter when it handles a normal reply. The cron adapter
+        # instance may not have it yet (no inbound message triggered install),
+        # so install it on demand — the same surface normal replies use.
+        try:
+            from .card import ensure_feishu_cardkit_streaming
+
+            ensure_feishu_cardkit_streaming(adapter)
+        except Exception:
+            logger.warning(
+                "[multitenancy] ensure_feishu_cardkit_streaming failed", exc_info=True
+            )
     if adapter is None or not callable(getattr(adapter, "start_streaming_card", None)):
+        logger.debug(
+            "[multitenancy] cron stream: adapter=%s lacks start_streaming_card=%s",
+            type(adapter).__name__ if adapter is not None else None,
+            callable(getattr(adapter, "start_streaming_card", None)),
+        )
         return None
     supports = getattr(adapter, "supports_streaming_card", None)
     if not callable(supports) or not supports():
+        logger.debug(
+            "[multitenancy] cron stream: supports callable=%s value=%s",
+            callable(supports),
+            (supports() if callable(supports) else None),
+        )
         return None
 
     # Media deliveries are handled by core's native path (cards don't carry files).
