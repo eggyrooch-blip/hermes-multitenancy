@@ -819,6 +819,27 @@ def _patch_cron_delivery_mirror() -> None:
 
     @functools.wraps(original)
     def deliver_result(job: dict, content: str, adapters: Any = None, loop: Any = None) -> Optional[str]:
+        # Deliver Feishu cron output as a STREAMING CardKit card (same UX as a
+        # normal agent reply: streaming print + rendered markdown + Done footer)
+        # before core falls back to flattened plain text. Only when every target
+        # is Feishu, a streaming-capable live adapter is present, and there is no
+        # media. Any failure returns None so we fall through to core delivery —
+        # a cron delivery is never dropped.
+        if _cron_card_response_enabled():
+            try:
+                streamed = _try_deliver_cron_feishu_streaming_card(
+                    scheduler, job, content, adapters=adapters, loop=loop
+                )
+            except Exception:
+                logger.warning(
+                    "[multitenancy] cron streaming card path raised; using core delivery",
+                    exc_info=True,
+                )
+                streamed = None
+            if streamed is True:
+                _mirror_cron_delivery_to_owner(job, content)
+                return None
+
         error = original(job, content, adapters=adapters, loop=loop)
         if error is not None and _is_feishu_platform_config_error(error):
             live_error = _deliver_cron_feishu_via_live_adapter(
@@ -1352,9 +1373,6 @@ def _linkify_markdown_links_in_text(text: str) -> str:
 _HEADING_RE = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
 _TABLE_ROW_RE = re.compile(r"(?m)^\s*\|.*\|\s*$")
-_LIST_ITEM_RE = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d+\.)[ \t]+\S")
-
-
 def _split_table_row(line: str) -> list[str]:
     s = line.strip()
     if s.startswith("|"):
@@ -1417,39 +1435,155 @@ def _cardify_markdown_for_feishu(text: str) -> str:
     return converted
 
 
-def _is_rich_outbound_markdown(text: str) -> bool:
-    """Rich content that renders badly as flattened plain text — upgrade to card.
+def _build_cron_card_body(job: dict, content: str) -> str:
+    """Build the streaming-card body for a cron delivery.
 
-    True when the text has a markdown heading, a pipe table, or >=2 list items.
-    Single-line / simple text is left as-is so a one-liner never becomes a card.
+    A clean title (the task name) + the agent content converted to the
+    Feishu-card-renderable markdown subset (headings -> bold, tables -> bullet
+    key/values) + a small stop-job hint. No "Cronjob Response:" plain wrapper —
+    the card already frames it like a normal reply.
     """
-    if _HEADING_RE.search(text):
-        return True
-    # table = a pipe row immediately followed by a separator row
-    lines = text.split("\n")
-    for idx in range(len(lines) - 1):
-        if _TABLE_ROW_RE.match(lines[idx]) and _TABLE_SEP_RE.match(lines[idx + 1]):
-            return True
-    return len(_LIST_ITEM_RE.findall(text)) >= 2
+    task_name = str(job.get("name") or job.get("id") or "").strip()
+    body = _cardify_markdown_for_feishu(content.strip())
+    parts: list[str] = []
+    if task_name:
+        parts.append(f"**⏰ {task_name}**")
+    parts.append(body)
+    if task_name:
+        parts.append(f'_停止该任务：回复 “stop reminder {task_name}”_')
+    return "\n\n".join(p for p in parts if p)
 
 
-def _render_outbound_text_card(content: str) -> dict[str, Any]:
-    """Build a Feishu interactive card that renders ``content`` as markdown."""
-    body = _cardify_markdown_for_feishu(content)
+def _stream_cron_card_on_loop(
+    adapter: Any,
+    chat_id: str,
+    body: str,
+    metadata: Optional[dict],
+    loop: Any,
+) -> Optional[str]:
+    """Drive start -> stream -> finalize of a streaming card. Returns err or None.
+
+    Reuses the same CardKit streaming surface a normal reply uses, so cron output
+    streams in with the print effect and finalizes with the Done footer. Never
+    raises: any failure is returned as a string so the caller falls back to core
+    plain-text delivery (a delivery is never dropped).
+    """
     try:
-        from .card.markdown_style import _optimize_markdown_style
+        future, sched_err = _schedule_on_gateway_loop(
+            adapter.start_streaming_card(chat_id=chat_id, metadata=metadata), loop
+        )
+        if sched_err:
+            return sched_err
+        if future is None:
+            return f"streaming loop unavailable for {chat_id}"
+        try:
+            start_res = future.result(timeout=15)
+        except FuturesTimeout:
+            future.cancel()
+            return f"streaming card start timed out for {chat_id}"
+        message_id = getattr(start_res, "message_id", None)
+        if not getattr(start_res, "success", False) or not message_id:
+            return f"streaming card start failed: {getattr(start_res, 'error', 'unknown')}"
 
-        body = _optimize_markdown_style(body)
+        # First push streams the content (print effect), second finalizes (footer).
+        for finalize in (False, True):
+            future, sched_err = _schedule_on_gateway_loop(
+                adapter.update_streaming_card(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=body,
+                    finalize=finalize,
+                ),
+                loop,
+            )
+            if sched_err:
+                # Finalize failure leaves a streamed-but-not-footered card — still
+                # delivered, so treat the overall send as success.
+                return None if not finalize else sched_err
+            if future is None:
+                return None if finalize else f"streaming loop unavailable for {chat_id}"
+            try:
+                res = future.result(timeout=15)
+            except FuturesTimeout:
+                future.cancel()
+                return None if finalize else f"streaming card update timed out for {chat_id}"
+            if finalize and res is not None and not getattr(res, "success", True):
+                # Content was already streamed in the non-finalize push; the card
+                # is on screen. Don't fall back (would double-send).
+                return None
+        return None
+    except Exception as exc:
+        return f"streaming card raised for {chat_id}: {exc}"
+
+
+def _try_deliver_cron_feishu_streaming_card(
+    scheduler: Any,
+    job: dict,
+    content: str,
+    *,
+    adapters: Any = None,
+    loop: Any = None,
+) -> Optional[bool]:
+    """Deliver an all-Feishu cron job as a streaming card.
+
+    Returns ``True`` when every target was delivered as a streaming card, or
+    ``None`` when the streaming path is not applicable / failed (caller then
+    falls through to core plain-text delivery). Only handles the case where every
+    resolved target is Feishu, a streaming-capable live adapter exists, the loop
+    is running, and the content carries no media attachments.
+    """
+    if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
+        return None
+    try:
+        targets = scheduler._resolve_delivery_targets(job)
     except Exception:
-        pass
-    return {
-        "config": {
-            "wide_screen_mode": True,
-            "update_multi": True,
-            "locales": ["zh_cn", "en_us"],
-        },
-        "elements": [{"tag": "markdown", "content": body}],
-    }
+        return None
+    if not targets:
+        return None
+    if any(str(t.get("platform") or "").strip().lower() != "feishu" for t in targets):
+        return None
+
+    adapter = _adapter_for_platform(adapters, "feishu")
+    if adapter is None or not callable(getattr(adapter, "start_streaming_card", None)):
+        return None
+    supports = getattr(adapter, "supports_streaming_card", None)
+    if not callable(supports) or not supports():
+        return None
+
+    # Media deliveries are handled by core's native path (cards don't carry files).
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media_files, cleaned = BasePlatformAdapter.extract_media(content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    except Exception:
+        media_files, cleaned = [], content
+    if media_files:
+        return None
+    if not cleaned.strip():
+        return None
+
+    body = _build_cron_card_body(job, cleaned)
+    for target in targets:
+        chat_id = str(target.get("chat_id") or "").strip()
+        if not chat_id:
+            return None
+        metadata = _feishu_delivery_metadata(chat_id, target.get("thread_id"))
+        err = _stream_cron_card_on_loop(adapter, chat_id, body, metadata, loop)
+        if err is not None:
+            logger.warning(
+                "[multitenancy] cron streaming card failed for %s job=%s: %s",
+                chat_id,
+                job.get("id", "?"),
+                err,
+            )
+            return None
+        logger.info(
+            "[multitenancy] cron delivered streaming card to feishu:%s job=%s",
+            chat_id,
+            job.get("id", "?"),
+        )
+    return True
 
 
 def _patch_feishu_outbound_link_render() -> None:
@@ -1474,12 +1608,6 @@ def _patch_feishu_outbound_link_render() -> None:
     @functools.wraps(original)
     def build_outbound_payload(self: Any, content: str) -> tuple[str, str]:
         msg_type, payload = original(self, content)
-        # Core returns "text" (flattened plain text) for table content and other
-        # cases. Rich markdown (headings / tables / lists) renders badly there,
-        # so — like openclaw-lark — upgrade it to an interactive card whose
-        # markdown element renders it properly. Non-rich text keeps the existing
-        # clickable-link rewrite. Any failure falls back to the original payload,
-        # so a delivery is never dropped.
         if msg_type != "text":
             return msg_type, payload
         try:
@@ -1487,18 +1615,7 @@ def _patch_feishu_outbound_link_render() -> None:
         except Exception:
             return msg_type, payload
         text = data.get("text") if isinstance(data, dict) else None
-        if not isinstance(text, str):
-            return msg_type, payload
-        if _cron_card_response_enabled() and _is_rich_outbound_markdown(text):
-            try:
-                card = _render_outbound_text_card(text)
-                return "interactive", json.dumps(card, ensure_ascii=False)
-            except Exception:
-                logger.warning(
-                    "[multitenancy] outbound card render failed; using plain text",
-                    exc_info=True,
-                )
-        if _MD_LINK_RE.search(text):
+        if isinstance(text, str) and _MD_LINK_RE.search(text):
             data["text"] = _linkify_markdown_links_in_text(text)
             payload = json.dumps(data, ensure_ascii=False)
         return msg_type, payload
