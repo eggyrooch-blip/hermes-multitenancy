@@ -1486,6 +1486,9 @@ def _stream_cron_card_on_loop(
             return f"streaming card start failed: {getattr(start_res, 'error', 'unknown')}"
 
         # First push streams the content (print effect), second finalizes (footer).
+        # Non-final failure => the body was never shown => return an error so the
+        # caller falls back to plain text. Final-only failure => the body is
+        # already on screen => tolerate (return None) to avoid a double-send.
         for finalize in (False, True):
             future, sched_err = _schedule_on_gateway_loop(
                 adapter.update_streaming_card(
@@ -1497,20 +1500,21 @@ def _stream_cron_card_on_loop(
                 loop,
             )
             if sched_err:
-                # Finalize failure leaves a streamed-but-not-footered card — still
-                # delivered, so treat the overall send as success.
-                return None if not finalize else sched_err
+                return None if finalize else sched_err
             if future is None:
                 return None if finalize else f"streaming loop unavailable for {chat_id}"
             try:
                 res = future.result(timeout=15)
-            except FuturesTimeout:
+            except Exception:
                 future.cancel()
-                return None if finalize else f"streaming card update timed out for {chat_id}"
-            if finalize and res is not None and not getattr(res, "success", True):
-                # Content was already streamed in the non-finalize push; the card
-                # is on screen. Don't fall back (would double-send).
-                return None
+                return None if finalize else f"streaming card update failed for {chat_id}"
+            if res is not None and not getattr(res, "success", True):
+                if finalize:
+                    return None
+                return (
+                    f"streaming card update failed for {chat_id}: "
+                    f"{getattr(res, 'error', 'unknown')}"
+                )
         return None
     except Exception as exc:
         return f"streaming card raised for {chat_id}: {exc}"
@@ -1541,6 +1545,11 @@ def _try_deliver_cron_feishu_streaming_card(
     if not targets:
         return None
     if any(str(t.get("platform") or "").strip().lower() != "feishu" for t in targets):
+        return None
+    # Single target only: a partial failure across multiple targets would make us
+    # return None and let core re-deliver ALL targets, double-sending the one we
+    # already streamed. Multi-target cron is rare — let core handle it as text.
+    if len(targets) != 1:
         return None
 
     adapter = _adapter_for_platform(adapters, "feishu")
@@ -1580,7 +1589,9 @@ def _try_deliver_cron_feishu_streaming_card(
         media_files, cleaned = BasePlatformAdapter.extract_media(content)
         media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     except Exception:
-        media_files, cleaned = [], content
+        # Fail closed: if we can't tell whether there's media, let core deliver
+        # (it handles attachments) rather than risk streaming text and dropping files.
+        return None
     if media_files:
         return None
     if not cleaned.strip():
