@@ -2937,6 +2937,15 @@ async def _run_hub_auth_flow(*, adapter, cred, chat_id, open_id, profile_name, p
                                     flow={"kind": "keep", "qrcode_id": qr["qrcode_id"]})
         elif cred == ch.KEP_CLI:
             origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip() or None
+            if origin:
+                # Ensure the run-broker (which hosts the kep callback endpoint) is
+                # up. It can't start at plugin register() (no running loop then);
+                # here we're in the loop, so this lazy-start succeeds + binds.
+                try:
+                    from . import webui_broker_server as _wb
+                    _wb.ensure_run_broker_server_started()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("multitenancy: run-broker lazy start failed (%s)", exc)
             login = await asyncio.to_thread(cha.start_kep_cli_login, pdir, profile_name, shared,
                                             public_origin=origin)
             proc = login.get("_proc")
