@@ -1045,25 +1045,31 @@ def test_stream_throttle_timing_matches_openclaw_lark():
 
 def test_markdown_table_over_limit_degrades_to_openclaw_code_mode():
     from hermes_multitenancy.feishu_cardkit_compat import _optimize_markdown_style
+    from hermes_multitenancy.card.markdown_style import _FEISHU_CARD_TABLE_LIMIT
 
-    text = """Before
-
-| Name | URL | Note | Owner | Status |
-|---|---|---|---|---|
-| **A** | [site](https://example.com) | `x` | Sunke | Ready |
-
-After"""
+    # Feishu CardKit renders the first _FEISHU_CARD_TABLE_LIMIT tables natively;
+    # one MORE than that and the overflow degrades to openclaw code-mode so the
+    # card never trips 230099/11310 ("table number over limit").
+    n = _FEISHU_CARD_TABLE_LIMIT + 1
+    tables = "\n\n".join(
+        f"| Name{i} | URL |\n|---|---|\n| **A{i}** | [site{i}](https://example.com) |"
+        for i in range(n)
+    )
+    text = "Before\n\n" + tables + "\n\nAfter"
 
     optimized = _optimize_markdown_style(text)
 
     assert "Before" in optimized
     assert "After" in optimized
+    # The overflow table is degraded → a code fence appears and its inline
+    # markdown is stripped to plain text.
     assert "```" in optimized
-    assert "| Name" in optimized
-    assert "| A" in optimized
-    assert "site" in optimized
-    assert "[site](https://example.com)" not in optimized
-    assert "**A**" not in optimized
+    assert f"**A{n - 1}**" not in optimized
+    assert f"[site{n - 1}](https://example.com)" not in optimized
+    # The first table stays NATIVE → its inline markdown is preserved verbatim
+    # (this is the whole point: real tables render in the card).
+    assert "**A0**" in optimized
+    assert "[site0](https://example.com)" in optimized
 
 
 def test_stream_into_feishu_streams_cardkit_cumulative_text_for_typewriter(

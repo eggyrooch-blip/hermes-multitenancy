@@ -1,8 +1,15 @@
-"""Markdown style normalization + oversized-table degradation.
+"""Markdown style normalization + overflow-table degradation.
 
-Mirrors openclaw-lark's safe-card markdown shape: card-v2 spacing rules
-and the table-limit fallback (code-mode shape rather than openclaw's plain
-text — see plan `card-table-reactive-fallback` for the reactive variant).
+Mirrors openclaw-lark's safe-card markdown shape: card-v2 spacing rules and
+the table-limit fallback. KEY (openclaw-lark `sanitizeTextForCard`): Feishu
+CardKit cards DO render markdown tables natively — empirically up to 3 per
+card before code 230099/subCode 11310 ("table number over limit"). So the
+first ``_FEISHU_CARD_TABLE_LIMIT`` tables are kept as native markdown (they
+render as real tables); only the overflow tables are degraded to a card-safe
+code-mode shape. The plugin sends via the CardKit API (cardkit.v1.card), which
+does NOT pass through core feishu.py's post/text path — so core's
+table→plain-text forcing (which only applies to post-type 'md' elements) never
+touches these cards.
 """
 from __future__ import annotations
 
@@ -11,13 +18,20 @@ from typing import Any
 
 from .sanitization import _strip_invalid_image_keys
 
-# Boundary between the two card-safe shapes a table degrades into. A narrow
-# table renders as an aligned monospace code block (clean, compact in the card);
-# a wide one (too many columns or a too-long rendered line that would wrap into a
-# mess on mobile) renders as a vertical key-value list instead. Either way the
-# native ``|---|`` table form never reaches core, which would otherwise force the
-# whole message to plain text and drop the card (feishu.py — md cards can't render
-# tables).
+# Empirical Feishu CardKit limit: a single card renders at most this many
+# markdown tables natively; the 4th+ trips code 230099 / subCode 11310
+# ("table number over limit"). openclaw-lark uses the same constant
+# (card-error.ts `FEISHU_CARD_TABLE_LIMIT = 3`, "2026-03 实测"). Tables within
+# the limit are kept as native markdown (Feishu renders them as real tables);
+# only the overflow is degraded.
+_FEISHU_CARD_TABLE_LIMIT = 3
+
+# Boundary between the two card-safe shapes an OVERFLOW table degrades into. A
+# narrow table renders as an aligned monospace code block (clean, compact in the
+# card); a wide one (too many columns or a too-long rendered line that would wrap
+# into a mess on mobile) renders as a vertical key-value list instead. This only
+# applies to tables beyond ``_FEISHU_CARD_TABLE_LIMIT`` — the first N tables stay
+# native and render as real tables.
 _TABLE_CODEBLOCK_MAX_COLUMNS = 5
 _TABLE_CODEBLOCK_MAX_LINE_CHARS = 100
 
@@ -63,25 +77,36 @@ def _optimize_markdown_style_inner(text: str, card_version: int = 2) -> str:
     return re.sub(r"\n{3,}", "\n\n", result)
 
 
-def _degrade_limited_markdown_tables(text: str, stash_code_text: Any) -> str:
-    """Convert EVERY markdown table into a card-safe shape.
+def _degrade_limited_markdown_tables(
+    text: str, stash_code_text: Any, table_limit: int = _FEISHU_CARD_TABLE_LIMIT
+) -> str:
+    """Keep the first ``table_limit`` markdown tables native; degrade the overflow.
 
-    Any native ``|---|`` table that survives to core makes core force the whole
-    message to plain text (md cards can't render tables), dropping the card. So
-    every table is degraded before core sees it: narrow → aligned code block,
-    wide → vertical key-value list. (Previously only *oversized* tables were
-    degraded; small ones leaked through and silently lost the card.)
+    Feishu CardKit cards render markdown tables natively, but only up to
+    ``_FEISHU_CARD_TABLE_LIMIT`` per card (the 4th+ trips 230099/11310). So the
+    first N native ``|---|`` tables pass through unchanged — Feishu renders them
+    as real tables — and the card-v2 spacing pass below frames them with ``<br>``.
+    Only tables beyond the limit are degraded to a card-safe shape: narrow →
+    aligned code block, wide → vertical key-value list. Mirrors openclaw-lark
+    `sanitizeTextForCard`. (Tables inside ``` fences are already stashed before
+    this runs, matching openclaw's findMarkdownTablesOutsideCodeBlocks, so a
+    documentation table in a code block is never counted or degraded.)
     """
     lines = str(text or "").splitlines()
     result: list[str] = []
     index = 0
+    kept = 0
     while index < len(lines):
         if _is_markdown_table_start(lines, index):
             end = index + 2
             while end < len(lines) and _is_markdown_table_row(lines[end]):
                 end += 1
             block_lines = lines[index:end]
-            result.append(_render_markdown_table_for_card(block_lines, stash_code_text))
+            if kept < table_limit:
+                result.extend(block_lines)  # native — Feishu renders a real table
+                kept += 1
+            else:
+                result.append(_render_markdown_table_for_card(block_lines, stash_code_text))
             index = end
             continue
         result.append(lines[index])
