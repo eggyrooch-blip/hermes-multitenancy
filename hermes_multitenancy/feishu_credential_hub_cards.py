@@ -185,6 +185,7 @@ def build_hub_card(
     auth_urls: Optional[dict[str, str]] = None,
     pending_note: Optional[dict[str, str]] = None,
     qr_image_keys: Optional[dict[str, str]] = None,
+    interactive_creds: Optional[set] = None,
 ) -> dict[str, Any]:
     """Build the credential-hub card.
 
@@ -197,6 +198,7 @@ def build_hub_card(
     auth_urls = auth_urls or {}
     pending_note = pending_note or {}
     qr_image_keys = qr_image_keys or {}
+    interactive = _INTERACTIVE_CREDS if interactive_creds is None else interactive_creds
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
@@ -215,7 +217,7 @@ def build_hub_card(
         # Interactive credentials get a CALLBACK button (click → synthetic /card
         # COMMAND → multitenancy starts that flow and sends the QR/URL card).
         # Authenticated rows still get a "重新认证" button so users can re-trigger.
-        if row.id in _INTERACTIVE_CREDS:
+        if row.id in interactive:
             label_zh = (row.action or {}).get("label") or ("重新认证" if row.authenticated else "认证")
             elements.append(_callback_button(
                 label_zh=label_zh,

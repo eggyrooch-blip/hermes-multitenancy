@@ -2829,10 +2829,19 @@ async def _handle_auth_command(
     if adapter is None:
         return
 
-    # /auth just renders status + callback buttons. No flow is started here — a
-    # click delivers a synthetic /card COMMAND that _handle_hub_card_action picks
-    # up and runs that credential's flow. (Click → flow → feedback, in-process.)
-    card = build_hub_card(rows=rows)
+    # /auth renders status + callback buttons. A click runs the flow in-process
+    # (card-action hook). kep-cli's OAuth needs a public callback host reachable
+    # from the browser — without one configured (local), offering its button just
+    # bounces in Feishu's webview, so gate it to a note and keep it for prod.
+    from .feishu_credential_hub_cards import _INTERACTIVE_CREDS
+    interactive = set(_INTERACTIVE_CREDS)
+    pending_note: dict[str, str] = {}
+    if not os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip():
+        interactive.discard(credential_hub.KEP_CLI)
+        kep_row = next((r for r in rows if r.id == credential_hub.KEP_CLI), None)
+        if kep_row is not None and kep_row.installed and not kep_row.authenticated:
+            pending_note[credential_hub.KEP_CLI] = "kep-cli 飞书内认证需公网回调（已在 prod 支持），本机请用 WebUI。"
+    card = build_hub_card(rows=rows, interactive_creds=interactive, pending_note=pending_note)
     sent = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
     if sent is None:
         lines = ["凭证中心："] + [
