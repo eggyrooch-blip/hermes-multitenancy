@@ -259,6 +259,32 @@ def _skillhub_authorized(request: Any) -> bool:
     return False
 
 
+def _ingest_authorized(request: Any) -> bool:
+    """Auth for the synchronous ingest ingress — **fail-closed**.
+
+    Mirrors ``_skillhub_authorized``: a public-facing route that must never
+    serve unauthenticated. Accepts a dedicated ``HERMES_INGEST_KEY`` (the
+    fixed Bearer token handed to the external caller, so neither the master
+    broker key nor the SkillHub key is ever shared) and also accepts the
+    master ``HERMES_MULTITENANCY_RUN_BROKER_KEY`` for internal callers. If
+    NEITHER key is configured, refuse — never serve this route open.
+    """
+    dedicated = os.environ.get("HERMES_INGEST_KEY", "").strip()
+    master = _run_broker_key()
+    if not dedicated and not master:
+        return False  # public route must never be open
+    header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    token = header[len(prefix):].strip() if header.startswith(prefix) else ""
+    if not token:
+        return False
+    if dedicated and hmac.compare_digest(token, dedicated):
+        return True
+    if master and hmac.compare_digest(token, master):
+        return True
+    return False
+
+
 async def _read_capped_body(request: Any, cap: int) -> Optional[bytes]:
     """Read the request body incrementally, returning None if it exceeds ``cap``.
 
@@ -1111,6 +1137,109 @@ def create_run_broker_app(
                     if not _is_client_transport_closed(exc):
                         raise
         return response
+
+    async def handle_ingest(request):
+        """Synchronous external-ingest entry.
+
+        Runs the agent as a *server-bound* profile and returns the result as
+        one JSON response (no SSE). Identity is pinned via the
+        ``HERMES_INGEST_PROFILE`` env var — the caller CANNOT choose the
+        profile (any ``profile`` field in the body is ignored), so a leaked
+        ``HERMES_INGEST_KEY`` can only ever run as that one bound identity.
+        See SPEC run-broker-ingest.
+        """
+        if not _ingest_authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        bound_profile = os.environ.get("HERMES_INGEST_PROFILE", "").strip()
+        if not bound_profile:
+            return web.json_response(
+                {"ok": False, "error": "ingest profile not configured"},
+                status=503,
+            )
+
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "error": f"invalid json: {exc}"}, status=400
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be a JSON object"}, status=400
+            )
+
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            return web.json_response(
+                {"ok": False, "error": "content is required"}, status=400
+            )
+
+        # Optional skill: prepend a slash command so the broker's native
+        # skill-slash rewriter (run_broker._rewrite_skill_slash_request)
+        # expands it — the same path the WebUI uses. A ``profile`` field in
+        # the body is deliberately NOT read: identity is server-bound.
+        skill = str(payload.get("skill") or "").strip()
+        if skill:
+            content = f"/{skill.lstrip('/')} {content}"
+
+        try:
+            run_request = RunRequest(
+                channel="webui",
+                profile_name=bound_profile,
+                user_key=bound_profile,
+                content=content,
+                idempotency_key=str(payload.get("idempotency_key") or "").strip() or None,
+                delivery_mode="sync",
+                credential_subject=bound_profile,
+                metadata={"source": "ingest"},
+            )
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+        collected: list[str] = []
+        error_text: dict[str, str] = {}
+
+        async def emit_event(event: RunEvent) -> None:
+            if event.kind == "content" and event.text:
+                collected.append(event.text)
+            elif event.kind == "error":
+                error_text["error"] = event.text or "agent error"
+
+        broker_dispatch = dispatch_agent or (
+            lambda req: _default_dispatch_agent(req, emit_event=emit_event)
+        )
+        broker = RunBroker(
+            dispatch_agent=broker_dispatch,
+            emit_event=emit_event,
+            mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+            sandbox_available=sandbox_available or _default_sandbox_available,
+        )
+
+        try:
+            result = await broker.run(run_request)
+        except RunRejected as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=403)
+        except Exception as exc:
+            logger.exception("[multitenancy] ingest run failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+        if error_text.get("error"):
+            return web.json_response(
+                {"ok": False, "error": error_text["error"], "profile": bound_profile},
+                status=500,
+            )
+
+        text = "".join(collected).strip() or (result.content if result else "")
+        return web.json_response(
+            {
+                "ok": True,
+                "result": text,
+                "profile": bound_profile,
+                "duplicate": bool(getattr(result, "duplicate", False)),
+            },
+            status=200,
+        )
 
     async def handle_clarify_respond(request):
         if not _authorized(request):
@@ -1979,6 +2108,7 @@ def create_run_broker_app(
     app = web.Application(client_max_size=_run_broker_client_max_size())
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post("/api/run-broker/ingest", handle_ingest)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/session-commands", handle_session_command)
     app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
