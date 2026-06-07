@@ -10,6 +10,14 @@ from types import SimpleNamespace
 import pytest
 
 
+def _read_yaml(path: Path) -> dict:
+    import yaml
+
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    assert isinstance(loaded, dict)
+    return loaded
+
+
 # -- Pure helpers ------------------------------------------------------------
 
 
@@ -150,6 +158,8 @@ def test_ensure_group_profile_writes_marker_and_soul(tmp_path):
     assert "api_server:" in config_text
     assert "terminal" not in config_text
     assert "feishu_docx" not in config_text
+    config = _read_yaml(profile_home / "config.yaml")
+    assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
     # The group profile marker exists and forbids feishu_auth.
     marker = json.loads((profile_home / "group_profile.json").read_text("utf-8"))
     assert marker["kind"] == "group"
@@ -1054,6 +1064,30 @@ def test_ensure_auto_profile_writes_profile_local_env(tmp_path):
     assert env_path.exists()
     assert not env_path.is_symlink()
     assert "shared-secret" not in env_path.read_text(encoding="utf-8")
+    config = _read_yaml(profile_home / "config.yaml")
+    assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
+
+
+def test_ensure_webui_agent_profile_defaults_to_vod_and_disables_feishu(tmp_path):
+    """WebUI agent profiles should inherit default image_gen but never connect Feishu."""
+    from hermes_multitenancy.router import _ensure_webui_agent_profile
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / "auth.json").write_text("{}", encoding="utf-8")
+    profile_home = shared / "profiles" / "agent_city_poster"
+
+    _ensure_webui_agent_profile(
+        profile_name="agent_city_poster",
+        profile_home=profile_home,
+        owner_open_id="ou_owner",
+        display_label="City Poster Agent",
+        agent_id="agent_city_poster",
+    )
+
+    config = _read_yaml(profile_home / "config.yaml")
+    assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
+    assert config["platforms"]["feishu"] == {"enabled": False}
 
 
 def test_repair_profile_local_env_backfills_shared_env_symlink(tmp_path):

@@ -678,6 +678,8 @@ _SENSITIVE_PROFILE_DIR_NAMES = {
     "feishu_uat",
     "tokens",
 }
+_DEFAULT_IMAGE_GEN_PROVIDER = "tencent-vod"
+_DEFAULT_IMAGE_GEN_MODEL = "gem-3.1"
 
 
 async def _deliver_media_from_stream_response(
@@ -4768,6 +4770,9 @@ def _profile_config_from_shared_home(shared_home: Path) -> dict[str, Any]:
                     value = loaded.get(key)
                     if value:
                         config[key] = value
+                image_gen = loaded.get("image_gen")
+                if isinstance(image_gen, dict) and image_gen:
+                    config["image_gen"] = dict(image_gen)
                 feishu_platform = ((loaded.get("platforms") or {}).get("feishu") or None)
                 if feishu_platform:
                     config["platforms"] = {"feishu": feishu_platform}
@@ -4779,6 +4784,7 @@ def _profile_config_from_shared_home(shared_home: Path) -> dict[str, Any]:
 
 
 def _normalize_profile_config(config: dict[str, Any]) -> dict[str, Any]:
+    _apply_default_image_gen_config(config)
     model = config.get("model")
     if isinstance(model, dict) and model.get("default"):
         default_model = str(model.get("default") or "").strip()
@@ -4786,6 +4792,45 @@ def _normalize_profile_config(config: dict[str, Any]) -> dict[str, Any]:
         if default_model and provider and "/" not in default_model:
             model["default"] = f"{provider}/{default_model}"
     return config
+
+
+def _has_explicit_image_gen_config(config: dict[str, Any]) -> bool:
+    section = config.get("image_gen")
+    if not isinstance(section, dict):
+        return False
+    provider = str(section.get("provider") or "").strip()
+    model = str(section.get("model") or "").strip()
+    return bool(provider or model)
+
+
+def _needs_default_image_gen_config(config: dict[str, Any]) -> bool:
+    section = config.get("image_gen")
+    if section is None:
+        return True
+    if isinstance(section, dict):
+        return not _has_explicit_image_gen_config(config)
+    return False
+
+
+def _apply_default_image_gen_config(config: dict[str, Any]) -> bool:
+    if not _needs_default_image_gen_config(config):
+        return False
+    config["image_gen"] = {
+        "provider": _DEFAULT_IMAGE_GEN_PROVIDER,
+        "model": _DEFAULT_IMAGE_GEN_MODEL,
+    }
+    return True
+
+
+def _profile_config_file_needs_default_image_gen(config_path: Path) -> bool:
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.debug("multitenancy: failed to inspect profile image_gen config %s: %s", config_path, exc)
+        return False
+    return isinstance(loaded, dict) and _needs_default_image_gen_config(loaded)
 
 
 def _normalize_profile_config_file(config_path: Path, *, shared_home: Path) -> None:
@@ -4995,6 +5040,63 @@ def repair_profile_local_envs(
             stats["created"] += 1
         else:
             stats["repaired"] += 1
+    return stats
+
+
+def repair_profile_image_gen_defaults(
+    *,
+    shared_home: Path | None = None,
+    profiles_root: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Backfill default image_gen config into ordinary profiles that lack it."""
+    root = (shared_home or Path(os.environ.get("HERMES_HOME", "~/.hermes"))).expanduser()
+    profiles = profiles_root or (root / "profiles")
+    stats = {
+        "scanned": 0,
+        "updated": 0,
+        "planned_updated": 0,
+        "kept_explicit": 0,
+        "skipped_service": 0,
+        "skipped_invalid": 0,
+        "errors": 0,
+    }
+    if not profiles.exists():
+        return stats
+    for profile_home in sorted(path for path in profiles.iterdir() if path.is_dir()):
+        stats["scanned"] += 1
+        if _is_service_profile(profile_home.name):
+            stats["skipped_service"] += 1
+            continue
+        config_path = profile_home / "config.yaml"
+        try:
+            if config_path.exists():
+                import yaml
+
+                loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                if not isinstance(loaded, dict):
+                    stats["skipped_invalid"] += 1
+                    continue
+                if _has_explicit_image_gen_config(loaded):
+                    stats["kept_explicit"] += 1
+                    continue
+                if not _needs_default_image_gen_config(loaded):
+                    stats["kept_explicit"] += 1
+                    continue
+            if dry_run:
+                stats["planned_updated"] += 1
+                continue
+            if config_path.exists():
+                _normalize_profile_config_file(config_path, shared_home=root)
+            else:
+                config_path.write_text(
+                    _dump_profile_config(_profile_config_from_shared_home(root)),
+                    encoding="utf-8",
+                )
+            stats["updated"] += 1
+        except Exception:
+            logger.exception("multitenancy: failed to repair profile image_gen config profile=%s", profile_home.name)
+            stats["errors"] += 1
     return stats
 
 

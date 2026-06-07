@@ -9,6 +9,14 @@ from pathlib import Path
 import pytest
 
 
+def _read_yaml(path: Path) -> dict:
+    import yaml
+
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    assert isinstance(loaded, dict)
+    return loaded
+
+
 @pytest.fixture
 def table():
     from hermes_multitenancy.routing import RoutingTable
@@ -338,6 +346,58 @@ def test_sync_cli_repair_profile_env_replaces_shared_symlink(capsys, tmp_path):
     assert parsed["repaired"] == 1
     assert not (profile / ".env").is_symlink()
     assert "shared-secret" not in (profile / ".env").read_text(encoding="utf-8")
+
+
+def test_sync_cli_repair_profile_image_gen_backfills_missing_configs(capsys, tmp_path):
+    from hermes_multitenancy.sync.cli import main
+
+    shared = tmp_path / ".hermes"
+    profiles = shared / "profiles"
+    missing = profiles / "alice"
+    explicit = profiles / "bob"
+    router = profiles / "multitenancy_router"
+    for path in (missing, explicit, router):
+        path.mkdir(parents=True)
+    (missing / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (explicit / "config.yaml").write_text(
+        "image_gen:\n  provider: custom-images\n  model: custom-v1\n",
+        encoding="utf-8",
+    )
+    (router / "config.yaml").write_text("model:\n  default: router/model\n", encoding="utf-8")
+
+    dry_code = main(["repair-profile-image-gen", "--home", str(shared), "--dry-run"])
+    dry_output = capsys.readouterr().out
+
+    assert dry_code == 0
+    dry = json.loads(dry_output)
+    assert dry["planned_updated"] == 1
+    assert dry["kept_explicit"] == 1
+    assert dry["skipped_service"] == 1
+    assert "image_gen" not in _read_yaml(missing / "config.yaml")
+
+    code = main(["repair-profile-image-gen", "--home", str(shared)])
+    output = capsys.readouterr().out
+
+    assert code == 0
+    parsed = json.loads(output)
+    assert parsed["updated"] == 1
+    assert parsed["kept_explicit"] == 1
+    assert parsed["skipped_service"] == 1
+    assert _read_yaml(missing / "config.yaml")["image_gen"] == {
+        "provider": "tencent-vod",
+        "model": "gem-3.1",
+    }
+    assert _read_yaml(explicit / "config.yaml")["image_gen"] == {
+        "provider": "custom-images",
+        "model": "custom-v1",
+    }
+    assert "image_gen" not in _read_yaml(router / "config.yaml")
+
+    second_code = main(["repair-profile-image-gen", "--home", str(shared), "--dry-run"])
+    second_output = capsys.readouterr().out
+
+    assert second_code == 0
+    assert json.loads(second_output)["planned_updated"] == 0
 
 
 def test_plan_profile_skill_sync_reads_org_default_skill_bundle(tmp_path):
@@ -1297,6 +1357,47 @@ def test_sync_feishu_org_writes_profiles_routes_and_snapshot(tmp_path):
     finally:
         table.close()
     assert json.loads(snapshot_path.read_text(encoding="utf-8"))["stats"]["total_employees"] == 1
+    config = _read_yaml(tmp_path / "profiles" / "alice" / "config.yaml")
+    assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
+
+
+def test_sync_profiles_backfills_vod_default_without_overwriting_explicit_image_gen(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    profiles_root = tmp_path / "profiles"
+    alice = profiles_root / "alice"
+    bob = profiles_root / "bob"
+    alice.mkdir(parents=True)
+    bob.mkdir(parents=True)
+    (alice / "config.yaml").write_text("model:\n  default: openai/test\n", encoding="utf-8")
+    (bob / "config.yaml").write_text(
+        "image_gen:\n  provider: custom-images\n  model: custom-v1\n",
+        encoding="utf-8",
+    )
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {
+            "od_sales": [
+                DepartmentUser(open_id="ou_alice", user_id="alice"),
+                DepartmentUser(open_id="ou_bob", user_id="bob"),
+            ]
+        },
+    )
+
+    stats = sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    assert stats["updated"] == 2
+    assert _read_yaml(alice / "config.yaml")["image_gen"] == {
+        "provider": "tencent-vod",
+        "model": "gem-3.1",
+    }
+    assert _read_yaml(bob / "config.yaml")["image_gen"] == {
+        "provider": "custom-images",
+        "model": "custom-v1",
+    }
 
 
 def test_sync_feishu_org_dept_sync_does_not_soft_delete_out_of_scope_routes(tmp_path):

@@ -2199,6 +2199,10 @@ def test_webui_profile_provisioning_initializes_group_like_agent_profile(tmp_pat
     assert (profile_home / "skills" / "lark-docs").is_symlink()
 
     config_text = (profile_home / "config.yaml").read_text(encoding="utf-8")
+    import yaml
+
+    config = yaml.safe_load(config_text)
+    assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
     assert "lark-cli" in config_text
     assert "platform_toolsets_mode" in config_text
     assert "enabled: false" in config_text

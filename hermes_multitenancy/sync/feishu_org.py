@@ -677,11 +677,16 @@ def _sync_one_profile(
         (profile_home / "SOUL.md").read_text(encoding="utf-8") != desired_soul
     )
     config_missing = not (profile_home / "config.yaml").exists()
+    config_needs_image_gen = False
+    if not config_missing:
+        from ..router import _profile_config_file_needs_default_image_gen
+
+        config_needs_image_gen = _profile_config_file_needs_default_image_gen(profile_home / "config.yaml")
 
     if dry_run:
         if not existed:
             return "created"
-        return "updated" if soul_changed or config_missing else "kept"
+        return "updated" if soul_changed or config_missing or config_needs_image_gen else "kept"
 
     profile_home.mkdir(parents=True, exist_ok=True)
     # Tighten profile_home to 0700 so other system users cannot enumerate the

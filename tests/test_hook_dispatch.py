@@ -1905,8 +1905,10 @@ async def test_handle_async_does_not_auto_provision_unknown_user_when_disabled(
 def test_auto_profile_config_does_not_invent_default_model():
     from hermes_multitenancy.router import _normalize_profile_config
 
-    assert _normalize_profile_config({}) == {}
-    assert _normalize_profile_config({"tools": ["web"]}) == {"tools": ["web"]}
+    assert "model" not in _normalize_profile_config({})
+    normalized = _normalize_profile_config({"tools": ["web"]})
+    assert "model" not in normalized
+    assert normalized["tools"] == ["web"]
 
 
 @pytest.mark.asyncio

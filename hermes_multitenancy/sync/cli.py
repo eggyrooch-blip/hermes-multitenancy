@@ -75,6 +75,14 @@ def main(argv: list[str] | None = None) -> int:
     p_repair_env.add_argument("--profiles-root", type=Path, default=None, help="Profiles root (default: <home>/profiles)")
     p_repair_env.add_argument("--dry-run", action="store_true", help="Report changes without touching profile files")
 
+    p_repair_image_gen = sub.add_parser(
+        "repair-profile-image-gen",
+        help="Add default Tencent VOD image_gen config to ordinary profiles that lack it",
+    )
+    p_repair_image_gen.add_argument("--home", type=Path, default=None, help="Shared Hermes home (default: HERMES_HOME or ~/.hermes)")
+    p_repair_image_gen.add_argument("--profiles-root", type=Path, default=None, help="Profiles root (default: <home>/profiles)")
+    p_repair_image_gen.add_argument("--dry-run", action="store_true", help="Report changes without touching profile config files")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "apply":
@@ -157,6 +165,17 @@ def main(argv: list[str] | None = None) -> int:
         from hermes_multitenancy.router import repair_profile_local_envs
 
         stats = repair_profile_local_envs(
+            shared_home=args.home,
+            profiles_root=args.profiles_root,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(stats, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.cmd == "repair-profile-image-gen":
+        from hermes_multitenancy.router import repair_profile_image_gen_defaults
+
+        stats = repair_profile_image_gen_defaults(
             shared_home=args.home,
             profiles_root=args.profiles_root,
             dry_run=args.dry_run,
