@@ -2584,6 +2584,172 @@ async def test_post_stream_media_delivery_sends_chinese_markdown_filename_direct
     ]
 
 
+def test_post_stream_media_delivery_sends_public_markdown_image_url(tmp_path, monkeypatch):
+    """Public markdown image URLs must become Feishu image uploads, not stripped card text."""
+    import socket
+    import urllib.request
+
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    event = _build_event(chat_id="oc_chat")
+    event.message_id = "om_vod_image"
+    payload = b"\xff\xd8\xff\xe0fake-vod-jpeg"
+    calls = []
+
+    class FakeHTTPResponse:
+        headers = {
+            "Content-Type": "image/jpeg",
+            "Content-Length": str(len(payload)),
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size=-1):
+            return payload
+
+    def fake_urlopen(request, timeout=0):
+        calls.append((request.full_url, timeout))
+        return FakeHTTPResponse()
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "cdn.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    class Adapter:
+        def __init__(self):
+            self.images = []
+
+        async def send_image_file(self, **kwargs):
+            self.images.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    adapter = Adapter()
+
+    asyncio.run(
+        router_mod._deliver_media_from_stream_response(
+            SimpleNamespace(),
+            "海报生成成功\n![未来城市夜景海报](https://cdn.example.com/path/aigcImageGenFile.jpg)",
+            event,
+            adapter,
+            profile_home,
+        )
+    )
+
+    assert calls == [("https://cdn.example.com/path/aigcImageGenFile.jpg", 15)]
+    assert len(adapter.images) == 1
+    image_path = Path(adapter.images[0]["image_path"])
+    assert image_path.parent == profile_home / "workspace" / "Downloads" / "remote-images"
+    assert image_path.suffix == ".jpg"
+    assert image_path.read_bytes() == payload
+    assert adapter.images[0] == {
+        "chat_id": "oc_chat",
+        "image_path": str(image_path),
+        "reply_to": None,
+        "metadata": None,
+    }
+
+
+def test_post_stream_media_delivery_rejects_private_markdown_image_url(tmp_path, monkeypatch):
+    """Remote image delivery must not turn model output into an SSRF fetch."""
+    import socket
+    import urllib.request
+
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    event = _build_event(chat_id="oc_chat")
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "internal.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    def fail_urlopen(*args, **kwargs):
+        raise AssertionError("private remote image URL should not be fetched")
+
+    class Adapter:
+        def __init__(self):
+            self.images = []
+
+        async def send_image_file(self, **kwargs):
+            self.images.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "urlopen", fail_urlopen)
+    adapter = Adapter()
+
+    asyncio.run(
+        router_mod._deliver_media_from_stream_response(
+            SimpleNamespace(),
+            "海报生成成功\n![未来城市夜景海报](http://internal.example.com/path/aigcImageGenFile.jpg)",
+            event,
+            adapter,
+            profile_home,
+        )
+    )
+
+    assert adapter.images == []
+    assert not (profile_home / "workspace" / "Downloads" / "remote-images").exists()
+
+
+def test_webui_profile_scoped_media_response_materializes_public_markdown_image_url(tmp_path, monkeypatch):
+    """WebUI should receive profile workspace media instead of relying on remote image markdown."""
+    import socket
+    import urllib.request
+
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    payload = b"\x89PNG\r\n\x1a\nfake-remote-png"
+
+    class FakeHTTPResponse:
+        headers = {
+            "Content-Type": "image/png",
+            "Content-Length": str(len(payload)),
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size=-1):
+            return payload
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "images.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    def fake_urlopen(request, timeout=0):
+        return FakeHTTPResponse()
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    response = router_mod._webui_profile_scoped_media_response(
+        "海报生成成功\n![poster](https://images.example.com/generated/poster.png)",
+        profile_home,
+    )
+
+    media_lines = [line for line in response.splitlines() if line.startswith("MEDIA:")]
+    assert len(media_lines) == 1
+    assert media_lines[0].startswith("MEDIA:/workspace/Downloads/remote-images/")
+    assert media_lines[0].endswith(".png")
+    workspace_relative = media_lines[0].removeprefix("MEDIA:/workspace/")
+    assert (profile_home / "workspace" / workspace_relative).read_bytes() == payload
+
+
 def test_recent_profile_markdown_file_context_is_added_for_this_file_request(tmp_path):
     from hermes_multitenancy import router as router_mod
 

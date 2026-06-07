@@ -88,6 +88,14 @@ _AIAGENT_TOOL_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "FAL_KEY",
     "TAVILY_API_KEY",
     "TAVILY_BASE_URL",
+    "TENCENTCLOUD_SECRET_ID",
+    "TENCENTCLOUD_SECRET_KEY",
+    "VOD_SUBAPP_ID",
+    "VOD_REGION",
+    "VOD_STORAGE_MODE",
+    "VOD_POLL_TIMEOUT",
+    "VOD_POLL_INTERVAL",
+    "VOD_ENDPOINT",
 })
 
 _SHARED_AIAGENT_ENV_ALLOWLIST: frozenset[str] = (
@@ -1803,6 +1811,28 @@ def _apply_runtime_env_for_aiagent(profile_home: Path):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = old_value
+
+    return _cleanup
+
+
+def _apply_vod_image_model_override_for_aiagent(user_text: str):
+    """Expose a one-run VOD image model override parsed from natural language."""
+    try:
+        from .tencent_vod_image_gen import VOD_MODEL_OVERRIDE_ENV, detect_vod_model_override
+    except Exception:
+        return lambda: None
+
+    model = detect_vod_model_override(user_text)
+    if not model:
+        return lambda: None
+    old_value = os.environ.get(VOD_MODEL_OVERRIDE_ENV)
+    os.environ[VOD_MODEL_OVERRIDE_ENV] = model
+
+    def _cleanup() -> None:
+        if old_value is None:
+            os.environ.pop(VOD_MODEL_OVERRIDE_ENV, None)
+        else:
+            os.environ[VOD_MODEL_OVERRIDE_ENV] = old_value
 
     return _cleanup
 
@@ -3576,6 +3606,7 @@ def _run_with_aiagent(
             str(gateway_session_key),
         )
         runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
         try:
             agent = AIAgent(**agent_kwargs)
@@ -3591,6 +3622,7 @@ def _run_with_aiagent(
             # parent process re-runs it post-done with full write access.
             _retag_source_now("finally-pre-close")
             approval_cleanup()
+            vod_image_override_cleanup()
             runtime_env_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)

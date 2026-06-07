@@ -87,6 +87,7 @@ def register(ctx) -> None:
     from .credential_tool import register_credential_status_tool
     from .router import override_pool
     from .runtime import ProfileRuntime
+    from .tencent_vod_image_gen import register_vod_image_gen_provider
 
     def _real_factory(profile_name, profile_home):
         return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
@@ -104,6 +105,7 @@ def register(ctx) -> None:
         install_profile_native_cron_guard()
 
     register_credential_status_tool(ctx)
+    register_vod_image_gen_provider(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
 
 

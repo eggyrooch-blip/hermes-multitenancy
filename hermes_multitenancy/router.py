@@ -10,13 +10,17 @@ import asyncio
 import base64
 import copy
 import hashlib
+import ipaddress
 import inspect
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import time
+import urllib.parse
+import urllib.request
 import zlib
 import zipfile
 from contextlib import asynccontextmanager
@@ -636,6 +640,7 @@ def _sanitize_tool_event_string(text: str, profile_home: Optional[Path]) -> str:
 
 _MEDIA_DIRECTIVE_RE = re.compile(r'''(?P<prefix>[`"']?MEDIA:\s*)(?P<path>\S+)(?P<suffix>[`"']?)''')
 _ARTIFACT_JSON_RE = re.compile(r"```hermes-artifact-json\s*(?P<body>.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_MARKDOWN_REMOTE_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((?P<url>https?://[^)\s]+)\)", re.IGNORECASE)
 _PROFILE_FILE_PATH_RE = re.compile(
     r'''(?P<path>(?:/workspace|/[^`"'<>\n\r]+?)'''
     r'''\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'''
@@ -647,6 +652,15 @@ _FEISHU_DOCUMENT_ID_LINE_RE = re.compile(
     r"[`\"']?(?P<token>[A-Za-z0-9]{20,})[`\"']?(?P<suffix>\s*)$"
 )
 _AUTO_FILE_DELIVERY_MAX_BYTES = int(os.getenv("HERMES_MULTITENANCY_AUTO_FILE_DELIVERY_MAX_BYTES", "52428800"))
+_REMOTE_IMAGE_DELIVERY_MAX_BYTES = int(os.getenv("HERMES_MULTITENANCY_REMOTE_IMAGE_DELIVERY_MAX_BYTES", "10485760"))
+_REMOTE_IMAGE_DOWNLOAD_TIMEOUT_S = float(os.getenv("HERMES_MULTITENANCY_REMOTE_IMAGE_DOWNLOAD_TIMEOUT", "15"))
+_REMOTE_IMAGE_CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
 _MARKDOWN_DOCUMENT_EXTENSIONS = {".md", ".markdown"}
 _SENSITIVE_PROFILE_FILE_NAMES = {
     ".env",
@@ -675,7 +689,8 @@ async def _deliver_media_from_stream_response(
 ) -> None:
     """Delegate post-stream media attachment delivery to Hermes' native gateway path."""
     response = _materialize_response_artifacts(response, profile_home)
-    response_with_files = _append_profile_file_media_directives(response, profile_home)
+    response_with_remote_images = _append_remote_image_media_directives(response, profile_home)
+    response_with_files = _append_profile_file_media_directives(response_with_remote_images, profile_home)
     scoped_response = _profile_scoped_media_response(response_with_files, profile_home)
     if "MEDIA:" not in scoped_response:
         return
@@ -885,6 +900,170 @@ def _materialize_response_artifacts(response: str, profile_home: Path) -> str:
     if not media_additions:
         return text
     return f"{text.rstrip()}\n" + "\n".join(media_additions)
+
+
+def _append_remote_image_media_directives(response: str, profile_home: Path) -> str:
+    """Attach public markdown image URLs as profile-local media artifacts."""
+    text = str(response or "")
+    if "![" not in text or "http" not in text.lower():
+        return text
+    additions: list[str] = []
+    seen_urls: set[str] = set()
+    existing_media_paths = {match.group("path").strip() for match in _MEDIA_DIRECTIVE_RE.finditer(text)}
+    for match in _MARKDOWN_REMOTE_IMAGE_RE.finditer(text):
+        url = match.group("url").strip()
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        image_path = _materialize_remote_image_url(url, profile_home)
+        if image_path is None:
+            continue
+        path_text = str(image_path)
+        if path_text in existing_media_paths:
+            continue
+        existing_media_paths.add(path_text)
+        additions.append(f"MEDIA:{path_text}")
+    if not additions:
+        return text
+    return f"{text.rstrip()}\n" + "\n".join(additions)
+
+
+def _materialize_remote_image_url(url: str, profile_home: Path) -> Optional[Path]:
+    parsed = urllib.parse.urlparse(url)
+    if not _is_public_remote_image_url(parsed):
+        logger.info("multitenancy: skipped remote image delivery for untrusted url host=%s", parsed.hostname or "")
+        return None
+
+    root = profile_home.expanduser().resolve(strict=False)
+    target_dir = (root / "workspace" / "Downloads" / "remote-images").resolve(strict=False)
+    url_ext = _remote_image_extension_from_url(parsed)
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+    tentative_ext = url_ext or ".img"
+    target = (target_dir / f"remote-image-{digest}{tentative_ext}").resolve(strict=False)
+    if not (target == root or root in target.parents):
+        return None
+    if target.exists() and target.is_file():
+        return target
+
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Hermes-Multitenancy/remote-image-delivery"})
+        with urllib.request.urlopen(request, timeout=_REMOTE_IMAGE_DOWNLOAD_TIMEOUT_S) as response:
+            final_url = str(getattr(response, "geturl", lambda: url)() or url)
+            final_parsed = urllib.parse.urlparse(final_url)
+            if final_url != url and not _is_public_remote_image_url(final_parsed):
+                logger.warning(
+                    "multitenancy: blocked remote image redirect host=%s final_host=%s",
+                    parsed.hostname or "",
+                    final_parsed.hostname or "",
+                )
+                return None
+            headers = getattr(response, "headers", {}) or {}
+            content_type = _header_value(headers, "Content-Type").split(";", 1)[0].strip().lower()
+            content_length = _header_value(headers, "Content-Length").strip()
+            if content_length:
+                try:
+                    if int(content_length) > _REMOTE_IMAGE_DELIVERY_MAX_BYTES:
+                        logger.info(
+                            "multitenancy: skipped oversized remote image host=%s size=%s",
+                            parsed.hostname or "",
+                            content_length,
+                        )
+                        return None
+                except ValueError:
+                    pass
+            ext = _remote_image_extension_from_content_type(content_type) or url_ext
+            if ext not in _MEDIA_IMAGE_EXTENSIONS:
+                logger.info(
+                    "multitenancy: skipped remote image with unsupported content type host=%s content_type=%s",
+                    parsed.hostname or "",
+                    content_type,
+                )
+                return None
+            data = response.read(_REMOTE_IMAGE_DELIVERY_MAX_BYTES + 1)
+            if not data or len(data) > _REMOTE_IMAGE_DELIVERY_MAX_BYTES:
+                logger.info(
+                    "multitenancy: skipped oversized or empty remote image host=%s size=%s",
+                    parsed.hostname or "",
+                    len(data),
+                )
+                return None
+    except Exception as exc:
+        logger.warning(
+            "multitenancy: failed to materialize remote image host=%s error=%s",
+            parsed.hostname or "",
+            exc,
+        )
+        return None
+
+    if ext != tentative_ext:
+        target = (target_dir / f"remote-image-{digest}{ext}").resolve(strict=False)
+        if not (target == root or root in target.parents):
+            return None
+        if target.exists() and target.is_file():
+            return target
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        tmp_target = target.with_name(target.name + ".tmp")
+        tmp_target.write_bytes(data)
+        tmp_target.replace(target)
+        logger.info("multitenancy: materialized remote image url host=%s path=%s", parsed.hostname or "", target)
+        return target
+    except Exception as exc:
+        logger.warning(
+            "multitenancy: failed to write remote image artifact host=%s path=%s error=%s",
+            parsed.hostname or "",
+            target,
+            exc,
+        )
+        return None
+
+
+def _is_public_remote_image_url(parsed: urllib.parse.ParseResult) -> bool:
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        return False
+    if hostname in {"localhost"} or hostname.endswith((".localhost", ".local", ".internal", ".lan")):
+        return False
+    try:
+        addresses = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except OSError as exc:
+        logger.info("multitenancy: remote image host resolution failed host=%s error=%s", hostname, exc)
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        sockaddr = address[4]
+        if not sockaddr:
+            return False
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _remote_image_extension_from_url(parsed: urllib.parse.ParseResult) -> Optional[str]:
+    path = urllib.parse.unquote(parsed.path or "")
+    suffix = Path(path).suffix.lower()
+    return suffix if suffix in _MEDIA_IMAGE_EXTENSIONS else None
+
+
+def _remote_image_extension_from_content_type(content_type: str) -> Optional[str]:
+    return _REMOTE_IMAGE_CONTENT_TYPE_EXTENSIONS.get(content_type.lower())
+
+
+def _header_value(headers: Any, name: str) -> str:
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        return str(getter(name) or getter(name.lower()) or "")
+    try:
+        return str(headers[name])
+    except Exception:
+        return ""
 
 
 def _existing_profile_source_for_artifact_spec(spec: dict[str, Any], target: Path, profile_home: Path) -> Optional[Path]:
@@ -1111,7 +1290,8 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
 def _webui_profile_scoped_media_response(response: str, profile_home: Path) -> str:
     """Scope outbound MEDIA and expose workspace files through browser-safe aliases."""
     root = profile_home.expanduser().resolve(strict=False)
-    scoped = _profile_scoped_media_response(response, root)
+    response_with_remote_images = _append_remote_image_media_directives(response, root)
+    scoped = _profile_scoped_media_response(response_with_remote_images, root)
 
     def repl(match: re.Match[str]) -> str:
         raw_path = match.group("path").strip()

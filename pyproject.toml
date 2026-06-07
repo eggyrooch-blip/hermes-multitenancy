@@ -32,6 +32,7 @@ dependencies = [
     "openai>=1.0",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
+    "tencentcloud-sdk-python-vod>=3.0",
 ]
 
 [project.urls]

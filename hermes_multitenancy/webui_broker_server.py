@@ -1104,6 +1104,20 @@ async def _default_dispatch_agent(
                 )
 
         if "".join(content_parts).strip():
+            remote_media_text = _webui_streamed_remote_media_additions(
+                "".join(content_parts),
+                router_mod=router_mod,
+                profile_home=profile_home,
+            )
+            if remote_media_text:
+                content_parts.append(remote_media_text)
+                await emitter.emit(
+                    RunEvent(
+                        kind="content",
+                        text=remote_media_text,
+                        payload={"text": remote_media_text},
+                    )
+                )
             # Answer already delivered via streamed content frames above.
             # Return "" so RunBroker.run does NOT emit it a second time.
             return ""
@@ -1129,6 +1143,24 @@ def _webui_streamable_media_text(text: str, *, router_mod, profile_home: Path) -
         return pending, items
 
     return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home)]
+
+
+def _webui_streamed_remote_media_additions(text: str, *, router_mod, profile_home: Path) -> str:
+    """Return only extra MEDIA aliases discovered after streamed chunks are joined."""
+    raw = str(text or "")
+    if "http" not in raw.lower() or "![" not in raw:
+        return ""
+    existing = {line.strip() for line in raw.splitlines() if line.strip().startswith("MEDIA:")}
+    scoped = router_mod._webui_profile_scoped_media_response(raw, profile_home)
+    additions: list[str] = []
+    for line in scoped.splitlines():
+        cleaned = line.strip()
+        if not cleaned.startswith("MEDIA:"):
+            continue
+        if cleaned in existing or cleaned in additions:
+            continue
+        additions.append(cleaned)
+    return "\n".join(additions)
 
 
 def _default_mark_seen(request: RunRequest) -> bool:

@@ -788,6 +788,90 @@ def test_webui_run_broker_buffers_split_media_directives(monkeypatch, tmp_path: 
     asyncio.run(runner())
 
 
+def test_webui_run_broker_materializes_split_remote_markdown_image(monkeypatch, tmp_path: Path):
+    import socket
+    import urllib.request
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    payload = b"\xff\xd8\xff\xe0fake-remote-jpeg"
+
+    class FakeHTTPResponse:
+        headers = {
+            "Content-Type": "image/jpeg",
+            "Content-Length": str(len(payload)),
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size=-1):
+            return payload
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "cdn.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    def fake_urlopen(request, timeout=0):
+        return FakeHTTPResponse()
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", "海报生成成功\n![poster]("
+        yield "content", "https://cdn.example.com/generated/poster.jpg"
+        yield "content", ")"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "generate image",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "MEDIA:/workspace/Downloads/remote-images/" in body
+        assert "https://cdn.example.com/generated/poster.jpg" in body
+        image_files = list((profile_home / "workspace" / "Downloads" / "remote-images").glob("*.jpg"))
+        assert len(image_files) == 1
+        assert image_files[0].read_bytes() == payload
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 

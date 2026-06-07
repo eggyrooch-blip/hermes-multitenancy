@@ -586,6 +586,7 @@ dependencies = [
     { name = "openai" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "tencentcloud-sdk-python-vod" },
 ]
 
 [package.optional-dependencies]
@@ -612,6 +613,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "reportlab", marker = "extra == 'test'", specifier = ">=4.0" },
+    { name = "tencentcloud-sdk-python-vod", specifier = ">=3.0" },
 ]
 provides-extras = ["test"]
 
@@ -1775,6 +1777,30 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python-common"
+version = "3.1.110"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/ed/13e9a1d4e2d51f966515f2f5e9b9a6665eac2dfeefd43d7159be78e5585b/tencentcloud_sdk_python_common-3.1.110.tar.gz", hash = "sha256:a7f48815998e15db023f83c000b296e99efa4cf92d492a17f1802651a642699c", size = 22643, upload-time = "2026-06-04T20:30:19.094Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/24/7cdbebc0041b529e089deed554e6c3c5f33e1a1e5c0eecbbb146b1226865/tencentcloud_sdk_python_common-3.1.110-py2.py3-none-any.whl", hash = "sha256:31d515b3d96441d16c14c465b656dc77248a560faef71598ff7b62b08383782b", size = 34273, upload-time = "2026-06-04T20:30:15.662Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python-vod"
+version = "3.1.109"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tencentcloud-sdk-python-common" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/2e/aa1934aa226a31d24c993eb2aecf73d0e4425171b61b5cc5a11d1c6c7719/tencentcloud_sdk_python_vod-3.1.109.tar.gz", hash = "sha256:3a99f9e2683a0c36e7e744a92f80720a3bb567bbb1a6191c89bc5233e7e06d2d", size = 435473, upload-time = "2026-06-03T21:21:45.81Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/c1/a65d0fc1267fdbc729be8fc7fd71e8ade0b0c74f149d7d4d8becb0b2383b/tencentcloud_sdk_python_vod-3.1.109-py2.py3-none-any.whl", hash = "sha256:ee1581992e8f4572d3af818061e34c7472193dc18c816d02213f03f3a6dcb6ba", size = 443948, upload-time = "2026-06-03T21:21:42.317Z" },
 ]
 
 [[package]]

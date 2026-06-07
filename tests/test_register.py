@@ -75,6 +75,27 @@ def test_register_calls_register_hook_once():
     assert callable(cb)
 
 
+def test_register_adds_tencent_vod_image_provider_when_supported():
+    """Newer Hermes plugin contexts expose register_image_gen_provider."""
+    from hermes_multitenancy import register
+
+    hook_calls = []
+    image_providers = []
+
+    class FakeCtx:
+        def register_hook(self, name, cb):
+            hook_calls.append((name, cb))
+
+        def register_image_gen_provider(self, provider):
+            image_providers.append(provider)
+
+    register(FakeCtx())
+
+    assert len(hook_calls) == 1
+    assert len(image_providers) == 1
+    assert image_providers[0].name == "tencent-vod"
+
+
 def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_path):
     """The WebUI broker sidecar is opt-in but wired during plugin register."""
     import hermes_multitenancy

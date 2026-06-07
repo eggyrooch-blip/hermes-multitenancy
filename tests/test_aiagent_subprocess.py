@@ -594,6 +594,92 @@ def test_shared_fal_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_
     assert "_HERMES_FORCE_FAL_KEY" not in env
 
 
+def test_shared_vod_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "\n".join(
+            [
+                "TENCENTCLOUD_SECRET_ID=vod-secret-id",
+                "TENCENTCLOUD_SECRET_KEY=vod-secret-key",
+                "VOD_SUBAPP_ID=123456789",
+                "VOD_REGION=ap-guangzhou",
+                "VOD_STORAGE_MODE=Temporary",
+                "VOD_POLL_TIMEOUT=300",
+                "UNRELATED_SECRET=do-not-forward",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    loaded = agent_real._profile_env_for_aiagent(profile_home)
+    assert loaded["TENCENTCLOUD_SECRET_ID"] == "vod-secret-id"
+    assert loaded["TENCENTCLOUD_SECRET_KEY"] == "vod-secret-key"
+    assert loaded["VOD_SUBAPP_ID"] == "123456789"
+    assert loaded["VOD_REGION"] == "ap-guangzhou"
+    assert loaded["VOD_STORAGE_MODE"] == "Temporary"
+    assert loaded["VOD_POLL_TIMEOUT"] == "300"
+    assert "UNRELATED_SECRET" not in loaded
+
+    monkeypatch.delenv("TENCENTCLOUD_SECRET_ID", raising=False)
+    monkeypatch.delenv("TENCENTCLOUD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("VOD_SUBAPP_ID", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_TENCENTCLOUD_SECRET_ID", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_TENCENTCLOUD_SECRET_KEY", raising=False)
+    monkeypatch.delenv("_HERMES_FORCE_VOD_SUBAPP_ID", raising=False)
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["TENCENTCLOUD_SECRET_ID"] == "vod-secret-id"
+        assert os.environ["TENCENTCLOUD_SECRET_KEY"] == "vod-secret-key"
+        assert os.environ["VOD_SUBAPP_ID"] == "123456789"
+        assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_ID" not in os.environ
+        assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_KEY" not in os.environ
+        assert "_HERMES_FORCE_VOD_SUBAPP_ID" not in os.environ
+    finally:
+        cleanup()
+    assert "TENCENTCLOUD_SECRET_ID" not in os.environ
+    assert "TENCENTCLOUD_SECRET_KEY" not in os.environ
+    assert "VOD_SUBAPP_ID" not in os.environ
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert env["TENCENTCLOUD_SECRET_ID"] == "vod-secret-id"
+    assert env["TENCENTCLOUD_SECRET_KEY"] == "vod-secret-key"
+    assert env["VOD_SUBAPP_ID"] == "123456789"
+    assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_ID" not in env
+    assert "_HERMES_FORCE_TENCENTCLOUD_SECRET_KEY" not in env
+    assert "_HERMES_FORCE_VOD_SUBAPP_ID" not in env
+
+
+def test_vod_model_override_env_is_scoped_to_one_aiagent_run(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.delenv("HERMES_VOD_IMAGE_MODEL_OVERRIDE", raising=False)
+    cleanup = agent_real._apply_vod_image_model_override_for_aiagent(
+        "用 gpt-image2-high 帮我生图：一张未来城市海报"
+    )
+    try:
+        assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gpt-image2-high"
+    finally:
+        cleanup()
+    assert "HERMES_VOD_IMAGE_MODEL_OVERRIDE" not in os.environ
+
+    monkeypatch.setenv("HERMES_VOD_IMAGE_MODEL_OVERRIDE", "gem-3.1")
+    cleanup = agent_real._apply_vod_image_model_override_for_aiagent(
+        "普通帮我生图：一张未来城市海报"
+    )
+    try:
+        assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gem-3.1"
+    finally:
+        cleanup()
+    assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gem-3.1"
+
+
 def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -4375,5 +4461,3 @@ def test_wrap_linux_bwrap_binds_token_named_source_script_skill(monkeypatch, tmp
 
     triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
     assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
-
-
