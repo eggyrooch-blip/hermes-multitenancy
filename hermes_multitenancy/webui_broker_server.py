@@ -285,6 +285,20 @@ def _ingest_authorized(request: Any) -> bool:
     return False
 
 
+def _ingest_public_interaction(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip internal bridge plumbing from a clarify/approval payload before
+    returning it to an internet-facing ingest caller (review NB3).
+
+    Removes the response/decision file paths and the internal session key,
+    which are server-side coordination details the external caller must never
+    see. Keeps the user-meaningful fields (question/choices/command/etc).
+    """
+    cleaned = dict(payload or {})
+    for key in ("response_path", "decision_path", "session_key"):
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def _ingest_timeout() -> float:
     """Hard wall-clock cap (seconds) for a synchronous ingest run.
 
@@ -1157,12 +1171,12 @@ def create_run_broker_app(
     # returns the SAME result the first one produced, instead of an empty
     # body. Bounded in-memory (TTL + cap), consistent with the broker's own
     # in-memory dedup — survives within one broker process, not across.
-    _ingest_results: dict[str, str] = {}
+    _ingest_results: dict[str, dict[str, Any]] = {}
     _ingest_results_at: dict[str, float] = {}
     _INGEST_RESULT_TTL = 3600.0
     _INGEST_RESULT_CAP = 256
 
-    def _ingest_store_result(key: str, value: str) -> None:
+    def _ingest_store_result(key: str, value: dict[str, Any]) -> None:
         now = time.time()
         _ingest_results[key] = value
         _ingest_results_at[key] = now
@@ -1176,7 +1190,7 @@ def create_run_broker_app(
                 _ingest_results.pop(k, None)
                 _ingest_results_at.pop(k, None)
 
-    def _ingest_get_result(key: str) -> Optional[str]:
+    def _ingest_get_result(key: str) -> Optional[dict[str, Any]]:
         # Review NB2: validate TTL on READ, not only on write — never hand back
         # a stale cached answer just because no later write has pruned it yet.
         ts = _ingest_results_at.get(key)
@@ -1347,8 +1361,15 @@ def create_run_broker_app(
                     run_task.cancel()
                     try:
                         await run_task
-                    except BaseException:
-                        pass
+                    except asyncio.CancelledError:
+                        pass  # expected: we cancelled it
+                    except Exception:
+                        # Review NB-new3: don't silently swallow cleanup
+                        # failures — log them, but still surface the
+                        # interaction request to the caller.
+                        logger.exception(
+                            "[multitenancy] ingest interactive run cleanup error"
+                        )
                     interrupt_task.cancel()
                 else:
                     interrupt_task.cancel()
@@ -1381,49 +1402,54 @@ def create_run_broker_app(
 
         text = "".join(collected).strip() or (result.content if result else "")
 
-        # Gap D — duplicate submission returns the original result, not empty.
+        # Gap D — duplicate submission returns the ORIGINAL structured response
+        # (success OR needs_*), not empty. Review NB-new2: caching the full
+        # response (not just text) means an interrupted interactive run is also
+        # replayable on its idempotency key instead of degrading to
+        # duplicate_pending.
         if result is not None and result.duplicate:
             cached = _ingest_get_result(cache_key)
             if cached is not None:
-                return web.json_response(
-                    {"ok": True, "result": cached, "profile": bound_profile, "duplicate": True},
-                    status=200,
-                )
+                replay = dict(cached)
+                replay["duplicate"] = True
+                return web.json_response(replay, status=200)
             return web.json_response(
                 {"ok": False, "status": "duplicate_pending", "profile": bound_profile, "duplicate": True},
                 status=200,
             )
 
         # Gap B — surface clarify/approval as a clear status instead of a
-        # silent empty body, so the caller knows the run needs input.
+        # silent empty body. Payloads are sanitized (review NB3) and cached so
+        # a retry with the same idempotency key replays the same request.
         if clarify_holder:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "status": "needs_clarification",
-                    "clarify": clarify_holder["payload"],
-                    "result": text,
-                    "profile": bound_profile,
-                },
-                status=200,
-            )
+            # Review NB-new1: clear the pending-clarify registration we
+            # abandoned, so it doesn't leak (no clarify_resolved will arrive).
+            _clear_pending_clarify(clarify_holder["payload"])
+            resp = {
+                "ok": False,
+                "status": "needs_clarification",
+                "clarify": _ingest_public_interaction(clarify_holder["payload"]),
+                "result": text,
+                "profile": bound_profile,
+                "duplicate": False,
+            }
+            _ingest_store_result(cache_key, resp)
+            return web.json_response(resp, status=200)
         if approval_holder:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "status": "needs_approval",
-                    "approval": approval_holder["payload"],
-                    "result": text,
-                    "profile": bound_profile,
-                },
-                status=200,
-            )
+            resp = {
+                "ok": False,
+                "status": "needs_approval",
+                "approval": _ingest_public_interaction(approval_holder["payload"]),
+                "result": text,
+                "profile": bound_profile,
+                "duplicate": False,
+            }
+            _ingest_store_result(cache_key, resp)
+            return web.json_response(resp, status=200)
 
-        _ingest_store_result(cache_key, text)
-        return web.json_response(
-            {"ok": True, "result": text, "profile": bound_profile, "duplicate": False},
-            status=200,
-        )
+        resp = {"ok": True, "result": text, "profile": bound_profile, "duplicate": False}
+        _ingest_store_result(cache_key, resp)
+        return web.json_response(resp, status=200)
 
     async def handle_clarify_respond(request):
         if not _authorized(request):

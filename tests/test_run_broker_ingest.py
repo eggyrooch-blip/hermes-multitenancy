@@ -317,7 +317,14 @@ def test_ingest_surfaces_approval_in_interactive_mode(monkeypatch, tmp_path):
     )
 
     async def fake_stream_run_agent(event, profile_home, *, messages=None):
-        yield "approval_required", {"command": "rm -rf x", "description": "danger"}
+        # Include internal bridge plumbing that MUST be stripped before
+        # reaching an internet-facing caller (review NB3).
+        yield "approval_required", {
+            "command": "rm -rf x",
+            "description": "danger",
+            "decision_path": "/tmp/secret/approval.json",
+            "session_key": "sess-internal-123",
+        }
 
     async def fake_real_run_agent(event, profile_home, *, messages=None):
         return ""
@@ -338,7 +345,78 @@ def test_ingest_surfaces_approval_in_interactive_mode(monkeypatch, tmp_path):
     assert status == 200
     assert data["ok"] is False
     assert data["status"] == "needs_approval"
-    assert "approval" in data
+    assert data["approval"]["command"] == "rm -rf x"
+    # Internal plumbing must NOT leak to the caller.
+    assert "decision_path" not in data["approval"]
+    assert "session_key" not in data["approval"]
+
+
+def test_ingest_interactive_clarify_is_replayed_on_duplicate(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "clarify_required", {"question": "哪个时间段？"}
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):
+        return ""
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    calls = {"n": 0}
+
+    def mark_seen(_request):
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    app = create_run_broker_app(
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+    body = {
+        "content": "查数据",
+        "interactive": True,
+        "requires_host_tools": False,
+        "idempotency_key": "ck1",
+    }
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r1 = await client.post(
+                "/api/run-broker/ingest", json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            b1 = await r1.text()
+            r2 = await client.post(
+                "/api/run-broker/ingest", json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            return (await r1.text() and json.loads(b1)), (r2.status, await r2.text())
+        finally:
+            await client.close()
+
+    d1, (s2, t2) = asyncio.run(runner())
+    d2 = json.loads(t2)
+    assert d1["status"] == "needs_clarification"
+    # Duplicate replays the SAME structured request, not duplicate_pending.
+    assert s2 == 200
+    assert d2["status"] == "needs_clarification"
+    assert d2["duplicate"] is True
 
 
 # ── Auth: master-key acceptance (review test gap) ────────────────────────
