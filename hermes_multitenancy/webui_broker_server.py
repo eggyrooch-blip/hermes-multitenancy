@@ -314,6 +314,77 @@ def _ingest_timeout() -> float:
     return value if value > 0 else 180.0
 
 
+def _ingest_owner() -> str:
+    """Owner (Feishu open_id) bound to the ingest key, or '' for v1 fixed-profile mode.
+
+    When set, the ingest endpoint runs in OWNER mode: the caller picks which of
+    this owner's agents to run via the ``agent`` field, and the server validates
+    that the chosen agent is actually owned by this owner. A leaked key can only
+    ever reach agents this one owner owns — never another owner's, never an
+    arbitrary profile.
+    """
+    return os.environ.get("HERMES_INGEST_OWNER", "").strip()
+
+
+def _ingest_list_owner_agents(owner: str) -> list:
+    """Return the active KIND_AGENT routing rows owned by ``owner`` ([] on failure).
+
+    Defense in depth: re-filters on ``owner_open_id == owner`` even though the
+    routing query is already owner-scoped.
+    """
+    if not owner:
+        return []
+    try:
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return []
+        rows = table.list_agents_for_owner(owner)
+        return [
+            r
+            for r in rows
+            if getattr(r, "kind", None) == "agent"
+            and (getattr(r, "owner_open_id", None) or "") == owner
+        ]
+    except Exception:
+        logger.debug("[multitenancy] ingest owner-agent enumeration failed", exc_info=True)
+        return []
+
+
+def _ingest_agent_label(row: Any) -> str:
+    return str(getattr(row, "display_label", None) or getattr(row, "agent_id", None) or getattr(row, "user_id", ""))
+
+
+def _ingest_agent_id(row: Any) -> str:
+    return str(getattr(row, "agent_id", None) or getattr(row, "user_id", ""))
+
+
+def _ingest_resolve_agent(owner: str, agent_str: str) -> tuple[Optional[str], list[str]]:
+    """Resolve a caller-supplied ``agent`` to a profile_name for ``owner``.
+
+    Matches by display_label / agent_id / user_id among the owner's own agents.
+    Returns ``(profile_name, available_names)``; profile_name is None when the
+    agent is not found or not owned by ``owner`` (caller cannot reach another
+    owner's agent). ``available_names`` is always the owner's own agent list so
+    error responses can hint what is valid.
+    """
+    agents = _ingest_list_owner_agents(owner)
+    available = [_ingest_agent_label(r) for r in agents]
+    target = (agent_str or "").strip()
+    if not target:
+        return None, available
+    for r in agents:
+        candidates = {
+            getattr(r, "display_label", None),
+            getattr(r, "agent_id", None),
+            getattr(r, "user_id", None),
+        }
+        if target in candidates and (getattr(r, "owner_open_id", None) or "") == owner:
+            return str(getattr(r, "profile_name", "")), available
+    return None, available
+
+
 async def _read_capped_body(request: Any, cap: int) -> Optional[bytes]:
     """Read the request body incrementally, returning None if it exceeds ``cap``.
 
@@ -1231,13 +1302,6 @@ def create_run_broker_app(
         if not _ingest_authorized(request):
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
 
-        bound_profile = os.environ.get("HERMES_INGEST_PROFILE", "").strip()
-        if not bound_profile:
-            return web.json_response(
-                {"ok": False, "error": "ingest profile not configured"},
-                status=503,
-            )
-
         try:
             payload = await request.json()
         except Exception:
@@ -1254,6 +1318,47 @@ def create_run_broker_app(
             return web.json_response(
                 {"ok": False, "error": "content is required"}, status=400
             )
+
+        # Identity resolution.
+        # - OWNER mode (HERMES_INGEST_OWNER set): the caller picks one of the
+        #   owner's own agents via ``agent``; the server validates ownership.
+        #   A leaked key can only reach THIS owner's agents — never another
+        #   owner's, never an arbitrary profile.
+        # - v1 mode (no owner): fixed HERMES_INGEST_PROFILE; ``agent``/``profile``
+        #   in the body are ignored. Behavior is byte-for-byte unchanged.
+        owner = _ingest_owner()
+        default_profile = os.environ.get("HERMES_INGEST_PROFILE", "").strip()
+        if owner:
+            agent_str = str(payload.get("agent") or "").strip()
+            if agent_str:
+                bound_profile, available = _ingest_resolve_agent(owner, agent_str)
+                if not bound_profile:
+                    return web.json_response(
+                        {
+                            "ok": False,
+                            "error": "agent not found or not owned by this key's owner",
+                            "agents": available,
+                        },
+                        status=403,
+                    )
+            elif default_profile:
+                bound_profile = default_profile  # configured fallback agent/profile
+            else:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "agent required",
+                        "agents": [_ingest_agent_label(r) for r in _ingest_list_owner_agents(owner)],
+                    },
+                    status=400,
+                )
+        else:
+            bound_profile = default_profile
+            if not bound_profile:
+                return web.json_response(
+                    {"ok": False, "error": "ingest profile not configured"},
+                    status=503,
+                )
 
         # Optional skill: prepend a slash command so the broker's native
         # skill-slash rewriter (run_broker._rewrite_skill_slash_request)
@@ -1450,6 +1555,33 @@ def create_run_broker_app(
         resp = {"ok": True, "result": text, "profile": bound_profile, "duplicate": False}
         _ingest_store_result(cache_key, resp)
         return web.json_response(resp, status=200)
+
+    async def handle_ingest_agents(request):
+        """List the ingest owner's own agents (OWNER mode discovery).
+
+        Lets a caller see which ``agent`` values are valid before POSTing to
+        /ingest. Same fail-closed Bearer auth as /ingest. Returns 503 when the
+        endpoint is not in OWNER mode (no HERMES_INGEST_OWNER configured).
+        """
+        if not _ingest_authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        owner = _ingest_owner()
+        if not owner:
+            return web.json_response(
+                {"ok": False, "error": "owner mode not configured"}, status=503
+            )
+        agents = _ingest_list_owner_agents(owner)
+        return web.json_response(
+            {
+                "ok": True,
+                "owner": owner,
+                "agents": [
+                    {"name": _ingest_agent_label(r), "id": _ingest_agent_id(r)}
+                    for r in agents
+                ],
+            },
+            status=200,
+        )
 
     async def handle_clarify_respond(request):
         if not _authorized(request):
@@ -2319,6 +2451,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/ingest", handle_ingest)
+    app.router.add_get("/api/run-broker/ingest/agents", handle_ingest_agents)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/session-commands", handle_session_command)
     app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
