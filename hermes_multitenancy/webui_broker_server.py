@@ -1576,14 +1576,28 @@ def create_run_broker_app(
                 {"ok": False, "error": "owner mode not configured"}, status=503
             )
         # Review NB2: distinguish "routing unavailable" from "owner has no
-        # agents" — don't report ok:true with an empty list during an outage.
+        # agents" — don't report ok:true with an empty list during an outage,
+        # whether the table is absent OR the query itself raises.
         from . import router as router_mod
 
-        if router_mod._get_routing_table() is None:
+        table = router_mod._get_routing_table()
+        if table is None:
             return web.json_response(
                 {"ok": False, "error": "routing table unavailable"}, status=503
             )
-        agents = _ingest_list_owner_agents(owner)
+        try:
+            rows = table.list_agents_for_owner(owner)
+        except Exception:
+            logger.exception("[multitenancy] ingest /agents enumeration failed")
+            return web.json_response(
+                {"ok": False, "error": "routing table unavailable"}, status=503
+            )
+        agents = [
+            r
+            for r in rows
+            if getattr(r, "kind", None) == "agent"
+            and (getattr(r, "owner_open_id", None) or "") == owner
+        ]
         return web.json_response(
             {
                 "ok": True,

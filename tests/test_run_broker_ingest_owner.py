@@ -196,6 +196,25 @@ def test_agents_endpoint_fail_closed_when_no_key(monkeypatch):
     assert status == 401
 
 
+def test_agents_endpoint_503_when_routing_query_raises(monkeypatch):
+    # Review NB2: a routing-query failure must 503, not ok:true empty.
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    def _boom(_oid):
+        raise RuntimeError("db down")
+
+    fake = types.SimpleNamespace(list_agents_for_owner=_boom)
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: fake)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "k")
+    monkeypatch.setenv("HERMES_INGEST_OWNER", OWNER)
+    app = create_run_broker_app(mark_seen=lambda _r: True, sandbox_available=lambda: True)
+    status, text = _req(app, "GET", AGENTS, headers=AUTH)
+    assert status == 503
+    assert json.loads(text)["ok"] is False
+
+
 def test_owner_filters_foreign_and_non_agent_rows(monkeypatch):
     # Prove ownership/kind filtering against a REALISTIC mixed routing result:
     # a foreign-owner agent, a non-agent (group) row, plus the owner's own.
