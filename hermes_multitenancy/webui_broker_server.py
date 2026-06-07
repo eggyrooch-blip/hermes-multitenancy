@@ -1138,6 +1138,29 @@ def create_run_broker_app(
                         raise
         return response
 
+    # Result cache for ingest idempotency (gap D): a duplicate submission
+    # returns the SAME result the first one produced, instead of an empty
+    # body. Bounded in-memory (TTL + cap), consistent with the broker's own
+    # in-memory dedup — survives within one broker process, not across.
+    _ingest_results: dict[str, str] = {}
+    _ingest_results_at: dict[str, float] = {}
+    _INGEST_RESULT_TTL = 3600.0
+    _INGEST_RESULT_CAP = 256
+
+    def _ingest_store_result(key: str, value: str) -> None:
+        now = time.time()
+        _ingest_results[key] = value
+        _ingest_results_at[key] = now
+        cutoff = now - _INGEST_RESULT_TTL
+        for k in [k for k, t in _ingest_results_at.items() if t < cutoff]:
+            _ingest_results.pop(k, None)
+            _ingest_results_at.pop(k, None)
+        if len(_ingest_results) > _INGEST_RESULT_CAP:
+            overflow = sorted(_ingest_results_at.items(), key=lambda kv: kv[1])
+            for k, _ in overflow[: len(_ingest_results) - _INGEST_RESULT_CAP]:
+                _ingest_results.pop(k, None)
+                _ingest_results_at.pop(k, None)
+
     async def handle_ingest(request):
         """Synchronous external-ingest entry.
 
@@ -1146,6 +1169,13 @@ def create_run_broker_app(
         ``HERMES_INGEST_PROFILE`` env var — the caller CANNOT choose the
         profile (any ``profile`` field in the body is ignored), so a leaked
         ``HERMES_INGEST_KEY`` can only ever run as that one bound identity.
+
+        Capability parity with the cron/WebUI run paths:
+        - host tools enabled by default (``requires_host_tools``, body-overridable)
+        - clarify/approval surfaced as a structured ``status`` instead of an
+          empty result
+        - optional ``model`` / ``metadata`` passthrough
+        - duplicate submissions return the original result
         See SPEC run-broker-ingest.
         """
         if not _ingest_authorized(request):
@@ -1183,6 +1213,20 @@ def create_run_broker_app(
         if skill:
             content = f"/{skill.lstrip('/')} {content}"
 
+        # Gap C — model / metadata passthrough (parity with cron). Identity is
+        # still server-bound; only run knobs are caller-tunable.
+        extra_meta = payload.get("metadata")
+        metadata: dict[str, Any] = {"source": "ingest"}
+        if isinstance(extra_meta, dict):
+            metadata.update(extra_meta)
+        model = str(payload.get("model") or "").strip()
+        if model:
+            metadata["model"] = model
+
+        # Gap A — host tools on by default (parity with cron/kanban), so
+        # credential-backed skills work. Caller may opt out.
+        requires_host_tools = bool(payload.get("requires_host_tools", True))
+
         try:
             run_request = RunRequest(
                 channel="webui",
@@ -1192,19 +1236,27 @@ def create_run_broker_app(
                 idempotency_key=str(payload.get("idempotency_key") or "").strip() or None,
                 delivery_mode="sync",
                 credential_subject=bound_profile,
-                metadata={"source": "ingest"},
+                requires_host_tools=requires_host_tools,
+                metadata=metadata,
             )
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
+        cache_key = run_request.effective_idempotency_key
         collected: list[str] = []
         error_text: dict[str, str] = {}
+        clarify_holder: dict[str, Any] = {}
+        approval_holder: dict[str, Any] = {}
 
         async def emit_event(event: RunEvent) -> None:
             if event.kind == "content" and event.text:
                 collected.append(event.text)
             elif event.kind == "error":
                 error_text["error"] = event.text or "agent error"
+            elif event.kind == "clarify_required" and "payload" not in clarify_holder:
+                clarify_holder["payload"] = event.payload or {}
+            elif event.kind == "approval_required" and "payload" not in approval_holder:
+                approval_holder["payload"] = event.payload or {}
 
         broker_dispatch = dispatch_agent or (
             lambda req: _default_dispatch_agent(req, emit_event=emit_event)
@@ -1231,13 +1283,48 @@ def create_run_broker_app(
             )
 
         text = "".join(collected).strip() or (result.content if result else "")
+
+        # Gap D — duplicate submission returns the original result, not empty.
+        if result is not None and result.duplicate:
+            cached = _ingest_results.get(cache_key)
+            if cached is not None:
+                return web.json_response(
+                    {"ok": True, "result": cached, "profile": bound_profile, "duplicate": True},
+                    status=200,
+                )
+            return web.json_response(
+                {"ok": False, "status": "duplicate_pending", "profile": bound_profile, "duplicate": True},
+                status=200,
+            )
+
+        # Gap B — surface clarify/approval as a clear status instead of a
+        # silent empty body, so the caller knows the run needs input.
+        if clarify_holder:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "needs_clarification",
+                    "clarify": clarify_holder["payload"],
+                    "result": text,
+                    "profile": bound_profile,
+                },
+                status=200,
+            )
+        if approval_holder:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "needs_approval",
+                    "approval": approval_holder["payload"],
+                    "result": text,
+                    "profile": bound_profile,
+                },
+                status=200,
+            )
+
+        _ingest_store_result(cache_key, text)
         return web.json_response(
-            {
-                "ok": True,
-                "result": text,
-                "profile": bound_profile,
-                "duplicate": bool(getattr(result, "duplicate", False)),
-            },
+            {"ok": True, "result": text, "profile": bound_profile, "duplicate": False},
             status=200,
         )
 

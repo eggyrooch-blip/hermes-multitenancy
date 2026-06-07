@@ -12,7 +12,15 @@ import json
 import pytest
 
 
-def _app(monkeypatch, *, ingest_key="testkey", ingest_profile="owner", seen=None):
+def _app(
+    monkeypatch,
+    *,
+    ingest_key="testkey",
+    ingest_profile="owner",
+    seen=None,
+    sandbox=True,
+    mark_seen=None,
+):
     """Build a broker app wired with a recording dispatch + env knobs."""
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
 
@@ -35,8 +43,8 @@ def _app(monkeypatch, *, ingest_key="testkey", ingest_profile="owner", seen=None
 
     app = create_run_broker_app(
         dispatch_agent=dispatch,
-        mark_seen=lambda _request: True,
-        sandbox_available=lambda: True,
+        mark_seen=mark_seen if mark_seen is not None else (lambda _request: True),
+        sandbox_available=lambda: sandbox,
     )
     return app, recorded
 
@@ -156,3 +164,137 @@ def test_ingest_skill_is_prepended_as_slash_command(monkeypatch):
     )
     assert status == 200
     assert seen[0].content.startswith("/keep-query ")
+
+
+# ── Gap A: host tools (parity with cron/kanban) ──────────────────────────
+
+def test_ingest_defaults_host_tools_true(monkeypatch):
+    app, seen = _app(monkeypatch)
+    status, _ = _post(
+        app, {"content": "hi"}, headers={"Authorization": "Bearer testkey"}
+    )
+    assert status == 200
+    assert seen[0].requires_host_tools is True
+
+
+def test_ingest_host_tools_default_requires_sandbox(monkeypatch):
+    # Default requires_host_tools=True → broker refuses without a sandbox.
+    app, seen = _app(monkeypatch, sandbox=False)
+    status, text = _post(
+        app, {"content": "hi"}, headers={"Authorization": "Bearer testkey"}
+    )
+    assert status == 403
+    assert json.loads(text)["ok"] is False
+    assert seen == []
+
+
+def test_ingest_host_tools_opt_out_runs_without_sandbox(monkeypatch):
+    app, seen = _app(monkeypatch, sandbox=False)
+    status, _ = _post(
+        app,
+        {"content": "hi", "requires_host_tools": False},
+        headers={"Authorization": "Bearer testkey"},
+    )
+    assert status == 200
+    assert seen[0].requires_host_tools is False
+
+
+# ── Gap C: model / metadata passthrough ──────────────────────────────────
+
+def test_ingest_model_passthrough(monkeypatch):
+    app, seen = _app(monkeypatch)
+    status, _ = _post(
+        app,
+        {"content": "hi", "model": "gpt-5.4", "metadata": {"trace": "t1"}},
+        headers={"Authorization": "Bearer testkey"},
+    )
+    assert status == 200
+    assert seen[0].metadata["model"] == "gpt-5.4"
+    assert seen[0].metadata["trace"] == "t1"
+    assert seen[0].metadata["source"] == "ingest"
+
+
+# ── Gap D: duplicate returns the original result ──────────────────────────
+
+def test_ingest_duplicate_returns_cached_result(monkeypatch):
+    calls = {"n": 0}
+
+    def mark_seen(_request):
+        calls["n"] += 1
+        return calls["n"] == 1  # first new, second is a duplicate
+
+    app, seen = _app(monkeypatch, mark_seen=mark_seen)
+    body = {"content": "summarize", "idempotency_key": "k1"}
+
+    # Both posts must share ONE event loop (the app binds to the first loop),
+    # so issue them inside a single runner against one client.
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r1 = await client.post(
+                "/api/run-broker/ingest", json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            b1 = await r1.text()
+            r2 = await client.post(
+                "/api/run-broker/ingest", json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            b2 = await r2.text()
+            return (r1.status, b1), (r2.status, b2)
+        finally:
+            await client.close()
+
+    (s1, t1), (s2, t2) = asyncio.run(runner())
+
+    assert s1 == 200 and json.loads(t1)["result"] == "echo:summarize"
+    d2 = json.loads(t2)
+    assert s2 == 200
+    assert d2["ok"] is True
+    assert d2["duplicate"] is True
+    assert d2["result"] == "echo:summarize"  # original result, not empty
+    assert len(seen) == 1  # agent ran only once
+
+
+# ── Gap B: clarify is surfaced (default-dispatch path) ────────────────────
+
+def test_ingest_surfaces_clarify_instead_of_empty(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "clarify_required", {"question": "哪个时间段？"}
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):
+        return ""  # nothing to add — the run is waiting on clarification
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    app = create_run_broker_app(
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    status, text = _post(
+        app,
+        {"content": "查数据", "requires_host_tools": False},
+        headers={"Authorization": "Bearer testkey"},
+    )
+    data = json.loads(text)
+    assert status == 200
+    assert data["ok"] is False
+    assert data["status"] == "needs_clarification"
+    assert "clarify" in data  # the question payload is surfaced, not swallowed
