@@ -1302,6 +1302,17 @@ def create_run_broker_app(
         if not _ingest_authorized(request):
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
 
+        owner = _ingest_owner()
+        default_profile = os.environ.get("HERMES_INGEST_PROFILE", "").strip()
+        # Review B2: in v1 mode (no owner), an unconfigured profile must 503
+        # immediately after auth — same precedence as before this feature,
+        # independent of body validity.
+        if not owner and not default_profile:
+            return web.json_response(
+                {"ok": False, "error": "ingest profile not configured"},
+                status=503,
+            )
+
         try:
             payload = await request.json()
         except Exception:
@@ -1319,31 +1330,17 @@ def create_run_broker_app(
                 {"ok": False, "error": "content is required"}, status=400
             )
 
-        # Identity resolution.
-        # - OWNER mode (HERMES_INGEST_OWNER set): the caller picks one of the
-        #   owner's own agents via ``agent``; the server validates ownership.
-        #   A leaked key can only reach THIS owner's agents — never another
-        #   owner's, never an arbitrary profile.
+        # Identity resolution (owner/default computed above, right after auth).
+        # - OWNER mode (HERMES_INGEST_OWNER set): the caller MUST name one of the
+        #   owner's own agents via ``agent``; the server validates ownership. No
+        #   fallback to an unvalidated HERMES_INGEST_PROFILE (review B1) — every
+        #   owner-mode run is ownership-checked, so a leaked key can only reach
+        #   THIS owner's agents, never another owner's, never an arbitrary profile.
         # - v1 mode (no owner): fixed HERMES_INGEST_PROFILE; ``agent``/``profile``
         #   in the body are ignored. Behavior is byte-for-byte unchanged.
-        owner = _ingest_owner()
-        default_profile = os.environ.get("HERMES_INGEST_PROFILE", "").strip()
         if owner:
             agent_str = str(payload.get("agent") or "").strip()
-            if agent_str:
-                bound_profile, available = _ingest_resolve_agent(owner, agent_str)
-                if not bound_profile:
-                    return web.json_response(
-                        {
-                            "ok": False,
-                            "error": "agent not found or not owned by this key's owner",
-                            "agents": available,
-                        },
-                        status=403,
-                    )
-            elif default_profile:
-                bound_profile = default_profile  # configured fallback agent/profile
-            else:
+            if not agent_str:
                 return web.json_response(
                     {
                         "ok": False,
@@ -1352,13 +1349,18 @@ def create_run_broker_app(
                     },
                     status=400,
                 )
-        else:
-            bound_profile = default_profile
+            bound_profile, available = _ingest_resolve_agent(owner, agent_str)
             if not bound_profile:
                 return web.json_response(
-                    {"ok": False, "error": "ingest profile not configured"},
-                    status=503,
+                    {
+                        "ok": False,
+                        "error": "agent not found or not owned by this key's owner",
+                        "agents": available,
+                    },
+                    status=403,
                 )
+        else:
+            bound_profile = default_profile  # guaranteed non-empty (checked after auth)
 
         # Optional skill: prepend a slash command so the broker's native
         # skill-slash rewriter (run_broker._rewrite_skill_slash_request)
@@ -1401,7 +1403,10 @@ def create_run_broker_app(
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-        cache_key = run_request.effective_idempotency_key
+        # Review B3: namespace the idempotency cache by the resolved profile so
+        # the same explicit idempotency_key used against two different owner
+        # agents can never replay the wrong agent's cached result.
+        cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
         collected: list[str] = []
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
@@ -1569,6 +1574,14 @@ def create_run_broker_app(
         if not owner:
             return web.json_response(
                 {"ok": False, "error": "owner mode not configured"}, status=503
+            )
+        # Review NB2: distinguish "routing unavailable" from "owner has no
+        # agents" — don't report ok:true with an empty list during an outage.
+        from . import router as router_mod
+
+        if router_mod._get_routing_table() is None:
+            return web.json_response(
+                {"ok": False, "error": "routing table unavailable"}, status=503
             )
         agents = _ingest_list_owner_agents(owner)
         return web.json_response(
