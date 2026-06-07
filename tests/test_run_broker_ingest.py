@@ -288,9 +288,11 @@ def test_ingest_surfaces_clarify_instead_of_empty(monkeypatch, tmp_path):
         mark_seen=lambda _request: True,
         sandbox_available=lambda: True,
     )
+    # interactive=true → streaming path with the clarify bridge wired and
+    # short-circuit on the event.
     status, text = _post(
         app,
-        {"content": "查数据", "requires_host_tools": False},
+        {"content": "查数据", "requires_host_tools": False, "interactive": True},
         headers={"Authorization": "Bearer testkey"},
     )
     data = json.loads(text)
@@ -298,3 +300,142 @@ def test_ingest_surfaces_clarify_instead_of_empty(monkeypatch, tmp_path):
     assert data["ok"] is False
     assert data["status"] == "needs_clarification"
     assert "clarify" in data  # the question payload is surfaced, not swallowed
+
+
+def test_ingest_surfaces_approval_in_interactive_mode(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        yield "approval_required", {"command": "rm -rf x", "description": "danger"}
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):
+        return ""
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    app = create_run_broker_app(
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    status, text = _post(
+        app,
+        {"content": "做点危险操作", "requires_host_tools": False, "interactive": True},
+        headers={"Authorization": "Bearer testkey"},
+    )
+    data = json.loads(text)
+    assert status == 200
+    assert data["ok"] is False
+    assert data["status"] == "needs_approval"
+    assert "approval" in data
+
+
+# ── Auth: master-key acceptance (review test gap) ────────────────────────
+
+def test_ingest_accepts_master_broker_key(monkeypatch):
+    # No dedicated ingest key; only the master broker key configured.
+    app, seen = _app(monkeypatch, ingest_key=None)
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "masterkey")
+    status, _ = _post(
+        app, {"content": "hi"}, headers={"Authorization": "Bearer masterkey"}
+    )
+    assert status == 200
+    assert seen[0].profile_name == "owner"
+
+
+# ── NB1: source provenance cannot be spoofed ─────────────────────────────
+
+def test_ingest_caller_cannot_override_source_marker(monkeypatch):
+    app, seen = _app(monkeypatch)
+    status, _ = _post(
+        app,
+        {"content": "hi", "metadata": {"source": "evil", "keep": "v"}},
+        headers={"Authorization": "Bearer testkey"},
+    )
+    assert status == 200
+    assert seen[0].metadata["source"] == "ingest"  # forced, not "evil"
+    assert seen[0].metadata["keep"] == "v"  # other caller metadata preserved
+
+
+# ── NB4: hard per-run timeout bounds the held connection ─────────────────
+
+def test_ingest_times_out_on_slow_run(monkeypatch):
+    monkeypatch.setenv("HERMES_INGEST_TIMEOUT", "0.2")
+
+    async def slow_dispatch(_request):
+        await asyncio.sleep(5)
+        return "too late"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    status, text = _post(
+        app, {"content": "hi"}, headers={"Authorization": "Bearer testkey"}
+    )
+    assert status == 504
+    assert json.loads(text)["status"] == "timeout"
+
+
+# ── NB2: stale cache entry is not returned ───────────────────────────────
+
+def test_ingest_duplicate_with_stale_cache_does_not_return_stale(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as mod
+
+    calls = {"n": 0}
+
+    def mark_seen(_request):
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    # Fake clock: first run stores at t=0; the duplicate lookup sees t well
+    # past the 3600s TTL, so the cached entry must be treated as expired.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mod.time, "time", lambda: clock["t"])
+
+    app, seen = _app(monkeypatch, mark_seen=mark_seen)
+    body = {"content": "summarize", "idempotency_key": "k1"}
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r1 = await client.post(
+                "/api/run-broker/ingest", json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            await r1.text()
+            clock["t"] += 4000.0  # advance past TTL (3600s)
+            r2 = await client.post(
+                "/api/run-broker/ingest", json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            return r2.status, await r2.text()
+        finally:
+            await client.close()
+
+    s2, t2 = asyncio.run(runner())
+    d2 = json.loads(t2)
+    assert s2 == 200
+    assert d2["ok"] is False
+    assert d2["status"] == "duplicate_pending"  # stale entry not served

@@ -285,6 +285,21 @@ def _ingest_authorized(request: Any) -> bool:
     return False
 
 
+def _ingest_timeout() -> float:
+    """Hard wall-clock cap (seconds) for a synchronous ingest run.
+
+    Bounds the held HTTP connection so a stuck agent / blocked interaction
+    bridge can never hang the caller forever. Default 180s; override via
+    ``HERMES_INGEST_TIMEOUT``.
+    """
+    raw = os.getenv("HERMES_INGEST_TIMEOUT", "180")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 180.0
+    return value if value > 0 else 180.0
+
+
 async def _read_capped_body(request: Any, cap: int) -> Optional[bytes]:
     """Read the request body incrementally, returning None if it exceeds ``cap``.
 
@@ -1161,6 +1176,18 @@ def create_run_broker_app(
                 _ingest_results.pop(k, None)
                 _ingest_results_at.pop(k, None)
 
+    def _ingest_get_result(key: str) -> Optional[str]:
+        # Review NB2: validate TTL on READ, not only on write — never hand back
+        # a stale cached answer just because no later write has pruned it yet.
+        ts = _ingest_results_at.get(key)
+        if ts is None:
+            return None
+        if time.time() - ts > _INGEST_RESULT_TTL:
+            _ingest_results.pop(key, None)
+            _ingest_results_at.pop(key, None)
+            return None
+        return _ingest_results.get(key)
+
     async def handle_ingest(request):
         """Synchronous external-ingest entry.
 
@@ -1170,12 +1197,21 @@ def create_run_broker_app(
         profile (any ``profile`` field in the body is ignored), so a leaked
         ``HERMES_INGEST_KEY`` can only ever run as that one bound identity.
 
-        Capability parity with the cron/WebUI run paths:
-        - host tools enabled by default (``requires_host_tools``, body-overridable)
-        - clarify/approval surfaced as a structured ``status`` instead of an
-          empty result
-        - optional ``model`` / ``metadata`` passthrough
-        - duplicate submissions return the original result
+        Interaction model (machine API — there is no human to answer):
+        - default (``interactive`` false) — NON-INTERACTIVE one-shot dispatch
+          with NO clarify/approval bridge wired (the bridges are only attached
+          on the streaming path), so the agent can never block waiting on a
+          human; it proceeds with best judgement and returns.
+        - ``interactive`` true — streaming dispatch WITH the bridges, but the
+          handler short-circuits on the first clarify/approval event: it
+          cancels the run and returns ``needs_clarification`` / ``needs_approval``
+          immediately instead of letting the bridge block up to its timeout.
+
+        A hard ``HERMES_INGEST_TIMEOUT`` (default 180s) bounds either path.
+
+        Capability parity with the cron/WebUI run paths: host tools on by
+        default (``requires_host_tools``); ``model`` / ``metadata`` passthrough;
+        duplicate submissions return the original result.
         See SPEC run-broker-ingest.
         """
         if not _ingest_authorized(request):
@@ -1190,9 +1226,9 @@ def create_run_broker_app(
 
         try:
             payload = await request.json()
-        except Exception as exc:
+        except Exception:
             return web.json_response(
-                {"ok": False, "error": f"invalid json: {exc}"}, status=400
+                {"ok": False, "error": "invalid json"}, status=400
             )
         if not isinstance(payload, dict):
             return web.json_response(
@@ -1214,18 +1250,22 @@ def create_run_broker_app(
             content = f"/{skill.lstrip('/')} {content}"
 
         # Gap C — model / metadata passthrough (parity with cron). Identity is
-        # still server-bound; only run knobs are caller-tunable.
+        # still server-bound; only run knobs are caller-tunable. Review NB1:
+        # caller metadata is applied FIRST, then ``source`` is forced, so a
+        # caller can never spoof the ingest provenance marker.
+        metadata: dict[str, Any] = {}
         extra_meta = payload.get("metadata")
-        metadata: dict[str, Any] = {"source": "ingest"}
         if isinstance(extra_meta, dict):
             metadata.update(extra_meta)
         model = str(payload.get("model") or "").strip()
         if model:
             metadata["model"] = model
+        metadata["source"] = "ingest"
 
         # Gap A — host tools on by default (parity with cron/kanban), so
         # credential-backed skills work. Caller may opt out.
         requires_host_tools = bool(payload.get("requires_host_tools", True))
+        interactive = bool(payload.get("interactive", False))
 
         try:
             run_request = RunRequest(
@@ -1247,6 +1287,7 @@ def create_run_broker_app(
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
         approval_holder: dict[str, Any] = {}
+        interrupt = asyncio.Event()
 
         async def emit_event(event: RunEvent) -> None:
             if event.kind == "content" and event.text:
@@ -1255,30 +1296,86 @@ def create_run_broker_app(
                 error_text["error"] = event.text or "agent error"
             elif event.kind == "clarify_required" and "payload" not in clarify_holder:
                 clarify_holder["payload"] = event.payload or {}
+                interrupt.set()
             elif event.kind == "approval_required" and "payload" not in approval_holder:
                 approval_holder["payload"] = event.payload or {}
+                interrupt.set()
 
+        # NON-INTERACTIVE (default): one-shot dispatch with NO event sink, so
+        # agent_real wires neither the clarify nor the approval bridge (both
+        # require an event_sink) — the run cannot block on a human.
+        # INTERACTIVE: streaming dispatch with the sink so clarify/approval
+        # events are emitted and we can short-circuit on them.
+        sink = emit_event if interactive else None
         broker_dispatch = dispatch_agent or (
-            lambda req: _default_dispatch_agent(req, emit_event=emit_event)
+            lambda req: _default_dispatch_agent(req, emit_event=sink)
         )
         broker = RunBroker(
             dispatch_agent=broker_dispatch,
-            emit_event=emit_event,
+            emit_event=sink,
             mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
         )
 
+        timeout_s = _ingest_timeout()
+
+        # Review BLOCKING fix + NB4: every path is bounded by a hard timeout,
+        # and interactive runs are abandoned the instant a human-input event
+        # appears so the synchronous connection never waits on the bridge.
+        result = None
         try:
-            result = await broker.run(run_request)
+            if interactive:
+                run_task = asyncio.ensure_future(broker.run(run_request))
+                interrupt_task = asyncio.ensure_future(interrupt.wait())
+                done, _pending = await asyncio.wait(
+                    {run_task, interrupt_task},
+                    timeout=timeout_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:  # hard timeout
+                    run_task.cancel()
+                    interrupt_task.cancel()
+                    logger.warning("[multitenancy] ingest run timed out after %ss", timeout_s)
+                    return web.json_response(
+                        {"ok": False, "status": "timeout", "profile": bound_profile},
+                        status=504,
+                    )
+                if interrupt.is_set() and not run_task.done():
+                    # Human-input needed: abandon the (bridge-blocked) run and
+                    # surface the request immediately. The orphaned child run
+                    # self-resolves at its own bridge timeout.
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except BaseException:
+                        pass
+                    interrupt_task.cancel()
+                else:
+                    interrupt_task.cancel()
+                    result = run_task.result()
+            else:
+                result = await asyncio.wait_for(broker.run(run_request), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning("[multitenancy] ingest run timed out after %ss", timeout_s)
+            return web.json_response(
+                {"ok": False, "status": "timeout", "profile": bound_profile},
+                status=504,
+            )
         except RunRejected as exc:
+            # Policy rejection text is safe-ish, but keep it short.
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
-        except Exception as exc:
+        except Exception:
+            # Review NB3: do not leak internal exception text to an
+            # internet-facing caller — log server-side, return generic.
             logger.exception("[multitenancy] ingest run failed")
-            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+            return web.json_response(
+                {"ok": False, "error": "internal error"}, status=500
+            )
 
         if error_text.get("error"):
+            logger.error("[multitenancy] ingest agent error: %s", error_text["error"])
             return web.json_response(
-                {"ok": False, "error": error_text["error"], "profile": bound_profile},
+                {"ok": False, "error": "agent run failed", "profile": bound_profile},
                 status=500,
             )
 
@@ -1286,7 +1383,7 @@ def create_run_broker_app(
 
         # Gap D — duplicate submission returns the original result, not empty.
         if result is not None and result.duplicate:
-            cached = _ingest_results.get(cache_key)
+            cached = _ingest_get_result(cache_key)
             if cached is not None:
                 return web.json_response(
                     {"ok": True, "result": cached, "profile": bound_profile, "duplicate": True},
