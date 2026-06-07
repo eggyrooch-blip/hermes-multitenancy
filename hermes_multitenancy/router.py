@@ -689,7 +689,7 @@ async def _deliver_media_from_stream_response(
 ) -> None:
     """Delegate post-stream media attachment delivery to Hermes' native gateway path."""
     response = _materialize_response_artifacts(response, profile_home)
-    response_with_remote_images = _append_remote_image_media_directives(response, profile_home)
+    response_with_remote_images = await _append_remote_image_media_directives_async(response, profile_home)
     response_with_files = _append_profile_file_media_directives(response_with_remote_images, profile_home)
     scoped_response = _profile_scoped_media_response(response_with_files, profile_home)
     if "MEDIA:" not in scoped_response:
@@ -928,6 +928,15 @@ def _append_remote_image_media_directives(response: str, profile_home: Path) -> 
     return f"{text.rstrip()}\n" + "\n".join(additions)
 
 
+async def _append_remote_image_media_directives_async(response: str, profile_home: Path) -> str:
+    """Async wrapper for remote image materialization.
+
+    DNS and HTTP reads are blocking in the sync materializer. Keep those calls
+    off the gateway event loop so Feishu/WebUI streaming stays responsive.
+    """
+    return await asyncio.to_thread(_append_remote_image_media_directives, response, profile_home)
+
+
 def _materialize_remote_image_url(url: str, profile_home: Path) -> Optional[Path]:
     parsed = urllib.parse.urlparse(url)
     if not _is_public_remote_image_url(parsed):
@@ -955,6 +964,14 @@ def _materialize_remote_image_url(url: str, profile_home: Path) -> Optional[Path
                     "multitenancy: blocked remote image redirect host=%s final_host=%s",
                     parsed.hostname or "",
                     final_parsed.hostname or "",
+                )
+                return None
+            peer_ip = _remote_image_response_peer_ip(response)
+            if not peer_ip or not _is_global_ip_address(peer_ip):
+                logger.warning(
+                    "multitenancy: blocked remote image peer host=%s peer_ip=%s",
+                    final_parsed.hostname or parsed.hostname or "",
+                    peer_ip or "",
                 )
                 return None
             headers = getattr(response, "headers", {}) or {}
@@ -1037,13 +1054,51 @@ def _is_public_remote_image_url(parsed: urllib.parse.ParseResult) -> bool:
         sockaddr = address[4]
         if not sockaddr:
             return False
-        try:
-            ip = ipaddress.ip_address(sockaddr[0])
-        except ValueError:
-            return False
-        if not ip.is_global:
+        if not _is_global_ip_address(str(sockaddr[0])):
             return False
     return True
+
+
+def _is_global_ip_address(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+def _remote_image_response_peer_ip(response: Any) -> Optional[str]:
+    explicit = str(getattr(response, "_hermes_peer_ip", "") or "").strip()
+    if explicit:
+        return explicit
+    seen: set[int] = set()
+    pending: list[Any] = [response]
+    for _ in range(32):
+        if not pending:
+            break
+        obj = pending.pop(0)
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        getpeername = getattr(obj, "getpeername", None)
+        if callable(getpeername):
+            try:
+                peer = getpeername()
+            except OSError:
+                peer = None
+            if peer:
+                return str(peer[0])
+        for attr in ("fp", "raw", "_fp", "_sock", "sock"):
+            try:
+                child = getattr(obj, attr)
+            except Exception:
+                continue
+            if child is not None and id(child) not in seen:
+                pending.append(child)
+    return None
 
 
 def _remote_image_extension_from_url(parsed: urllib.parse.ParseResult) -> Optional[str]:
@@ -1287,10 +1342,19 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
     return _MEDIA_DIRECTIVE_RE.sub(repl, str(response or ""))
 
 
-def _webui_profile_scoped_media_response(response: str, profile_home: Path) -> str:
+def _webui_profile_scoped_media_response(
+    response: str,
+    profile_home: Path,
+    *,
+    materialize_remote_images: bool = True,
+) -> str:
     """Scope outbound MEDIA and expose workspace files through browser-safe aliases."""
     root = profile_home.expanduser().resolve(strict=False)
-    response_with_remote_images = _append_remote_image_media_directives(response, root)
+    response_with_remote_images = (
+        _append_remote_image_media_directives(response, root)
+        if materialize_remote_images
+        else str(response or "")
+    )
     scoped = _profile_scoped_media_response(response_with_remote_images, root)
 
     def repl(match: re.Match[str]) -> str:

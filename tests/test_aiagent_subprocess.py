@@ -680,6 +680,18 @@ def test_vod_model_override_env_is_scoped_to_one_aiagent_run(monkeypatch):
     assert os.environ["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gem-3.1"
 
 
+def test_build_subprocess_env_forwards_vod_model_override(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    approval_dir = tmp_path / "approvals"
+    monkeypatch.setenv("HERMES_VOD_IMAGE_MODEL_OVERRIDE", "gpt-image2-high")
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gpt-image2-high"
+
+
 def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
     from hermes_multitenancy import agent_real
 

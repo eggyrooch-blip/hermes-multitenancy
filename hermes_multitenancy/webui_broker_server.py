@@ -1092,7 +1092,11 @@ async def _default_dispatch_agent(
                 continue
 
         if pending_media_text:
-            text = router_mod._webui_profile_scoped_media_response(pending_media_text, profile_home)
+            text = await asyncio.to_thread(
+                router_mod._webui_profile_scoped_media_response,
+                pending_media_text,
+                profile_home,
+            )
             if text:
                 content_parts.append(text)
                 await emitter.emit(
@@ -1104,7 +1108,7 @@ async def _default_dispatch_agent(
                 )
 
         if "".join(content_parts).strip():
-            remote_media_text = _webui_streamed_remote_media_additions(
+            remote_media_text = await _webui_streamed_remote_media_additions(
                 "".join(content_parts),
                 router_mod=router_mod,
                 profile_home=profile_home,
@@ -1123,7 +1127,11 @@ async def _default_dispatch_agent(
             return ""
         # Nothing streamed — fall back to one-shot; RunBroker emits it once.
         fallback_text = await real_run_agent(event, profile_home, messages=messages)
-        return router_mod._webui_profile_scoped_media_response(fallback_text, profile_home)
+        return await asyncio.to_thread(
+            router_mod._webui_profile_scoped_media_response,
+            fallback_text,
+            profile_home,
+        )
     finally:
         _PROFILE_HOME_VAR.reset(token)
 
@@ -1133,25 +1141,29 @@ def _webui_streamable_media_text(text: str, *, router_mod, profile_home: Path) -
     raw = str(text or "")
     marker_index = raw.rfind("MEDIA:")
     if marker_index < 0:
-        return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home)]
+        return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home, materialize_remote_images=False)]
 
     newline_after_marker = raw.find("\n", marker_index)
     if newline_after_marker < 0:
         prefix = raw[:marker_index]
         pending = raw[marker_index:]
-        items = [router_mod._webui_profile_scoped_media_response(prefix, profile_home)] if prefix else []
+        items = (
+            [router_mod._webui_profile_scoped_media_response(prefix, profile_home, materialize_remote_images=False)]
+            if prefix
+            else []
+        )
         return pending, items
 
-    return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home)]
+    return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home, materialize_remote_images=False)]
 
 
-def _webui_streamed_remote_media_additions(text: str, *, router_mod, profile_home: Path) -> str:
+async def _webui_streamed_remote_media_additions(text: str, *, router_mod, profile_home: Path) -> str:
     """Return only extra MEDIA aliases discovered after streamed chunks are joined."""
     raw = str(text or "")
     if "http" not in raw.lower() or "![" not in raw:
         return ""
     existing = {line.strip() for line in raw.splitlines() if line.strip().startswith("MEDIA:")}
-    scoped = router_mod._webui_profile_scoped_media_response(raw, profile_home)
+    scoped = await asyncio.to_thread(router_mod._webui_profile_scoped_media_response, raw, profile_home)
     additions: list[str] = []
     for line in scoped.splitlines():
         cleaned = line.strip()

@@ -2599,6 +2599,7 @@ def test_post_stream_media_delivery_sends_public_markdown_image_url(tmp_path, mo
     calls = []
 
     class FakeHTTPResponse:
+        _hermes_peer_ip = "93.184.216.34"
         headers = {
             "Content-Type": "image/jpeg",
             "Content-Length": str(len(payload)),
@@ -2657,6 +2658,53 @@ def test_post_stream_media_delivery_sends_public_markdown_image_url(tmp_path, mo
     }
 
 
+def test_post_stream_remote_image_materialization_runs_off_event_loop(tmp_path, monkeypatch):
+    """Blocking remote image materialization must not run on the gateway loop thread."""
+    import threading
+
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    event = _build_event(chat_id="oc_chat")
+    loop_thread = threading.get_ident()
+    materialize_threads: list[int] = []
+
+    def fake_materialize(url: str, materialize_profile_home: Path):
+        assert url == "https://cdn.example.com/path/aigcImageGenFile.jpg"
+        assert materialize_profile_home == profile_home
+        materialize_threads.append(threading.get_ident())
+        target = profile_home / "workspace" / "Downloads" / "remote-images" / "poster.jpg"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"jpeg")
+        return target
+
+    class Adapter:
+        def __init__(self):
+            self.images = []
+
+        async def send_image_file(self, **kwargs):
+            self.images.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(router_mod, "_materialize_remote_image_url", fake_materialize)
+    adapter = Adapter()
+
+    asyncio.run(
+        router_mod._deliver_media_from_stream_response(
+            SimpleNamespace(),
+            "海报生成成功\n![未来城市夜景海报](https://cdn.example.com/path/aigcImageGenFile.jpg)",
+            event,
+            adapter,
+            profile_home,
+        )
+    )
+
+    assert materialize_threads
+    assert all(thread_id != loop_thread for thread_id in materialize_threads)
+    assert len(adapter.images) == 1
+
+
 def test_post_stream_media_delivery_rejects_private_markdown_image_url(tmp_path, monkeypatch):
     """Remote image delivery must not turn model output into an SSRF fetch."""
     import socket
@@ -2701,6 +2749,66 @@ def test_post_stream_media_delivery_rejects_private_markdown_image_url(tmp_path,
     assert not (profile_home / "workspace" / "Downloads" / "remote-images").exists()
 
 
+def test_post_stream_media_delivery_rejects_rebound_private_peer_ip(tmp_path, monkeypatch):
+    """A host that resolves public but connects private must not be fetched as media."""
+    import socket
+    import urllib.request
+
+    from hermes_multitenancy import router as router_mod
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    event = _build_event(chat_id="oc_chat")
+
+    class FakeHTTPResponse:
+        _hermes_peer_ip = "127.0.0.1"
+        headers = {
+            "Content-Type": "image/jpeg",
+            "Content-Length": "4",
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size=-1):  # pragma: no cover - peer check should stop first
+            raise AssertionError("private peer response body should not be read")
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "rebind.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    def fake_urlopen(request, timeout=0):
+        return FakeHTTPResponse()
+
+    class Adapter:
+        def __init__(self):
+            self.images = []
+
+        async def send_image_file(self, **kwargs):
+            self.images.append(kwargs)
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    adapter = Adapter()
+
+    asyncio.run(
+        router_mod._deliver_media_from_stream_response(
+            SimpleNamespace(),
+            "海报生成成功\n![未来城市夜景海报](http://rebind.example.com/path/aigcImageGenFile.jpg)",
+            event,
+            adapter,
+            profile_home,
+        )
+    )
+
+    assert adapter.images == []
+    assert not (profile_home / "workspace" / "Downloads" / "remote-images").exists()
+
+
 def test_webui_profile_scoped_media_response_materializes_public_markdown_image_url(tmp_path, monkeypatch):
     """WebUI should receive profile workspace media instead of relying on remote image markdown."""
     import socket
@@ -2713,6 +2821,7 @@ def test_webui_profile_scoped_media_response_materializes_public_markdown_image_
     payload = b"\x89PNG\r\n\x1a\nfake-remote-png"
 
     class FakeHTTPResponse:
+        _hermes_peer_ip = "93.184.216.34"
         headers = {
             "Content-Type": "image/png",
             "Content-Length": str(len(payload)),

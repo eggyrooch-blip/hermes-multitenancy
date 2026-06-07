@@ -7,6 +7,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -802,6 +803,7 @@ def test_webui_run_broker_materializes_split_remote_markdown_image(monkeypatch, 
     payload = b"\xff\xd8\xff\xe0fake-remote-jpeg"
 
     class FakeHTTPResponse:
+        _hermes_peer_ip = "93.184.216.34"
         headers = {
             "Content-Type": "image/jpeg",
             "Content-Length": str(len(payload)),
@@ -870,6 +872,35 @@ def test_webui_run_broker_materializes_split_remote_markdown_image(monkeypatch, 
         assert image_files[0].read_bytes() == payload
 
     asyncio.run(runner())
+
+
+def test_webui_streamed_remote_media_additions_runs_scoping_off_event_loop(tmp_path: Path):
+    import threading
+
+    from hermes_multitenancy import webui_broker_server as server
+
+    loop_thread = threading.get_ident()
+    scoped_threads: list[int] = []
+
+    def fake_scoped_response(raw: str, profile_home: Path):
+        assert raw == "生成完成\n![poster](https://cdn.example.com/poster.jpg)"
+        assert profile_home == tmp_path
+        scoped_threads.append(threading.get_ident())
+        return f"{raw}\nMEDIA:/workspace/Downloads/remote-images/poster.jpg"
+
+    router_mod = SimpleNamespace(_webui_profile_scoped_media_response=fake_scoped_response)
+
+    result = asyncio.run(
+        server._webui_streamed_remote_media_additions(
+            "生成完成\n![poster](https://cdn.example.com/poster.jpg)",
+            router_mod=router_mod,
+            profile_home=tmp_path,
+        )
+    )
+
+    assert result == "MEDIA:/workspace/Downloads/remote-images/poster.jpg"
+    assert scoped_threads
+    assert all(thread_id != loop_thread for thread_id in scoped_threads)
 
 
 def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_path: Path):
