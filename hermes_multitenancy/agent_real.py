@@ -1838,6 +1838,25 @@ def _apply_vod_image_model_override_for_aiagent(user_text: str):
     return _cleanup
 
 
+def _register_aiagent_process_image_gen_providers() -> None:
+    """Register multitenancy image providers inside routed AIAgent children."""
+
+    class _ImageGenRegistryContext:
+        def register_image_gen_provider(self, provider: Any) -> None:
+            from agent.image_gen_registry import register_provider
+
+            register_provider(provider)
+
+    try:
+        from .tencent_vod_image_gen import register_vod_image_gen_provider
+
+        registered = register_vod_image_gen_provider(_ImageGenRegistryContext())
+        if registered:
+            logger.info("[multitenancy] registered AIAgent image_gen provider: tencent-vod")
+    except Exception:
+        logger.debug("[multitenancy] AIAgent image_gen provider registration skipped", exc_info=True)
+
+
 def _install_skill_runtime_compat(profile_home: Path) -> None:
     """Install profile-scoped skill template compatibility in the AIAgent child.
 
@@ -3610,6 +3629,7 @@ def _run_with_aiagent(
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
         try:
+            _register_aiagent_process_image_gen_providers()
             agent = AIAgent(**agent_kwargs)
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,

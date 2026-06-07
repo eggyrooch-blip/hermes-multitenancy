@@ -1805,6 +1805,53 @@ def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_
     assert seen["cleanup"] is True
 
 
+def test_run_with_aiagent_registers_vod_provider_in_child_process(monkeypatch, tmp_path: Path):
+    """Routed AIAgent subprocesses do not go through the Hermes plugin loader."""
+    from agent.image_gen_registry import _reset_for_tests, get_provider
+    from hermes_multitenancy import agent_real
+
+    _reset_for_tests()
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "image_gen:\n  provider: tencent-vod\n  model: gem-3.1\n"
+        "platform_toolsets:\n  webui:\n  - image_gen\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            provider = get_provider("tencent-vod")
+            seen["provider_name_at_init"] = getattr(provider, "name", None)
+
+        def run_conversation(self, user_message, task_id, conversation_history=None):
+            provider = get_provider("tencent-vod")
+            seen["provider_name_at_run"] = getattr(provider, "name", None)
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    try:
+        assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+        assert seen == {
+            "provider_name_at_init": "tencent-vod",
+            "provider_name_at_run": "tencent-vod",
+        }
+    finally:
+        _reset_for_tests()
+
+
 def test_run_with_aiagent_passes_router_history_without_current_user(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
