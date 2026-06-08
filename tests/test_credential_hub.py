@@ -113,26 +113,106 @@ def test_kep_cli_unknown_when_token_present_no_live(monkeypatch, tmp_path):
     assert row.status == "unknown"
 
 
-def test_kep_cli_authenticated_via_live_status(monkeypatch, tmp_path):
-    from hermes_multitenancy import credential_hub
+def _make_jwt(exp: int) -> str:
+    """Build an unsigned-payload JWT carrying ``exp`` (epoch seconds)."""
+    import base64 as _b64
+    import json as _json
 
-    bin_path = tmp_path / "bin" / "kep-auth"
-    bin_path.parent.mkdir(parents=True)
-    bin_path.write_text("#!/bin/sh\n")
-    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(bin_path))
+    def _seg(d: dict) -> str:
+        return _b64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
 
-    class _Proc:
+    return f"{_seg({'alg': 'HS256'})}.{_seg({'exp': exp})}.sig"
+
+
+def _kep_run_stub(*, status_out: str, token_out: str, token_rc: int = 0):
+    """A _run replacement that answers the `status` and `token` kep-auth calls."""
+    class _StatusProc:
         returncode = 0
-        stdout = "state: valid\noperator: owner <owner@keep.com>\n"
+        stdout = status_out
         stderr = ""
 
-    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    class _TokenProc:
+        returncode = token_rc
+        stdout = token_out
+        stderr = ""
+
+    def _run(cmd, *a, **k):
+        return _TokenProc() if "token" in cmd else _StatusProc()
+
+    return _run
+
+
+def _kep_bin(monkeypatch, tmp_path):
+    bin_path = tmp_path / "bin" / "kep-auth"
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+    bin_path.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(bin_path))
+    return bin_path
+
+
+def test_decode_jwt_exp_ms():
+    from hermes_multitenancy import credential_hub
+
+    assert credential_hub._decode_jwt_exp_ms(_make_jwt(1781058668)) == 1781058668000
+    assert credential_hub._decode_jwt_exp_ms("not.a.jwt") is None
+    assert credential_hub._decode_jwt_exp_ms("a.b") is None
+    assert credential_hub._decode_jwt_exp_ms("") is None
+    # payload without exp claim
+    import base64 as _b64, json as _json
+    noexp = "h." + _b64.urlsafe_b64encode(_json.dumps({"name": "x"}).encode()).rstrip(b"=").decode() + ".s"
+    assert credential_hub._decode_jwt_exp_ms(noexp) is None
+
+
+def test_kep_cli_authenticated_when_token_live(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600  # +1h
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
     row = credential_hub.kep_cli_status(
         profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
         shared_home=tmp_path, installed=True,
     )
     assert row.status == "authenticated"
     assert row.account_hint == "owner"
+    assert row.expires_at == future * 1000
+
+
+def test_kep_cli_needs_auth_when_token_expired(monkeypatch, tmp_path):
+    """The core bug: kep-auth status says valid but the token is server-stale."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    past = int(credential_hub._now_ms() / 1000) - 3600  # expired 1h ago
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(past) + "\n",
+    ))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "needs_auth"
+    assert row.expires_at == past * 1000
+
+
+def test_kep_cli_unknown_when_token_undecodable(monkeypatch, tmp_path):
+    """status valid but token can't be fetched/decoded → don't claim authenticated."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out="", token_rc=1,
+    ))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "unknown"
 
 
 # -- feishu-project reader ---------------------------------------------------

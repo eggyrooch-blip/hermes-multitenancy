@@ -28,6 +28,7 @@ WebUI — so this module is safe to call anywhere the run-broker runs.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -583,6 +584,45 @@ def _kep_auth_bin(shared_home: Path) -> str:
     return str(Path(shared_home) / "bin" / "kep-auth")
 
 
+def _decode_jwt_exp_ms(token: str) -> Optional[int]:
+    """Decode a JWT's ``exp`` claim to epoch-ms, or None if undecodable.
+
+    kep-cli tokens are HS256 JWTs carrying ``exp`` (48h TTL). ``kep-auth status``
+    reports ``state: valid`` from a LOCAL check only — it does not know the real
+    server-side expiry (it prints ``expires: 0``). So we decode the token's own
+    ``exp`` here to tell a live token from a stale one. Signature is NOT verified
+    (the backend owns trust); we only read the unauthenticated expiry hint.
+    """
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)  # restore base64url padding
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    return _normalize_epoch_ms(claims.get("exp"))
+
+
+def _kep_token_exp_ms(
+    bin_path: str, *, profile_name: str, env: dict[str, str], cwd: Path
+) -> Optional[int]:
+    """Run ``kep-auth token`` and return the token's ``exp`` in epoch-ms.
+
+    Returns None when the token cannot be fetched or decoded — callers treat
+    None as "expiry unknown" (conservative: do NOT claim authenticated).
+    """
+    proc = _run([bin_path, "--profile", profile_name, "--env", "online", "token"], cwd=cwd, env=env)
+    if proc is None or proc.returncode != 0:
+        return None
+    return _decode_jwt_exp_ms((proc.stdout or "").strip().splitlines()[0] if proc.stdout else "")
+
+
 def kep_cli_status(
     *,
     profile_dir: Path,
@@ -632,9 +672,27 @@ def kep_cli_status(
                 live = "not_logged_in"
 
     if live == "logged_in":
-        row.status, row.account_hint = S_AUTHENTICATED, account
-        row.detail = "kep-auth 已验证该 profile 登录。"
-        row.action["label"] = "重新认证"
+        # kep-auth status only does a LOCAL check (expires:0) — blind to a
+        # server-side-expired token. Decode the token's own exp to tell live
+        # from stale, so a stale token correctly collapses to needs_auth and
+        # the /auth card re-surfaces the re-login button.
+        row.account_hint = account
+        exp_ms = _kep_token_exp_ms(bin_path, profile_name=profile_name, env=env, cwd=profile_dir)
+        if exp_ms is not None:
+            row.expires_at = exp_ms
+        if exp_ms is not None and exp_ms <= _now_ms():
+            row.status = S_NEEDS_AUTH
+            row.detail = "kep-cli 登录已过期，请重新认证。"
+        elif exp_ms is None:
+            # Token unreadable/undecodable → cannot confirm validity. Do NOT
+            # claim authenticated (that's the false-positive that traps users).
+            row.status = S_UNKNOWN
+            row.detail = "kep-cli 凭证存在，但无法确认有效期，建议重新认证。"
+            row.action["label"] = "重新认证"
+        else:
+            row.status = S_AUTHENTICATED
+            row.detail = "kep-auth 已验证该 profile 登录。"
+            row.action["label"] = "重新认证"
     elif live == "not_logged_in":
         row.status = S_NEEDS_AUTH
         row.detail = "kep-auth 报告该 profile 未登录。"
