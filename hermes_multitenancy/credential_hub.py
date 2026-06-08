@@ -620,7 +620,14 @@ def _kep_token_exp_ms(
     proc = _run([bin_path, "--profile", profile_name, "--env", "online", "token"], cwd=cwd, env=env)
     if proc is None or proc.returncode != 0:
         return None
-    return _decode_jwt_exp_ms((proc.stdout or "").strip().splitlines()[0] if proc.stdout else "")
+    # Scan for a JWT-shaped line rather than assuming line 0 is the token:
+    # tolerates banners/warnings on stdout and whitespace-only output (no
+    # IndexError). Returns the first decodable exp.
+    for line in (proc.stdout or "").splitlines():
+        exp = _decode_jwt_exp_ms(line.strip())
+        if exp is not None:
+            return exp
+    return None
 
 
 def kep_cli_status(
@@ -683,9 +690,18 @@ def kep_cli_status(
         if exp_ms is not None and exp_ms <= _now_ms():
             row.status = S_NEEDS_AUTH
             row.detail = "kep-cli 登录已过期，请重新认证。"
+            row.action["label"] = "重新认证"
         elif exp_ms is None:
             # Token unreadable/undecodable → cannot confirm validity. Do NOT
             # claim authenticated (that's the false-positive that traps users).
+            # WARN (not debug): status said valid but the token won't decode —
+            # an anomaly. If this fires fleet-wide it signals a token-format
+            # change, not one stale profile; that distinction is worth a signal.
+            logger.warning(
+                "credential_hub: kep-cli status=valid but token undecodable for profile %r — "
+                "treating as needs re-auth (fleet-wide occurrence may indicate a token-format change)",
+                profile_name,
+            )
             row.status = S_UNKNOWN
             row.detail = "kep-cli 凭证存在，但无法确认有效期，建议重新认证。"
             row.action["label"] = "重新认证"

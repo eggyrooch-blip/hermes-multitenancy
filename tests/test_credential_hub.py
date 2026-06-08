@@ -215,6 +215,40 @@ def test_kep_cli_unknown_when_token_undecodable(monkeypatch, tmp_path):
     assert row.status == "unknown"
 
 
+def test_kep_cli_token_whitespace_only_no_crash(monkeypatch, tmp_path):
+    """rc=0 but whitespace-only stdout must not raise IndexError → unknown."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out="   \n\n", token_rc=0,
+    ))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "unknown"
+
+
+def test_kep_cli_token_with_banner_lines(monkeypatch, tmp_path):
+    """A JWT preceded by banner/warning lines is still found and decoded."""
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=f"WARNING: using cached key\n{_make_jwt(future)}\n",
+    ))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        shared_home=tmp_path, installed=True,
+    )
+    assert row.status == "authenticated"
+    assert row.expires_at == future * 1000
+
+
 # -- feishu-project reader ---------------------------------------------------
 
 
