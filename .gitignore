@@ -30,3 +30,7 @@ Thumbs.db
 .idea/
 *.swp
 .ace-tool/
+
+# ftask: per-slug runtime files (env + sim artifacts) — never committed
+.ftask/*/.env
+.ftask/*/sim_artifacts/
