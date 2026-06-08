@@ -9,6 +9,7 @@ import re
 import tempfile
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -704,6 +705,25 @@ def _raise_if_detail_failed(detail: dict[str, Any]) -> None:
         raise TencentVODProviderError(_detail_error_message(detail))
 
 
+# Tencent CDN hosts that serve every object over TLS. VOD returns plaintext
+# ``http://`` AIGC image URLs, but the WebUI is served over HTTPS and browsers
+# block an http image on an https page as mixed content (the image renders as
+# broken). The same object is reachable over https on these hosts, so upgrade
+# the scheme before the URL ever leaves the provider. Scoped to Tencent's own
+# CDN domains so we never force https onto an http-only third party.
+_TENCENT_TLS_HOST_SUFFIXES = (".myqcloud.com", ".qcloud.com", ".tencentcos.cn")
+
+
+def _https_upgrade_tencent_url(url: str) -> str:
+    if not isinstance(url, str) or not url.startswith("http://"):
+        return url
+    host = urllib.parse.urlparse(url).hostname or ""
+    host = host.strip().lower().rstrip(".")
+    if host.endswith(_TENCENT_TLS_HOST_SUFFIXES):
+        return "https://" + url[len("http://"):]
+    return url
+
+
 def _extract_image_urls(detail: dict[str, Any]) -> list[str]:
     task = _detail_task(detail)
     output = task.get("Output") if isinstance(task, dict) else None
@@ -718,11 +738,11 @@ def _extract_image_urls(detail: dict[str, Any]) -> list[str]:
                     for url_key in ("FileUrl", "Url", "ImageUrl", "MediaUrl"):
                         url = item.get(url_key)
                         if isinstance(url, str) and url.startswith(("http://", "https://")):
-                            candidates.append(url)
+                            candidates.append(_https_upgrade_tencent_url(url))
         for url_key in ("FileUrl", "Url", "ImageUrl", "MediaUrl"):
             url = output.get(url_key)
             if isinstance(url, str) and url.startswith(("http://", "https://")):
-                candidates.append(url)
+                candidates.append(_https_upgrade_tencent_url(url))
     return list(dict.fromkeys(candidates))
 
 

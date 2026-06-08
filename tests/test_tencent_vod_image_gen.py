@@ -306,3 +306,56 @@ def test_generate_serializes_vod_tasks_across_processes(tmp_path: Path):
             if process.is_alive():
                 process.terminate()
                 process.join(1)
+
+
+# ── Regression: VOD returns plaintext http:// image URLs; the HTTPS WebUI blocks
+#    them as mixed content (broken image). The same object is served over https
+#    on Tencent's CDN, so the provider must upgrade the scheme. (2026-06-08) ──
+
+def test_vod_http_image_url_upgraded_to_https():
+    from hermes_multitenancy.tencent_vod_image_gen import _extract_image_urls
+
+    detail = _success_detail(
+        "http://251000800.vod2.myqcloud.com/abc/def/aigcImageGenFile.jpg"
+    )
+    assert _extract_image_urls(detail) == [
+        "https://251000800.vod2.myqcloud.com/abc/def/aigcImageGenFile.jpg"
+    ]
+
+
+def test_generate_returns_https_image_url_for_tencent_cdn(monkeypatch):
+    from hermes_multitenancy.tencent_vod_image_gen import TencentVODImageGenProvider
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"image_gen": {"provider": "tencent-vod", "model": "gem-3.1"}},
+    )
+    client = FakeVODClient([
+        _success_detail("http://251000800.vod2.myqcloud.com/x/y/aigcImageGenFile.jpg"),
+    ])
+    provider = TencentVODImageGenProvider(client=client, sleep_fn=lambda _s: None)
+
+    result = provider.generate("一张未来城市夜景海报", aspect_ratio="landscape")
+
+    assert result["success"] is True
+    assert result["image"].startswith("https://")
+    assert result["image"] == (
+        "https://251000800.vod2.myqcloud.com/x/y/aigcImageGenFile.jpg"
+    )
+    # extra["images"] should also be normalized
+    assert all(u.startswith("https://") for u in result["images"])
+
+
+def test_non_tencent_http_url_is_left_untouched():
+    from hermes_multitenancy.tencent_vod_image_gen import _extract_image_urls
+
+    # Never force https onto an arbitrary http-only third-party host.
+    detail = _success_detail("http://images.example.com/path/pic.jpg")
+    assert _extract_image_urls(detail) == ["http://images.example.com/path/pic.jpg"]
+
+
+def test_already_https_tencent_url_unchanged():
+    from hermes_multitenancy.tencent_vod_image_gen import _https_upgrade_tencent_url
+
+    u = "https://251000800.vod2.myqcloud.com/x/y/aigcImageGenFile.jpg"
+    assert _https_upgrade_tencent_url(u) == u
