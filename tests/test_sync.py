@@ -400,6 +400,42 @@ def test_sync_cli_repair_profile_image_gen_backfills_missing_configs(capsys, tmp
     assert json.loads(second_output)["planned_updated"] == 0
 
 
+def test_repair_profile_image_gen_preserves_existing_config_except_image_gen(tmp_path):
+    from hermes_multitenancy.router import repair_profile_image_gen_defaults
+
+    import yaml
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    original = {
+        "model": {"default": "custom/model"},
+        "platform_toolsets": {
+            "feishu": ["custom-existing"],
+            "webui": ["custom-webui"],
+        },
+        "multitenancy": {
+            "toolsets_mode": "custom",
+            "platform_toolsets_mode": {"feishu": "strict"},
+        },
+        "browser": {"enabled": False},
+    }
+    (profile / "config.yaml").write_text(
+        yaml.safe_dump(original, sort_keys=True, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    stats = repair_profile_image_gen_defaults(shared_home=shared)
+
+    assert stats["updated"] == 1
+    updated = _read_yaml(profile / "config.yaml")
+    assert updated.pop("image_gen") == {
+        "provider": "tencent-vod",
+        "model": "gem-3.1",
+    }
+    assert updated == original
+
+
 def test_plan_profile_skill_sync_reads_org_default_skill_bundle(tmp_path):
     from hermes_multitenancy.sync.feishu_org import Employee, plan_profile_skill_sync
 

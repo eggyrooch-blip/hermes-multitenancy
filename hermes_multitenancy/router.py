@@ -5069,6 +5069,7 @@ def repair_profile_image_gen_defaults(
             stats["skipped_service"] += 1
             continue
         config_path = profile_home / "config.yaml"
+        loaded: dict[str, Any] | None = None
         try:
             if config_path.exists():
                 import yaml
@@ -5087,7 +5088,10 @@ def repair_profile_image_gen_defaults(
                 stats["planned_updated"] += 1
                 continue
             if config_path.exists():
-                _normalize_profile_config_file(config_path, shared_home=root)
+                if loaded is None or not _apply_default_image_gen_config(loaded):
+                    stats["kept_explicit"] += 1
+                    continue
+                config_path.write_text(_dump_profile_config(loaded), encoding="utf-8")
             else:
                 config_path.write_text(
                     _dump_profile_config(_profile_config_from_shared_home(root)),
