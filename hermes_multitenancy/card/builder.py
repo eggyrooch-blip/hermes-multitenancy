@@ -96,9 +96,15 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     parts: list[str] = []
     if content:
         parts.append(content)
-    elif tool_section or reasoning:
-        if reasoning:
-            parts.append(f"💭 **Thought**\n\n{_clip(reasoning, 1200)}")
+    elif reasoning:
+        # issue #4 (openclaw parity): live PRESENT-tense thinking indicator
+        # while streaming (was past-tense "💭 Thought"). The final card switches
+        # to "思考了 Ns" via _render_reasoning_panel.
+        parts.append(f"💭 **思考中...**\n\n{_clip(reasoning, 1200)}")
+    elif tool_section:
+        # Tools running but no reasoning/content yet — show the live indicator
+        # instead of a blank card (previously rendered an empty placeholder).
+        parts.append("💭 **思考中...**")
     else:
         parts.append(" ")
     return "\n\n".join(part for part in parts if part).strip() or " "
