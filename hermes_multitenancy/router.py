@@ -320,13 +320,16 @@ def _is_reaction_synthetic_event(event: Any, text: str) -> bool:
 
 
 def _event_reply_to_message_id(event: Any) -> Optional[str]:
-    """Only group/topic chats should use Feishu reply_to.
+    """Anchor the bot reply to the user's original message in ALL chat types.
 
-    In p2p/dm chats Feishu renders bot replies with ``reply_to`` as visible
-    topics, which makes a private chat look like it was posted into a group.
+    Mirrors openclaw-lark (``replyToMessageId ?? ctx.messageId``): the reply
+    card quotes the message it answers, in groups AND p2p/dm. This is safe in
+    p2p because ``_thread_metadata_for_media_delivery`` returns None for
+    non-group chats, so core derives ``reply_in_thread = bool(thread_id)`` =
+    False (feishu.py) -> an ordinary quoted reply, NOT a visible topic. The
+    earlier p2p->None short-circuit avoided a topic that only appears when
+    reply_in_thread is True, which p2p never sets.
     """
-    if not _is_group_chat_type(_extract_chat_type(event)):
-        return None
     return _event_message_id(event)
 
 
@@ -6209,6 +6212,26 @@ async def _stream_into_feishu(
                         piece = str(delta or "")
                         if not piece:
                             continue
+                        # Compensation flush (issue #2): a short/fast reasoning
+                        # burst can be throttled so state["reasoning"] freezes at
+                        # the first token ("The"). Before the answer renders,
+                        # push the full accumulated thinking so the collapsed
+                        # reasoning panel shows it all. Mirrors the shared-consumer
+                        # loop above (single-flush before content).
+                        if stream_mode == "card" and thinking and len(thinking) > last_reasoning_render_len:
+                            try:
+                                await _update_feishu_stream_reasoning(
+                                    adapter,
+                                    chat_id,
+                                    placeholder_id,
+                                    thinking,
+                                    mode=stream_mode,
+                                )
+                                last_reasoning_render_len = len(thinking)
+                            except Exception as exc:
+                                logger.debug(
+                                    "multitenancy: card reasoning compensation flush failed: %s", exc
+                                )
                         full_content += piece
                         while piece:
                             remaining = _STREAM_MAX_VISIBLE_CHARS - len(content)

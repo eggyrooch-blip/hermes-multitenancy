@@ -2652,10 +2652,12 @@ def test_post_stream_media_delivery_sends_public_markdown_image_url(tmp_path, mo
     assert image_path.parent == profile_home / "workspace" / "Downloads" / "remote-images"
     assert image_path.suffix == ".jpg"
     assert image_path.read_bytes() == payload
+    # issue #1 (openclaw parity): media/image delivery now quotes the original
+    # request message (reply_in_thread=False => ordinary quote, not a topic).
     assert adapter.images[0] == {
         "chat_id": "oc_chat",
         "image_path": str(image_path),
-        "reply_to": None,
+        "reply_to": "om_vod_image",
         "metadata": None,
     }
 

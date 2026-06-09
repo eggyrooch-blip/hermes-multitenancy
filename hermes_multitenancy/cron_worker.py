@@ -113,6 +113,8 @@ def install_cron_runtime_patches() -> None:
     _patch_feishu_open_id_send()
     _patch_feishu_outbound_link_render()
     install_feishu_inbound_richtext_patch()
+    from .feishu_merge_forward_api import install_feishu_merge_forward_api_patch
+    install_feishu_merge_forward_api_patch()
     _runtime_patches_installed = True
 
 

@@ -435,8 +435,11 @@ async def _run_stream_into_feishu_does_not_reply_to_dm_message_to_avoid_topic(
     )
 
     assert response == "Hello"
+    # issue #1 (openclaw parity): DM replies now QUOTE the original message.
+    # Safe because p2p has no thread_id => core reply_in_thread=False =>
+    # ordinary quoted reply, not a visible topic.
     assert adapter.started == [
-        {"chat_id": "dm-chat", "reply_to": None, "metadata": None}
+        {"chat_id": "dm-chat", "reply_to": "om_dm_source", "metadata": None}
     ]
 
 
@@ -1824,7 +1827,9 @@ async def _run_handle_async_keeps_processing_reaction_until_media_delivery_finis
 
     assert adapter.lifecycle == [
         ("start", "om_media_life"),
-        ("send_document", None, "report.md"),
+        # issue #1 side-effect: DM media delivery now also quotes the original
+        # message (reply_in_thread=False, so ordinary quote not a topic).
+        ("send_document", "om_media_life", "report.md"),
         ("complete_deferred", "ProcessingOutcome.SUCCESS"),
     ]
 
@@ -2398,8 +2403,12 @@ def test_stream_into_feishu_streams_raw_reasoning_in_card(monkeypatch, tmp_path)
         router_mod._strip_stream_status_animation_markers(item["content"])
         for item in adapter.status_updates
     ] == [""]
+    # issue #2: the compensation flush emits the FULL accumulated thinking
+    # before content begins, so the collapsed reasoning panel shows it all
+    # (previously frozen at the first throttled token).
     assert [item["content"] for item in adapter.reasoning_updates] == [
         "The user wants to update a Feishu record.",
+        "The user wants to update a Feishu record. Let me inspect the app token.",
     ]
 
 
@@ -2485,14 +2494,15 @@ async def test_stream_into_feishu_text_fallback_omits_dm_reply_to(
     )
 
     assert response == "fallback text"
+    # issue #1 (openclaw parity): DM text-fallback also quotes the original.
     assert adapter.started == [
-        {"chat_id": "dm-chat", "reply_to": None, "metadata": None}
+        {"chat_id": "dm-chat", "reply_to": "om_dm_fallback", "metadata": None}
     ]
     assert adapter.sent == [
         {
             "chat_id": "dm-chat",
             "content": "\u200b",
-            "reply_to": None,
+            "reply_to": "om_dm_fallback",
             "metadata": None,
         }
     ]
