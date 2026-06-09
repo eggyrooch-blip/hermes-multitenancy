@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .credential_renewal_common import find_marker_for_open_id, read_needs_reauth_marker
+from .feishu_inbound_richtext import install_feishu_inbound_richtext_patch
 from .run_broker import RunBroker
 from .run_models import RunRequest
 
@@ -111,6 +112,7 @@ def install_cron_runtime_patches() -> None:
     _patch_cron_delivery_mirror()
     _patch_feishu_open_id_send()
     _patch_feishu_outbound_link_render()
+    install_feishu_inbound_richtext_patch()
     _runtime_patches_installed = True
 
 
