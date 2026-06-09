@@ -11,6 +11,21 @@
 
 ---
 
+## ✨ What you get
+
+- **True multi-tenancy on one bot** — each Feishu user gets an isolated profile (its own SOUL, memory, sessions, credentials, workspace), not a shared persona.
+- **Zero patches to hermes-agent** — ships as a `pre_gateway_dispatch` plugin; pin the upstream version and upgrade without re-patching the core.
+- **Privacy by construction** — per-profile sandbox (HOME/XDG/TMPDIR pivot + subprocess env allowlist), credentials materialized through a local broker and kept out of the model, redacted streaming output.
+- **Real Feishu UX, reused not reimplemented** — CardKit streaming cards, reactions, multi-turn sessions, vision/STT/file inject, group chat, cron delivery — delegated to hermes-agent.
+- **Full Feishu OpenAPI reach** — through the `lark-cli` bridge (docs, sheets, calendar, contacts, tasks, approvals) with per-request user-vs-bot identity isolation.
+
+### 🧭 Where it sits
+
+- **vs vanilla [hermes-agent](https://github.com/NousResearch/hermes-agent):** hermes assumes *1 bot = 1 user* (one profile per gateway process). This plugin makes *1 bot = N users* — routing each user to their own `ProfileRuntime` — without forking the core.
+- **vs a single-tenant Lark/Feishu channel plugin (e.g. [OpenClaw Lark](https://github.com/larksuite/openclaw-lark)):** those bridge *one* agent identity to Feishu. This adds per-user routing, profile isolation, and a credential vault so a *single* deployment can safely serve a whole org — each person getting their own agent, memory, and tokens.
+
+---
+
 ## 😖 Why I built this (the pain)
 
 I love hermes-agent — it's the most polished personal-agent runtime I've used. But shipping it inside a company hit one wall:

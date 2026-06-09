@@ -11,6 +11,21 @@
 
 ---
 
+## ✨ 你能得到什么
+
+- **一个 Bot 上的真多租户** —— 每个飞书用户拥有独立 profile(自己的 SOUL、记忆、会话、凭据、工作区),而不是共享同一个人格。
+- **对 hermes-agent 零侵入** —— 以 `pre_gateway_dispatch` 插件形式接入;锁定上游版本即可升级,无需反复打补丁。
+- **隐私内建** —— 每个 profile 独立沙箱(HOME/XDG/TMPDIR 切换 + 子进程环境变量白名单),凭据经本地 broker 物化、永不暴露给模型,流式输出自动脱敏。
+- **复用而非重造的飞书体验** —— CardKit 流式卡片、表情回应、多轮会话、图片/语音/文件注入、群聊、定时投递,全部委托给 hermes-agent。
+- **完整飞书 OpenAPI 能力** —— 通过 `lark-cli` 桥接(云文档/表格/日历/通讯录/任务/审批),并按请求做用户态 vs 应用态身份隔离。
+
+### 🧭 它的定位
+
+- **对比原版 [hermes-agent](https://github.com/NousResearch/hermes-agent):** hermes 假设 *1 个 Bot = 1 个用户*(每个 profile 一个 gateway 进程)。本插件让 *1 个 Bot = N 个用户* —— 把每个用户路由到各自的 `ProfileRuntime` —— 且不 fork 内核。
+- **对比单租户的 Lark/飞书 channel 插件(如 [OpenClaw Lark](https://github.com/larksuite/openclaw-lark)):** 那类插件把*一个* agent 身份桥接到飞书;本插件加上了 per-user 路由、profile 隔离与凭据金库,让*一套*部署安全地服务整个组织 —— 人人拥有自己的 agent、记忆和 token。
+
+---
+
 ## 😖 为什么写这个插件 (痛点)
 
 我很喜欢 hermes-agent —— 这是我用过最完整的个人 Agent 运行时。但是想把它放进公司里给所有人用的时候, 撞墙了:
