@@ -1785,6 +1785,9 @@ def _profile_main_runtime_for_image_prep(profile_home: Path) -> Optional[dict[st
     except Exception as exc:
         logger.debug("multitenancy: cannot resolve custom provider api key for image prep (%s)", exc)
 
+    provider_l = provider.lower()
+    if not (provider_l == "custom" or provider_l.startswith("custom:")):
+        return None
     if not (provider and model_name):
         return None
     return {
@@ -1815,7 +1818,7 @@ def _install_auxiliary_main_runtime_patch(runtime: Optional[dict[str, str]]) -> 
     api_mode = runtime.get("api_mode", "")
 
     set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
-    if callable(set_runtime_main):
+    if callable(set_runtime_main) and api_key:
         try:
             set_runtime_main(provider, model, base_url=base_url, api_key=api_key, api_mode=api_mode)
         except Exception as exc:
