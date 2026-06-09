@@ -40,7 +40,21 @@ logger = logging.getLogger(__name__)
 _HOOK_INSTALLED = False
 _EXTRACT_FLAG = "_hermes_multitenancy_merge_forward_api_patched"
 _PROCESS_FLAG = "_hermes_multitenancy_merge_forward_sender_capture_patched"
-_SENDER_ATTR = "_mt_merge_forward_sender_open_id"
+_SENDER_ATTR = "_mt_merge_forward_sender_by_mid"  # {message_id: forwarder open_id}
+_SENDER_MAP_MAX = 256
+
+
+def _sender_map(adapter: Any) -> dict:
+    """Per-message_id forwarder-open_id map on the adapter.
+
+    Keyed by message_id (not a single shared attribute) so concurrent forwards
+    from different senders on the same gateway can't race each other's UAT token.
+    """
+    m = getattr(adapter, _SENDER_ATTR, None)
+    if not isinstance(m, dict):
+        m = {}
+        setattr(adapter, _SENDER_ATTR, m)
+    return m
 
 _MAX_ENTRIES = 60          # safety cap on rendered sub-messages
 _MAX_DEPTH = 6             # nested merge_forward recursion cap
@@ -274,9 +288,13 @@ def _patch_process_inbound(FeishuAdapter: Any) -> None:
     async def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
             sender_id = kwargs.get("sender_id")
+            mid = str(kwargs.get("message_id") or "")
             open_id = str(getattr(sender_id, "open_id", "") or "")
-            if open_id:
-                setattr(self, _SENDER_ATTR, open_id)
+            if mid and open_id:
+                m = _sender_map(self)
+                if len(m) >= _SENDER_MAP_MAX:
+                    m.clear()  # bound memory; a dropped entry only costs a fallback
+                m[mid] = open_id
         except Exception:
             logger.debug("[multitenancy] merge_forward sender capture failed", exc_info=True)
         return await original(self, *args, **kwargs)
@@ -298,7 +316,7 @@ def _patch_extract(FeishuAdapter: Any) -> None:
             if raw_type != "merge_forward":
                 return result
             message_id = str(getattr(message, "message_id", "") or "")
-            sender_open_id = str(getattr(self, _SENDER_ATTR, "") or "")
+            sender_open_id = str(_sender_map(self).pop(message_id, "") or "")
             if not message_id or not sender_open_id:
                 return result
             transcript = await _expand_merge_forward(message_id, sender_open_id)
