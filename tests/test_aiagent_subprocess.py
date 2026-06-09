@@ -4480,11 +4480,21 @@ def test_bwrap_default_args_masks_profile_and_shared_secret_files():
     })
 
     triples = set(zip(tokens, tokens[1:], tokens[2:]))
+    # .env and auth.lock are masked with /dev/null.
     for secret_path in (
         "/probe/shared/.env",
-        "/probe/shared/auth.json",
+        "/probe/shared/auth.lock",
     ):
         assert ("--ro-bind-try", "/dev/null", secret_path) in triples
+    # auth.json is masked with a VALID-but-EMPTY auth store instead of /dev/null
+    # (hides the host credential pool while letting hermes_cli.auth parse it
+    # silently). The real host auth.json must NOT be exposed.
+    assert (
+        "--ro-bind-try",
+        "/probe/mt-repo/hermes_multitenancy/sandbox/empty-auth.json",
+        "/probe/shared/auth.json",
+    ) in triples
+    assert ("--ro-bind-try", "/dev/null", "/probe/shared/auth.json") not in triples
 
 
 def test_wrap_linux_bwrap_binds_token_named_source_script_skill(monkeypatch, tmp_path: Path):

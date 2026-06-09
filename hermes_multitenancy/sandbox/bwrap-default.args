@@ -107,7 +107,11 @@
 # process env before bwrap starts; terminal/code subprocesses then strip
 # secret-like env names before executing model-generated commands.
 --ro-bind-try /dev/null ${SHARED_HOME}/.env
---ro-bind-try /dev/null ${SHARED_HOME}/auth.json
+# auth.json is masked with a VALID-but-EMPTY auth store (not /dev/null): the
+# host credential pool stays hidden, but hermes_cli.auth._load_auth_store can
+# parse it cleanly instead of choking on empty bytes and logging a misleading
+# "failed to parse ... Corrupt file preserved" warning on every request.
+--ro-bind-try ${HERMES_MT_REPO}/hermes_multitenancy/sandbox/empty-auth.json ${SHARED_HOME}/auth.json
 --ro-bind-try /dev/null ${SHARED_HOME}/auth.lock
 
 # ── Cross-tenant deny by construction ───────────────────────────────
