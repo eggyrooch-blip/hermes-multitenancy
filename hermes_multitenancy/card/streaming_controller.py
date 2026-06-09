@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from types import MethodType
 from typing import Any, Optional
@@ -69,6 +70,22 @@ from hermes_multitenancy.card.unavailable_guard import UnavailableGuard
 # observable logger name must not change with the modularization.
 logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
 _FLUSH_CONTROLLERS_ATTR = "_hermes_mt_streaming_flush_controllers"
+
+
+def _card_content_throttle_s() -> float:
+    """Min seconds between streamed content/reasoning network pushes (issue #4).
+
+    Coalesces rapid token frames so the card updates as a smooth typewriter
+    instead of one blocking round-trip per token. Env-tunable for real-machine
+    tuning without a redeploy; 0 disables throttling (revert to per-event push).
+    """
+    raw = os.getenv("HERMES_CARD_CONTENT_THROTTLE_S")
+    if raw is None:
+        return 0.12
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.12
 
 
 def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
@@ -291,20 +308,9 @@ async def _update_streaming_card_reasoning(
         state["reasoning_started_at"] = time.monotonic()
     answer_text, reasoning_text = _split_reasoning_text(_format(self, content))
     state["reasoning"] = reasoning_text or answer_text
-    if state.get("card_id"):
-        try:
-            await _stream_cardkit_content(
-                self,
-                str(state["card_id"]),
-                _render_stream_text(state),
-                _next_sequence(state),
-            )
-            return _result(True, message_id=str(message_id))
-        except Exception as exc:
-            if isinstance(exc, UnavailableError):
-                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
-            logger.warning("multitenancy: Feishu CardKit reasoning update failed, falling back to full flush: %s", exc)
-            state["card_id"] = None
+    # issue #4: route reasoning through the throttled _flush_state (it pushes the
+    # same _render_stream_text content) so rapid thinking tokens coalesce into a
+    # smooth typewriter instead of one blocking round-trip per token.
     return await _flush_state(self, message_id, state)
 
 
@@ -488,14 +494,20 @@ async def _flush_state(
             return _result(False, message_id=str(message_id), error=str(exc))
 
     if final:
+        # issue #4: cancel any armed throttle timer so a stale frame can't fire
+        # after the card is finalized (no post-completion ghost update).
+        controllers = _flush_controllers(adapter)
+        existing = controllers.get(str(message_id))
+        if existing is not None:
+            existing.cancel()
         try:
             return await _flush_body()
         finally:
-            _flush_controllers(adapter).pop(str(message_id), None)
+            controllers.pop(str(message_id), None)
 
     try:
         controller = _flush_controllers(adapter).setdefault(str(message_id), FlushController())
-        result = await controller.flush(_flush_body)
+        result = await controller.throttled_update(_card_content_throttle_s(), _flush_body)
         if result is None:
             return _result(True, message_id=str(message_id))
         return result

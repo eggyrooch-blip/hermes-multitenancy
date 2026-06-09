@@ -10,6 +10,39 @@ from hermes_multitenancy.card import ensure_feishu_cardkit_streaming
 from hermes_multitenancy.card import tool_use_config, tool_use_display
 
 
+@pytest.fixture(autouse=True)
+def _disable_card_content_throttle(monkeypatch):
+    # issue #4: these tests assert per-event/reflush push behavior; run them with
+    # the time-based throttle transparent (0) so flushes are immediate and
+    # deterministic. Throttle coalescing is covered by its own dedicated test.
+    monkeypatch.setenv("HERMES_CARD_CONTENT_THROTTLE_S", "0")
+
+
+@pytest.mark.asyncio
+async def test_flush_controller_throttled_update_coalesces_and_lands_trailing():
+    # issue #4: rapid frames within the throttle window coalesce to a single
+    # deferred push that carries the LATEST state; the trailing frame always
+    # lands (after the window), never dropped.
+    from hermes_multitenancy.card.flush_controller import FlushController
+
+    calls: list[str] = []
+
+    async def _mk(tag: str) -> None:
+        calls.append(tag)
+
+    c = FlushController()
+    # First update has no prior push -> flushes immediately.
+    await c.throttled_update(0.05, lambda: _mk("a"))
+    # Two more within the window -> coalesced into one armed timer; the second
+    # supersedes the first, so only the LATEST ("c") will fire.
+    await c.throttled_update(0.05, lambda: _mk("b"))
+    await c.throttled_update(0.05, lambda: _mk("c"))
+    assert calls == ["a"]  # b/c still pending in the throttle window
+    await asyncio.sleep(0.09)  # past the window: trailing timer fires latest
+    assert calls == ["a", "c"]  # trailing landed and it is the newest frame
+    c.cancel()
+
+
 def _tool(index: int) -> dict[str, object]:
     return {
         "name": f"tool_{index}",
@@ -270,7 +303,9 @@ async def test_flush_controller_wiring_fails_open_and_logs_warning(caplog):
     controllers = getattr(adapter, _FLUSH_CONTROLLERS_ATTR)
 
     class _BoomController:
-        async def flush(self, flush_callable):
+        # throttled_update is the entry point _flush_state now uses (issue #4);
+        # raising here exercises the C2 fail-open fallback to a direct flush.
+        async def throttled_update(self, throttle_s, flush_callable):
             raise RuntimeError("flush boom")
 
     controllers[started.message_id] = _BoomController()

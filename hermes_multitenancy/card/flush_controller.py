@@ -46,10 +46,66 @@ class FlushController:
         self._lock: asyncio.Lock = asyncio.Lock()
         self._needs_reflush: bool = False
         self._in_flight: bool = False
+        # Time-based throttle (issue #4): coalesce rapid content/reasoning frames
+        # into ≤1 network push per throttle window, while GUARANTEEING the
+        # trailing frame lands via a deferred timer. Mirrors openclaw-lark
+        # flush-controller.ts throttledUpdate.
+        self._last_update: float = 0.0
+        self._pending_timer: Optional[asyncio.TimerHandle] = None
+        self._pending_callable: Optional[Callable[[], Awaitable[Any]]] = None
 
     @property
     def in_flight(self) -> bool:
         return self._in_flight
+
+    async def throttled_update(
+        self, throttle_s: float, flush_callable: Callable[[], Awaitable[Any]]
+    ) -> Optional[Any]:
+        """Coalesce rapid flushes; always land the trailing frame.
+
+        - If at least ``throttle_s`` has elapsed since the last push, flush now.
+        - Otherwise remember the LATEST ``flush_callable`` and (re)arm a single
+          timer that fires the latest pending callable when the window closes.
+          Intermediate frames within the window are dropped (their state is
+          already superseded), but the final one always fires.
+
+        ``flush_callable`` MUST re-render from the live state at call time
+        (it is invoked later than the event that scheduled it).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return await self.flush(flush_callable)
+        now = loop.time()
+        # Always keep the latest callable so a pending timer fires fresh state.
+        self._pending_callable = flush_callable
+        if self._pending_timer is not None:
+            return None  # a timer is already armed; it will use the latest callable
+        if now - self._last_update >= throttle_s:
+            self._last_update = now
+            cb = self._pending_callable
+            self._pending_callable = None
+            return await self.flush(cb)
+        delay = max(0.0, throttle_s - (now - self._last_update))
+        self._pending_timer = loop.call_later(delay, self._fire_pending, loop)
+        return None
+
+    def _fire_pending(self, loop: Any) -> None:
+        self._pending_timer = None
+        cb = self._pending_callable
+        self._pending_callable = None
+        if cb is None:
+            return
+        self._last_update = loop.time()
+        # Schedule the async flush; the timer callback itself is sync.
+        asyncio.ensure_future(self.flush(cb))
+
+    def cancel(self) -> None:
+        """Cancel any armed trailing timer (call on finalize/abort/terminal)."""
+        if self._pending_timer is not None:
+            self._pending_timer.cancel()
+            self._pending_timer = None
+        self._pending_callable = None
 
     @property
     def needs_reflush(self) -> bool:

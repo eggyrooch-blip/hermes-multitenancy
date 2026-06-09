@@ -8,6 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _disable_card_content_throttle(monkeypatch):
+    # issue #4: these tests assert per-event push behavior; run with the
+    # time-based content throttle transparent (0) for deterministic immediate
+    # flushes. Throttle coalescing is covered by its own dedicated test.
+    monkeypatch.setenv("HERMES_CARD_CONTENT_THROTTLE_S", "0")
+
+
 def _card_text(card_or_elements):
     elements = card_or_elements.get("elements", card_or_elements) if isinstance(card_or_elements, dict) else card_or_elements
     parts = []
