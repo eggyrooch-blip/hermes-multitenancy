@@ -5433,6 +5433,37 @@ async def _run_terminal_stream_update(update_coro, *, label: str):
         raise
 
 
+def _resolve_stream_footer_model_name(profile_home: Path) -> Optional[str]:
+    from .agent_real import _load_profile_config
+
+    config = _load_profile_config(Path(profile_home).expanduser())
+    default_spec = str(((config.get("model") or {}).get("default") or "")).strip()
+    if not default_spec:
+        return None
+    model_name = default_spec.rsplit("/", 1)[-1].strip()
+    return model_name or None
+
+
+def _merge_stream_footer_metrics(
+    adapter: Any,
+    *,
+    mode: str,
+    message_id: Optional[str],
+    profile_home: Path,
+) -> None:
+    if mode != "card" or not message_id:
+        return
+    if not callable(getattr(adapter, "update_streaming_card_metrics", None)):
+        return
+    try:
+        adapter.update_streaming_card_metrics(
+            message_id=message_id,
+            model_name=_resolve_stream_footer_model_name(profile_home),
+        )
+    except Exception as exc:
+        logger.debug("multitenancy: stream footer metrics merge failed: %s", exc)
+
+
 async def _update_feishu_stream_reasoning(
     adapter, chat_id, message_id, content, *, mode: str
 ):
@@ -6307,6 +6338,12 @@ async def _stream_into_feishu(
         display_current = _clean_stream_display_text(content or full, profile_home)
 
         # 3. Final commit. finalize=True signals end of stream to Feishu.
+        _merge_stream_footer_metrics(
+            adapter,
+            mode=stream_mode,
+            message_id=placeholder_id,
+            profile_home=profile_home,
+        )
         try:
             await _run_terminal_stream_update(
                 _update_feishu_stream_target(
@@ -6332,6 +6369,12 @@ async def _stream_into_feishu(
                 stream_mode,
                 placeholder_id,
                 len(full),
+            )
+            _merge_stream_footer_metrics(
+                adapter,
+                mode=stream_mode,
+                message_id=placeholder_id,
+                profile_home=profile_home,
             )
             try:
                 await _run_terminal_stream_update(

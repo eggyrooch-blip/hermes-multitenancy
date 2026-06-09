@@ -8,7 +8,7 @@ streaming) → reasoning panel → body markdown → Done footer.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, TypedDict
 
 from .footer_config import get_show_metrics
 from .markdown_style import _optimize_markdown_style
@@ -30,6 +30,11 @@ _TOOLS_ELEMENT_ID = "tool_calls"
 _STREAMING_ELEMENT_ID = "streaming_content"
 _LOADING_ELEMENT_ID = "loading_icon"
 _LOADING_ICON_IMG_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
+
+
+class _I18nMarkdown(TypedDict):
+    zh_cn: str
+    en_us: str
 
 
 def _render_cardkit_initial_card() -> dict[str, Any]:
@@ -120,10 +125,12 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
     elif state.get("finalized") or state.get("aborted") or not elements:
         elements.append({"tag": "markdown", "content": "..."})
     if state.get("finalized") or state.get("aborted"):
+        footer = _render_done_footer(state)
         elements.append(
             {
                 "tag": "markdown",
-                "content": _render_done_footer(state),
+                "content": footer["zh_cn"],
+                "i18n_content": footer,
                 "text_size": "notation",
             }
         )
@@ -192,15 +199,29 @@ def _render_reasoning_panel(reasoning: str, state: dict[str, Any]) -> dict[str, 
     }
 
 
-def _render_done_footer(state: dict[str, Any]) -> str:
-    label = "Aborted" if state.get("aborted") else "Done"
-    base = f"{label} ({_format_elapsed_since_start(state)})"
+def _render_done_footer(state: dict[str, Any]) -> _I18nMarkdown:
+    elapsed = _format_elapsed_since_start(state)
+    base: _I18nMarkdown = {
+        "zh_cn": _format_footer_primary_line(state, elapsed, locale="zh_cn"),
+        "en_us": _format_footer_primary_line(state, elapsed, locale="en_us"),
+    }
     if not get_show_metrics():
         return base
     metrics = _format_metrics_line(state)
     if not metrics:
         return base
-    return f"{base}\n{metrics}"
+    return {
+        "zh_cn": f"{base['zh_cn']}\n{metrics}",
+        "en_us": f"{base['en_us']}\n{metrics}",
+    }
+
+
+def _format_footer_primary_line(state: dict[str, Any], elapsed: str, *, locale: str) -> str:
+    if locale == "zh_cn":
+        label = "已停止" if state.get("aborted") else "已完成"
+        return f"{label} · 耗时 {elapsed}"
+    label = "Stopped" if state.get("aborted") else "Completed"
+    return f"{label} · Elapsed {elapsed}"
 
 
 def _format_metrics_line(state: dict[str, Any]) -> str:
@@ -236,5 +257,9 @@ def _format_elapsed_since_start(state: dict[str, Any]) -> str:
     started_at = state.get("started_at")
     if isinstance(started_at, (int, float)) and started_at > 0:
         elapsed = max(0.0, time.monotonic() - float(started_at))
+        if elapsed >= 60.0:
+            total_seconds = int(elapsed)
+            minutes, seconds = divmod(total_seconds, 60)
+            return f"{minutes}m {seconds}s"
         return f"{elapsed:.1f}s"
     return "0.0s"

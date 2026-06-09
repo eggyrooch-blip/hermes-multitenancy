@@ -494,7 +494,7 @@ async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapt
     assert "**Tool calls:**" not in rendered
     assert "`lark_cli` (300 ms)" in rendered
     assert "Hello from clean adapter" in rendered
-    assert "Done (" in rendered
+    assert "已完成 · 耗时" in rendered
 
 
 def test_stream_into_feishu_updates_interactive_card_without_auth_patch_helper(
@@ -543,7 +543,7 @@ async def _run_stream_into_feishu_updates_interactive_card_without_auth_patch_he
     assert all(element.get("tag") == "markdown" for element in final_card["elements"])
     assert final_card["elements"][-1]["tag"] == "markdown"
     assert "Updated through Feishu message.update" in rendered
-    assert "Done (" in rendered
+    assert "已完成 · 耗时" in rendered
 
 
 def test_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
@@ -739,7 +739,7 @@ async def _run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
     assert "hidden chain" not in body_text
     assert "https://example.com/a.png" not in body_text
 
-    assert elements[3]["content"].startswith("Done (")
+    assert elements[3]["content"].startswith("已完成 · 耗时")
     assert elements[3]["text_size"] == "notation"
 
 
@@ -771,7 +771,7 @@ async def _run_cardkit_compat_never_renders_raw_tool_call_xml():
     assert "lark-cli doc +create" not in rendered
     assert "**Tool calls:**" not in rendered
     assert "- `lark_cli` failed" in rendered
-    assert "Done (" in rendered
+    assert "已完成 · 耗时" in rendered
 
 
 def test_cardkit_compat_filters_tool_process_narration_from_final_body():
@@ -1000,7 +1000,7 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     assert "`lark_cli` (300 ms)" in tool_panel["elements"][0]["content"]
     assert "**Tool calls:**" not in final_text
     assert "Hello CardKit" in final_text
-    assert "Done (" in final_text
+    assert "已完成 · 耗时" in final_text
 
 
 def test_cardkit_initial_card_has_delay_streaming_loading_and_no_visible_thinking():
@@ -1361,7 +1361,7 @@ async def _run_stream_into_feishu_skips_legacy_shared_consumer_without_card_meth
     assert final_card["elements"][-1]["tag"] == "markdown"
     rendered = _card_text(final_card)
     assert "Compat survives legacy consumer" in rendered
-    assert "Done (" in rendered
+    assert "已完成 · 耗时" in rendered
 
 
 def test_stream_into_feishu_uses_gateway_stream_consumer_for_card_transport(
