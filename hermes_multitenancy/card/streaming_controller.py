@@ -24,7 +24,7 @@ from .builder import (
     _render_stream_text,
     _to_cardkit2,
 )
-from .card_error import UnavailableError, _finalize, _result
+from .card_error import RateLimitError, TableLimitError, UnavailableError, _finalize, _result
 from .cardkit_client import (
     _create_cardkit_card,
     _patch_interactive_message,
@@ -35,13 +35,14 @@ from .cardkit_client import (
     _update_interactive_message,
 )
 from .flush_controller import FlushController
+from .markdown_style import _optimize_markdown_style
 from .reasoning import _split_reasoning_text
 from .reply_dispatcher import (
     _can_patch_interactive_message,
     _can_update_interactive_message,
     _can_use_cardkit,
 )
-from .sanitization import _format
+from .sanitization import _format, _plain_summary
 from .state import (
     _INSTALLED_ATTR,
     _STATE_ATTR,
@@ -163,6 +164,8 @@ async def _start_streaming_card(
                 state["card_id"] = card_id
                 state["original_card_id"] = card_id
                 state["sequence"] = 1
+                state["chat_id"] = str(chat_id or "")
+                state["reply_to"] = reply_to
                 response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
                     msg_type="interactive",
@@ -190,6 +193,8 @@ async def _start_streaming_card(
             state["sequence"] = 0
 
     try:
+        state["chat_id"] = str(chat_id or "")
+        state["reply_to"] = reply_to
         response = await self._feishu_send_with_retry(
             chat_id=chat_id,
             msg_type="interactive",
@@ -342,10 +347,11 @@ async def _update_streaming_card_status(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
-            if isinstance(exc, UnavailableError):
-                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
-            logger.warning("multitenancy: Feishu CardKit status update failed, falling back to full flush: %s", exc)
-            state["card_id"] = None
+            handled = _handle_cardkit_exc(self, message_id, state, exc)
+            if handled is True:
+                return _result(True, message_id=str(message_id))
+            if handled is False:
+                return _result(False, message_id=str(message_id), error=str(exc))
     return await _flush_state(self, message_id, state)
 
 
@@ -386,10 +392,11 @@ async def _update_streaming_card_tool_started(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
-            if isinstance(exc, UnavailableError):
-                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
-            logger.warning("multitenancy: Feishu CardKit tool update failed, falling back to full flush: %s", exc)
-            state["card_id"] = None
+            handled = _handle_cardkit_exc(self, message_id, state, exc)
+            if handled is True:
+                return _result(True, message_id=str(message_id))
+            if handled is False:
+                return _result(False, message_id=str(message_id), error=str(exc))
     return await _flush_state(self, message_id, state)
 
 
@@ -431,11 +438,33 @@ async def _update_streaming_card_tool_completed(
             )
             return _result(True, message_id=str(message_id))
         except Exception as exc:
-            if isinstance(exc, UnavailableError):
-                UnavailableGuard.mark_unavailable(self, str(message_id), exc.code)
-            logger.warning("multitenancy: Feishu CardKit tool update failed, falling back to full flush: %s", exc)
-            state["card_id"] = None
+            handled = _handle_cardkit_exc(self, message_id, state, exc)
+            if handled is True:
+                return _result(True, message_id=str(message_id))
+            if handled is False:
+                return _result(False, message_id=str(message_id), error=str(exc))
     return await _flush_state(self, message_id, state)
+
+
+def _handle_cardkit_exc(
+    adapter: Any,
+    message_id: str,
+    state: dict[str, Any],
+    exc: Exception,
+) -> Optional[bool]:
+    if isinstance(exc, UnavailableError):
+        UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
+        return False
+    if isinstance(exc, RateLimitError):
+        logger.debug("multitenancy: Feishu CardKit rate limited (230020), skipping frame")
+        return True
+    if isinstance(exc, TableLimitError):
+        logger.warning("multitenancy: Feishu CardKit content exceeded table limit, falling back to final card: %s", exc)
+        state["card_id"] = None
+        return None
+    logger.warning("multitenancy: Feishu CardKit update failed, falling back to final card: %s", exc)
+    state["card_id"] = None
+    return None
 
 
 async def _flush_state(
@@ -454,41 +483,27 @@ async def _flush_state(
             card_id = str(state.get("card_id") or "")
             original_card_id = str(state.get("original_card_id") or "")
             if final and original_card_id:
-                if card_id:
-                    await _stream_cardkit_content(
-                        adapter,
-                        card_id,
-                        _render_stream_text(state),
-                        _next_sequence(state),
-                    )
-                await _set_card_streaming_mode(adapter, original_card_id, False, _next_sequence(state))
-                await _update_cardkit_card(adapter, original_card_id, _to_cardkit2(_render_message_card(state)), _next_sequence(state))
-                if not state.get("aborted"):
-                    _transition(state, PHASE_COMPLETED)
-                if pop:
-                    _states(adapter).pop(str(message_id), None)
-                return _result(True, message_id=str(message_id))
+                return await _deliver_final_card(adapter, message_id, state, pop=pop)
 
             if card_id:
                 try:
                     await _stream_cardkit_content(adapter, card_id, _render_stream_text(state), _next_sequence(state))
                     return _result(True, message_id=str(message_id))
                 except Exception as exc:
-                    logger.warning(
-                        "multitenancy: Feishu CardKit content update failed, final card will use card.update: %s",
-                        exc,
-                    )
-                    state["card_id"] = None
+                    handled = _handle_cardkit_exc(adapter, message_id, state, exc)
+                    if handled is True:
+                        return _result(True, message_id=str(message_id))
+                    if handled is False:
+                        return _result(False, message_id=str(message_id), error=str(exc))
                     return _result(True, message_id=str(message_id))
 
             if original_card_id:
                 return _result(True, message_id=str(message_id))
 
+            if final:
+                return await _deliver_final_card(adapter, message_id, state, pop=pop)
+
             success = await _patch_interactive_state(adapter, str(message_id), state)
-            if success and final and not state.get("aborted"):
-                _transition(state, PHASE_COMPLETED)
-            if success and pop:
-                _states(adapter).pop(str(message_id), None)
             return _result(bool(success), message_id=str(message_id), error=None if success else "card patch failed")
         except Exception as exc:
             if isinstance(exc, UnavailableError):
@@ -534,6 +549,114 @@ async def _patch_interactive_state(adapter: Any, message_id: str, state: dict[st
     if _can_update_interactive_message(adapter):
         return await _update_interactive_message(adapter, message_id, card)
     return False
+
+
+async def _deliver_final_card(
+    adapter: Any,
+    message_id: str,
+    state: dict[str, Any],
+    *,
+    pop: bool,
+) -> Any:
+    card_id = str(state.get("card_id") or "")
+    original_card_id = str(state.get("original_card_id") or "")
+
+    if card_id:
+        try:
+            await _stream_cardkit_content(
+                adapter,
+                card_id,
+                _render_stream_text(state),
+                _next_sequence(state),
+            )
+        except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
+            if isinstance(exc, RateLimitError):
+                logger.debug("multitenancy: Feishu CardKit rate limited (230020) during final stream, skipping frame")
+            else:
+                logger.warning(
+                    "multitenancy: Feishu CardKit final stream failed, falling back to full-card delivery: %s",
+                    exc,
+                )
+                state["card_id"] = None
+
+    if original_card_id:
+        try:
+            await _set_card_streaming_mode(adapter, original_card_id, False, _next_sequence(state))
+        except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
+            logger.warning(
+                "multitenancy: Feishu CardKit failed to close streaming mode, falling back to IM delivery: %s",
+                exc,
+            )
+        else:
+            try:
+                await _update_cardkit_card(
+                    adapter,
+                    original_card_id,
+                    _to_cardkit2(_render_message_card(state)),
+                    _next_sequence(state),
+                )
+            except Exception as exc:
+                if isinstance(exc, UnavailableError):
+                    UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
+                logger.warning(
+                    "multitenancy: Feishu CardKit final card update failed, falling back to IM delivery: %s",
+                    exc,
+                )
+            else:
+                if not state.get("aborted"):
+                    _transition(state, PHASE_COMPLETED)
+                if pop:
+                    _states(adapter).pop(str(message_id), None)
+                return _result(True, message_id=str(message_id))
+
+    patch_success = await _patch_interactive_state(adapter, str(message_id), state)
+    if patch_success:
+        if not state.get("aborted"):
+            _transition(state, PHASE_COMPLETED)
+        if pop:
+            _states(adapter).pop(str(message_id), None)
+        return _result(True, message_id=str(message_id))
+
+    text_success = await _send_plaintext_last_resort(adapter, state)
+    if text_success:
+        if pop:
+            _states(adapter).pop(str(message_id), None)
+        return _result(True, message_id=str(message_id))
+    return _result(False, message_id=str(message_id), error="final delivery failed")
+
+
+async def _send_plaintext_last_resort(adapter: Any, state: dict[str, Any]) -> bool:
+    chat_id = str(state.get("chat_id") or "")
+    if not chat_id:
+        return False
+    content = _render_plaintext_last_resort(state)
+    reply_to = state.get("reply_to")
+    sender = getattr(adapter, "send", None)
+    if callable(sender):
+        response = await sender(chat_id, content, reply_to=reply_to, metadata=None)
+        return bool(getattr(response, "success", False))
+    retry_sender = getattr(adapter, "_feishu_send_with_retry", None)
+    if callable(retry_sender):
+        response = await retry_sender(
+            chat_id=chat_id,
+            msg_type="text",
+            payload=content,
+            reply_to=reply_to,
+            metadata=None,
+        )
+        return bool(getattr(_finalize(adapter, response, "text send failed"), "success", False))
+    return False
+
+
+def _render_plaintext_last_resort(state: dict[str, Any]) -> str:
+    content = _optimize_markdown_style(str(state.get("content") or ""), card_version=2).strip()
+    if content:
+        return content
+    return _plain_summary(str(state.get("status") or "") or "Hermes")
 
 
 def _flush_controllers(adapter: Any) -> dict[str, FlushController]:

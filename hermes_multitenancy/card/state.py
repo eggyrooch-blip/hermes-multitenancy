@@ -64,6 +64,8 @@ _PHASE_TRANSITIONS: dict[CardPhase, frozenset[CardPhase]] = {
 
 def _new_state() -> dict[str, Any]:
     return {
+        "chat_id": "",
+        "reply_to": None,
         "status": "",
         "reasoning": "",
         "reasoning_started_at": None,

@@ -7,6 +7,7 @@ streaming) → reasoning panel → body markdown → Done footer.
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, TypedDict
 
@@ -30,6 +31,8 @@ _TOOLS_ELEMENT_ID = "tool_calls"
 _STREAMING_ELEMENT_ID = "streaming_content"
 _LOADING_ELEMENT_ID = "loading_icon"
 _LOADING_ICON_IMG_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
+_STREAM_CARDKIT_CONTENT_MAX_CHARS = int(os.getenv("HERMES_CARD_STREAM_MAX_CHARS", "8000"))
+_TRUNCATION_SUFFIX = "\n...[truncated]"
 
 
 class _I18nMarkdown(TypedDict):
@@ -92,6 +95,8 @@ def _render_stream_text(state: dict[str, Any]) -> str:
     tools = list(state.get("tools") or [])
     tool_section = _render_tool_calls_section(tools)
     content = _strip_tool_process_narration(content, tools)
+    if len(content) > _STREAM_CARDKIT_CONTENT_MAX_CHARS:
+        content = _clip(content, max(0, _STREAM_CARDKIT_CONTENT_MAX_CHARS - len(_TRUNCATION_SUFFIX)))
 
     parts: list[str] = []
     if content:
