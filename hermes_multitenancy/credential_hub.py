@@ -259,6 +259,22 @@ def _parse_skill_tags(text: str) -> list[str]:
     return [t.strip().strip("\"'").lower() for t in m.group(1).split(",") if t.strip()]
 
 
+def _configured_domain_patterns(env_var: str) -> tuple["re.Pattern[str]", ...]:
+    """Deployment-specific internal domains used for credential detection.
+
+    Kept out of source so this plugin ships no site-specific hostnames. A
+    deployment can restore host-based detection by exporting a comma-separated
+    list, e.g. ``HERMES_MT_KEP_DOMAINS="proxy.cms.internal,ark.internal/aidock-cms"``.
+    Matched case-insensitively against the (already lower-cased) skill text.
+    """
+    raw = os.environ.get(env_var, "")
+    return tuple(
+        re.compile(re.escape(d.strip().lower()))
+        for d in raw.split(",")
+        if d.strip()
+    )
+
+
 def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
     """Which credential ids a skill needs (mirrors detectSkillCredentialRequirements)."""
     text = f"{skill.name}\n{chr(10).join(skill.tags)}\n{skill.text}".lower()
@@ -290,11 +306,9 @@ def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
         re.compile(r"\bkep[-_ ]?cli\b"), re.compile(r"\bkep[-_ ]?auth\b"),
         re.compile(r"\baidock\b"), re.compile(r"\bskillhub\b"),
         re.compile(r"\bkeep[-_ ]?login\b"), re.compile(r"\bproxy[-_ ]?cms\b"),
-        re.compile(r"proxy\.cms\.(pre\.)?example\.com"),
-        re.compile(r"ark\.example\.com/aidock-cms"),
         re.compile(r"skill/zipfile"),
         re.compile(r"\bkep_profile\b"), re.compile(r"\bkep_no_auto_login\b"),
-        re.compile(r"bearer\s+token.*example"),
+        *_configured_domain_patterns("HERMES_MT_KEP_DOMAINS"),
     )):
         required.append(KEP_CLI)
 
@@ -305,8 +319,9 @@ def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
         required.append(KEEP_RECORD)
 
     if any(p.search(text) for p in (
-        re.compile(r"\bgitlab_token\b"), re.compile(r"gitlab\.example\.com"),
+        re.compile(r"\bgitlab_token\b"),
         re.compile(r"oauth2:\$\{?gitlab_token\}?@"),
+        *_configured_domain_patterns("HERMES_MT_GITLAB_DOMAINS"),
     )):
         required.append(GITLAB)
 

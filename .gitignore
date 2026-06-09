@@ -34,3 +34,11 @@ Thumbs.db
 # ftask: per-slug runtime files (env + sim artifacts) — never committed
 .ftask/*/.env
 .ftask/*/sim_artifacts/
+
+# Internal working docs — never publish (privacy)
+/ARCHITECTURE-GUIDE.md
+/CLAUDE.md
+/AGENTS.md
+/ISA-*.md
+/.ftask/
+/docs/plans/
