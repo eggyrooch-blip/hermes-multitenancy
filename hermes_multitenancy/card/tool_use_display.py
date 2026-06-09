@@ -1,9 +1,8 @@
 """Tool-call card rendering: rows, panel, args summary, narration strip.
 
 Renders the openclaw-lark style ``Tool calls`` ``collapsible_panel`` plus the
-inner ``- `tool_name` (Nms)`` rows, last 5 only. Secret-aware args summary
-(masks ``token``/``secret``/``password``/``credential``/``authorization``)
-and host-path narration scrubbing for the tool-process body cleanup.
+inner ``- `tool_name` (Nms)`` rows. Host-path narration scrubbing keeps the
+tool-process body cleanup aligned with the pinned transport contract.
 """
 from __future__ import annotations
 
@@ -11,13 +10,14 @@ import json
 import re
 from typing import Any
 
-from .tool_use_config import _HIDDEN_TOOL_NAMES
+from .secret_redaction import redact_inline_secrets
+from .tool_use_config import _HIDDEN_TOOL_NAMES, _TOOL_ROW_MAX
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
 
 
 def _render_tool_calls_section(tools: list[Any]) -> str:
-    normalized = _normalize_tool_rows(tools)[-5:]
+    normalized = _apply_tool_row_cap(_normalize_tool_rows(tools))
     if not normalized:
         return ""
     lines = [_render_tool_call_line(tool) for tool in normalized]
@@ -79,7 +79,13 @@ def _render_tool_call_line(tool: dict[str, Any]) -> str:
     if tool.get("duration") is not None:
         duration = f"({_format_tool_duration(tool['duration'])})"
         extra = f" failed {duration}" if status == "error" else f" {duration}"
-    return f"- `{name}`{extra}"
+    return redact_inline_secrets(f"- `{name}`{extra}")
+
+
+def _apply_tool_row_cap(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if _TOOL_ROW_MAX <= 0:
+        return tools
+    return tools[-_TOOL_ROW_MAX:]
 
 
 def _format_tool_duration(value: Any) -> str:

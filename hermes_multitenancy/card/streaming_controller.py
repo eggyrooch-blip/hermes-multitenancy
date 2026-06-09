@@ -33,6 +33,7 @@ from .cardkit_client import (
     _update_cardkit_card,
     _update_interactive_message,
 )
+from .flush_controller import FlushController
 from .reasoning import _split_reasoning_text
 from .reply_dispatcher import (
     _can_patch_interactive_message,
@@ -67,6 +68,7 @@ from hermes_multitenancy.card.unavailable_guard import UnavailableGuard
 # firing. The implementation moved under hermes_multitenancy.card.*, but the
 # observable logger name must not change with the modularization.
 logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
+_FLUSH_CONTROLLERS_ATTR = "_hermes_mt_streaming_flush_controllers"
 
 
 def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
@@ -79,6 +81,7 @@ def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
         return adapter
 
     setattr(adapter, _STATE_ATTR, {})
+    setattr(adapter, _FLUSH_CONTROLLERS_ATTR, {})
     adapter.supports_streaming_card = MethodType(_supports_streaming_card, adapter)
     adapter.start_streaming_card = MethodType(_start_streaming_card, adapter)
     adapter.update_streaming_card = MethodType(_update_streaming_card, adapter)
@@ -436,51 +439,74 @@ async def _flush_state(
 ) -> Any:
     if not message_id:
         return _result(False, error="missing message_id")
-    try:
-        card_id = str(state.get("card_id") or "")
-        original_card_id = str(state.get("original_card_id") or "")
-        if final and original_card_id:
+
+    async def _flush_body() -> Any:
+        try:
+            card_id = str(state.get("card_id") or "")
+            original_card_id = str(state.get("original_card_id") or "")
+            if final and original_card_id:
+                if card_id:
+                    await _stream_cardkit_content(
+                        adapter,
+                        card_id,
+                        _render_stream_text(state),
+                        _next_sequence(state),
+                    )
+                await _set_card_streaming_mode(adapter, original_card_id, False, _next_sequence(state))
+                await _update_cardkit_card(adapter, original_card_id, _to_cardkit2(_render_message_card(state)), _next_sequence(state))
+                if not state.get("aborted"):
+                    _transition(state, PHASE_COMPLETED)
+                if pop:
+                    _states(adapter).pop(str(message_id), None)
+                return _result(True, message_id=str(message_id))
+
             if card_id:
-                await _stream_cardkit_content(
-                    adapter,
-                    card_id,
-                    _render_stream_text(state),
-                    _next_sequence(state),
-                )
-            await _set_card_streaming_mode(adapter, original_card_id, False, _next_sequence(state))
-            await _update_cardkit_card(adapter, original_card_id, _to_cardkit2(_render_message_card(state)), _next_sequence(state))
-            if not state.get("aborted"):
+                try:
+                    await _stream_cardkit_content(adapter, card_id, _render_stream_text(state), _next_sequence(state))
+                    return _result(True, message_id=str(message_id))
+                except Exception as exc:
+                    logger.warning(
+                        "multitenancy: Feishu CardKit content update failed, final card will use card.update: %s",
+                        exc,
+                    )
+                    state["card_id"] = None
+                    return _result(True, message_id=str(message_id))
+
+            if original_card_id:
+                return _result(True, message_id=str(message_id))
+
+            success = await _patch_interactive_state(adapter, str(message_id), state)
+            if success and final and not state.get("aborted"):
                 _transition(state, PHASE_COMPLETED)
-            if pop:
+            if success and pop:
                 _states(adapter).pop(str(message_id), None)
+            return _result(bool(success), message_id=str(message_id), error=None if success else "card patch failed")
+        except Exception as exc:
+            if isinstance(exc, UnavailableError):
+                UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
+            logger.warning("multitenancy: Feishu CardKit compat patch failed: %s", exc)
+            return _result(False, message_id=str(message_id), error=str(exc))
+
+    if final:
+        try:
+            return await _flush_body()
+        finally:
+            _flush_controllers(adapter).pop(str(message_id), None)
+
+    try:
+        controller = _flush_controllers(adapter).setdefault(str(message_id), FlushController())
+        result = await controller.flush(_flush_body)
+        if result is None:
             return _result(True, message_id=str(message_id))
-
-        if card_id:
-            try:
-                await _stream_cardkit_content(adapter, card_id, _render_stream_text(state), _next_sequence(state))
-                return _result(True, message_id=str(message_id))
-            except Exception as exc:
-                logger.warning(
-                    "multitenancy: Feishu CardKit content update failed, final card will use card.update: %s",
-                    exc,
-                )
-                state["card_id"] = None
-                return _result(True, message_id=str(message_id))
-
-        if original_card_id:
-            return _result(True, message_id=str(message_id))
-
-        success = await _patch_interactive_state(adapter, str(message_id), state)
-        if success and final and not state.get("aborted"):
-            _transition(state, PHASE_COMPLETED)
-        if success and pop:
-            _states(adapter).pop(str(message_id), None)
-        return _result(bool(success), message_id=str(message_id), error=None if success else "card patch failed")
+        return result
     except Exception as exc:
-        if isinstance(exc, UnavailableError):
-            UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
-        logger.warning("multitenancy: Feishu CardKit compat patch failed: %s", exc)
-        return _result(False, message_id=str(message_id), error=str(exc))
+        logger.warning(
+            "multitenancy: FlushController failed for message_id=%s, falling back to direct flush: %s",
+            message_id,
+            exc,
+        )
+        _flush_controllers(adapter).pop(str(message_id), None)
+        return await _flush_body()
 
 
 async def _patch_interactive_state(adapter: Any, message_id: str, state: dict[str, Any]) -> bool:
@@ -493,3 +519,11 @@ async def _patch_interactive_state(adapter: Any, message_id: str, state: dict[st
     if _can_update_interactive_message(adapter):
         return await _update_interactive_message(adapter, message_id, card)
     return False
+
+
+def _flush_controllers(adapter: Any) -> dict[str, FlushController]:
+    controllers = getattr(adapter, _FLUSH_CONTROLLERS_ATTR, None)
+    if not isinstance(controllers, dict):
+        controllers = {}
+        setattr(adapter, _FLUSH_CONTROLLERS_ATTR, controllers)
+    return controllers
