@@ -81,11 +81,14 @@ def _card_content_throttle_s() -> float:
     """
     raw = os.getenv("HERMES_CARD_CONTENT_THROTTLE_S")
     if raw is None:
-        return 0.12
+        # Just under the consumer's 0.1s content gate so it stays transparent
+        # for content (no double-coarsening) while still coalescing faster
+        # reasoning frames. openclaw CardKit throttle is 100ms.
+        return 0.08
     try:
         return max(0.0, float(raw))
     except ValueError:
-        return 0.12
+        return 0.08
 
 
 def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:

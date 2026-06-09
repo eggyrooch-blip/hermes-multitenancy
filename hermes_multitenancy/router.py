@@ -5549,7 +5549,15 @@ async def _update_feishu_stream_tool_event(
 # time-based throttle is the cross-project contract.
 _STREAM_CONTENT_MIN_CHARS = 120
 _STREAM_CONTENT_MIN_SECONDS = 1.5
-_STREAM_CARDKIT_CONTENT_MIN_CHARS = 30
+# issue #4: was 30 — content was pushed to the card in 30-char jumps, which the
+# CardKit client typewriter (print_step=1, print_strategy=delay) can't smooth.
+# openclaw-lark does NOT char-batch; it pushes accumulated content per 100ms
+# window and lets the client animate char-by-char. Lower this near 1 so we feed
+# the typewriter granularly. Env-tunable for real-machine tuning.
+try:
+    _STREAM_CARDKIT_CONTENT_MIN_CHARS = max(1, int(os.getenv("HERMES_CARD_CONTENT_MIN_CHARS") or "2"))
+except ValueError:
+    _STREAM_CARDKIT_CONTENT_MIN_CHARS = 2
 _STREAM_CARDKIT_CONTENT_MIN_SECONDS = 0.1
 _STREAM_THINKING_MIN_SECONDS = 2.0
 _STREAM_CARD_REASONING_MIN_CHARS = 100
