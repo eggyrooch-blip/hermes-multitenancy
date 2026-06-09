@@ -126,6 +126,17 @@ def _strip_stream_status_animation_markers(text: str) -> str:
     return result
 
 
+def _maybe_budget_footer(content: str, tool_turns: int, cap: int) -> str:
+    """Append a budget-exhaustion footer when the tool-turn cap is reached."""
+    if cap <= 0 or tool_turns < cap:
+        return content
+    footer = f"\n\n---\n⚠️ 已用满 {cap} 步工具预算，以上为目前进展；回复“继续”可接着查。"
+    base = content or ""
+    if base.endswith(footer):
+        return base
+    return base + footer
+
+
 async def stream_run_agent(  # type: ignore[override]
     event: Any,
     profile_home: Path,
@@ -148,6 +159,7 @@ async def stream_run_agent(  # type: ignore[override]
     try:
         content_parts: list[str] = []
         final_text = ""
+        tool_started_count = 0
         stream = (
             _stream_aiagent_subprocess(event, profile_home, messages=messages)
             if messages is not None
@@ -157,6 +169,8 @@ async def stream_run_agent(  # type: ignore[override]
             if kind == "done":
                 final_text = str(payload or "")
                 continue
+            if kind == "tool_started":
+                tool_started_count += 1
             if kind == "content":
                 text = str(payload or "")
                 if text:
@@ -164,8 +178,15 @@ async def stream_run_agent(  # type: ignore[override]
                     yield "content", text
                 continue
             yield kind, payload
-        if final_text and not "".join(content_parts).strip():
+        content_text = "".join(content_parts)
+        if final_text and not content_text.strip():
             yield "content", final_text
+            content_text = final_text
+        cap = int(os.getenv("HERMES_MAX_ITERATIONS", "30"))
+        footer_text = _maybe_budget_footer(content_text, tool_started_count, cap)
+        footer_tail = footer_text[len(content_text):]
+        if footer_tail:
+            yield "content", footer_tail
         if final_text or content_parts:
             return
     except Exception as exc:
@@ -1271,8 +1292,8 @@ def _build_subprocess_env(
     shared_bin = str(_resolve_shared_hermes_home(profile_home) / "bin")
     existing_path = env.get("PATH", "")
     path_parts = [part for part in existing_path.split(os.pathsep) if part]
-    if shared_bin not in path_parts:
-        env["PATH"] = os.pathsep.join([shared_bin, *path_parts]) if path_parts else shared_bin
+    deduped = [part for part in path_parts if part != shared_bin]
+    env["PATH"] = os.pathsep.join([shared_bin, *deduped])
 
     # Mirror _wrap_with_sandbox's toggle + per-profile gate so the subprocess
     # knows it's running inside a sandbox host. tools/approval.py reads
