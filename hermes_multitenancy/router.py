@@ -10,6 +10,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import importlib
 import ipaddress
 import inspect
 import json
@@ -1687,6 +1688,189 @@ def _image_prep_unavailable_note(event: Any, *, reason: str = "provider") -> str
     )
 
 
+_AUX_MAIN_RUNTIME_FIELDS = (
+    "_RUNTIME_MAIN_PROVIDER",
+    "_RUNTIME_MAIN_MODEL",
+    "_RUNTIME_MAIN_BASE_URL",
+    "_RUNTIME_MAIN_API_KEY",
+    "_RUNTIME_MAIN_API_MODE",
+)
+
+
+def _matching_custom_provider_entry(config: dict[str, Any], provider: str) -> Optional[dict[str, Any]]:
+    """Return the custom provider entry that backs ``provider`` if present."""
+    provider_l = str(provider or "").strip().lower()
+    if not (provider_l == "custom" or provider_l.startswith("custom:")):
+        return None
+    custom_providers = config.get("custom_providers")
+    if not isinstance(custom_providers, list):
+        return None
+    model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
+    model_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    want_name = provider_l.split(":", 1)[1].strip() if ":" in provider_l else ""
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip().lower().replace(" ", "-")
+        base_url = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "").strip().rstrip("/")
+        if want_name:
+            matched = name == want_name
+        else:
+            matched = bool(model_base_url) and base_url == model_base_url
+        if matched:
+            return entry
+    return None
+
+
+def _profile_main_runtime_for_image_prep(profile_home: Path) -> Optional[dict[str, str]]:
+    """Build a normalized main-model runtime for Hermes auxiliary image prep."""
+    try:
+        from .agent_real import (
+            _load_profile_config,
+            _resolve_custom_provider_api_key,
+            _split_model_spec,
+        )
+    except Exception as exc:
+        logger.debug("multitenancy: cannot import profile model helpers for image prep (%s)", exc)
+        return None
+
+    try:
+        config = _load_profile_config(Path(profile_home))
+    except Exception as exc:
+        logger.debug("multitenancy: cannot load profile config for image prep profile_home=%s (%s)", profile_home, exc)
+        return None
+
+    model_cfg_raw = config.get("model")
+    if isinstance(model_cfg_raw, dict):
+        model_cfg = model_cfg_raw
+        default_spec = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        provider = str(model_cfg.get("provider") or "").strip().lower()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+    elif isinstance(model_cfg_raw, str):
+        model_cfg = {}
+        default_spec = model_cfg_raw.strip()
+        provider = ""
+        base_url = ""
+    else:
+        model_cfg = {}
+        default_spec = ""
+        provider = ""
+        base_url = ""
+
+    parsed_provider = ""
+    model_name = default_spec
+    if default_spec and "/" in default_spec:
+        try:
+            parsed_provider, parsed_model = _split_model_spec(default_spec)
+            if not provider:
+                provider = parsed_provider
+            if not provider or provider == parsed_provider or parsed_provider.startswith("custom:"):
+                model_name = parsed_model
+        except Exception as exc:
+            logger.debug("multitenancy: cannot split profile model spec %r (%s)", default_spec, exc)
+
+    entry = _matching_custom_provider_entry(config, provider)
+    if entry is not None:
+        if not base_url:
+            base_url = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "").strip()
+        if not model_name:
+            model_name = str(entry.get("model") or "").strip()
+        api_mode = str(entry.get("api_mode") or "").strip()
+    else:
+        api_mode = str(model_cfg.get("api_mode") or "").strip()
+
+    api_key = ""
+    try:
+        api_key = str(_resolve_custom_provider_api_key(config, provider) or "").strip()
+    except Exception as exc:
+        logger.debug("multitenancy: cannot resolve custom provider api key for image prep (%s)", exc)
+
+    if not (provider and model_name):
+        return None
+    return {
+        "provider": provider,
+        "model": model_name,
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_mode": api_mode,
+    }
+
+
+def _install_auxiliary_main_runtime_patch(runtime: Optional[dict[str, str]]) -> tuple[Optional[Any], dict[str, tuple[bool, Any]]]:
+    """Patch hermes-agent auxiliary runtime readers under the env lock."""
+    if not runtime:
+        return None, {}
+    try:
+        auxiliary_client = importlib.import_module("agent.auxiliary_client")
+    except Exception as exc:
+        logger.debug("multitenancy: agent.auxiliary_client unavailable for image prep runtime (%s)", exc)
+        return None, {}
+
+    attrs = tuple(_AUX_MAIN_RUNTIME_FIELDS) + ("_read_main_provider", "_read_main_model")
+    saved = {name: (hasattr(auxiliary_client, name), getattr(auxiliary_client, name, None)) for name in attrs}
+    provider = runtime.get("provider", "")
+    model = runtime.get("model", "")
+    base_url = runtime.get("base_url", "")
+    api_key = runtime.get("api_key", "")
+    api_mode = runtime.get("api_mode", "")
+
+    set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
+    if callable(set_runtime_main):
+        try:
+            set_runtime_main(provider, model, base_url=base_url, api_key=api_key, api_mode=api_mode)
+        except Exception as exc:
+            logger.debug("multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)", exc)
+
+    setattr(auxiliary_client, "_read_main_provider", lambda: provider)
+    setattr(auxiliary_client, "_read_main_model", lambda: model)
+    return auxiliary_client, saved
+
+
+def _restore_auxiliary_main_runtime_patch(auxiliary_client: Optional[Any], saved: dict[str, tuple[bool, Any]]) -> None:
+    if auxiliary_client is None:
+        return
+    for name, (had_attr, value) in saved.items():
+        try:
+            if had_attr:
+                setattr(auxiliary_client, name, value)
+            else:
+                delattr(auxiliary_client, name)
+        except Exception as exc:
+            logger.debug("multitenancy: failed to restore auxiliary runtime attr %s (%s)", name, exc)
+
+
+@asynccontextmanager
+async def _profile_image_prep_runtime(profile_home: Optional[Path]):
+    """Temporarily scope Hermes' private inbound media preprocessing to a profile."""
+    if profile_home is None:
+        yield
+        return
+
+    from .runtime import HERMES_HOME_ENV, _PROFILE_HOME_VAR, _get_env_lock
+
+    profile_home = Path(profile_home)
+    runtime = _profile_main_runtime_for_image_prep(profile_home)
+    token = _PROFILE_HOME_VAR.set(profile_home)
+    try:
+        async with _get_env_lock():
+            had_home = HERMES_HOME_ENV in os.environ
+            old_home = os.environ.get(HERMES_HOME_ENV)
+            auxiliary_client = None
+            saved_aux: dict[str, tuple[bool, Any]] = {}
+            try:
+                os.environ[HERMES_HOME_ENV] = str(profile_home)
+                auxiliary_client, saved_aux = _install_auxiliary_main_runtime_patch(runtime)
+                yield
+            finally:
+                _restore_auxiliary_main_runtime_patch(auxiliary_client, saved_aux)
+                if had_home:
+                    os.environ[HERMES_HOME_ENV] = old_home or ""
+                else:
+                    os.environ.pop(HERMES_HOME_ENV, None)
+    finally:
+        _PROFILE_HOME_VAR.reset(token)
+
+
 def _materialize_inbound_media_for_profile(event: Any, profile_home: Path) -> None:
     """Copy gateway-cached inbound media into the routed profile boundary."""
     media_urls = getattr(event, "media_urls", None) or []
@@ -1754,7 +1938,12 @@ def _materialize_inbound_media_for_profile(event: Any, profile_home: Path) -> No
             setattr(event, "text", text)
 
 
-async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]:
+async def _enrich_via_hermes_pipeline(
+    event: Any,
+    gateway: Any,
+    *,
+    profile_home: Optional[Path] = None,
+) -> Optional[str]:
     """Delegate inbound preprocessing to hermes' ``_prepare_inbound_message_text``.
 
     This is the single call that mainstream uses to:
@@ -1774,42 +1963,64 @@ async def _enrich_via_hermes_pipeline(event: Any, gateway: Any) -> Optional[str]
     Returns:
         Enriched text string, or None on failure (caller falls back to event.text).
     """
-    native_text: Optional[str] = None
-    if _event_has_image_media(event):
-        strategy = os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_STRATEGY", "gateway").strip().lower()
-        if strategy in {"blocked", "block", "skip", "disabled", "off"}:
-            logger.warning(
-                "multitenancy: image preprocessing blocked by strategy message_id=%s",
-                _event_message_id(event) or "",
-            )
-            return _image_prep_unavailable_note(event)
+    media_profile_home = profile_home if (getattr(event, "media_urls", None) or []) else None
+    async with _profile_image_prep_runtime(media_profile_home):
+        native_text: Optional[str] = None
+        if _event_has_image_media(event):
+            strategy = os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_STRATEGY", "gateway").strip().lower()
+            if strategy in {"blocked", "block", "skip", "disabled", "off"}:
+                logger.warning(
+                    "multitenancy: image preprocessing blocked by strategy message_id=%s",
+                    _event_message_id(event) or "",
+                )
+                return _image_prep_unavailable_note(event)
 
-    prep = getattr(gateway, "_prepare_inbound_message_text", None)
-    if gateway is None or prep is None or not callable(prep):
-        logger.debug("multitenancy: gateway._prepare_inbound_message_text unavailable")
-    else:
-        source = getattr(event, "source", None)
-        if source is not None:
-            try:
-                prep_call = prep(event=event, source=source, history=[])
-                if _event_has_image_media(event):
-                    timeout_s = float(os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_TIMEOUT_S", "30"))
-                    native_text = await asyncio.wait_for(prep_call, timeout=max(0.1, timeout_s))
-                else:
-                    native_text = await prep_call
-            except asyncio.TimeoutError:
-                logger.warning("multitenancy: image preprocessing timed out")
-                native_text = _image_prep_unavailable_note(event, reason="timeout")
-            except Exception as exc:
-                logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
+        prep = getattr(gateway, "_prepare_inbound_message_text", None)
+        if gateway is None or prep is None or not callable(prep):
+            logger.debug("multitenancy: gateway._prepare_inbound_message_text unavailable")
+        else:
+            source = getattr(event, "source", None)
+            if source is not None:
+                try:
+                    prep_call = prep(event=event, source=source, history=[])
+                    if _event_has_image_media(event):
+                        timeout_s = float(os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_TIMEOUT_S", "30"))
+                        native_text = await asyncio.wait_for(prep_call, timeout=max(0.1, timeout_s))
+                    else:
+                        native_text = await prep_call
+                except asyncio.TimeoutError:
+                    logger.warning("multitenancy: image preprocessing timed out")
+                    native_text = _image_prep_unavailable_note(event, reason="timeout")
+                except Exception as exc:
+                    logger.debug("multitenancy: gateway._prepare_inbound_message_text failed (%s)", exc)
 
-    local_file_text = _local_enrich_with_file_content(event, existing_text=native_text or "")
-    if local_file_text:
-        return _append_enrichment(native_text or getattr(event, "text", "") or "", local_file_text)
+        local_file_text = _local_enrich_with_file_content(event, existing_text=native_text or "")
+        if local_file_text:
+            return _append_enrichment(native_text or getattr(event, "text", "") or "", local_file_text)
 
-    if native_text:
-        return native_text
-    return await _local_enrich_with_vision_only(event)
+        if native_text:
+            return native_text
+        return await _local_enrich_with_vision_only(event)
+
+
+async def _call_enrich_via_hermes_pipeline(
+    event: Any,
+    gateway: Any,
+    *,
+    profile_home: Optional[Path],
+) -> Optional[str]:
+    """Call enrichment with profile context while preserving monkeypatch compatibility."""
+    try:
+        params = inspect.signature(_enrich_via_hermes_pipeline).parameters
+    except (TypeError, ValueError):
+        params = {}
+    accepts_profile_home = "profile_home" in params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
+    if accepts_profile_home:
+        return await _enrich_via_hermes_pipeline(event, gateway, profile_home=profile_home)
+    return await _enrich_via_hermes_pipeline(event, gateway)
 
 
 def _append_enrichment(base: str, enrichment: str) -> str:
@@ -2397,7 +2608,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # file-only Feishu events have empty event.text.  The enriched content is
         # the real prompt and the dedupe/admission key should reflect it.
         _materialize_inbound_media_for_profile(event, profile_home)
-        enriched_text = await _enrich_via_hermes_pipeline(event, gateway)
+        enriched_text = await _call_enrich_via_hermes_pipeline(event, gateway, profile_home=profile_home)
         vision_blocked = _image_vision_unavailable_response(event, enriched_text)
         if vision_blocked:
             logger.info(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -61,6 +62,86 @@ async def test_pipeline_uses_gateway_prepare_when_available():
     assert result == "ENRICHED: hi from user"
     assert captured["event_text"] == "hi from user"
     assert captured["history"] == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_scopes_custom_profile_runtime_for_gateway_image_prep(monkeypatch, tmp_path):
+    """Feishu image pre-analysis must not pass Hermes custom model ids to LiteLLM."""
+    from hermes_multitenancy.router import _enrich_via_hermes_pipeline
+
+    shared_home = tmp_path / ".hermes"
+    profile_home = shared_home / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  default: custom:litellm-sre/tencent-sonnet-4-6",
+                "  provider: custom:litellm-sre",
+                "  base_url: https://litellm.sre.example/v1",
+                "custom_providers:",
+                "- name: litellm-sre",
+                "  base_url: https://litellm.sre.example/v1",
+                "  api_key: sk-test",
+                "  model: tencent-sonnet-4-6",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    fake_aux = types.ModuleType("agent.auxiliary_client")
+    fake_aux._RUNTIME_MAIN_PROVIDER = ""
+    fake_aux._RUNTIME_MAIN_MODEL = ""
+    fake_aux._RUNTIME_MAIN_BASE_URL = ""
+    fake_aux._RUNTIME_MAIN_API_KEY = ""
+    fake_aux._RUNTIME_MAIN_API_MODE = ""
+    runtime_calls = []
+
+    def set_runtime_main(provider, model, *, base_url="", api_key="", api_mode=""):
+        runtime_calls.append(
+            {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+            }
+        )
+        fake_aux._RUNTIME_MAIN_PROVIDER = provider
+        fake_aux._RUNTIME_MAIN_MODEL = model
+        fake_aux._RUNTIME_MAIN_BASE_URL = base_url
+        fake_aux._RUNTIME_MAIN_API_KEY = api_key
+        fake_aux._RUNTIME_MAIN_API_MODE = api_mode
+
+    fake_aux.set_runtime_main = set_runtime_main
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+    monkeypatch.setenv("HERMES_HOME", str(shared_home / "profiles" / "multitenancy_router"))
+
+    class FakeGateway:
+        async def _prepare_inbound_message_text(self, *, event, source, history):
+            assert os.environ["HERMES_HOME"] == str(profile_home)
+            assert fake_aux._RUNTIME_MAIN_PROVIDER == "custom:litellm-sre"
+            assert fake_aux._RUNTIME_MAIN_MODEL == "tencent-sonnet-4-6"
+            assert fake_aux._RUNTIME_MAIN_BASE_URL == "https://litellm.sre.example/v1"
+            assert fake_aux._RUNTIME_MAIN_API_KEY == "sk-test"
+            return "ENRICHED IMAGE"
+
+    event = _make_event(text="", media_urls=[str(profile_home / "cache" / "images" / "x.jpg")], media_types=["image/jpeg"])
+    result = await _enrich_via_hermes_pipeline(event, FakeGateway(), profile_home=profile_home)
+
+    assert result == "ENRICHED IMAGE"
+    assert runtime_calls == [
+        {
+            "provider": "custom:litellm-sre",
+            "model": "tencent-sonnet-4-6",
+            "base_url": "https://litellm.sre.example/v1",
+            "api_key": "sk-test",
+            "api_mode": "",
+        }
+    ]
+    assert os.environ["HERMES_HOME"] == str(shared_home / "profiles" / "multitenancy_router")
 
 
 @pytest.mark.asyncio
