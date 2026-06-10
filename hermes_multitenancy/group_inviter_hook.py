@@ -24,6 +24,8 @@ import functools
 import logging
 from typing import Any
 
+from .feishu_auth_cards import send_auth_card
+
 logger = logging.getLogger(__name__)
 
 import threading as _threading
@@ -126,15 +128,25 @@ def _patch_chat_added_welcome(FeishuAdapter: Any) -> None:
                 # Duplicate bot-added redelivery — already welcomed.
                 return None
             try:
-                await self.send(
-                    chat_id,
-                    "👋 已加入此群。@我提问即可，群里不会以任何成员的身份调用飞书数据。"
-                    "如需以你本人身份调用飞书 API，请私聊我后发送 `/feishu_auth`。",
-                )
+                card = _build_group_welcome_card(chat_id)
+                await send_auth_card(adapter=self, chat_id=chat_id, card=card)
             except Exception:
                 logger.debug(
-                    "[multitenancy] group welcome send failed for chat=%s", chat_id
+                    "[multitenancy] group welcome card send failed for chat=%s",
+                    chat_id,
+                    exc_info=True,
                 )
+                try:
+                    await self.send(
+                        chat_id,
+                        "👋 已加入此群。@我提问即可，群里不会以任何成员的身份调用飞书数据。"
+                        "如需以你本人身份调用飞书 API，请私聊我后发送 `/feishu_auth`。",
+                    )
+                except Exception:
+                    logger.debug(
+                        "[multitenancy] group welcome send failed for chat=%s",
+                        chat_id,
+                    )
             return None
         return await original(self, chat_id)
 
@@ -192,6 +204,83 @@ def _capture_inviter_from_event(data: Any) -> None:
     )
 
 
+def _build_group_welcome_card(chat_id: str) -> dict[str, Any]:
+    body_zh = (
+        "👋 已加入此群。默认是 **仅回复 @我**，避免打扰群聊。"
+        "\n\n如果你希望我回复群里的每条消息，可以直接点下面的按钮切换。"
+        "\n\n<font color='grey'>如需以你本人身份调用飞书 API，请私聊我后发送 `/feishu_auth`。</font>"
+    )
+    body_en = (
+        "I joined this group. The default is **reply only when mentioned**."
+        "\n\nUse the buttons below to choose the group reply mode."
+        "\n\n<font color='grey'>For Feishu API calls as yourself, DM me and send `/feishu_auth`.</font>"
+    )
+    return {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": False,
+            "update_multi": True,
+            "locales": ["zh_cn", "en_us"],
+        },
+        "header": {
+            "title": _plain_i18n("欢迎设置群回复模式", "Choose group reply mode"),
+            "subtitle": {"tag": "plain_text", "content": ""},
+            "template": "blue",
+            "padding": "12px 12px 12px 12px",
+            "icon": {"tag": "standard_icon", "token": "robot_filled"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": body_en,
+                    "i18n_content": _i18n(body_zh, body_en),
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "stretch",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [
+                                {
+                                    "tag": "button",
+                                    "text": _plain_i18n("仅回复 @我", "Mention only"),
+                                    "type": "default",
+                                    "value": {
+                                        "hermes_action": "group_reply_mode",
+                                        "mode": "mention",
+                                        "chat_id": chat_id,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [
+                                {
+                                    "tag": "button",
+                                    "text": _plain_i18n("回复所有消息", "Reply to all"),
+                                    "type": "primary",
+                                    "value": {
+                                        "hermes_action": "group_reply_mode",
+                                        "mode": "all",
+                                        "chat_id": chat_id,
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+            ]
+        },
+    }
+
+
 def _read_first(obj: Any, names: tuple[str, ...]) -> Any:
     if obj is None:
         return None
@@ -206,3 +295,11 @@ def _read_first(obj: Any, names: tuple[str, ...]) -> Any:
         if value:
             return value
     return None
+
+
+def _plain_i18n(zh: str, en: str) -> dict[str, Any]:
+    return {"tag": "plain_text", "content": en, "i18n_content": _i18n(zh, en)}
+
+
+def _i18n(zh: str, en: str) -> dict[str, str]:
+    return {"zh_cn": zh, "en_us": en}

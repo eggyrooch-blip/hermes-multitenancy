@@ -197,13 +197,13 @@ def test_install_hook_idempotent():
 
 def test_install_hook_patches_chat_added_welcome_for_groups():
     """The class-level patch must replace _send_chat_added_onboarding with a
-    group-aware wrapper that sends the group message when chat_type is 'group'.
+    group-aware wrapper that sends the welcome card when chat_type is 'group'.
     """
     import asyncio
     from hermes_multitenancy import group_inviter_hook
     import sys, types
 
-    sent = []
+    sent_cards = []
 
     class FakeFeishuAdapter:
         def __init__(self):
@@ -213,13 +213,17 @@ def test_install_hook_patches_chat_added_welcome_for_groups():
             return {"type": "group", "name": "测试群"}
 
         async def send(self, chat_id, text):
-            sent.append((chat_id, text))
+            raise AssertionError("group welcome should use send_auth_card, not plain text")
 
         async def _on_bot_added_to_chat(self, data):
             return None
 
         async def _send_chat_added_onboarding(self, chat_id):
             await self.send(chat_id, "ORIGINAL_P2P_WELCOME")
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        sent_cards.append((chat_id, card, metadata))
+        return {"message_id": "om_card"}
 
     fake_module = types.ModuleType("gateway.platforms.feishu")
     fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
@@ -231,8 +235,11 @@ def test_install_hook_patches_chat_added_welcome_for_groups():
             sys.modules[name] = types.ModuleType(name)
     sys.modules["gateway.platforms.feishu"] = fake_module
     group_inviter_hook._HOOK_INSTALLED = False
+    group_inviter_hook._welcomed_chats.clear()
     original_welcome = FakeFeishuAdapter._send_chat_added_onboarding
+    original_send_auth_card = getattr(group_inviter_hook, "send_auth_card", None)
     try:
+        group_inviter_hook.send_auth_card = fake_send_auth_card
         group_inviter_hook.install_feishu_bot_added_hook()
         assert FakeFeishuAdapter._send_chat_added_onboarding is not original_welcome
 
@@ -241,14 +248,86 @@ def test_install_hook_patches_chat_added_welcome_for_groups():
         adapter._chat_info_cache["oc_group"] = {"type": "group", "name": "测试群"}
 
         asyncio.run(adapter._send_chat_added_onboarding("oc_group"))
-        assert sent, "wrapper should have sent the group welcome"
-        chat_id, text = sent[-1]
+        assert sent_cards, "wrapper should have sent the group welcome card"
+        chat_id, card, metadata = sent_cards[-1]
         assert chat_id == "oc_group"
-        assert "群" in text and "/feishu_auth" in text
-        # Original p2p text MUST NOT have been sent — the wrapper short-circuited
-        assert "ORIGINAL_P2P_WELCOME" not in text
+        assert metadata is None
+        actions = card["body"]["elements"][1]["columns"]
+        assert card["schema"] == "2.0"
+        assert "回复模式" in str(card)
+        assert actions[0]["elements"][0]["value"]["mode"] == "mention"
+        assert actions[1]["elements"][0]["value"]["mode"] == "all"
     finally:
         FakeFeishuAdapter._send_chat_added_onboarding = original_welcome
+        group_inviter_hook.send_auth_card = original_send_auth_card
+        group_inviter_hook._welcomed_chats.clear()
+        if saved_module is None:
+            sys.modules.pop("gateway.platforms.feishu", None)
+        else:
+            sys.modules["gateway.platforms.feishu"] = saved_module
+        for name, mod in saved_parents.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        group_inviter_hook._HOOK_INSTALLED = False
+
+
+def test_group_welcome_falls_back_to_plain_text_when_card_send_fails():
+    import asyncio
+    import sys
+    import types
+
+    from hermes_multitenancy import group_inviter_hook
+
+    sent = []
+
+    class FakeFeishuAdapter:
+        def __init__(self):
+            self._chat_info_cache = {
+                "oc_group_fallback": {"type": "group", "name": "测试群"}
+            }
+
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        async def _on_bot_added_to_chat(self, data):
+            return None
+
+        async def _send_chat_added_onboarding(self, chat_id):
+            await self.send(chat_id, "ORIGINAL_P2P_WELCOME")
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        raise RuntimeError("card send failed")
+
+    fake_module = types.ModuleType("gateway.platforms.feishu")
+    fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
+    parents = ("gateway", "gateway.platforms")
+    saved_parents = {name: sys.modules.get(name) for name in parents}
+    saved_module = sys.modules.get("gateway.platforms.feishu")
+    for name in parents:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules["gateway.platforms.feishu"] = fake_module
+    group_inviter_hook._HOOK_INSTALLED = False
+    group_inviter_hook._welcomed_chats.clear()
+    original_welcome = FakeFeishuAdapter._send_chat_added_onboarding
+    original_send_auth_card = getattr(group_inviter_hook, "send_auth_card", None)
+    try:
+        group_inviter_hook.send_auth_card = fake_send_auth_card
+        group_inviter_hook.install_feishu_bot_added_hook()
+
+        asyncio.run(FakeFeishuAdapter()._send_chat_added_onboarding("oc_group_fallback"))
+
+        assert sent
+        chat_id, text = sent[-1]
+        assert chat_id == "oc_group_fallback"
+        assert "已加入此群" in text
+        assert "/feishu_auth" in text
+    finally:
+        FakeFeishuAdapter._send_chat_added_onboarding = original_welcome
+        group_inviter_hook.send_auth_card = original_send_auth_card
+        group_inviter_hook._welcomed_chats.clear()
         if saved_module is None:
             sys.modules.pop("gateway.platforms.feishu", None)
         else:
@@ -354,7 +433,7 @@ def test_group_welcome_deduplicated_on_redelivery():
     import asyncio, sys, types
     from hermes_multitenancy import group_inviter_hook
 
-    sent = []
+    sent_cards = []
 
     class FakeFeishuAdapter:
         def __init__(self):
@@ -362,11 +441,15 @@ def test_group_welcome_deduplicated_on_redelivery():
         async def get_chat_info(self, chat_id):
             return {"type": "group"}
         async def send(self, chat_id, text):
-            sent.append((chat_id, text))
+            raise AssertionError("dedup test should go through send_auth_card")
         async def _on_bot_added_to_chat(self, data):
             return None
         async def _send_chat_added_onboarding(self, chat_id):
             await self.send(chat_id, "ORIG")
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        sent_cards.append((chat_id, card, metadata))
+        return {"message_id": "om_card"}
 
     fake_module = types.ModuleType("gateway.platforms.feishu")
     fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
@@ -380,16 +463,18 @@ def test_group_welcome_deduplicated_on_redelivery():
     with group_inviter_hook._welcomed_chats_lock:
         group_inviter_hook._welcomed_chats.clear()
     orig = FakeFeishuAdapter._send_chat_added_onboarding
+    original_send_auth_card = getattr(group_inviter_hook, "send_auth_card", None)
     try:
+        group_inviter_hook.send_auth_card = fake_send_auth_card
         group_inviter_hook.install_feishu_bot_added_hook()
         a = FakeFeishuAdapter()
         asyncio.run(a._send_chat_added_onboarding("oc_dedup"))
         asyncio.run(a._send_chat_added_onboarding("oc_dedup"))  # redelivery
         asyncio.run(a._send_chat_added_onboarding("oc_dedup"))  # redelivery
-        group_welcomes = [m for _c, m in sent if "群" in m]
-        assert len(group_welcomes) == 1, f"expected 1 welcome, got {len(group_welcomes)}"
+        assert len(sent_cards) == 1, f"expected 1 welcome card, got {len(sent_cards)}"
     finally:
         FakeFeishuAdapter._send_chat_added_onboarding = orig
+        group_inviter_hook.send_auth_card = original_send_auth_card
         if saved_module is None:
             sys.modules.pop("gateway.platforms.feishu", None)
         else:

@@ -19,11 +19,14 @@ Read/write contract (per design D6 in review v2 + group-profile extension):
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Default db path — independent from ~/.hermes/state.db so router writes don't
 # contend with gateway sessions/pairing/cron writes for the WAL.
@@ -32,6 +35,8 @@ DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
 KIND_USER = "user"
 KIND_GROUP = "group"
 KIND_AGENT = "agent"
+_DEFAULT_REPLY_MODE = "mention"
+_VALID_REPLY_MODES = frozenset({"mention", "all"})
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS multitenancy_routing (
@@ -49,7 +54,8 @@ CREATE TABLE IF NOT EXISTS multitenancy_routing (
     kind           TEXT NOT NULL DEFAULT 'user',
     chat_id        TEXT,
     owner_open_id  TEXT,
-    display_label  TEXT
+    display_label  TEXT,
+    reply_mode     TEXT NOT NULL DEFAULT 'mention'
 );
 
 -- Pending inviter capture closes the restart / multi-worker hazard between
@@ -73,6 +79,7 @@ _NEW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("agent_id", "TEXT"),
     ("upstream_profile", "TEXT"),
     ("provenance", "TEXT NOT NULL DEFAULT 'auto'"),
+    ("reply_mode", "TEXT NOT NULL DEFAULT 'mention'"),
 )
 
 # Old (pre-group) index name to drop before recreating a kind-aware version.
@@ -139,6 +146,7 @@ class RoutingRow:
     chat_id: Optional[str] = None
     owner_open_id: Optional[str] = None
     display_label: Optional[str] = None
+    reply_mode: Optional[str] = None
     # Multi-user/multi-agent columns (US-03/US-04). Defaulted + Optional so
     # callers and column-list SELECTs that predate them keep working; SELECT *
     # lookups (e.g. lookup_agent) populate them from the row.
@@ -656,6 +664,33 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def get_group_reply_mode(self, chat_id: str) -> str:
+        cur = self._conn.execute(
+            "SELECT reply_mode FROM multitenancy_routing "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group' LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        mode = str(row["reply_mode"] or "").strip() if row else ""
+        if mode in _VALID_REPLY_MODES:
+            return mode
+        return _DEFAULT_REPLY_MODE
+
+    def set_group_reply_mode(self, chat_id: str, mode: str) -> None:
+        if mode not in _VALID_REPLY_MODES:
+            raise ValueError(f"invalid reply mode: {mode}")
+        cur = self._conn.execute(
+            "UPDATE multitenancy_routing SET reply_mode = ?, updated_at = ? "
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
+            (mode, _now(), chat_id),
+        )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            logger.debug(
+                "[multitenancy] group reply mode update no-op for missing chat_id=%s",
+                chat_id,
+            )
+
     def soft_delete(self, user_id: str) -> bool:
         """Mark a route as inactive (kind-agnostic). Returns True on update."""
         now = _now()
@@ -707,6 +742,7 @@ def _row_to_dataclass(row: sqlite3.Row) -> RoutingRow:
         chat_id=row["chat_id"] if "chat_id" in row.keys() else None,
         owner_open_id=row["owner_open_id"] if "owner_open_id" in row.keys() else None,
         display_label=row["display_label"] if "display_label" in row.keys() else None,
+        reply_mode=row["reply_mode"] if "reply_mode" in row.keys() else None,
         agent_id=row["agent_id"] if "agent_id" in row.keys() else None,
         provenance=row["provenance"] if "provenance" in row.keys() else None,
         upstream_profile=row["upstream_profile"] if "upstream_profile" in row.keys() else None,
