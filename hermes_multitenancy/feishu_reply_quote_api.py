@@ -44,6 +44,7 @@ _HOOK_INSTALLED = False
 _PROCESS_FLAG = "_hermes_multitenancy_reply_quote_sender_capture_patched"
 _FETCH_FLAG = "_hermes_multitenancy_reply_quote_fetch_patched"
 _DISPATCH_FLAG = "_hermes_multitenancy_reply_quote_media_dispatch_patched"
+_TEXT_BATCH_FLAG = "_hermes_multitenancy_reply_quote_media_text_batch_patched"
 _REPLY_SENDER_ATTR = "_mt_reply_quote_sender_by_parent_mid"
 _REPLY_MEDIA_ATTR = "_mt_reply_quote_media_by_parent_mid"
 _REPLY_SENDER_MAP_MAX = 256
@@ -64,6 +65,40 @@ def _reply_media_map(adapter: Any) -> dict[str, list[tuple[str, str]]]:
         mapping = {}
         setattr(adapter, _REPLY_MEDIA_ATTR, mapping)
     return mapping
+
+
+def _event_media_pairs(event: Any) -> list[tuple[str, str]]:
+    urls = list(getattr(event, "media_urls", None) or [])
+    media_types = list(getattr(event, "media_types", None) or [])
+    pairs: list[tuple[str, str]] = []
+    for index, url in enumerate(urls):
+        path = str(url or "").strip()
+        if not path:
+            continue
+        media_type = str(media_types[index] if index < len(media_types) else "" or "application/octet-stream")
+        pairs.append((path, media_type))
+    return pairs
+
+
+def _append_event_media(event: Any, media: list[tuple[str, str]]) -> int:
+    if not media:
+        return 0
+    existing_urls = list(getattr(event, "media_urls", None) or [])
+    existing_types = list(getattr(event, "media_types", None) or [])
+    while len(existing_types) < len(existing_urls):
+        existing_types.append("application/octet-stream")
+    seen = set(existing_urls)
+    added = 0
+    for path, media_type in media:
+        if path and path not in seen:
+            existing_urls.append(path)
+            existing_types.append(media_type or "application/octet-stream")
+            seen.add(path)
+            added += 1
+    if added:
+        setattr(event, "media_urls", existing_urls)
+        setattr(event, "media_types", existing_types)
+    return added
 
 
 def _reply_prefix(message_id: str) -> str:
@@ -295,6 +330,7 @@ def install_feishu_reply_quote_api_patch() -> None:
     _patch_process_inbound(FeishuAdapter)
     _patch_fetch_message_text(FeishuAdapter)
     _patch_dispatch_inbound_event(FeishuAdapter)
+    _patch_enqueue_text_event(FeishuAdapter)
     _HOOK_INSTALLED = True
 
 
@@ -384,20 +420,11 @@ def _patch_dispatch_inbound_event(FeishuAdapter: Any) -> None:
             reply_to_message_id = str(getattr(event, "reply_to_message_id", "") or "")
             media = _reply_media_map(self).pop(reply_to_message_id, []) if reply_to_message_id else []
             if media:
-                existing_urls = list(getattr(event, "media_urls", None) or [])
-                existing_types = list(getattr(event, "media_types", None) or [])
-                seen = set(existing_urls)
-                for path, media_type in media:
-                    if path and path not in seen:
-                        existing_urls.append(path)
-                        existing_types.append(media_type)
-                        seen.add(path)
-                setattr(event, "media_urls", existing_urls)
-                setattr(event, "media_types", existing_types)
+                added = _append_event_media(event, media)
                 logger.info(
                     "[multitenancy] attached reply quote media to inbound event (reply_mid=%s, media=%d)",
                     reply_to_message_id,
-                    len(media),
+                    added,
                 )
         except Exception:
             logger.debug("[multitenancy] reply quote media dispatch attachment failed", exc_info=True)
@@ -405,3 +432,44 @@ def _patch_dispatch_inbound_event(FeishuAdapter: Any) -> None:
 
     setattr(wrapped, _DISPATCH_FLAG, True)
     FeishuAdapter._dispatch_inbound_event = wrapped
+
+
+def _patch_enqueue_text_event(FeishuAdapter: Any) -> None:
+    original = getattr(FeishuAdapter, "_enqueue_text_event", None)
+    if original is None or getattr(original, _TEXT_BATCH_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    async def wrapped(self: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
+        incoming_media = _event_media_pairs(event)
+        batch_key = None
+        before_existing = None
+        if incoming_media:
+            try:
+                pending_batches = getattr(self, "_pending_text_batches", None)
+                text_batch_key = getattr(self, "_text_batch_key", None)
+                if isinstance(pending_batches, dict) and callable(text_batch_key):
+                    batch_key = text_batch_key(event)
+                    before_existing = pending_batches.get(batch_key)
+            except Exception:
+                logger.debug("[multitenancy] reply quote text batch media probe failed", exc_info=True)
+
+        result = await original(self, event, *args, **kwargs)
+
+        if incoming_media and batch_key is not None and before_existing is not None:
+            try:
+                pending_batches = getattr(self, "_pending_text_batches", None)
+                after_existing = pending_batches.get(batch_key) if isinstance(pending_batches, dict) else None
+                if after_existing is before_existing:
+                    added = _append_event_media(after_existing, incoming_media)
+                    if added:
+                        logger.info(
+                            "[multitenancy] preserved reply quote media through text batch merge (media=%d)",
+                            added,
+                        )
+            except Exception:
+                logger.debug("[multitenancy] reply quote text batch media preservation failed", exc_info=True)
+        return result
+
+    setattr(wrapped, _TEXT_BATCH_FLAG, True)
+    FeishuAdapter._enqueue_text_event = wrapped

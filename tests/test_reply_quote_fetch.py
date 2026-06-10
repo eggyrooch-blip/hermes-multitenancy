@@ -21,8 +21,11 @@ def _install_fake_feishu():
     class FakeFeishuAdapter:
         def __init__(self) -> None:
             self._message_text_cache: dict[str, str] = {}
+            self._pending_text_batches: dict[str, Any] = {}
+            self._pending_text_batch_counts: dict[str, int] = {}
             self.fetch_calls: list[str] = []
             self.downloaded_images: list[tuple[str, str]] = []
+            self.scheduled_batch_keys: list[str] = []
             self.last_event: Any = None
             self.last_reply_to_message_id: str | None = None
             self.last_reply_to_text: str | None = None
@@ -69,6 +72,45 @@ def _install_fake_feishu():
             self.last_reply_to_text = event.reply_to_text
             self.last_media_urls = list(event.media_urls)
             self.last_media_types = list(event.media_types)
+
+        def _text_batch_key(self, event: Any) -> str:
+            return str(getattr(event, "batch_key", "") or "default")
+
+        @staticmethod
+        def _text_batch_is_compatible(existing: Any, incoming: Any) -> bool:
+            return (
+                existing.reply_to_message_id == incoming.reply_to_message_id
+                and existing.reply_to_text == incoming.reply_to_text
+                and existing.source.thread_id == incoming.source.thread_id
+            )
+
+        def _schedule_text_batch_flush(self, key: str) -> None:
+            self.scheduled_batch_keys.append(key)
+
+        async def _enqueue_text_event(self, event: Any) -> None:
+            key = self._text_batch_key(event)
+            existing = self._pending_text_batches.get(key)
+            if existing is None:
+                self._pending_text_batches[key] = event
+                self._pending_text_batch_counts[key] = 1
+                self._schedule_text_batch_flush(key)
+                return
+            if not self._text_batch_is_compatible(existing, event):
+                self._pending_text_batches[key] = event
+                self._pending_text_batch_counts[key] = 1
+                self._schedule_text_batch_flush(key)
+                return
+            appended_text = event.text or ""
+            existing.text = (
+                f"{existing.text}\n{appended_text}"
+                if existing.text and appended_text
+                else (existing.text or appended_text)
+            )
+            existing.timestamp = event.timestamp
+            if event.message_id:
+                existing.message_id = event.message_id
+            self._pending_text_batch_counts[key] = self._pending_text_batch_counts.get(key, 1) + 1
+            self._schedule_text_batch_flush(key)
 
         async def _download_feishu_image(self, *, message_id: str, image_key: str) -> tuple[str, str]:
             self.downloaded_images.append((message_id, image_key))
@@ -414,6 +456,50 @@ async def test_reply_quote_patch_keeps_p2p_reply_text_enrichment(
 
 
 @pytest.mark.asyncio
+async def test_reply_quote_patch_preserves_quoted_media_when_text_batch_merges() -> None:
+    FakeFeishuAdapter, saved = _install_fake_feishu()
+    try:
+        reply_module = _load_reply_module()
+        reply_module.install_feishu_reply_quote_api_patch()
+        adapter = FakeFeishuAdapter()
+        source = SimpleNamespace(thread_id=None)
+        first = SimpleNamespace(
+            batch_key="chat",
+            text="first",
+            media_urls=[],
+            media_types=[],
+            reply_to_message_id="om_parent_batch",
+            reply_to_text="[message_id=om_parent_batch] Bob: [image]",
+            source=source,
+            timestamp=1,
+            message_id="om_first",
+        )
+        second = SimpleNamespace(
+            batch_key="chat",
+            text="second",
+            media_urls=["/tmp/om_parent_batch-img_1.jpg"],
+            media_types=["image/jpeg"],
+            reply_to_message_id="om_parent_batch",
+            reply_to_text="[message_id=om_parent_batch] Bob: [image]",
+            source=source,
+            timestamp=2,
+            message_id="om_second",
+        )
+
+        await adapter._enqueue_text_event(first)
+        await adapter._enqueue_text_event(second)
+
+        batched = adapter._pending_text_batches["chat"]
+        assert batched is first
+        assert batched.text == "first\nsecond"
+        assert batched.message_id == "om_second"
+        assert batched.media_urls == ["/tmp/om_parent_batch-img_1.jpg"]
+        assert batched.media_types == ["image/jpeg"]
+    finally:
+        _restore(saved)
+
+
+@pytest.mark.asyncio
 async def test_reply_quote_patch_fails_open_to_original_text(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeFeishuAdapter, saved = _install_fake_feishu()
     try:
@@ -493,11 +579,13 @@ async def test_reply_quote_patch_install_and_enrichment_are_idempotent(monkeypat
         wrapped_process = FakeFeishuAdapter._process_inbound_message
         wrapped_fetch = FakeFeishuAdapter._fetch_message_text
         wrapped_dispatch = FakeFeishuAdapter._dispatch_inbound_event
+        wrapped_enqueue = FakeFeishuAdapter._enqueue_text_event
         reply_module.install_feishu_reply_quote_api_patch()
 
         assert FakeFeishuAdapter._process_inbound_message is wrapped_process
         assert FakeFeishuAdapter._fetch_message_text is wrapped_fetch
         assert FakeFeishuAdapter._dispatch_inbound_event is wrapped_dispatch
+        assert FakeFeishuAdapter._enqueue_text_event is wrapped_enqueue
 
         monkeypatch.setattr(
             reply_module,

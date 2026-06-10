@@ -16,11 +16,12 @@ from types import SimpleNamespace
 import pytest
 
 
-def _make_event(text="hi", media_urls=None, media_types=None):
+def _make_event(text="hi", media_urls=None, media_types=None, message_type="text"):
     return SimpleNamespace(
         text=text,
         media_urls=media_urls or [],
         media_types=media_types or [],
+        message_type=message_type,
         reply_to_text=None,
         source=SimpleNamespace(
             chat_id="c", user_id="u", user_id_alt=None,
@@ -53,6 +54,8 @@ async def test_pipeline_uses_gateway_prepare_when_available():
     class FakeGateway:
         async def _prepare_inbound_message_text(self, *, event, source, history):
             captured["event_text"] = event.text
+            captured["media_urls"] = list(event.media_urls)
+            captured["message_type"] = event.message_type
             captured["source_user"] = source.user_id
             captured["history"] = history
             return "ENRICHED: " + event.text
@@ -61,6 +64,8 @@ async def test_pipeline_uses_gateway_prepare_when_available():
     result = await _enrich_via_hermes_pipeline(event, FakeGateway())
     assert result == "ENRICHED: hi from user"
     assert captured["event_text"] == "hi from user"
+    assert captured["media_urls"] == ["/tmp/x.png"]
+    assert captured["message_type"] == "text"
     assert captured["history"] == []
 
 
