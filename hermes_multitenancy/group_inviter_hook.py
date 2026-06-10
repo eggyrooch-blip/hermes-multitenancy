@@ -20,6 +20,7 @@ message for group chats.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from typing import Any
@@ -80,12 +81,20 @@ def install_feishu_bot_added_hook() -> None:
         )
         return
 
-    _patch_bot_added(FeishuAdapter)
+    # Upstream cores (prod runs NousResearch upstream) have NO
+    # _send_chat_added_onboarding — the fork-only welcome was lost on the
+    # upstream realign, which is why prod stopped sending any group welcome.
+    # When that method is absent, the welcome card must be sent straight from
+    # the _on_bot_added_to_chat wrapper (which DOES exist upstream); otherwise
+    # we ride the existing _send_chat_added_onboarding path and let this
+    # wrapper stay welcome-free to avoid a double send.
+    has_onboarding = getattr(FeishuAdapter, "_send_chat_added_onboarding", None) is not None
+    _patch_bot_added(FeishuAdapter, send_welcome=not has_onboarding)
     _patch_chat_added_welcome(FeishuAdapter)
     _HOOK_INSTALLED = True
 
 
-def _patch_bot_added(FeishuAdapter: Any) -> None:
+def _patch_bot_added(FeishuAdapter: Any, *, send_welcome: bool = False) -> None:
     original = getattr(FeishuAdapter, "_on_bot_added_to_chat", None)
     if original is None:
         logger.warning(
@@ -103,11 +112,44 @@ def _patch_bot_added(FeishuAdapter: Any) -> None:
             logger.exception(
                 "[multitenancy] inviter capture failed; deferring to original handler"
             )
-        return original(self, data)
+        result = original(self, data)
+        # im.chat.member.bot.added_v1 fires only for group/topic chats, so the
+        # group welcome card is always the right surface here. Only used when
+        # the core lacks _send_chat_added_onboarding (upstream/prod).
+        if send_welcome:
+            try:
+                _schedule_group_welcome_card(self, data)
+            except Exception:
+                logger.debug(
+                    "[multitenancy] could not schedule group welcome card",
+                    exc_info=True,
+                )
+        return result
 
     setattr(wrapped, _CLASS_PATCH_FLAG, True)
     FeishuAdapter._on_bot_added_to_chat = wrapped
-    logger.info("[multitenancy] installed bot-added inviter hook on FeishuAdapter class")
+    logger.info(
+        "[multitenancy] installed bot-added inviter hook on FeishuAdapter class "
+        "(welcome_card_here=%s)",
+        send_welcome,
+    )
+
+
+def _schedule_group_welcome_card(adapter: Any, data: Any) -> None:
+    """Schedule the welcome card on the adapter loop (sync callback context)."""
+    event = getattr(data, "event", None)
+    chat_id = str(getattr(event, "chat_id", "") or "")
+    if not chat_id:
+        return
+    loop = getattr(adapter, "_loop", None)
+    accepts = getattr(adapter, "_loop_accepts_callbacks", None)
+    if loop is None or (callable(accepts) and not accepts(loop)):
+        logger.debug(
+            "[multitenancy] adapter loop not ready; skipping welcome card for chat=%s",
+            chat_id,
+        )
+        return
+    asyncio.run_coroutine_threadsafe(_send_group_welcome_card(adapter, chat_id), loop)
 
 
 def _patch_chat_added_welcome(FeishuAdapter: Any) -> None:
@@ -124,35 +166,45 @@ def _patch_chat_added_welcome(FeishuAdapter: Any) -> None:
     async def wrapped(self: Any, chat_id: str) -> Any:
         chat_type = await _resolve_chat_type(self, chat_id)
         if chat_type in ("group", "topic"):
-            if _mark_and_check_welcomed(chat_id):
-                # Duplicate bot-added redelivery — already welcomed.
-                return None
-            try:
-                card = _build_group_welcome_card(chat_id)
-                await send_auth_card(adapter=self, chat_id=chat_id, card=card)
-            except Exception:
-                logger.debug(
-                    "[multitenancy] group welcome card send failed for chat=%s",
-                    chat_id,
-                    exc_info=True,
-                )
-                try:
-                    await self.send(
-                        chat_id,
-                        "👋 已加入此群。@我提问即可，群里不会以任何成员的身份调用飞书数据。"
-                        "如需以你本人身份调用飞书 API，请私聊我后发送 `/feishu_auth`。",
-                    )
-                except Exception:
-                    logger.debug(
-                        "[multitenancy] group welcome send failed for chat=%s",
-                        chat_id,
-                    )
+            await _send_group_welcome_card(self, chat_id)
             return None
         return await original(self, chat_id)
 
     setattr(wrapped, _WELCOME_PATCH_FLAG, True)
     FeishuAdapter._send_chat_added_onboarding = wrapped
     logger.info("[multitenancy] installed group-aware welcome on FeishuAdapter class")
+
+
+async def _send_group_welcome_card(adapter: Any, chat_id: str) -> None:
+    """Send the group reply-mode welcome card once per chat (dedup-guarded).
+
+    Shared by both welcome paths: the _send_chat_added_onboarding wrapper
+    (fork cores) and the _on_bot_added_to_chat wrapper (upstream/prod cores
+    that lack the onboarding method). The dedup makes concurrent paths safe.
+    """
+    if _mark_and_check_welcomed(chat_id):
+        # Duplicate bot-added redelivery / second welcome path — already sent.
+        return
+    try:
+        card = _build_group_welcome_card(chat_id)
+        await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
+    except Exception:
+        logger.debug(
+            "[multitenancy] group welcome card send failed for chat=%s",
+            chat_id,
+            exc_info=True,
+        )
+        try:
+            await adapter.send(
+                chat_id,
+                "👋 已加入此群。默认仅回复 @我。"
+                "如需以你本人身份调用飞书 API，请私聊我后发送 `/feishu_auth`。",
+            )
+        except Exception:
+            logger.debug(
+                "[multitenancy] group welcome text fallback send failed for chat=%s",
+                chat_id,
+            )
 
 
 async def _resolve_chat_type(adapter: Any, chat_id: str) -> str:

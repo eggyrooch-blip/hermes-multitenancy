@@ -489,6 +489,110 @@ def test_group_welcome_deduplicated_on_redelivery():
             group_inviter_hook._welcomed_chats.clear()
 
 
+def test_upstream_core_without_onboarding_sends_card_via_bot_added():
+    """Prod runs upstream core which has NO _send_chat_added_onboarding.
+
+    In that case the welcome card must be sent straight from the
+    _on_bot_added_to_chat wrapper (the only welcome hook upstream has),
+    otherwise prod sends no group welcome at all — the regression sunke saw.
+    """
+    import asyncio
+    import sys
+    import types
+
+    from hermes_multitenancy import group_inviter_hook
+
+    scheduled = []
+    sent_cards = []
+
+    # Upstream adapter: note there is NO _send_chat_added_onboarding here.
+    class UpstreamFeishuAdapter:
+        def __init__(self):
+            self._loop = object()  # sentinel; run_coroutine_threadsafe is patched
+
+        def _loop_accepts_callbacks(self, loop):
+            return True
+
+        async def send(self, chat_id, text):
+            raise AssertionError("should send card, not plain text, on happy path")
+
+        def _on_bot_added_to_chat(self, data):
+            return "orig"
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        sent_cards.append((chat_id, card))
+        return {"message_id": "om_card"}
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        scheduled.append((coro, loop))
+
+        class _F:
+            def add_done_callback(self, *_a, **_k):
+                pass
+
+        return _F()
+
+    fake_module = types.ModuleType("gateway.platforms.feishu")
+    fake_module.FeishuAdapter = UpstreamFeishuAdapter  # type: ignore[attr-defined]
+    parents = ("gateway", "gateway.platforms")
+    saved_parents = {n: sys.modules.get(n) for n in parents}
+    saved_module = sys.modules.get("gateway.platforms.feishu")
+    for n in parents:
+        sys.modules.setdefault(n, types.ModuleType(n))
+    sys.modules["gateway.platforms.feishu"] = fake_module
+
+    group_inviter_hook._HOOK_INSTALLED = False
+    with group_inviter_hook._welcomed_chats_lock:
+        group_inviter_hook._welcomed_chats.clear()
+    orig_method = UpstreamFeishuAdapter._on_bot_added_to_chat
+    original_send_auth_card = getattr(group_inviter_hook, "send_auth_card", None)
+    original_rcts = group_inviter_hook.asyncio.run_coroutine_threadsafe
+    try:
+        group_inviter_hook.send_auth_card = fake_send_auth_card
+        group_inviter_hook.asyncio.run_coroutine_threadsafe = fake_run_coroutine_threadsafe
+        group_inviter_hook.install_feishu_bot_added_hook()
+
+        # Wrapper installed even though there is no onboarding method.
+        assert UpstreamFeishuAdapter._on_bot_added_to_chat is not orig_method
+
+        adapter = UpstreamFeishuAdapter()
+        payload = SimpleNamespace(
+            event=SimpleNamespace(
+                chat_id="oc_upstream",
+                operator_id=SimpleNamespace(open_id="ou_inv"),
+            ),
+        )
+        # SDK invokes the (sync) wrapped handler.
+        assert adapter._on_bot_added_to_chat(payload) == "orig"
+
+        # The welcome card coroutine was scheduled on the adapter loop.
+        assert len(scheduled) == 1, "welcome card must be scheduled via the bot-added path"
+        coro, loop = scheduled[0]
+        assert loop is adapter._loop
+        # Run the scheduled coroutine to confirm it actually emits the card.
+        asyncio.run(coro)
+        assert sent_cards, "scheduled coroutine should send the welcome card"
+        chat_id, card = sent_cards[-1]
+        assert chat_id == "oc_upstream"
+        assert "回复模式" in str(card)
+    finally:
+        UpstreamFeishuAdapter._on_bot_added_to_chat = orig_method
+        group_inviter_hook.send_auth_card = original_send_auth_card
+        group_inviter_hook.asyncio.run_coroutine_threadsafe = original_rcts
+        if saved_module is None:
+            sys.modules.pop("gateway.platforms.feishu", None)
+        else:
+            sys.modules["gateway.platforms.feishu"] = saved_module
+        for n, m in saved_parents.items():
+            if m is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = m
+        group_inviter_hook._HOOK_INSTALLED = False
+        with group_inviter_hook._welcomed_chats_lock:
+            group_inviter_hook._welcomed_chats.clear()
+
+
 def test_welcomed_chats_set_is_bounded():
     from hermes_multitenancy import group_inviter_hook
     with group_inviter_hook._welcomed_chats_lock:
