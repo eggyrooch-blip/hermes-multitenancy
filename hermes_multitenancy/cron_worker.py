@@ -115,6 +115,8 @@ def install_cron_runtime_patches() -> None:
     install_feishu_inbound_richtext_patch()
     from .feishu_merge_forward_api import install_feishu_merge_forward_api_patch
     install_feishu_merge_forward_api_patch()
+    from .feishu_reply_quote_api import install_feishu_reply_quote_api_patch
+    install_feishu_reply_quote_api_patch()
     from .feishu_reaction_lifecycle import install_feishu_reaction_lifecycle_patch
     install_feishu_reaction_lifecycle_patch()
     _runtime_patches_installed = True
