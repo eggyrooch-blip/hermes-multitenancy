@@ -140,6 +140,7 @@ def _patch_process_inbound(FeishuAdapter: Any) -> None:
             reply_to_message_id = (
                 getattr(message, "parent_id", None)
                 or getattr(message, "upper_message_id", None)
+                or getattr(message, "root_id", None)
                 or ""
             )
             replying_open_id = str(getattr(sender_id, "open_id", "") or "")

@@ -47,6 +47,7 @@ def _install_fake_feishu():
             reply_to_message_id = (
                 getattr(message, "parent_id", None)
                 or getattr(message, "upper_message_id", None)
+                or getattr(message, "root_id", None)
                 or None
             )
             reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
@@ -147,6 +148,48 @@ async def test_reply_quote_patch_replaces_degraded_parent_text_even_if_core_cach
         assert adapter.last_reply_to_message_id == "om_parent_1"
         assert adapter.last_reply_to_text == "[message_id=om_parent_1] Alice: 完整引用正文"
         assert adapter._message_text_cache["om_parent_1"] == "正文: img <key> text"
+    finally:
+        _restore(saved)
+
+
+@pytest.mark.asyncio
+async def test_reply_quote_patch_uses_root_id_when_feishu_reply_only_sets_thread_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeFeishuAdapter, saved = _install_fake_feishu()
+    try:
+        reply_module = _load_reply_module()
+        reply_module.install_feishu_reply_quote_api_patch()
+        adapter = FakeFeishuAdapter()
+        message = SimpleNamespace(parent_id=None, upper_message_id=None, root_id="om_root_parent")
+        sender_id = SimpleNamespace(open_id="ou_replying_user")
+
+        monkeypatch.setattr(
+            reply_module,
+            "_fetch_parent_message_blocking",
+            lambda message_id, replying_open_id: {
+                "message_id": message_id,
+                "msg_type": "text",
+                "body": {"content": json.dumps({"text": "root id 引用正文"}, ensure_ascii=False)},
+                "sender": {"id": "ou_parent_author"},
+            },
+        )
+        monkeypatch.setattr(
+            reply_module,
+            "_resolve_names_blocking",
+            lambda open_ids, replying_open_id: {"ou_parent_author": "Alice"},
+        )
+
+        await adapter._process_inbound_message(
+            data={},
+            message=message,
+            sender_id=sender_id,
+            chat_type="group",
+            message_id="om_reply_root",
+        )
+
+        assert adapter.last_reply_to_message_id == "om_root_parent"
+        assert adapter.last_reply_to_text == "[message_id=om_root_parent] Alice: root id 引用正文"
     finally:
         _restore(saved)
 

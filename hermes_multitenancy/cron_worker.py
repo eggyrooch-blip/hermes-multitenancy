@@ -40,7 +40,15 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
 
-from .credential_renewal_common import find_marker_for_open_id, read_needs_reauth_marker
+from .credential_renewal_common import (
+    clear_needs_reauth_marker,
+    classify_uat_payload,
+    find_marker_for_open_id,
+    iter_uat_locations,
+    payload_access_expired,
+    payload_refresh_expired,
+    read_needs_reauth_marker,
+)
 from .feishu_inbound_richtext import install_feishu_inbound_richtext_patch
 from .run_broker import RunBroker
 from .run_models import RunRequest
@@ -492,6 +500,8 @@ def _l4_check_needs_reauth_and_defer(
     marker = find_marker_for_open_id(shared_home, owner_open_id)
     if marker is None:
         return None
+    if _clear_stale_reauth_markers_if_uat_recovered(shared_home, owner_open_id, marker):
+        return None
     marker_body = read_needs_reauth_marker(marker) or {}
     reason = str(marker_body.get("reason") or "unknown")
 
@@ -531,6 +541,65 @@ def _l4_check_needs_reauth_and_defer(
         f"待 owner 重新授权 / 管理员修正 app scope 后会自动恢复。"
     )
     return False, output, "", error_msg
+
+
+def _clear_stale_reauth_markers_if_uat_recovered(
+    shared_home: Path,
+    owner_open_id: str,
+    marker: Path,
+) -> bool:
+    """Return True when a newer, valid UAT makes existing reauth markers stale."""
+    try:
+        marker_mtime = marker.stat().st_mtime
+    except OSError:
+        return False
+
+    recovered_mtime: float | None = None
+    for loc in iter_uat_locations(shared_home):
+        if loc.open_id != owner_open_id:
+            continue
+        try:
+            uat_mtime = loc.path.stat().st_mtime
+            if uat_mtime <= marker_mtime:
+                continue
+            payload = json.loads(loc.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if classify_uat_payload(payload) is not None:
+            continue
+        if payload_access_expired(payload) or payload_refresh_expired(payload):
+            continue
+        recovered_mtime = max(recovered_mtime or 0.0, uat_mtime)
+
+    if recovered_mtime is None:
+        return False
+
+    for stale_marker in _iter_reauth_markers_for_open_id(shared_home, owner_open_id):
+        try:
+            if stale_marker.stat().st_mtime <= recovered_mtime:
+                clear_needs_reauth_marker(stale_marker)
+        except OSError:
+            continue
+    logger.info(
+        "[multitenancy] L4 ignored stale reauth marker for owner=%s because a newer valid UAT exists",
+        owner_open_id,
+    )
+    return True
+
+
+def _iter_reauth_markers_for_open_id(shared_home: Path, open_id: str) -> list[Path]:
+    markers = [shared_home / "feishu_uat" / f"{open_id}.needs_reauth"]
+    profiles_dir = shared_home / "profiles"
+    try:
+        profile_dirs = list(profiles_dir.iterdir())
+    except OSError:
+        profile_dirs = []
+    for profile_dir in profile_dirs:
+        if profile_dir.is_dir():
+            markers.append(profile_dir / "feishu_uat" / f"{open_id}.needs_reauth")
+    return markers
 
 
 def _cron_user_key(job: dict, profile_name: str) -> str:
