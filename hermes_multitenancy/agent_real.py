@@ -1205,6 +1205,15 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
     "HERMES_VOD_IMAGE_MODEL_OVERRIDE",
+    # RunBroker auth so the sandboxed agent's cronjob(action=run) tool can
+    # authenticate to the router-owned RunBroker (:8766). Shared infra key
+    # (server enforces per-profile scope via X-Hermes-Profile / X-Hermes-User-Key),
+    # same class as the credential keys above — not a per-user secret. Without
+    # it the child sends no Bearer token and the cron trigger gets 401.
+    "HERMES_RUN_BROKER_KEY",
+    "HERMES_MULTITENANCY_RUN_BROKER_KEY",
+    "HERMES_RUN_BROKER_URL",
+    "HERMES_MULTITENANCY_RUN_BROKER_URL",
 })
 
 _FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
