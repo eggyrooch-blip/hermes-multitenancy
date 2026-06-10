@@ -14,6 +14,7 @@ from .router import _get_routing_table
 logger = logging.getLogger(__name__)
 
 _HOOK_INSTALLED = False
+_REQUIRE_MENTION_FLAG = "_hermes_multitenancy_group_valve_require_mention_patched"
 _SHOULD_ACCEPT_FLAG = "_hermes_multitenancy_group_valve_should_accept_patched"
 _CARD_ACTION_FLAG = "_hermes_multitenancy_group_valve_card_action_patched"
 _VALID_REPLY_MODES = frozenset({"mention", "all"})
@@ -30,9 +31,49 @@ def install_feishu_group_valve_patch() -> None:
             "[multitenancy] FeishuAdapter not importable yet; group valve patch deferred"
         )
         return
+    # Two gate shapes across core versions:
+    #  - upstream/prod (v0.16.0): _admit() -> _require_mention_for(chat_id) -> bool.
+    #    'all' mode means "don't require a mention", so we make that bool False.
+    #  - fork/local: _should_accept_group_message(message, sender_id, chat_id).
+    # Patch whichever exists; both fail-open to the original.
+    _patch_require_mention_for(FeishuAdapter)
     _patch_should_accept_group_message(FeishuAdapter)
     _patch_on_card_action_trigger(FeishuAdapter)
     _HOOK_INSTALLED = True
+
+
+def _patch_require_mention_for(FeishuAdapter: Any) -> None:
+    """Prod path: flip _require_mention_for(chat_id) to False for 'all' groups.
+
+    In _admit(), ``require_mention = is_group and self._require_mention_for(chat_id)``
+    and a non-mention group message is rejected only ``if require_mention``. So
+    returning False admits every group message. The group-policy gate
+    (_allow_group_message) runs separately in _admit and is left untouched.
+    """
+    original = getattr(FeishuAdapter, "_require_mention_for", None)
+    if original is None or getattr(original, _REQUIRE_MENTION_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def wrapped(self: Any, chat_id: Any = "") -> Any:
+        normalized_chat_id = str(chat_id or "")
+        try:
+            if normalized_chat_id:
+                table = _get_routing_table()
+                if table is not None and table.get_group_reply_mode(normalized_chat_id) == "all":
+                    return False
+        except Exception:
+            logger.debug(
+                "[multitenancy] require-mention valve failed; delegating to original",
+                exc_info=True,
+            )
+        return original(self, chat_id)
+
+    setattr(wrapped, _REQUIRE_MENTION_FLAG, True)
+    FeishuAdapter._require_mention_for = wrapped
+    logger.info(
+        "[multitenancy] installed group reply valve on FeishuAdapter._require_mention_for"
+    )
 
 
 def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
@@ -111,8 +152,7 @@ def _handle_group_reply_mode_action(
         table = _get_routing_table()
         if table is None or not chat_id:
             return _toast_response("暂时无法保存设置，请稍后再试")
-        row = table.lookup_by_chat_id(chat_id)
-        owner_open_id = str(getattr(row, "owner_open_id", "") or "")
+        owner_open_id = _resolve_group_owner(table, chat_id)
         if (
             not operator_open_id
             or not owner_open_id
@@ -127,6 +167,29 @@ def _handle_group_reply_mode_action(
             exc_info=True,
         )
         return _toast_response("暂时无法保存设置，请稍后再试")
+
+
+def _resolve_group_owner(table: Any, chat_id: str) -> str:
+    """The owner = inviter. Right after bot-added the group routing row may not
+    be provisioned yet (that happens on the first routed group message), but the
+    inviter is already in the pending table. Check the provisioned row first,
+    then fall back to the pending inviter so the real owner is never wrongly
+    denied when they tap the welcome card immediately.
+    """
+    try:
+        row = table.lookup_by_chat_id(chat_id)
+        owner = str(getattr(row, "owner_open_id", "") or "")
+        if owner:
+            return owner
+    except Exception:
+        logger.debug("[multitenancy] owner lookup_by_chat_id failed", exc_info=True)
+    try:
+        pending = table.get_pending_inviter(chat_id)
+        if pending:
+            return str(pending)
+    except Exception:
+        logger.debug("[multitenancy] owner get_pending_inviter failed", exc_info=True)
+    return ""
 
 
 def _event_operator_open_id(event: Any) -> str:
