@@ -11,6 +11,9 @@ existing merge-forward API machinery:
   parent message through ``GET /open-apis/im/v1/messages/{message_id}`` using
   that replying user's UAT, and returns an agent-visible
   ``[message_id=<id>] <sender>: <full content>`` string.
+- If the parent message carries image/file resources, the patch downloads them
+  through the adapter's bot/app message-resource path and attaches the cached
+  local paths to the inbound event before Hermes' native media preprocessing.
 
 Any UAT/API failure is fail-open: the wrapper falls back to core's original
 bot-token lookup so inbound delivery never breaks.
@@ -40,8 +43,11 @@ logger = logging.getLogger(__name__)
 _HOOK_INSTALLED = False
 _PROCESS_FLAG = "_hermes_multitenancy_reply_quote_sender_capture_patched"
 _FETCH_FLAG = "_hermes_multitenancy_reply_quote_fetch_patched"
+_DISPATCH_FLAG = "_hermes_multitenancy_reply_quote_media_dispatch_patched"
 _REPLY_SENDER_ATTR = "_mt_reply_quote_sender_by_parent_mid"
+_REPLY_MEDIA_ATTR = "_mt_reply_quote_media_by_parent_mid"
 _REPLY_SENDER_MAP_MAX = 256
+_QUOTE_MEDIA_MAX = 8
 
 
 def _reply_sender_map(adapter: Any) -> dict[str, str]:
@@ -49,6 +55,14 @@ def _reply_sender_map(adapter: Any) -> dict[str, str]:
     if not isinstance(mapping, dict):
         mapping = {}
         setattr(adapter, _REPLY_SENDER_ATTR, mapping)
+    return mapping
+
+
+def _reply_media_map(adapter: Any) -> dict[str, list[tuple[str, str]]]:
+    mapping = getattr(adapter, _REPLY_MEDIA_ATTR, None)
+    if not isinstance(mapping, dict):
+        mapping = {}
+        setattr(adapter, _REPLY_MEDIA_ATTR, mapping)
     return mapping
 
 
@@ -90,13 +104,162 @@ async def _fetch_parent_message(message_id: str, replying_open_id: str) -> Optio
     return await asyncio.to_thread(_fetch_parent_message_blocking, message_id, replying_open_id)
 
 
-async def _build_reply_quote_text(message_id: str, replying_open_id: str) -> Optional[str]:
+def _item_raw_content(item: dict[str, Any]) -> str:
+    body = item.get("body") or {}
+    raw_content = body.get("content") if isinstance(body, dict) else ""
+    if isinstance(raw_content, (dict, list)):
+        raw_content = json.dumps(raw_content, ensure_ascii=False)
+    return str(raw_content or "")
+
+
+def _load_item_payload(item: dict[str, Any]) -> Any:
+    raw_content = _item_raw_content(item)
+    try:
+        return json.loads(raw_content) if raw_content else {}
+    except Exception:
+        return {}
+
+
+def _collect_nested_strings(value: Any, key: str) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            found.append(raw.strip())
+        for child in value.values():
+            found.extend(_collect_nested_strings(child, key))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_collect_nested_strings(child, key))
+    return found
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value and value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
+
+
+def _normalize_parent_item(item: dict[str, Any]) -> Any:
+    try:
+        from gateway.platforms.feishu import normalize_feishu_message  # type: ignore
+
+        return normalize_feishu_message(
+            message_type=str(item.get("msg_type") or ""),
+            raw_content=_item_raw_content(item),
+            mentions=item.get("mentions"),
+        )
+    except Exception:
+        return None
+
+
+def _parent_image_keys(item: dict[str, Any], normalized: Any) -> list[str]:
+    keys = [str(value or "").strip() for value in (getattr(normalized, "image_keys", None) or [])]
+    if not keys:
+        keys = _collect_nested_strings(_load_item_payload(item), "image_key")
+    return _unique_strings([value for value in keys if value])
+
+
+def _media_ref_value(ref: Any, key: str) -> str:
+    if isinstance(ref, dict):
+        return str(ref.get(key) or "").strip()
+    return str(getattr(ref, key, "") or "").strip()
+
+
+def _parent_media_refs(item: dict[str, Any], normalized: Any) -> list[tuple[str, str, str]]:
+    refs: list[tuple[str, str, str]] = []
+    for ref in getattr(normalized, "media_refs", None) or []:
+        file_key = _media_ref_value(ref, "file_key")
+        if not file_key:
+            continue
+        resource_type = _media_ref_value(ref, "resource_type") or "file"
+        file_name = _media_ref_value(ref, "file_name")
+        refs.append((file_key, resource_type, file_name))
+    if not refs:
+        payload = _load_item_payload(item)
+        for file_key in _collect_nested_strings(payload, "file_key"):
+            refs.append((file_key, "file", ""))
+    unique: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for file_key, resource_type, file_name in refs:
+        key = (file_key, resource_type)
+        if key not in seen:
+            unique.append((file_key, resource_type, file_name))
+            seen.add(key)
+    return unique
+
+
+async def _download_reply_quote_media(adapter: Any, message_id: str, item: dict[str, Any]) -> list[tuple[str, str]]:
+    normalized = _normalize_parent_item(item)
+    media: list[tuple[str, str]] = []
+
+    download_image = getattr(adapter, "_download_feishu_image", None)
+    if callable(download_image):
+        for image_key in _parent_image_keys(item, normalized):
+            if len(media) >= _QUOTE_MEDIA_MAX:
+                break
+            try:
+                cached_path, media_type = await download_image(message_id=message_id, image_key=image_key)
+            except Exception:
+                logger.debug("[multitenancy] reply quote image download failed (mid=%s)", message_id, exc_info=True)
+                continue
+            if cached_path:
+                media.append((str(cached_path), str(media_type or "image/jpeg")))
+
+    download_resource = getattr(adapter, "_download_feishu_message_resource", None)
+    if callable(download_resource):
+        for file_key, resource_type, file_name in _parent_media_refs(item, normalized):
+            if len(media) >= _QUOTE_MEDIA_MAX:
+                break
+            try:
+                cached_path, media_type = await download_resource(
+                    message_id=message_id,
+                    file_key=file_key,
+                    resource_type=resource_type,
+                    fallback_filename=file_name,
+                )
+            except Exception:
+                logger.debug(
+                    "[multitenancy] reply quote resource download failed (mid=%s key=%s)",
+                    message_id,
+                    file_key,
+                    exc_info=True,
+                )
+                continue
+            if cached_path:
+                media.append((str(cached_path), str(media_type or "application/octet-stream")))
+
+    deduped: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+    for path, media_type in media:
+        if path and path not in seen_paths:
+            deduped.append((path, media_type))
+            seen_paths.add(path)
+    return deduped
+
+
+def _append_quote_media_notes(text: Optional[str], media: list[tuple[str, str]]) -> Optional[str]:
+    if not media:
+        return text
+    lines: list[str] = [text] if text else []
+    for path, _media_type in media:
+        lines.append(f"[Quoted media saved at: {path}]")
+    return "\n".join(line for line in lines if line)
+
+
+async def _build_reply_quote_context(
+    adapter: Any,
+    message_id: str,
+    replying_open_id: str,
+) -> tuple[Optional[str], list[tuple[str, str]]]:
     item = await _fetch_parent_message(message_id, replying_open_id)
     if not item:
-        return None
+        return None, []
     full_content = str(_item_text(item) or "").strip()
-    if not full_content:
-        return None
     sender_name = ""
     parent_sender_open_id = _item_sender_open_id(item)
     if parent_sender_open_id:
@@ -109,7 +272,14 @@ async def _build_reply_quote_text(message_id: str, replying_open_id: str) -> Opt
             sender_name = str((names or {}).get(parent_sender_open_id) or "").strip()
         except Exception:
             logger.debug("[multitenancy] reply quote sender lookup failed", exc_info=True)
-    return _format_reply_quote_text(message_id, sender_name, full_content)
+    text = _format_reply_quote_text(message_id, sender_name, full_content)
+    media = await _download_reply_quote_media(adapter, message_id, item)
+    return text, media
+
+
+async def _build_reply_quote_text(message_id: str, replying_open_id: str) -> Optional[str]:
+    text, _media = await _build_reply_quote_context(None, message_id, replying_open_id)
+    return text
 
 
 def install_feishu_reply_quote_api_patch() -> None:
@@ -124,6 +294,7 @@ def install_feishu_reply_quote_api_patch() -> None:
         return
     _patch_process_inbound(FeishuAdapter)
     _patch_fetch_message_text(FeishuAdapter)
+    _patch_dispatch_inbound_event(FeishuAdapter)
     _HOOK_INSTALLED = True
 
 
@@ -173,12 +344,19 @@ def _patch_fetch_message_text(FeishuAdapter: Any) -> None:
             return await original(self, message_id, *args, **kwargs)
 
         try:
-            enriched = await _build_reply_quote_text(normalized_message_id, replying_open_id)
+            enriched, media = await _build_reply_quote_context(self, normalized_message_id, replying_open_id)
+            if media:
+                media_mapping = _reply_media_map(self)
+                if len(media_mapping) >= _REPLY_SENDER_MAP_MAX:
+                    media_mapping.clear()
+                media_mapping[normalized_message_id] = media
+                enriched = _append_quote_media_notes(enriched, media)
             if enriched:
                 logger.info(
-                    "[multitenancy] reply quote enriched via UAT API (mid=%s, %d chars)",
+                    "[multitenancy] reply quote enriched via UAT API (mid=%s, %d chars, media=%d)",
                     normalized_message_id,
                     len(enriched),
+                    len(media),
                 )
                 return enriched
         except Exception as exc:
@@ -193,3 +371,37 @@ def _patch_fetch_message_text(FeishuAdapter: Any) -> None:
     setattr(wrapped, _FETCH_FLAG, True)
     FeishuAdapter._fetch_message_text = wrapped
     logger.info("[multitenancy] installed reply quote UAT-API enrichment on FeishuAdapter")
+
+
+def _patch_dispatch_inbound_event(FeishuAdapter: Any) -> None:
+    original = getattr(FeishuAdapter, "_dispatch_inbound_event", None)
+    if original is None or getattr(original, _DISPATCH_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    async def wrapped(self: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            reply_to_message_id = str(getattr(event, "reply_to_message_id", "") or "")
+            media = _reply_media_map(self).pop(reply_to_message_id, []) if reply_to_message_id else []
+            if media:
+                existing_urls = list(getattr(event, "media_urls", None) or [])
+                existing_types = list(getattr(event, "media_types", None) or [])
+                seen = set(existing_urls)
+                for path, media_type in media:
+                    if path and path not in seen:
+                        existing_urls.append(path)
+                        existing_types.append(media_type)
+                        seen.add(path)
+                setattr(event, "media_urls", existing_urls)
+                setattr(event, "media_types", existing_types)
+                logger.info(
+                    "[multitenancy] attached reply quote media to inbound event (reply_mid=%s, media=%d)",
+                    reply_to_message_id,
+                    len(media),
+                )
+        except Exception:
+            logger.debug("[multitenancy] reply quote media dispatch attachment failed", exc_info=True)
+        return await original(self, event, *args, **kwargs)
+
+    setattr(wrapped, _DISPATCH_FLAG, True)
+    FeishuAdapter._dispatch_inbound_event = wrapped
