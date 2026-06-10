@@ -318,6 +318,17 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    def lookup_by_profile_name(self, profile_name: str) -> Optional[RoutingRow]:
+        """Return the active row that owns ``profile_name``, if any."""
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE profile_name = ? AND active = 1 "
+            "ORDER BY (provenance = 'sync') DESC, updated_at DESC LIMIT 1",
+            (profile_name,),
+        )
+        row = cur.fetchone()
+        return _row_to_dataclass(row) if row else None
+
     def lookup_by_chat_id(self, chat_id: str) -> Optional[RoutingRow]:
         """Return the active group row for chat_id, or None if missing.
 

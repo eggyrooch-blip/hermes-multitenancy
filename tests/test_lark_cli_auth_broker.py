@@ -146,6 +146,7 @@ def test_broker_mints_tenant_token_for_bot_identity(monkeypatch, tmp_path: Path)
             user_open_id="ou_alice",
             hmac_key="proxy-key",
             allowed_identities=frozenset({"user", "bot"}),
+            profile_kind="group",
         ),
         forwarder=fake_forward,
     )
@@ -165,6 +166,198 @@ def test_broker_mints_tenant_token_for_bot_identity(monkeypatch, tmp_path: Path)
     assert captured["token_url"] == "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     assert captured["token_body"] == {"app_id": "cli_app", "app_secret": "app-secret"}
     assert captured["authorization"] == "Bearer tat-secret"
+
+
+def test_broker_allows_personal_bot_message_send_to_allowed_group(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_app_credential(shared)
+    captured: dict[str, object] = {}
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"code":0,"tenant_access_token":"tat-secret"}'
+
+    def fake_urlopen(request, timeout):
+        captured["token_url"] = request.full_url
+        captured["token_timeout"] = timeout
+        return FakeHTTPResponse()
+
+    def fake_forward(_method, _url, headers, _body, _timeout):
+        captured["authorization"] = headers.get("Authorization")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker.urllib.request.urlopen", fake_urlopen)
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+            allowed_bot_chat_ids=frozenset({"oc_allowed"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    body = json.dumps({"receive_id": "oc_allowed", "msg_type": "text"}).encode("utf-8")
+    path = "/open-apis/im/v1/messages?receive_id_type=chat_id"
+    response = broker.handle(
+        method="POST",
+        path_and_query=path,
+        headers=_headers(
+            "proxy-key",
+            method="POST",
+            identity="bot",
+            path_and_query=path,
+            body_sha=_body_sha(body),
+        ),
+        body=body,
+    )
+
+    assert response.status == 200
+    assert captured["authorization"] == "Bearer tat-secret"
+
+
+def test_broker_rejects_personal_bot_message_send_to_unmapped_group_before_token_lookup(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_app_credential(shared)
+    calls: list[str] = []
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"code":0,"tenant_access_token":"tat-secret"}'
+
+    def fake_urlopen(_request, _timeout):
+        calls.append("token")
+        return FakeHTTPResponse()
+
+    def fake_forward(*_args, **_kwargs):
+        calls.append("forward")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker.urllib.request.urlopen", fake_urlopen)
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+            allowed_bot_chat_ids=frozenset({"oc_allowed"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    body = json.dumps({"receive_id": "oc_other", "msg_type": "text"}).encode("utf-8")
+    path = "/open-apis/im/v1/messages?receive_id_type=chat_id"
+    response = broker.handle(
+        method="POST",
+        path_and_query=path,
+        headers=_headers(
+            "proxy-key",
+            method="POST",
+            identity="bot",
+            path_and_query=path,
+            body_sha=_body_sha(body),
+        ),
+        body=body,
+    )
+
+    assert response.status == 403
+    assert b"personal profile bot identity is limited to owner mapped group chats" in response.body
+    assert calls == []
+
+
+def test_broker_rejects_personal_bot_non_message_send_before_token_lookup(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_app_credential(shared)
+    calls: list[str] = []
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"code":0,"tenant_access_token":"tat-secret"}'
+
+    def fake_urlopen(_request, _timeout):
+        calls.append("token")
+        return FakeHTTPResponse()
+
+    def fake_forward(*_args, **_kwargs):
+        calls.append("forward")
+        return BrokerResponse(status=200, body=b'{"code":0}')
+
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker.urllib.request.urlopen", fake_urlopen)
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+            allowed_bot_chat_ids=frozenset({"oc_allowed"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    response = broker.handle(
+        method="POST",
+        path_and_query="/open-apis/calendar/v4/calendars/primary/events",
+        headers=_headers(
+            "proxy-key",
+            method="POST",
+            identity="bot",
+            path_and_query="/open-apis/calendar/v4/calendars/primary/events",
+        ),
+        body=b"",
+    )
+
+    assert response.status == 403
+    assert b"personal profile bot identity is limited to owner mapped group chats" in response.body
+    assert calls == []
 
 
 def test_broker_prefers_newer_profile_local_uat_json_over_stale_vault(monkeypatch, tmp_path: Path):

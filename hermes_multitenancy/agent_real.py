@@ -1583,6 +1583,48 @@ def _log_feishu_identity_context(
     )
 
 
+def _owner_mapped_bot_chat_ids(profile_home: Path, sender_open_id: str) -> frozenset[str]:
+    sender_open_id = str(sender_open_id or "").strip()
+    if not sender_open_id or _is_group_profile_home(profile_home):
+        return frozenset()
+    table = None
+    try:
+        from .routing import KIND_GROUP, RoutingTable
+
+        table = RoutingTable(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
+        rows = table.list_by_owner(sender_open_id, kind=KIND_GROUP)
+    except Exception:
+        logger.debug("[multitenancy] failed to resolve owner-mapped bot chat ids", exc_info=True)
+        return frozenset()
+    finally:
+        if table is not None:
+            try:
+                table.close()
+            except Exception:
+                logger.debug("[multitenancy] failed to close owner-mapped routing table", exc_info=True)
+    return frozenset(str(row.chat_id or "").strip() for row in rows if str(row.chat_id or "").strip())
+
+
+def _profile_owner_open_id(profile_home: Path) -> str:
+    profile_name = Path(profile_home).name
+    table = None
+    try:
+        from .routing import RoutingTable
+
+        table = RoutingTable(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
+        row = table.lookup_by_profile_name(profile_name)
+    except Exception:
+        logger.debug("[multitenancy] failed to resolve profile owner open_id", exc_info=True)
+        return ""
+    finally:
+        if table is not None:
+            try:
+                table.close()
+            except Exception:
+                logger.debug("[multitenancy] failed to close profile-owner routing table", exc_info=True)
+    return str(row.owner_open_id or "").strip() if row is not None else ""
+
+
 @contextmanager
 def _lark_cli_auth_broker_scope(
     profile_home: Path,
@@ -1591,6 +1633,8 @@ def _lark_cli_auth_broker_scope(
     """Start a per-run lark-cli auth broker and return child env overrides."""
     app_id = _resolve_lark_cli_app_id(profile_home)
     sender_open_id = str(sender_open_id or "").strip()
+    if not sender_open_id:
+        sender_open_id = _profile_owner_open_id(profile_home)
     binary = _resolve_lark_cli_authsidecar_binary(profile_home)
     is_group_profile = _is_group_profile_home(profile_home)
     if not (app_id and binary.exists() and (sender_open_id or is_group_profile)):
@@ -1598,7 +1642,12 @@ def _lark_cli_auth_broker_scope(
         return
 
     default_as = _lark_cli_default_identity(profile_home, sender_open_id)
-    allowed_identities = frozenset({"user"}) if default_as == "user" else frozenset({"user", "bot"})
+    allowed_bot_chat_ids = _owner_mapped_bot_chat_ids(profile_home, sender_open_id)
+    allowed_identities = (
+        frozenset({"user"})
+        if default_as == "user" and not allowed_bot_chat_ids
+        else frozenset({"user", "bot"})
+    )
     key = secrets.token_urlsafe(32)
     server = start_lark_cli_auth_broker_server(
         LarkCliAuthBrokerContext(
@@ -1609,11 +1658,13 @@ def _lark_cli_auth_broker_scope(
             allowed_identities=allowed_identities,
             profile_kind="group" if is_group_profile else "user",
             current_chat_id=_group_profile_chat_id(profile_home) if is_group_profile else "",
+            allowed_bot_chat_ids=allowed_bot_chat_ids,
         )
     )
     try:
-        yield {
+        env = {
             "HERMES_LARK_CLI_BIN": str(binary),
+            "HERMES_FEISHU_USER_OPEN_ID": sender_open_id,
             "LARKSUITE_CLI_AUTH_PROXY": server.url,
             "LARKSUITE_CLI_PROXY_KEY": key,
             "LARKSUITE_CLI_APP_ID": app_id,
@@ -1621,6 +1672,9 @@ def _lark_cli_auth_broker_scope(
             "LARKSUITE_CLI_DEFAULT_AS": default_as,
             "LARKSUITE_CLI_STRICT_MODE": str(os.environ.get("HERMES_LARK_CLI_STRICT_MODE") or "off").strip() or "off",
         }
+        if allowed_bot_chat_ids:
+            env["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] = ",".join(sorted(allowed_bot_chat_ids))
+        yield env
     finally:
         server.close()
 

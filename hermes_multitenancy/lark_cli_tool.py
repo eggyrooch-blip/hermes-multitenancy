@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,7 @@ _SAFE_ENV_NAMES = {
     "HERMES_HOME",
     "HERMES_PROFILE",
     "HERMES_FEISHU_USER_OPEN_ID",
+    "HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS",
     "HERMES_LARK_CLI_BIN",
     "LARKSUITE_CLI_AUTH_PROXY",
     "LARKSUITE_CLI_PROXY_KEY",
@@ -113,6 +115,26 @@ def _normalise_openapi_path(path: str) -> str:
     if not path.startswith("/open-apis/"):
         path = "/open-apis/" + path.lstrip("/")
     return path.split("?", 1)[0].split("#", 1)[0]
+
+
+def _normalise_openapi_path_with_query(path: str) -> str:
+    path = str(path or "").strip()
+    if path.startswith(("http://", "https://")):
+        marker = "/open-apis/"
+        idx = path.find(marker)
+        if idx >= 0:
+            path = path[idx:]
+    if not path.startswith("/open-apis/"):
+        path = "/open-apis/" + path.lstrip("/")
+    return path.split("#", 1)[0]
+
+
+def _api_path_arg_from_argv(argv: list[str]) -> str:
+    if len(argv) >= 2 and argv[0].upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+        return str(argv[1])
+    if len(argv) >= 3 and argv[0] == "api":
+        return str(argv[2])
+    return ""
 
 
 def _matches_pattern(argv: list[str], pattern: list[str]) -> bool:
@@ -215,11 +237,13 @@ def _without_identity_flag(argv: list[str]) -> list[str]:
     return cleaned
 
 
-def _effective_identity(requested: Any) -> str:
+def _effective_identity(requested: Any, *, allow_explicit_bot: bool = False) -> str:
+    identity = str(requested or "auto").strip().lower()
+    if identity == "bot" and allow_explicit_bot:
+        return "bot"
     default_as = str(os.getenv("LARKSUITE_CLI_DEFAULT_AS") or "").strip().lower()
     if default_as in {"user", "bot"}:
         return default_as
-    identity = str(requested or "auto").strip().lower()
     if identity in {"user", "bot"}:
         return identity
     return "auto"
@@ -287,6 +311,71 @@ def _argv_option_value(argv: list[str], name: str) -> str:
     return ""
 
 
+def _argv_json_option(argv: list[str], name: str) -> dict[str, Any]:
+    raw = _argv_option_value(argv, name)
+    if not raw or raw.startswith(("@", "-")):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _argv_params_option(argv: list[str]) -> dict[str, str]:
+    raw = _argv_option_value(argv, "--params")
+    if not raw or raw.startswith(("@", "-")):
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        return {key: values[-1] for key, values in parsed.items() if values}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(value) for key, value in payload.items()}
+
+
+def _argv_path_query_params(argv: list[str]) -> dict[str, str]:
+    parsed = urllib.parse.urlsplit(_api_path_arg_from_argv(argv))
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    return {key: values[-1] for key, values in query.items() if values}
+
+
+def _bot_im_send_chat_id(mode: str, argv: list[str]) -> str:
+    if mode == "shortcut" and _shortcut_prefix(argv) == ("im", "+messages-send"):
+        if _argv_option_value(argv, "--user-id"):
+            return ""
+        return _argv_option_value(argv, "--chat-id")
+    if mode != "api":
+        return ""
+    request = _api_request_from_argv(argv)
+    if not request:
+        return ""
+    method, path = request
+    if method != "POST" or path != "/open-apis/im/v1/messages":
+        return ""
+    params = {**_argv_path_query_params(argv), **_argv_params_option(argv)}
+    if str(params.get("receive_id_type") or "").strip() != "chat_id":
+        return ""
+    body = _argv_json_option(argv, "--data")
+    return str(body.get("receive_id") or "").strip()
+
+
+def _allowed_bot_chat_ids(env: dict[str, str]) -> frozenset[str]:
+    raw = str(env.get("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS") or "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _personal_bot_im_send_allowed(env: dict[str, str], mode: str, argv: list[str]) -> bool:
+    if not str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
+        return False
+    if _is_group_profile(_profile_home(env)):
+        return False
+    target_chat_id = _bot_im_send_chat_id(mode, argv)
+    return bool(target_chat_id and target_chat_id in _allowed_bot_chat_ids(env))
+
+
 def _is_im_read_request(mode: str, argv: list[str]) -> bool:
     if mode == "shortcut":
         return _shortcut_prefix(argv) in _PERSONAL_IM_READ_SHORTCUTS
@@ -326,14 +415,31 @@ def _feishu_im_read_identity_error(env: dict[str, str], mode: str, argv: list[st
     return _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED
 
 
-def _personal_user_write_identity_error(env: dict[str, str], risk: str, identity: str) -> str | None:
-    if risk not in {"write", "admin"}:
-        return None
-    if identity == "user":
-        return None
+def _personal_user_write_identity_error(
+    env: dict[str, str],
+    mode: str,
+    argv: list[str],
+    risk: str,
+    identity: str,
+    requested_identity: str,
+) -> str | None:
     if not str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
         return None
     if _is_group_profile(_profile_home(env)):
+        return None
+    if requested_identity == "bot":
+        if _personal_bot_im_send_allowed(env, mode, argv):
+            return None
+        if _is_im_read_request(mode, argv):
+            return None
+        if _bot_im_send_chat_id(mode, argv) or risk in {"write", "admin"}:
+            return (
+                "personal profile bot identity is limited to owner mapped group chats; "
+                "refusing unmapped or non-message bot write"
+            )
+    if risk not in {"write", "admin"}:
+        return None
+    if identity == "user":
         return None
     return (
         "personal profile write requires bound Feishu user identity; "
@@ -459,7 +565,11 @@ LARK_CLI_SCHEMA = {
             "identity": {
                 "type": "string",
                 "enum": ["user", "bot", "auto"],
-                "description": "Intended lark-cli identity.",
+                "description": (
+                    "Intended lark-cli identity. Use auto/user for personal profile work; "
+                    "use bot for owner-mapped Feishu group message sends or group-profile contexts. "
+                    "Personal bot writes to unmapped groups or non-message APIs are refused."
+                ),
             },
             "risk": {
                 "type": "string",
@@ -492,7 +602,12 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         api_req = _api_request_from_argv(argv)
         if not api_req:
             return tool_error("api mode requires argv like ['api', '<METHOD>', '<PATH>'] or ['<METHOD>', '<PATH>']")
-        argv = ["api", api_req[0], api_req[1], *argv[3:]] if argv and argv[0] == "api" else ["api", api_req[0], api_req[1], *argv[2:]]
+        path_for_command = _normalise_openapi_path_with_query(_api_path_arg_from_argv(argv))
+        argv = (
+            ["api", api_req[0], path_for_command, *argv[3:]]
+            if argv and argv[0] == "api"
+            else ["api", api_req[0], path_for_command, *argv[2:]]
+        )
     elif argv and argv[0] == "api":
         return tool_error("api command must use mode=api")
 
@@ -504,7 +619,10 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     if not binary:
         return tool_error("lark-cli binary not found; set HERMES_LARK_CLI_BIN or install lark-cli")
 
-    identity = _effective_identity(args.get("identity"))
+    env = _safe_env()
+    requested_identity = str(args.get("identity") or "auto").strip().lower()
+    allow_explicit_bot = requested_identity == "bot" and _personal_bot_im_send_allowed(env, mode, argv)
+    identity = _effective_identity(args.get("identity"), allow_explicit_bot=allow_explicit_bot)
     if identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
         argv = _without_identity_flag(argv)
     command = [binary, *_argv_with_json_format(argv, mode)]
@@ -512,7 +630,6 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         command.extend(["--as", identity])
 
     timeout = min(int(args.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS)
-    env = _safe_env()
     runtime_error = _profile_runtime_error(env)
     if runtime_error:
         return tool_error(runtime_error, mode=mode, command=argv, risk=risk)
@@ -520,7 +637,7 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     output_paths, output_error = _extract_output_paths(command, workspace)
     if output_error:
         return tool_error(output_error, mode=mode, command=argv, risk=risk)
-    identity_error = _personal_user_write_identity_error(env, risk, identity)
+    identity_error = _personal_user_write_identity_error(env, mode, argv, risk, identity, requested_identity)
     if identity_error:
         return tool_error(identity_error, mode=mode, command=argv, risk=risk, identity=identity)
     im_read_error = _feishu_im_read_identity_error(env, mode, argv, risk, identity)

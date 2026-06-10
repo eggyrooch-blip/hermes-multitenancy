@@ -33,6 +33,9 @@ def test_lark_cli_tool_registers_with_hermes_registry_when_available(monkeypatch
     assert registrations[-1]["name"] == "lark_cli"
     assert registrations[-1]["toolset"] == "lark_cli"
     assert registrations[-1]["schema"]["name"] == "lark_cli"
+    identity_description = registrations[-1]["schema"]["parameters"]["properties"]["identity"]["description"]
+    assert "owner-mapped Feishu group message sends" in identity_description
+    assert "non-message APIs are refused" in identity_description
 
     import hermes_multitenancy.lark_cli_tool as lark_cli_tool
 
@@ -349,6 +352,297 @@ def test_lark_cli_tool_profile_default_user_overrides_explicit_argv_as_bot(monke
     assert "--as=bot" not in captured["command"]
     assert "bot" not in captured["command"]
     assert captured["command"][-2:] == ["--as", "user"]
+
+
+def test_lark_cli_tool_allows_personal_bot_im_send_to_owner_mapped_chat(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"message_id":"om_allowed"}}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    body = {
+        "receive_id": "oc_allowed",
+        "msg_type": "text",
+        "content": json.dumps({"text": "hello"}, ensure_ascii=False),
+    }
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": [
+                "POST",
+                "/open-apis/im/v1/messages",
+                "--params",
+                json.dumps({"receive_id_type": "chat_id"}, ensure_ascii=False),
+                "--data",
+                json.dumps(body, ensure_ascii=False),
+            ],
+            "identity": "bot",
+            "risk": "write",
+            "reason": "send owner mapped group message as Hermes bot",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "bot"
+    assert captured["command"][-2:] == ["--as", "bot"]
+    assert captured["kwargs"]["env"]["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
+
+
+def test_lark_cli_tool_allows_personal_bot_im_send_with_query_string_path(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"message_id":"om_allowed"}}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    body = {"receive_id": "oc_allowed", "msg_type": "text"}
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": [
+                "POST",
+                "/open-apis/im/v1/messages?receive_id_type=chat_id",
+                "--data",
+                json.dumps(body, ensure_ascii=False),
+            ],
+            "identity": "bot",
+            "risk": "write",
+            "reason": "send owner mapped group message as Hermes bot",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "bot"
+    assert captured["command"][3] == "/open-apis/im/v1/messages?receive_id_type=chat_id"
+    assert captured["command"][-2:] == ["--as", "bot"]
+
+
+def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"message_id":"om_other"}}'
+        stderr = ""
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+messages-send", "--chat-id", "oc_other", "--text", "hello"],
+            "identity": "bot",
+            "risk": "write",
+            "reason": "send non-owned group message as Hermes bot",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile bot identity is limited to owner mapped group chats" in result["error"]
+
+
+def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat_even_when_risk_read(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"message_id":"om_other"}}'
+        stderr = ""
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+messages-send", "--chat-id", "oc_other", "--text", "hello"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "send non-owned group message as Hermes bot",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile bot identity is limited to owner mapped group chats" in result["error"]
+
+
+def test_lark_cli_tool_keeps_user_coerced_read_when_requested_identity_is_bot(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"open_id":"ou_owner"}}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["GET", "/open-apis/authen/v1/user_info"],
+            "identity": "bot",
+            "risk": "read",
+            "reason": "read current Feishu user info",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "user"
+    assert captured["command"][-2:] == ["--as", "user"]
+
+
+def test_lark_cli_tool_rejects_personal_bot_non_message_write_even_when_default_is_user(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("personal bot non-message write must fail before spawning lark-cli")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fail_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": [
+                "POST",
+                "/open-apis/calendar/v4/calendars",
+                "--data",
+                json.dumps({"summary": "Hermes"}, ensure_ascii=False),
+            ],
+            "identity": "bot",
+            "risk": "write",
+            "reason": "create calendar as Hermes bot",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "personal profile bot identity is limited to owner mapped group chats" in result["error"]
 
 
 def test_lark_cli_tool_rejects_personal_write_when_sender_user_identity_is_not_bound(

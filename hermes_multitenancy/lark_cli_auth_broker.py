@@ -67,6 +67,7 @@ class LarkCliAuthBrokerContext:
     request_timeout_seconds: float = 30.0
     profile_kind: str = "user"
     current_chat_id: str = ""
+    allowed_bot_chat_ids: frozenset[str] = frozenset()
 
 
 Forwarder = Callable[[str, str, Mapping[str, str], bytes, float], BrokerResponse]
@@ -164,6 +165,15 @@ class LarkCliAuthBroker:
         )
         if im_policy_error:
             return _error(403, im_policy_error)
+        bot_policy_error = _personal_bot_identity_policy_error(
+            self.context,
+            identity=identity,
+            method=method,
+            path_and_query=path_and_query,
+            body=body,
+        )
+        if bot_policy_error:
+            return _error(403, bot_policy_error)
 
         try:
             token = self._resolve_token(identity)
@@ -377,6 +387,43 @@ def _im_read_policy_error(
     if identity == "user" and str(context.user_open_id or "").strip():
         return None
     return _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED
+
+
+def _personal_bot_identity_policy_error(
+    context: LarkCliAuthBrokerContext,
+    *,
+    identity: str,
+    method: str,
+    path_and_query: str,
+    body: bytes,
+) -> str | None:
+    profile_kind = str(context.profile_kind or "user").strip().lower()
+    if profile_kind != "user" or identity != "bot":
+        return None
+    target_chat_id = _bot_im_message_send_chat_id(method, path_and_query, body)
+    if target_chat_id and target_chat_id in context.allowed_bot_chat_ids:
+        return None
+    return (
+        "personal profile bot identity is limited to owner mapped group chats; "
+        "refusing unmapped or non-message bot write"
+    )
+
+
+def _bot_im_message_send_chat_id(method: str, path_and_query: str, body: bytes) -> str:
+    parsed = urllib.parse.urlsplit(path_and_query)
+    if method.upper() != "POST" or parsed.path != "/open-apis/im/v1/messages":
+        return ""
+    query = urllib.parse.parse_qs(parsed.query)
+    receive_id_type = (query.get("receive_id_type") or [""])[0]
+    if receive_id_type != "chat_id":
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("receive_id") or "").strip()
 
 
 def _mint_tenant_access_token(payload: Mapping[str, object], *, timeout: float) -> str:

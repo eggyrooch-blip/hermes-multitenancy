@@ -3379,6 +3379,201 @@ def test_lark_cli_auth_broker_scope_defaults_to_user_when_profile_has_uat(monkey
         assert seen["context"].allowed_identities == frozenset({"user"})
 
 
+def test_lark_cli_auth_broker_scope_passes_owner_mapped_bot_chat_allowlist(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Personal profiles can use bot identity only for routing-owned group chats."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert_group(chat_id="oc_allowed", profile_name="feishu_group_allowed", owner_open_id="ou_alice")
+    table.upsert_group(chat_id="oc_other", profile_name="feishu_group_other", owner_open_id="ou_someone_else")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        context = seen["context"]
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+        assert extra["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
+        assert context.allowed_identities == frozenset({"user", "bot"})
+        assert context.allowed_bot_chat_ids == frozenset({"oc_allowed"})
+
+
+def test_lark_cli_auth_broker_scope_uses_webui_agent_owner_for_bot_chat_allowlist(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """WebUI-owned agents should inherit the owner's mapped bot group sends."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "test-group"
+    profile.mkdir(parents=True)
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert_owned_agent(
+        agent_id="webui:ou_owner:test-group",
+        profile_name="test-group",
+        owner_open_id="ou_owner",
+        display_label="test-group",
+    )
+    table.upsert_group(chat_id="oc_allowed", profile_name="feishu_group_allowed", owner_open_id="ou_owner")
+    table.close()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="test-group",
+            user_key="webui:ou_owner:test-group",
+            content="发群聊 P1 测试",
+            session_id="webui-agent-bot-identity",
+        )
+    )
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        context = seen["context"]
+        assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_owner"
+        assert env["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
+        assert context.allowed_bot_chat_ids == frozenset({"oc_allowed"})
+
+
+def test_owner_mapped_bot_chat_ids_closes_routing_table(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import routing
+
+    closed_paths = []
+
+    class Row:
+        chat_id = "oc_allowed"
+
+    class FakeRoutingTable:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def list_by_owner(self, owner_open_id, *, kind=None):
+            assert owner_open_id == "ou_alice"
+            assert kind == routing.KIND_GROUP
+            return [Row()]
+
+        def close(self):
+            closed_paths.append(self.db_path)
+
+    monkeypatch.setattr(agent_real, "_resolve_shared_hermes_home", lambda _profile: tmp_path)
+    monkeypatch.setattr(routing, "RoutingTable", FakeRoutingTable)
+
+    assert agent_real._owner_mapped_bot_chat_ids(tmp_path / "profiles" / "alice", "ou_alice") == frozenset(
+        {"oc_allowed"}
+    )
+    assert closed_paths == [tmp_path / "multitenancy.db"]
+
+
+def test_lark_cli_auth_broker_scope_does_not_broaden_bot_identity_without_owner_groups(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark_cli = shared_bin / "lark-cli-authsidecar"
+    lark_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark_cli.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    (profile / "feishu_uat").mkdir(parents=True)
+    (profile / "feishu_uat" / "ou_alice.json").write_text(
+        json.dumps({
+            "access_token": "user-token",
+            "expires_at": int(time.time() * 1000) + 3_600_000,
+            "app_id": "cli_public",
+        }),
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared_home / "multitenancy.db")
+    table.upsert_group(chat_id="oc_other", profile_name="feishu_group_other", owner_open_id="ou_someone_else")
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+
+    class FakeServer:
+        url = "http://127.0.0.1:19090"
+
+        def close(self):
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_start(context):
+        seen["context"] = context
+        return FakeServer()
+
+    monkeypatch.setattr(agent_real, "start_lark_cli_auth_broker_server", fake_start)
+
+    with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
+        context = seen["context"]
+        assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
+        assert "HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS" not in extra
+        assert context.allowed_identities == frozenset({"user"})
+        assert context.allowed_bot_chat_ids == frozenset()
+
+
 def test_lark_cli_auth_broker_scope_forces_bot_for_group_profile(monkeypatch, tmp_path: Path):
     """Group profiles must not default to a member's user identity."""
     from hermes_multitenancy import agent_real

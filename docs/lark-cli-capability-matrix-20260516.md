@@ -112,6 +112,7 @@ These are not Hermes execution failures. They are concrete `lark-cli` identity, 
 - Kept only `lark-cli` as the configured Feishu toolset for generated profiles.
 - Ran `lark-cli` inside the profile runtime sandbox using the authsidecar, not through terminal or global shell access.
 - Forced group profiles to bot identity and user profiles to user identity when UAT credentials exist.
+- 2026-06-10: personal profiles may explicitly use bot identity only for owner-mapped Feishu group message sends. The run scope derives `HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS` from active routing group rows owned by the sender and passes the same allowlist into the auth broker; unmapped group sends and non-message personal bot writes are rejected before spawn/token lookup. Plain `identity=auto` still keeps the existing default-user behavior when the sender has UAT, so user-identity capability is not degraded.
 - Added runner locking so Feishu true-chat tests do not interleave multiple matrix sessions into the same chat.
 - Hardened matrix prompts to use official shortcut commands, for example `calendar +agenda`, `docs +create --api-version v2`, `task +get-my-tasks`, and `vc +meeting-join`.
 - Required final responses to echo a unique test mark on the first line, fixing Feishu private-chat rows that previously answered correctly but were not machine-correlatable.
