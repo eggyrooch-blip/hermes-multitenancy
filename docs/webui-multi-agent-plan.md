@@ -36,7 +36,7 @@
 
 视图切换语义下**唯一真实缺口**：把休眠的 `list_by_owner()` 通过一个 webui 端点激活 + 前端切换器。**不涉及** owner 可变、鉴权转移、SOUL 同步（这些在"转移归属"语义下才需要，已排除）。
 
-**仍需修的隐患（与语义无关）**：拉群人捕获用的是**单进程内存缓存**（`router.py:55 _chat_inviter_cache`）。拉群到首次 @ 之间若 router 重启或多 worker，owner 可能丢→provision 被拒→需重新加 bot。建议把拉群人在 `bot.added` 时落一条短时 DB pending 行，而非只存内存。
+**P1.5 已收口（与语义无关）**：拉群人 owner 不再依赖“bot.added 后到首次 @ 之间”的短时缓存。`bot.added` 捕获到可信 `operator_id.open_id` 后会立即写 durable group route + profile skeleton；DB pending 与进程缓存只作为兼容兜底和 welcome-card 交互的短时 hand-off。这样即使首次群消息晚于 TTL 或 router 重启，只要 bot-added 事件曾被捕获，群 route 仍然存在。
 
 ## 3. 目标架构
 
@@ -89,7 +89,7 @@ resolve_agent(owner_open_id, agent_id, surface) -> profile_name | reject:
 | 阶段 | 范围 | 验收检查 |
 |---|---|---|
 | **P1 鉴权堵洞**（纯安全，零新功能，可独立发） | `handle_run`/`handle_create_job` 不再信前端 `profile_name`；前端传 `agent_id`，服务端用会话 `owner_open_id`+lookup 校验归属后解析。`agent_id` 对存量单用户=其 sync profile，行为不变。 | 现有 webui 测试零回归；伪造他人 `agent_id`→403；无 `agent_id`→回退 owner sync root |
-| **P1.5 拉群人落库**（修隐患） | `bot.added` 时拉群人写一条短时 DB pending 行，provision 时优先读 DB 再读内存缓存。 | router 重启后再首次 @，owner 仍正确；多 worker 下不丢 owner |
+| **P1.5 拉群人落库**（已修隐患） | `bot.added` 时立即用拉群人写 durable group route + profile skeleton；DB pending/内存缓存仅保留短时兼容。 | 首次群消息晚于 TTL 仍命中 group route；没有可信 inviter 仍拒绝建 owner route |
 | **P2 数据模型迁移** | 加 `agent_id`/`upstream_profile` 列+索引（幂等）；回填 sync 行 `agent_id=canonical,upstream=NULL`、群行 `upstream=owner root`；`list_by_owner` 泛化去掉 group 硬过滤。 | 生产 DB 副本幂等跑两次一致；旧行全回填出合法 root 链 |
 | **P3 Agents 端点 + 视图切换** | 新增 `GET /api/run-broker/agents`：列出 owner 全部 agent（sync root + 群 agent）。webui 侧边栏列出并可切换当前 agent。**不含**建/改归属。 | 用户切换 agent，群聊请求命中对应 profile；列表只回本人有权的；切换不改任何 owner |
 | **P4 三面接选择器** | 群聊+任务请求统一带 `agent_id`；看板列/卡片携带 `agent_id`（第一阶段非持久，前端态即可）。 | 同一用户切多 agent，群聊/任务/看板分别命中对应 profile 且隔离 |
@@ -99,7 +99,7 @@ P1 单独可发：它把"前端自报 profile"这个客户端信任洞堵上，�
 
 ## 5. 仍需 owner 拍板的开放问题（视图切换语义下保留的）
 
-1. **拉群人落库（P1.5）做不做、优先级**？这是现有隐患（owner 可能丢），与新功能无关，建议尽早做。
+1. ~~**拉群人落库（P1.5）做不做、优先级**？~~ 已完成：bot-added 即刻持久化 group route，不再等首次群消息。
 2. **`agent_id` 命名空间**：系统生成不可变 id（推荐）还是允许用户起名？与 sync canonical id 的隔离规则。
 3. **看板"列/卡片→agent"绑定要不要持久化**？第一阶段不持久最省（前端态+每请求带 agent_id）；持久化需确认看板产品形态（是否真有"列绑定 agent"语义）。
 4. **每 owner agent 数量上限 + RuntimePool 压力**：`RuntimePool` 默认 `max_loaded=50` 全局共享，N 用户×M agent 放大冷启动。建议单 owner ≤10，是否需 pool 调参。

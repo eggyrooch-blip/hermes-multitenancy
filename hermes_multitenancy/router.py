@@ -51,9 +51,9 @@ _suppress_interruption_marker_tasks: set[asyncio.Task] = set()
 _synthetic_session_guards: dict[str, Any] = {}
 
 # Group-chat profile state. Populated by the bot_added hook (Layer 4, runs
-# on the Lark SDK thread) and consumed by the auto-provision path (asyncio
-# loop thread). Persistent state lives in the SQLite routing table; this
-# only covers the window between bot_added and the first @mention.
+# on the Lark SDK thread) and mirrored into the SQLite routing table as soon
+# as the trusted inviter is captured. This cache/pending hand-off remains as
+# a short-lived compatibility fallback for older flows and metadata refreshes.
 #
 # Bounded + TTL'd + lock-guarded: an attacker spamming bot add/remove across
 # throwaway chats would otherwise grow this dict without bound, and the
@@ -63,7 +63,7 @@ import threading as _threading
 from collections import OrderedDict as _OrderedDict
 
 _CHAT_INVITER_CACHE_MAX = 512
-_CHAT_INVITER_CACHE_TTL_S = 3600  # bot_added → first @; generous for restarts
+_CHAT_INVITER_CACHE_TTL_S = 3600  # compatibility fallback TTL
 _chat_inviter_cache: "_OrderedDict[str, dict[str, Any]]" = _OrderedDict()
 _chat_inviter_cache_lock = _threading.Lock()
 _GROUP_PROFILE_PREFIX = "feishu_group_"
@@ -4376,6 +4376,69 @@ def is_group_profile_name(name: Optional[str]) -> bool:
     return bool(name) and str(name).startswith(_GROUP_PROFILE_PREFIX)
 
 
+def _group_display_label(
+    *,
+    owner_open_id: str,
+    chat_id: str,
+    chat_name: Optional[str] = None,
+    inviter_display: Optional[str] = None,
+) -> str:
+    owner_label = (inviter_display or owner_open_id or "").strip()
+    chat_label = (chat_name or chat_id or "").strip()
+    return f"{owner_label}-{chat_label}".strip("-") or chat_id or owner_open_id
+
+
+def _persist_group_route_from_inviter(
+    *,
+    chat_id: str,
+    inviter_open_id: str,
+    chat_name: Optional[str] = None,
+    inviter_display: Optional[str] = None,
+    table: Any = None,
+) -> tuple[Optional[str], Optional[Path]]:
+    if not chat_id or not _is_feishu_open_id(inviter_open_id):
+        return None, None
+    table = table or _get_routing_table()
+    if table is None:
+        return None, None
+
+    existing = table.lookup_by_chat_id(chat_id)
+    display_label = _group_display_label(
+        owner_open_id=inviter_open_id,
+        chat_id=chat_id,
+        chat_name=chat_name,
+        inviter_display=inviter_display,
+    )
+    existing_owner = existing.owner_open_id if existing is not None else ""
+    if existing is not None and existing_owner and existing_owner != inviter_open_id:
+        display_label = existing.display_label or existing.profile_name
+
+    profile_name = (
+        existing.profile_name if existing is not None else _make_group_profile_name(chat_id)
+    )
+    profile_home = _profile_name_to_home(profile_name)
+    _ensure_group_profile(
+        profile_name=profile_name,
+        profile_home=profile_home,
+        chat_id=chat_id,
+        owner_open_id=existing_owner or inviter_open_id,
+        display_label=display_label,
+    )
+    table.upsert_group(
+        chat_id=chat_id,
+        profile_name=profile_name,
+        owner_open_id=inviter_open_id,
+        display_label=display_label,
+    )
+    logger.info(
+        "multitenancy: persisted group route from bot_added chat_id=%s profile=%s owner=%s",
+        chat_id,
+        profile_name,
+        inviter_open_id,
+    )
+    return profile_name, profile_home
+
+
 def register_chat_inviter(
     chat_id: str,
     inviter_open_id: str,
@@ -4383,11 +4446,12 @@ def register_chat_inviter(
     chat_name: Optional[str] = None,
     inviter_display: Optional[str] = None,
 ) -> None:
-    """Layer 4 hook entry — cache who pulled the bot into a chat.
+    """Layer 4 hook entry — persist who pulled the bot into a chat.
 
-    The cache survives only until the first @mention in the chat (or until
-    the process restarts); the durable owner record is the routing row's
-    ``owner_open_id`` column written by ``_provision_group_route``.
+    The durable owner record is the routing row's ``owner_open_id`` column
+    written immediately from the trusted bot-added event. The cache/pending
+    records are retained as compatibility hand-offs for older first-use
+    provisioning paths and welcome-card owner checks.
     """
     if not chat_id or not _is_feishu_open_id(inviter_open_id):
         return
@@ -4409,19 +4473,33 @@ def register_chat_inviter(
             _chat_inviter_cache.pop(cid, None)
         while len(_chat_inviter_cache) > _CHAT_INVITER_CACHE_MAX:
             _chat_inviter_cache.popitem(last=False)
+    table = _get_routing_table()
+    if table is None:
+        logger.debug(
+            "multitenancy: routing table unavailable for bot_added chat_id=%s",
+            chat_id,
+        )
+        return
     try:
-        table = _get_routing_table()
-        if table is None:
-            logger.debug(
-                "multitenancy: pending inviter store unavailable for chat_id=%s",
-                chat_id,
-            )
-            return
         table.put_pending_inviter(chat_id, inviter_open_id)
         table.prune_pending_inviters(int(now), _CHAT_INVITER_CACHE_TTL_S)
     except Exception as exc:
         logger.debug(
             "multitenancy: failed to persist pending inviter chat_id=%s: %s",
+            chat_id,
+            exc,
+        )
+    try:
+        _persist_group_route_from_inviter(
+            chat_id=chat_id,
+            inviter_open_id=inviter_open_id,
+            chat_name=chat_name,
+            inviter_display=inviter_display,
+            table=table,
+        )
+    except Exception as exc:
+        logger.debug(
+            "multitenancy: failed to persist group route from bot_added chat_id=%s: %s",
             chat_id,
             exc,
         )
@@ -4473,19 +4551,58 @@ async def resolve_or_auto_provision_group_route(
     row = table.lookup_by_chat_id(chat_id)
     if row is not None:
         profile_home = _profile_name_to_home(row.profile_name)
+        display_label = row.display_label or row.profile_name
+        cached = _resolve_group_inviter_from_cache(chat_id)
+        if (
+            cached
+            and row.owner_open_id
+            and cached.get("inviter_open_id") == row.owner_open_id
+        ):
+            chat_name = cached.get("chat_name")
+            inviter_display = cached.get("inviter_display")
+            if not chat_name:
+                chat_name = await _fetch_chat_name(chat_id, gateway)
+            if not inviter_display:
+                inviter_display = await _fetch_user_display(row.owner_open_id, gateway)
+            if chat_name or inviter_display:
+                refreshed_label = _group_display_label(
+                    owner_open_id=row.owner_open_id,
+                    chat_id=chat_id,
+                    chat_name=chat_name,
+                    inviter_display=inviter_display,
+                )
+                if refreshed_label != display_label:
+                    try:
+                        table.update_display_label(chat_id, refreshed_label)
+                        display_label = refreshed_label
+                    except Exception as exc:
+                        logger.debug(
+                            "multitenancy: failed to refresh group display_label chat_id=%s: %s",
+                            chat_id,
+                            exc,
+                        )
         try:
             _ensure_group_profile(
                 profile_name=row.profile_name,
                 profile_home=profile_home,
                 chat_id=chat_id,
                 owner_open_id=row.owner_open_id or "",
-                display_label=row.display_label or row.profile_name,
+                display_label=display_label,
             )
         except Exception as exc:
             logger.debug(
                 "multitenancy: failed to normalize existing group profile chat_id=%s profile=%s: %s",
                 chat_id,
                 row.profile_name,
+                exc,
+            )
+        _pop_chat_inviter(chat_id)
+        try:
+            table.clear_pending_inviter(chat_id)
+        except Exception as exc:
+            logger.debug(
+                "multitenancy: failed to clear pending inviter for existing group chat_id=%s: %s",
+                chat_id,
                 exc,
             )
         return row.profile_name, profile_home
@@ -4545,22 +4662,13 @@ async def _provision_group_route(
             await _fetch_user_display(inviter_open_id, gateway) or inviter_open_id
         )
 
-    display_label = f"{inviter_display}-{chat_name}".strip("-") or chat_id
-    profile_name = _make_group_profile_name(chat_id)
-    profile_home = _profile_name_to_home(profile_name)
     try:
-        _ensure_group_profile(
-            profile_name=profile_name,
-            profile_home=profile_home,
+        profile_name, profile_home = _persist_group_route_from_inviter(
+            table=table,
             chat_id=chat_id,
-            owner_open_id=inviter_open_id,
-            display_label=display_label,
-        )
-        table.upsert_group(
-            chat_id=chat_id,
-            profile_name=profile_name,
-            owner_open_id=inviter_open_id,
-            display_label=display_label,
+            inviter_open_id=inviter_open_id,
+            chat_name=chat_name,
+            inviter_display=inviter_display,
         )
     except Exception as exc:
         logger.warning(
@@ -4568,6 +4676,8 @@ async def _provision_group_route(
             chat_id,
             exc,
         )
+        return None, None
+    if profile_name is None or profile_home is None:
         return None, None
 
     logger.info(

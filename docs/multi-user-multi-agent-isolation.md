@@ -78,7 +78,7 @@
 | P0-1 | US-06 | webui_broker handle_run owner 校验 agent 解析 | 伪造他人 agent_id→403；不传→本人 sync root，零回归 |
 | 群聊 | US-07 | gc_rooms owner 列 + 列表/单房间/socket join 校验 + agents 接口 owner 校验 | A 看不到 B 房间；A 用 B roomId/profile→拒绝 |
 | 看板 | US-08 | kanban BFF 层 owner 隔离 + CLI 边界确认与记录 | A 不见 B 任务；client profile 越权→403；残留缺口书面化 |
-| P1.5 | US-09 | 拉群人 owner 落库 | router 重启后首次 @ owner 仍正确；TTL 清理 |
+| P1.5 | US-09 | 拉群人 owner 落库 | `bot.added` 立即写 durable group route；首次消息晚于 TTL 仍可路由；无可信 inviter 仍拒绝建 owner route |
 | 收尾 | US-10 | 零回归总验证 + 跨模型 review + progress | 全量测试绿；reviewer verdict 记录；无 doc drift |
 
 ## 5. 硬约束
@@ -105,5 +105,7 @@
 **M2 — 看板写动作按 id 跨 owner(补 §6 残留中遗漏的写穿透)**:`complete`/`block`/`unblock` 原仅校验登录、不校验任务归属,任何已登录员工可按 task-id 改别人任务。已加 `requireOwnedTasks`(复用与 list/get 同一 `created_by` 优先、`assignee` 兜底的 BFF 尽力归属信号),整批 all-or-nothing fail-closed:任一请求任务非己有 → 403,不部分执行。仍是 BFF 尽力(非 DB 级,需上游 CLI),但写穿透已堵且不再是未披露残留。
 
 **M1 配套 BFF run 路径(端到端闭环)**:python broker fail-closed 后,WebUI「跑 agent」需 BFF 在 `/api/run-broker/runs` POST 上转发已验证 openid。已定位唯一发起点 `hermes-web-ui chat-run-socket.ts` 的 run-broker fetch(Block B,原仅 Content-Type+runBrokerKey,无身份);`socket.data.user.openid`(HMAC 验证)在作用域内。**改动 = 2 行**(`ownerOpenId = socket.data?.user?.openid?.trim()` → `headers['X-Hermes-Owner-Open-Id']`,与 jobs.ts server-stamped-owner 同模式)。**协调阻塞(诚实记录)**:该文件有另一作者约 600 行未提交在途重写,强行在 hermes-web-ui 提交会卷入/损坏其 WIP。故此 2 行以「针对干净 HEAD 生成、已验证可干净 apply」的 hunk 形式并入 `docs/patches/hermes-web-ui-multi-user-isolation.patch`(末尾,带协调说明),**未在 hermes-web-ui 提交**。落地条件:待该 WIP 由其作者合并/暂存后 apply,或由 BFF 作者在其重写中顺手 thread 这 2 行。在此之前:broker 是安全的(无头→403,不泄露),但多用户 WebUI run 被 fail-closed 挡着等此 hunk。群聊/看板/路由隔离不受影响、已端到端通。
+
+**US-09 修订（2026-06-10）**：仅写短时 pending 仍会留下“bot-added 后超过 TTL 才发第一条群消息 → pending 被清理 → route 无法建立”的静默失败窗口。当前设计改为在 `register_chat_inviter()` 捕获可信 inviter 时立即创建 durable group route 和 profile skeleton；pending/cache 只保留兼容兜底。回归测试覆盖 pending 过期、进程缓存清空后仍可通过 durable route 解析；无可信 inviter 的群仍 fail-closed，不会把第一条发消息的人当 owner。
 
 **次要**:`_migrate` US-03 backfill 已包 BEGIN/try/rollback(幂等与二次 no-op 不变);backfill provenance 启发式(`user_id==open_id→auto`)对生产数据形态正确,极端边界下次全量 `pull-feishu` 自愈(建议迁移后立即手动跑一次兜底);沙箱 `localhost:*` 出站因 auth-sidecar 用临时端口无法静态收窄,属已知接受项;`readArtifact` 路径包含检查经独立调试确认 fail-closed 无误(此前一个失败是测试对 `os.homedir` mock 泄漏脆弱,已 pin 修复,实现未动)。预存红点 `test_lark_cli_canary_preflight::test_preflight_reports_missing_vault_key_without_traceback` 在改动前后全套跑均红、单跑绿,系无关测试污染,非本次引入——`ftask ship` 测试门会因它误红,勿误判。

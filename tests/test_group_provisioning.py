@@ -679,6 +679,38 @@ async def test_expired_pending_inviter_is_pruned_and_not_used_as_owner(isolated_
     assert router_mod._get_routing_table().lookup_by_chat_id("oc_expired") is None
 
 
+def test_bot_added_creates_durable_route_before_first_message(isolated_router):
+    router_mod, _ = isolated_router
+    table = router_mod._get_routing_table()
+
+    router_mod.register_chat_inviter(
+        "oc_durable", "ou_inviter", chat_name="IT", inviter_display="owner"
+    )
+    table._conn.execute(
+        "UPDATE multitenancy_pending_group_inviter SET created_at = ? WHERE chat_id = ?",
+        (1, "oc_durable"),
+    )
+    table._conn.commit()
+    table.prune_pending_inviters(
+        now=router_mod._CHAT_INVITER_CACHE_TTL_S + 2,
+        ttl_seconds=router_mod._CHAT_INVITER_CACHE_TTL_S,
+    )
+    router_mod._chat_inviter_cache.clear()
+
+    profile_name, profile_home = asyncio.run(
+        router_mod.resolve_or_auto_provision_group_route(
+            chat_id="oc_durable", gateway=None,
+        )
+    )
+
+    assert profile_name is not None
+    assert profile_home is not None and profile_home.is_dir()
+    row = table.lookup_by_chat_id("oc_durable")
+    assert row is not None
+    assert row.owner_open_id == "ou_inviter"
+    assert row.display_label == "owner-IT"
+
+
 def test_register_chat_inviter_survives_unavailable_pending_store(monkeypatch):
     from hermes_multitenancy import router as router_mod
 
