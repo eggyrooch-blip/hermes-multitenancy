@@ -256,7 +256,8 @@ def test_broker_rejects_personal_bot_message_send_to_unmapped_group_before_token
         def read(self):
             return b'{"code":0,"tenant_access_token":"tat-secret"}'
 
-    def fake_urlopen(_request, _timeout):
+    def fake_urlopen(_request, timeout):
+        del timeout
         calls.append("token")
         return FakeHTTPResponse()
 
@@ -295,6 +296,79 @@ def test_broker_rejects_personal_bot_message_send_to_unmapped_group_before_token
     assert response.status == 403
     assert b"personal profile bot identity is limited to owner mapped group chats" in response.body
     assert calls == []
+
+
+def test_broker_allows_personal_bot_im_image_upload_before_group_message_send(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_app_credential(shared)
+    calls: list[str] = []
+    captured: dict[str, object] = {}
+
+    class FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"code":0,"tenant_access_token":"tat-secret"}'
+
+    def fake_urlopen(_request, timeout):
+        del timeout
+        calls.append("token")
+        return FakeHTTPResponse()
+
+    def fake_forward(method, url, headers, body, _timeout):
+        calls.append("forward")
+        captured.update({"method": method, "url": url, "authorization": headers.get("Authorization"), "body": body})
+        return BrokerResponse(status=200, body=b'{"code":0,"data":{"image_key":"img_allowed"}}')
+
+    monkeypatch.setattr("hermes_multitenancy.lark_cli_auth_broker.urllib.request.urlopen", fake_urlopen)
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user", "bot"}),
+            allowed_bot_chat_ids=frozenset({"oc_allowed"}),
+        ),
+        forwarder=fake_forward,
+    )
+
+    body = b"--boundary\r\nimage bytes\r\n--boundary--\r\n"
+    path = "/open-apis/im/v1/images"
+    response = broker.handle(
+        method="POST",
+        path_and_query=path,
+        headers=_headers(
+            "proxy-key",
+            method="POST",
+            identity="bot",
+            path_and_query=path,
+            body_sha=_body_sha(body),
+            **{"Content-Type": "multipart/form-data; boundary=boundary"},
+        ),
+        body=body,
+    )
+
+    assert response.status == 200
+    assert calls == ["token", "forward"]
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://open.feishu.cn/open-apis/im/v1/images"
+    assert captured["authorization"] == "Bearer tat-secret"
+    assert captured["body"] == body
 
 
 def test_broker_rejects_personal_bot_non_message_send_before_token_lookup(

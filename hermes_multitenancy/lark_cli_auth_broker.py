@@ -403,10 +403,17 @@ def _personal_bot_identity_policy_error(
     target_chat_id = _bot_im_message_send_chat_id(method, path_and_query, body)
     if target_chat_id and target_chat_id in context.allowed_bot_chat_ids:
         return None
+    if context.allowed_bot_chat_ids and _is_bot_im_image_upload(method, path_and_query):
+        return None
     return (
         "personal profile bot identity is limited to owner mapped group chats; "
         "refusing unmapped or non-message bot write"
     )
+
+
+def _is_bot_im_image_upload(method: str, path_and_query: str) -> bool:
+    parsed = urllib.parse.urlsplit(path_and_query)
+    return method.upper() == "POST" and parsed.path == "/open-apis/im/v1/images"
 
 
 def _bot_im_message_send_chat_id(method: str, path_and_query: str, body: bytes) -> str:

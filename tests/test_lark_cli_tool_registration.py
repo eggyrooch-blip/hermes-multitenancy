@@ -472,6 +472,65 @@ def test_lark_cli_tool_allows_personal_bot_im_send_with_query_string_path(
     assert captured["command"][-2:] == ["--as", "bot"]
 
 
+def test_lark_cli_tool_allows_personal_bot_im_image_upload_for_owner_mapped_groups(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"image_key":"img_allowed"}}'
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": [
+                "im",
+                "images",
+                "create",
+                "--data",
+                json.dumps({"image_type": "message"}, ensure_ascii=False),
+                "--file",
+                "image=battle_report_tech.jpg",
+            ],
+            "identity": "bot",
+            "risk": "write",
+            "reason": "upload image for an owner-mapped Hermes bot group card",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["identity"] == "bot"
+    assert captured["command"][:4] == [str(binary), "im", "images", "create"]
+    assert captured["command"][-2:] == ["--as", "bot"]
+    assert captured["kwargs"]["env"]["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
+
+
 def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat(
     monkeypatch,
     tmp_path,

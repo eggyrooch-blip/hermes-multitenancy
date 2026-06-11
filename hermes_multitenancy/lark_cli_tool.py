@@ -362,6 +362,18 @@ def _bot_im_send_chat_id(mode: str, argv: list[str]) -> str:
     return str(body.get("receive_id") or "").strip()
 
 
+def _is_bot_im_image_upload(mode: str, argv: list[str]) -> bool:
+    if mode == "shortcut":
+        return len(argv) >= 3 and tuple(argv[:3]) == ("im", "images", "create")
+    if mode != "api":
+        return False
+    request = _api_request_from_argv(argv)
+    if not request:
+        return False
+    method, path = request
+    return method == "POST" and path == "/open-apis/im/v1/images"
+
+
 def _allowed_bot_chat_ids(env: dict[str, str]) -> frozenset[str]:
     raw = str(env.get("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS") or "")
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
@@ -374,6 +386,14 @@ def _personal_bot_im_send_allowed(env: dict[str, str], mode: str, argv: list[str
         return False
     target_chat_id = _bot_im_send_chat_id(mode, argv)
     return bool(target_chat_id and target_chat_id in _allowed_bot_chat_ids(env))
+
+
+def _personal_bot_im_image_upload_allowed(env: dict[str, str], mode: str, argv: list[str]) -> bool:
+    if not str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
+        return False
+    if _is_group_profile(_profile_home(env)):
+        return False
+    return bool(_is_bot_im_image_upload(mode, argv) and _allowed_bot_chat_ids(env))
 
 
 def _is_im_read_request(mode: str, argv: list[str]) -> bool:
@@ -428,7 +448,7 @@ def _personal_user_write_identity_error(
     if _is_group_profile(_profile_home(env)):
         return None
     if requested_identity == "bot":
-        if _personal_bot_im_send_allowed(env, mode, argv):
+        if _personal_bot_im_send_allowed(env, mode, argv) or _personal_bot_im_image_upload_allowed(env, mode, argv):
             return None
         if _is_im_read_request(mode, argv):
             return None
@@ -567,8 +587,8 @@ LARK_CLI_SCHEMA = {
                 "enum": ["user", "bot", "auto"],
                 "description": (
                     "Intended lark-cli identity. Use auto/user for personal profile work; "
-                    "use bot for owner-mapped Feishu group message sends or group-profile contexts. "
-                    "Personal bot writes to unmapped groups or non-message APIs are refused."
+                    "use bot for owner-mapped Feishu group message sends/image uploads or group-profile contexts. "
+                    "Personal bot writes to unmapped groups or other non-message APIs are refused."
                 ),
             },
             "risk": {
@@ -621,7 +641,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
 
     env = _safe_env()
     requested_identity = str(args.get("identity") or "auto").strip().lower()
-    allow_explicit_bot = requested_identity == "bot" and _personal_bot_im_send_allowed(env, mode, argv)
+    allow_explicit_bot = requested_identity == "bot" and (
+        _personal_bot_im_send_allowed(env, mode, argv) or _personal_bot_im_image_upload_allowed(env, mode, argv)
+    )
     identity = _effective_identity(args.get("identity"), allow_explicit_bot=allow_explicit_bot)
     if identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
         argv = _without_identity_flag(argv)
