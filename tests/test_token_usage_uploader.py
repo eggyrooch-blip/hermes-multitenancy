@@ -226,3 +226,45 @@ def test_email_dept_dept_falls_back_to_unknown():
     r = RoutingOwnerLookup.__new__(RoutingOwnerLookup)
     r._table = _FakeRoutingTable({"ou_x": SimpleNamespace(user_id="x", display_label="")})
     assert r.email_dept_for_open_id("ou_x", "keep.com") == {"email": "x@keep.com", "dept": "unknown"}
+
+
+class _FakeRoutingDupRows:
+    """Same open_id has a sync root (real user_id) AND a synthetic sibling.
+    resolve_owner_root returns the sync root; lookup_by_open_id (no order) may
+    return the synthetic. email resolution must prefer the sync root."""
+
+    def __init__(self, root, sibling):
+        self._root = root
+        self._sibling = sibling
+
+    def resolve_owner_root(self, open_id):
+        return self._root
+
+    def lookup_by_open_id(self, open_id):
+        return self._sibling  # the wrong (synthetic) one — must NOT be used
+
+
+def test_email_prefers_sync_root_over_synthetic_sibling():
+    from types import SimpleNamespace
+    from hermes_multitenancy.token_usage_uploader import RoutingOwnerLookup
+
+    r = RoutingOwnerLookup.__new__(RoutingOwnerLookup)
+    r._table = _FakeRoutingDupRows(
+        root=SimpleNamespace(user_id="sunke", display_label="IT 组"),
+        sibling=SimpleNamespace(user_id="ou_7576abcd", display_label=""),
+    )
+    # resolve_owner_root (sync) wins -> real LDAP, not the synthetic sibling.
+    assert r.email_dept_for_open_id("ou_sunke", "keep.com") == {"email": "sunke@keep.com", "dept": "IT 组"}
+
+
+def test_email_falls_back_to_lookup_when_no_sync_root():
+    from types import SimpleNamespace
+    from hermes_multitenancy.token_usage_uploader import RoutingOwnerLookup
+
+    # sync root absent (None) -> fall back to lookup_by_open_id's real user_id.
+    r = RoutingOwnerLookup.__new__(RoutingOwnerLookup)
+    r._table = _FakeRoutingDupRows(
+        root=None,
+        sibling=SimpleNamespace(user_id="bob", display_label="Eng"),
+    )
+    assert r.email_dept_for_open_id("ou_bob", "keep.com") == {"email": "bob@keep.com", "dept": "Eng"}
