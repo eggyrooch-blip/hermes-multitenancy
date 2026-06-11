@@ -54,12 +54,13 @@ test = [
 [project.scripts]
 hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
 hermes-multitenancy-credentials = "hermes_multitenancy.credential_materializer:main"
+hermes-multitenancy-analytics = "hermes_multitenancy.analytics.cli:main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"
 
 [tool.setuptools]
-packages = ["hermes_multitenancy", "hermes_multitenancy.card", "hermes_multitenancy.sync"]
+packages = ["hermes_multitenancy", "hermes_multitenancy.analytics", "hermes_multitenancy.card", "hermes_multitenancy.sync"]
 
 [tool.setuptools.package-data]
 hermes_multitenancy = ["plugin.yaml"]

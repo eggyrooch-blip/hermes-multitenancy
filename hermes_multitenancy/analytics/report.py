@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .audit import AuditLoadResult, Turn, build_turns, load_audit_rows, parse_timestamp
+from .classify import SCENARIOS, annotate_turn
+
+DEFAULT_AUDIT_PATH = Path("/var/log/hermes/conversation-audit.jsonl")
+DEFAULT_ROUTING_DB = Path.home() / ".hermes" / "multitenancy.db"
+COMPLETION_PROXY_NOTE = (
+    "Completion is a proxy metric based on assistant final stop replies and explicit failure text; "
+    "it is not a real user satisfaction or business success measurement."
+)
+COMPLETION_PROXY_BLIND_SPOT = (
+    "tool-call-only turns without a later finish_reason=stop assistant row are counted as unfinished, "
+    "even when the underlying tool action may have succeeded."
+)
+ACTIVE_USER_PROXY_NOTE = (
+    "DAU is an active profiles proxy: it counts unique Hermes profiles seen in the audit window, "
+    "not de-duplicated natural people."
+)
+
+
+def _rate(part: int, total: int) -> float:
+    return round((part / total) * 100, 1) if total else 0.0
+
+
+def _top(counter: Counter[str], limit: int = 20) -> list[list[Any]]:
+    return [[key, count] for key, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def load_routing_summary(db_path: Path | None) -> dict[str, Any]:
+    if db_path is None or not db_path.exists():
+        return {"active_by_kind": {}, "profile_kind": {}, "available": False}
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return {"active_by_kind": {}, "profile_kind": {}, "available": False}
+    try:
+        conn.row_factory = sqlite3.Row
+        tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
+        if "multitenancy_routing" not in tables:
+            return {"active_by_kind": {}, "profile_kind": {}, "available": False}
+        columns = [row[1] for row in conn.execute("pragma table_info(multitenancy_routing)")]
+        profile_col = "profile_name" if "profile_name" in columns else "profile"
+        if profile_col not in columns or "kind" not in columns or "active" not in columns:
+            return {"active_by_kind": {}, "profile_kind": {}, "available": False}
+        active_by_kind: Counter[str] = Counter()
+        profile_kind: dict[str, str] = {}
+        for row in conn.execute(f"select {profile_col} as profile, kind from multitenancy_routing where active=1"):
+            profile = str(row["profile"] or "")
+            kind = str(row["kind"] or "unknown")
+            active_by_kind[kind] += 1
+            if profile:
+                profile_kind[profile] = kind
+        return {
+            "active_by_kind": dict(sorted(active_by_kind.items())),
+            "profile_kind": profile_kind,
+            "available": True,
+        }
+    except sqlite3.Error:
+        return {"active_by_kind": {}, "profile_kind": {}, "available": False}
+    finally:
+        conn.close()
+
+
+def routing_summary_from_records(records: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if not records:
+        return {"active_by_kind": {}, "profile_kind": {}, "available": False}
+    active_by_kind: Counter[str] = Counter()
+    profile_kind: dict[str, str] = {}
+    for record in records:
+        active = record.get("active", 1)
+        if str(active).lower() in {"0", "false", "no", "off"}:
+            continue
+        profile = str(record.get("profile_name") or record.get("profile") or "")
+        kind = str(record.get("kind") or "unknown")
+        active_by_kind[kind] += 1
+        if profile:
+            profile_kind[profile] = kind
+    return {
+        "active_by_kind": dict(sorted(active_by_kind.items())),
+        "profile_kind": profile_kind,
+        "available": True,
+    }
+
+
+def _audit_load_from_records(records: list[dict[str, Any]]) -> AuditLoadResult:
+    rows: list[dict[str, Any]] = []
+    bad = 0
+    first: datetime | None = None
+    last: datetime | None = None
+    for record in records:
+        if not isinstance(record, dict):
+            bad += 1
+            continue
+        if record.get("event_type", "conversation_message") != "conversation_message":
+            continue
+        timestamp = parse_timestamp(record.get("@timestamp"))
+        if timestamp is None:
+            bad += 1
+            continue
+        row = dict(record)
+        row["_dt"] = timestamp
+        rows.append(row)
+        first = timestamp if first is None or timestamp < first else first
+        last = timestamp if last is None or timestamp > last else last
+    rows.sort(key=lambda row: (row["_dt"], str(row.get("session_id") or ""), str(row.get("message_id") or "")))
+    return AuditLoadResult(rows=rows, total_lines=len(records), bad_lines=bad, first_timestamp=first, last_timestamp=last)
+
+
+def _window_turns(turns: list[Turn], last: datetime | None, days: int | None) -> list[Turn]:
+    if last is None or days is None:
+        return list(turns)
+    cutoff = last - timedelta(days=days)
+    return [turn for turn in turns if turn.timestamp >= cutoff]
+
+
+def _window_key(days: int | None) -> str:
+    return "all" if days is None else f"{days}d"
+
+
+def _window_metrics(turns: list[Turn], profile_kind: dict[str, str]) -> dict[str, Any]:
+    profiles = {turn.profile for turn in turns}
+    sessions = {turn.session_id for turn in turns}
+    final_stop = sum(1 for turn in turns if turn.has_final_stop)
+    explicit_failure = sum(1 for turn in turns if turn.explicit_failure)
+    completion_proxy = sum(1 for turn in turns if turn.has_final_stop and not turn.explicit_failure)
+    success_signal = sum(1 for turn in turns if turn.success_signal)
+    by_platform: dict[str, set[str]] = defaultdict(set)
+    turns_by_platform: Counter[str] = Counter()
+    chat_types_by_profile: dict[str, set[str]] = defaultdict(set)
+    for turn in turns:
+        by_platform[turn.platform or "unknown"].add(turn.profile)
+        turns_by_platform[turn.platform or "unknown"] += 1
+        chat_types_by_profile[turn.profile].add((turn.chat_type or "").lower())
+    agent_like = {profile for profile in profiles if profile_kind.get(profile) == "agent"}
+    group_like = {
+        profile
+        for profile in profiles
+        if profile not in agent_like
+        and (
+            profile_kind.get(profile) == "group"
+            or str(profile).startswith("feishu_group_")
+            or any("group" in chat_type for chat_type in chat_types_by_profile.get(profile, set()))
+        )
+    }
+    user_like = {
+        profile
+        for profile in profiles
+        if profile not in group_like
+        and profile not in agent_like
+        and profile_kind.get(profile, "user") in {"user", "unknown", ""}
+    }
+    counts = Counter(turn.profile for turn in turns)
+    total_turns = sum(counts.values())
+    top10 = sum(count for _profile, count in counts.most_common(10))
+    top20 = sum(count for _profile, count in counts.most_common(20))
+    return {
+        "turns": len(turns),
+        "sessions": len(sessions),
+        "active_profiles": len(profiles),
+        "active_user_like_profiles": len(user_like),
+        "active_group_like_profiles": len(group_like),
+        "active_agent_like_profiles": len(agent_like),
+        "active_profiles_by_kind_proxy": {
+            "agent": len(agent_like),
+            "group": len(group_like),
+            "user": len(user_like),
+        },
+        "active_profiles_by_platform": {platform: len(items) for platform, items in sorted(by_platform.items())},
+        "turns_by_platform": dict(sorted(turns_by_platform.items())),
+        "final_stop": final_stop,
+        "final_stop_rate": _rate(final_stop, len(turns)),
+        "explicit_failures": explicit_failure,
+        "explicit_failure_rate": _rate(explicit_failure, len(turns)),
+        "completion_proxy": completion_proxy,
+        "completion_proxy_rate": _rate(completion_proxy, len(turns)),
+        "success_signals": success_signal,
+        "success_signal_rate": _rate(success_signal, len(turns)),
+        "top10_turn_share": _rate(top10, total_turns),
+        "top20_turn_share": _rate(top20, total_turns),
+        "profiles_with_3plus_turns": sum(1 for count in counts.values() if count >= 3),
+        "profiles_with_10plus_turns": sum(1 for count in counts.values() if count >= 10),
+    }
+
+
+def _scenario_metrics(turns: list[Turn]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    by_scenario: dict[str, list[Turn]] = defaultdict(list)
+    for turn in turns:
+        by_scenario[turn.scenario].append(turn)
+    for scenario in SCENARIOS:
+        items = by_scenario.get(scenario, [])
+        if not items:
+            continue
+        final_stop = sum(1 for item in items if item.has_final_stop)
+        failures = sum(1 for item in items if item.explicit_failure)
+        completion_proxy = sum(1 for item in items if item.has_final_stop and not item.explicit_failure)
+        result[scenario] = {
+            "turns": len(items),
+            "final_stop_rate": _rate(final_stop, len(items)),
+            "failures": failures,
+            "failure_rate": _rate(failures, len(items)),
+            "completion_proxy_rate": _rate(completion_proxy, len(items)),
+        }
+    return result
+
+
+def _counter_metrics(turns: list[Turn], *, include_profiles: bool) -> dict[str, Any]:
+    tools: Counter[str] = Counter()
+    skills: Counter[str] = Counter()
+    lark_commands: Counter[str] = Counter()
+    lark_modes: Counter[str] = Counter()
+    terminal_themes: Counter[str] = Counter()
+    profiles: Counter[str] = Counter()
+    for turn in turns:
+        profiles[redact_text(turn.profile)] += 1
+        tools.update(turn.tools)
+        skills.update(turn.skills)
+        lark_commands.update(turn.lark_commands)
+        lark_modes.update(turn.lark_modes)
+        terminal_themes.update(turn.terminal_themes)
+    result = {
+        "tools": _top(tools),
+        "skills": _top(skills),
+        "lark_commands": _top(lark_commands),
+        "lark_modes": _top(lark_modes),
+        "terminal_themes": _top(terminal_themes),
+    }
+    if include_profiles:
+        result["top_active_profiles"] = _top(profiles)
+    return result
+
+
+def _failure_categories(turns: list[Turn]) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for turn in turns:
+        if turn.failure_category:
+            counter[turn.failure_category] += 1
+    return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _dau(turns: list[Turn], last: datetime | None, days: int) -> list[dict[str, Any]]:
+    if last is None:
+        return []
+    start_date = (last - timedelta(days=days - 1)).date()
+    by_date: dict[str, list[Turn]] = defaultdict(list)
+    for turn in turns:
+        if turn.timestamp.date() >= start_date:
+            by_date[turn.date].append(turn)
+    rows: list[dict[str, Any]] = []
+    for date in sorted(by_date):
+        items = by_date[date]
+        by_platform: dict[str, set[str]] = defaultdict(set)
+        for turn in items:
+            by_platform[turn.platform or "unknown"].add(turn.profile)
+        rows.append(
+            {
+                "date": date,
+                "active_profiles": len({turn.profile for turn in items}),
+                "turns": len(items),
+                "sessions": len({turn.session_id for turn in items}),
+                "feishu_profiles": len(by_platform.get("feishu", set())),
+                "webui_profiles": len(by_platform.get("webui", set())),
+            }
+        )
+    return rows
+
+
+_URL_RE = re.compile(r"https?://\S+")
+_JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b")
+_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.I)
+_OPEN_ID_RE = re.compile(r"(?<![A-Za-z0-9])ou_[A-Za-z0-9_-]+")
+_CHAT_ID_RE = re.compile(r"(?<![A-Za-z0-9])oc_[A-Za-z0-9_-]+")
+_MESSAGE_ID_RE = re.compile(r"(?<![A-Za-z0-9])om_[A-Za-z0-9_-]+")
+_IMAGE_KEY_RE = re.compile(r"(?<![A-Za-z0-9])img_[A-Za-z0-9_-]+")
+_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
+
+
+def redact_text(text: str) -> str:
+    redacted = _URL_RE.sub("<url>", text)
+    redacted = _JWT_RE.sub("<jwt>", redacted)
+    redacted = _BEARER_RE.sub("<bearer>", redacted)
+    redacted = _OPEN_ID_RE.sub("<open_id>", redacted)
+    redacted = _CHAT_ID_RE.sub("<chat_id>", redacted)
+    redacted = _MESSAGE_ID_RE.sub("<message_id>", redacted)
+    redacted = _IMAGE_KEY_RE.sub("<image_key>", redacted)
+    return _LONG_TOKEN_RE.sub("<token>", redacted)
+
+
+def _samples(turns: list[Turn], *, include_profiles: bool, limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    result: list[dict[str, Any]] = []
+    for turn in turns:
+        if not turn.text.strip():
+            continue
+        if len(result) >= limit:
+            break
+        item: dict[str, Any] = {
+            "timestamp": turn.timestamp.isoformat(),
+            "platform": turn.platform,
+            "scenario": turn.scenario,
+            "text": redact_text(turn.text).replace("\n", " ")[:240],
+        }
+        if include_profiles:
+            item["profile"] = redact_text(turn.profile)
+        result.append(item)
+    return result
+
+
+def _insights(turns: list[Turn], scenario_counts: dict[str, Any], failure_counts: dict[str, int]) -> list[str]:
+    insights: list[str] = []
+    if scenario_counts:
+        top_scenario, top_stats = max(scenario_counts.items(), key=lambda item: item[1]["turns"])
+        insights.append(f"Top demand area is {top_scenario} ({top_stats['turns']} turns in the selected window).")
+    if len(scenario_counts) >= 2:
+        second, stats = sorted(scenario_counts.items(), key=lambda item: item[1]["turns"], reverse=True)[1]
+        insights.append(f"Second demand area is {second} ({stats['turns']} turns), so analytics should track both workflow depth and breadth.")
+    if failure_counts:
+        top_failure, count = max(failure_counts.items(), key=lambda item: item[1])
+        insights.append(f"Most common explicit failure category is {top_failure} ({count} turns); prioritize this before tuning prompts.")
+    image_turns = scenario_counts.get("Image/multimodal generation/analysis", {}).get("turns", 0)
+    image_failures = scenario_counts.get("Image/multimodal generation/analysis", {}).get("failures", 0)
+    if image_turns and _rate(image_failures, image_turns) >= 40:
+        insights.append("Image/multimodal demand is visible but has a high explicit-failure rate; keep tracing file path, upload, and provider boundaries.")
+    if any("lark_cli" in turn.tools for turn in turns):
+        insights.append("Lark/Feishu tool usage is a core product surface; command-family metrics should remain first-class.")
+    return insights
+
+
+def _build_summary(
+    *,
+    load: AuditLoadResult,
+    audit_path: str,
+    routing: dict[str, Any],
+    days: int,
+    include_profiles: bool,
+    include_samples: bool,
+    sample_limit: int,
+) -> dict[str, Any]:
+    profile_kind = routing.get("profile_kind", {})
+    turns = [annotate_turn(turn) for turn in build_turns(load.rows)]
+    last = load.last_timestamp
+    window_days: list[int | None] = sorted({1, 7, 30, max(1, int(days))})
+    window_days.append(None)
+
+    summary: dict[str, Any] = {
+        "audit": {
+            "path": audit_path,
+            "rows": len(load.rows),
+            "total_lines": load.total_lines,
+            "bad_lines": load.bad_lines,
+            "first_timestamp": _iso(load.first_timestamp),
+            "last_timestamp": _iso(load.last_timestamp),
+        },
+        "routing": {
+            "available": routing.get("available", False),
+            "active_by_kind": routing.get("active_by_kind", {}),
+        },
+        "selected_days": days,
+        "methodology": {
+            "completion_proxy": COMPLETION_PROXY_NOTE,
+            "completion_proxy_blind_spot": COMPLETION_PROXY_BLIND_SPOT,
+            "active_user_proxy": ACTIVE_USER_PROXY_NOTE,
+        },
+        "dau": _dau(turns, last, max(1, int(days))),
+        "windows": {},
+        "scenarios": {},
+        "failure_categories": {},
+        "top": {},
+    }
+
+    for item in window_days:
+        key = _window_key(item)
+        items = _window_turns(turns, last, item)
+        summary["windows"][key] = _window_metrics(items, profile_kind)
+        summary["scenarios"][key] = {"primary": _scenario_metrics(items)}
+        summary["failure_categories"][key] = _failure_categories(items)
+        summary["top"][key] = _counter_metrics(items, include_profiles=include_profiles)
+
+    selected_key = _window_key(max(1, int(days)))
+    selected_turns = _window_turns(turns, last, max(1, int(days)))
+    summary["insights"] = _insights(
+        selected_turns,
+        summary["scenarios"].get(selected_key, {}).get("primary", {}),
+        summary["failure_categories"].get(selected_key, {}),
+    )
+    if include_samples:
+        summary["samples"] = _samples(selected_turns, include_profiles=include_profiles, limit=max(0, sample_limit))
+    return summary
+
+
+def build_summary(
+    *,
+    audit_path: Path = DEFAULT_AUDIT_PATH,
+    routing_db: Path | None = DEFAULT_ROUTING_DB,
+    days: int = 7,
+    include_profiles: bool = False,
+    include_samples: bool = False,
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    load = load_audit_rows(audit_path)
+    routing = load_routing_summary(routing_db)
+    return _build_summary(
+        load=load,
+        audit_path=redact_text(str(audit_path)),
+        routing=routing,
+        days=days,
+        include_profiles=include_profiles,
+        include_samples=include_samples,
+        sample_limit=sample_limit,
+    )
+
+
+def build_summary_from_records(
+    conversation_rows: list[dict[str, Any]],
+    routing_rows: list[dict[str, Any]] | None = None,
+    *,
+    days: int = 7,
+    include_profiles: bool = False,
+    include_samples: bool = False,
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    return _build_summary(
+        load=_audit_load_from_records(conversation_rows),
+        audit_path="<in-memory>",
+        routing=routing_summary_from_records(routing_rows),
+        days=days,
+        include_profiles=include_profiles,
+        include_samples=include_samples,
+        sample_limit=sample_limit,
+    )
+
+
+def _table(headers: list[str], rows: list[list[Any]]) -> str:
+    if not rows:
+        return "_No data._\n"
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(item) for item in row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def render_markdown(summary: dict[str, Any]) -> str:
+    selected_key = f"{summary.get('selected_days', 7)}d"
+    selected = summary.get("windows", {}).get(selected_key, {})
+    routing = summary.get("routing", {})
+    lines = [
+        "# Hermes Conversation Analytics",
+        "",
+        f"- Audit window: `{summary.get('audit', {}).get('first_timestamp')}` to `{summary.get('audit', {}).get('last_timestamp')}`",
+        f"- Audit rows: `{summary.get('audit', {}).get('rows', 0)}` (bad lines: `{summary.get('audit', {}).get('bad_lines', 0)}`)",
+        f"- Routing active by kind: `{json.dumps(routing.get('active_by_kind', {}), ensure_ascii=False, sort_keys=True)}`",
+        f"- Selected window: `{selected_key}`",
+        "",
+        "## Activity",
+        "",
+        _table(
+            [
+                "Window",
+                "Turns",
+                "Active Profiles",
+                "User-like",
+                "Group-like",
+                "Agent-like",
+                "Sessions",
+                "Feishu Profiles",
+                "WebUI Profiles",
+            ],
+            [
+                [
+                    key,
+                    metrics.get("turns", 0),
+                    metrics.get("active_profiles", 0),
+                    metrics.get("active_user_like_profiles", 0),
+                    metrics.get("active_group_like_profiles", 0),
+                    metrics.get("active_agent_like_profiles", 0),
+                    metrics.get("sessions", 0),
+                    metrics.get("active_profiles_by_platform", {}).get("feishu", 0),
+                    metrics.get("active_profiles_by_platform", {}).get("webui", 0),
+                ]
+                for key, metrics in (
+                    (key, summary.get("windows", {}).get(key, {}))
+                    for key in ("1d", "7d", "30d", "all")
+                    if key in summary.get("windows", {})
+                )
+            ],
+        ),
+        "## DAU Proxy (Active Profiles)",
+        "",
+        summary.get("methodology", {}).get("active_user_proxy", ACTIVE_USER_PROXY_NOTE),
+        "",
+        _table(
+            ["Date", "Active Profiles", "Turns", "Sessions", "Feishu", "WebUI"],
+            [
+                [
+                    row["date"],
+                    row["active_profiles"],
+                    row["turns"],
+                    row["sessions"],
+                    row["feishu_profiles"],
+                    row["webui_profiles"],
+                ]
+                for row in summary.get("dau", [])
+            ],
+        ),
+        "## Proxy Completion",
+        "",
+        summary.get("methodology", {}).get("completion_proxy", COMPLETION_PROXY_NOTE),
+        summary.get("methodology", {}).get("completion_proxy_blind_spot", COMPLETION_PROXY_BLIND_SPOT),
+        "",
+        _table(
+            ["Window", "Completion Proxy Rate", "Final Stop Rate", "Explicit Failure Rate", "Success Signal Rate"],
+            [
+                [
+                    selected_key,
+                    f"{selected.get('completion_proxy_rate', 0)}%",
+                    f"{selected.get('final_stop_rate', 0)}%",
+                    f"{selected.get('explicit_failure_rate', 0)}%",
+                    f"{selected.get('success_signal_rate', 0)}%",
+                ]
+            ],
+        ),
+        "## Concentration",
+        "",
+        _table(
+            ["Window", "Top 10 Turn Share", "Top 20 Turn Share", "Profiles >=3 Turns", "Profiles >=10 Turns"],
+            [
+                [
+                    selected_key,
+                    f"{selected.get('top10_turn_share', 0)}%",
+                    f"{selected.get('top20_turn_share', 0)}%",
+                    selected.get("profiles_with_3plus_turns", 0),
+                    selected.get("profiles_with_10plus_turns", 0),
+                ]
+            ],
+        ),
+        "## Scenarios",
+        "",
+        _table(
+            ["Scenario", "Turns", "Completion Proxy Rate", "Final Stop Rate", "Failure Rate"],
+            [
+                [
+                    name,
+                    stats["turns"],
+                    f"{stats['completion_proxy_rate']}%",
+                    f"{stats['final_stop_rate']}%",
+                    f"{stats['failure_rate']}%",
+                ]
+                for name, stats in summary.get("scenarios", {}).get(selected_key, {}).get("primary", {}).items()
+            ],
+        ),
+        "## Failure Categories",
+        "",
+        _table(
+            ["Category", "Turns"],
+            [[name, count] for name, count in summary.get("failure_categories", {}).get(selected_key, {}).items()],
+        ),
+        "## Top Tools",
+        "",
+        _table(["Tool", "Turns"], summary.get("top", {}).get(selected_key, {}).get("tools", [])[:15]),
+        "## Top Skills",
+        "",
+        _table(["Skill", "Turns"], summary.get("top", {}).get(selected_key, {}).get("skills", [])[:15]),
+        "## Top Lark Commands",
+        "",
+        _table(["Command", "Turns"], summary.get("top", {}).get(selected_key, {}).get("lark_commands", [])[:15]),
+    ]
+    top_profiles = summary.get("top", {}).get(selected_key, {}).get("top_active_profiles")
+    if top_profiles is not None:
+        lines.extend(["## Top Profiles", "", _table(["Profile", "Turns"], top_profiles[:20])])
+    insights = summary.get("insights") or []
+    if insights:
+        lines.extend(["## Demand Insights", ""])
+        lines.extend(f"- {insight}" for insight in insights)
+        lines.append("")
+    samples = summary.get("samples") or []
+    if samples:
+        lines.extend(["## Redacted Samples", ""])
+        for sample in samples:
+            label = sample.get("profile", sample.get("platform", "sample"))
+            lines.append(f"- `{label}` {sample.get('scenario')}: {sample.get('text')}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def dumps_json(summary: dict[str, Any]) -> str:
+    return json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
