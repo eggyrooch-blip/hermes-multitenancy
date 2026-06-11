@@ -692,6 +692,23 @@ def test_build_subprocess_env_forwards_vod_model_override(monkeypatch, tmp_path:
     assert env["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gpt-image2-high"
 
 
+def test_build_subprocess_env_forwards_token_usage_ledger_switch(monkeypatch, tmp_path: Path):
+    """Regression (codex review): the ledger writer runs in the CHILD, so the
+    enable switch + path must survive the subprocess env allowlist, else prod
+    silently writes no ledger even with the shared switch set."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    approval_dir = tmp_path / "approvals"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", "/var/log/hermes/token-usage.jsonl")
+
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+
+    assert env["HERMES_TOKEN_USAGE_LEDGER_ENABLED"] == "1"
+    assert env["HERMES_TOKEN_USAGE_LEDGER_PATH"] == "/var/log/hermes/token-usage.jsonl"
+
+
 def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):
     from hermes_multitenancy import agent_real
 

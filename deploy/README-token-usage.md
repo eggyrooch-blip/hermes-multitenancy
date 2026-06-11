@@ -8,13 +8,18 @@
 
 1. **回合台账写入**（`hermes_multitenancy/token_usage_ledger.py`，已挂进 `agent_real.py`）
    每个回合把 `谁(open_id)/profile/平台/群或单聊/模型/in·out·total token` 追加一行到
-   `/var/log/hermes/token-usage.jsonl`。**默认关闭**，靠 prod 的 profile `.env` 打开：
+   `/var/log/hermes/token-usage.jsonl`。**默认关闭**。
 
+   **开关在哪设（重要，别设错）**：台账写入发生在 **AIAgent 子进程**内
+   （`_run_with_aiagent`，token 计数器只在子进程的 agent 上）。子进程 env 被
+   `_SUBPROCESS_ENV_ALLOWLIST` 过滤，`HERMES_TOKEN_USAGE_LEDGER_ENABLED` /
+   `HERMES_TOKEN_USAGE_LEDGER_PATH` 已加进该白名单。所以只需把开关设进
+   **gateway 进程自己的环境**（`hermes-gateway.service` 的 `Environment=` 或其
+   EnvironmentFile，与 `HERMES_RUN_BROKER_KEY` 等同一处），白名单会把它带进每个子进程：
    ```
    HERMES_TOKEN_USAGE_LEDGER_ENABLED=1
    ```
-   （白名单一处即可覆盖全员的沙箱环境；勿逐个写 1279 份 .env —— 用现有的
-   `_SUBPROCESS_ENV_ALLOWLIST` / 共享 env 注入机制。）
+   **不要**逐个写 1279 份 profile `.env`——一处 gateway env 即覆盖全员。
 
 2. **每小时 uploader**（`hermes_multitenancy/token_usage_uploader.py` + 本目录 systemd 单元）
    读台账 → 按 open_id 聚合当天 → 经 **feishu-sync**（`sync.fetch_contact_directory`，

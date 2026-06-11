@@ -7,7 +7,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=hermes
+# 作为 hermes 用户的 user unit 安装（systemctl --user，见 README），故不设 User=；
+# 若改成 system-level 安装，请在此加回 User=hermes 并用 `systemctl enable`（非 --user）。
 # HERMES_HOME 必须指向 feishu-sync 的 sync-root profile：FeishuContactClient
 # .for_current_home 从该 profile 的 vault 取租户 app 凭据来查通讯录。
 Environment=HERMES_HOME=<sync-root-profile-home>

@@ -1205,6 +1205,12 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
     "HERMES_VOD_IMAGE_MODEL_OVERRIDE",
+    # Token-usage ledger switch + path. The ledger writer runs INSIDE this
+    # subprocess (_run_with_aiagent, where agent.session_*_tokens lives), so the
+    # parent/shared env value only reaches it via this allowlist. Without these
+    # two keys, prod silently writes no ledger even with the shared switch set.
+    "HERMES_TOKEN_USAGE_LEDGER_ENABLED",
+    "HERMES_TOKEN_USAGE_LEDGER_PATH",
     # RunBroker auth so the sandboxed agent's cronjob(action=run) tool can
     # authenticate to the router-owned RunBroker (:8766). Shared infra key
     # (server enforces per-profile scope via X-Hermes-Profile / X-Hermes-User-Key),
