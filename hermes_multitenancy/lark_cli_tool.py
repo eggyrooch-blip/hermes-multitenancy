@@ -363,7 +363,7 @@ def _bot_im_send_chat_id(mode: str, argv: list[str]) -> str:
 
 
 def _is_bot_im_image_upload(mode: str, argv: list[str]) -> bool:
-    if mode == "shortcut":
+    if mode in {"shortcut", "schema"}:
         return len(argv) >= 3 and tuple(argv[:3]) == ("im", "images", "create")
     if mode != "api":
         return False

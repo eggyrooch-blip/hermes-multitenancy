@@ -3,6 +3,8 @@ import json
 import sys
 import types
 
+import pytest
+
 
 def test_lark_cli_tool_registers_with_hermes_registry_when_available(monkeypatch):
     calls = []
@@ -472,9 +474,11 @@ def test_lark_cli_tool_allows_personal_bot_im_send_with_query_string_path(
     assert captured["command"][-2:] == ["--as", "bot"]
 
 
+@pytest.mark.parametrize("mode", ["shortcut", "schema"])
 def test_lark_cli_tool_allows_personal_bot_im_image_upload_for_owner_mapped_groups(
     monkeypatch,
     tmp_path,
+    mode,
 ):
     from hermes_multitenancy import lark_cli_tool
 
@@ -505,18 +509,22 @@ def test_lark_cli_tool_allows_personal_bot_im_image_upload_for_owner_mapped_grou
 
     monkeypatch.setattr(lark_cli_tool.subprocess, "run", fake_run)
 
+    argv = [
+        "im",
+        "images",
+        "create",
+        "--data",
+        json.dumps({"image_type": "message"}, ensure_ascii=False),
+        "--file",
+        "image=battle_report_tech.jpg",
+    ]
+    if mode == "schema":
+        argv[3:3] = ["--as", "bot"]
+
     raw = lark_cli_tool._handle_lark_cli_execute(
         {
-            "mode": "shortcut",
-            "argv": [
-                "im",
-                "images",
-                "create",
-                "--data",
-                json.dumps({"image_type": "message"}, ensure_ascii=False),
-                "--file",
-                "image=battle_report_tech.jpg",
-            ],
+            "mode": mode,
+            "argv": argv,
             "identity": "bot",
             "risk": "write",
             "reason": "upload image for an owner-mapped Hermes bot group card",
