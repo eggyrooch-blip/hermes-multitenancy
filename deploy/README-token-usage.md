@@ -40,12 +40,23 @@
 结果：你拉进 N 个群的 bot + 你的所有 agent 的消耗，全部归你一人。**漏记不误记**：唯一不记的
 是路由表都查不到归属的行（极少），绝不会算到错误的人头上。
 
+### 邮箱解析：open_id → user_id → `<user_id>@<域名>`（不需要飞书 email scope）
+
+归属人 open_id 经路由表 `resolve_owner_root`/`lookup_by_open_id` 拿到 **user_id（即 LDAP）**，
+邮箱 = `<user_id>@<HERMES_TOKEN_USAGE_EMAIL_DOMAIN>`。这是**全公司排行榜的统一身份键**
+（已在 prod 用现有数据验证 `sunke`→`sunke@keep.com` 精确匹配各个源 + people 表），所以
+Hermes 用量会和该人的 Cursor/Claude Code/MDM 等数据**合并到同一行**，不裂成两个人。
+multitenancy 飞书 app **没有** `contact:user.email:readonly` scope，本方案因此**不依赖**它。
+合成/占位身份（user_id=`ou_*` 或空）解析不到 → 跳过（不误记）。
+
 ## 安装 uploader 到 hermes-1（hermes 用户）
 
-1. 替换 `hermes-token-uploader.service` 里的占位符：
-   - `@PYTHON@` → 跑 multitenancy 包的 python（gateway venv 的解释器绝对路径）。
-   - `<sync-root-profile-home>` → feishu-sync 的 sync-root profile home（持有租户 app 凭据的那个）。
-   - `<tokscale-report-key>` → 上报 Bearer（= 员工 Mac MDM 同一把，收集端 COLLECTOR_API_TOKENS 之一）。
+1. 替换 `hermes-token-uploader.service` 里的占位符 + 设环境：
+   - `@PYTHON@` → gateway venv 的 python（`/home/hermes/.hermes/hermes-agent/venv/bin/python`）。
+   - `HERMES_TOKSCALE_REPORT_KEY` → 上报 Bearer（= 员工 Mac MDM 同一把，收集端 COLLECTOR_API_TOKENS 之一）。
+   - `HERMES_TOKEN_USAGE_EMAIL_DOMAIN=keep.com`（必填）。
+   - `HERMES_MULTITENANCY_DB`（可选，默认 `~/.hermes/multitenancy.db`）。
+   - 不再需要 `HERMES_HOME`/sync-root：邮箱与归属都只读路由表。
 2. 拷进用户级 systemd 并启用：
    ```
    cp deploy/hermes-token-uploader.{service,timer} ~/.config/systemd/user/
@@ -54,9 +65,7 @@
    ```
 3. 先手动干跑一次确认归属正确（不写网）：
    ```
-   systemctl --user start hermes-token-uploader.service   # 真跑（默认只发今天）
-   # 或本地干跑：
-   HERMES_HOME=<sync-root> python3 -m hermes_multitenancy.token_usage_uploader --dry-run
+   HERMES_TOKEN_USAGE_EMAIL_DOMAIN=keep.com python3 -m hermes_multitenancy.token_usage_uploader --dry-run
    ```
 
 ### 首次初始化：回写台账里所有历史日期

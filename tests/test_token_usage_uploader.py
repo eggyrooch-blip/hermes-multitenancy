@@ -189,16 +189,40 @@ def test_fetch_contact_directory_maps_open_id_to_email_and_dept() -> None:
     assert "ou_noemail" not in directory
 
 
-def test_feishu_sync_resolver_reads_same_day_cache_without_network(monkeypatch, tmp_path) -> None:
-    from hermes_multitenancy.token_usage_uploader import FeishuSyncResolver
+# --- email via routing (open_id -> user_id -> user_id@domain; no Feishu email scope) ---
 
-    cache = tmp_path / "cache.json"
-    cache.write_text(json.dumps({
-        "day": "2026-06-11",
-        "map": {"ou_a": {"email": "alice@corp.com", "dept": "Eng"}},
-    }), encoding="utf-8")
+class _FakeRoutingTable:
+    def __init__(self, rows):
+        self._rows = rows  # open_id -> SimpleNamespace(user_id=..., display_label=...)
 
-    # If it tried the network it would import fetch_contact_directory; ensure it doesn't need to.
-    resolver = FeishuSyncResolver(cache, day="2026-06-11")
-    assert resolver("ou_a") == {"email": "alice@corp.com", "dept": "Eng"}
-    assert resolver("ou_unknown") is None
+    def lookup_by_open_id(self, open_id):
+        return self._rows.get(open_id)
+
+
+def test_email_dept_for_open_id_derives_company_key():
+    from types import SimpleNamespace
+    from hermes_multitenancy.token_usage_uploader import RoutingOwnerLookup
+
+    r = RoutingOwnerLookup.__new__(RoutingOwnerLookup)
+    r._table = _FakeRoutingTable({
+        "ou_sunke": SimpleNamespace(user_id="sunke", display_label="IT 组"),
+        "ou_synth": SimpleNamespace(user_id="ou_7576abcd", display_label=""),   # synthetic user_id
+        "ou_empty": SimpleNamespace(user_id="", display_label=""),
+    })
+    # real user_id -> <user_id>@domain (the company-wide leaderboard key)
+    assert r.email_dept_for_open_id("ou_sunke", "keep.com") == {"email": "sunke@keep.com", "dept": "IT 组"}
+    # synthetic (ou_*) user_id -> None (can't map to a real employee email)
+    assert r.email_dept_for_open_id("ou_synth", "keep.com") is None
+    # empty user_id -> None
+    assert r.email_dept_for_open_id("ou_empty", "keep.com") is None
+    # unknown open_id -> None
+    assert r.email_dept_for_open_id("ou_missing", "keep.com") is None
+
+
+def test_email_dept_dept_falls_back_to_unknown():
+    from types import SimpleNamespace
+    from hermes_multitenancy.token_usage_uploader import RoutingOwnerLookup
+
+    r = RoutingOwnerLookup.__new__(RoutingOwnerLookup)
+    r._table = _FakeRoutingTable({"ou_x": SimpleNamespace(user_id="x", display_label="")})
+    assert r.email_dept_for_open_id("ou_x", "keep.com") == {"email": "x@keep.com", "dept": "unknown"}

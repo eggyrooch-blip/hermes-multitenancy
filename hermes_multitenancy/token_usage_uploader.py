@@ -12,25 +12,22 @@
        个人/DM → sender 本人；sender 空(如 webui ingest) → profile 的 owner。
        解析不到（如路由表没这群）→ 丢弃，绝不把全群量硬安给某人（防误记护栏）。
   3. 按 (owner_open_id, model) 聚合 sum(input/output/total)。
-  4. owner_open_id → {email, dept}：经 **feishu-sync**（hermes_multitenancy.sync.fetch_contact_directory，
-     复用其租户 token，与花名册同一条认证路径）一次性拉全量通讯录目录，按天缓存到本地后逐人查。
-     解析不到的 open_id → 跳过并计数（log，不静默吞、不污染他人）。
-  4. POST 到收集端 `POST <COLLECTOR>/v1/usage/report`（工件 2 的 additive 端点），
+  4. owner_open_id → {email, dept}：**纯路由表**（lookup_by_open_id → user_id），
+     email = ``<user_id>@<域名>`` —— user_id 即 LDAP 即全公司排行榜的统一身份键
+     （已在 prod 用现有数据验证 sunke→sunke@keep.com 精确匹配），故 **不需要飞书
+     email scope**。合成/占位身份(ou_* / 空)解析不到 → 跳过并计数（不污染他人）。
+  5. POST 到收集端 `POST <COLLECTOR>/v1/usage/report`（工件 2 的 additive 端点），
      `{"source":"hermes","client":"Hermes","date":..., "records":[...]}`，Bearer 鉴权。
 
 幂等：收集端按 (source, period, ...) DELETE+INSERT；本脚本每小时重算当天全量上报，
 连跑同日不翻倍。失败重试下小时（重算全量自动补当天）。
 
-测试友好：解析台账→当日聚合→拼上报体 全是纯函数（test_token_usage_uploader.py 覆盖）；
-lark-cli 解析与 HTTP POST 在边缘，--dry-run 不联网、解析器可注入。
-
 环境变量：
-  HERMES_TOKEN_USAGE_LEDGER_PATH   台账路径（默认 /var/log/hermes/token-usage.jsonl）
-  HERMES_TOKSCALE_COLLECTOR        收集端 base（默认 https://tokscale.gotokeep.com）
-  HERMES_TOKSCALE_REPORT_KEY       上报 Bearer（必填，非 dry-run 时）
-  HERMES_TOKEN_USAGE_RESOLVE_CACHE 通讯录目录缓存（默认 ~/.hermes/token-usage-resolve-cache.json）
-  HERMES_HOME                      指向 feishu-sync 的 sync-root profile；FeishuContactClient
-                                   .for_current_home 从该 profile 的 vault 取租户 app 凭据。
+  HERMES_TOKEN_USAGE_LEDGER_PATH    台账路径（默认 /var/log/hermes/token-usage.jsonl）
+  HERMES_TOKSCALE_COLLECTOR         收集端 base（默认 https://tokscale.gotokeep.com）
+  HERMES_TOKSCALE_REPORT_KEY        上报 Bearer（必填，非 dry-run 时）
+  HERMES_TOKEN_USAGE_EMAIL_DOMAIN   邮箱域名（必填，非 dry-run；如 keep.com）
+  HERMES_MULTITENANCY_DB            路由表路径（默认 ~/.hermes/multitenancy.db）
 """
 from __future__ import annotations
 
@@ -216,63 +213,30 @@ class RoutingOwnerLookup:
         # user 行 owner_open_id 可能为空 → 退用 open_id 本人。
         return getattr(row, "owner_open_id", None) or getattr(row, "open_id", None) or None
 
+    def email_dept_for_open_id(self, open_id: str, domain: str) -> dict[str, str] | None:
+        """归属人 open_id → {email, dept}。
 
-class FeishuSyncResolver:
-    """open_id → {email, dept}，经 feishu-sync 的 ``fetch_contact_directory``（复用其租户
-    token，与花名册同一条认证路径）。一次拉全量目录、按天缓存到本地，之后逐人 O(1) 查。
-    拉取失败时退回缓存；缓存也无则全部解析不到（调用方跳过计数）。返回 None = 未解析。"""
-
-    def __init__(self, cache_path: Path, *, day: str) -> None:
-        self.cache_path = cache_path
-        self.day = day
-        self._directory: dict[str, dict[str, str]] = {}
-        self._ready = False
-
-    def _load_cache(self) -> dict[str, dict[str, str]] | None:
-        try:
-            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except Exception:
+        email = ``<user_id>@<domain>`` —— user_id 即 LDAP 即全公司排行榜的统一身份键
+        （已在 prod 用现有数据验证 sunke→sunke@keep.com 精确匹配），故无需飞书 email scope。
+        合成/占位 user_id（``ou_*`` 或空）无法可靠归属 → 返回 None（调用方跳过计数）。
+        dept 取路由表 display_label（次要；看板按 email JOIN people 表补全部门）。
+        """
+        if self._table is None:
             return None
-        if isinstance(data, dict) and data.get("day") == self.day:
-            return {k: v for k, v in (data.get("map") or {}).items() if isinstance(v, dict)}
-        return None
-
-    def _save_cache(self) -> None:
-        try:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_path.write_text(
-                json.dumps({"day": self.day, "map": self._directory}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-    def _ensure_directory(self) -> None:
-        if self._ready:
-            return
-        cached = self._load_cache()
-        if cached is not None:
-            self._directory = cached
-            self._ready = True
-            return
-        try:
-            from .sync import fetch_contact_directory
-
-            self._directory = fetch_contact_directory()
-            self._save_cache()
-        except Exception as exc:  # network / scope / auth — degrade, don't crash the run
-            print(f"[uploader] feishu-sync directory fetch failed: {exc}", file=sys.stderr)
-            # fall back to any stale cache from a previous day so we still attribute.
+        # 一个 open_id 在路由表可能有多行 kind='user'（sync 根 + 自动 provision 的合成兄弟，
+        # 后者 user_id=ou_*）。优先 resolve_owner_root（只取 provenance='sync' 的唯一根），
+        # 拿到真 LDAP user_id；非 sync 环境再退 lookup_by_open_id。取到合成/空 user_id → None。
+        row = None
+        for getter in ("resolve_owner_root", "lookup_by_open_id"):
             try:
-                stale = json.loads(self.cache_path.read_text(encoding="utf-8"))
-                self._directory = {k: v for k, v in (stale.get("map") or {}).items() if isinstance(v, dict)}
+                row = getattr(self._table, getter)(open_id)
             except Exception:
-                self._directory = {}
-        self._ready = True
-
-    def __call__(self, open_id: str) -> dict[str, str] | None:
-        self._ensure_directory()
-        return self._directory.get(open_id)
+                row = None
+            user_id = (getattr(row, "user_id", "") or "").strip() if row else ""
+            if user_id and not user_id.startswith("ou_"):
+                return {"email": f"{user_id}@{domain}",
+                        "dept": str(getattr(row, "display_label", "") or "unknown")}
+        return None  # 合成/占位身份或查不到，无法可靠映射成员工邮箱 → 跳过计数
 
 
 def post_records(collector: str, key: str, day: str, records: list[dict]) -> dict:
@@ -318,17 +282,18 @@ def main(argv: list[str] | None = None) -> int:
         print("[uploader] ledger has no dated rows; nothing to do")
         return 0
 
-    cache_path = Path(
-        os.getenv("HERMES_TOKEN_USAGE_RESOLVE_CACHE")
-        or (Path.home() / ".hermes" / "token-usage-resolve-cache.json")
-    ).expanduser()
-    # One resolver shared across all days — the org directory is date-independent,
-    # so a single feishu-sync pull (cached) serves the whole backfill.
-    resolver = FeishuSyncResolver(cache_path, day=today_str())
-    # Owner attribution: group -> inviter (routing.lookup_by_chat_id), DM -> sender,
-    # empty sender -> profile owner. Routing table lives next to the uploader on hermes-1.
+    # Owner attribution + email, both from the routing table (no Feishu email scope
+    # needed — see email_dept_for_open_id). group -> inviter (lookup_by_chat_id),
+    # DM -> sender, empty sender -> profile owner; then owner open_id -> user_id ->
+    # <user_id>@<domain>, the company-wide leaderboard identity key.
     routing = RoutingOwnerLookup(os.getenv("HERMES_MULTITENANCY_DB") or None)
     owner_of = make_owner_resolver(routing.group_owner, routing.profile_owner)
+    email_domain = (os.getenv("HERMES_TOKEN_USAGE_EMAIL_DOMAIN") or "").strip()
+    if not args.dry_run and not email_domain:
+        print("[uploader] ERROR: HERMES_TOKEN_USAGE_EMAIL_DOMAIN unset (e.g. keep.com)", file=sys.stderr)
+        return 2
+    email_domain = email_domain or "example.com"  # dry-run placeholder
+    resolver = lambda open_id: routing.email_dept_for_open_id(open_id, email_domain)
 
     key = os.getenv("HERMES_TOKSCALE_REPORT_KEY") or ""
     collector = os.getenv("HERMES_TOKSCALE_COLLECTOR") or DEFAULT_COLLECTOR
