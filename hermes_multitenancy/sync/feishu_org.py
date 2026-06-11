@@ -333,6 +333,33 @@ class FeishuContactClient:
             if not page_token:
                 return users
 
+    def iter_department_user_records(self, dept_id: str) -> list[dict[str, Any]]:
+        """Same find_by_department pull as fetch_department_users, but returns the
+        RAW user objects (which carry email / enterprise_email that DepartmentUser
+        drops). Additive — existing callers are untouched. Used by
+        ``fetch_contact_directory`` to build an open_id -> {email, dept} map without
+        a second auth path (reuses this client's tenant token)."""
+        records: list[dict[str, Any]] = []
+        page_token = ""
+        while True:
+            queries = [
+                ("department_id", dept_id),
+                ("department_id_type", "open_department_id"),
+                ("user_id_type", "user_id"),
+                ("page_size", "50"),
+            ]
+            if page_token:
+                queries.append(("page_token", page_token))
+            data = self._request(
+                "GET",
+                "/open-apis/contact/v3/users/find_by_department",
+                queries=queries,
+            )
+            records.extend(raw for raw in (data.get("items") or []) if isinstance(raw, dict))
+            page_token = str(data.get("page_token") or "")
+            if not page_token:
+                return records
+
     def _request(self, method: str, uri: str, *, queries: list[tuple[str, str]]) -> dict[str, Any]:
         if self._api_delay > 0:
             self._sleep(self._api_delay)
@@ -361,6 +388,45 @@ def pull_feishu_org(
         for dept in departments
     }
     return build_org_snapshot(departments, dept_user_map)
+
+
+def fetch_contact_directory(
+    dept_id: Optional[str] = None,
+    *,
+    client: Any = None,
+    api_delay: float = 0.65,
+) -> dict[str, dict[str, str]]:
+    """Build ``open_id -> {"email", "dept", "name"}`` via the SAME feishu-sync
+    contact client (tenant token from the vault), so callers that need to map a
+    Feishu sender to an enterprise email/department reuse the established
+    feishu-sync auth path instead of standing up their own (e.g. lark-cli).
+
+    email prefers ``enterprise_email`` then ``email``; users without either are
+    omitted (the caller decides how to handle an unresolved open_id). dept is the
+    name of the department the user was listed under.
+    """
+    contact = _coerce_contact_client(client, api_delay=api_delay)
+    root_id = dept_id or "0"
+    departments = contact.fetch_department_tree(root_id)
+    target = contact.fetch_department_detail(root_id)
+    if target and all(dept.dept_id != target.dept_id for dept in departments):
+        departments.insert(0, target)
+
+    directory: dict[str, dict[str, str]] = {}
+    for dept in departments:
+        for raw in contact.iter_department_user_records(dept.dept_id):
+            open_id = str(raw.get("open_id") or "")
+            if not open_id or open_id in directory:
+                continue
+            email = str(raw.get("enterprise_email") or raw.get("email") or "")
+            if not email:
+                continue
+            directory[open_id] = {
+                "email": email,
+                "dept": str(dept.name or "unknown"),
+                "name": str(raw.get("name") or ""),
+            }
+    return directory
 
 
 def build_org_snapshot(

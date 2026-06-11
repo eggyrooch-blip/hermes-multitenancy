@@ -3722,6 +3722,27 @@ def _run_with_aiagent(
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
+            # 工件1a：把本回合 token 消耗按触发人落进台账（best-effort，开关默认关）。
+            # sender_open_id / agent / model_only / source 都在此作用域内现成。
+            try:
+                from .token_usage_ledger import (
+                    append_token_usage,
+                    read_agent_session_tokens,
+                )
+
+                _usage_tokens = read_agent_session_tokens(agent)
+                append_token_usage(
+                    sender_open_id=sender_open_id,
+                    profile=profile_home.name,
+                    platform=platform_key,
+                    chat_type=str(getattr(source, "chat_type", "") or "") if source else "",
+                    model=model_only,
+                    input_tokens=_usage_tokens["input_tokens"],
+                    output_tokens=_usage_tokens["output_tokens"],
+                    total_tokens=_usage_tokens["total_tokens"],
+                )
+            except Exception:
+                logger.debug("[multitenancy] token usage ledger hook skipped", exc_info=True)
         finally:
             # Best-effort retag from inside the sandbox; if it fails the
             # parent process re-runs it post-done with full write access.

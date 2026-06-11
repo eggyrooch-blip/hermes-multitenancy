@@ -1,0 +1,22 @@
+# 工件1b：每小时把 Hermes token 台账聚合+解析+上报到排行榜收集端。
+# 安装到 hermes-1（跑 hermes 用户）。占位符（@...@ / <...>）部署时按 README.md 替换。
+[Unit]
+Description=Hermes token usage -> enterprise leaderboard uploader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hermes
+# HERMES_HOME 必须指向 feishu-sync 的 sync-root profile：FeishuContactClient
+# .for_current_home 从该 profile 的 vault 取租户 app 凭据来查通讯录。
+Environment=HERMES_HOME=<sync-root-profile-home>
+# 上报 Bearer（与员工 Mac MDM 同一把，收集端 COLLECTOR_API_TOKENS 之一）。
+Environment=HERMES_TOKSCALE_REPORT_KEY=<tokscale-report-key>
+# 以下有默认值，按需覆盖：
+# Environment=HERMES_TOKSCALE_COLLECTOR=https://tokscale.gotokeep.com
+# Environment=HERMES_TOKEN_USAGE_LEDGER_PATH=/var/log/hermes/token-usage.jsonl
+# Environment=HERMES_TOKEN_USAGE_RESOLVE_CACHE=/home/hermes/.hermes/token-usage-resolve-cache.json
+ExecStart=@PYTHON@ -m hermes_multitenancy.token_usage_uploader
+Nice=10
+IOSchedulingClass=idle
