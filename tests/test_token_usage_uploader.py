@@ -7,12 +7,17 @@ from hermes_multitenancy.token_usage_uploader import (
     build_records,
     distinct_dates,
     iter_ledger_rows,
+    make_owner_resolver,
     _line_date,
 )
 
 
 def _ledger(*rows: dict) -> str:
     return "\n".join(json.dumps(r) for r in rows) + "\n"
+
+
+# DM-only resolver: no group/profile routing → non-group rows resolve to their sender.
+_DM_OWNER = make_owner_resolver(lambda chat_id: None, lambda profile: None)
 
 
 def test_line_date_converts_to_shanghai_day() -> None:
@@ -34,22 +39,58 @@ def test_aggregate_sums_per_sender_and_model_for_the_day() -> None:
         {"ts": "2026-06-10T11:00:00+08:00", "sender_open_id": "ou_a", "model": "m1",
          "input_tokens": 999, "output_tokens": 999, "total_tokens": 1998},
     )
-    agg = aggregate_day(iter_ledger_rows(text), "2026-06-11")
+    agg = aggregate_day(iter_ledger_rows(text), "2026-06-11", _DM_OWNER)
     assert agg[("ou_a", "m1")] == {"input_tokens": 30, "output_tokens": 11, "total_tokens": 41}
     assert agg[("ou_a", "m2")] == {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
     assert ("ou_a", "m1") in agg and len(agg) == 2  # yesterday's row excluded
 
 
-def test_group_chat_two_humans_attribute_separately() -> None:
+def test_group_usage_attributes_to_group_owner_not_senders() -> None:
+    # Two different humans @ the bot in the SAME group. Per sunke's model, ALL of it
+    # bills to the group's owner (whoever pulled the bot in), not the @-ers.
     text = _ledger(
         {"ts": "2026-06-11T09:00:00+08:00", "sender_open_id": "ou_alice", "profile": "grp",
-         "model": "m", "input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+         "chat_type": "group", "chat_id": "oc_team", "model": "m",
+         "input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
         {"ts": "2026-06-11T09:05:00+08:00", "sender_open_id": "ou_bob", "profile": "grp",
-         "model": "m", "input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+         "chat_type": "group", "chat_id": "oc_team", "model": "m",
+         "input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
     )
-    agg = aggregate_day(iter_ledger_rows(text), "2026-06-11")
-    assert agg[("ou_alice", "m")]["total_tokens"] == 15
-    assert agg[("ou_bob", "m")]["total_tokens"] == 10
+    # oc_team was pulled in by ou_owner.
+    owner_of = make_owner_resolver(
+        lambda chat_id: "ou_owner" if chat_id == "oc_team" else None,
+        lambda profile: None,
+    )
+    agg = aggregate_day(iter_ledger_rows(text), "2026-06-11", owner_of)
+    assert agg == {("ou_owner", "m"): {"input_tokens": 17, "output_tokens": 8, "total_tokens": 25}}
+
+
+def test_group_with_unknown_chat_is_dropped_not_misattributed() -> None:
+    text = _ledger(
+        {"ts": "2026-06-11T09:00:00+08:00", "sender_open_id": "ou_alice", "profile": "grp",
+         "chat_type": "group", "chat_id": "oc_unknown", "model": "m",
+         "input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    )
+    owner_of = make_owner_resolver(lambda chat_id: None, lambda profile: None)
+    # Routing can't resolve the group -> dropped, NEVER attributed to the @-er.
+    assert aggregate_day(iter_ledger_rows(text), "2026-06-11", owner_of) == {}
+
+
+def test_make_owner_resolver_rules() -> None:
+    owner_of = make_owner_resolver(
+        lambda chat_id: {"oc_g": "ou_inviter"}.get(chat_id),
+        lambda profile: {"sunke": "ou_sunke"}.get(profile),
+    )
+    # group -> inviter
+    assert owner_of({"chat_type": "group", "chat_id": "oc_g", "sender_open_id": "ou_x"}) == "ou_inviter"
+    # group unknown -> None (drop, never the sender)
+    assert owner_of({"chat_type": "group", "chat_id": "oc_?", "sender_open_id": "ou_x"}) is None
+    # DM with sender -> the person
+    assert owner_of({"chat_type": "p2p", "sender_open_id": "ou_p"}) == "ou_p"
+    # DM empty sender (e.g. webui ingest) -> profile owner
+    assert owner_of({"chat_type": "p2p", "sender_open_id": "", "profile": "sunke"}) == "ou_sunke"
+    # empty sender + unknown profile -> None
+    assert owner_of({"chat_type": "p2p", "sender_open_id": "", "profile": "ghost"}) is None
 
 
 def test_build_records_resolves_email_and_skips_unresolved() -> None:
@@ -92,12 +133,12 @@ def test_distinct_dates_for_backfill_are_sorted_unique() -> None:
     assert distinct_dates(iter_ledger_rows(text)) == ["2026-06-09", "2026-06-11"]
 
 
-def test_rows_without_sender_are_dropped_from_aggregate() -> None:
+def test_rows_without_sender_or_resolvable_owner_are_dropped() -> None:
     text = _ledger(
-        {"ts": "2026-06-11T09:00:00+08:00", "sender_open_id": "", "model": "m",
+        {"ts": "2026-06-11T09:00:00+08:00", "sender_open_id": "", "profile": "", "model": "m",
          "input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
     )
-    assert aggregate_day(iter_ledger_rows(text), "2026-06-11") == {}
+    assert aggregate_day(iter_ledger_rows(text), "2026-06-11", _DM_OWNER) == {}
 
 
 # --- feishu-sync directory resolution (reuses feishu-sync auth, no lark-cli) ---

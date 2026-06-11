@@ -2412,6 +2412,7 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
             profile=profile_home.name,
             platform=_resolve_platform_value(source),
             chat_type=str(getattr(source, "chat_type", "") or "") if source else "",
+            chat_id=str(getattr(source, "chat_id", "") or "") if source else "",
             model=usage.get("model"),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),

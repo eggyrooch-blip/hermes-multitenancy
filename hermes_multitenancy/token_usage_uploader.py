@@ -2,10 +2,17 @@
 
 跑在 hermes-1（systemd timer，见 deploy/hermes-token-uploader.{service,timer}）。
 
+归属模型（sunke 2026-06-12）：**agent 属于谁，消耗就是谁的**，按 owner 记账，不按
+每条消息的发送人。群聊里别人 @ 我拉进去的 bot 也算我的消耗。
+
 流程：
   1. 读 token 台账 jsonl（工件 1a 写的），筛「今天」（上海时区）的行。
-  2. 按 (sender_open_id, model) 聚合 sum(input/output/total)。
-  3. sender_open_id → {email, dept}：经 **feishu-sync**（hermes_multitenancy.sync.fetch_contact_directory，
+  2. 每行解析「归属人 open_id」（make_owner_resolver + 路由表）：
+       群聊(chat_type=group) → lookup_by_chat_id(chat_id).owner_open_id（拉群的人）；
+       个人/DM → sender 本人；sender 空(如 webui ingest) → profile 的 owner。
+       解析不到（如路由表没这群）→ 丢弃，绝不把全群量硬安给某人（防误记护栏）。
+  3. 按 (owner_open_id, model) 聚合 sum(input/output/total)。
+  4. owner_open_id → {email, dept}：经 **feishu-sync**（hermes_multitenancy.sync.fetch_contact_directory，
      复用其租户 token，与花名册同一条认证路径）一次性拉全量通讯录目录，按天缓存到本地后逐人查。
      解析不到的 open_id → 跳过并计数（log，不静默吞、不污染他人）。
   4. POST 到收集端 `POST <COLLECTOR>/v1/usage/report`（工件 2 的 additive 端点），
@@ -79,25 +86,64 @@ def distinct_dates(rows: Iterable[dict]) -> list[str]:
     return sorted(days)
 
 
-def aggregate_day(rows: Iterable[dict], day: str) -> dict[tuple[str, str], dict[str, int]]:
-    """筛当天行，按 (sender_open_id, model) 聚合 token。返回 {(open_id, model): {in,out,total}}。"""
+def aggregate_day(
+    rows: Iterable[dict],
+    day: str,
+    resolve_owner: Callable[[dict], str | None],
+) -> dict[tuple[str, str], dict[str, int]]:
+    """筛当天行，按 (owner_open_id, model) 聚合 token。
+
+    归属身份由 ``resolve_owner(row)`` 决定（群聊→拉群 owner、个人→本人；见
+    ``make_owner_resolver``）。返回 None 的行（无法可靠归属，如路由表查不到该群）被丢弃，
+    绝不硬安给某人。返回 {(owner_open_id, model): {in,out,total}}。
+    """
     agg: dict[tuple[str, str], dict[str, int]] = defaultdict(
         lambda: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     )
     for row in rows:
         if _line_date(str(row.get("ts") or "")) != day:
             continue
-        open_id = str(row.get("sender_open_id") or "").strip()
-        if not open_id:
-            continue  # 无触发人身份，留给调用方计数
+        owner = resolve_owner(row)
+        if not owner:
+            continue  # 无法可靠归属（空 sender 且查不到 profile/群 owner）→ 丢弃，不误记
         model = str(row.get("model") or "unknown")
-        bucket = agg[(open_id, model)]
+        bucket = agg[(owner, model)]
         for k in ("input_tokens", "output_tokens", "total_tokens"):
             try:
                 bucket[k] += int(row.get(k) or 0)
             except (TypeError, ValueError):
                 pass
     return dict(agg)
+
+
+def make_owner_resolver(
+    lookup_group_owner: Callable[[str], str | None],
+    lookup_profile_owner: Callable[[str], str | None],
+) -> Callable[[dict], str | None]:
+    """构造「台账行 → 归属人 open_id」解析器（纯逻辑，路由查询通过两个注入回调）。
+
+    归属策略（sunke 2026-06-12）：agent 属于谁，消耗就是谁的。
+      - 群聊（chat_type=='group'）→ 拉群的 owner：用 chat_id 反查群 owner_open_id。
+        查不到该群 → None（丢弃，绝不把全群量硬安给某人 = 防误记的护栏）。
+      - 个人/DM/webui → 发送人本人(sender_open_id)；若 sender 为空（如 webui ingest
+        服务身份）→ 退而用 profile 的 owner（profile 名即 user_id，路由表有 owner）。
+        都拿不到 → None（丢弃）。
+    """
+    def resolve(row: dict) -> str | None:
+        chat_type = str(row.get("chat_type") or "").strip().lower()
+        if chat_type == "group":
+            chat_id = str(row.get("chat_id") or "").strip()
+            if not chat_id:
+                return None
+            return lookup_group_owner(chat_id) or None
+        sender = str(row.get("sender_open_id") or "").strip()
+        if sender:
+            return sender
+        profile = str(row.get("profile") or "").strip()
+        if profile:
+            return lookup_profile_owner(profile) or None
+        return None
+    return resolve
 
 
 def build_records(
@@ -130,6 +176,44 @@ def build_records(
 
 
 # --------------------------------------------------------------------------- 边缘 I/O
+
+class RoutingOwnerLookup:
+    """从 multitenancy 路由表解析归属人 open_id（群→拉群 owner、profile→owner）。
+
+    复用 hermes_multitenancy.routing.RoutingTable（默认 ~/.hermes/multitenancy.db）。
+    打不开路由表时所有查询返回 None（调用方丢弃，不误记）。给 make_owner_resolver 用。
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self._table = None
+        try:
+            from .routing import RoutingTable
+
+            self._table = RoutingTable(db_path) if db_path else RoutingTable()
+        except Exception as exc:
+            print(f"[uploader] routing table open failed: {exc}", file=sys.stderr)
+
+    def group_owner(self, chat_id: str) -> str | None:
+        if self._table is None:
+            return None
+        try:
+            row = self._table.lookup_by_chat_id(chat_id)
+        except Exception:
+            return None
+        return (getattr(row, "owner_open_id", None) or None) if row else None
+
+    def profile_owner(self, profile_name: str) -> str | None:
+        if self._table is None:
+            return None
+        try:
+            row = self._table.lookup_by_profile_name(profile_name)
+        except Exception:
+            return None
+        if not row:
+            return None
+        # user 行 owner_open_id 可能为空 → 退用 open_id 本人。
+        return getattr(row, "owner_open_id", None) or getattr(row, "open_id", None) or None
+
 
 class FeishuSyncResolver:
     """open_id → {email, dept}，经 feishu-sync 的 ``fetch_contact_directory``（复用其租户
@@ -239,6 +323,10 @@ def main(argv: list[str] | None = None) -> int:
     # One resolver shared across all days — the org directory is date-independent,
     # so a single feishu-sync pull (cached) serves the whole backfill.
     resolver = FeishuSyncResolver(cache_path, day=today_str())
+    # Owner attribution: group -> inviter (routing.lookup_by_chat_id), DM -> sender,
+    # empty sender -> profile owner. Routing table lives next to the uploader on hermes-1.
+    routing = RoutingOwnerLookup(os.getenv("HERMES_MULTITENANCY_DB") or None)
+    owner_of = make_owner_resolver(routing.group_owner, routing.profile_owner)
 
     key = os.getenv("HERMES_TOKSCALE_REPORT_KEY") or ""
     collector = os.getenv("HERMES_TOKSCALE_COLLECTOR") or DEFAULT_COLLECTOR
@@ -248,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rc = 0
     for day in days:
-        records, stats = build_records(aggregate_day(rows, day), resolver)
+        records, stats = build_records(aggregate_day(rows, day, owner_of), resolver)
         print(f"[uploader] day={day} {stats}")
         if args.dry_run:
             print(json.dumps({"source": SOURCE, "client": CLIENT, "date": day, "records": records},

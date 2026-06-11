@@ -32,7 +32,7 @@ def test_enabled_writes_full_contract_shape(monkeypatch, tmp_path: Path) -> None
 
     append_token_usage(
         sender_open_id="ou_a", profile="owner", platform="feishu", chat_type="p2p",
-        model="sonnet-4-6", input_tokens=1234, output_tokens=567, total_tokens=1801,
+        chat_id="oc_x", model="sonnet-4-6", input_tokens=1234, output_tokens=567, total_tokens=1801,
         timestamp="2026-06-11T17:40:12+08:00",
     )
     rows = _read_lines(ledger)
@@ -43,6 +43,7 @@ def test_enabled_writes_full_contract_shape(monkeypatch, tmp_path: Path) -> None
         "profile": "owner",
         "platform": "feishu",
         "chat_type": "p2p",
+        "chat_id": "oc_x",
         "model": "sonnet-4-6",
         "input_tokens": 1234,
         "output_tokens": 567,

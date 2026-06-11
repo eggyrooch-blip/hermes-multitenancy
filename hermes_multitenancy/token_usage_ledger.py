@@ -90,9 +90,15 @@ def append_token_usage(
     input_tokens: Any,
     output_tokens: Any,
     total_tokens: Any,
+    chat_id: str | None = None,
     timestamp: str | None = None,
 ) -> None:
-    """追加一行 token 台账。开关关 / token 非正 / 任何异常 → 静默 no-op。"""
+    """追加一行 token 台账。开关关 / token 非正 / 任何异常 → 静默 no-op。
+
+    记录的是「原始事实」：sender / profile / chat_type / chat_id。归属策略（群聊→拉群
+    owner、个人→本人）由每小时的 uploader 用路由表解析，热路径不做策略判断。``chat_id``
+    用于 uploader 把群聊回合按 ``lookup_by_chat_id`` 反查 owner_open_id。
+    """
     if not token_usage_ledger_enabled():
         return
 
@@ -108,6 +114,7 @@ def append_token_usage(
         "profile": str(profile or ""),
         "platform": str(platform or ""),
         "chat_type": str(chat_type or ""),
+        "chat_id": str(chat_id or ""),
         "model": str(model or ""),
         "input_tokens": it,
         "output_tokens": ot,

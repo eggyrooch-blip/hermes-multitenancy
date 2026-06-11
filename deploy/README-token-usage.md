@@ -23,8 +23,22 @@
    （写发生在父进程，无需进子进程 env 白名单。）
 
 2. **每小时 uploader**（`hermes_multitenancy/token_usage_uploader.py` + 本目录 systemd 单元）
-   读台账 → 按 open_id 聚合当天 → 经 **feishu-sync**（`sync.fetch_contact_directory`，
+   读台账 → **按 owner 归属**（见下）→ 聚合当天 → 经 **feishu-sync**（`sync.fetch_contact_directory`，
    复用租户 token）解析成企业邮箱/部门 → POST 到收集端，`source=hermes`、`client=Hermes`。
+
+## 归属模型（sunke 2026-06-12）：agent 属于谁，消耗就是谁的
+
+不按「每条消息谁发的」记，按 **owner** 记账。uploader 用 multitenancy 路由表
+（`~/.hermes/multitenancy.db`，可 `HERMES_MULTITENANCY_DB` 覆盖）解析每行的归属人：
+
+- **群聊**（`chat_type=group`）→ `lookup_by_chat_id(chat_id).owner_open_id`（**拉群的人**）。
+  群里别人 @ 你拉进去的 bot，也算你的消耗。路由表查不到该群 → 丢弃该行，**绝不把全群量
+  硬安给某人**（防误记护栏）。
+- **个人/DM** → 发送人本人；sender 为空（如 webui ingest 服务身份）→ 退用 profile 的 owner
+  （profile 名即 user_id，路由表有归属）。都拿不到 → 丢弃。
+
+结果：你拉进 N 个群的 bot + 你的所有 agent 的消耗，全部归你一人。**漏记不误记**：唯一不记的
+是路由表都查不到归属的行（极少），绝不会算到错误的人头上。
 
 ## 安装 uploader 到 hermes-1（hermes 用户）
 
@@ -67,17 +81,11 @@ HERMES_HOME=<sync-root> HERMES_TOKSCALE_REPORT_KEY=<key> \
 - **HERMES_HOME 指对**：指错 profile → 取不到租户凭据 → 目录拉取失败（会退本地缓存或全跳过）。
 - 工件 2 的 `/v1/usage/report` 端点要**先**在收集端宿主上线，否则 POST 404。
 
-## 已知限制（sunke 2026-06-12 接受，A 方案）
+## 已知限制（漏记不误记 — 都不会让任何人拿到错误数字）
 
-两条都属「漏记不误记」——不会让任何人拿到错误数字，仅少数边角不计入：
-
-- **WebUI ingest 服务身份不归人**：`/api/run-broker/ingest`（外部 HTTP，服务号身份如
-  hanmeng）等 `user_key` 非 `ou_` 开头的路径，sender 解析为空 → 该回合不进台账。
-  这是有意的：服务号调用不该被算到某个真人头上。飞书 DM / 群聊的 sender 永远是
-  `ou_`，正常归人，不受影响（这才是「一个人多个智能体含群聊」的核心场景）。
+- **路由表查不到归属的行**：群 chat_id 不在路由表、或空 sender 且 profile 也查不到 owner →
+  丢弃该行（极少）。绝不误记。
 - **失败回合不计**：报错中断的回合即使消耗了 token 也不落账（轻微少计）。
-
-如果将来要覆盖这两类，再单独起 ftask（需引入 profile→人 映射 / 失败路径捕获）。
 
 ## 验证（端到端）
 
