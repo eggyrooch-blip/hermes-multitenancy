@@ -182,7 +182,7 @@ def test_aiagent_subprocess_main_replays_event(monkeypatch, tmp_path: Path):
 
     seen: dict[str, object] = {}
 
-    def fake_run(event, profile_home):
+    def fake_run(event, profile_home, *, usage_sink=None):
         seen["text"] = event.text
         seen["message_id"] = event.message_id
         seen["profile_home"] = profile_home
@@ -224,7 +224,7 @@ def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Pa
     from hermes_multitenancy import agent_real
     from hermes_multitenancy import aiagent_subprocess
 
-    def fake_run(event, profile_home, *, event_sink=None):
+    def fake_run(event, profile_home, *, event_sink=None, usage_sink=None):
         assert event.text == "hello child"
         assert profile_home == tmp_path
         assert event_sink is not None
@@ -692,21 +692,61 @@ def test_build_subprocess_env_forwards_vod_model_override(monkeypatch, tmp_path:
     assert env["HERMES_VOD_IMAGE_MODEL_OVERRIDE"] == "gpt-image2-high"
 
 
-def test_build_subprocess_env_forwards_token_usage_ledger_switch(monkeypatch, tmp_path: Path):
-    """Regression (codex review): the ledger writer runs in the CHILD, so the
-    enable switch + path must survive the subprocess env allowlist, else prod
-    silently writes no ledger even with the shared switch set."""
+def test_write_token_ledger_from_child_writes_in_parent(monkeypatch, tmp_path: Path):
+    """Regression (codex review): the ledger MUST be written by the parent, not the
+    sandboxed child (which can't write /var/log/hermes). The parent resolves
+    sender/platform from the event and writes the usage block the child emitted."""
+    import json
+    from types import SimpleNamespace
     from hermes_multitenancy import agent_real
 
-    profile_home = tmp_path / "profiles" / "owner"
-    approval_dir = tmp_path / "approvals"
+    ledger = tmp_path / "token-usage.jsonl"
     monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
-    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", "/var/log/hermes/token-usage.jsonl")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
 
-    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    event = SimpleNamespace(source=SimpleNamespace(
+        platform=SimpleNamespace(value="feishu"), chat_type="group",
+        user_id="ou_sender", message_id="om_x",
+    ))
+    profile_home = tmp_path / "profiles" / "grpprofile"
+    profile_home.mkdir(parents=True)
+    usage = {"model": "sonnet-4-6", "input_tokens": 100, "output_tokens": 40, "total_tokens": 140}
 
-    assert env["HERMES_TOKEN_USAGE_LEDGER_ENABLED"] == "1"
-    assert env["HERMES_TOKEN_USAGE_LEDGER_PATH"] == "/var/log/hermes/token-usage.jsonl"
+    agent_real._write_token_ledger_from_child(event, profile_home, usage)
+
+    row = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert row["sender_open_id"] == "ou_sender"
+    assert row["profile"] == "grpprofile"
+    assert row["platform"] == "feishu"
+    assert row["chat_type"] == "group"
+    assert row["model"] == "sonnet-4-6"
+    assert row["total_tokens"] == 140
+
+
+def test_write_token_ledger_disabled_is_noop(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "token-usage.jsonl"
+    monkeypatch.delenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", raising=False)
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+    event = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value="feishu"), chat_type="p2p", user_id="ou_x"))
+    agent_real._write_token_ledger_from_child(
+        event, tmp_path, {"model": "m", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+    assert not ledger.exists()
+
+
+def test_write_token_ledger_ignores_non_dict_usage(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "token-usage.jsonl"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+    event = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value="feishu"), chat_type="p2p", user_id="ou_x"))
+    # Child emitted no usage (None) -> parent must no-op, not crash.
+    agent_real._write_token_ledger_from_child(event, tmp_path, None)
+    assert not ledger.exists()
 
 
 def test_build_subprocess_env_adds_browser_runtime_only_when_enabled(tmp_path: Path):

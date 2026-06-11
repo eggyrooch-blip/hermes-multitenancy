@@ -90,23 +90,29 @@ def main() -> None:
         # from Hermes core, providers, or tools to stderr so the parent can
         # parse stdout deterministically.
         sys.stdout = sys.stderr
+        # Per-turn token usage captured here (child has the agent), written to the
+        # ledger by the PARENT (sandbox blocks the child from writing /var/log/hermes).
+        usage: dict = {}
         if event_stream:
             if messages is None:
-                result = _run_with_aiagent(event, profile_home, event_sink=emit)
+                result = _run_with_aiagent(event, profile_home, event_sink=emit, usage_sink=usage)
             else:
                 result = _run_with_aiagent(
                     event,
                     profile_home,
                     messages=messages,
                     event_sink=emit,
+                    usage_sink=usage,
                 )
             out = {"event": "done", "result": result or "", "error": None}
         else:
             if messages is None:
-                result = _run_with_aiagent(event, profile_home)
+                result = _run_with_aiagent(event, profile_home, usage_sink=usage)
             else:
-                result = _run_with_aiagent(event, profile_home, messages=messages)
+                result = _run_with_aiagent(event, profile_home, messages=messages, usage_sink=usage)
             out = {"result": result or "", "error": None}
+        if usage:
+            out["usage"] = usage
     except Exception as exc:
         if event_stream:
             out = {

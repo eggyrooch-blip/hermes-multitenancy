@@ -1205,12 +1205,6 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
     "HERMES_VOD_IMAGE_MODEL_OVERRIDE",
-    # Token-usage ledger switch + path. The ledger writer runs INSIDE this
-    # subprocess (_run_with_aiagent, where agent.session_*_tokens lives), so the
-    # parent/shared env value only reaches it via this allowlist. Without these
-    # two keys, prod silently writes no ledger even with the shared switch set.
-    "HERMES_TOKEN_USAGE_LEDGER_ENABLED",
-    "HERMES_TOKEN_USAGE_LEDGER_PATH",
     # RunBroker auth so the sandboxed agent's cronjob(action=run) tool can
     # authenticate to the router-owned RunBroker (:8766). Shared infra key
     # (server enforces per-profile scope via X-Hermes-Profile / X-Hermes-User-Key),
@@ -2398,6 +2392,35 @@ def _aiagent_subprocess_cwd(profile_home: Path) -> str:
     return str(workspace)
 
 
+def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -> None:
+    """工件1a：父进程侧写 token 台账（子进程沙箱不能写 /var/log/hermes）。
+
+    ``usage`` 是子进程透传上来的 {model, input/output/total_tokens}；触发人身份与平台
+    维度在父进程从 ``event`` 解析（与 conversation_audit 同源）。整段 best-effort，
+    任何失败只 debug、绝不影响回复。开关关闭时 append_token_usage 内部直接 no-op。
+    """
+    if not isinstance(usage, dict):
+        return
+    try:
+        from .token_usage_ledger import append_token_usage, token_usage_ledger_enabled
+
+        if not token_usage_ledger_enabled():
+            return
+        source = getattr(event, "source", None)
+        append_token_usage(
+            sender_open_id=_resolve_subprocess_sender_open_id(event),
+            profile=profile_home.name,
+            platform=_resolve_platform_value(source),
+            chat_type=str(getattr(source, "chat_type", "") or "") if source else "",
+            model=usage.get("model"),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            total_tokens=usage.get("total_tokens"),
+        )
+    except Exception:
+        logger.debug("[multitenancy] token usage ledger (parent) skipped", exc_info=True)
+
+
 async def _run_aiagent_subprocess(
     event: Any,
     profile_home: Path,
@@ -2482,6 +2505,7 @@ async def _run_aiagent_subprocess(
         )
     if data.get("error"):
         raise RuntimeError(f"AIAgent subprocess failed: {data['error']}")
+    _write_token_ledger_from_child(event, profile_home, data.get("usage"))
     return str(data.get("result") or "")
 
 
@@ -2934,6 +2958,7 @@ async def _stream_aiagent_subprocess(
                 _mirror.seal_assistant(finish_reason="stop")
                 _mirror.retag_source()
                 _mirror.dedupe()
+                _write_token_ledger_from_child(event, profile_home, data.get("usage"))
                 yield "done", str(data.get("result") or "")
                 continue
             if event_name == "content":
@@ -3436,6 +3461,7 @@ def _run_with_aiagent(
     *,
     messages: Optional[list[dict]] = None,
     event_sink=None,
+    usage_sink: Optional[dict] = None,
 ) -> str:
     """Synchronous body — runs hermes' real AIAgent against the profile config.
 
@@ -3728,27 +3754,24 @@ def _run_with_aiagent(
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
-            # 工件1a：把本回合 token 消耗按触发人落进台账（best-effort，开关默认关）。
-            # sender_open_id / agent / model_only / source 都在此作用域内现成。
-            try:
-                from .token_usage_ledger import (
-                    append_token_usage,
-                    read_agent_session_tokens,
-                )
+            # 工件1a：捕获本回合 token 用量到 usage_sink，由父进程（非沙箱）写台账。
+            # 不能在这里(子进程)直接写 /var/log/hermes —— 沙箱策略不允许该路径，
+            # 写会静默失败。token 计数器只在子进程的 agent 上，故在此读出、透传出去；
+            # 真正的台账落盘在 _run_aiagent_subprocess / _stream_aiagent_subprocess 的
+            # 父进程侧完成（与 conversation_audit 同样的「父进程写」规避沙箱）。
+            if usage_sink is not None:
+                try:
+                    from .token_usage_ledger import read_agent_session_tokens
 
-                _usage_tokens = read_agent_session_tokens(agent)
-                append_token_usage(
-                    sender_open_id=sender_open_id,
-                    profile=profile_home.name,
-                    platform=platform_key,
-                    chat_type=str(getattr(source, "chat_type", "") or "") if source else "",
-                    model=model_only,
-                    input_tokens=_usage_tokens["input_tokens"],
-                    output_tokens=_usage_tokens["output_tokens"],
-                    total_tokens=_usage_tokens["total_tokens"],
-                )
-            except Exception:
-                logger.debug("[multitenancy] token usage ledger hook skipped", exc_info=True)
+                    _ut = read_agent_session_tokens(agent)
+                    usage_sink.update({
+                        "model": model_only,
+                        "input_tokens": _ut["input_tokens"],
+                        "output_tokens": _ut["output_tokens"],
+                        "total_tokens": _ut["total_tokens"],
+                    })
+                except Exception:
+                    logger.debug("[multitenancy] token usage capture skipped", exc_info=True)
         finally:
             # Best-effort retag from inside the sandbox; if it fails the
             # parent process re-runs it post-done with full write access.

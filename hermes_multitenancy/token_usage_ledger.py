@@ -16,9 +16,16 @@
 
 token 来源：上游核心 ``AIAgent`` 实例的累计计数器
 ``session_input_tokens / session_output_tokens / session_total_tokens``
-（``run_agent.py`` 约 2021-2027 定义）。multitenancy 每个回合都新建一个 ``AIAgent``
-（``agent_real.py`` 约 3717），计数器从 0 起累加，所以跑完读到的就是「这一回合
-（含工具循环里多次模型调用）的合计」，不含历史回合 → 不重复计数。
+（``run_agent.py`` 约 2021-2027 定义）。multitenancy 每个回合都新建一个 ``AIAgent``，
+计数器从 0 起累加，所以跑完读到的就是「这一回合（含工具循环里多次模型调用）的合计」，
+不含历史回合 → 不重复计数。
+
+**写入发生在父进程**（重要）：token 计数器只在被沙箱化的 AIAgent 子进程里，但子进程沙箱
+策略不允许写 ``/var/log/hermes``。因此子进程只「读出」usage 并透传给父进程
+（``aiagent_subprocess`` 把 usage 放进最终 JSON），父进程
+（``agent_real._write_token_ledger_from_child``，非沙箱）才调用本模块落盘 —— 与
+``conversation_audit`` 同样的「父进程写」规避沙箱。开关 ``HERMES_TOKEN_USAGE_LEDGER_ENABLED``
+由父进程（gateway）读自身环境，无需进子进程 env 白名单。
 """
 from __future__ import annotations
 
