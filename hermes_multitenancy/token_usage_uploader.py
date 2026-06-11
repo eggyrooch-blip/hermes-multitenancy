@@ -255,7 +255,11 @@ def main(argv: list[str] | None = None) -> int:
                              ensure_ascii=False, indent=2))
             continue
         if not records:
-            continue  # nothing resolvable for this day; leave any existing snapshot intact
+            # 该日无可解析记录 → 不发空快照。这是有意的安全选择，不是契约漂移：
+            # 台账是 append-only、日内只增不减，故「无记录」只可能是该日真没用量或全员
+            # 解析不到（如 feishu-sync 临时失败）。发空快照会让端点 DELETE 掉上次的好数据；
+            # 宁可保留旧快照、等下次 resolution 恢复后重算覆盖。真·清空交由端点 records=[] 路径。
+            continue
         try:
             resp = post_records(collector, key, day, records)
             print(f"[uploader] uploaded {len(records)} record(s) for {day}: {resp}")

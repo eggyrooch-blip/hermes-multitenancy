@@ -117,4 +117,6 @@ def append_token_usage(
             fh.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
             fh.write("\n")
     except Exception:
-        logger.exception("[multitenancy] token usage ledger append failed")
+        # debug-only：台账是 best-effort 旁路，写失败绝不该污染用户可见的 ERROR 日志，
+        # 更不能影响主回合。exc_info 保留堆栈供排障。
+        logger.debug("[multitenancy] token usage ledger append failed", exc_info=True)
