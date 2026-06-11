@@ -67,6 +67,18 @@ HERMES_HOME=<sync-root> HERMES_TOKSCALE_REPORT_KEY=<key> \
 - **HERMES_HOME 指对**：指错 profile → 取不到租户凭据 → 目录拉取失败（会退本地缓存或全跳过）。
 - 工件 2 的 `/v1/usage/report` 端点要**先**在收集端宿主上线，否则 POST 404。
 
+## 已知限制（sunke 2026-06-12 接受，A 方案）
+
+两条都属「漏记不误记」——不会让任何人拿到错误数字，仅少数边角不计入：
+
+- **WebUI ingest 服务身份不归人**：`/api/run-broker/ingest`（外部 HTTP，服务号身份如
+  hanmeng）等 `user_key` 非 `ou_` 开头的路径，sender 解析为空 → 该回合不进台账。
+  这是有意的：服务号调用不该被算到某个真人头上。飞书 DM / 群聊的 sender 永远是
+  `ou_`，正常归人，不受影响（这才是「一个人多个智能体含群聊」的核心场景）。
+- **失败回合不计**：报错中断的回合即使消耗了 token 也不落账（轻微少计）。
+
+如果将来要覆盖这两类，再单独起 ftask（需引入 profile→人 映射 / 失败路径捕获）。
+
 ## 验证（端到端）
 
 `--dry-run` 看某人聚合正确 → 真跑一次 → 排行榜 `/v1/leaderboard` 该 email 总 token 增加、
