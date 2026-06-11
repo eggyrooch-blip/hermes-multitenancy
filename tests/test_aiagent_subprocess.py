@@ -705,7 +705,7 @@ def test_write_token_ledger_from_child_writes_in_parent(monkeypatch, tmp_path: P
     monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
 
     event = SimpleNamespace(source=SimpleNamespace(
-        platform=SimpleNamespace(value="feishu"), chat_type="group",
+        platform=SimpleNamespace(value="feishu"), chat_type="group", chat_id="oc_team",
         user_id="ou_sender", message_id="om_x",
     ))
     profile_home = tmp_path / "profiles" / "grpprofile"
@@ -719,8 +719,37 @@ def test_write_token_ledger_from_child_writes_in_parent(monkeypatch, tmp_path: P
     assert row["profile"] == "grpprofile"
     assert row["platform"] == "feishu"
     assert row["chat_type"] == "group"
+    assert row["chat_id"] == "oc_team"   # persisted so uploader can resolve the group owner
     assert row["model"] == "sonnet-4-6"
     assert row["total_tokens"] == 140
+
+
+def test_write_token_ledger_uses_canonical_chat_extraction(monkeypatch, tmp_path: Path):
+    """Regression (codex review): topic groups / fallback-shaped events carry chat info on
+    parent_chat_id / event.message.chat_id and chat_type 'topic'. The ledger must capture
+    the router-canonical chat_id/chat_type, else group turns mis-bill."""
+    import json
+    from types import SimpleNamespace
+    from hermes_multitenancy import agent_real
+
+    ledger = tmp_path / "t.jsonl"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+
+    # chat_type only on event; chat_id only on source.parent_chat_id (a real Feishu variant).
+    event = SimpleNamespace(
+        chat_type="topic",
+        source=SimpleNamespace(platform=SimpleNamespace(value="feishu"),
+                               parent_chat_id="oc_topic_parent", user_id="ou_s"),
+    )
+    profile_home = tmp_path / "profiles" / "grp"
+    profile_home.mkdir(parents=True)
+    agent_real._write_token_ledger_from_child(
+        event, profile_home, {"model": "m", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
+    row = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert row["chat_type"] == "topic"
+    assert row["chat_id"] == "oc_topic_parent"
 
 
 def test_write_token_ledger_disabled_is_noop(monkeypatch, tmp_path: Path):

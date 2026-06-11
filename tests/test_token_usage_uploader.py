@@ -76,6 +76,16 @@ def test_group_with_unknown_chat_is_dropped_not_misattributed() -> None:
     assert aggregate_day(iter_ledger_rows(text), "2026-06-11", owner_of) == {}
 
 
+def test_topic_group_also_attributes_to_owner() -> None:
+    # Feishu 'topic' chats are multi-person too -> bill to the group owner, not the @-er.
+    owner_of = make_owner_resolver(
+        lambda chat_id: "ou_owner" if chat_id == "oc_topic" else None,
+        lambda profile: None,
+    )
+    row = {"chat_type": "topic", "chat_id": "oc_topic", "sender_open_id": "ou_x"}
+    assert owner_of(row) == "ou_owner"
+
+
 def test_make_owner_resolver_rules() -> None:
     owner_of = make_owner_resolver(
         lambda chat_id: {"oc_g": "ou_inviter"}.get(chat_id),
@@ -83,6 +93,8 @@ def test_make_owner_resolver_rules() -> None:
     )
     # group -> inviter
     assert owner_of({"chat_type": "group", "chat_id": "oc_g", "sender_open_id": "ou_x"}) == "ou_inviter"
+    # topic (also multi-person) -> inviter, not sender
+    assert owner_of({"chat_type": "topic", "chat_id": "oc_g", "sender_open_id": "ou_x"}) == "ou_inviter"
     # group unknown -> None (drop, never the sender)
     assert owner_of({"chat_type": "group", "chat_id": "oc_?", "sender_open_id": "ou_x"}) is None
     # DM with sender -> the person

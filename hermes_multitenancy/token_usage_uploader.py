@@ -50,6 +50,8 @@ DEFAULT_LEDGER_PATH = Path("/var/log/hermes/token-usage.jsonl")
 DEFAULT_COLLECTOR = "https://tokscale.gotokeep.com"
 SOURCE = "hermes"
 CLIENT = "Hermes"
+# Feishu multi-person chat types — both bill to the group owner (mirror router._GROUP_CHAT_TYPES).
+GROUP_CHAT_TYPES = frozenset({"group", "topic"})
 
 
 # --------------------------------------------------------------------------- 纯逻辑（可测）
@@ -131,7 +133,7 @@ def make_owner_resolver(
     """
     def resolve(row: dict) -> str | None:
         chat_type = str(row.get("chat_type") or "").strip().lower()
-        if chat_type == "group":
+        if chat_type in GROUP_CHAT_TYPES:  # 'group' or 'topic' — both → group owner
             chat_id = str(row.get("chat_id") or "").strip()
             if not chat_id:
                 return None

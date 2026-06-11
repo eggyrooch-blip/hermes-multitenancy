@@ -2407,12 +2407,19 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
         if not token_usage_ledger_enabled():
             return
         source = getattr(event, "source", None)
+        # Use the router's canonical chat_type/chat_id extraction (same fallback
+        # chain feishu.py/routing use), so the recorded chat_id matches the key
+        # routing.lookup_by_chat_id expects — covers 'topic' groups and the
+        # parent_chat_id / chat_id_alt / event.message.chat_id variants that a
+        # bare source.chat_id read would miss (would mis-bill group turns).
+        from .router import _extract_chat_id, _extract_chat_type
+
         append_token_usage(
             sender_open_id=_resolve_subprocess_sender_open_id(event),
             profile=profile_home.name,
             platform=_resolve_platform_value(source),
-            chat_type=str(getattr(source, "chat_type", "") or "") if source else "",
-            chat_id=str(getattr(source, "chat_id", "") or "") if source else "",
+            chat_type=_extract_chat_type(event),
+            chat_id=_extract_chat_id(event),
             model=usage.get("model"),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
