@@ -41,7 +41,7 @@
    ```
    systemctl --user start hermes-token-uploader.service   # 真跑（默认只发今天）
    # 或本地干跑：
-   HERMES_HOME=<sync-root> python -m hermes_multitenancy.token_usage_uploader --dry-run
+   HERMES_HOME=<sync-root> python3 -m hermes_multitenancy.token_usage_uploader --dry-run
    ```
 
 ### 首次初始化：回写台账里所有历史日期
@@ -50,9 +50,9 @@
 所以「能采集的所有历史」= 台账启用后已积累的所有日期。首次接入时跑一次 `--backfill`，
 把台账里**全部日期**逐日上报（端点会从所有 day 行重算 month/lifetime，回写完总量自动正确）：
 ```
-HERMES_HOME=<sync-root> python -m hermes_multitenancy.token_usage_uploader --backfill --dry-run  # 先看
+HERMES_HOME=<sync-root> python3 -m hermes_multitenancy.token_usage_uploader --backfill --dry-run  # 先看
 HERMES_HOME=<sync-root> HERMES_TOKSCALE_REPORT_KEY=<key> \
-  python -m hermes_multitenancy.token_usage_uploader --backfill                                   # 真回写
+  python3 -m hermes_multitenancy.token_usage_uploader --backfill                                   # 真回写
 ```
 之后交给每小时 timer（默认只发当天，增量幂等）。`--backfill` 可随时重跑，不会翻倍。
 
