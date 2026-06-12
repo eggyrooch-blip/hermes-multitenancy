@@ -389,6 +389,37 @@ def _im_read_policy_error(
     return _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED
 
 
+def _live_owner_mapped_group(shared_home: Path, chat_id: str, user_open_id: str) -> bool:
+    """Live routing re-check: is ``chat_id`` a group owned by ``user_open_id`` right now?
+
+    ``context.allowed_bot_chat_ids`` is frozen at turn start, so a group the sender
+    just created / was mapped to mid-turn isn't in it yet (a freshness race that made
+    bot sends to a sender's own fresh group fail until the next turn). On the cache
+    miss we re-read the routing table for this one chat_id; if it now shows the
+    sender as the group owner, allow. Best-effort: any error → not-allowed (keeps the
+    original deny).
+    """
+    chat_id = str(chat_id or "").strip()
+    user_open_id = str(user_open_id or "").strip()
+    if not (chat_id and user_open_id):
+        return False
+    table = None
+    try:
+        from .routing import RoutingTable
+
+        table = RoutingTable(shared_home / "multitenancy.db")
+        row = table.lookup_by_chat_id(chat_id)
+    except Exception:
+        return False
+    finally:
+        try:
+            if table is not None:
+                table.close()
+        except Exception:
+            pass
+    return bool(row) and str(getattr(row, "owner_open_id", "") or "").strip() == user_open_id
+
+
 def _personal_bot_identity_policy_error(
     context: LarkCliAuthBrokerContext,
     *,
@@ -402,6 +433,12 @@ def _personal_bot_identity_policy_error(
         return None
     target_chat_id = _bot_im_message_send_chat_id(method, path_and_query, body)
     if target_chat_id and target_chat_id in context.allowed_bot_chat_ids:
+        return None
+    # Cache miss: re-check routing live so a sender's freshly-created own group works
+    # immediately instead of failing until the next turn (allowlist freshness race).
+    if target_chat_id and _live_owner_mapped_group(
+        context.shared_home, target_chat_id, context.user_open_id
+    ):
         return None
     if context.allowed_bot_chat_ids and _is_bot_im_image_upload(method, path_and_query):
         return None
