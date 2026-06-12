@@ -40,6 +40,22 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL_SECONDS = 30
 _DEDUPE_TTL_SECONDS = 24 * 3600
+# Freshness gate: only DM for markers written within this window. Stops a first
+# live-send enable from blasting a stale backlog (e.g. the 1100+ markers all
+# stamped 2026-06-09 by an internal "encryption key not ready" event, NOT real
+# Feishu rejections). A user who is genuinely still broken re-triggers a FRESH
+# marker on their next attempt, which passes this gate. 0 disables the gate.
+_DEFAULT_MAX_MARKER_AGE_SECONDS = 24 * 3600
+
+
+def _resolve_max_marker_age() -> int:
+    raw = (os.environ.get("HERMES_CREDENTIAL_REAUTH_NOTIFIER_MAX_AGE_SECONDS") or "").strip()
+    if not raw:
+        return _DEFAULT_MAX_MARKER_AGE_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_MARKER_AGE_SECONDS
 
 _worker_lock = threading.Lock()
 _worker_thread: Optional[threading.Thread] = None
@@ -95,6 +111,7 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
     bot_token = _get_bot_token(shared_home)
     owner_open_id = (os.environ.get("HERMES_CREDENTIAL_RENEWAL_OWNER_OPEN_ID") or "").strip()
     send_enabled = (os.environ.get("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND") or "").strip() == "1"
+    max_marker_age = _resolve_max_marker_age()
 
     for marker in _iter_markers(shared_home):
         body = read_needs_reauth_marker(marker)
@@ -108,6 +125,15 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
         key = f"{open_id}:{reason}"
         last = seen.get(key)
         now = int(time.time())
+        if max_marker_age and ts and (now - ts) > max_marker_age:
+            # Stale marker (e.g. the 2026-06-09 internal-error backlog): don't DM
+            # for a days-old rejection. Keep the marker + don't touch `seen` so a
+            # later FRESH re-rejection still notifies.
+            logger.debug(
+                "[credential_reauth_notifier] skip stale marker open_id=%s reason=%s age=%ss (> %ss)",
+                open_id, reason, now - ts, max_marker_age,
+            )
+            continue
         if last and now - int(last.get("notified_at", 0)) < _DEDUPE_TTL_SECONDS:
             # Within 24h dedupe window; skip even if a new marker has same key.
             continue
