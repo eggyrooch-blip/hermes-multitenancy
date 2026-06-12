@@ -403,10 +403,13 @@ def _bot_mention_ref(open_id: str = "ou_bot"):
 
 
 def _patch_mentions(monkeypatch):
-    """Install the valve and stub the core post-normalizer (no gateway import)."""
+    """Install the valve, a real (empty => default 'mention') routing table, and
+    stub the core post-normalizer (no gateway import)."""
     from hermes_multitenancy import feishu_group_valve
+    from hermes_multitenancy import router as router_mod
 
     feishu_group_valve._patch_mentions_self(_MentionAdapter)
+    router_mod.override_routing_table(":memory:")  # empty => get_group_reply_mode -> 'mention'
     monkeypatch.setattr(
         feishu_group_valve,
         "_load_normalize",
@@ -419,7 +422,9 @@ def test_mentions_self_ignores_at_all_broadcast(monkeypatch):
     NOT count as mentioning the bot. Without the valve the core returns True and
     the bot wrongly replies in a mention-only group."""
     _patch_mentions(monkeypatch)
-    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
+    msg = SimpleNamespace(
+        content='{"text":"@_all 全员通知"}', mentions=[], message_type="text", chat_id="oc_group"
+    )
     assert _MentionAdapter()._mentions_self(msg) is False
 
 
@@ -430,6 +435,7 @@ def test_mentions_self_keeps_genuine_mention_even_with_at_all(monkeypatch):
         content='{"text":"@_all @bot 看下"}',
         mentions=[_bot_mention_ref("ou_bot")],
         message_type="text",
+        chat_id="oc_group",
     )
     assert _MentionAdapter()._mentions_self(msg) is True
 
@@ -440,13 +446,16 @@ def test_mentions_self_keeps_plain_bot_mention(monkeypatch):
         content='{"text":"@bot hi"}',
         mentions=[_bot_mention_ref("ou_bot")],
         message_type="text",
+        chat_id="oc_group",
     )
     assert _MentionAdapter()._mentions_self(msg) is True
 
 
 def test_mentions_self_no_mention_stays_false(monkeypatch):
     _patch_mentions(monkeypatch)
-    msg = SimpleNamespace(content='{"text":"普通消息"}', mentions=[], message_type="text")
+    msg = SimpleNamespace(
+        content='{"text":"普通消息"}', mentions=[], message_type="text", chat_id="oc_group"
+    )
     assert _MentionAdapter()._mentions_self(msg) is False
 
 
@@ -470,6 +479,30 @@ def test_mentions_self_all_mode_leaves_at_all_untouched(monkeypatch):
         content='{"text":"@_all 全员通知"}', mentions=[], message_type="text", chat_id="oc_group"
     )
     assert _MentionAdapter()._mentions_self(msg) is True
+
+
+def test_mentions_self_fail_open_when_table_none(monkeypatch):
+    """Regression (codex review 3): router._get_routing_table() returns None on
+    init failure. When the mode is unreadable the valve must fail open and keep
+    the core's answer (True for @_all), NOT default to suppress."""
+    from hermes_multitenancy import feishu_group_valve
+
+    feishu_group_valve._patch_mentions_self(_MentionAdapter)
+    monkeypatch.setattr(feishu_group_valve, "_get_routing_table", lambda: None)
+    msg = SimpleNamespace(
+        content='{"text":"@_all x"}', mentions=[], message_type="text", chat_id="oc_group"
+    )
+    assert _MentionAdapter()._mentions_self(msg) is True
+
+
+def test_fork_should_accept_fail_open_when_table_none(monkeypatch):
+    """Same fail-open guard on the fork gate shape."""
+    from hermes_multitenancy import feishu_group_valve
+
+    feishu_group_valve._patch_should_accept_group_message(_ForkMentionAdapter)
+    monkeypatch.setattr(feishu_group_valve, "_get_routing_table", lambda: None)
+    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[], message_type="text")
+    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
 
 
 def test_mentions_self_fail_open_on_exception(monkeypatch):

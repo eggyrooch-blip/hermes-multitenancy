@@ -132,7 +132,11 @@ def _patch_mentions_self(FeishuAdapter: Any) -> None:
             chat_id = str(getattr(message, "chat_id", "") or "")
             if chat_id:
                 table = _get_routing_table()
-                if table is not None and table.get_group_reply_mode(chat_id) == "all":
+                if table is None:
+                    # Mode unreadable (router init failure returns None) —
+                    # fail-open: keep the core's answer, don't suppress.
+                    return result
+                if table.get_group_reply_mode(chat_id) == "all":
                     return result  # all-mode replies to everything — leave it
             if not _genuinely_mentions_bot(self, message):
                 # Original said "mentioned" only because of @everyone; drop it.
@@ -167,12 +171,15 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
         # fail-open: delegate to core and return its answer unchanged (we must
         # not apply the @everyone suppression when we couldn't read the mode).
         try:
-            table = _get_routing_table() if normalized_chat_id else None
-            mode = (
-                table.get_group_reply_mode(normalized_chat_id)
-                if table is not None and normalized_chat_id
-                else "mention"
-            )
+            if normalized_chat_id:
+                table = _get_routing_table()
+                if table is None:
+                    # Mode unreadable (router init failure returns None) —
+                    # fail-open: delegate to core, don't suppress @everyone.
+                    return original(self, *args, **kwargs)
+                mode = table.get_group_reply_mode(normalized_chat_id)
+            else:
+                mode = "mention"
         except Exception:
             logger.debug(
                 "[multitenancy] group reply valve failed; delegating to original",
