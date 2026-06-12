@@ -539,7 +539,7 @@ def test_lark_cli_tool_allows_personal_bot_im_image_upload_for_owner_mapped_grou
     assert captured["kwargs"]["env"]["HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS"] == "oc_allowed"
 
 
-def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat(
+def test_lark_cli_tool_defers_personal_bot_im_send_to_broker(
     monkeypatch,
     tmp_path,
 ):
@@ -576,11 +576,16 @@ def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat(
     )
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
-    assert result.get("ok") is not True
-    assert "personal profile bot identity is limited to owner mapped group chats" in result["error"]
+    # The child preflight now DEFERS bot IM sends to the broker — the authoritative
+    # gate that live-re-checks routing (see test_bot_group_livecheck). The sandboxed
+    # child can't read routing, so it must not hard-reject here (that broke sending
+    # to a sender's freshly-created own group until the next turn). In prod an
+    # unmapped send is still refused, by the broker proxy (403).
+    assert result.get("ok") is True
+    assert "limited to owner mapped group chats" not in (result.get("error") or "")
 
 
-def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat_even_when_risk_read(
+def test_lark_cli_tool_defers_personal_bot_im_send_to_broker_even_when_risk_read(
     monkeypatch,
     tmp_path,
 ):
@@ -617,8 +622,13 @@ def test_lark_cli_tool_rejects_personal_bot_im_send_to_unmapped_chat_even_when_r
     )
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
-    assert result.get("ok") is not True
-    assert "personal profile bot identity is limited to owner mapped group chats" in result["error"]
+    # The child preflight now DEFERS bot IM sends to the broker — the authoritative
+    # gate that live-re-checks routing (see test_bot_group_livecheck). The sandboxed
+    # child can't read routing, so it must not hard-reject here (that broke sending
+    # to a sender's freshly-created own group until the next turn). In prod an
+    # unmapped send is still refused, by the broker proxy (403).
+    assert result.get("ok") is True
+    assert "limited to owner mapped group chats" not in (result.get("error") or "")
 
 
 def test_lark_cli_tool_keeps_user_coerced_read_when_requested_identity_is_bot(
@@ -708,6 +718,9 @@ def test_lark_cli_tool_rejects_personal_bot_non_message_write_even_when_default_
     )
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
+    # NON-message bot writes (e.g. a calendar API POST) are still hard-refused in the
+    # child preflight — only IM message sends to a chat defer to the broker. So this
+    # must fail before spawning lark-cli.
     assert result.get("ok") is not True
     assert "personal profile bot identity is limited to owner mapped group chats" in result["error"]
 

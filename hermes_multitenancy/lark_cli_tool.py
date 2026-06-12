@@ -452,7 +452,14 @@ def _personal_user_write_identity_error(
             return None
         if _is_im_read_request(mode, argv):
             return None
-        if _bot_im_send_chat_id(mode, argv) or risk in {"write", "admin"}:
+        if _bot_im_send_chat_id(mode, argv):
+            # IM message send to a chat: defer to the broker, which live-re-checks
+            # routing and allows the sender's own (possibly freshly-created) group
+            # or denies an unmapped one. This child preflight runs in the sandboxed
+            # subprocess and cannot read routing, so it must NOT hard-refuse here —
+            # otherwise a sender's just-created own group fails until the next turn.
+            return None
+        if risk in {"write", "admin"}:
             return (
                 "personal profile bot identity is limited to owner mapped group chats; "
                 "refusing unmapped or non-message bot write"
@@ -642,7 +649,12 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     env = _safe_env()
     requested_identity = str(args.get("identity") or "auto").strip().lower()
     allow_explicit_bot = requested_identity == "bot" and (
-        _personal_bot_im_send_allowed(env, mode, argv) or _personal_bot_im_image_upload_allowed(env, mode, argv)
+        _personal_bot_im_send_allowed(env, mode, argv)
+        or _personal_bot_im_image_upload_allowed(env, mode, argv)
+        # An explicit bot IM message send (has a target chat_id) uses the bot
+        # identity and lets the broker authorize it (live routing re-check), so a
+        # sender's freshly-created own group isn't blocked by the turn-start cache.
+        or bool(_bot_im_send_chat_id(mode, argv))
     )
     identity = _effective_identity(args.get("identity"), allow_explicit_bot=allow_explicit_bot)
     if identity in {"user", "bot"} and _supports_identity_flag(argv, mode):

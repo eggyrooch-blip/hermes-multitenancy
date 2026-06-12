@@ -1684,11 +1684,12 @@ def _lark_cli_auth_broker_scope(
 
     default_as = _lark_cli_default_identity(profile_home, sender_open_id)
     allowed_bot_chat_ids = _owner_mapped_bot_chat_ids(profile_home, sender_open_id)
-    allowed_identities = (
-        frozenset({"user"})
-        if default_as == "user" and not allowed_bot_chat_ids
-        else frozenset({"user", "bot"})
-    )
+    # Always permit the bot identity: the broker is the authoritative gate and now
+    # live-re-checks routing per send (see _personal_bot_identity_policy_error), so a
+    # sender's freshly-created own group works even when the turn-start cache was
+    # empty. Restricting identities to {"user"} here would reject `--as bot` at the
+    # broker identity gate before that policy check ever runs (freshness race).
+    allowed_identities = frozenset({"user", "bot"})
     key = secrets.token_urlsafe(32)
     server = start_lark_cli_auth_broker_server(
         LarkCliAuthBrokerContext(

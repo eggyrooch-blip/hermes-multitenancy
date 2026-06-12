@@ -3462,7 +3462,9 @@ def test_lark_cli_auth_broker_scope_defaults_to_user_when_profile_has_uat(monkey
 
     with agent_real._lark_cli_auth_broker_scope(profile, "ou_alice") as extra:
         assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
-        assert seen["context"].allowed_identities == frozenset({"user"})
+        # default identity stays user, but bot is always PERMITTED — the broker's
+        # per-send policy (live routing re-check) is the authoritative gate now.
+        assert seen["context"].allowed_identities == frozenset({"user", "bot"})
 
 
 def test_lark_cli_auth_broker_scope_passes_owner_mapped_bot_chat_allowlist(
@@ -3656,7 +3658,10 @@ def test_lark_cli_auth_broker_scope_does_not_broaden_bot_identity_without_owner_
         context = seen["context"]
         assert extra["LARKSUITE_CLI_DEFAULT_AS"] == "user"
         assert "HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS" not in extra
-        assert context.allowed_identities == frozenset({"user"})
+        # bot identity is always permitted now; ou_alice owning no groups means the
+        # allow-set is empty, so a bot send to oc_other (owned by someone else) is
+        # denied by the broker's per-send policy — not by restricting identities here.
+        assert context.allowed_identities == frozenset({"user", "bot"})
         assert context.allowed_bot_chat_ids == frozenset()
 
 
