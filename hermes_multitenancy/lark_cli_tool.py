@@ -379,6 +379,16 @@ def _allowed_bot_chat_ids(env: dict[str, str]) -> frozenset[str]:
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _broker_proxy_configured(env: dict[str, str]) -> bool:
+    """True only when the lark-cli auth broker proxy is actually wired into this
+    subprocess. The broker is the authoritative owner-vs-sender gate; without it
+    there is nothing to defer to, so a bot IM send must NOT be let through."""
+    return bool(
+        str(env.get("LARKSUITE_CLI_AUTH_PROXY") or "").strip()
+        and str(env.get("LARKSUITE_CLI_PROXY_KEY") or "").strip()
+    )
+
+
 def _personal_bot_im_send_allowed(env: dict[str, str], mode: str, argv: list[str]) -> bool:
     if not str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip():
         return False
@@ -452,12 +462,15 @@ def _personal_user_write_identity_error(
             return None
         if _is_im_read_request(mode, argv):
             return None
-        if _bot_im_send_chat_id(mode, argv):
-            # IM message send to a chat: defer to the broker, which live-re-checks
-            # routing and allows the sender's own (possibly freshly-created) group
-            # or denies an unmapped one. This child preflight runs in the sandboxed
-            # subprocess and cannot read routing, so it must NOT hard-refuse here —
-            # otherwise a sender's just-created own group fails until the next turn.
+        if _bot_im_send_chat_id(mode, argv) and _broker_proxy_configured(env):
+            # IM message send to a chat WITH the broker proxy wired: defer to the
+            # broker, which live-re-checks routing and allows the sender's own
+            # (possibly freshly-created) group or denies an unmapped one. This
+            # child preflight runs in the sandboxed subprocess and cannot read
+            # routing, so it must NOT hard-refuse here — otherwise a sender's
+            # just-created own group fails until the next turn. Without the broker
+            # there is no authoritative gate to defer to, so we fall through and
+            # the write/admin refusal below still applies.
             return None
         if risk in {"write", "admin"}:
             return (
@@ -654,7 +667,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         # An explicit bot IM message send (has a target chat_id) uses the bot
         # identity and lets the broker authorize it (live routing re-check), so a
         # sender's freshly-created own group isn't blocked by the turn-start cache.
-        or bool(_bot_im_send_chat_id(mode, argv))
+        # Only when the broker proxy is wired — without it there is no authoritative
+        # gate, so we do not promote to the bot identity.
+        or bool(_bot_im_send_chat_id(mode, argv) and _broker_proxy_configured(env))
     )
     identity = _effective_identity(args.get("identity"), allow_explicit_bot=allow_explicit_bot)
     if identity in {"user", "bot"} and _supports_identity_flag(argv, mode):

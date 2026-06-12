@@ -557,6 +557,9 @@ def test_lark_cli_tool_defers_personal_bot_im_send_to_broker(
     monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
     monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
     monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+    # Broker proxy is wired: deferral to the authoritative live-routing gate applies.
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:1/")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "k")
 
     class Completed:
         returncode = 0
@@ -603,6 +606,9 @@ def test_lark_cli_tool_defers_personal_bot_im_send_to_broker_even_when_risk_read
     monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
     monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
     monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+    # Broker proxy is wired: deferral to the authoritative live-routing gate applies.
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:1/")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "k")
 
     class Completed:
         returncode = 0
@@ -629,6 +635,52 @@ def test_lark_cli_tool_defers_personal_bot_im_send_to_broker_even_when_risk_read
     # unmapped send is still refused, by the broker proxy (403).
     assert result.get("ok") is True
     assert "limited to owner mapped group chats" not in (result.get("error") or "")
+
+
+def test_lark_cli_tool_refuses_personal_bot_im_send_when_broker_proxy_absent(
+    monkeypatch,
+    tmp_path,
+):
+    # No broker proxy wired -> there is no authoritative gate to defer to, so the
+    # child preflight must keep refusing an unmapped bot IM send rather than let it
+    # through unauthorized (codex review round 3).
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "owner"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS", "oc_allowed")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+    monkeypatch.delenv("LARKSUITE_CLI_AUTH_PROXY", raising=False)
+    monkeypatch.delenv("LARKSUITE_CLI_PROXY_KEY", raising=False)
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"message_id":"om_other"}}'
+        stderr = ""
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["im", "+messages-send", "--chat-id", "oc_other", "--text", "hello"],
+            "identity": "bot",
+            "risk": "write",
+            "reason": "send non-owned group message as Hermes bot",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result.get("ok") is not True
+    assert "limited to owner mapped group chats" in (result.get("error") or "")
 
 
 def test_lark_cli_tool_keeps_user_coerced_read_when_requested_identity_is_bot(
