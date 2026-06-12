@@ -284,6 +284,118 @@ def test_should_accept_fail_open_delegates_on_exception(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Valve: prod gate _mentions_self — @everyone (@_all) must NOT wake the bot
+# --------------------------------------------------------------------------- #
+
+class _MentionAdapter:
+    """Mimics core _mentions_self: any @_all in raw content => True (the bug)."""
+
+    def __init__(self, bot_open_id: str = "ou_bot"):
+        self._bot_open_id = bot_open_id
+        self._bot_user_id = ""
+        self._bot_name = ""
+
+    def _bot_identity(self):
+        return SimpleNamespace(open_id=self._bot_open_id, user_id="", name="")
+
+    def _message_mentions_bot(self, mentions):
+        for m in mentions:
+            mid = getattr(m, "id", None)
+            if mid is not None and getattr(mid, "open_id", "") == self._bot_open_id:
+                return True
+        return False
+
+    def _post_mentions_bot(self, mentions):
+        return any(getattr(m, "is_self", False) for m in mentions)
+
+    def _mentions_self(self, message):
+        raw = getattr(message, "content", "") or ""
+        if "@_all" in raw:  # core's @everyone shortcut — the bug we neutralize
+            return True
+        mentions = getattr(message, "mentions", None) or []
+        return bool(mentions and self._message_mentions_bot(mentions))
+
+
+def _bot_mention_ref(open_id: str = "ou_bot"):
+    return SimpleNamespace(id=SimpleNamespace(open_id=open_id))
+
+
+def _patch_mentions(monkeypatch):
+    """Install the valve and stub the core post-normalizer (no gateway import)."""
+    from hermes_multitenancy import feishu_group_valve
+
+    feishu_group_valve._patch_mentions_self(_MentionAdapter)
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_load_normalize",
+        lambda: (lambda **_: SimpleNamespace(mentions=[])),
+    )
+
+
+def test_mentions_self_ignores_at_all_broadcast(monkeypatch):
+    """Regression: an @所有人 (@_all) broadcast — e.g. a bot notification — must
+    NOT count as mentioning the bot. Without the valve the core returns True and
+    the bot wrongly replies in a mention-only group."""
+    _patch_mentions(monkeypatch)
+    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
+    assert _MentionAdapter()._mentions_self(msg) is False
+
+
+def test_mentions_self_keeps_genuine_mention_even_with_at_all(monkeypatch):
+    """A real @bot still wakes the bot, even if @_all is also present."""
+    _patch_mentions(monkeypatch)
+    msg = SimpleNamespace(
+        content='{"text":"@_all @bot 看下"}',
+        mentions=[_bot_mention_ref("ou_bot")],
+        message_type="text",
+    )
+    assert _MentionAdapter()._mentions_self(msg) is True
+
+
+def test_mentions_self_keeps_plain_bot_mention(monkeypatch):
+    _patch_mentions(monkeypatch)
+    msg = SimpleNamespace(
+        content='{"text":"@bot hi"}',
+        mentions=[_bot_mention_ref("ou_bot")],
+        message_type="text",
+    )
+    assert _MentionAdapter()._mentions_self(msg) is True
+
+
+def test_mentions_self_no_mention_stays_false(monkeypatch):
+    _patch_mentions(monkeypatch)
+    msg = SimpleNamespace(content='{"text":"普通消息"}', mentions=[], message_type="text")
+    assert _MentionAdapter()._mentions_self(msg) is False
+
+
+def test_mentions_self_fail_open_on_exception(monkeypatch):
+    from hermes_multitenancy import feishu_group_valve
+
+    feishu_group_valve._patch_mentions_self(_MentionAdapter)
+    # Genuine-check blows up => valve must yield the core's original answer.
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_genuinely_mentions_bot",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[], message_type="text")
+    assert _MentionAdapter()._mentions_self(msg) is True
+
+
+def test_mentions_self_patch_idempotent():
+    from hermes_multitenancy.feishu_group_valve import _patch_mentions_self
+
+    class A:
+        def _mentions_self(self, message):
+            return True
+
+    _patch_mentions_self(A)
+    first = A._mentions_self
+    _patch_mentions_self(A)
+    assert A._mentions_self is first
+
+
+# --------------------------------------------------------------------------- #
 # Card action callback (owner-gated, via provisioned row OR pending inviter)
 # --------------------------------------------------------------------------- #
 

@@ -17,6 +17,7 @@ _HOOK_INSTALLED = False
 _REQUIRE_MENTION_FLAG = "_hermes_multitenancy_group_valve_require_mention_patched"
 _SHOULD_ACCEPT_FLAG = "_hermes_multitenancy_group_valve_should_accept_patched"
 _CARD_ACTION_FLAG = "_hermes_multitenancy_group_valve_card_action_patched"
+_MENTIONS_SELF_FLAG = "_hermes_multitenancy_group_valve_mentions_self_patched"
 _VALID_REPLY_MODES = frozenset({"mention", "all"})
 
 
@@ -38,6 +39,7 @@ def install_feishu_group_valve_patch() -> None:
     # Patch whichever exists; both fail-open to the original.
     _patch_require_mention_for(FeishuAdapter)
     _patch_should_accept_group_message(FeishuAdapter)
+    _patch_mentions_self(FeishuAdapter)
     _patch_on_card_action_trigger(FeishuAdapter)
     _HOOK_INSTALLED = True
 
@@ -73,6 +75,68 @@ def _patch_require_mention_for(FeishuAdapter: Any) -> None:
     FeishuAdapter._require_mention_for = wrapped
     logger.info(
         "[multitenancy] installed group reply valve on FeishuAdapter._require_mention_for"
+    )
+
+
+def _load_normalize() -> Any:
+    """Lazy handle to the core post-payload normalizer (indirected for tests)."""
+    from gateway.platforms.feishu import normalize_feishu_message  # type: ignore
+
+    return normalize_feishu_message
+
+
+def _genuinely_mentions_bot(adapter: Any, message: Any) -> bool:
+    """True only when the message @-mentions THIS bot by id/name.
+
+    Mirrors core ``_mentions_self`` minus its ``@_all`` shortcut: an @everyone
+    (@所有人 / @_all) is NOT a mention of the bot. Reuses the core helpers so the
+    id/name matching rules never drift from upstream.
+    """
+    mentions = getattr(message, "mentions", None) or []
+    if mentions and adapter._message_mentions_bot(mentions):
+        return True
+    normalize_feishu_message = _load_normalize()
+    normalized = normalize_feishu_message(
+        message_type=getattr(message, "message_type", "") or "",
+        raw_content=getattr(message, "content", "") or "",
+        mentions=getattr(message, "mentions", None),
+        bot=adapter._bot_identity(),
+    )
+    return adapter._post_mentions_bot(normalized.mentions)
+
+
+def _patch_mentions_self(FeishuAdapter: Any) -> None:
+    """Prod path: stop @everyone (@_all / @所有人) from counting as a bot mention.
+
+    Core ``_mentions_self`` returns True whenever ``@_all`` appears in the raw
+    content, so in a mention-only group an @everyone broadcast (e.g. a bot
+    notification) wrongly satisfies _admit's mention gate and wakes the bot.
+    Here we let the bot wake ONLY on a genuine @-mention of itself; @everyone
+    alone is ignored. Fails open to the original on any error.
+    """
+    original = getattr(FeishuAdapter, "_mentions_self", None)
+    if original is None or getattr(original, _MENTIONS_SELF_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def wrapped(self: Any, message: Any) -> Any:
+        try:
+            result = original(self, message)
+            if result and not _genuinely_mentions_bot(self, message):
+                # Original said "mentioned" only because of @everyone; drop it.
+                return False
+            return result
+        except Exception:
+            logger.debug(
+                "[multitenancy] mentions-self valve failed; delegating to original",
+                exc_info=True,
+            )
+            return original(self, message)
+
+    setattr(wrapped, _MENTIONS_SELF_FLAG, True)
+    FeishuAdapter._mentions_self = wrapped
+    logger.info(
+        "[multitenancy] installed @everyone-ignore valve on FeishuAdapter._mentions_self"
     )
 
 
