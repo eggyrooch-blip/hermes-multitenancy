@@ -450,6 +450,28 @@ def test_mentions_self_no_mention_stays_false(monkeypatch):
     assert _MentionAdapter()._mentions_self(msg) is False
 
 
+def test_mentions_self_all_mode_leaves_at_all_untouched(monkeypatch):
+    """All reply-mode groups must keep replying to everything, including a bot
+    @everyone (which _admit routes through _mentions_self for bot admission).
+    The valve must NOT suppress @_all there."""
+    from hermes_multitenancy import feishu_group_valve
+    from hermes_multitenancy import router as router_mod
+
+    feishu_group_valve._patch_mentions_self(_MentionAdapter)
+    router_mod.override_routing_table(":memory:")
+    table = router_mod._get_routing_table()
+    table.set_group_reply_mode("oc_group", "all")
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_load_normalize",
+        lambda: (lambda **_: SimpleNamespace(mentions=[])),
+    )
+    msg = SimpleNamespace(
+        content='{"text":"@_all 全员通知"}', mentions=[], message_type="text", chat_id="oc_group"
+    )
+    assert _MentionAdapter()._mentions_self(msg) is True
+
+
 def test_mentions_self_fail_open_on_exception(monkeypatch):
     from hermes_multitenancy import feishu_group_valve
 

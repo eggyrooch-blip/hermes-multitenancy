@@ -112,7 +112,12 @@ def _patch_mentions_self(FeishuAdapter: Any) -> None:
     content, so in a mention-only group an @everyone broadcast (e.g. a bot
     notification) wrongly satisfies _admit's mention gate and wakes the bot.
     Here we let the bot wake ONLY on a genuine @-mention of itself; @everyone
-    alone is ignored. Fails open to the original on any error.
+    alone is ignored.
+
+    Mode-gated: suppression applies only in mention/default groups. In 'all'
+    reply-mode groups we leave the core answer untouched so they keep replying
+    to everything (incl. bot @everyone, which _admit also routes through
+    _mentions_self for bot-sender admission). Fails open on any error.
     """
     original = getattr(FeishuAdapter, "_mentions_self", None)
     if original is None or getattr(original, _MENTIONS_SELF_FLAG, False):
@@ -122,7 +127,14 @@ def _patch_mentions_self(FeishuAdapter: Any) -> None:
     def wrapped(self: Any, message: Any) -> Any:
         try:
             result = original(self, message)
-            if result and not _genuinely_mentions_bot(self, message):
+            if not result:
+                return result
+            chat_id = str(getattr(message, "chat_id", "") or "")
+            if chat_id:
+                table = _get_routing_table()
+                if table is not None and table.get_group_reply_mode(chat_id) == "all":
+                    return result  # all-mode replies to everything — leave it
+            if not _genuinely_mentions_bot(self, message):
                 # Original said "mentioned" only because of @everyone; drop it.
                 return False
             return result
