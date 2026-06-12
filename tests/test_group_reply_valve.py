@@ -335,20 +335,25 @@ def test_fork_should_accept_keeps_genuine_bot_mention(monkeypatch):
     assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
 
 
-def test_fork_should_accept_fail_open_keeps_at_all_when_routing_errors(monkeypatch):
-    """Regression (codex review 2): if the routing-table lookup throws, the
-    valve must NOT apply @everyone suppression — it must fail open and return
-    the core's original answer (True for a raw @_all), per the SPEC."""
+def test_fork_should_accept_suppresses_at_all_even_when_routing_errors(monkeypatch):
+    """@everyone suppression is routing-table-INDEPENDENT: a raw @_all that does
+    not @ the bot is dropped even if the routing-table lookup throws (the
+    suppression decision never consults the table)."""
     from hermes_multitenancy import feishu_group_valve
 
     feishu_group_valve._patch_should_accept_group_message(_ForkMentionAdapter)
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_load_normalize",
+        lambda: (lambda **_: SimpleNamespace(mentions=[])),
+    )
     monkeypatch.setattr(
         feishu_group_valve,
         "_get_routing_table",
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
-    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
+    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is False
 
 
 def test_should_accept_fail_open_delegates_on_exception(monkeypatch):
@@ -366,16 +371,24 @@ def test_should_accept_fail_open_delegates_on_exception(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Valve: prod gate _mentions_self — @everyone (@_all) must NOT wake the bot
+# Valve: prod gate _admit — @everyone (@_all) must NEVER wake the bot (any mode)
 # --------------------------------------------------------------------------- #
 
-class _MentionAdapter:
-    """Mimics core _mentions_self: any @_all in raw content => True (the bug)."""
+def _bot_mention_ref(open_id: str = "ou_bot"):
+    return SimpleNamespace(id=SimpleNamespace(open_id=open_id))
 
-    def __init__(self, bot_open_id: str = "ou_bot"):
+
+class _AdmitAdapter:
+    """Mimics prod _admit: in 'all' reply mode require_mention is False so a group
+    message is admitted WITHOUT ever consulting _mentions_self; in mention mode it
+    requires _mentions_self, and core _mentions_self treats a raw @_all as a
+    self-mention (the bug). The valve must drop @everyone in BOTH modes."""
+
+    def __init__(self, bot_open_id: str = "ou_bot", mode_all: bool = False):
         self._bot_open_id = bot_open_id
         self._bot_user_id = ""
         self._bot_name = ""
+        self._mode_all = mode_all
 
     def _bot_identity(self):
         return SimpleNamespace(open_id=self._bot_open_id, user_id="", name="")
@@ -390,26 +403,44 @@ class _MentionAdapter:
     def _post_mentions_bot(self, mentions):
         return any(getattr(m, "is_self", False) for m in mentions)
 
+    def _require_mention_for(self, chat_id=""):
+        return not self._mode_all
+
+    def _allow_group_message(self, sender_id, chat_id="", *, is_bot=False):
+        return True
+
     def _mentions_self(self, message):
-        raw = getattr(message, "content", "") or ""
-        if "@_all" in raw:  # core's @everyone shortcut — the bug we neutralize
-            return True
+        if "@_all" in (getattr(message, "content", "") or ""):
+            return True  # core's @everyone shortcut — the bug
         mentions = getattr(message, "mentions", None) or []
         return bool(mentions and self._message_mentions_bot(mentions))
 
+    def _admit(self, sender, message):
+        is_group = getattr(message, "chat_type", "p2p") != "p2p"
+        if not is_group:
+            return None
+        require_mention = self._require_mention_for(getattr(message, "chat_id", ""))
+        if not self._allow_group_message(
+            getattr(sender, "sender_id", None), getattr(message, "chat_id", "")
+        ):
+            return "group_policy_rejected"
+        if require_mention and not self._mentions_self(message):
+            return "group_policy_rejected"
+        return None
 
-def _bot_mention_ref(open_id: str = "ou_bot"):
-    return SimpleNamespace(id=SimpleNamespace(open_id=open_id))
+
+def _group_msg(content, mentions=None, chat_id="oc_group"):
+    return SimpleNamespace(
+        content=content, mentions=mentions or [], message_type="text",
+        chat_id=chat_id, chat_type="group",
+    )
 
 
-def _patch_mentions(monkeypatch):
-    """Install the valve, a real (empty => default 'mention') routing table, and
-    stub the core post-normalizer (no gateway import)."""
+def _patch_admit_adapter(monkeypatch):
+    """Install the _admit valve and stub the core post-normalizer (no gateway)."""
     from hermes_multitenancy import feishu_group_valve
-    from hermes_multitenancy import router as router_mod
 
-    feishu_group_valve._patch_mentions_self(_MentionAdapter)
-    router_mod.override_routing_table(":memory:")  # empty => get_group_reply_mode -> 'mention'
+    feishu_group_valve._patch_admit(_AdmitAdapter)
     monkeypatch.setattr(
         feishu_group_valve,
         "_load_normalize",
@@ -417,119 +448,93 @@ def _patch_mentions(monkeypatch):
     )
 
 
-def test_mentions_self_ignores_at_all_broadcast(monkeypatch):
-    """Regression: an @所有人 (@_all) broadcast — e.g. a bot notification — must
-    NOT count as mentioning the bot. Without the valve the core returns True and
-    the bot wrongly replies in a mention-only group."""
-    _patch_mentions(monkeypatch)
-    msg = SimpleNamespace(
-        content='{"text":"@_all 全员通知"}', mentions=[], message_type="text", chat_id="oc_group"
+def test_admit_ignores_at_all_in_mention_mode(monkeypatch):
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=False)
+    assert a._admit(None, _group_msg('{"text":"@_all 测试"}')) == "group_at_everyone_ignored"
+
+
+def test_admit_ignores_at_all_in_all_mode(monkeypatch):
+    """THE sunke bug: an 'all' reply-mode group replied to @所有人. @everyone must
+    be dropped even there (core admits all-mode msgs without checking mentions)."""
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=True)
+    assert a._admit(None, _group_msg('{"text":"@_all 测试@all 触发"}')) == "group_at_everyone_ignored"
+
+
+def test_admit_keeps_genuine_bot_mention_with_at_all(monkeypatch):
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=False)
+    msg = _group_msg('{"text":"@_all @bot"}', mentions=[_bot_mention_ref("ou_bot")])
+    assert a._admit(None, msg) is None  # genuine @bot => admitted
+
+
+def test_admit_all_mode_normal_message_still_admitted(monkeypatch):
+    """all-mode keeps replying to everything that is NOT an @everyone broadcast."""
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=True)
+    assert a._admit(None, _group_msg('{"text":"普通消息"}')) is None
+
+
+def test_admit_mention_mode_plain_message_rejected(monkeypatch):
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=False)
+    assert a._admit(None, _group_msg('{"text":"普通消息"}')) == "group_policy_rejected"
+
+
+def test_admit_dm_untouched(monkeypatch):
+    """DMs (p2p) are not groups — the valve must not touch them."""
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=False)
+    dm = SimpleNamespace(
+        content='{"text":"@_all"}', mentions=[], message_type="text",
+        chat_id="oc_dm", chat_type="p2p",
     )
-    assert _MentionAdapter()._mentions_self(msg) is False
+    assert a._admit(None, dm) is None
 
 
-def test_mentions_self_keeps_genuine_mention_even_with_at_all(monkeypatch):
-    """A real @bot still wakes the bot, even if @_all is also present."""
-    _patch_mentions(monkeypatch)
-    msg = SimpleNamespace(
-        content='{"text":"@_all @bot 看下"}',
-        mentions=[_bot_mention_ref("ou_bot")],
-        message_type="text",
-        chat_id="oc_group",
-    )
-    assert _MentionAdapter()._mentions_self(msg) is True
-
-
-def test_mentions_self_keeps_plain_bot_mention(monkeypatch):
-    _patch_mentions(monkeypatch)
-    msg = SimpleNamespace(
-        content='{"text":"@bot hi"}',
-        mentions=[_bot_mention_ref("ou_bot")],
-        message_type="text",
-        chat_id="oc_group",
-    )
-    assert _MentionAdapter()._mentions_self(msg) is True
-
-
-def test_mentions_self_no_mention_stays_false(monkeypatch):
-    _patch_mentions(monkeypatch)
-    msg = SimpleNamespace(
-        content='{"text":"普通消息"}', mentions=[], message_type="text", chat_id="oc_group"
-    )
-    assert _MentionAdapter()._mentions_self(msg) is False
-
-
-def test_mentions_self_all_mode_leaves_at_all_untouched(monkeypatch):
-    """All reply-mode groups must keep replying to everything, including a bot
-    @everyone (which _admit routes through _mentions_self for bot admission).
-    The valve must NOT suppress @_all there."""
-    from hermes_multitenancy import feishu_group_valve
-    from hermes_multitenancy import router as router_mod
-
-    feishu_group_valve._patch_mentions_self(_MentionAdapter)
-    router_mod.override_routing_table(":memory:")
-    table = router_mod._get_routing_table()
-    table.set_group_reply_mode("oc_group", "all")
-    monkeypatch.setattr(
-        feishu_group_valve,
-        "_load_normalize",
-        lambda: (lambda **_: SimpleNamespace(mentions=[])),
-    )
-    msg = SimpleNamespace(
-        content='{"text":"@_all 全员通知"}', mentions=[], message_type="text", chat_id="oc_group"
-    )
-    assert _MentionAdapter()._mentions_self(msg) is True
-
-
-def test_mentions_self_fail_open_when_table_none(monkeypatch):
-    """Regression (codex review 3): router._get_routing_table() returns None on
-    init failure. When the mode is unreadable the valve must fail open and keep
-    the core's answer (True for @_all), NOT default to suppress."""
+def test_admit_fail_open_on_genuine_check_error(monkeypatch):
+    """If the genuine-mention check blows up we must NOT suppress — fail open and
+    let core decide (here all-mode admits)."""
     from hermes_multitenancy import feishu_group_valve
 
-    feishu_group_valve._patch_mentions_self(_MentionAdapter)
-    monkeypatch.setattr(feishu_group_valve, "_get_routing_table", lambda: None)
-    msg = SimpleNamespace(
-        content='{"text":"@_all x"}', mentions=[], message_type="text", chat_id="oc_group"
-    )
-    assert _MentionAdapter()._mentions_self(msg) is True
-
-
-def test_fork_should_accept_fail_open_when_table_none(monkeypatch):
-    """Same fail-open guard on the fork gate shape."""
-    from hermes_multitenancy import feishu_group_valve
-
-    feishu_group_valve._patch_should_accept_group_message(_ForkMentionAdapter)
-    monkeypatch.setattr(feishu_group_valve, "_get_routing_table", lambda: None)
-    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[], message_type="text")
-    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
-
-
-def test_mentions_self_fail_open_on_exception(monkeypatch):
-    from hermes_multitenancy import feishu_group_valve
-
-    feishu_group_valve._patch_mentions_self(_MentionAdapter)
-    # Genuine-check blows up => valve must yield the core's original answer.
+    feishu_group_valve._patch_admit(_AdmitAdapter)
     monkeypatch.setattr(
         feishu_group_valve,
         "_genuinely_mentions_bot",
         lambda *_: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[], message_type="text")
-    assert _MentionAdapter()._mentions_self(msg) is True
+    a = _AdmitAdapter(mode_all=True)
+    assert a._admit(None, _group_msg('{"text":"@_all x"}')) is None
 
 
-def test_mentions_self_patch_idempotent():
-    from hermes_multitenancy.feishu_group_valve import _patch_mentions_self
+def test_admit_patch_idempotent():
+    from hermes_multitenancy.feishu_group_valve import _patch_admit
 
     class A:
-        def _mentions_self(self, message):
-            return True
+        def _admit(self, sender, message):
+            return None
 
-    _patch_mentions_self(A)
-    first = A._mentions_self
-    _patch_mentions_self(A)
-    assert A._mentions_self is first
+    _patch_admit(A)
+    first = A._admit
+    _patch_admit(A)
+    assert A._admit is first
+
+
+def test_fork_should_accept_suppresses_at_all_when_table_none(monkeypatch):
+    """Fork shape: @everyone dropped even when the routing table is None (the
+    suppression decision is table-independent)."""
+    from hermes_multitenancy import feishu_group_valve
+
+    feishu_group_valve._patch_should_accept_group_message(_ForkMentionAdapter)
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_load_normalize",
+        lambda: (lambda **_: SimpleNamespace(mentions=[])),
+    )
+    monkeypatch.setattr(feishu_group_valve, "_get_routing_table", lambda: None)
+    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[], message_type="text")
+    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is False
 
 
 # --------------------------------------------------------------------------- #

@@ -17,7 +17,7 @@ _HOOK_INSTALLED = False
 _REQUIRE_MENTION_FLAG = "_hermes_multitenancy_group_valve_require_mention_patched"
 _SHOULD_ACCEPT_FLAG = "_hermes_multitenancy_group_valve_should_accept_patched"
 _CARD_ACTION_FLAG = "_hermes_multitenancy_group_valve_card_action_patched"
-_MENTIONS_SELF_FLAG = "_hermes_multitenancy_group_valve_mentions_self_patched"
+_ADMIT_FLAG = "_hermes_multitenancy_group_valve_admit_patched"
 _VALID_REPLY_MODES = frozenset({"mention", "all"})
 
 
@@ -39,7 +39,7 @@ def install_feishu_group_valve_patch() -> None:
     # Patch whichever exists; both fail-open to the original.
     _patch_require_mention_for(FeishuAdapter)
     _patch_should_accept_group_message(FeishuAdapter)
-    _patch_mentions_self(FeishuAdapter)
+    _patch_admit(FeishuAdapter)
     _patch_on_card_action_trigger(FeishuAdapter)
     _HOOK_INSTALLED = True
 
@@ -105,54 +105,62 @@ def _genuinely_mentions_bot(adapter: Any, message: Any) -> bool:
     return adapter._post_mentions_bot(normalized.mentions)
 
 
-def _patch_mentions_self(FeishuAdapter: Any) -> None:
-    """Prod path: stop @everyone (@_all / @所有人) from counting as a bot mention.
+def _is_ignorable_at_everyone(adapter: Any, message: Any) -> bool:
+    """True iff the message is an @everyone (@_all / @所有人) broadcast that does
+    NOT genuinely @-mention the bot — i.e. it must NEVER wake the bot, in ANY
+    reply mode. This is reply-mode- AND routing-table-independent.
 
-    Core ``_mentions_self`` returns True whenever ``@_all`` appears in the raw
-    content, so in a mention-only group an @everyone broadcast (e.g. a bot
-    notification) wrongly satisfies _admit's mention gate and wakes the bot.
-    Here we let the bot wake ONLY on a genuine @-mention of itself; @everyone
-    alone is ignored.
-
-    Mode-gated: suppression applies only in mention/default groups. In 'all'
-    reply-mode groups we leave the core answer untouched so they keep replying
-    to everything (incl. bot @everyone, which _admit also routes through
-    _mentions_self for bot-sender admission). Fails open on any error.
+    Fail-open: returns False (let the bot's normal logic run) when @_all is
+    absent OR when the genuine-mention check can't be evaluated. We only suppress
+    when we are positively sure it is an @everyone-only broadcast.
     """
-    original = getattr(FeishuAdapter, "_mentions_self", None)
-    if original is None or getattr(original, _MENTIONS_SELF_FLAG, False):
+    try:
+        raw = getattr(message, "content", "") or ""
+        if "@_all" not in raw:
+            return False
+        return not _genuinely_mentions_bot(adapter, message)
+    except Exception:
+        logger.debug(
+            "[multitenancy] @everyone detection failed; not suppressing",
+            exc_info=True,
+        )
+        return False
+
+
+def _patch_admit(FeishuAdapter: Any) -> None:
+    """Prod path: an @everyone (@_all) broadcast never wakes the bot — in ANY
+    reply mode.
+
+    Core ``_admit`` admits a group message unconditionally in 'all' reply mode
+    (require_mention is False, so it never consults ``_mentions_self``), and in
+    mention mode core ``_mentions_self`` treats a raw ``@_all`` as a self-mention.
+    Both make an @everyone broadcast (e.g. a bot notification, or a human typing
+    @所有人) wake the bot. We gate at admission instead: if a GROUP message is an
+    @everyone-only broadcast (not a genuine @bot), reject it regardless of mode.
+    Everything else — including normal messages in 'all' groups and real @bot
+    mentions — delegates to core untouched. Fails open on any error.
+    """
+    original = getattr(FeishuAdapter, "_admit", None)
+    if original is None or getattr(original, _ADMIT_FLAG, False):
         return
 
     @functools.wraps(original)
-    def wrapped(self: Any, message: Any) -> Any:
+    def wrapped(self: Any, sender: Any, message: Any) -> Any:
         try:
-            result = original(self, message)
-            if not result:
-                return result
-            chat_id = str(getattr(message, "chat_id", "") or "")
-            if chat_id:
-                table = _get_routing_table()
-                if table is None:
-                    # Mode unreadable (router init failure returns None) —
-                    # fail-open: keep the core's answer, don't suppress.
-                    return result
-                if table.get_group_reply_mode(chat_id) == "all":
-                    return result  # all-mode replies to everything — leave it
-            if not _genuinely_mentions_bot(self, message):
-                # Original said "mentioned" only because of @everyone; drop it.
-                return False
-            return result
+            is_group = getattr(message, "chat_type", "p2p") != "p2p"
+            if is_group and _is_ignorable_at_everyone(self, message):
+                return "group_at_everyone_ignored"
         except Exception:
             logger.debug(
-                "[multitenancy] mentions-self valve failed; delegating to original",
+                "[multitenancy] @everyone admit valve failed; delegating to original",
                 exc_info=True,
             )
-            return original(self, message)
+        return original(self, sender, message)
 
-    setattr(wrapped, _MENTIONS_SELF_FLAG, True)
-    FeishuAdapter._mentions_self = wrapped
+    setattr(wrapped, _ADMIT_FLAG, True)
+    FeishuAdapter._admit = wrapped
     logger.info(
-        "[multitenancy] installed @everyone-ignore valve on FeishuAdapter._mentions_self"
+        "[multitenancy] installed @everyone-ignore valve on FeishuAdapter._admit"
     )
 
 
@@ -167,52 +175,28 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
         sender_id = args[1] if len(args) >= 2 else kwargs.get("sender_id")
         chat_id = args[2] if len(args) >= 3 else kwargs.get("chat_id", "")
         normalized_chat_id = str(chat_id or "")
-        # Resolve the group's reply mode first. ANY failure here => pure
-        # fail-open: delegate to core and return its answer unchanged (we must
-        # not apply the @everyone suppression when we couldn't read the mode).
+        # Global, mode-independent: an @everyone broadcast that doesn't @ the bot
+        # never wakes it — even in 'all' reply mode.
+        if message is not None and _is_ignorable_at_everyone(self, message):
+            return False
+        # 'all' reply-mode groups answer everything else; the group-policy gate
+        # (_allow_group_message) is still honored. ANY failure => fail-open to
+        # the core's original answer.
         try:
             if normalized_chat_id:
                 table = _get_routing_table()
-                if table is None:
-                    # Mode unreadable (router init failure returns None) —
-                    # fail-open: delegate to core, don't suppress @everyone.
-                    return original(self, *args, **kwargs)
-                mode = table.get_group_reply_mode(normalized_chat_id)
-            else:
-                mode = "mention"
+                if (
+                    table is not None
+                    and table.get_group_reply_mode(normalized_chat_id) == "all"
+                    and self._allow_group_message(sender_id, normalized_chat_id)
+                ):
+                    return True
         except Exception:
             logger.debug(
                 "[multitenancy] group reply valve failed; delegating to original",
                 exc_info=True,
             )
-            return original(self, *args, **kwargs)
-
-        if mode == "all":
-            try:
-                if self._allow_group_message(sender_id, normalized_chat_id):
-                    return True
-            except Exception:
-                logger.debug(
-                    "[multitenancy] all-mode policy check failed; delegating to original",
-                    exc_info=True,
-                )
-            return original(self, *args, **kwargs)
-
-        # mention/default mode: core's _should_accept returns True on a raw
-        # @_all too, so an @everyone broadcast wrongly wakes the bot. Drop it
-        # unless the message genuinely @-mentions the bot. Genuine-check failure
-        # fails open to the core's original answer.
-        result = original(self, *args, **kwargs)
-        if result and message is not None:
-            try:
-                if not _genuinely_mentions_bot(self, message):
-                    return False
-            except Exception:
-                logger.debug(
-                    "[multitenancy] should-accept @everyone check failed; keeping original",
-                    exc_info=True,
-                )
-        return result
+        return original(self, *args, **kwargs)
 
     setattr(wrapped, _SHOULD_ACCEPT_FLAG, True)
     FeishuAdapter._should_accept_group_message = wrapped
