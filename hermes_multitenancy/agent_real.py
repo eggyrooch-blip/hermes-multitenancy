@@ -1779,8 +1779,10 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
         logger.debug("[multitenancy] failed to load provider adapter env for subprocess", exc_info=True)
 
     try:
-        config = _load_yaml(profile_home / "config.yaml")
-        _normalize_model_spec_inplace(config)  # bare default + provider -> prefixed (same net)
+        # Use the MERGED+normalized config (not profile-local only): provider may be
+        # inherited from shared config, and _load_profile_config self-heals a bare
+        # default so _split_model_spec below can never raise on it.
+        config = _load_profile_config(profile_home)
         primary = ((config.get("model") or {}).get("default") or "").strip()
         provider = _split_model_spec(primary)[0] if primary else ""
         if provider:

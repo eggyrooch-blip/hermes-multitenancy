@@ -55,6 +55,18 @@ def test_load_profile_config_self_heals_bare_default(tmp_path: Path):
     assert _split_model_spec(cfg["model"]["default"])[0] == "custom:litellm-sre"
 
 
+def test_load_profile_config_heals_when_provider_inherited_from_shared(tmp_path: Path):
+    # Profile-local has a BARE default and NO provider; provider is inherited from
+    # shared config. The merged+normalized config must still self-heal (codex review).
+    shared = tmp_path
+    prof = shared / "profiles" / "inherits"
+    _write(shared / "config.yaml", "model:\n  provider: custom:litellm-sre\n")
+    _write(prof / "config.yaml", "model:\n  default: tencent-sonnet-4-6\n")  # no provider locally
+    cfg = _load_profile_config(prof)
+    assert cfg["model"]["default"] == "custom:litellm-sre/tencent-sonnet-4-6"
+    assert _split_model_spec(cfg["model"]["default"])[0] == "custom:litellm-sre"
+
+
 def test_load_profile_config_keeps_prefixed_profile(tmp_path: Path):
     shared = tmp_path
     prof = shared / "profiles" / "good"
