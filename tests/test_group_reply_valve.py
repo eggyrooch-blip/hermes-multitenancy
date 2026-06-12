@@ -321,7 +321,7 @@ def test_fork_should_accept_ignores_at_all_in_mention_mode(monkeypatch):
     """Regression (codex review): the fork gate shape must ALSO drop @everyone
     in mention mode — fixing only _mentions_self left this path buggy."""
     _patch_fork_mention(monkeypatch)
-    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
+    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[_at_all_ref()], message_type="text")
     assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is False
 
 
@@ -329,7 +329,7 @@ def test_fork_should_accept_keeps_genuine_bot_mention(monkeypatch):
     _patch_fork_mention(monkeypatch)
     msg = SimpleNamespace(
         content='{"text":"@_all @bot"}',
-        mentions=[_bot_mention_ref("ou_bot")],
+        mentions=[_at_all_ref(), _bot_mention_ref("ou_bot")],
         message_type="text",
     )
     assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
@@ -352,7 +352,7 @@ def test_fork_should_accept_suppresses_at_all_even_when_routing_errors(monkeypat
         "_get_routing_table",
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
+    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[_at_all_ref()], message_type="text")
     assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is False
 
 
@@ -376,6 +376,11 @@ def test_should_accept_fail_open_delegates_on_exception(monkeypatch):
 
 def _bot_mention_ref(open_id: str = "ou_bot"):
     return SimpleNamespace(id=SimpleNamespace(open_id=open_id))
+
+
+def _at_all_ref():
+    """Structured @everyone mention as Feishu delivers it (key == '@_all')."""
+    return SimpleNamespace(key="@_all")
 
 
 class _AdmitAdapter:
@@ -451,7 +456,7 @@ def _patch_admit_adapter(monkeypatch):
 def test_admit_ignores_at_all_in_mention_mode(monkeypatch):
     _patch_admit_adapter(monkeypatch)
     a = _AdmitAdapter(mode_all=False)
-    assert a._admit(None, _group_msg('{"text":"@_all 测试"}')) == "group_at_everyone_ignored"
+    assert a._admit(None, _group_msg('{"text":"@_all 测试"}', mentions=[_at_all_ref()])) == "group_at_everyone_ignored"
 
 
 def test_admit_ignores_at_all_in_all_mode(monkeypatch):
@@ -459,13 +464,13 @@ def test_admit_ignores_at_all_in_all_mode(monkeypatch):
     be dropped even there (core admits all-mode msgs without checking mentions)."""
     _patch_admit_adapter(monkeypatch)
     a = _AdmitAdapter(mode_all=True)
-    assert a._admit(None, _group_msg('{"text":"@_all 测试@all 触发"}')) == "group_at_everyone_ignored"
+    assert a._admit(None, _group_msg('{"text":"@_all 测试@all 触发"}', mentions=[_at_all_ref()])) == "group_at_everyone_ignored"
 
 
 def test_admit_keeps_genuine_bot_mention_with_at_all(monkeypatch):
     _patch_admit_adapter(monkeypatch)
     a = _AdmitAdapter(mode_all=False)
-    msg = _group_msg('{"text":"@_all @bot"}', mentions=[_bot_mention_ref("ou_bot")])
+    msg = _group_msg('{"text":"@_all @bot"}', mentions=[_at_all_ref(), _bot_mention_ref("ou_bot")])
     assert a._admit(None, msg) is None  # genuine @bot => admitted
 
 
@@ -474,6 +479,16 @@ def test_admit_all_mode_normal_message_still_admitted(monkeypatch):
     _patch_admit_adapter(monkeypatch)
     a = _AdmitAdapter(mode_all=True)
     assert a._admit(None, _group_msg('{"text":"普通消息"}')) is None
+
+
+def test_admit_literal_at_all_text_is_not_a_broadcast(monkeypatch):
+    """Regression (codex review): ordinary text that merely contains the literal
+    characters '@_all' (with NO structured @everyone mention) must NOT be
+    suppressed — only a real @所有人 mention counts."""
+    _patch_admit_adapter(monkeypatch)
+    a = _AdmitAdapter(mode_all=True)
+    msg = _group_msg('{"text":"the @_all check is broken"}')  # mentions=[] => not a broadcast
+    assert a._admit(None, msg) is None  # all-mode keeps replying
 
 
 def test_admit_mention_mode_plain_message_rejected(monkeypatch):
@@ -505,7 +520,7 @@ def test_admit_fail_open_on_genuine_check_error(monkeypatch):
         lambda *_: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     a = _AdmitAdapter(mode_all=True)
-    assert a._admit(None, _group_msg('{"text":"@_all x"}')) is None
+    assert a._admit(None, _group_msg('{"text":"@_all x"}', mentions=[_at_all_ref()])) is None
 
 
 def test_admit_patch_idempotent():
@@ -533,13 +548,29 @@ def test_fork_should_accept_suppresses_at_all_when_table_none(monkeypatch):
         lambda: (lambda **_: SimpleNamespace(mentions=[])),
     )
     monkeypatch.setattr(feishu_group_valve, "_get_routing_table", lambda: None)
-    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[], message_type="text")
+    msg = SimpleNamespace(content='{"text":"@_all x"}', mentions=[_at_all_ref()], message_type="text")
     assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is False
 
 
 # --------------------------------------------------------------------------- #
 # Card action callback (owner-gated, via provisioned row OR pending inviter)
 # --------------------------------------------------------------------------- #
+
+def _resp_kind(r):
+    """Normalize valve responses across envs: a plain dict (lark_oapi absent) or
+    a P2CardActionTriggerResponse SDK object (lark_oapi present)."""
+    if isinstance(r, dict):
+        return r["kind"]
+    return "toast" if getattr(r, "toast", None) is not None else "card"
+
+
+def _resp_toast_content(r):
+    return r["toast"]["content"] if isinstance(r, dict) else r.toast["content"]
+
+
+def _resp_card_type(r):
+    return r["card"]["type"] if isinstance(r, dict) else r.card.type
+
 
 class _CardAdapter:
     def _on_card_action_trigger(self, data):
@@ -576,8 +607,8 @@ def test_card_action_owner_can_switch_via_provisioned_row():
 
     response = _CardAdapter()._on_card_action_trigger(_card_data(operator_open_id="ou_owner"))
     assert table.get_group_reply_mode("oc_group") == "all"
-    assert response["kind"] == "card"
-    assert response["card"]["type"] == "raw"
+    assert _resp_kind(response) == "card"
+    assert _resp_card_type(response) == "raw"
 
 
 def test_card_action_owner_can_switch_via_pending_inviter_before_provision():
@@ -597,7 +628,7 @@ def test_card_action_owner_can_switch_via_pending_inviter_before_provision():
 
     response = _CardAdapter()._on_card_action_trigger(_card_data(operator_open_id="ou_owner"))
     assert table.get_group_reply_mode("oc_group") == "all"
-    assert response["kind"] == "card"
+    assert _resp_kind(response) == "card"
 
 
 def test_card_action_non_owner_gets_denied_toast():
@@ -614,8 +645,8 @@ def test_card_action_non_owner_gets_denied_toast():
 
     response = _CardAdapter()._on_card_action_trigger(_card_data(operator_open_id="ou_other"))
     assert table.get_group_reply_mode("oc_group") == "mention"
-    assert response["kind"] == "toast"
-    assert "无权" in response["toast"]["content"]
+    assert _resp_kind(response) == "toast"
+    assert "无权" in _resp_toast_content(response)
 
 
 def test_card_action_denied_when_no_owner_known_at_all():
@@ -631,8 +662,8 @@ def test_card_action_denied_when_no_owner_known_at_all():
 
     response = _CardAdapter()._on_card_action_trigger(_card_data(operator_open_id="ou_someone"))
     assert table.get_group_reply_mode("oc_group") == "mention"
-    assert response["kind"] == "toast"
-    assert "无权" in response["toast"]["content"]
+    assert _resp_kind(response) == "toast"
+    assert "无权" in _resp_toast_content(response)
 
 
 def test_card_action_other_hermes_action_delegates_to_original():
@@ -665,5 +696,5 @@ def test_card_action_missing_chat_or_table_returns_toast(chat_id, table_factory,
     response = _CardAdapter()._on_card_action_trigger(
         _card_data(operator_open_id="ou_owner", chat_id=chat_id)
     )
-    assert response["kind"] == "toast"
-    assert "暂时无法保存设置" in response["toast"]["content"]
+    assert _resp_kind(response) == "toast"
+    assert "暂时无法保存设置" in _resp_toast_content(response)

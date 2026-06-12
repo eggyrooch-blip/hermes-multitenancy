@@ -105,18 +105,35 @@ def _genuinely_mentions_bot(adapter: Any, message: Any) -> bool:
     return adapter._post_mentions_bot(normalized.mentions)
 
 
+def _message_at_everyone(message: Any) -> bool:
+    """Does the raw inbound message carry a STRUCTURED @everyone (@_all) mention?
+
+    Feishu marks a real @所有人 with a mention whose ``key == "@_all"`` (this is
+    exactly what core ``_build_mentions_map`` keys on). We deliberately use the
+    structured mention rather than a substring of the text, so that ordinary
+    messages that merely contain the literal characters ``@_all`` (e.g. someone
+    discussing the token) are NOT mistaken for a broadcast.
+    """
+    for m in getattr(message, "mentions", None) or []:
+        if str(getattr(m, "key", "") or "") == "@_all":
+            return True
+        if getattr(m, "is_all", False):
+            return True
+    return False
+
+
 def _is_ignorable_at_everyone(adapter: Any, message: Any) -> bool:
     """True iff the message is an @everyone (@_all / @所有人) broadcast that does
     NOT genuinely @-mention the bot — i.e. it must NEVER wake the bot, in ANY
     reply mode. This is reply-mode- AND routing-table-independent.
 
-    Fail-open: returns False (let the bot's normal logic run) when @_all is
-    absent OR when the genuine-mention check can't be evaluated. We only suppress
-    when we are positively sure it is an @everyone-only broadcast.
+    Fail-open: returns False (let the bot's normal logic run) when there is no
+    structured @everyone mention OR when the genuine-mention check can't be
+    evaluated. We only suppress when we are positively sure it is an
+    @everyone-only broadcast.
     """
     try:
-        raw = getattr(message, "content", "") or ""
-        if "@_all" not in raw:
+        if not _message_at_everyone(message):
             return False
         return not _genuinely_mentions_bot(adapter, message)
     except Exception:
