@@ -3481,13 +3481,33 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
     Raise on a failed/empty turn so those existing fallbacks activate; return
     the text on success. A genuine empty-but-successful turn (``final_response``
     is ``""`` with no ``failed`` flag) still returns ``""`` unchanged.
+
+    Exception — output-length truncation is RECOVERABLE, not a provider failure:
+    core rolls back to the last complete state (``partial:True``) and, in
+    streaming, the user has usually already seen the partial text. Raising would
+    fire the "⚠️ 模型暂时不可用" fallback + a legacy-spike retry that just truncates
+    again, turning a long answer into a hard failure. So on truncation we return a
+    graceful notice instead. Genuine failures (provider 400 etc.) still raise.
     """
     res = result or {}
     final_response = res.get("final_response")
-    if res.get("failed") or final_response is None:
-        err = res.get("error") or "agent turn failed without a final response"
-        raise RuntimeError(f"AIAgent turn failed: {err}")
-    return final_response or ""
+    if final_response is not None and not res.get("failed"):
+        return final_response or ""
+    err = res.get("error") or "agent turn failed without a final response"
+    if res.get("partial") or _is_output_truncation_error(err):
+        return _TRUNCATION_NOTICE
+    raise RuntimeError(f"AIAgent turn failed: {err}")
+
+
+_TRUNCATION_NOTICE = (
+    "⚠️ 这次回复内容太长，超出了单条输出的长度上限被截断了。\n"
+    "你可以回复「继续」让我接着往下说，或把问题拆小一点、分几次问，我就能完整回答。"
+)
+
+
+def _is_output_truncation_error(err: Any) -> bool:
+    text = str(err or "").lower()
+    return "truncat" in text and "output length" in text
 
 
 def _run_with_aiagent(
