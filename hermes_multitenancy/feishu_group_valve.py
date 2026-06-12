@@ -106,20 +106,28 @@ def _genuinely_mentions_bot(adapter: Any, message: Any) -> bool:
 
 
 def _message_at_everyone(message: Any) -> bool:
-    """Does the raw inbound message carry a STRUCTURED @everyone (@_all) mention?
+    """Is this message an @everyone (@_all / @所有人) broadcast?
 
-    Feishu marks a real @所有人 with a mention whose ``key == "@_all"`` (this is
-    exactly what core ``_build_mentions_map`` keys on). We deliberately use the
-    structured mention rather than a substring of the text, so that ordinary
-    messages that merely contain the literal characters ``@_all`` (e.g. someone
-    discussing the token) are NOT mistaken for a broadcast.
+    Two signals, mirroring how core itself recognizes @_all:
+      1. A STRUCTURED mention with ``key == "@_all"`` (or ``is_all``) — this is
+         what core ``_build_mentions_map`` keys on; the authoritative signal.
+      2. The raw text fallback ``"@_all" in message.content`` — Feishu's SDK
+         "sometimes omits @_all from the mentions payload even when @_all is in
+         text" (core's own comment), and core ``_mentions_self`` itself treats
+         ``"@_all" in raw_content`` as @everyone. We mirror that so we never MISS
+         a real broadcast that arrives without a structured mention.
+
+    Trade-off (accepted, sunke 2026-06-12): the text fallback can rarely
+    over-match ordinary text that literally contains the characters "@_all".
+    We bias to suppression because failing to ignore a real @所有人 is the bug
+    being fixed, and a stray "@_all" in prose is rare and low-harm.
     """
     for m in getattr(message, "mentions", None) or []:
         if str(getattr(m, "key", "") or "") == "@_all":
             return True
         if getattr(m, "is_all", False):
             return True
-    return False
+    return "@_all" in (getattr(message, "content", "") or "")
 
 
 def _is_ignorable_at_everyone(adapter: Any, message: Any) -> bool:

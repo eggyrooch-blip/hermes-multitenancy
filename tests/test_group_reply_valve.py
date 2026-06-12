@@ -481,14 +481,15 @@ def test_admit_all_mode_normal_message_still_admitted(monkeypatch):
     assert a._admit(None, _group_msg('{"text":"普通消息"}')) is None
 
 
-def test_admit_literal_at_all_text_is_not_a_broadcast(monkeypatch):
-    """Regression (codex review): ordinary text that merely contains the literal
-    characters '@_all' (with NO structured @everyone mention) must NOT be
-    suppressed — only a real @所有人 mention counts."""
+def test_admit_raw_only_at_all_suppressed_in_all_mode(monkeypatch):
+    """Regression (codex review): Feishu sometimes delivers a real @所有人 with
+    @_all only in the raw text and NO structured mention. That broadcast must
+    still be suppressed in all-mode (the prod failure form), mirroring how core
+    treats '@_all' in raw_content as @everyone."""
     _patch_admit_adapter(monkeypatch)
     a = _AdmitAdapter(mode_all=True)
-    msg = _group_msg('{"text":"the @_all check is broken"}')  # mentions=[] => not a broadcast
-    assert a._admit(None, msg) is None  # all-mode keeps replying
+    msg = _group_msg('{"text":"@_all 测试"}')  # mentions=[] (SDK omitted structured @_all)
+    assert a._admit(None, msg) == "group_at_everyone_ignored"
 
 
 def test_admit_mention_mode_plain_message_rejected(monkeypatch):
