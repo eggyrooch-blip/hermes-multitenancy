@@ -335,6 +335,22 @@ def test_fork_should_accept_keeps_genuine_bot_mention(monkeypatch):
     assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
 
 
+def test_fork_should_accept_fail_open_keeps_at_all_when_routing_errors(monkeypatch):
+    """Regression (codex review 2): if the routing-table lookup throws, the
+    valve must NOT apply @everyone suppression — it must fail open and return
+    the core's original answer (True for a raw @_all), per the SPEC."""
+    from hermes_multitenancy import feishu_group_valve
+
+    feishu_group_valve._patch_should_accept_group_message(_ForkMentionAdapter)
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_get_routing_table",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
+    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
+
+
 def test_should_accept_fail_open_delegates_on_exception(monkeypatch):
     from hermes_multitenancy import feishu_group_valve
 

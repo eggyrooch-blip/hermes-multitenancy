@@ -151,23 +151,38 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
         sender_id = args[1] if len(args) >= 2 else kwargs.get("sender_id")
         chat_id = args[2] if len(args) >= 3 else kwargs.get("chat_id", "")
         normalized_chat_id = str(chat_id or "")
+        # Resolve the group's reply mode first. ANY failure here => pure
+        # fail-open: delegate to core and return its answer unchanged (we must
+        # not apply the @everyone suppression when we couldn't read the mode).
         try:
-            if normalized_chat_id:
-                table = _get_routing_table()
-                if (
-                    table is not None
-                    and table.get_group_reply_mode(normalized_chat_id) == "all"
-                    and self._allow_group_message(sender_id, normalized_chat_id)
-                ):
-                    return True
+            table = _get_routing_table() if normalized_chat_id else None
+            mode = (
+                table.get_group_reply_mode(normalized_chat_id)
+                if table is not None and normalized_chat_id
+                else "mention"
+            )
         except Exception:
             logger.debug(
                 "[multitenancy] group reply valve failed; delegating to original",
                 exc_info=True,
             )
+            return original(self, *args, **kwargs)
+
+        if mode == "all":
+            try:
+                if self._allow_group_message(sender_id, normalized_chat_id):
+                    return True
+            except Exception:
+                logger.debug(
+                    "[multitenancy] all-mode policy check failed; delegating to original",
+                    exc_info=True,
+                )
+            return original(self, *args, **kwargs)
+
         # mention/default mode: core's _should_accept returns True on a raw
         # @_all too, so an @everyone broadcast wrongly wakes the bot. Drop it
-        # unless the message genuinely @-mentions the bot. Fail-open.
+        # unless the message genuinely @-mentions the bot. Genuine-check failure
+        # fails open to the core's original answer.
         result = original(self, *args, **kwargs)
         if result and message is not None:
             try:
