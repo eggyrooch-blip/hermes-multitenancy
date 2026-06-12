@@ -165,7 +165,20 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
                 "[multitenancy] group reply valve failed; delegating to original",
                 exc_info=True,
             )
-        return original(self, *args, **kwargs)
+        # mention/default mode: core's _should_accept returns True on a raw
+        # @_all too, so an @everyone broadcast wrongly wakes the bot. Drop it
+        # unless the message genuinely @-mentions the bot. Fail-open.
+        result = original(self, *args, **kwargs)
+        if result and message is not None:
+            try:
+                if not _genuinely_mentions_bot(self, message):
+                    return False
+            except Exception:
+                logger.debug(
+                    "[multitenancy] should-accept @everyone check failed; keeping original",
+                    exc_info=True,
+                )
+        return result
 
     setattr(wrapped, _SHOULD_ACCEPT_FLAG, True)
     FeishuAdapter._should_accept_group_message = wrapped

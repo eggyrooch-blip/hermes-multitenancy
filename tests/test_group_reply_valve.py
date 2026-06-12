@@ -269,6 +269,72 @@ def test_should_accept_all_mode_respects_policy_gate():
     ) is False
 
 
+class _ForkMentionAdapter:
+    """Fork-shape core: _should_accept returns True on raw @_all (the bug),
+    plus the helper methods _genuinely_mentions_bot needs."""
+
+    def __init__(self, *, allow: bool = True, bot_open_id: str = "ou_bot"):
+        self.allow = allow
+        self._bot_open_id = bot_open_id
+        self._bot_user_id = ""
+        self._bot_name = ""
+
+    def _allow_group_message(self, sender_id, chat_id):
+        return self.allow
+
+    def _bot_identity(self):
+        return SimpleNamespace(open_id=self._bot_open_id, user_id="", name="")
+
+    def _message_mentions_bot(self, mentions):
+        for m in mentions:
+            mid = getattr(m, "id", None)
+            if mid is not None and getattr(mid, "open_id", "") == self._bot_open_id:
+                return True
+        return False
+
+    def _post_mentions_bot(self, mentions):
+        return any(getattr(m, "is_self", False) for m in mentions)
+
+    def _should_accept_group_message(self, message, sender_id, chat_id=""):
+        if not self._allow_group_message(sender_id, chat_id):
+            return False
+        if "@_all" in (getattr(message, "content", "") or ""):
+            return True  # core's @everyone shortcut — the bug
+        mentions = getattr(message, "mentions", None) or []
+        return bool(mentions and self._message_mentions_bot(mentions))
+
+
+def _patch_fork_mention(monkeypatch):
+    from hermes_multitenancy import feishu_group_valve
+    from hermes_multitenancy import router as router_mod
+
+    feishu_group_valve._patch_should_accept_group_message(_ForkMentionAdapter)
+    router_mod.override_routing_table(":memory:")
+    monkeypatch.setattr(
+        feishu_group_valve,
+        "_load_normalize",
+        lambda: (lambda **_: SimpleNamespace(mentions=[])),
+    )
+
+
+def test_fork_should_accept_ignores_at_all_in_mention_mode(monkeypatch):
+    """Regression (codex review): the fork gate shape must ALSO drop @everyone
+    in mention mode — fixing only _mentions_self left this path buggy."""
+    _patch_fork_mention(monkeypatch)
+    msg = SimpleNamespace(content='{"text":"@_all 全员通知"}', mentions=[], message_type="text")
+    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is False
+
+
+def test_fork_should_accept_keeps_genuine_bot_mention(monkeypatch):
+    _patch_fork_mention(monkeypatch)
+    msg = SimpleNamespace(
+        content='{"text":"@_all @bot"}',
+        mentions=[_bot_mention_ref("ou_bot")],
+        message_type="text",
+    )
+    assert _ForkMentionAdapter()._should_accept_group_message(msg, "ou_sender", "oc_group") is True
+
+
 def test_should_accept_fail_open_delegates_on_exception(monkeypatch):
     from hermes_multitenancy import feishu_group_valve
 
