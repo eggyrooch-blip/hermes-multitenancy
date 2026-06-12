@@ -79,6 +79,18 @@ def test_dryrun_seen_does_not_block_first_live_send(sent, tmp_path, monkeypatch)
     assert len(sent) == 1 and sent[0][0] == "ou_stt"
 
 
+def test_dryrun_self_dedupes_no_relog(sent, tmp_path, monkeypatch):
+    # codex round 2: dry-run must still dedupe its OWN entries (no re-log/churn every scan).
+    monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", raising=False)
+    now = int(time.time())
+    _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60)
+    seen = {}
+    changed1 = N._scan_once(tmp_path, seen)   # records dry-run entry
+    changed2 = N._scan_once(tmp_path, seen)   # same entry within 24h -> deduped, no churn
+    assert changed1 is True and changed2 is False
+    assert sent == []
+
+
 def test_real_send_then_dedupes(sent, tmp_path):
     now = int(time.time())
     _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60)

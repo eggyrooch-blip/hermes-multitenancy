@@ -124,11 +124,12 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
         ts = int(body.get("ts") or 0)
         key = f"{open_id}:{reason}"
         last = seen.get(key)
-        # Dedupe must only count REAL sends. A dry-run `seen` entry (recorded while
-        # SEND!=1) must NOT block the first live send after enabling — otherwise
-        # flipping HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND=1 within 24h would send
-        # nothing for markers already seen in dry-run.
-        last_send = last if (last and not last.get("dry_run")) else None
+        # Mode-aware dedupe:
+        #  - live (SEND=1): only a REAL prior send dedupes, so a dry-run `seen`
+        #    entry never blocks the first live send after flipping SEND=1.
+        #  - dry-run: dedupe against its own entries so we don't re-log the
+        #    "suppressed" warning every scan (dry-run behavior unchanged).
+        dedupe = (last if (last and not last.get("dry_run")) else None) if send_enabled else last
         now = int(time.time())
         if max_marker_age and ts and (now - ts) > max_marker_age:
             # Stale marker (e.g. the 2026-06-09 internal-error backlog): don't DM
@@ -139,11 +140,11 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
                 open_id, reason, now - ts, max_marker_age,
             )
             continue
-        if last_send and now - int(last_send.get("notified_at", 0)) < _DEDUPE_TTL_SECONDS:
-            # Within 24h dedupe window of a real send; skip even if same key.
+        if dedupe and now - int(dedupe.get("notified_at", 0)) < _DEDUPE_TTL_SECONDS:
+            # Within 24h dedupe window; skip even if same key.
             continue
-        if last_send and ts and ts <= int(last_send.get("marker_ts", 0)):
-            # Marker hasn't been refreshed since the last real send.
+        if dedupe and ts and ts <= int(dedupe.get("marker_ts", 0)):
+            # Marker hasn't been refreshed since the last (real / dry-run) record.
             continue
 
         recipient_open_id, message = _route_message(open_id, reason, owner_open_id, body)
