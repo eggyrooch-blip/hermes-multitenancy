@@ -124,6 +124,11 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
         ts = int(body.get("ts") or 0)
         key = f"{open_id}:{reason}"
         last = seen.get(key)
+        # Dedupe must only count REAL sends. A dry-run `seen` entry (recorded while
+        # SEND!=1) must NOT block the first live send after enabling — otherwise
+        # flipping HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND=1 within 24h would send
+        # nothing for markers already seen in dry-run.
+        last_send = last if (last and not last.get("dry_run")) else None
         now = int(time.time())
         if max_marker_age and ts and (now - ts) > max_marker_age:
             # Stale marker (e.g. the 2026-06-09 internal-error backlog): don't DM
@@ -134,11 +139,11 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
                 open_id, reason, now - ts, max_marker_age,
             )
             continue
-        if last and now - int(last.get("notified_at", 0)) < _DEDUPE_TTL_SECONDS:
-            # Within 24h dedupe window; skip even if a new marker has same key.
+        if last_send and now - int(last_send.get("notified_at", 0)) < _DEDUPE_TTL_SECONDS:
+            # Within 24h dedupe window of a real send; skip even if same key.
             continue
-        if last and ts and ts <= int(last.get("marker_ts", 0)):
-            # Marker hasn't been refreshed since last send.
+        if last_send and ts and ts <= int(last_send.get("marker_ts", 0)):
+            # Marker hasn't been refreshed since the last real send.
             continue
 
         recipient_open_id, message = _route_message(open_id, reason, owner_open_id, body)

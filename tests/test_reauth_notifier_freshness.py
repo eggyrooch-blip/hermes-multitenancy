@@ -62,6 +62,32 @@ def test_resolve_max_marker_age_env(monkeypatch):
     assert N._resolve_max_marker_age() == N._DEFAULT_MAX_MARKER_AGE_SECONDS
 
 
+def test_dryrun_seen_does_not_block_first_live_send(sent, tmp_path, monkeypatch):
+    # codex review: a marker seen during dry-run must still send once SEND=1 is flipped
+    # (a dry-run seen entry must not win the 24h dedupe).
+    now = int(time.time())
+    _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60)
+    seen = {}
+    # First pass: dry-run (SEND not set) records a dry_run seen entry.
+    monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", raising=False)
+    N._scan_once(tmp_path, seen)
+    assert sent == []
+    assert seen.get("ou_stt:refresh_rejected", {}).get("dry_run") is True
+    # Now enable live sends: the dry-run entry must NOT dedupe-block the real send.
+    monkeypatch.setenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", "1")
+    N._scan_once(tmp_path, seen)
+    assert len(sent) == 1 and sent[0][0] == "ou_stt"
+
+
+def test_real_send_then_dedupes(sent, tmp_path):
+    now = int(time.time())
+    _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60)
+    seen = {}
+    N._scan_once(tmp_path, seen)          # real send (SEND=1 via fixture)
+    N._scan_once(tmp_path, seen)          # second pass: deduped (real send within 24h)
+    assert len(sent) == 1
+
+
 def test_marker_with_no_ts_is_not_gated(sent, tmp_path):
     # A marker missing ts (ts=0) must not be skipped by the age gate (treat as send-eligible).
     d = tmp_path / "profiles" / "p" / "feishu_uat"
