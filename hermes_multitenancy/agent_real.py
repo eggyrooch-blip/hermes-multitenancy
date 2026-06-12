@@ -182,6 +182,14 @@ async def stream_run_agent(  # type: ignore[override]
         if final_text and not content_text.strip():
             yield "content", final_text
             content_text = final_text
+        elif final_text == _TRUNCATION_NOTICE and _TRUNCATION_NOTICE not in content_text:
+            # Output-length truncation AFTER partial content already streamed into
+            # the card: the streamed text is incomplete, so append the recovery
+            # hint as a trailing delta (the normal-completion branch above only
+            # fires when nothing streamed, dropping the notice otherwise).
+            tail = "\n\n" + _TRUNCATION_NOTICE
+            yield "content", tail
+            content_text += tail
         cap = int(os.getenv("HERMES_MAX_ITERATIONS", "30"))
         footer_text = _maybe_budget_footer(content_text, tool_started_count, cap)
         footer_tail = footer_text[len(content_text):]

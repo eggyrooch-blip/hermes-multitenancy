@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from hermes_multitenancy.agent_real import (
@@ -7,6 +9,48 @@ from hermes_multitenancy.agent_real import (
     _is_output_truncation_error,
     _TRUNCATION_NOTICE,
 )
+
+
+def _event():
+    return SimpleNamespace(text="hello", message_id="om_x",
+                           source=SimpleNamespace(platform="feishu", chat_id="oc_x", user_id="ou_x"))
+
+
+@pytest.mark.asyncio
+async def test_streaming_truncation_appends_notice_after_partial_content(monkeypatch, tmp_path):
+    """codex review: when partial content already streamed, the truncation notice
+    (done payload) must still reach the user as a trailing delta, not be dropped."""
+    from hermes_multitenancy import agent_real
+
+    async def fake_stream(event, profile_home):
+        yield ("content", "前半段回答……")           # partial content streamed into the card
+        yield ("done", _TRUNCATION_NOTICE)            # core truncated -> finalize returned the notice
+
+    async def fail_subprocess(*_a, **_k):
+        raise AssertionError("should consume the event-stream subprocess")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", fake_stream, raising=False)
+    monkeypatch.setattr(agent_real, "_run_aiagent_subprocess", fail_subprocess)
+
+    chunks = [c async for c in agent_real.stream_run_agent(_event(), tmp_path)]
+    # partial content + the appended truncation notice (the user gets the hint)
+    assert ("content", "前半段回答……") in chunks
+    assert any(kind == "content" and _TRUNCATION_NOTICE in str(text) for kind, text in chunks)
+
+
+@pytest.mark.asyncio
+async def test_streaming_normal_completion_does_not_append_notice(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+
+    async def fake_stream(event, profile_home):
+        yield ("content", "完整回答")
+        yield ("done", "完整回答")  # normal: done == streamed content
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", fake_stream, raising=False)
+    chunks = [c async for c in agent_real.stream_run_agent(_event(), tmp_path)]
+    # no truncation notice on a normal turn; no duplicate of the answer
+    assert all(_TRUNCATION_NOTICE not in str(t) for _, t in chunks)
+    assert [t for k, t in chunks if k == "content"] == ["完整回答"]
 
 
 def test_success_returns_final_response():
