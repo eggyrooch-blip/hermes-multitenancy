@@ -462,16 +462,22 @@ def _personal_user_write_identity_error(
             return None
         if _is_im_read_request(mode, argv):
             return None
-        if _bot_im_send_chat_id(mode, argv) and _broker_proxy_configured(env):
-            # IM message send to a chat WITH the broker proxy wired: defer to the
-            # broker, which live-re-checks routing and allows the sender's own
-            # (possibly freshly-created) group or denies an unmapped one. This
-            # child preflight runs in the sandboxed subprocess and cannot read
-            # routing, so it must NOT hard-refuse here — otherwise a sender's
-            # just-created own group fails until the next turn. Without the broker
-            # there is no authoritative gate to defer to, so we fall through and
-            # the write/admin refusal below still applies.
-            return None
+        if _bot_im_send_chat_id(mode, argv):
+            # A bot IM send is inherently a write, regardless of the caller-declared
+            # `risk` (which can be mis-set to "read"). Decide it on its own merits:
+            if _broker_proxy_configured(env):
+                # Broker proxy wired: defer to the broker, which live-re-checks
+                # routing and allows the sender's own (possibly freshly-created)
+                # group or denies an unmapped one. This child preflight runs in the
+                # sandboxed subprocess and cannot read routing, so it must NOT
+                # hard-refuse here — otherwise a sender's just-created own group
+                # fails until the next turn.
+                return None
+            # No broker to authorize → refuse the unmapped bot IM send outright.
+            return (
+                "personal profile bot identity is limited to owner mapped group chats; "
+                "refusing unmapped or non-message bot write"
+            )
         if risk in {"write", "admin"}:
             return (
                 "personal profile bot identity is limited to owner mapped group chats; "
