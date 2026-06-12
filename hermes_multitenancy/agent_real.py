@@ -578,11 +578,35 @@ def _merge_profile_config(base: dict[str, Any], override: dict[str, Any]) -> dic
     return merged
 
 
+def _normalize_model_spec_inplace(config: dict[str, Any]) -> None:
+    """Runtime safety net: if ``model.default`` is a bare model name (no provider
+    prefix) but ``model.provider`` is set, prepend it so ``_split_model_spec`` can
+    parse it.
+
+    This mirrors router._normalize_profile_config but runs at every config READ,
+    not only at provision time. Root-cause fix for the recurring
+    "model spec missing provider prefix: 'tencent-sonnet-4-6'" failures: the
+    provision-time normalization can be bypassed by some write paths, leaving a
+    bare default on disk; without a runtime net, every turn for that profile then
+    fails. Applying it here makes a bare-but-providered config self-heal at read
+    time, so no write path can ever fail a turn this way again.
+    """
+    model = config.get("model")
+    if not isinstance(model, dict):
+        return
+    default_model = str(model.get("default") or "").strip()
+    provider = str(model.get("provider") or "").strip()
+    if default_model and provider and "/" not in default_model:
+        model["default"] = f"{provider}/{default_model}"
+
+
 def _load_profile_config(profile_home: Path) -> dict[str, Any]:
     shared_home = _resolve_shared_hermes_home(profile_home)
     shared = _load_yaml(shared_home / "config.yaml")
     profile = _load_yaml(profile_home / "config.yaml")
-    return _merge_profile_config(shared, profile)
+    merged = _merge_profile_config(shared, profile)
+    _normalize_model_spec_inplace(merged)
+    return merged
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -1756,6 +1780,7 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
 
     try:
         config = _load_yaml(profile_home / "config.yaml")
+        _normalize_model_spec_inplace(config)  # bare default + provider -> prefixed (same net)
         primary = ((config.get("model") or {}).get("default") or "").strip()
         provider = _split_model_spec(primary)[0] if primary else ""
         if provider:
