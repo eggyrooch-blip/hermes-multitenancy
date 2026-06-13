@@ -4185,8 +4185,43 @@ def _diagnostics_subject_context(
                     "owner_open_id": getattr(row, "owner_open_id", None),
                     "agent_id": getattr(row, "agent_id", None),
                 }
+            # Enumerate the agents this user owns (群聊 agents / 智能体 …).
+            try:
+                owned = table.list_by_owner(subject_open_id)
+                agents = []
+                for r in owned or []:
+                    if getattr(r, "kind", None) == "user":
+                        continue  # the user's own root row is not an "agent"
+                    agents.append(
+                        {
+                            "kind": getattr(r, "kind", None) or "agent",
+                            "profile": getattr(r, "profile_name", None),
+                            "label": getattr(r, "display_label", None)
+                            or getattr(r, "chat_id", None)
+                            or getattr(r, "agent_id", None),
+                        }
+                    )
+                multitenancy["agents"] = agents
+            except Exception:
+                logger.debug("multitenancy: diagnostics agents listing failed", exc_info=True)
         except Exception:
             logger.debug("multitenancy: diagnostics identity lookup failed", exc_info=True)
+
+    # Resolve Feishu display names (never show raw open_id to the user).
+    try:
+        from .feishu_merge_forward_api import _resolve_names_blocking
+
+        owner_oid = (multitenancy or {}).get("owner_open_id")
+        want = [subject_open_id] + ([owner_oid] if owner_oid else [])
+        names = _resolve_names_blocking(want, subject_open_id)
+        if names:
+            if names.get(subject_open_id):
+                identity["name"] = names[subject_open_id]
+            if owner_oid and names.get(owner_oid) and multitenancy is not None:
+                multitenancy["owner_name"] = names[owner_oid]
+    except Exception:
+        logger.debug("multitenancy: diagnostics name resolution failed", exc_info=True)
+    identity["hide_open_id"] = True
     return subject_open_id, identity, multitenancy
 
 

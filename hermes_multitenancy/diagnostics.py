@@ -85,6 +85,11 @@ _TEXT: dict[str, dict[str, str]] = {
         "mt_owner": "群主(邀请人)",
         "mt_agent": "Agent ID",
         "mt_unrouted": "尚无路由记录",
+        "mt_agents_count": "我的 Agent 数量",
+        "agent_kind_group": "群聊 Agent",
+        "agent_kind_agent": "智能体",
+        "agent_kind_user": "用户",
+        "agents_none": "暂无",
     },
     "en_us": {
         "doctor_title": "Feishu Bot Doctor Report",
@@ -132,6 +137,11 @@ _TEXT: dict[str, dict[str, str]] = {
         "mt_owner": "Owner (inviter)",
         "mt_agent": "Agent ID",
         "mt_unrouted": "no routing record yet",
+        "mt_agents_count": "My agents",
+        "agent_kind_group": "Group agent",
+        "agent_kind_agent": "Assistant",
+        "agent_kind_user": "User",
+        "agents_none": "none",
     },
 }
 
@@ -226,17 +236,20 @@ def _format_expiry(value: Any) -> Optional[str]:
 
 
 def _identity_label(identity: Optional[dict[str, Any]], loc: dict[str, str]) -> Optional[str]:
-    """One-line 'name (open_id) · profile' for the invoking user, or None."""
+    """One-line 'name · profile' for the invoking user (Feishu name, never raw
+    open_id), or None."""
     if not isinstance(identity, dict):
         return None
     open_id = str(identity.get("open_id") or "").strip()
     name = str(identity.get("name") or "").strip()
     profile = str(identity.get("profile") or "").strip()
+    hide = bool(identity.get("hide_open_id"))
     if not open_id and not name:
         return None
     who = name or _t(loc, "user_unresolved")
     parts = [who]
-    if open_id:
+    if open_id and not (hide or name):
+        # Only fall back to open_id when we have no name AND aren't told to hide.
         parts.append(f"`{open_id}`")
     label = " ".join(parts)
     if profile:
@@ -492,10 +505,21 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
     if isinstance(mt, dict) and (mt.get("kind") or mt.get("profile")):
         lines.append(f"- **{_t(loc, 'mt_kind')}**: {mt.get('kind') or _t(loc, 'unknown')}")
         lines.append(f"- **{_t(loc, 'profile')}**: {mt.get('profile') or _t(loc, 'profile_unrouted')}")
-        if mt.get("owner_open_id"):
-            lines.append(f"- **{_t(loc, 'mt_owner')}**: `{mt.get('owner_open_id')}`")
-        if mt.get("agent_id"):
-            lines.append(f"- **{_t(loc, 'mt_agent')}**: `{mt.get('agent_id')}`")
+        owner_name = str(mt.get("owner_name") or "").strip()
+        if owner_name:  # show the Feishu name, never the raw open_id
+            lines.append(f"- **{_t(loc, 'mt_owner')}**: {owner_name}")
+        agents = mt.get("agents") or []
+        if isinstance(agents, list):
+            lines.append(f"- **{_t(loc, 'mt_agents_count')}**: {len(agents)}")
+            for a in agents[:20]:
+                kind = a.get("kind") or "agent"
+                kind_label = _t(loc, f"agent_kind_{kind}")
+                if kind_label == f"agent_kind_{kind}":  # unknown kind → raw
+                    kind_label = kind
+                label = a.get("profile") or a.get("label") or "?"
+                lines.append(f"  - {kind_label}: `{label}`")
+            if not agents:
+                lines.append(f"  - {_t(loc, 'agents_none')}")
     else:
         lines.append(f"- {_t(loc, 'mt_unrouted')}")
 
