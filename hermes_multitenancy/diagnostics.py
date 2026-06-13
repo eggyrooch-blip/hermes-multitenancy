@@ -74,9 +74,17 @@ _TEXT: dict[str, dict[str, str]] = {
         "overall_healthy": "健康",
         "overall_degraded": "降级",
         "overall_unhealthy": "异常",
-        "notes": "说明",
-        "note_recent_errors": "近期错误：无廉价数据源，已省略",
-        "note_message_trace": "按消息 ID 追踪：无廉价数据源，已省略",
+        "current_user": "当前用户",
+        "user_unresolved": "未识别用户",
+        "cred_valid": "有效",
+        "cred_expired": "已过期",
+        "cred_scope_missing": "缺少权限",
+        "cred_unauth": "未授权（请私聊发 /auth 授权）",
+        "multitenancy": "多租户状态",
+        "mt_kind": "路由类型",
+        "mt_owner": "群主(邀请人)",
+        "mt_agent": "Agent ID",
+        "mt_unrouted": "尚无路由记录",
     },
     "en_us": {
         "doctor_title": "Feishu Bot Doctor Report",
@@ -113,9 +121,17 @@ _TEXT: dict[str, dict[str, str]] = {
         "overall_healthy": "healthy",
         "overall_degraded": "degraded",
         "overall_unhealthy": "unhealthy",
-        "notes": "Notes",
-        "note_recent_errors": "Recent errors: no cheap data source, omitted",
-        "note_message_trace": "Trace-by-message-id: no cheap data source, omitted",
+        "current_user": "Current user",
+        "user_unresolved": "unresolved user",
+        "cred_valid": "valid",
+        "cred_expired": "expired",
+        "cred_scope_missing": "missing scopes",
+        "cred_unauth": "not authorized (DM /auth to authorize)",
+        "multitenancy": "Multitenancy",
+        "mt_kind": "Route kind",
+        "mt_owner": "Owner (inviter)",
+        "mt_agent": "Agent ID",
+        "mt_unrouted": "no routing record yet",
     },
 }
 
@@ -209,6 +225,37 @@ def _format_expiry(value: Any) -> Optional[str]:
         return str(value)
 
 
+def _identity_label(identity: Optional[dict[str, Any]], loc: dict[str, str]) -> Optional[str]:
+    """One-line 'name (open_id) · profile' for the invoking user, or None."""
+    if not isinstance(identity, dict):
+        return None
+    open_id = str(identity.get("open_id") or "").strip()
+    name = str(identity.get("name") or "").strip()
+    profile = str(identity.get("profile") or "").strip()
+    if not open_id and not name:
+        return None
+    who = name or _t(loc, "user_unresolved")
+    parts = [who]
+    if open_id:
+        parts.append(f"`{open_id}`")
+    label = " ".join(parts)
+    if profile:
+        label += f" · {profile}"
+    return label
+
+
+def _cred_validity(cred: dict[str, Any], loc: dict[str, str]) -> str:
+    """Map a credential-status dict to a friendly validity word."""
+    state = str(cred.get("status") or "").lower()
+    if state in {"missing", "unauthorized", "none"} or not cred.get("has_credential"):
+        return _t(loc, "cred_unauth")
+    if state == "expired":
+        return _t(loc, "cred_expired")
+    if state == "scope_missing" or (cred.get("missing_scopes") or []):
+        return _t(loc, "cred_scope_missing")
+    return _t(loc, "cred_valid")
+
+
 def build_doctor_markdown(
     *,
     version: str,
@@ -216,6 +263,7 @@ def build_doctor_markdown(
     credential_status: dict[str, Any],
     health: dict[str, Any],
     env: dict[str, str],
+    identity: Optional[dict[str, Any]] = None,
     locale: str = "zh_cn",
 ) -> str:
     """Build a locale-aware, non-empty Markdown doctor report from plain inputs."""
@@ -226,6 +274,9 @@ def build_doctor_markdown(
 
     lines: list[str] = [f"## {_t(loc, 'doctor_title')}", ""]
 
+    who = _identity_label(identity, loc)
+    if who:
+        lines.append(f"- **{_t(loc, 'current_user')}**: {who}")
     # Version + profile + environment
     lines.append(f"- **{_t(loc, 'plugin_version')}**: {version or _t(loc, 'unknown')}")
     lines.append(f"- **{_t(loc, 'profile')}**: {profile_name or _t(loc, 'profile_unrouted')}")
@@ -245,7 +296,7 @@ def build_doctor_markdown(
     elif cred.get("error"):
         lines.append(f"- {_t(loc, 'capability_unavailable')}: {cred.get('error')}")
     else:
-        lines.append(f"- **{_t(loc, 'cred_state')}**: {cred.get('status', _t(loc, 'unknown'))}")
+        lines.append(f"- **{_t(loc, 'cred_state')}**: {_cred_validity(cred, loc)}")
         lines.append(f"- **{_t(loc, 'cred_provider')}**: {cred.get('provider', _t(loc, 'unknown'))}")
         lines.append(f"- **{_t(loc, 'cred_kind')}**: {cred.get('credential_kind', _t(loc, 'unknown'))}")
         expires = _format_expiry(cred.get("expires_at"))
@@ -333,6 +384,8 @@ def build_diagnose_report(
     credential_status: dict[str, Any],
     health: dict[str, Any],
     env: dict[str, str],
+    identity: Optional[dict[str, Any]] = None,
+    multitenancy: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build a structured, secret-free health report with an overall verdict."""
     cred = credential_status if isinstance(credential_status, dict) else {}
@@ -343,6 +396,8 @@ def build_diagnose_report(
     return {
         "version": version or "unknown",
         "profile": profile_name,
+        "identity": identity if isinstance(identity, dict) else None,
+        "multitenancy": multitenancy if isinstance(multitenancy, dict) else None,
         "overall": _overall_verdict(cred, hc),
         "environment": {
             "python_version": environment.get("python_version", "unknown"),
@@ -364,11 +419,6 @@ def build_diagnose_report(
             "status": hc.get("status"),
             "error": hc.get("error"),
         },
-        "notes": {
-            # No cheap data source for these in the multitenancy plugin surface.
-            "recent_errors": "omitted",
-            "message_trace": "omitted",
-        },
     }
 
 
@@ -389,6 +439,9 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
 
     lines: list[str] = [f"## {_t(loc, 'diagnose_title')}", ""]
     lines.append(f"- **{_t(loc, 'overall')}**: {overall_label}")
+    who = _identity_label(rpt.get("identity"), loc)
+    if who:
+        lines.append(f"- **{_t(loc, 'current_user')}**: {who}")
     lines.append(f"- **{_t(loc, 'plugin_version')}**: {rpt.get('version', _t(loc, 'unknown'))}")
     lines.append(f"- **{_t(loc, 'profile')}**: {rpt.get('profile') or _t(loc, 'profile_unrouted')}")
     lines.append("")
@@ -404,9 +457,12 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
     elif cred.get("error"):
         lines.append(f"- {_t(loc, 'capability_unavailable')}: {cred.get('error')}")
     else:
-        lines.append(f"- **{_t(loc, 'cred_state')}**: {cred.get('status', _t(loc, 'unknown'))}")
+        lines.append(f"- **{_t(loc, 'cred_state')}**: {_cred_validity(cred, loc)}")
         has_cred = _t(loc, "yes") if cred.get("has_credential") else _t(loc, "no")
         lines.append(f"- **{_t(loc, 'cred_has')}**: {has_cred}")
+        expires = _format_expiry(cred.get("expires_at"))
+        if expires:
+            lines.append(f"- **{_t(loc, 'cred_expires')}**: {expires}")
         missing = cred.get("missing_scopes") or []
         if isinstance(missing, list) and missing:
             lines.append(
@@ -430,9 +486,18 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
             lines.append(f"- **{_t(loc, 'capability_attention')}**: {_t(loc, 'none')}")
     lines.append("")
 
-    lines.append(f"### {_t(loc, 'notes')}")
-    lines.append(f"- {_t(loc, 'note_recent_errors')}")
-    lines.append(f"- {_t(loc, 'note_message_trace')}")
+    mt = rpt.get("multitenancy")
+    lines.append("")
+    lines.append(f"### {_t(loc, 'multitenancy')}")
+    if isinstance(mt, dict) and (mt.get("kind") or mt.get("profile")):
+        lines.append(f"- **{_t(loc, 'mt_kind')}**: {mt.get('kind') or _t(loc, 'unknown')}")
+        lines.append(f"- **{_t(loc, 'profile')}**: {mt.get('profile') or _t(loc, 'profile_unrouted')}")
+        if mt.get("owner_open_id"):
+            lines.append(f"- **{_t(loc, 'mt_owner')}**: `{mt.get('owner_open_id')}`")
+        if mt.get("agent_id"):
+            lines.append(f"- **{_t(loc, 'mt_agent')}**: `{mt.get('agent_id')}`")
+    else:
+        lines.append(f"- {_t(loc, 'mt_unrouted')}")
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -441,12 +506,14 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
 # Collectors — live environment, all guarded
 # ---------------------------------------------------------------------------
 
-def _collect_credential_status() -> dict[str, Any]:
-    """Pull redacted credential status for the current profile. Never raises."""
+def _collect_credential_status(subject_open_id: Optional[str] = None) -> dict[str, Any]:
+    """Pull redacted credential status for a subject (the invoking user when
+    known, else the current profile). Never raises."""
     try:
         from .credential_tool import credential_status
 
-        raw = credential_status({})
+        args = {"subject_id": subject_open_id} if subject_open_id else {}
+        raw = credential_status(args)
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
             return parsed
@@ -483,8 +550,13 @@ def _collect_health() -> dict[str, Any]:
         return {"status": "unavailable", "error": exc.__class__.__name__}
 
 
-def collect_runtime_inputs() -> dict[str, Any]:
-    """Gather all builder inputs from the live environment, degrading gracefully."""
+def collect_runtime_inputs(subject_open_id: Optional[str] = None) -> dict[str, Any]:
+    """Gather all builder inputs from the live environment, degrading gracefully.
+
+    ``subject_open_id`` — the invoking user's Feishu open_id (from the message
+    sender). When present we query that user's real credential validity instead
+    of failing with "no subject".
+    """
     profile_name: Optional[str] = None
     home = os.getenv("HERMES_HOME")
     if home:
@@ -497,7 +569,7 @@ def collect_runtime_inputs() -> dict[str, Any]:
     return {
         "version": plugin_version(),
         "profile_name": profile_name,
-        "credential_status": _collect_credential_status(),
+        "credential_status": _collect_credential_status(subject_open_id),
         "health": _collect_health(),
         "env": _environment(),
     }
@@ -507,27 +579,41 @@ def collect_runtime_inputs() -> dict[str, Any]:
 # Top-level entry points used by the router
 # ---------------------------------------------------------------------------
 
-def render_doctor(*, locale: str = "zh_cn") -> str:
+def render_doctor(
+    *,
+    locale: str = "zh_cn",
+    subject_open_id: Optional[str] = None,
+    identity: Optional[dict[str, Any]] = None,
+) -> str:
     """Collect live inputs and render the /doctor Markdown report."""
-    inputs = collect_runtime_inputs()
+    inputs = collect_runtime_inputs(subject_open_id)
     return build_doctor_markdown(
         version=inputs["version"],
         profile_name=inputs["profile_name"],
         credential_status=inputs["credential_status"],
         health=inputs["health"],
         env=inputs["env"],
+        identity=identity,
         locale=locale,
     )
 
 
-def render_diagnose(*, locale: str = "zh_cn") -> str:
+def render_diagnose(
+    *,
+    locale: str = "zh_cn",
+    subject_open_id: Optional[str] = None,
+    identity: Optional[dict[str, Any]] = None,
+    multitenancy: Optional[dict[str, Any]] = None,
+) -> str:
     """Collect live inputs, build the structured report, render its Markdown."""
-    inputs = collect_runtime_inputs()
+    inputs = collect_runtime_inputs(subject_open_id)
     report = build_diagnose_report(
         version=inputs["version"],
         profile_name=inputs["profile_name"],
         credential_status=inputs["credential_status"],
         health=inputs["health"],
         env=inputs["env"],
+        identity=identity,
+        multitenancy=multitenancy,
     )
     return render_diagnose_markdown(report, locale)

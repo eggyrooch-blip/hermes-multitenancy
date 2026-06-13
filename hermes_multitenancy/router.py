@@ -4112,15 +4112,65 @@ def _event_locale(event: Any) -> str:
     return _normalize_locale(raw)
 
 
+def _diagnostics_subject_context(event: Any):
+    """Resolve (subject_open_id, identity, multitenancy) for the invoking user.
+
+    Lets /doctor /diagnose identify WHO is asking and check THEIR real
+    credential validity instead of "no subject". Fail-soft → (None, None, None).
+    """
+    subject_open_id = None
+    try:
+        sender = _resolve_sender_for_routing(event, fallback="")
+        subject_open_id = _normalize_feishu_open_id(sender) or (sender or None)
+    except Exception:
+        subject_open_id = None
+    if not subject_open_id:
+        return None, None, None
+
+    identity: dict[str, Any] = {"open_id": subject_open_id}
+    multitenancy = None
+    try:
+        table = _get_routing_table()
+    except Exception:
+        table = None
+    if table is not None:
+        try:
+            row = table.lookup_by_open_id(subject_open_id)
+            if row is not None:
+                identity["name"] = (
+                    getattr(row, "display_label", None)
+                    or getattr(row, "profile_name", None)
+                    or getattr(row, "user_id", None)
+                )
+                identity["profile"] = getattr(row, "profile_name", None)
+                multitenancy = {
+                    "kind": getattr(row, "kind", None),
+                    "profile": getattr(row, "profile_name", None),
+                    "owner_open_id": getattr(row, "owner_open_id", None),
+                    "agent_id": getattr(row, "agent_id", None),
+                }
+        except Exception:
+            logger.debug("multitenancy: diagnostics identity lookup failed", exc_info=True)
+    return subject_open_id, identity, multitenancy
+
+
 def _render_diagnostics_reply(cmd: str, event: Any) -> str:
     """Build the /doctor or /diagnose Markdown reply (read-only, fail-soft)."""
     locale = _event_locale(event)
     try:
         from . import diagnostics
 
+        subject_open_id, identity, multitenancy = _diagnostics_subject_context(event)
         if cmd == "doctor":
-            return diagnostics.render_doctor(locale=locale)
-        return diagnostics.render_diagnose(locale=locale)
+            return diagnostics.render_doctor(
+                locale=locale, subject_open_id=subject_open_id, identity=identity
+            )
+        return diagnostics.render_diagnose(
+            locale=locale,
+            subject_open_id=subject_open_id,
+            identity=identity,
+            multitenancy=multitenancy,
+        )
     except Exception as exc:  # diagnostics is read-only; never crash the command
         logger.warning("multitenancy: /%s diagnostics failed (%s)", cmd, exc)
         return f"诊断暂不可用：{exc.__class__.__name__}"

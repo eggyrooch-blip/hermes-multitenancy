@@ -98,8 +98,38 @@ def test_build_diagnose_report_contains_required_keys():
     assert report["environment"]["platform"] == "darwin-arm64"
     assert report["credential"]["status"] == "valid"
     assert report["capability"]["ready"] is True
-    assert "recent_errors" in report["notes"]
-    assert "message_trace" in report["notes"]
+    # The dev-speak "no cheap data source, omitted" notes were removed.
+    assert "notes" not in report
+    # New structured keys for identity + multitenancy.
+    assert "identity" in report
+    assert "multitenancy" in report
+
+
+def test_diagnose_identifies_user_and_real_credential_validity():
+    """When the invoking user is known, the report names them and shows real
+    credential validity instead of the no-subject skip."""
+    from hermes_multitenancy.diagnostics import (
+        build_diagnose_report,
+        render_diagnose_markdown,
+    )
+
+    report = build_diagnose_report(
+        version="0.1.0",
+        profile_name="feishu_sunke",
+        credential_status={"status": "expired", "has_credential": True},
+        health=_sample_health(),
+        env=_sample_env(),
+        identity={"open_id": "ou_abc", "name": "孙可", "profile": "feishu_sunke"},
+        multitenancy={"kind": "user", "profile": "feishu_sunke", "owner_open_id": None, "agent_id": None},
+    )
+    md = render_diagnose_markdown(report, "zh_cn")
+    assert report["identity"]["name"] == "孙可"
+    assert "孙可" in md and "ou_abc" in md          # names the user
+    assert "已过期" in md                            # real validity word, not "已跳过"
+    assert "多租户状态" in md                         # multitenancy section present
+    assert "无廉价数据源" not in md                   # dev-speak gone
+    assert "subject_id is required" not in md        # no raw internal error
+    assert report["overall"] == "unhealthy"          # expired cred → unhealthy (real)
 
 
 def test_render_diagnose_markdown_is_non_empty_in_both_locales():
