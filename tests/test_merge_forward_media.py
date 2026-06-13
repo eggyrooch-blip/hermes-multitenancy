@@ -170,9 +170,12 @@ def _file_item(
     }
 
 
-async def test_expand_merge_forward_with_media_uses_sub_item_message_id_for_image_download(
+async def test_expand_merge_forward_with_media_uses_container_message_id_for_image_download(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Real Feishu contract: a merge_forward's sub-message resources are owned by
+    # the CONTAINER message, not the sub-item. Downloading with the sub-item
+    # message_id returns 234003 "File not in msg"; the container message_id works.
     FakeFeishuAdapter, saved = _install_fake_feishu()
     try:
         merge_module, _reply_module = _load_modules()
@@ -194,8 +197,8 @@ async def test_expand_merge_forward_with_media_uses_sub_item_message_id_for_imag
             "ou_forwarder",
         )
 
-        assert adapter.downloaded_images == [("om_sub_1", "img_1")]
-        assert media == [("/tmp/om_sub_1-img_1.jpg", "image/jpeg")]
+        assert adapter.downloaded_images == [("om_container", "img_1")]
+        assert media == [("/tmp/om_container-img_1.jpg", "image/jpeg")]
         assert transcript is not None
         assert "[图片]" in transcript
         assert "[image]" not in transcript
@@ -236,7 +239,7 @@ async def test_merge_forward_patch_appends_downloaded_media_and_file_marker(
         assert result[0] is not None
         assert "[文件:report.pdf]" in result[0]
         assert result[1] == "merge"
-        assert result[2] == ["/core/keep.txt", "/tmp/om_file_1-file_1"]
+        assert result[2] == ["/core/keep.txt", "/tmp/om_container-file_1"]
         assert result[3] == ["text/plain", "application/pdf"]
         assert result[4] == ["@core"]
     finally:
@@ -283,7 +286,7 @@ async def test_expand_merge_forward_with_media_continues_when_one_resource_downl
         assert transcript is not None
         assert "[资源已过期(14005)，请直接发送]" in transcript
         assert "[图片]" in transcript
-        assert media == [("/tmp/om_good-img_good.jpg", "image/jpeg")]
+        assert media == [("/tmp/om_container-img_good.jpg", "image/jpeg")]
     finally:
         _restore(saved)
 

@@ -317,6 +317,7 @@ def _media_marker_for_item(image_keys: list[str], media_refs: list[tuple[str, st
 
 async def _collect_merge_forward_media(
     adapter: Any,
+    container_message_id: str,
     items: list[dict],
 ) -> tuple[dict[str, str], list[tuple[str, str]]]:
     from .feishu_reply_quote_api import (
@@ -327,6 +328,13 @@ async def _collect_merge_forward_media(
         _parent_media_refs,
     )
 
+    # IMPORTANT: a merge_forward's sub-message resources are owned by the
+    # CONTAINER message, not the sub-item. The im/v1/messages/{id}/resources
+    # endpoint returns 234003 "File not in msg" for a sub-item message_id +
+    # the sub-item's image_key, but HTTP 200 for the container message_id +
+    # that same image_key (verified against real Feishu data). So we download
+    # every sub-item's media via the container message_id, and key the inline
+    # markers by the sub-item message_id only for transcript render-matching.
     media_markers: dict[str, str] = {}
     media: list[tuple[str, str]] = []
     seen_paths: set[str] = set()
@@ -336,27 +344,28 @@ async def _collect_merge_forward_media(
         media_refs = _parent_media_refs(item, normalized)
         if not image_keys and not media_refs:
             continue
-        message_id = str(item.get("message_id") or "")
-        if not message_id:
+        sub_message_id = str(item.get("message_id") or "")
+        if not sub_message_id:
             continue
         success_marker = _media_marker_for_item(image_keys, media_refs)
         if len(media) >= _QUOTE_MEDIA_MAX:
-            media_markers[message_id] = success_marker
+            media_markers[sub_message_id] = success_marker
             continue
         try:
-            downloaded = await _download_reply_quote_media(adapter, message_id, item)
+            downloaded = await _download_reply_quote_media(adapter, container_message_id, item)
         except Exception:
             logger.debug(
-                "[multitenancy] merge_forward media download failed (mid=%s)",
-                message_id,
+                "[multitenancy] merge_forward media download failed (container=%s sub=%s)",
+                container_message_id,
+                sub_message_id,
                 exc_info=True,
             )
-            media_markers[message_id] = _MEDIA_EXPIRED_HINT
+            media_markers[sub_message_id] = _MEDIA_EXPIRED_HINT
             continue
         if not downloaded:
-            media_markers[message_id] = _MEDIA_EXPIRED_HINT
+            media_markers[sub_message_id] = _MEDIA_EXPIRED_HINT
             continue
-        media_markers[message_id] = success_marker
+        media_markers[sub_message_id] = success_marker
         remaining = _QUOTE_MEDIA_MAX - len(media)
         for path, media_type in downloaded[:remaining]:
             if path and path not in seen_paths:
@@ -383,7 +392,7 @@ async def _expand_merge_forward_with_media(
         [_item_sender_open_id(it) for it in items],
         sender_open_id,
     )
-    media_markers, media = await _collect_merge_forward_media(adapter, items)
+    media_markers, media = await _collect_merge_forward_media(adapter, message_id, items)
     transcript = _render_forwarded_messages(message_id, items, names, media_markers=media_markers)
     return transcript, media
 
