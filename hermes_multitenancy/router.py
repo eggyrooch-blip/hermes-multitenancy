@@ -5779,7 +5779,21 @@ async def _start_feishu_stream_target(
     reply_to: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
 ) -> tuple[str, Optional[str]]:
-    """Start a card stream when possible, otherwise create the text placeholder."""
+    """Start a card stream when possible, otherwise create the text placeholder.
+
+    Reply-mode note: transport here is chosen up-front by CAPABILITY
+    (``_adapter_supports_streaming_card``), before the reply text exists — the
+    card is opened immediately so the user sees a "Generating…" surface while
+    content streams in. The content-based predicate ``should_use_card``
+    (card/card_error.py) therefore cannot gate this path: it needs the complete
+    text, which only exists after the stream finishes. Sending a plain reply as a
+    STATIC message instead of a card would require a CORE seam in
+    ``gateway.stream_consumer.GatewayStreamConsumer.ensure_streaming_card_started``
+    (or the core ``FeishuAdapter``) to defer transport until the buffer is known.
+    Until core exposes that, ``should_use_card`` stays unit-tested but unwired.
+    See tests/test_streaming_card_transport.py
+    ::test_plaintext_reply_still_uses_card_because_core_owns_reply_mode.
+    """
     if _adapter_supports_streaming_card(adapter):
         starter = getattr(adapter, "start_streaming_card", None)
         updater = getattr(adapter, "update_streaming_card", None)

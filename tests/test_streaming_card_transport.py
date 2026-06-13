@@ -418,6 +418,77 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
     }
 
 
+@pytest.mark.asyncio
+async def test_plaintext_reply_still_uses_card_because_core_owns_reply_mode(
+    monkeypatch, tmp_path
+):
+    """Pin the CORE dependency for the static-text-vs-card reply-mode decision.
+
+    ``should_use_card`` (card/card_error.py) is content-based: a plain-text reply
+    with no fenced code and no markdown table returns False, i.e. "a static text
+    message renders this fine, no interactive card needed". But the live plugin
+    reply path cannot consult it, and this test proves WHY:
+
+    The multitenancy router commits to the interactive-card transport BEFORE the
+    reply text exists. ``_stream_into_feishu`` →
+    ``_stream_into_feishu_shared_consumer`` calls core's
+    ``GatewayStreamConsumer.ensure_streaming_card_started()``
+    (imported ``from gateway.stream_consumer`` at router.py:40, invoked at
+    router.py:6038) to open the card up-front so the user sees a "Generating…"
+    card immediately; content then streams in token-by-token. Transport choice is
+    capability-based (``_adapter_supports_streaming_card`` → core's
+    ``FeishuAdapter.supports_streaming_card``), NOT content-based.
+
+    Consequence asserted below: a reply whose final text is plain
+    (``should_use_card(...) is False``) STILL goes out as a card
+    (``adapter.started`` non-empty, ``adapter.sent == []``). Making that reply a
+    STATIC message instead would require a CORE hook that lets the adapter defer
+    transport selection until the full text is known — e.g.
+    ``GatewayStreamConsumer.ensure_streaming_card_started`` accepting a
+    content-gate callback, or ``FeishuAdapter`` exposing a post-buffer
+    "finalize as text vs card" seam. The plugin owns neither; hacking core is out
+    of scope. So the tested predicate stays in place for the day core grows that
+    seam, and this test fails loudly if the plugin ever silently starts owning
+    the decision (at which point should_use_card SHOULD be wired here).
+    """
+    from hermes_multitenancy import agent_real, router as router_mod
+    from hermes_multitenancy.card.card_error import should_use_card
+
+    plain_reply = "状态正常，一切就绪，没有代码也没有表格。"
+    # Precondition: by content alone this reply does NOT warrant a card.
+    assert should_use_card(plain_reply) is False
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("content", plain_reply)
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    adapter = _CardCapableAdapter()
+    event = SimpleNamespace(
+        text="状态？",
+        message_id="om_source_plain",
+        source=SimpleNamespace(chat_type="group"),
+    )
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        event,
+        messages=[{"role": "user", "content": "状态？"}],
+    )
+
+    assert response == plain_reply
+    # The decision was made by transport capability, up-front — NOT by content:
+    # the card was started, and no static text message was sent. This is the
+    # behavior that would change if/when the core reply-mode hook lands.
+    assert adapter.started == [
+        {"chat_id": "chat-1", "reply_to": "om_source_plain", "metadata": None}
+    ]
+    assert adapter.sent == []
+
+
 def test_stream_into_feishu_does_not_reply_to_dm_message_to_avoid_topic(
     monkeypatch, tmp_path
 ):
