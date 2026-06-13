@@ -3027,7 +3027,7 @@ async def _handle_command(
             f"会话历史: {hist_len} 条消息"
         )
     elif cmd in ("doctor", "diagnose"):
-        await _send_diagnostics_card(adapter, chat_id, cmd, event)
+        await _send_diagnostics_card(adapter, chat_id, cmd, event, sender=sender)
         return
     elif cmd in ("new", "reset"):
         _cancel_inflight_task(
@@ -4112,18 +4112,24 @@ def _event_locale(event: Any) -> str:
     return _normalize_locale(raw)
 
 
-def _diagnostics_subject_context(event: Any):
+def _diagnostics_subject_context(event: Any, sender: Optional[str] = None):
     """Resolve (subject_open_id, identity, multitenancy) for the invoking user.
 
     Lets /doctor /diagnose identify WHO is asking and check THEIR real
-    credential validity instead of "no subject". Fail-soft → (None, None, None).
+    credential validity instead of "no subject". Prefers the already-resolved
+    command ``sender`` (the routed user key), falling back to event resolution.
+    Fail-soft → (None, None, None).
     """
     subject_open_id = None
-    try:
-        sender = _resolve_sender_for_routing(event, fallback="")
-        subject_open_id = _normalize_feishu_open_id(sender) or (sender or None)
-    except Exception:
-        subject_open_id = None
+    candidate = (sender or "").strip()
+    if candidate and candidate.lower() != "unknown":
+        subject_open_id = _normalize_feishu_open_id(candidate) or candidate
+    if not subject_open_id:
+        try:
+            resolved = _resolve_sender_for_routing(event, fallback="")
+            subject_open_id = _normalize_feishu_open_id(resolved) or (resolved or None)
+        except Exception:
+            subject_open_id = None
     if not subject_open_id:
         return None, None, None
 
@@ -4154,13 +4160,13 @@ def _diagnostics_subject_context(event: Any):
     return subject_open_id, identity, multitenancy
 
 
-def _render_diagnostics_reply(cmd: str, event: Any) -> str:
+def _render_diagnostics_reply(cmd: str, event: Any, sender: Optional[str] = None) -> str:
     """Build the /doctor or /diagnose Markdown reply (read-only, fail-soft)."""
     locale = _event_locale(event)
     try:
         from . import diagnostics
 
-        subject_open_id, identity, multitenancy = _diagnostics_subject_context(event)
+        subject_open_id, identity, multitenancy = _diagnostics_subject_context(event, sender)
         if cmd == "doctor":
             return diagnostics.render_doctor(
                 locale=locale, subject_open_id=subject_open_id, identity=identity
@@ -4216,12 +4222,14 @@ def _build_diagnostics_card(markdown: str, cmd: str, locale: str) -> dict[str, A
     }
 
 
-async def _send_diagnostics_card(adapter: Any, chat_id: str, cmd: str, event: Any) -> None:
+async def _send_diagnostics_card(
+    adapter: Any, chat_id: str, cmd: str, event: Any, *, sender: Optional[str] = None
+) -> None:
     """Prefer sending diagnostics via interactive card, with text fallback."""
     if adapter is None:
         return
 
-    markdown = _render_diagnostics_reply(cmd, event)
+    markdown = _render_diagnostics_reply(cmd, event, sender=sender)
     locale = _event_locale(event)
     card = _build_diagnostics_card(markdown, cmd, locale)
 
