@@ -107,6 +107,7 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
                 "status": status["status"],
                 "storage": status["storage"],
                 "expires_at": status["expires_at"],
+                "refresh_expires_at": status.get("refresh_expires_at"),
                 "scopes": status["scopes"],
                 "missing_scopes": status["missing_scopes"],
                 "has_credential": status["has_payload"],

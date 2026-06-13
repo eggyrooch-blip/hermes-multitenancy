@@ -99,6 +99,57 @@ def test_credential_status_reports_scope_missing_and_expired(tmp_path):
     assert expired["status"] == "expired"
 
 
+def test_credential_status_surfaces_refresh_token_expiry_from_payload(tmp_path):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    store = CredentialStore(tmp_path / "multitenancy.db", encryption_key="test-key")
+    expires_at = int(time.time() * 1000) + 3600_000
+    refresh_expires_at = expires_at + 86_400_000
+    store.put_credential(
+        profile_name="owner",
+        subject_id="ou_owner",
+        provider="feishu",
+        secret_kind="uat",
+        payload={
+            "access_token": "secret",
+            "refresh_expires_at": refresh_expires_at,
+        },
+        scopes=[],
+        expires_at=expires_at,
+    )
+
+    status = store.get_status(
+        profile_name="owner",
+        subject_id="ou_owner",
+        provider="feishu",
+    )
+
+    assert status["refresh_expires_at"] == refresh_expires_at
+
+
+def test_credential_status_omits_refresh_token_expiry_when_missing(tmp_path):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    store = CredentialStore(tmp_path / "multitenancy.db", encryption_key="test-key")
+    store.put_credential(
+        profile_name="owner",
+        subject_id="ou_owner",
+        provider="feishu",
+        secret_kind="uat",
+        payload={"access_token": "secret"},
+        scopes=[],
+        expires_at=int(time.time() * 1000) + 3600_000,
+    )
+
+    status = store.get_status(
+        profile_name="owner",
+        subject_id="ou_owner",
+        provider="feishu",
+    )
+
+    assert "refresh_expires_at" not in status
+
+
 def test_runtime_secret_decrypts_only_for_exact_profile_subject_provider(tmp_path):
     from hermes_multitenancy.credentials import CredentialStore
 

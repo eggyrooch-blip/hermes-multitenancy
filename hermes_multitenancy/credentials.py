@@ -148,7 +148,7 @@ class CredentialStore:
         elif missing:
             status = "scope_missing"
 
-        return {
+        result = {
             **base,
             "status": status,
             "has_payload": bool(row["encrypted_payload"]),
@@ -156,6 +156,15 @@ class CredentialStore:
             "missing_scopes": missing,
             "expires_at": expires_at,
         }
+        try:
+            payload = _open_json(row["encrypted_payload"], self._key)
+            refresh_expires_at = int(payload.get("refresh_expires_at"))
+            if refresh_expires_at > 0:
+                result["refresh_expires_at"] = refresh_expires_at
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+        return result
 
     def get_secret_for_runtime(
         self,
