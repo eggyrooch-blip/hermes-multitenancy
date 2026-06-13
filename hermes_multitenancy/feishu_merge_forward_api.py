@@ -43,6 +43,9 @@ _PROCESS_FLAG = "_hermes_multitenancy_merge_forward_sender_capture_patched"
 _SENDER_ATTR = "_mt_merge_forward_sender_by_mid"  # {message_id: forwarder open_id}
 _SENDER_MAP_MAX = 256
 
+_MEDIA_EXPIRED_HINT = "[资源已过期(14005)，请直接发送]"
+_FORWARD_EXPIRED_HINT = "[转发内容含已过期资源(14005)，请直接发送]"
+
 
 def _sender_map(adapter: Any) -> dict:
     """Per-message_id forwarder-open_id map on the adapter.
@@ -217,6 +220,7 @@ def _render_sub_tree(
     depth: int,
     counter: list[int],
     indent: str = "    ",
+    media_markers: Optional[dict[str, str]] = None,
 ) -> list[str]:
     lines: list[str] = []
     if depth > _MAX_DEPTH:
@@ -230,17 +234,49 @@ def _render_sub_tree(
         name = names.get(oid) or (oid[:8] + "…" if oid else "未知")
         ts = _format_create_time(it)
         prefix = f"[{ts}] {name}:" if ts else f"{name}:"
-        body = _item_text(it)
+        mid = str(it.get("message_id") or "")
+        body = str((media_markers or {}).get(mid) or _item_text(it))
         pad = indent * (depth + 1)
         lines.append(indent * depth + prefix)
         for bl in body.splitlines() or [""]:
             lines.append(pad + bl)
-        mid = str(it.get("message_id") or "")
         if mid and children.get(mid):  # nested merge_forward — recurse, no extra API
             lines.extend(
-                _render_sub_tree(mid, children, names, depth=depth + 1, counter=counter, indent=indent)
+                _render_sub_tree(
+                    mid,
+                    children,
+                    names,
+                    depth=depth + 1,
+                    counter=counter,
+                    indent=indent,
+                    media_markers=media_markers,
+                )
             )
     return lines
+
+
+def _render_forwarded_messages(
+    message_id: str,
+    items: list[dict],
+    names: dict[str, str],
+    *,
+    media_markers: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    if not items:
+        return None
+    children = _build_children_map(items, message_id)
+    body_lines = _render_sub_tree(
+        message_id,
+        children,
+        names,
+        depth=0,
+        counter=[0],
+        media_markers=media_markers,
+    )
+    if not body_lines:
+        return None
+    inner = "\n".join(body_lines)
+    return f"<forwarded_messages>\n{inner}\n</forwarded_messages>"
 
 
 def _expand_merge_forward_blocking(message_id: str, sender_open_id: str) -> Optional[str]:
@@ -249,16 +285,107 @@ def _expand_merge_forward_blocking(message_id: str, sender_open_id: str) -> Opti
     if not items:
         return None
     names = _resolve_names_blocking([_item_sender_open_id(it) for it in items], sender_open_id)
-    children = _build_children_map(items, message_id)
-    body_lines = _render_sub_tree(message_id, children, names, depth=0, counter=[0])
-    if not body_lines:
-        return None
-    inner = "\n".join(body_lines)
-    return f"<forwarded_messages>\n{inner}\n</forwarded_messages>"
+    return _render_forwarded_messages(message_id, items, names)
 
 
 async def _expand_merge_forward(message_id: str, sender_open_id: str) -> Optional[str]:
     return await asyncio.to_thread(_expand_merge_forward_blocking, message_id, sender_open_id)
+
+
+def _is_merge_forward_hint_error(exc: Exception) -> bool:
+    # Match only specific Feishu errcodes (14005 = resource deleted, 230002 =
+    # no permission), not a bare "permission" substring which could false-match
+    # unrelated transport errors and mislabel a live resource as expired.
+    text = str(exc or "").lower()
+    return "14005" in text or "230002" in text or "resource has been deleted" in text
+
+
+def _forward_hint_transcript(text: str) -> str:
+    return f"<forwarded_messages>\n{text}\n</forwarded_messages>"
+
+
+def _media_marker_for_item(image_keys: list[str], media_refs: list[tuple[str, str, str]]) -> str:
+    if image_keys:
+        return "[图片]"
+    file_name = ""
+    if media_refs:
+        file_name = str(media_refs[0][2] or "").strip()
+    if file_name:
+        return f"[文件:{file_name}]"
+    return "[文件]"
+
+
+async def _collect_merge_forward_media(
+    adapter: Any,
+    items: list[dict],
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    from .feishu_reply_quote_api import (
+        _QUOTE_MEDIA_MAX,
+        _download_reply_quote_media,
+        _normalize_parent_item,
+        _parent_image_keys,
+        _parent_media_refs,
+    )
+
+    media_markers: dict[str, str] = {}
+    media: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+    for item in items:
+        normalized = _normalize_parent_item(item)
+        image_keys = _parent_image_keys(item, normalized)
+        media_refs = _parent_media_refs(item, normalized)
+        if not image_keys and not media_refs:
+            continue
+        message_id = str(item.get("message_id") or "")
+        if not message_id:
+            continue
+        success_marker = _media_marker_for_item(image_keys, media_refs)
+        if len(media) >= _QUOTE_MEDIA_MAX:
+            media_markers[message_id] = success_marker
+            continue
+        try:
+            downloaded = await _download_reply_quote_media(adapter, message_id, item)
+        except Exception:
+            logger.debug(
+                "[multitenancy] merge_forward media download failed (mid=%s)",
+                message_id,
+                exc_info=True,
+            )
+            media_markers[message_id] = _MEDIA_EXPIRED_HINT
+            continue
+        if not downloaded:
+            media_markers[message_id] = _MEDIA_EXPIRED_HINT
+            continue
+        media_markers[message_id] = success_marker
+        remaining = _QUOTE_MEDIA_MAX - len(media)
+        for path, media_type in downloaded[:remaining]:
+            if path and path not in seen_paths:
+                media.append((path, media_type))
+                seen_paths.add(path)
+    return media_markers, media
+
+
+async def _expand_merge_forward_with_media(
+    adapter: Any,
+    message_id: str,
+    sender_open_id: str,
+) -> tuple[Optional[str], list[tuple[str, str]]]:
+    try:
+        items = await asyncio.to_thread(_fetch_sub_messages_blocking, message_id, sender_open_id)
+    except Exception as exc:
+        if _is_merge_forward_hint_error(exc):
+            return _forward_hint_transcript(_FORWARD_EXPIRED_HINT), []
+        raise
+    if not items:
+        return None, []
+    names = await asyncio.to_thread(
+        _resolve_names_blocking,
+        [_item_sender_open_id(it) for it in items],
+        sender_open_id,
+    )
+    media_markers, media = await _collect_merge_forward_media(adapter, items)
+    transcript = _render_forwarded_messages(message_id, items, names, media_markers=media_markers)
+    return transcript, media
 
 
 # --------------------------------------------------------------------------- #
@@ -319,16 +446,20 @@ def _patch_extract(FeishuAdapter: Any) -> None:
             sender_open_id = str(_sender_map(self).pop(message_id, "") or "")
             if not message_id or not sender_open_id:
                 return result
-            transcript = await _expand_merge_forward(message_id, sender_open_id)
+            transcript, media = await _expand_merge_forward_with_media(self, message_id, sender_open_id)
             if not transcript:
                 return result
-            # result is a tuple: (text, inbound_type, media_urls, media_types, mentions)
-            rest = tuple(result[1:])
+            if not isinstance(result, tuple) or len(result) < 4:
+                return result
+            media_urls = list(result[2] or []) + [path for path, _media_type in media]
+            media_types = list(result[3] or []) + [media_type for _path, media_type in media]
             logger.info(
-                "[multitenancy] merge_forward expanded via UAT API (mid=%s, %d chars)",
-                message_id, len(transcript),
+                "[multitenancy] merge_forward expanded via UAT API (mid=%s, %d chars, %d media)",
+                message_id,
+                len(transcript),
+                len(media),
             )
-            return (transcript,) + rest
+            return (transcript, result[1], media_urls, media_types) + tuple(result[4:])
         except Exception:
             logger.exception("[multitenancy] merge_forward API expansion failed; using fallback text")
             return result
