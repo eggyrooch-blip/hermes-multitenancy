@@ -92,6 +92,28 @@ def _card_content_throttle_s() -> float:
         return 0.08
 
 
+def _card_long_gap_threshold_s() -> float:
+    """Idle-gap threshold before the next flush batches briefly."""
+    raw = os.getenv("HERMES_CARD_LONG_GAP_THRESHOLD_S")
+    if raw is None:
+        return 2.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _card_batch_after_gap_s() -> float:
+    """Post-gap batch window so the next visible frame is meaningful."""
+    raw = os.getenv("HERMES_CARD_BATCH_AFTER_GAP_S")
+    if raw is None:
+        return 0.3
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.3
+
+
 def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
     """Install streaming-card methods on a Feishu adapter when they are absent."""
     if adapter is None:
@@ -487,7 +509,13 @@ async def _flush_state(
 
             if card_id:
                 try:
-                    await _stream_cardkit_content(adapter, card_id, _render_stream_text(state), _next_sequence(state))
+                    rendered = _render_stream_text(state)
+                    missing = object()
+                    last_flushed = state.get("last_flushed_text", missing)
+                    if last_flushed is not missing and rendered == last_flushed:
+                        return _result(True, message_id=str(message_id))
+                    await _stream_cardkit_content(adapter, card_id, rendered, _next_sequence(state))
+                    state["last_flushed_text"] = rendered
                     return _result(True, message_id=str(message_id))
                 except Exception as exc:
                     handled = _handle_cardkit_exc(adapter, message_id, state, exc)
@@ -525,7 +553,12 @@ async def _flush_state(
 
     try:
         controller = _flush_controllers(adapter).setdefault(str(message_id), FlushController())
-        result = await controller.throttled_update(_card_content_throttle_s(), _flush_body)
+        result = await controller.throttled_update(
+            _card_content_throttle_s(),
+            _flush_body,
+            long_gap_s=_card_long_gap_threshold_s(),
+            batch_after_gap_s=_card_batch_after_gap_s(),
+        )
         if result is None:
             return _result(True, message_id=str(message_id))
         return result

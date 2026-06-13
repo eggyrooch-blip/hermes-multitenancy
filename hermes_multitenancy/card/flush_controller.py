@@ -59,11 +59,18 @@ class FlushController:
         return self._in_flight
 
     async def throttled_update(
-        self, throttle_s: float, flush_callable: Callable[[], Awaitable[Any]]
+        self,
+        throttle_s: float,
+        flush_callable: Callable[[], Awaitable[Any]],
+        *,
+        long_gap_s: float = 2.0,
+        batch_after_gap_s: float = 0.3,
     ) -> Optional[Any]:
         """Coalesce rapid flushes; always land the trailing frame.
 
         - If at least ``throttle_s`` has elapsed since the last push, flush now.
+        - After a long idle gap, briefly defer the next flush so multiple fresh
+          tokens can batch into one visible update.
         - Otherwise remember the LATEST ``flush_callable`` and (re)arm a single
           timer that fires the latest pending callable when the window closes.
           Intermediate frames within the window are dropped (their state is
@@ -79,14 +86,30 @@ class FlushController:
         now = loop.time()
         # Always keep the latest callable so a pending timer fires fresh state.
         self._pending_callable = flush_callable
-        if self._pending_timer is not None:
-            return None  # a timer is already armed; it will use the latest callable
-        if now - self._last_update >= throttle_s:
+        if self._last_update <= 0.0:
             self._last_update = now
             cb = self._pending_callable
             self._pending_callable = None
             return await self.flush(cb)
-        delay = max(0.0, throttle_s - (now - self._last_update))
+        if self._pending_timer is not None:
+            return None  # a timer is already armed; it will use the latest callable
+        elapsed = now - self._last_update
+        if elapsed >= throttle_s:
+            self.cancel()
+            self._pending_callable = flush_callable
+            if elapsed > max(0.0, long_gap_s):
+                self._last_update = now
+                self._pending_timer = loop.call_later(
+                    max(0.0, batch_after_gap_s),
+                    self._fire_pending,
+                    loop,
+                )
+                return None
+            self._last_update = now
+            cb = self._pending_callable
+            self._pending_callable = None
+            return await self.flush(cb)
+        delay = max(0.0, throttle_s - elapsed)
         self._pending_timer = loop.call_later(delay, self._fire_pending, loop)
         return None
 
