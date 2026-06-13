@@ -4445,6 +4445,7 @@ def register_chat_inviter(
     *,
     chat_name: Optional[str] = None,
     inviter_display: Optional[str] = None,
+    inviter_union_id: Optional[str] = None,
 ) -> None:
     """Layer 4 hook entry — persist who pulled the bot into a chat.
 
@@ -4455,10 +4456,14 @@ def register_chat_inviter(
     """
     if not chat_id or not _is_feishu_open_id(inviter_open_id):
         return
+    normalized_inviter_union_id = (
+        str(inviter_union_id).strip() if inviter_union_id else None
+    )
     now = time.time()
     with _chat_inviter_cache_lock:
         _chat_inviter_cache[chat_id] = {
             "inviter_open_id": inviter_open_id,
+            "inviter_union_id": normalized_inviter_union_id,
             "chat_name": chat_name,
             "inviter_display": inviter_display,
             "_ts": now,
@@ -4481,7 +4486,11 @@ def register_chat_inviter(
         )
         return
     try:
-        table.put_pending_inviter(chat_id, inviter_open_id)
+        table.put_pending_inviter(
+            chat_id,
+            inviter_open_id,
+            inviter_union_id=normalized_inviter_union_id,
+        )
         table.prune_pending_inviters(int(now), _CHAT_INVITER_CACHE_TTL_S)
     except Exception as exc:
         logger.debug(

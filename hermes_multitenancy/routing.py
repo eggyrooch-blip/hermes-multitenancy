@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS multitenancy_routing (
 CREATE TABLE IF NOT EXISTS multitenancy_pending_group_inviter (
     chat_id          TEXT PRIMARY KEY NOT NULL,
     inviter_open_id  TEXT NOT NULL,
+    inviter_union_id TEXT,
     created_at       INTEGER NOT NULL
 );
 
@@ -90,6 +91,10 @@ _NEW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("agent_id", "TEXT"),
     ("upstream_profile", "TEXT"),
     ("provenance", "TEXT NOT NULL DEFAULT 'auto'"),
+)
+
+_PENDING_INVITER_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("inviter_union_id", "TEXT"),
 )
 
 # Old (pre-group) index name to drop before recreating a kind-aware version.
@@ -200,6 +205,17 @@ class RoutingTable:
             if col_name not in existing_cols:
                 self._conn.execute(
                     f"ALTER TABLE multitenancy_routing ADD COLUMN {col_name} {col_def}"
+                )
+
+        cur = self._conn.execute(
+            "PRAGMA table_info(multitenancy_pending_group_inviter)"
+        )
+        existing_pending_cols = {row["name"] for row in cur.fetchall()}
+        for col_name, col_def in _PENDING_INVITER_NEW_COLUMNS:
+            if col_name not in existing_pending_cols:
+                self._conn.execute(
+                    "ALTER TABLE multitenancy_pending_group_inviter "
+                    f"ADD COLUMN {col_name} {col_def}"
                 )
 
         # Drop the legacy open_id unique index — its predicate doesn't include
@@ -404,7 +420,13 @@ class RoutingTable:
         )
         self._conn.commit()
 
-    def put_pending_inviter(self, chat_id: str, inviter_open_id: str) -> None:
+    def put_pending_inviter(
+        self,
+        chat_id: str,
+        inviter_open_id: str,
+        *,
+        inviter_union_id: Optional[str] = None,
+    ) -> None:
         """Upsert the latest pending inviter hand-off for a group chat.
 
         Empty ``chat_id`` / ``inviter_open_id`` are ignored so the Feishu
@@ -416,13 +438,14 @@ class RoutingTable:
         self._conn.execute(
             """
             INSERT INTO multitenancy_pending_group_inviter
-                (chat_id, inviter_open_id, created_at)
-            VALUES (?, ?, ?)
+                (chat_id, inviter_open_id, inviter_union_id, created_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 inviter_open_id = excluded.inviter_open_id,
+                inviter_union_id = excluded.inviter_union_id,
                 created_at = excluded.created_at
             """,
-            (chat_id, inviter_open_id, now),
+            (chat_id, inviter_open_id, inviter_union_id, now),
         )
         self._conn.commit()
 
@@ -440,6 +463,19 @@ class RoutingTable:
         )
         row = cur.fetchone()
         return str(row["inviter_open_id"]) if row is not None else None
+
+    def get_pending_inviter_union_id(self, chat_id: str) -> Optional[str]:
+        """Return the raw stored inviter_union_id for ``chat_id``, if any."""
+        cur = self._conn.execute(
+            "SELECT inviter_union_id FROM multitenancy_pending_group_inviter "
+            "WHERE chat_id = ? LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        value = row["inviter_union_id"]
+        return str(value) if value else None
 
     def clear_pending_inviter(self, chat_id: str) -> None:
         """Delete a pending inviter hand-off row for ``chat_id`` if present."""

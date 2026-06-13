@@ -234,8 +234,9 @@ def _capture_inviter_from_event(data: Any) -> None:
     if event is None:
         return
     chat_id = _read_first(event, ("chat_id",))
-    operator = getattr(event, "operator_id", None) or getattr(event, "operator", None)
+    operator = _read_first(event, ("operator_id", "operator"))
     inviter_open_id = _read_first(operator, ("open_id", "operator_open_id"))
+    inviter_union_id = _read_first(operator, ("union_id", "operator_union_id"))
     if not inviter_open_id or not chat_id:
         logger.info(
             "[multitenancy] bot_added missing inviter or chat_id; cache not seeded"
@@ -248,6 +249,7 @@ def _capture_inviter_from_event(data: Any) -> None:
         str(inviter_open_id),
         chat_name=str(chat_name) if chat_name else None,
         inviter_display=str(inviter_display) if inviter_display else None,
+        inviter_union_id=str(inviter_union_id) if inviter_union_id else None,
     )
     logger.info(
         "[multitenancy] captured inviter for chat=%s inviter=%s",

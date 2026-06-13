@@ -236,9 +236,9 @@ def _patch_on_card_action_trigger(FeishuAdapter: Any) -> None:
     @functools.wraps(original)
     def wrapped(self: Any, data: Any) -> Any:
         try:
-            event = getattr(data, "event", None)
-            action = getattr(event, "action", None)
-            action_value = getattr(action, "value", {}) or {}
+            event = _read_value(data, "event")
+            action = _read_value(event, "action")
+            action_value = _read_value(action, "value") or {}
             if not isinstance(action_value, dict):
                 action_value = {}
             hermes_action = action_value.get("hermes_action")
@@ -267,17 +267,13 @@ def _handle_group_reply_mode_action(
         mode = str(action_value.get("mode") or "").strip()
         if mode not in _VALID_REPLY_MODES:
             return _toast_response("无效的模式")
-        operator_open_id = _event_operator_open_id(event)
+        operator_ids = _event_operator_id_set(event)
         chat_id = _event_chat_id(event, action_value)
         table = _get_routing_table()
         if table is None or not chat_id:
             return _toast_response("暂时无法保存设置，请稍后再试")
-        owner_open_id = _resolve_group_owner(table, chat_id)
-        if (
-            not operator_open_id
-            or not owner_open_id
-            or operator_open_id != owner_open_id
-        ):
+        owner_ids = _resolve_group_owner_id_set(table, chat_id)
+        if not operator_ids or not owner_ids or operator_ids.isdisjoint(owner_ids):
             return _toast_response("无权操作：只有把我拉进群的人能改")
         table.set_group_reply_mode(chat_id, mode)
         return _updated_card_response(_build_group_reply_mode_status_card(chat_id, mode))
@@ -289,40 +285,104 @@ def _handle_group_reply_mode_action(
         return _toast_response("暂时无法保存设置，请稍后再试")
 
 
-def _resolve_group_owner(table: Any, chat_id: str) -> str:
-    """The owner = inviter. Right after bot-added the group routing row may not
-    be provisioned yet (that happens on the first routed group message), but the
-    inviter is already in the pending table. Check the provisioned row first,
-    then fall back to the pending inviter so the real owner is never wrongly
-    denied when they tap the welcome card immediately.
+def _resolve_group_owner_id_set(table: Any, chat_id: str) -> set[str]:
+    """Return every known non-empty id for the group owner/inviter.
+
+    The owner = inviter. A provisioned group row is authoritative, but the
+    pending inviter row can carry the same owner's union_id before the Feishu
+    user sync has created a root row. Pending ids are only combined with a
+    provisioned owner when their open_id agrees, so stale pending rows cannot
+    grant access to a different user.
     """
+    owner_ids: set[str] = set()
+    provisioned_owner_open_id = ""
     try:
         row = table.lookup_by_chat_id(chat_id)
-        owner = str(getattr(row, "owner_open_id", "") or "")
-        if owner:
-            return owner
+        provisioned_owner_open_id = _id_text(_read_value(row, "owner_open_id"))
+        if provisioned_owner_open_id:
+            owner_ids.add(provisioned_owner_open_id)
+            _add_synced_open_id_owner_ids(table, provisioned_owner_open_id, owner_ids)
     except Exception:
         logger.debug("[multitenancy] owner lookup_by_chat_id failed", exc_info=True)
+
+    pending_open_id = ""
     try:
-        pending = table.get_pending_inviter(chat_id)
-        if pending:
-            return str(pending)
+        pending_open_id = _id_text(table.get_pending_inviter(chat_id))
     except Exception:
         logger.debug("[multitenancy] owner get_pending_inviter failed", exc_info=True)
-    return ""
+
+    pending_belongs_to_owner = (
+        bool(pending_open_id)
+        and (
+            not provisioned_owner_open_id
+            or pending_open_id == provisioned_owner_open_id
+        )
+    )
+    if pending_belongs_to_owner:
+        owner_ids.add(pending_open_id)
+        _add_synced_open_id_owner_ids(table, pending_open_id, owner_ids)
+
+    try:
+        pending_union_id = _id_text(table.get_pending_inviter_union_id(chat_id))
+        if pending_union_id and (not provisioned_owner_open_id or pending_belongs_to_owner):
+            owner_ids.add(pending_union_id)
+    except Exception:
+        logger.debug(
+            "[multitenancy] owner get_pending_inviter_union_id failed",
+            exc_info=True,
+        )
+    return owner_ids
 
 
-def _event_operator_open_id(event: Any) -> str:
-    operator = getattr(event, "operator", None)
-    return str(getattr(operator, "open_id", "") or "")
+def _add_synced_open_id_owner_ids(table: Any, open_id: str, owner_ids: set[str]) -> None:
+    try:
+        row = table.lookup_by_open_id(open_id)
+    except Exception:
+        logger.debug("[multitenancy] owner lookup_by_open_id failed", exc_info=True)
+        return
+    owner_ids.update(_identity_id_set(row))
+
+
+def _event_operator_id_set(event: Any) -> set[str]:
+    operator = _read_value(event, "operator") or _read_value(event, "operator_id")
+    return _identity_id_set(operator)
+
+
+def _identity_id_set(obj: Any) -> set[str]:
+    return {
+        value
+        for value in (
+            _id_text(_read_value(obj, "open_id")),
+            _id_text(_read_value(obj, "operator_open_id")),
+            _id_text(_read_value(obj, "union_id")),
+            _id_text(_read_value(obj, "operator_union_id")),
+            _id_text(_read_value(obj, "user_id")),
+            _id_text(_read_value(obj, "operator_user_id")),
+        )
+        if value
+    }
+
+
+def _read_value(obj: Any, name: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _id_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _event_chat_id(event: Any, action_value: dict[str, Any]) -> str:
     chat_id = str(action_value.get("chat_id") or "").strip()
     if chat_id:
         return chat_id
-    context = getattr(event, "context", None)
-    return str(getattr(context, "open_chat_id", "") or "").strip()
+    context = _read_value(event, "context")
+    return _id_text(_read_value(context, "open_chat_id"))
 
 
 def _build_group_reply_mode_status_card(chat_id: str, mode: str) -> dict[str, Any]:
