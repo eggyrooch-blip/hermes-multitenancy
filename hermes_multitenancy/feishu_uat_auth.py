@@ -8,6 +8,7 @@ credential vault plus the profile-local compatibility JSON.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -17,6 +18,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Iterable, Optional
 
 from .credentials import CredentialStore
@@ -29,12 +31,36 @@ from .credential_renewal_common import (
     write_needs_reauth_marker,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class FeishuUatAuthError(Exception):
-    def __init__(self, message: str, *, status: int = 400) -> None:
+    def __init__(self, message: str, *, status: int = 400, refresh_class: str | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.status = status
+        self.refresh_class = refresh_class
+
+
+LARK_REFRESH_ERROR = MappingProxyType(
+    {
+        "TOKEN_INVALID": 99991668,
+        "REFRESH_TOKEN_INVALID": 20026,
+        "REFRESH_TOKEN_EXPIRED": 20037,
+        "REFRESH_TOKEN_REVOKED": 20064,
+        "REFRESH_TOKEN_ALREADY_USED": 20073,
+        "REFRESH_SERVER_ERROR": 20050,
+    }
+)
+REFRESH_RETRYABLE_CODES: frozenset[int] = frozenset({LARK_REFRESH_ERROR["REFRESH_SERVER_ERROR"]})
+
+
+def classify_refresh_error(code: int | None) -> str:
+    if code is None or code == 0:
+        return "ok"
+    if code in REFRESH_RETRYABLE_CODES:
+        return "retryable"
+    return "invalid"
 
 
 @dataclass
@@ -752,9 +778,26 @@ def _poll_device_token(device_code: str, client_id: str, client_secret: str) -> 
 
 def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -> dict[str, Any]:
     data = _refresh_access_token(client_id, client_secret, refresh_token)
-    if int(data.get("code") or 0) != 0:
+    code = int(data.get("code") or 0)
+    refresh_class = classify_refresh_error(code)
+    if refresh_class == "retryable":
+        logger.warning("Feishu UAT refresh transient error: code=%s; retrying once", code)
+        data = _refresh_access_token(client_id, client_secret, refresh_token)
+        code = int(data.get("code") or 0)
+        if code != 0:
+            msg = str(data.get("msg") or data.get("message") or "refresh rejected").strip()
+            raise FeishuUatAuthError(
+                f"Feishu UAT refresh failed after retry: code={code} msg={msg}",
+                status=401,
+                refresh_class="retryable_exhausted",
+            )
+    elif refresh_class == "invalid":
         msg = str(data.get("msg") or data.get("message") or "refresh rejected").strip()
-        raise FeishuUatAuthError(f"Feishu UAT refresh failed: code={data.get('code')} msg={msg}", status=401)
+        raise FeishuUatAuthError(
+            f"Feishu UAT refresh failed: code={code} msg={msg}",
+            status=401,
+            refresh_class="invalid",
+        )
     if isinstance(data.get("data"), dict):
         data = data["data"]
     return _normalise_refresh_response(data, require_refresh_token=False)

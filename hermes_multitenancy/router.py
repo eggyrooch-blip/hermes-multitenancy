@@ -27,10 +27,13 @@ import zipfile
 from contextlib import asynccontextmanager
 from itertools import zip_longest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
+
+SYNTHETIC_AUTH_COMPLETE_TEXT = "我已完成飞书账号授权，请继续执行之前的操作。"
 
 _SKILL_SLASH_ALIASES = {
     "hades": "kep-hades-cli",
@@ -3165,6 +3168,72 @@ def _start_feishu_auth_poll_task(
     task.add_done_callback(lambda t: logger.debug("Feishu auth poll task ended: %s", t.get_name()))
 
 
+async def _dispatch_synthetic_auth_complete(
+    *,
+    event: Any,
+    gateway: Any,
+    chat_id: str,
+    profile_name: str,
+    open_id: str,
+    text: str = SYNTHETIC_AUTH_COMPLETE_TEXT,
+) -> bool:
+    try:
+        clean_chat_id = str(chat_id or "").strip()
+        clean_profile_name = str(profile_name or "").strip()
+        if not clean_chat_id or not clean_profile_name:
+            logger.warning(
+                "multitenancy: skip synthetic auth-complete dispatch without AI context "
+                "chat_id=%r profile_name=%r",
+                chat_id,
+                profile_name,
+            )
+            return False
+
+        source = getattr(event, "source", None)
+        original_message_id = _event_message_id(event) or f"auth-complete:{int(time.time() * 1000)}"
+        synthetic_message_id = f"{original_message_id}:auth-complete"
+        sender_open_id = (
+            _normalize_feishu_open_id(getattr(event, "sender_open_id", None))
+            or _normalize_feishu_open_id(getattr(source, "open_id", None) if source is not None else None)
+            or _normalize_feishu_open_id(open_id)
+        )
+        sender_id = sender_open_id or str(open_id or "").strip()
+
+        synthetic_source = SimpleNamespace(
+            chat_id=clean_chat_id,
+            message_id=synthetic_message_id,
+            parent_chat_id=getattr(source, "parent_chat_id", None) if source is not None else None,
+            chat_id_alt=getattr(source, "chat_id_alt", None) if source is not None else None,
+            user_id=sender_id,
+            user_id_alt=getattr(source, "user_id_alt", None) if source is not None else None,
+            open_id=sender_open_id,
+            chat_type=getattr(source, "chat_type", None) if source is not None else None,
+            platform=getattr(source, "platform", None) if source is not None else None,
+        )
+        synthetic_event = SimpleNamespace(
+            text=text,
+            message_id=synthetic_message_id,
+            sender_open_id=sender_open_id or sender_id,
+            source=synthetic_source,
+            raw_event={
+                "event": {
+                    "message": {
+                        "message_id": synthetic_message_id,
+                        "chat_id": clean_chat_id,
+                        "chat_type": getattr(synthetic_source, "chat_type", None),
+                    },
+                    "sender": {"sender_id": {"open_id": sender_open_id or sender_id}},
+                }
+            },
+        )
+
+        await handle_async(event=synthetic_event, gateway=gateway)
+        return True
+    except Exception as exc:
+        logger.warning("multitenancy: synthetic auth-complete dispatch failed: %s", exc)
+        return False
+
+
 async def _poll_feishu_auth_session_until_done(
     *,
     session_id: str,
@@ -3213,6 +3282,13 @@ async def _poll_feishu_auth_session_until_done(
             updated = await update_auth_card(adapter=adapter, auth_card=auth_card, card=build_auth_success_card())
             if not updated:
                 await _safe_call(adapter.send, chat_id, "✅ 飞书 UAT 授权完成，后续 lark_cli 将优先使用你的 user 身份。")
+            await _dispatch_synthetic_auth_complete(
+                event=event,
+                gateway=gateway,
+                chat_id=chat_id,
+                profile_name=profile_name,
+                open_id=open_id,
+            )
         elif status == "expired":
             updated = await update_auth_card(adapter=adapter, auth_card=auth_card, card=build_auth_failed_card("expired"))
             if not updated:
