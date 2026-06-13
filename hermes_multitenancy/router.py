@@ -2963,6 +2963,8 @@ async def _handle_command(
             f"profile: {profile_name or '(未路由)'}\n"
             f"会话历史: {hist_len} 条消息"
         )
+    elif cmd in ("doctor", "diagnose"):
+        reply = _render_diagnostics_reply(cmd, event)
     elif cmd in ("new", "reset"):
         _cancel_inflight_task(
             _inflight_key(profile_name, sender, sender_alt, chat_id),
@@ -3956,6 +3958,31 @@ def _event_platform_value(event: Any) -> Optional[str]:
     platform = getattr(source, "platform", None) if source is not None else None
     value = getattr(platform, "value", platform)
     return str(value) if value else None
+
+
+def _event_locale(event: Any) -> str:
+    """Resolve a Feishu locale from the event, defaulting to zh_cn."""
+    source = getattr(event, "source", None)
+    raw = None
+    if source is not None:
+        raw = getattr(source, "locale", None) or getattr(source, "language", None)
+    from .diagnostics import _normalize_locale
+
+    return _normalize_locale(raw)
+
+
+def _render_diagnostics_reply(cmd: str, event: Any) -> str:
+    """Build the /doctor or /diagnose Markdown reply (read-only, fail-soft)."""
+    locale = _event_locale(event)
+    try:
+        from . import diagnostics
+
+        if cmd == "doctor":
+            return diagnostics.render_doctor(locale=locale)
+        return diagnostics.render_diagnose(locale=locale)
+    except Exception as exc:  # diagnostics is read-only; never crash the command
+        logger.warning("multitenancy: /%s diagnostics failed (%s)", cmd, exc)
+        return f"诊断暂不可用：{exc.__class__.__name__}"
 
 
 def _profile_relative_skill_dir(skill_info: dict[str, Any], profile_home: Optional[Path]) -> Optional[str]:

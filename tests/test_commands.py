@@ -31,6 +31,8 @@ def _build_event(text: str, user_id: str = "ou_cmd", chat_id: str = "chat-cmd"):
 
 def test_parse_known_commands():
     from hermes_multitenancy.commands import parse_command
+    assert parse_command("/doctor") == ("doctor", "")
+    assert parse_command("/diagnose") == ("diagnose", "")
     assert parse_command("/stop") == ("stop", "")
     assert parse_command("/status") == ("status", "")
     assert parse_command("/new") == ("new", "")
@@ -73,6 +75,45 @@ def test_parse_unescapes_feishu_markdown_command_name():
 def test_parse_rejects_paths():
     from hermes_multitenancy.commands import parse_command
     assert parse_command("/some/path") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pair", "locale", "expected"),
+    [
+        (("doctor", ""), "en_us", "Plugin Version"),
+        (("diagnose", ""), "en_us", "Overall Verdict"),
+        (("doctor", ""), None, "插件版本"),
+        (("diagnose", ""), None, "总体结论"),
+    ],
+)
+async def test_handle_command_renders_localized_diagnostics(pair, locale, expected):
+    from hermes_multitenancy.router import _handle_command
+
+    sends = []
+    event = _build_event(f"/{pair[0]}")
+    if locale is not None:
+        event.source.locale = locale
+
+    class Adapter:
+        async def send_typing(self, c): pass
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            sends.append(m)
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+    await _handle_command(
+        pair,
+        sender="ou_cmd",
+        sender_alt=None,
+        profile_name=None,
+        profile_home=None,
+        chat_id="chat-cmd",
+        gateway=gateway,
+        event=event,
+    )
+
+    assert sends
+    assert expected in sends[0]
 
 
 def test_resolve_sender_strips_feishu_sender_type_prefix():

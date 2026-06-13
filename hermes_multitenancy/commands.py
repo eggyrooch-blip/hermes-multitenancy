@@ -45,6 +45,8 @@ _FALLBACK_GATEWAY_COMMANDS = frozenset(
         "compress",
         "debug",
         "deny",
+        "diagnose",
+        "doctor",
         "fast",
         "feishu-auth",
         "help",
