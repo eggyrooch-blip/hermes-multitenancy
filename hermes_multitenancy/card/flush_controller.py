@@ -42,7 +42,12 @@ class FlushController:
     pending flush is the one that matters; intermediate ones are coalesced.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        long_gap_s: float = 2.0,
+        batch_after_gap_s: float = 0.3,
+    ) -> None:
         self._lock: asyncio.Lock = asyncio.Lock()
         self._needs_reflush: bool = False
         self._in_flight: bool = False
@@ -53,6 +58,13 @@ class FlushController:
         self._last_update: float = 0.0
         self._pending_timer: Optional[asyncio.TimerHandle] = None
         self._pending_callable: Optional[Callable[[], Awaitable[Any]]] = None
+        # Long-gap batching (G5): after an idle gap > ``long_gap_s`` defer the
+        # next flush by ``batch_after_gap_s`` so post-tool/reasoning bursts land
+        # as one meaningful frame. These live on the instance (not the public
+        # ``throttled_update`` signature) so duck-typed/fork controllers that
+        # only accept ``(throttle_s, flush_callable)`` stay compatible.
+        self._long_gap_s: float = long_gap_s
+        self._batch_after_gap_s: float = batch_after_gap_s
 
     @property
     def in_flight(self) -> bool:
@@ -62,9 +74,6 @@ class FlushController:
         self,
         throttle_s: float,
         flush_callable: Callable[[], Awaitable[Any]],
-        *,
-        long_gap_s: float = 2.0,
-        batch_after_gap_s: float = 0.3,
     ) -> Optional[Any]:
         """Coalesce rapid flushes; always land the trailing frame.
 
@@ -97,10 +106,10 @@ class FlushController:
         if elapsed >= throttle_s:
             self.cancel()
             self._pending_callable = flush_callable
-            if elapsed > max(0.0, long_gap_s):
+            if elapsed > max(0.0, self._long_gap_s):
                 self._last_update = now
                 self._pending_timer = loop.call_later(
-                    max(0.0, batch_after_gap_s),
+                    max(0.0, self._batch_after_gap_s),
                     self._fire_pending,
                     loop,
                 )

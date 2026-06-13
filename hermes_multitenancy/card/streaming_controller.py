@@ -552,12 +552,19 @@ async def _flush_state(
             controllers.pop(str(message_id), None)
 
     try:
-        controller = _flush_controllers(adapter).setdefault(str(message_id), FlushController())
+        controller = _flush_controllers(adapter).setdefault(
+            str(message_id),
+            FlushController(
+                long_gap_s=_card_long_gap_threshold_s(),
+                batch_after_gap_s=_card_batch_after_gap_s(),
+            ),
+        )
+        # Call signature stays (throttle_s, flush_callable) so duck-typed /
+        # fork controllers (e.g. a core that supplies its own) keep working;
+        # the long-gap batching knobs live on our FlushController instance.
         result = await controller.throttled_update(
             _card_content_throttle_s(),
             _flush_body,
-            long_gap_s=_card_long_gap_threshold_s(),
-            batch_after_gap_s=_card_batch_after_gap_s(),
         )
         if result is None:
             return _result(True, message_id=str(message_id))

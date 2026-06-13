@@ -102,39 +102,26 @@ def test_flush_state_skip_does_not_consume_sequence(monkeypatch: pytest.MonkeyPa
 
 def test_flush_controller_batches_after_long_gap() -> None:
     async def driver() -> None:
-        controller = FlushController()
+        # Long-gap knobs live on the instance (back-compat: throttled_update's
+        # public signature stays (throttle_s, flush_callable)).
+        controller = FlushController(long_gap_s=0.05, batch_after_gap_s=0.02)
         rendered = {"text": "seed"}
         calls: list[str] = []
 
         async def flush() -> None:
             calls.append(rendered["text"])
 
-        await controller.throttled_update(
-            0.01,
-            flush,
-            long_gap_s=0.05,
-            batch_after_gap_s=0.02,
-        )
+        await controller.throttled_update(0.01, flush)
         assert calls == ["seed"]
 
         await asyncio.sleep(0.06)
 
         rendered["text"] = "H"
-        await controller.throttled_update(
-            0.01,
-            flush,
-            long_gap_s=0.05,
-            batch_after_gap_s=0.02,
-        )
+        await controller.throttled_update(0.01, flush)
         assert calls == ["seed"]
 
         rendered["text"] = "Hello after batching"
-        await controller.throttled_update(
-            0.01,
-            flush,
-            long_gap_s=0.05,
-            batch_after_gap_s=0.02,
-        )
+        await controller.throttled_update(0.01, flush)
         assert calls == ["seed"]
 
         await asyncio.sleep(0.03)
