@@ -4141,8 +4141,6 @@ def _diagnostics_subject_context(
 
     routed = (routed_profile or "").strip() or None
     identity: dict[str, Any] = {"open_id": subject_open_id, "profile": routed}
-    # The live-routed profile is authoritative even if the routing table has no
-    # row yet; the table lookup only enriches name/owner/agent.
     multitenancy: dict[str, Any] = {
         "kind": "user",
         "profile": routed,
@@ -4155,12 +4153,24 @@ def _diagnostics_subject_context(
         table = None
     if table is not None:
         try:
-            row = table.lookup_by_open_id(subject_open_id)
+            # Feishu open_id is per-APP; the router's ``sender`` is a short
+            # routing key, not the vault key. Resolve the user's REAL open_id
+            # (+ name) from the routed profile's row so the credential check
+            # targets the right subject and the verdict is accurate.
+            row = None
+            if routed and hasattr(table, "lookup_by_profile_name"):
+                row = table.lookup_by_profile_name(routed)
+            if row is None:
+                row = table.lookup_by_open_id(subject_open_id)
             if row is not None:
+                real_open_id = str(getattr(row, "open_id", "") or "").strip()
+                if real_open_id:
+                    subject_open_id = real_open_id  # vault key for credential check
+                identity["open_id"] = real_open_id or subject_open_id
                 identity["name"] = (
                     getattr(row, "display_label", None)
-                    or getattr(row, "profile_name", None)
                     or getattr(row, "user_id", None)
+                    or getattr(row, "profile_name", None)
                 )
                 identity["profile"] = routed or getattr(row, "profile_name", None)
                 multitenancy = {
