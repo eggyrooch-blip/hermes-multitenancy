@@ -3027,7 +3027,8 @@ async def _handle_command(
             f"会话历史: {hist_len} 条消息"
         )
     elif cmd in ("doctor", "diagnose"):
-        reply = _render_diagnostics_reply(cmd, event)
+        await _send_diagnostics_card(adapter, chat_id, cmd, event)
+        return
     elif cmd in ("new", "reset"):
         _cancel_inflight_task(
             _inflight_key(profile_name, sender, sender_alt, chat_id),
@@ -4123,6 +4124,71 @@ def _render_diagnostics_reply(cmd: str, event: Any) -> str:
     except Exception as exc:  # diagnostics is read-only; never crash the command
         logger.warning("multitenancy: /%s diagnostics failed (%s)", cmd, exc)
         return f"诊断暂不可用：{exc.__class__.__name__}"
+
+
+def _build_diagnostics_card(markdown: str, cmd: str, locale: str) -> dict[str, Any]:
+    """Build a locale-labeled diagnostics card whose body is the rendered markdown."""
+    del locale
+    titles = {
+        "doctor": {"zh_cn": "飞书机器人体检", "en_us": "Feishu Bot Doctor"},
+        "diagnose": {"zh_cn": "飞书机器人诊断", "en_us": "Feishu Bot Diagnose"},
+    }
+    title_map = titles["doctor"] if cmd == "doctor" else titles["diagnose"]
+    return {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": False,
+            "update_multi": True,
+            "locales": ["zh_cn", "en_us"],
+        },
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": title_map["en_us"],
+                "i18n_content": {
+                    "zh_cn": title_map["zh_cn"],
+                    "en_us": title_map["en_us"],
+                },
+            },
+            "subtitle": {"tag": "plain_text", "content": ""},
+            "template": "blue",
+            "padding": "12px 12px 12px 12px",
+            "icon": {"tag": "standard_icon", "token": "info_filled"},
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": markdown,
+                }
+            ]
+        },
+    }
+
+
+async def _send_diagnostics_card(adapter: Any, chat_id: str, cmd: str, event: Any) -> None:
+    """Prefer sending diagnostics via interactive card, with text fallback."""
+    if adapter is None:
+        return
+
+    markdown = _render_diagnostics_reply(cmd, event)
+    locale = _event_locale(event)
+    card = _build_diagnostics_card(markdown, cmd, locale)
+
+    sent = None
+    try:
+        from .feishu_auth_cards import send_auth_card
+
+        sent = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
+    except Exception as exc:
+        logger.warning("multitenancy: /%s diagnostics card send failed (%s)", cmd, exc)
+
+    if sent:
+        return
+    try:
+        await _safe_call(adapter.send, chat_id, markdown)
+    except Exception as exc:
+        logger.warning("multitenancy: /%s diagnostics text fallback failed (%s)", cmd, exc)
 
 
 def _profile_relative_skill_dir(skill_info: dict[str, Any], profile_home: Optional[Path]) -> Optional[str]:
@@ -6044,6 +6110,8 @@ async def _update_feishu_stream_tool_event(
                 preview=payload.get("preview"),
                 args=payload.get("args"),
             )
+    if mode == "card":
+        return None
 
     status = (
         f"✅ 工具完成: {tool_name}"

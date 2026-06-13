@@ -116,6 +116,133 @@ async def test_handle_command_renders_localized_diagnostics(pair, locale, expect
     assert expected in sends[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pair", "locale", "expected_title"),
+    [
+        (("doctor", ""), "zh_cn", "飞书机器人体检"),
+        (("diagnose", ""), "en_us", "Feishu Bot Diagnose"),
+    ],
+)
+async def test_handle_command_sends_diagnostics_as_interactive_card(
+    monkeypatch, pair, locale, expected_title
+):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _handle_command
+
+    monkeypatch.setattr(router_mod, "_render_diagnostics_reply", lambda *_args, **_kwargs: "## report")
+
+    text_sends = []
+    card_sends = []
+    created_cards = []
+
+    class _Card:
+        def create(self, request):
+            created_cards.append(json.loads(request.request_body.data))
+            return SimpleNamespace(code=0, data=SimpleNamespace(card_id="card-diag-1"))
+
+        def update(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+        def settings(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    class _CardElement:
+        def content(self, request):  # pragma: no cover - capability probe only
+            return SimpleNamespace(code=0)
+
+    class Adapter:
+        def __init__(self):
+            self._client = SimpleNamespace(
+                cardkit=SimpleNamespace(
+                    v1=SimpleNamespace(card=_Card(), card_element=_CardElement())
+                )
+            )
+
+        async def send_typing(self, c): pass
+
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            text_sends.append(m)
+
+        async def _feishu_send_with_retry(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            card_sends.append((chat_id, msg_type, json.loads(payload)))
+            return SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_diag_card"))
+
+    event = _build_event(f"/{pair[0]}")
+    event.source.locale = locale
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+    await _handle_command(
+        pair,
+        sender="ou_cmd",
+        sender_alt=None,
+        profile_name=None,
+        profile_home=None,
+        chat_id="chat-cmd",
+        gateway=gateway,
+        event=event,
+    )
+
+    assert text_sends == []
+    assert card_sends == [
+        (
+            "chat-cmd",
+            "interactive",
+            {"type": "card", "data": {"card_id": "card-diag-1"}},
+        )
+    ]
+    assert created_cards
+    card = created_cards[0]
+    assert card["schema"] == "2.0"
+    assert card["header"]["template"] == "blue"
+    assert card["header"]["icon"]["token"] == "info_filled"
+    assert card["header"]["title"]["i18n_content"][locale] == expected_title
+    assert card["body"]["elements"][0]["tag"] == "markdown"
+    assert card["body"]["elements"][0]["content"] == "## report"
+
+
+@pytest.mark.asyncio
+async def test_handle_command_falls_back_to_plain_text_when_diagnostics_card_send_fails(monkeypatch):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _handle_command
+
+    monkeypatch.setattr(
+        router_mod, "_render_diagnostics_reply", lambda *_args, **_kwargs: "## fallback report"
+    )
+
+    text_sends = []
+    card_attempts = []
+
+    class Adapter:
+        async def send_typing(self, c): pass
+
+        async def send(self, c, m, *, reply_to=None, metadata=None):
+            text_sends.append((c, m))
+
+        async def _feishu_send_with_retry(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            card_attempts.append((chat_id, msg_type, json.loads(payload)))
+            raise RuntimeError("interactive down")
+
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+    await _handle_command(
+        ("doctor", ""),
+        sender="ou_cmd",
+        sender_alt=None,
+        profile_name=None,
+        profile_home=None,
+        chat_id="chat-cmd",
+        gateway=gateway,
+        event=_build_event("/doctor"),
+    )
+
+    assert card_attempts
+    assert card_attempts[0][0] == "chat-cmd"
+    assert card_attempts[0][1] == "interactive"
+    assert card_attempts[0][2]["schema"] == "2.0"
+    assert text_sends == [("chat-cmd", "## fallback report")]
+
+
 def test_resolve_sender_strips_feishu_sender_type_prefix():
     from hermes_multitenancy.router import _resolve_sender_for_routing
 
@@ -1857,3 +1984,91 @@ def test_session_guard_transfers_to_replacement_dispatch(monkeypatch):
 
     second.complete()
     assert session_key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_update_feishu_stream_tool_event_prefers_card_tool_panel(monkeypatch):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _update_feishu_stream_tool_event
+
+    target_updates = []
+    tool_updates = []
+
+    async def fake_target(adapter, chat_id, message_id, status, *, mode):
+        target_updates.append((chat_id, message_id, status, mode))
+
+    monkeypatch.setattr(router_mod, "_update_feishu_stream_target", fake_target)
+
+    class Adapter:
+        async def update_streaming_card_tool_completed(
+            self, *, chat_id, message_id, tool_name, duration, is_error
+        ):
+            tool_updates.append((chat_id, message_id, tool_name, duration, is_error))
+            return "card-updated"
+
+    result = await _update_feishu_stream_tool_event(
+        Adapter(),
+        "chat-cmd",
+        "om-card",
+        {"name": "calendar", "duration": 1.2, "is_error": False},
+        mode="card",
+        completed=True,
+    )
+
+    assert result == "card-updated"
+    assert tool_updates == [("chat-cmd", "om-card", "calendar", 1.2, False)]
+    assert target_updates == []
+
+
+@pytest.mark.asyncio
+async def test_update_feishu_stream_tool_event_suppresses_plain_text_in_card_mode(monkeypatch):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _update_feishu_stream_tool_event
+
+    target_updates = []
+
+    async def fake_target(adapter, chat_id, message_id, status, *, mode):
+        target_updates.append((chat_id, message_id, status, mode))
+
+    monkeypatch.setattr(router_mod, "_update_feishu_stream_target", fake_target)
+
+    class Adapter:
+        pass
+
+    result = await _update_feishu_stream_tool_event(
+        Adapter(),
+        "chat-cmd",
+        "om-card",
+        {"name": "calendar"},
+        mode="card",
+        completed=True,
+    )
+
+    assert result is None
+    assert target_updates == []
+
+
+@pytest.mark.asyncio
+async def test_update_feishu_stream_tool_event_emits_plain_text_outside_card_mode(monkeypatch):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.router import _update_feishu_stream_tool_event
+
+    target_updates = []
+
+    async def fake_target(adapter, chat_id, message_id, status, *, mode):
+        target_updates.append((chat_id, message_id, status, mode))
+        return "text-updated"
+
+    monkeypatch.setattr(router_mod, "_update_feishu_stream_target", fake_target)
+
+    result = await _update_feishu_stream_tool_event(
+        object(),
+        "chat-cmd",
+        "om-text",
+        {"name": "calendar"},
+        mode="text",
+        completed=True,
+    )
+
+    assert result == "text-updated"
+    assert target_updates == [("chat-cmd", "om-text", "✅ 工具完成: calendar", "text")]

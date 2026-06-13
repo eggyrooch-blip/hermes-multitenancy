@@ -155,6 +155,85 @@ def test_overall_verdict_is_deterministic():
     assert unhealthy["overall"] == "unhealthy"
 
 
+def test_no_subject_credential_error_is_treated_as_skipped():
+    from hermes_multitenancy.diagnostics import (
+        build_diagnose_report,
+        build_doctor_markdown,
+        render_diagnose_markdown,
+    )
+
+    credential_status = {
+        "error": "subject_id is required when HERMES_FEISHU_USER_OPEN_ID is unset",
+    }
+    report = build_diagnose_report(
+        version="0.1.0",
+        profile_name="owner",
+        credential_status=credential_status,
+        health=_sample_health(ok=True),
+        env=_sample_env(),
+    )
+    doctor_zh = build_doctor_markdown(
+        version="0.1.0",
+        profile_name="owner",
+        credential_status=credential_status,
+        health=_sample_health(ok=True),
+        env=_sample_env(),
+        locale="zh_cn",
+    )
+    doctor_en = build_doctor_markdown(
+        version="0.1.0",
+        profile_name="owner",
+        credential_status=credential_status,
+        health=_sample_health(ok=True),
+        env=_sample_env(),
+        locale="en_us",
+    )
+    diagnose_zh = render_diagnose_markdown(report, "zh_cn")
+    diagnose_en = render_diagnose_markdown(report, "en_us")
+
+    assert report["overall"] == "healthy"
+    assert report["credential"]["error"] is None
+    assert "未指定用户，已跳过个人凭证检查" in doctor_zh
+    assert "No user context" in doctor_en
+    assert "未指定用户，已跳过个人凭证检查" in diagnose_zh
+    assert "No user context" in diagnose_en
+    assert "subject_id is required" not in doctor_zh
+    assert "subject_id is required" not in doctor_en
+    assert "subject_id is required" not in diagnose_zh
+    assert "subject_id is required" not in diagnose_en
+
+
+def test_genuine_credential_error_remains_unhealthy_and_visible():
+    from hermes_multitenancy.diagnostics import (
+        build_diagnose_report,
+        build_doctor_markdown,
+        render_diagnose_markdown,
+    )
+
+    credential_status = {"error": "CredentialStoreError"}
+    report = build_diagnose_report(
+        version="0.1.0",
+        profile_name="owner",
+        credential_status=credential_status,
+        health=_sample_health(ok=True),
+        env=_sample_env(),
+    )
+    doctor = build_doctor_markdown(
+        version="0.1.0",
+        profile_name="owner",
+        credential_status=credential_status,
+        health=_sample_health(ok=True),
+        env=_sample_env(),
+        locale="en_us",
+    )
+    diagnose = render_diagnose_markdown(report, "en_us")
+
+    assert report["overall"] == "unhealthy"
+    assert report["credential"]["error"] == "CredentialStoreError"
+    assert "CredentialStoreError" in doctor
+    assert "CredentialStoreError" in diagnose
+
+
 def test_plugin_version_reads_manifest():
     from hermes_multitenancy.diagnostics import plugin_version
 

@@ -52,6 +52,7 @@ _TEXT: dict[str, dict[str, str]] = {
         "cred_refresh": "刷新令牌到期",
         "cred_scopes": "授权范围",
         "cred_has": "已存储凭证",
+        "cred_no_subject": "未指定用户，已跳过个人凭证检查（私聊机器人时会针对你的身份检查）",
         "permission_summary": "权限/范围概览",
         "missing_scopes": "缺失范围",
         "no_missing_scopes": "无缺失范围",
@@ -90,6 +91,7 @@ _TEXT: dict[str, dict[str, str]] = {
         "cred_refresh": "Refresh token expires",
         "cred_scopes": "Scopes",
         "cred_has": "Credential stored",
+        "cred_no_subject": "No user context — personal credential check skipped (it runs when you DM the bot)",
         "permission_summary": "Permission / Scope Summary",
         "missing_scopes": "Missing scopes",
         "no_missing_scopes": "No missing scopes",
@@ -129,6 +131,18 @@ def _normalize_locale(value: Optional[str]) -> str:
 def _t(locale: str, key: str) -> str:
     table = _TEXT.get(locale) or _TEXT["zh_cn"]
     return table.get(key, _TEXT["zh_cn"].get(key, key))
+
+
+def _is_no_subject_error(credential_status: dict[str, Any]) -> bool:
+    """Return whether the credential error only indicates missing user context."""
+    error = credential_status.get("error")
+    if not error:
+        return False
+    text = str(error).strip().lower()
+    return any(
+        needle in text
+        for needle in ("subject_id is required", "user_open_id", "no user subject")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +240,9 @@ def build_doctor_markdown(
 
     # Credential status
     lines.append(f"### {_t(loc, 'credential_status')}")
-    if cred.get("error"):
+    if _is_no_subject_error(cred):
+        lines.append(f"- {_t(loc, 'cred_no_subject')}")
+    elif cred.get("error"):
         lines.append(f"- {_t(loc, 'capability_unavailable')}: {cred.get('error')}")
     else:
         lines.append(f"- **{_t(loc, 'cred_state')}**: {cred.get('status', _t(loc, 'unknown'))}")
@@ -297,7 +313,9 @@ def _capability_degraded(health: dict[str, Any]) -> bool:
 def _overall_verdict(credential_status: dict[str, Any], health: dict[str, Any]) -> str:
     """Deterministic health verdict from credential + capability inputs."""
     cred_state = str(credential_status.get("status") or "").lower()
-    if cred_state in {"missing", "expired"} or credential_status.get("error"):
+    if cred_state in {"missing", "expired"}:
+        return "unhealthy"
+    if credential_status.get("error") and not _is_no_subject_error(credential_status):
         return "unhealthy"
     if _capability_errored(health):
         return "unhealthy"
@@ -320,6 +338,7 @@ def build_diagnose_report(
     cred = credential_status if isinstance(credential_status, dict) else {}
     hc = health if isinstance(health, dict) else {}
     environment = env if isinstance(env, dict) else {}
+    no_subject = _is_no_subject_error(cred)
 
     return {
         "version": version or "unknown",
@@ -336,7 +355,8 @@ def build_diagnose_report(
             "has_credential": bool(cred.get("has_credential")),
             "expires_at": cred.get("expires_at"),
             "missing_scopes": cred.get("missing_scopes") or [],
-            "error": cred.get("error"),
+            "error": None if no_subject else cred.get("error"),
+            "no_subject": no_subject,
         },
         "capability": {
             "ready": hc.get("ready"),
@@ -379,7 +399,9 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
     lines.append("")
 
     lines.append(f"### {_t(loc, 'credential_status')}")
-    if cred.get("error"):
+    if cred.get("no_subject"):
+        lines.append(f"- {_t(loc, 'cred_no_subject')}")
+    elif cred.get("error"):
         lines.append(f"- {_t(loc, 'capability_unavailable')}: {cred.get('error')}")
     else:
         lines.append(f"- **{_t(loc, 'cred_state')}**: {cred.get('status', _t(loc, 'unknown'))}")
