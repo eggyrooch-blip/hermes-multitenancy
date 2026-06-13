@@ -116,6 +116,9 @@ _session_history: dict[tuple[str, str], list[dict]] = {}
 # so we only hit SQLite once per pair per process lifetime.
 _session_loaded: set[tuple[str, str]] = set()
 _pending_approval_requests: dict[str, list[dict]] = {}
+_PENDING_AUTH_REPLAY_TTL_SECONDS = 600
+_PENDING_AUTH_REPLAY_MAX = 2000
+_pending_auth_replay: dict[str, tuple[float, str]] = {}
 _RECENT_PROFILE_FILE_CONTEXT_MAX = 5
 _recent_profile_files_by_chat: dict[tuple[str, str], list[str]] = {}
 _RECENT_FILE_CONTEXT_TRIGGER_RE = re.compile(
@@ -126,6 +129,44 @@ _RECENT_FILE_CONTEXT_TRIGGER_RE = re.compile(
 def _history_key(profile_name: str, sender: str, sender_alt: Optional[str]) -> tuple[str, str]:
     """Return the per-(profile, user) key used to look up conversation history."""
     return (profile_name, _tenant_user_key(sender, sender_alt))
+
+
+def _pending_auth_replay_key(profile_name: str, open_id: str) -> str:
+    return f"{str(profile_name or '').strip()}\x1f{str(open_id or '').strip()}"
+
+
+def _capture_pending_auth_replay(profile_name: str, open_id: str, text: str) -> None:
+    """Stash the user's last substantive request for post-/feishu_auth replay."""
+    clean_text = str(text or "").strip()
+    clean_profile = str(profile_name or "").strip()
+    clean_open_id = str(open_id or "").strip()
+    if not clean_text or clean_text.startswith("/") or not clean_profile or not clean_open_id:
+        return
+    now = time.time()
+    expired = [
+        key
+        for key, (ts, _stored_text) in _pending_auth_replay.items()
+        if now - ts > _PENDING_AUTH_REPLAY_TTL_SECONDS
+    ]
+    for key in expired:
+        _pending_auth_replay.pop(key, None)
+    if len(_pending_auth_replay) >= _PENDING_AUTH_REPLAY_MAX:
+        oldest = sorted(_pending_auth_replay.items(), key=lambda item: item[1][0])
+        overflow = len(_pending_auth_replay) - _PENDING_AUTH_REPLAY_MAX + 1
+        for key, _value in oldest[: max(1, overflow)]:
+            _pending_auth_replay.pop(key, None)
+    _pending_auth_replay[_pending_auth_replay_key(clean_profile, clean_open_id)] = (now, clean_text)
+
+
+def _take_pending_auth_replay(profile_name: str, open_id: str) -> Optional[str]:
+    """Pop the stashed request for (profile, open_id) if present and fresh."""
+    entry = _pending_auth_replay.pop(_pending_auth_replay_key(profile_name, open_id), None)
+    if entry is None:
+        return None
+    ts, text = entry
+    if time.time() - ts > _PENDING_AUTH_REPLAY_TTL_SECONDS:
+        return None
+    return text
 
 
 def _inflight_key(
@@ -321,6 +362,17 @@ def _is_reaction_synthetic_event(event: Any, text: str) -> bool:
     if message_type is None:
         return True
     return str(getattr(message_type, "name", message_type)).upper() == "TEXT"
+
+
+def _is_interactive_or_card_event(event: Any) -> bool:
+    message_type_obj = getattr(event, "message_type", None)
+    message_type_parts = [
+        str(getattr(message_type_obj, "value", "") or ""),
+        str(getattr(message_type_obj, "name", "") or ""),
+        str(message_type_obj or ""),
+    ]
+    message_type = " ".join(message_type_parts).lower()
+    return "interactive" in message_type or "card" in message_type
 
 
 def _event_reply_to_message_id(event: Any) -> Optional[str]:
@@ -2599,6 +2651,14 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             if profile_home is None:
                 logger.info("multitenancy: no route for sender=%s, ignoring", sender)
                 return
+            if not _is_interactive_or_card_event(event):
+                _capture_pending_auth_replay(
+                    profile_name,
+                    _normalize_feishu_open_id(getattr(event, "sender_open_id", None))
+                    or _normalize_feishu_open_id(sender)
+                    or str(sender or "").strip(),
+                    text,
+                )
 
         adapter = _get_feishu_adapter(gateway)
         # Detect whether adapter supports the streaming/reaction APIs we use.
@@ -3189,6 +3249,10 @@ async def _dispatch_synthetic_auth_complete(
             )
             return False
 
+        if text == SYNTHETIC_AUTH_COMPLETE_TEXT:
+            replay = _take_pending_auth_replay(clean_profile_name, str(open_id or "").strip())
+            if replay:
+                text = replay
         source = getattr(event, "source", None)
         original_message_id = _event_message_id(event) or f"auth-complete:{int(time.time() * 1000)}"
         synthetic_message_id = f"{original_message_id}:auth-complete"

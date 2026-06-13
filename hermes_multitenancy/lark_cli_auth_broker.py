@@ -48,6 +48,11 @@ _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED = (
     "请在飞书私聊 Hermes 发送 `/feishu_auth`，"
     "或在 WebUI「凭证」页点击 Lark-cli 的「授权/重新授权」。"
 )
+_CRED_RESOLVE_BACKOFFS = (0.2, 0.4, 0.8)
+
+
+class CredentialExpiredError(PermissionError):
+    """Terminal: stored UAT present but expired — re-auth required, never retry."""
 
 
 @dataclass(frozen=True)
@@ -175,12 +180,23 @@ class LarkCliAuthBroker:
         if bot_policy_error:
             return _error(403, bot_policy_error)
 
-        try:
-            token = self._resolve_token(identity)
-        except PermissionError:
-            return _error(503, "credential unavailable")
-        except Exception:
-            return _error(503, "credential lookup failed")
+        token = None
+        last_transient = "credential unavailable"
+        attempts = 1 + len(_CRED_RESOLVE_BACKOFFS)
+        for attempt in range(attempts):
+            try:
+                token = self._resolve_token(identity)
+                break
+            except CredentialExpiredError:
+                return _error(503, "credential expired")
+            except PermissionError:
+                last_transient = "credential unavailable"
+            except Exception:
+                last_transient = "credential lookup failed"
+            if attempt < len(_CRED_RESOLVE_BACKOFFS):
+                time.sleep(_CRED_RESOLVE_BACKOFFS[attempt])
+            else:
+                return _error(503, last_transient)
 
         forward_headers = _forward_headers(headers)
         forward_headers.pop("Authorization", None)
@@ -253,19 +269,19 @@ class LarkCliAuthBroker:
         except Exception:
             if json_payload:
                 if _payload_is_expired(json_payload):
-                    raise PermissionError("credential expired")
+                    raise CredentialExpiredError("credential expired")
                 return json_payload
             raise
         if not json_payload:
             if _payload_is_expired(vault_payload):
-                raise PermissionError("credential expired")
+                raise CredentialExpiredError("credential expired")
             return vault_payload
         if _payload_freshness(json_payload) > _payload_freshness(vault_payload):
             selected = json_payload
         else:
             selected = vault_payload
         if _payload_is_expired(selected):
-            raise PermissionError("credential expired")
+            raise CredentialExpiredError("credential expired")
         return selected
 
 
