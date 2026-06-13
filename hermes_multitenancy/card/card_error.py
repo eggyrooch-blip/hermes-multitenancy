@@ -17,8 +17,9 @@ Class hierarchy::
 """
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 try:  # pragma: no cover - import shape depends on the installed Hermes agent.
     from gateway.platforms.base import SendResult  # type: ignore
@@ -31,6 +32,15 @@ _TABLE_LIMIT_CODE = 230099
 _TABLE_LIMIT_SUB_CODE = 11310
 _RECALLED_CODE = 99991663
 _DELETED_CODE = 230006
+
+# Empirical Feishu CardKit limit: a single card renders at most this many
+# markdown tables natively; the 4th+ trips code 230099 / sub_code 11310
+# ("table number over limit"). openclaw-lark pins the same constant
+# (card-error.ts ``FEISHU_CARD_TABLE_LIMIT = 3``, "2026-03 实测"). The table
+# DEGRADATION that keeps a card under this limit lives in
+# ``markdown_style._degrade_limited_markdown_tables``; this constant is the
+# shared source of truth both that path and ``should_use_card`` reason about.
+_FEISHU_CARD_TABLE_LIMIT = 3
 
 
 class CardKitApiError(RuntimeError):
@@ -146,3 +156,100 @@ def _result(
     if SendResult is not None:
         return SendResult(success=success, message_id=message_id, error=error, raw_response=raw_response)
     return SimpleNamespace(success=success, message_id=message_id, error=error, raw_response=raw_response)
+
+
+# ---------------------------------------------------------------------------
+# Card-vs-text decision predicate
+# ---------------------------------------------------------------------------
+#
+# Ports openclaw-lark's ``shouldUseCard`` (src/card/reply-mode.ts) +
+# ``findMarkdownTablesOutsideCodeBlocks`` (src/card/card-error.ts),
+# re-implemented Pythonically. The plugin's table-DEGRADATION path
+# (markdown_style._degrade_limited_markdown_tables) already exists; this is the
+# upstream GATE that decides whether a reply's text warrants an interactive card
+# at all (fenced code or markdown tables) versus a plain static text message.
+#
+# Table detection mirrors markdown_style.py's line conditions EXACTLY so the
+# gate and the degrader agree on what a "table" is: a header line matched by
+# ``^\|.*\|`` immediately followed by a separator line matched by ``^\|[-|: ]+\|``
+# (anchored, on the raw line). Tables that appear only inside ``` / ~~~ fences
+# are documentation — Feishu never renders them as card table elements — so they
+# are excluded from the count, matching findMarkdownTablesOutsideCodeBlocks.
+
+# Both ``` and ~~~ fences are stripped before table scanning. Feishu CardKit
+# treats either fence as a code block; a table drawn inside one is never a
+# renderable card table element, so it must not be counted.
+_CODE_FENCE_RE = re.compile(r"(?:```|~~~)[\s\S]*?(?:```|~~~)")
+
+# Mirror markdown_style.py's _CORE_TABLE_LINE1 / _CORE_TABLE_LINE2 verbatim:
+# core (gateway/platforms/feishu.py) fires its table→plain-text path on these
+# two anchored line shapes, so the gate must recognise exactly the same set.
+_TABLE_HEADER_LINE_RE = re.compile(r"^\|.*\|")
+_TABLE_SEPARATOR_LINE_RE = re.compile(r"^\|[-|: ]+\|")
+
+
+def find_markdown_tables_outside_code_blocks(text: Optional[str]) -> List[str]:
+    """Return each markdown table NOT inside a ``` / ~~~ code fence.
+
+    A table is a header line (``^\\|.*\\|``) immediately followed by a separator
+    line (``^\\|[-|: ]+\\|``); the returned string for each match is the header +
+    separator + any contiguous trailing pipe rows. Code-fenced pseudo-tables are
+    excluded so a documentation table never inflates the count. Mirrors
+    openclaw-lark ``findMarkdownTablesOutsideCodeBlocks``.
+    """
+    if not text:
+        return []
+
+    # Replace fenced regions with newline-preserving blanks so a fenced table
+    # cannot be matched, while line numbering for any later use stays stable.
+    def _blank_fence(match: "re.Match[str]") -> str:
+        return re.sub(r"[^\n]", " ", match.group(0))
+
+    scanned = _CODE_FENCE_RE.sub(_blank_fence, str(text))
+
+    lines = scanned.splitlines()
+    tables: List[str] = []
+    index = 0
+    while index < len(lines):
+        header = lines[index]
+        separator = lines[index + 1] if index + 1 < len(lines) else ""
+        if _TABLE_HEADER_LINE_RE.match(header) and _TABLE_SEPARATOR_LINE_RE.match(separator):
+            end = index + 2
+            while end < len(lines) and _is_pipe_row(lines[end]):
+                end += 1
+            tables.append("\n".join(lines[index:end]))
+            index = end
+            continue
+        index += 1
+    return tables
+
+
+def _is_pipe_row(line: str) -> bool:
+    stripped = str(line or "").strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def should_use_card(text: Optional[str]) -> bool:
+    """Decide whether a reply's text should be sent as an interactive card.
+
+    Returns True when the text contains markdown elements that benefit from /
+    require a card — fenced code blocks or markdown tables — and False for plain
+    text that renders fine as a static message.
+
+    Tables exceeding ``_FEISHU_CARD_TABLE_LIMIT`` STILL warrant a card: the
+    markdown_style degrade path wraps the overflow so the card stays under
+    230099/11310, and the first N tables still render natively. Falling back to
+    plain text here would lose that native rendering. (This differs from
+    openclaw's early ``shouldUseCard``, which once returned False on overflow
+    before the degrade path was reliable; the multitenancy plugin's degrader
+    makes the card the correct choice in every table case.) Mirrors the intent
+    of openclaw-lark ``shouldUseCard``.
+    """
+    if not text:
+        return False
+    body = str(text)
+    if _CODE_FENCE_RE.search(body):
+        return True
+    if find_markdown_tables_outside_code_blocks(body):
+        return True
+    return False
