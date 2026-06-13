@@ -3028,7 +3028,13 @@ async def _handle_command(
         )
     elif cmd in ("doctor", "diagnose"):
         await _send_diagnostics_card(
-            adapter, chat_id, cmd, event, sender=sender, routed_profile=profile_name
+            adapter,
+            chat_id,
+            cmd,
+            event,
+            sender=sender,
+            routed_profile=profile_name,
+            profile_home=profile_home,
         )
         return
     elif cmd in ("new", "reset"):
@@ -4250,6 +4256,38 @@ def _build_diagnostics_card(markdown: str, cmd: str, locale: str) -> dict[str, A
     }
 
 
+async def _render_diagnostics_in_profile_scope(
+    cmd: str,
+    event: Any,
+    *,
+    sender: Optional[str] = None,
+    routed_profile: Optional[str] = None,
+    profile_home: Optional[Path] = None,
+) -> str:
+    """Render diagnostics with HERMES_HOME scoped to the routed profile so the
+    profile-materialized credential resolves correctly. Shared home (routing db)
+    is unchanged. Fail-soft: on any scoping error, render unscoped."""
+    if profile_home is None:
+        return _render_diagnostics_reply(
+            cmd, event, sender=sender, routed_profile=routed_profile
+        )
+    from .runtime import _get_env_lock
+
+    async with _get_env_lock():
+        old_home = os.environ.get("HERMES_HOME")
+        had_home = "HERMES_HOME" in os.environ
+        os.environ["HERMES_HOME"] = str(profile_home)
+        try:
+            return _render_diagnostics_reply(
+                cmd, event, sender=sender, routed_profile=routed_profile
+            )
+        finally:
+            if had_home:
+                os.environ["HERMES_HOME"] = old_home  # type: ignore[arg-type]
+            else:
+                os.environ.pop("HERMES_HOME", None)
+
+
 async def _send_diagnostics_card(
     adapter: Any,
     chat_id: str,
@@ -4258,13 +4296,19 @@ async def _send_diagnostics_card(
     *,
     sender: Optional[str] = None,
     routed_profile: Optional[str] = None,
+    profile_home: Optional[Path] = None,
 ) -> None:
     """Prefer sending diagnostics via interactive card, with text fallback."""
     if adapter is None:
         return
 
-    markdown = _render_diagnostics_reply(
-        cmd, event, sender=sender, routed_profile=routed_profile
+    # The user's UAT credential is profile-materialized, so credential_status
+    # only reads "valid" from the routed profile's HERMES_HOME (from the router
+    # home it reads "missing"). Scope the render to profile_home; the shared
+    # home (routing db) stays ~/.hermes either way, so routing lookups are
+    # unaffected.
+    markdown = await _render_diagnostics_in_profile_scope(
+        cmd, event, sender=sender, routed_profile=routed_profile, profile_home=profile_home
     )
     locale = _event_locale(event)
     card = _build_diagnostics_card(markdown, cmd, locale)
