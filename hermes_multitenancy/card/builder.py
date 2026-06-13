@@ -7,6 +7,7 @@ streaming) → reasoning panel → body markdown → Done footer.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, TypedDict
@@ -25,7 +26,10 @@ from .tool_use_display import (
     _render_tool_calls_section,
     _strip_tool_call_blocks,
     _strip_tool_process_narration,
+    build_live_tool_use_panel,
 )
+
+logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
 
 _TOOLS_ELEMENT_ID = "tool_calls"
 _STREAMING_ELEMENT_ID = "streaming_content"
@@ -123,9 +127,9 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
     content = _strip_reasoning_tags(content).strip()
     tools = list(state.get("tools") or [])
 
-    tool_section = _render_tool_calls_section(tools)
-    if tool_section:
-        elements.append(_render_tool_calls_panel(tool_section))
+    tool_panel = _render_tool_section_panel(tools)
+    if tool_panel is not None:
+        elements.append(tool_panel)
     if status and not state.get("finalized"):
         elements.append({"tag": "markdown", "content": status})
     if reasoning:
@@ -159,6 +163,30 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
         },
         "elements": elements,
     }
+
+
+def _render_tool_section_panel(tools: list[Any]) -> dict[str, Any] | None:
+    """Render the final-card tool section, preferring the rich panel.
+
+    The rich ``collapsible_panel`` (icon + human title + extracted detail +
+    "查看 N 个步骤" suffix) is the primary output. It is fail-open: if rich
+    rendering raises for any reason we fall back to the bare-row panel so the
+    card — and message delivery — never breaks. Returns ``None`` when there are
+    no visible tool rows so the caller omits the section entirely.
+    """
+    try:
+        rich_panel = build_live_tool_use_panel(tools)
+        if rich_panel is not None:
+            return rich_panel
+    except Exception:  # noqa: BLE001 — fail-open: never block delivery on render
+        logger.warning(
+            "multitenancy: rich tool-use panel failed, falling back to bare rows",
+            exc_info=True,
+        )
+    tool_section = _render_tool_calls_section(tools)
+    if tool_section:
+        return _render_tool_calls_panel(tool_section)
+    return None
 
 
 def _should_use_wide_screen_mode(*, content: str, reasoning: str, tools: list[Any]) -> bool:

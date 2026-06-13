@@ -25,6 +25,18 @@ def _card_text(card_or_elements):
         content = element.get("content")
         if content:
             parts.append(str(content))
+        text = element.get("text")
+        if isinstance(text, dict):
+            text_content = text.get("content")
+            if text_content:
+                parts.append(str(text_content))
+        header = element.get("header")
+        if isinstance(header, dict):
+            title = header.get("title")
+            if isinstance(title, dict):
+                title_content = title.get("content")
+                if title_content:
+                    parts.append(str(title_content))
         nested = element.get("elements")
         if nested:
             parts.append(_card_text(nested))
@@ -36,8 +48,8 @@ def _assert_tool_panel(card_or_elements):
     panel sits at elements[0], tag is collapsible_panel, expanded is False (closed
     by default per openclaw layout), and the header title is exactly 'Tool calls'.
 
-    Returns the panel dict so callers can drill into ``panel['elements'][0]['content']``
-    when they need to assert the inner tool-rows text directly.
+    Returns the panel dict so callers can drill into the rich step elements under
+    ``panel['elements']`` when they need to assert the rendered tool rows directly.
     """
     elements = (
         card_or_elements.get("elements", card_or_elements)
@@ -503,7 +515,7 @@ async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapt
     _assert_tool_panel(final_card)
     rendered = _card_text(final_card)
     assert "**Tool calls:**" not in rendered
-    assert "`lark_cli` (300 ms)" in rendered
+    assert "**Lark cli (300 ms)**" in rendered
     assert "Hello from clean adapter" in rendered
     assert "已完成 · 耗时" in rendered
 
@@ -600,7 +612,8 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
     running_card = adapter.card_patches[-1]["card"]
     _assert_tool_panel(running_card)
     rendered_running = _card_text(running_card)
-    assert "- `lark_cli` running" in rendered_running
+    assert "**Lark cli**" in rendered_running
+    assert "<font color='turquoise'>Running</font>" in rendered_running
     assert "GET /open-apis/authen/v1/user_info" not in rendered_running
 
     await adapter.update_streaming_card_tool_completed(
@@ -613,7 +626,7 @@ async def _run_cardkit_compat_flushes_tool_events_during_stream():
     done_card = adapter.card_patches[-1]["card"]
     _assert_tool_panel(done_card)
     rendered_done = _card_text(done_card)
-    assert "`lark_cli` (420 ms)" in rendered_done
+    assert "**Lark cli (420 ms)**" in rendered_done
 
 
 def test_cardkit_compat_hides_tool_argument_summary():
@@ -638,7 +651,8 @@ async def _run_cardkit_compat_hides_tool_argument_summary():
     _assert_tool_panel(tool_card)
     rendered = _card_text(tool_card)
     assert "generating arguments" not in rendered
-    assert "`execute_code` running" in rendered
+    assert "**Execute code**" in rendered
+    assert "<font color='turquoise'>Running</font>" in rendered
     assert "language=python" not in rendered
     assert "path=home/generated_art.png" not in rendered
 
@@ -737,7 +751,9 @@ async def _run_cardkit_compat_matches_openclaw_reasoning_body_tool_layout():
     tool_panel = elements[0]
     assert tool_panel["expanded"] is False
     assert tool_panel["header"]["title"]["content"] == "Tool calls"
-    assert tool_panel["elements"][0]["content"] == "- `lark_cli` (300 ms)"
+    assert tool_panel["elements"][0]["text"]["content"] == (
+        "**Lark cli (300 ms)** · <font color='green'>Succeeded</font>"
+    )
     reasoning_panel = elements[1]
     assert reasoning_panel["expanded"] is False
     assert reasoning_panel["header"]["title"]["content"].startswith("💭 Thought")
@@ -781,7 +797,8 @@ async def _run_cardkit_compat_never_renders_raw_tool_call_xml():
     assert "<tool_call>" not in rendered
     assert "lark-cli doc +create" not in rendered
     assert "**Tool calls:**" not in rendered
-    assert "- `lark_cli` failed" in rendered
+    assert "**Lark cli**" in rendered
+    assert "<font color='red'>Failed</font>" in rendered
     assert "已完成 · 耗时" in rendered
 
 
@@ -874,8 +891,8 @@ async def _run_cardkit_compat_collapses_argument_generation_tool_rows():
     _assert_tool_panel(final_card)
     rendered = _card_text(final_card)
     assert "generating arguments" not in rendered
-    assert rendered.count("`lark_cli`") == 1
-    assert "- `lark_cli` (487 ms)" in rendered
+    assert rendered.count("**Lark cli") == 1
+    assert "**Lark cli (487 ms)**" in rendered
 
 
 def test_cardkit_compat_hides_internal_skill_view_tool_rows():
@@ -925,9 +942,13 @@ async def _run_cardkit_compat_hides_internal_skill_view_tool_rows():
     panel = _assert_tool_panel(final_card)
     tool_panel_text = _card_text(panel)
     assert "`skill_view`" not in tool_panel_text
+    assert "skill_view" not in tool_panel_text
+    assert "Skill view" not in tool_panel_text
     rendered = _card_text(final_card)
     assert "`skill_view`" not in rendered
-    assert "- `lark_cli` (1159 ms)" in rendered
+    assert "skill_view" not in rendered
+    assert "Skill view" not in rendered
+    assert "**Lark cli (1.2 s)**" in rendered
 
 
 def test_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
@@ -1008,7 +1029,9 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     assert tool_panel["tag"] == "collapsible_panel"
     assert tool_panel["expanded"] is False
     assert tool_panel["header"]["title"]["content"] == "Tool calls"
-    assert "`lark_cli` (300 ms)" in tool_panel["elements"][0]["content"]
+    assert tool_panel["elements"][0]["text"]["content"] == (
+        "**Lark cli (300 ms)** · <font color='green'>Succeeded</font>"
+    )
     assert "**Tool calls:**" not in final_text
     assert "Hello CardKit" in final_text
     assert "已完成 · 耗时" in final_text
@@ -1223,8 +1246,59 @@ async def _run_cardkit_compat_tool_events_do_not_rewrite_streaming_content():
     _assert_tool_panel(final_card["body"]["elements"])
     final_text = _card_text(final_card["body"]["elements"])
     assert "**Tool calls:**" not in final_text
-    assert "`lark_cli` (400 ms)" in final_text
+    assert "**Lark cli (400 ms)**" in final_text
+    assert "<font color='green'>Succeeded</font>" in final_text
     assert "final answer" in final_text
+
+
+def test_live_tool_stream_stays_markdown_but_final_card_uses_rich_tool_panel():
+    asyncio.run(_run_live_tool_stream_stays_markdown_but_final_card_uses_rich_tool_panel())
+
+
+async def _run_live_tool_stream_stays_markdown_but_final_card_uses_rich_tool_panel():
+    from hermes_multitenancy.feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+
+    adapter = ensure_feishu_cardkit_streaming(_OpenClawCardKitAdapter())
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+
+    await adapter.update_streaming_card_tool_started(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="read",
+        preview="read /tmp/demo/report.md",
+        args={"file_path": "/tmp/demo/report.md"},
+    )
+    await adapter.update_streaming_card_tool_completed(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        tool_name="read",
+        duration=0.2,
+        is_error=False,
+    )
+    await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="final answer",
+        finalize=True,
+    )
+
+    streamed_tools = [
+        request.request_body.content
+        for request in adapter.content_updates
+        if getattr(request, "element_id", "") == "tool_calls"
+    ]
+    assert streamed_tools == ["- `read` running", "- `read` (200 ms)"]
+
+    final_card = json.loads(adapter.card_updates[-1].request_body.card["data"])
+    panel = final_card["body"]["elements"][0]
+    assert panel["tag"] == "collapsible_panel"
+    assert panel["header"]["title"]["content"] == "Tool calls"
+    assert panel["elements"][0]["icon"]["token"] == "file-link-text_outlined"
+    assert panel["elements"][0]["text"]["content"] == (
+        "**Read (200 ms)** · <font color='green'>Succeeded</font>"
+    )
+    assert panel["elements"][1]["text"]["content"] == "report.md"
+    assert "`read`" not in panel["elements"][0]["text"]["content"]
 
 
 def test_cardkit_tool_rows_do_not_print_argument_details():

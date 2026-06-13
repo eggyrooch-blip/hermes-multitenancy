@@ -84,8 +84,7 @@ def test_build_tool_use_panel_renders_title_detail_result_and_error_blocks() -> 
 
     assert panel["tag"] == "collapsible_panel"
     title = panel["header"]["title"]
-    assert title["content"] == "🛠️ Tool use · Show 2 steps"
-    assert title["i18n"]["zh_cn"] == "🛠️ 工具执行 · 查看 2 个步骤"
+    assert title["content"] == "Tool calls"
 
     elements = panel["elements"]
     assert elements[0]["text"]["content"] == (

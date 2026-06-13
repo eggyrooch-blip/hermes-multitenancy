@@ -30,6 +30,60 @@ def _render_tool_calls_section(tools: list[Any]) -> str:
     return "\n".join(lines)
 
 
+_LIVE_STATUS_TO_TRACE_STATUS = {
+    "running": "running",
+    "done": "success",
+    "error": "error",
+}
+
+
+def _live_tools_to_trace_steps(tools: list[Any]) -> list[dict[str, Any]]:
+    """Bridge live ``state['tools']`` rows to the rich-panel trace-step shape.
+
+    Live rows carry ``{name, status, preview, args, duration}`` (see
+    ``streaming_controller`` tool-started/completed handlers); the rich renderer
+    consumes ``{tool_name, params, summary, duration_ms, status}``. The same
+    dedupe / hidden-tool / row-cap filtering used by the bare-row path is applied
+    first so the two paths stay behaviorally aligned.
+    """
+    normalized = _apply_tool_row_cap(_normalize_tool_rows(tools))
+    steps: list[dict[str, Any]] = []
+    for tool in normalized:
+        live_status = str(tool.get("status") or "running")
+        step: dict[str, Any] = {
+            "tool_name": str(tool.get("name") or "tool"),
+            "status": _LIVE_STATUS_TO_TRACE_STATUS.get(live_status, "success"),
+        }
+        args = tool.get("args")
+        if isinstance(args, dict) and args:
+            step["params"] = args
+        # NOTE: live `preview` is intentionally NOT forwarded as `summary`.
+        # The bare-row path never displayed preview text (it only used the
+        # "generating arguments" preview as a collapse SIGNAL in
+        # _normalize_tool_rows). Forwarding it here would leak raw API previews
+        # (e.g. "GET /open-apis/...") and the "generating arguments" placeholder
+        # into the rich panel as visible detail — a regression vs bare-row
+        # behavior. Descriptor-driven detail comes from params/args instead.
+        duration = tool.get("duration")
+        if isinstance(duration, (int, float)):
+            step["duration_ms"] = int(round(float(duration) * 1000))
+        steps.append(step)
+    return steps
+
+
+def build_live_tool_use_panel(tools: list[Any]) -> dict[str, Any] | None:
+    """Rich ``collapsible_panel`` for the final card, built from live tool rows.
+
+    Returns ``None`` when there are no visible tool rows so callers can omit the
+    panel entirely. Never raises for ordinary input — callers still wrap the call
+    fail-open so a malformed row can never block message delivery.
+    """
+    steps = _live_tools_to_trace_steps(tools)
+    if not steps:
+        return None
+    return build_tool_use_panel(steps)
+
+
 def _render_tool_calls_panel(tool_section: str) -> dict[str, Any]:
     return {
         "tag": "collapsible_panel",
@@ -191,9 +245,6 @@ _STATUS_DISPLAY = {
     "success": ("Succeeded", "green"),
 }
 _SKILL_PATH_RE = re.compile(r"(?:^|/)skills/([^/]+)/", re.IGNORECASE)
-_URL_SECRET_QUERY_RE = re.compile(
-    r"(secret|token|password|key|credential|bearer|auth)", re.IGNORECASE
-)
 
 
 def normalize_tool_use_display(
@@ -242,17 +293,6 @@ def build_tool_use_panel(
     )
     steps = display["steps"]
 
-    duration_label = (
-        _format_duration_label(elapsed_ms)
-        if isinstance(elapsed_ms, (int, float)) and elapsed_ms > 0
-        else None
-    )
-    zh_parts = [f"工具执行 {duration_label}" if duration_label else "工具执行"]
-    en_parts = [f"Tool use {duration_label}" if duration_label else "Tool use"]
-    suffix = build_tool_use_title_suffix(display["step_count"])
-    zh_parts.append(suffix["zh"])
-    en_parts.append(suffix["en"])
-
     if steps:
         elements: list[dict[str, Any]] = []
         for step in steps:
@@ -260,19 +300,16 @@ def build_tool_use_panel(
     else:
         elements = [_build_tool_use_placeholder()]
 
-    zh_title = f"🛠️ {' · '.join(zh_parts)}"
-    en_title = f"🛠️ {' · '.join(en_parts)}"
+    # Preserve the established "Tool calls" panel-header contract (pinned by
+    # tests/test_streaming_card_transport.py). G7's enrichment lives in the
+    # ROWS (icons + human titles + extracted detail), not a renamed header —
+    # changing the header text is not worth breaking the guard tests that also
+    # assert skill_view-hidden / arg-gen-collapsed / narration-filtered.
     return {
         "tag": "collapsible_panel",
         "expanded": False,
         "header": {
-            "title": {
-                "tag": "plain_text",
-                "content": en_title,
-                "i18n": {"zh_cn": zh_title, "en_us": en_title},
-                "text_color": "grey",
-                "text_size": "notation",
-            },
+            "title": {"tag": "markdown", "content": "Tool calls"},
             "vertical_align": "center",
             "icon": {
                 "tag": "standard_icon",
