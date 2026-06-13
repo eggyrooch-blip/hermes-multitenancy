@@ -3027,7 +3027,9 @@ async def _handle_command(
             f"会话历史: {hist_len} 条消息"
         )
     elif cmd in ("doctor", "diagnose"):
-        await _send_diagnostics_card(adapter, chat_id, cmd, event, sender=sender)
+        await _send_diagnostics_card(
+            adapter, chat_id, cmd, event, sender=sender, routed_profile=profile_name
+        )
         return
     elif cmd in ("new", "reset"):
         _cancel_inflight_task(
@@ -4112,13 +4114,17 @@ def _event_locale(event: Any) -> str:
     return _normalize_locale(raw)
 
 
-def _diagnostics_subject_context(event: Any, sender: Optional[str] = None):
+def _diagnostics_subject_context(
+    event: Any, sender: Optional[str] = None, routed_profile: Optional[str] = None
+):
     """Resolve (subject_open_id, identity, multitenancy) for the invoking user.
 
     Lets /doctor /diagnose identify WHO is asking and check THEIR real
     credential validity instead of "no subject". Prefers the already-resolved
     command ``sender`` (the routed user key), falling back to event resolution.
-    Fail-soft → (None, None, None).
+    ``routed_profile`` is the profile the live message actually routed to
+    (multitenancy_router → feishu_<userid>); it's authoritative for display,
+    used even when the routing table has no separate row. Fail-soft.
     """
     subject_open_id = None
     candidate = (sender or "").strip()
@@ -4133,8 +4139,16 @@ def _diagnostics_subject_context(event: Any, sender: Optional[str] = None):
     if not subject_open_id:
         return None, None, None
 
-    identity: dict[str, Any] = {"open_id": subject_open_id}
-    multitenancy = None
+    routed = (routed_profile or "").strip() or None
+    identity: dict[str, Any] = {"open_id": subject_open_id, "profile": routed}
+    # The live-routed profile is authoritative even if the routing table has no
+    # row yet; the table lookup only enriches name/owner/agent.
+    multitenancy: dict[str, Any] = {
+        "kind": "user",
+        "profile": routed,
+        "owner_open_id": None,
+        "agent_id": None,
+    }
     try:
         table = _get_routing_table()
     except Exception:
@@ -4148,10 +4162,10 @@ def _diagnostics_subject_context(event: Any, sender: Optional[str] = None):
                     or getattr(row, "profile_name", None)
                     or getattr(row, "user_id", None)
                 )
-                identity["profile"] = getattr(row, "profile_name", None)
+                identity["profile"] = routed or getattr(row, "profile_name", None)
                 multitenancy = {
-                    "kind": getattr(row, "kind", None),
-                    "profile": getattr(row, "profile_name", None),
+                    "kind": getattr(row, "kind", None) or "user",
+                    "profile": routed or getattr(row, "profile_name", None),
                     "owner_open_id": getattr(row, "owner_open_id", None),
                     "agent_id": getattr(row, "agent_id", None),
                 }
@@ -4160,13 +4174,17 @@ def _diagnostics_subject_context(event: Any, sender: Optional[str] = None):
     return subject_open_id, identity, multitenancy
 
 
-def _render_diagnostics_reply(cmd: str, event: Any, sender: Optional[str] = None) -> str:
+def _render_diagnostics_reply(
+    cmd: str, event: Any, sender: Optional[str] = None, routed_profile: Optional[str] = None
+) -> str:
     """Build the /doctor or /diagnose Markdown reply (read-only, fail-soft)."""
     locale = _event_locale(event)
     try:
         from . import diagnostics
 
-        subject_open_id, identity, multitenancy = _diagnostics_subject_context(event, sender)
+        subject_open_id, identity, multitenancy = _diagnostics_subject_context(
+            event, sender, routed_profile
+        )
         if cmd == "doctor":
             return diagnostics.render_doctor(
                 locale=locale, subject_open_id=subject_open_id, identity=identity
@@ -4223,13 +4241,21 @@ def _build_diagnostics_card(markdown: str, cmd: str, locale: str) -> dict[str, A
 
 
 async def _send_diagnostics_card(
-    adapter: Any, chat_id: str, cmd: str, event: Any, *, sender: Optional[str] = None
+    adapter: Any,
+    chat_id: str,
+    cmd: str,
+    event: Any,
+    *,
+    sender: Optional[str] = None,
+    routed_profile: Optional[str] = None,
 ) -> None:
     """Prefer sending diagnostics via interactive card, with text fallback."""
     if adapter is None:
         return
 
-    markdown = _render_diagnostics_reply(cmd, event, sender=sender)
+    markdown = _render_diagnostics_reply(
+        cmd, event, sender=sender, routed_profile=routed_profile
+    )
     locale = _event_locale(event)
     card = _build_diagnostics_card(markdown, cmd, locale)
 
