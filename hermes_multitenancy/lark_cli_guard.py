@@ -26,9 +26,21 @@ def _shim_program(real_binary: Path) -> str:
         import hashlib
         import json
         import os
+        import re
         import sys
         from datetime import datetime, timedelta, timezone
         from pathlib import Path
+
+        # Self-contained mirror of security_audit._redact_embedded_ids: the shim
+        # cannot import the plugin, so it scrubs embedded ou_/oc_ ids from the
+        # raw HERMES_PROFILE here too (prod profiles embed chat_id/open_id).
+        _EMBEDDED_ID_RE = re.compile(r"(?<![A-Za-z0-9])(ou|oc)_[A-Za-z0-9_-]+")
+
+        def _redact_embedded_ids(value):
+            return _EMBEDDED_ID_RE.sub(
+                lambda m: m.group(1) + "_" + hashlib.sha256(m.group(0).encode("utf-8")).hexdigest()[:12],
+                value,
+            )
 
         HERMES_LARK_CLI_RUN_TOKEN = {HERMES_LARK_CLI_RUN_TOKEN!r}
         HERMES_LARK_CLI_AUTHORIZED = {HERMES_LARK_CLI_AUTHORIZED!r}
@@ -47,7 +59,7 @@ def _shim_program(real_binary: Path) -> str:
             }}
             profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
             if profile:
-                event["profile"] = profile
+                event["profile"] = _redact_embedded_ids(profile)
             if command_name:
                 event["command_name"] = command_name
             if reason:

@@ -94,3 +94,39 @@ def test_redaction_unit():
     assert _redact_embedded_ids("plain text no id") == "plain text no id"
     out = _redact_embedded_ids("feishu_group_oc_ABC123")
     assert "oc_ABC123" not in out and out.startswith("feishu_group_oc_")
+    # underscore-inclusive body (SPEC): a hypothetical id with '_' is fully hashed
+    out2 = _redact_embedded_ids("feishu_group_oc_secret_chat_id")
+    assert "secret_chat_id" not in out2
+
+
+def test_shim_denied_path_redacts_profile(monkeypatch, tmp_path):
+    """Finding #1: the self-contained lark-cli shim writes its own audit line
+    (no plugin import), so it must redact HERMES_PROFILE itself."""
+    import subprocess
+    import sys
+
+    from hermes_multitenancy.lark_cli_guard import install_lark_cli_shim
+
+    shim_dir = tmp_path / "shim"
+    real = tmp_path / "real-lark-cli"
+    real.write_text("#!/bin/sh\necho TOOL\n")
+    real.chmod(0o755)
+    install_lark_cli_shim(shim_dir, real_binary=real)
+
+    audit = tmp_path / "sec.jsonl"
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HERMES_PROFILE": "feishu_group_oc_1914a6e2c17a197a",
+        "HERMES_FEISHU_USER_OPEN_ID": "ou_cf23e7c262afa4b7",
+        "HERMES_MT_SECURITY_AUDIT_ENABLED": "1",
+        "HERMES_MT_SECURITY_AUDIT_PATH": str(audit),
+        # no run token → denied path
+    }
+    proc = subprocess.run([sys.executable, str(shim_dir / "lark-cli"), "im"], env=env, capture_output=True)
+    assert proc.returncode == 126
+    raw = audit.read_text()
+    assert "oc_1914a6e2c17a197a" not in raw          # group chat_id not leaked
+    assert "ou_cf23e7c262afa4b7" not in raw          # open_id not leaked (hashed)
+    row = _rows(audit)[-1]
+    assert row["event_type"] == "lark_cli.direct_exec.denied"
+    assert row["profile"] == f"feishu_group_oc_{_h('oc_1914a6e2c17a197a')}"

@@ -102,7 +102,7 @@ def _hash_id(candidate: Any) -> str:
 # Note: a plain \b won't fire because the id is usually preceded by '_'
 # (`feishu_group_oc_...`) and '_' is a word char, so there's no boundary before
 # `oc`. Anchor on a non-alphanumeric (or string start) lookbehind instead.
-_EMBEDDED_ID_RE = re.compile(r"(?<![A-Za-z0-9])(ou|oc)_[A-Za-z0-9-]+")
+_EMBEDDED_ID_RE = re.compile(r"(?<![A-Za-z0-9])(ou|oc)_[A-Za-z0-9_-]+")
 
 
 def _redact_embedded_ids(value: str) -> str:
