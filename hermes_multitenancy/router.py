@@ -4728,8 +4728,28 @@ def _repair_auto_profile(
         logger.debug("multitenancy: auto profile repair failed for %s: %s", profile_name, exc)
 
 
+def _dev_mode_enabled() -> bool:
+    """Explicit dev/demo escape hatch — re-enables conveniences that strict mode
+    turns off by default."""
+    return os.environ.get("HERMES_MULTITENANCY_DEV_MODE", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _auto_provision_enabled() -> bool:
-    value = os.environ.get("HERMES_MULTITENANCY_AUTO_PROVISION", "1").strip().lower()
+    # P0-3: in strict mode, auto-provision defaults OFF (a new/unknown open_id
+    # must not silently create a profile, bypassing allowlist/org-sync). It can
+    # only be on if explicit dev mode is set. Non-strict keeps the legacy
+    # default-on behavior.
+    from .runtime import strict_context_enabled
+
+    raw = os.environ.get("HERMES_MULTITENANCY_AUTO_PROVISION")
+    if strict_context_enabled() and not _dev_mode_enabled():
+        # Strict: only an explicit truthy opt-in enables it; default + unset = off.
+        if raw is None:
+            return False
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    value = (raw if raw is not None else "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 

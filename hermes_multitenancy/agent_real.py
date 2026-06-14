@@ -384,6 +384,25 @@ async def _legacy_real_run_agent(
     messages: Optional[list[dict]] = None,
 ) -> str:
     """Original spike implementation — kept as a fallback for the AIAgent path."""
+    # P0-1: strict mode requires the real agent to run ONLY inside the isolated
+    # AIAgent subprocess (per-profile env, no parent HERMES_HOME reliance). The
+    # legacy in-process runner reads the parent process env/config directly, so
+    # in strict mode we fail closed rather than silently degrade to it.
+    if strict_context_enabled():
+        try:
+            from .security_audit import append_security_event
+
+            append_security_event(
+                event_type="route.denied",
+                reason="strict_in_process_real_runner_disabled",
+                profile=profile_home.name,
+            )
+        except Exception:
+            logger.debug("[multitenancy] route.denied audit failed", exc_info=True)
+        raise RuntimeError(
+            "HERMES_MULTITENANCY_STRICT_CONTEXT=1: in-process legacy real runner "
+            "is disabled; the AIAgent isolated subprocess is required."
+        )
     from openai import AsyncOpenAI
     from dotenv import dotenv_values
 
