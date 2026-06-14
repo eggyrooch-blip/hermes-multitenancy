@@ -1965,16 +1965,22 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
                 try:
                     from .agent_real import _load_profile_config
                     _prof_cfg = _load_profile_config(profile_home)
-                    _model_cfg = _prof_cfg.get("model") or {}
-                    _prof_provider = str(_model_cfg.get("provider") or "").strip()
-                    if not _prof_provider:
-                        # Common shape: model.default == "zai/glm-5.1" with no
-                        # separate provider field. _load_profile_config already
-                        # ran _normalize_model_spec_inplace, so the prefix is the
-                        # provider. Derive it so default-only profiles aren't missed.
-                        _default = str(_model_cfg.get("default") or "").strip()
-                        if "/" in _default:
-                            _prof_provider = _default.split("/", 1)[0].strip()
+                    _model_cfg = _prof_cfg.get("model")
+                    _prof_provider = ""
+                    if isinstance(_model_cfg, dict):
+                        _prof_provider = str(_model_cfg.get("provider") or "").strip()
+                        if not _prof_provider:
+                            # Common shape: model.default == "zai/glm-5.1" with no
+                            # separate provider field. _load_profile_config already
+                            # ran _normalize_model_spec_inplace, so the prefix is
+                            # the provider — derive it so default-only profiles
+                            # aren't missed.
+                            _default = str(_model_cfg.get("default") or "").strip()
+                            if "/" in _default:
+                                _prof_provider = _default.split("/", 1)[0].strip()
+                    elif isinstance(_model_cfg, str) and "/" in _model_cfg:
+                        # Legacy shape: model is a bare "provider/model" string.
+                        _prof_provider = _model_cfg.split("/", 1)[0].strip()
                 except Exception as exc:
                     _prof_provider = ""
                     logger.debug("multitenancy: vision-override provider read failed (%s)", exc)
