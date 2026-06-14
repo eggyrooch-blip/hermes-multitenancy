@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,28 @@ def _hash_id(candidate: Any) -> str:
     return hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()[:12]
 
 
+# Feishu identifiers can be EMBEDDED inside otherwise-safe text fields — most
+# notably the `profile` name (prod profiles look like `feishu_group_<chat_id>`
+# or `feishu_ou_<open_id>`). Logging them raw would leak open_id/chat_id through
+# the side door, defeating the open_id_hash/chat_id_hash redaction. Replace each
+# embedded ou_/oc_ id with `ou_<hash12>` / `oc_<hash12>` (same digest as
+# _hash_id → deterministic + cross-line correlatable). Plain names like
+# `feishu_alice` / `sunke` contain no such token and pass through unchanged,
+# preserving ops readability.
+# Note: a plain \b won't fire because the id is usually preceded by '_'
+# (`feishu_group_oc_...`) and '_' is a word char, so there's no boundary before
+# `oc`. Anchor on a non-alphanumeric (or string start) lookbehind instead.
+_EMBEDDED_ID_RE = re.compile(r"(?<![A-Za-z0-9])(ou|oc)_[A-Za-z0-9-]+")
+
+
+def _redact_embedded_ids(value: str) -> str:
+    def _sub(m: "re.Match[str]") -> str:
+        prefix = m.group(1)
+        return f"{prefix}_{_hash_id(m.group(0))}"
+
+    return _EMBEDDED_ID_RE.sub(_sub, value)
+
+
 def append_security_event(*, event_type: str, **fields: Any) -> None:
     if not security_audit_enabled():
         return
@@ -103,7 +126,10 @@ def append_security_event(*, event_type: str, **fields: Any) -> None:
     for name in _SAFE_FIELD_NAMES:
         value = str(fields.get(name) or "").strip()
         if value:
-            event[name] = value
+            # Scrub any embedded ou_/oc_ id from safe text fields (mainly
+            # `profile`, whose prod names embed chat_id/open_id) so identifiers
+            # never reach the log raw via the side door.
+            event[name] = _redact_embedded_ids(value)
     open_id = str(fields.get("open_id") or "").strip()
     if open_id:
         event["open_id_hash"] = _hash_id(open_id)
