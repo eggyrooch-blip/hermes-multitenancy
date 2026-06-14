@@ -169,6 +169,30 @@ class RoutingRow:
     upstream_profile: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class TenantContext:
+    """Strongly-typed, resolved tenant identity for a single dispatch (P0-2).
+
+    Built only from an ACTIVE routing row (deleted/inactive → no context →
+    caller denies). ``user_key`` is the stable session/memory key (open_id
+    first; the alias is never the primary key). ``route_version`` lets session
+    scopes invalidate when the routing row changes.
+    """
+
+    profile_name: str
+    open_id: Optional[str]
+    union_id: Optional[str]
+    user_key: str
+    kind: str
+    chat_id: Optional[str]
+    owner_open_id: Optional[str]
+    route_version: int
+
+    @property
+    def is_group(self) -> bool:
+        return self.kind == KIND_GROUP
+
+
 class RoutingTable:
     """SQLite-backed routing table.
 
@@ -319,6 +343,49 @@ class RoutingTable:
         )
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
+
+    def resolve_context(
+        self,
+        sender: str,
+        *,
+        alt_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> Optional[TenantContext]:
+        """Resolve a dispatch's sender into a typed, ACTIVE TenantContext, or
+        None (caller must deny / auto-provision). Single fail-closed entry: a
+        deleted/inactive/unknown sender yields None because every lookup filters
+        ``active = 1``. The session ``user_key`` is stable (open_id first; the
+        alias is only a last-resort fallback, never the primary key).
+        """
+        sender_key = str(sender or "").strip()
+        row: Optional[RoutingRow] = None
+        # Group dispatch: bind by chat_id (stable owner/profile per chat).
+        if chat_id:
+            row = self.lookup_by_chat_id(str(chat_id))
+        if row is None and sender_key and sender_key != "unknown":
+            row = self.lookup_by_open_id(sender_key) or self.lookup_by_union_id(sender_key)
+        alt_key = str(alt_id or "").strip()
+        if row is None and alt_key:  # legacy alias is a LOOKUP helper only
+            row = self.lookup_by_user_id(alt_key)
+        if row is None or not row.active:
+            return None
+        # Stable user key: open_id first, never the alias as primary.
+        user_key = (
+            (sender_key if sender_key and sender_key != "unknown" else "")
+            or str(row.open_id or "")
+            or str(row.user_id or "")
+            or (alt_key or "unknown")
+        )
+        return TenantContext(
+            profile_name=row.profile_name,
+            open_id=row.open_id,
+            union_id=row.union_id,
+            user_key=user_key,
+            kind=row.kind,
+            chat_id=row.chat_id or (str(chat_id) if chat_id else None),
+            owner_open_id=row.owner_open_id,
+            route_version=int(row.version),
+        )
 
     def lookup_agent(self, agent_id: str) -> Optional[RoutingRow]:
         """Return the active row for a stable agent_id, or None if missing.
