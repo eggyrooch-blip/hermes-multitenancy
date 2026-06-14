@@ -516,8 +516,8 @@ def render_diagnose_markdown(report: dict[str, Any], locale: str = "zh_cn") -> s
                 kind_label = _t(loc, f"agent_kind_{kind}")
                 if kind_label == f"agent_kind_{kind}":  # unknown kind → raw
                     kind_label = kind
-                label = a.get("profile") or a.get("label") or "?"
-                lines.append(f"  - {kind_label}: `{label}`")
+                label = a.get("name") or a.get("profile") or a.get("label") or "?"
+                lines.append(f"  - {kind_label}: {label}")
             if not agents:
                 lines.append(f"  - {_t(loc, 'agents_none')}")
     else:

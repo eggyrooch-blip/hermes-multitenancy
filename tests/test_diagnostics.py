@@ -160,6 +160,33 @@ def test_diagnose_lists_owned_agents_by_kind_and_owner_name():
     assert "李雷" in md and "ou_owner" not in md       # owner by name, no open_id
 
 
+def test_diagnose_renders_agent_friendly_names():
+    """Each agent renders its readable name (group chat name / 智能体 display
+    name), not the raw chat_id / profile id."""
+    from hermes_multitenancy.diagnostics import build_diagnose_report, render_diagnose_markdown
+
+    report = build_diagnose_report(
+        version="0.1.0",
+        profile_name="feishu_sunke",
+        credential_status={"status": "valid", "has_credential": True},
+        health=_sample_health(),
+        env=_sample_env(),
+        identity={"open_id": "ou_x", "name": "孙可", "profile": "feishu_sunke", "hide_open_id": True},
+        multitenancy={
+            "kind": "user",
+            "profile": "feishu_sunke",
+            "agents": [
+                {"kind": "group", "profile": "feishu_group_dfe", "chat_id": "oc_dfe", "name": "IT 运维组"},
+                {"kind": "agent", "profile": "webui_abc_codex", "chat_id": None, "name": "codex_verify"},
+            ],
+        },
+    )
+    md = render_diagnose_markdown(report, "zh_cn")
+    assert "IT 运维组" in md                 # group chat name, not oc_dfe
+    assert "oc_dfe" not in md                 # raw chat_id hidden
+    assert "codex_verify" in md              # agent friendly name
+
+
 def test_render_diagnose_markdown_is_non_empty_in_both_locales():
     from hermes_multitenancy.diagnostics import (
         build_diagnose_report,

@@ -149,6 +149,38 @@ def _resolve_names_blocking(open_ids: list[str], sender_open_id: str) -> dict[st
         return {}
 
 
+def _resolve_chat_names_blocking(chat_ids: list[str], sender_open_id: str) -> dict[str, str]:
+    """Best-effort UAT lookup: chat_id (oc_…) → group name. {} on failure.
+
+    Feishu has no chat batch-get, so this issues one GET /im/v1/chats/{id} per
+    chat (capped by the caller). Fail-soft: any error → that chat is omitted and
+    the caller falls back to the chat_id.
+    """
+    ids = [cid for cid in dict.fromkeys(chat_ids) if cid]
+    if not ids:
+        return {}
+    try:
+        token = _resolve_uat_token(sender_open_id)
+    except Exception:
+        return {}
+    names: dict[str, str] = {}
+    host = _feishu_api_host()
+    for cid in ids:
+        try:
+            url = f"{host}/open-apis/im/v1/chats/{urllib.parse.quote(cid, safe='')}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=6) as resp:  # noqa: S310 (fixed host)
+                body = json.loads(resp.read().decode("utf-8"))
+            if body.get("code") != 0:
+                continue
+            name = str((body.get("data") or {}).get("name") or "").strip()
+            if name:
+                names[cid] = name
+        except Exception:
+            continue
+    return names
+
+
 # --------------------------------------------------------------------------- #
 # Tree build + render  (openclaw-lark merge-forward.ts algorithm)              #
 # --------------------------------------------------------------------------- #

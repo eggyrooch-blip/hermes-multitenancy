@@ -4185,22 +4185,52 @@ def _diagnostics_subject_context(
                     "owner_open_id": getattr(row, "owner_open_id", None),
                     "agent_id": getattr(row, "agent_id", None),
                 }
-            # Enumerate the agents this user owns (群聊 agents / 智能体 …).
+            # Enumerate the agents this user owns (群聊 agents / 智能体 …),
+            # rendering readable names: 智能体 → display_label; 群聊 → group name
+            # resolved from chat_id via UAT (fail-soft to chat_id).
             try:
                 owned = table.list_by_owner(subject_open_id)
                 agents = []
                 for r in owned or []:
-                    if getattr(r, "kind", None) == "user":
+                    kind = getattr(r, "kind", None) or "agent"
+                    if kind == "user":
                         continue  # the user's own root row is not an "agent"
+                    chat_id = getattr(r, "chat_id", None)
+                    if kind == "group":
+                        name = chat_id  # replaced below once chat names resolve
+                    else:
+                        name = (
+                            getattr(r, "display_label", None)
+                            or getattr(r, "profile_name", None)
+                            or getattr(r, "agent_id", None)
+                        )
                     agents.append(
                         {
-                            "kind": getattr(r, "kind", None) or "agent",
+                            "kind": kind,
                             "profile": getattr(r, "profile_name", None),
-                            "label": getattr(r, "display_label", None)
-                            or getattr(r, "chat_id", None)
-                            or getattr(r, "agent_id", None),
+                            "chat_id": chat_id,
+                            "name": name,
                         }
                     )
+                # Resolve group chat names (cap to keep /diagnose responsive).
+                group_chat_ids = [
+                    a["chat_id"] for a in agents if a["kind"] == "group" and a.get("chat_id")
+                ][:15]
+                if group_chat_ids:
+                    try:
+                        from .feishu_merge_forward_api import _resolve_chat_names_blocking
+
+                        chat_names = _resolve_chat_names_blocking(
+                            group_chat_ids, subject_open_id
+                        )
+                        for a in agents:
+                            if a["kind"] == "group" and chat_names.get(a.get("chat_id")):
+                                a["name"] = chat_names[a["chat_id"]]
+                    except Exception:
+                        logger.debug(
+                            "multitenancy: diagnostics chat-name resolution failed",
+                            exc_info=True,
+                        )
                 multitenancy["agents"] = agents
             except Exception:
                 logger.debug("multitenancy: diagnostics agents listing failed", exc_info=True)
