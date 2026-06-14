@@ -517,7 +517,9 @@ def _dispatch_session_history_command(*, profile_name: str, user_key: str, comma
             "message": f"not a supported Run Broker session-history command: /{command_name}",
         }
 
-    key = router_mod._history_key(profile_name, user_key, None)
+    # WebUI sessions must not cross with Feishu DM sessions under strict context,
+    # so tag the channel explicitly (default-mode keys are unchanged).
+    key = router_mod._history_key(profile_name, user_key, None, channel="webui")
     if command_name in {"new", "reset"}:
         cleared = bool(router_mod._clear_history(key))
         return {

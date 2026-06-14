@@ -258,6 +258,63 @@ def _tenant_user_key(sender: str, sender_alt: Optional[str]) -> str:
     return alt_key or sender_key or "unknown"
 
 
+def _event_thread_id(event: Any) -> Optional[str]:
+    """Best-effort thread/topic id from a Feishu event source (mirrors the
+    agent_real extraction: thread_id, then chat_topic)."""
+    source = getattr(event, "source", None) if event is not None else None
+    if source is None:
+        return None
+    value = getattr(source, "thread_id", None) or getattr(source, "chat_topic", None)
+    return str(value) if value else None
+
+
+def _route_version_for(
+    sender: str, sender_alt: Optional[str], chat_id: Optional[str]
+) -> int:
+    """Resolve the routing-row version so a strict session invalidates when the
+    route changes. Fail-open to 0 (no invalidation) if routing is unavailable."""
+    try:
+        table = _get_routing_table()
+        if table is None:
+            return 0
+        ctx = table.resolve_context(sender, alt_id=sender_alt, chat_id=chat_id)
+        return int(getattr(ctx, "route_version", 0) or 0) if ctx is not None else 0
+    except Exception:
+        return 0
+
+
+def _dispatch_session_scope(
+    profile_name: Optional[str],
+    sender: str,
+    sender_alt: Optional[str],
+    chat_id: Optional[str],
+    event: Any = None,
+    *,
+    channel: str = "feishu",
+):
+    """Build the typed SessionScope for a dispatch (P1-7). In default (strict
+    OFF) mode the thread/route_version discriminators are IGNORED by the scope,
+    so we skip resolving them entirely — keeping the prod hot path zero-overhead
+    AND byte-identical to the legacy keys. Under strict mode they are resolved so
+    DM/group-thread/route-version sessions are isolated."""
+    from .session_scope import build_session_scope
+    from .runtime import strict_context_enabled
+
+    thread_id: Optional[str] = None
+    route_version = 0
+    if strict_context_enabled():
+        thread_id = _event_thread_id(event)
+        route_version = _route_version_for(sender, sender_alt, chat_id)
+    return build_session_scope(
+        profile_name=profile_name,
+        user_key=_tenant_user_key(sender, sender_alt),
+        channel=channel,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        route_version=route_version,
+    )
+
+
 def _trim_history(history: list[dict]) -> list[dict]:
     """Keep at most ``_SESSION_HISTORY_MAX`` most recent messages."""
     if len(history) <= _SESSION_HISTORY_MAX:
@@ -2843,7 +2900,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 profile_name,
                 _event_message_id(event) or "",
             )
-            hist_key = _history_key(profile_name, sender, sender_alt)
+            hist_key = _dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key
             user_msg = _build_user_message(event, text_override=enriched_text)
             _persist_turn(hist_key, user_msg, vision_blocked)
             if adapter is not None:
@@ -2900,7 +2957,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
 
         # Register self in the context-scoped in-flight slot (replace previous)
         current = asyncio.current_task()
-        inflight_key = _inflight_key(profile_name, sender, sender_alt, chat_id)
+        inflight_key = _dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).inflight_key
         prev = _user_inflight_tasks.get(inflight_key)
         if prev is not None and not prev.done() and prev is not current:
             prev_hist_key = _user_inflight_history_keys.get(inflight_key)
@@ -2921,7 +2978,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # Build the conversation: prior history + current user message (with
         # reply context spliced in). The runner prepends the profile's SOUL.
         # First lookup for a (profile, user) pair hydrates from SessionStore.
-        hist_key = _history_key(profile_name, sender, sender_alt)
+        hist_key = _dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key
         prior = _load_history(hist_key)
         contextual_text = _append_recent_profile_file_context(
             enriched_text or text,
@@ -3166,7 +3223,7 @@ async def _handle_command(
         reply = approval_reply
     elif cmd == "stop":
         task = _cancel_inflight_task(
-            _inflight_key(profile_name, sender, sender_alt, chat_id),
+            _dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).inflight_key,
             preserve_resume_marker=True,
         )
         if task is not None and not task.done():
@@ -3174,11 +3231,11 @@ async def _handle_command(
         else:
             reply = "没有进行中的任务"
     elif cmd == "status":
-        task = _user_inflight_tasks.get(_inflight_key(profile_name, sender, sender_alt, chat_id))
+        task = _user_inflight_tasks.get(_dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).inflight_key)
         running = task is not None and not task.done()
         # Surface session memory size + profile so the user knows their context.
         if profile_name:
-            hist = _session_history.get(_history_key(profile_name, sender, sender_alt), [])
+            hist = _session_history.get(_dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key, [])
             hist_len = len(hist)
         else:
             hist_len = 0
@@ -3200,12 +3257,12 @@ async def _handle_command(
         return
     elif cmd in ("new", "reset"):
         _cancel_inflight_task(
-            _inflight_key(profile_name, sender, sender_alt, chat_id),
+            _dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).inflight_key,
             preserve_resume_marker=False,
         )
         # Clear this user's per-profile history (cache + persistent SessionStore).
         if profile_name:
-            key = _history_key(profile_name, sender, sender_alt)
+            key = _dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key
             _clear_history(key)
             reply = "会话已重置 ✅"
         else:

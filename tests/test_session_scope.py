@@ -28,6 +28,25 @@ def test_scope_requires_user_key():
         SessionScope(profile_name="p", channel="feishu", user_key="")
 
 
+def test_build_session_scope_explicit_blank_channel_raises():
+    """Re-review (round 3): the builder must NOT silently coerce a blank channel
+    to a default — that would defeat the fail-closed check."""
+    from hermes_multitenancy.session_scope import build_session_scope
+
+    with pytest.raises(ValueError, match="channel"):
+        build_session_scope(profile_name="p", user_key="ou_a", channel="")
+    with pytest.raises(ValueError, match="channel"):
+        build_session_scope(profile_name="p", user_key="ou_a", channel=None)
+
+
+def test_build_session_scope_omitted_channel_defaults_feishu():
+    """Omitting channel entirely keeps the legacy convenience (feishu)."""
+    from hermes_multitenancy.session_scope import build_session_scope
+
+    s = build_session_scope(profile_name="p", user_key="ou_a")
+    assert s.channel == "feishu"
+
+
 def test_scope_is_frozen():
     from hermes_multitenancy.session_scope import build_session_scope
 
@@ -159,3 +178,60 @@ def test_strict_inflight_key_still_three_tuple(monkeypatch):
     assert len(s.inflight_key) == 3
     assert s.inflight_key[0] == "p"
     assert s.inflight_key[1] == "oc"
+
+
+# --------------------------------------------------------------------------- #
+# Production wiring: router._dispatch_session_scope feeds the discriminators
+# --------------------------------------------------------------------------- #
+
+from types import SimpleNamespace  # noqa: E402
+
+
+def _event_with_thread(thread_id):
+    return SimpleNamespace(source=SimpleNamespace(thread_id=thread_id, chat_topic=None))
+
+
+def test_dispatch_scope_default_is_byte_identical(monkeypatch):
+    """Re-review (round 3): production callers now go through
+    _dispatch_session_scope; default mode must still equal the legacy keys."""
+    from hermes_multitenancy import router
+
+    ev = _event_with_thread("th_xyz")
+    scope = router._dispatch_session_scope(
+        "feishu_alice", "ou_alice", None, "oc_dm", ev
+    )
+    assert scope.history_key == ("feishu_alice", "ou_alice")
+    assert scope.inflight_key == ("feishu_alice", "oc_dm", "ou_alice")
+
+
+def test_dispatch_scope_strict_includes_thread(monkeypatch):
+    """Under strict mode the dispatch scope actually resolves thread_id from the
+    event so group threads don't collide (the wiring the review demanded)."""
+    from hermes_multitenancy import router
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    # Avoid real routing-table lookups deciding route_version in this unit test.
+    monkeypatch.setattr(router, "_route_version_for", lambda *a, **k: 0)
+
+    s1 = router._dispatch_session_scope(
+        "feishu_g", "ou_a", None, "oc_g", _event_with_thread("th1")
+    )
+    s2 = router._dispatch_session_scope(
+        "feishu_g", "ou_a", None, "oc_g", _event_with_thread("th2")
+    )
+    assert s1.history_key != s2.history_key  # threads isolated in strict mode
+
+
+def test_dispatch_scope_strict_channel_isolation(monkeypatch):
+    from hermes_multitenancy import router
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setattr(router, "_route_version_for", lambda *a, **k: 0)
+
+    feishu = router._dispatch_session_scope(
+        "p", "ou_a", None, "oc", _event_with_thread(None), channel="feishu"
+    )
+    webui = router._dispatch_session_scope(
+        "p", "ou_a", None, "oc", None, channel="webui"
+    )
+    assert feishu.history_key != webui.history_key

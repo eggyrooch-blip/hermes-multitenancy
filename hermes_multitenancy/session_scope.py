@@ -108,9 +108,12 @@ def build_session_scope(
     ``profile_name`` is normalized to a stable string (None → "" so the legacy
     history key, which used the raw profile_name, is preserved exactly).
     """
+    # Do NOT coerce a blank channel to a default here — that would defeat the
+    # SessionScope fail-closed check. The default lives on the parameter so
+    # callers that omit it get feishu, but an explicit blank/None is an error.
     return SessionScope(
         profile_name=str(profile_name or ""),
-        channel=str(channel or CHANNEL_FEISHU),
+        channel=str(channel) if channel is not None else "",
         user_key=str(user_key or ""),
         chat_id=(str(chat_id) if chat_id else None),
         thread_id=(str(thread_id) if thread_id else None),
