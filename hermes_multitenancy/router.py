@@ -3905,12 +3905,21 @@ async def _handle_child_approval_required(adapter: Any, chat_id: str, payload: A
         command[:120],
     )
     stripped_command = command.strip()
-    # Record only the executable basename, never the raw first token — an
-    # absolute path like /Users/alice/secret-bin/doit would otherwise leak a
-    # filesystem path into the audit log (SPEC: 无 raw 路径). The full command
-    # is still correlatable via command_hash.
-    first_token = stripped_command.split()[0] if stripped_command else ""
-    command_kind = (os.path.basename(first_token) or first_token)[:32] if first_token else "<empty>"
+    # Record only the executable basename, never a raw token — both an absolute
+    # path (/Users/alice/secret-bin/doit) AND a leading "VAR=secret" env
+    # assignment would otherwise leak into the audit log (SPEC: 无 raw 路径/无
+    # secret). Skip env-assignment prefixes, then basename the real executable.
+    # The full command stays correlatable via command_hash.
+    tokens = stripped_command.split() if stripped_command else []
+    _env_assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+    idx = 0
+    while idx < len(tokens) and _env_assign.match(tokens[idx]):
+        idx += 1
+    exe = tokens[idx] if idx < len(tokens) else ""
+    if exe:
+        command_kind = (os.path.basename(exe) or exe)[:32]
+    else:
+        command_kind = "<env-only>" if tokens else "<empty>"
     append_security_event(
         event_type="approval.requested",
         open_id=str(data.get("open_id") or "").strip() or None,

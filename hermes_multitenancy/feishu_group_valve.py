@@ -181,11 +181,18 @@ def _message_audit_id(message: Any) -> str | None:
     return None
 
 
-def _audit_everyone_ignored(message: Any) -> None:
+def _audit_everyone_ignored(
+    message: Any,
+    *,
+    chat_id: str | None = None,
+    sender_id: str | None = None,
+) -> None:
     # Both the `_admit` valve and the fork's `_should_accept_group_message`
     # suppression path may fire for the same broadcast; dedupe by message id so
     # one ignored broadcast yields exactly one audit row (best-effort — a
-    # message with no id always audits).
+    # message with no id always audits). The fork path passes chat_id/sender_id
+    # explicitly because its `message` object may not carry them, so without the
+    # fallback the audit hashes would be empty.
     try:
         msg_id = _message_audit_id(message)
         if msg_id is not None:
@@ -194,10 +201,12 @@ def _audit_everyone_ignored(message: Any) -> None:
             _AUDITED_EVERYONE_MSG_IDS[msg_id] = None
             if len(_AUDITED_EVERYONE_MSG_IDS) > _AUDITED_EVERYONE_MAX:
                 _AUDITED_EVERYONE_MSG_IDS.popitem(last=False)
+        resolved_chat = str(getattr(message, "chat_id", "") or "") or str(chat_id or "")
+        resolved_open_id = _sender_open_id(message) or (str(sender_id) if sender_id else None)
         append_security_event(
             event_type="group.everyone.ignored",
-            chat_id=str(getattr(message, "chat_id", "") or ""),
-            open_id=_sender_open_id(message),
+            chat_id=resolved_chat,
+            open_id=resolved_open_id,
             reason="at_everyone_broadcast",
         )
     except Exception:
@@ -259,8 +268,12 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
         # Global, mode-independent: an @everyone broadcast that doesn't @ the bot
         # never wakes it — even in 'all' reply mode. Audit the suppression here
         # too (deduped by message id) so this fork-only path isn't a blind spot.
+        # Pass the fork's own sender_id/chat_id args — the message object may not
+        # carry them, and without the fallback the audit hashes would be empty.
         if message is not None and _is_ignorable_at_everyone(self, message):
-            _audit_everyone_ignored(message)
+            _audit_everyone_ignored(
+                message, chat_id=normalized_chat_id, sender_id=sender_id
+            )
             return False
         # 'all' reply-mode groups answer everything else; the group-policy gate
         # (_allow_group_message) is still honored. ANY failure => fail-open to

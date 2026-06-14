@@ -3574,6 +3574,11 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
                 description=description,
                 pattern_keys=approval_data.get("pattern_keys") or [],
                 decision_path=str(decision_path),
+                # Carry the routed requester so the parent's approval.requested
+                # audit can hash a real open_id (env is set per-child by
+                # _build_subprocess_env). Without this the prod payload had no
+                # requester attribution.
+                open_id=str(os.environ.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip(),
             )
 
             timeout_s = _approval_bridge_timeout()

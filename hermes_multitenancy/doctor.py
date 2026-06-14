@@ -117,6 +117,16 @@ def _sandbox_required_available_check() -> dict[str, Any]:
     check = dict(_required_sandbox_check())
     check["name"] = "sandbox_required_available"
     check["required_when"] = "HERMES_MULTITENANCY_REQUIRE_SANDBOX"
+    # Under strict context the sandbox must be ACTIVELY enforced. The upstream
+    # check returns ok/"skipped" when REQUIRE_SANDBOX is off — a fail-open hole
+    # a strict startup gate must catch (else prod boots without sandboxing).
+    if runtime.strict_context_enabled() and not runtime.require_sandbox_enabled():
+        check["ok"] = False
+        check["status"] = "disabled"
+        check["reason"] = (
+            "sandbox enforcement (HERMES_MULTITENANCY_REQUIRE_SANDBOX) must be "
+            "on under strict context"
+        )
     return check
 
 
@@ -219,6 +229,25 @@ def _db_not_world_readable_check(*, db_path: Path) -> dict[str, Any]:
 def _lark_cli_authsidecar_check() -> dict[str, Any]:
     check = dict(_lark_cli_registration_check())
     check["name"] = "lark_cli_authsidecar"
+    # Tool-schema registration alone is not enough — verify the actual
+    # authsidecar binary is resolvable (shared_home/bin or PATH via the same
+    # resolver the runtime uses), else strict prod would pass with no CLI.
+    try:
+        from . import lark_cli_tool
+
+        binary = lark_cli_tool._resolve_binary()
+    except Exception as exc:  # pragma: no cover - defensive
+        binary = None
+        check["reason"] = f"authsidecar probe failed: {exc.__class__.__name__}"
+    if not binary:
+        check["ok"] = False
+        check["status"] = "binary_missing"
+        check.setdefault(
+            "reason",
+            "lark-cli-authsidecar binary not found (shared_home/bin or PATH)",
+        )
+    else:
+        check["binary"] = str(binary)
     return check
 
 

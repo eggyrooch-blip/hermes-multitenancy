@@ -2176,10 +2176,14 @@ def create_run_broker_app(
                 decision="granted",
             )
         except LeaseError:
+            # Attribute the denial to the AUTHENTICATED broker token, never the
+            # untrusted request JSON — otherwise an attacker controls who the
+            # audit blames. token_record is keyed by the bearer token already
+            # verified above.
             append_security_event(
                 event_type="credential.lease.denied",
-                open_id=open_id,
-                profile=profile_name,
+                open_id=token_record["open_id"],
+                profile=token_record["profile_name"],
                 lease_kind=kind,
                 decision="denied",
                 reason="lease_verification_failed",

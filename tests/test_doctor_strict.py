@@ -46,10 +46,26 @@ def _checks(report: dict[str, object]) -> dict[str, dict[str, object]]:
     return {str(row["name"]): row for row in report["checks"]}  # type: ignore[index]
 
 
-def test_build_report_passes_when_configured(tmp_path: Path) -> None:
+def test_build_report_passes_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_multitenancy import doctor, lark_cli_tool
     from hermes_multitenancy.doctor import build_report
 
     shared_home, db_path = _configured_home(tmp_path)
+
+    # A genuinely locked-down strict deployment: sandbox enforced + available
+    # and the authsidecar binary present. (Monkeypatched because the real
+    # sandbox policy file / Go sidecar aren't in the unit-test sandbox.)
+    monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
+    monkeypatch.setattr(
+        doctor,
+        "_required_sandbox_check",
+        lambda: {"name": "required_sandbox", "ok": True, "status": "available"},
+    )
+    sidecar = tmp_path / "lark-cli-authsidecar"
+    sidecar.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(lark_cli_tool, "_resolve_binary", lambda: str(sidecar))
 
     report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
 
@@ -59,6 +75,44 @@ def test_build_report_passes_when_configured(tmp_path: Path) -> None:
     assert checks["strict_context"]["ok"] is True
     assert checks["auto_provision_disabled"]["ok"] is True
     assert checks["route_table_active_users"]["ok"] is True
+    assert checks["sandbox_required_available"]["ok"] is True
+    assert checks["lark_cli_authsidecar"]["ok"] is True
+
+
+def test_strict_fails_when_sandbox_not_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review gap A: under strict context, REQUIRE_SANDBOX off is a fail-open
+    hole the gate must catch (upstream returns 'skipped'/ok otherwise)."""
+    from hermes_multitenancy.doctor import build_report
+
+    shared_home, db_path = _configured_home(tmp_path)
+    monkeypatch.delenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", raising=False)
+
+    report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
+
+    row = _checks(report)["sandbox_required_available"]
+    assert row["ok"] is False
+    assert "sandbox_required_available" in report["failed_required"]
+
+
+def test_strict_fails_when_authsidecar_binary_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review gap B: tool-schema registration is not enough — the actual
+    authsidecar binary must resolve, else the check is a false PASS."""
+    from hermes_multitenancy import lark_cli_tool
+    from hermes_multitenancy.doctor import build_report
+
+    shared_home, db_path = _configured_home(tmp_path)
+    monkeypatch.setattr(lark_cli_tool, "_resolve_binary", lambda: None)
+
+    report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
+
+    row = _checks(report)["lark_cli_authsidecar"]
+    assert row["ok"] is False
+    assert row["status"] == "binary_missing"
+    assert "lark_cli_authsidecar" in report["failed_required"]
 
 
 def test_strict_exits_nonzero_when_required_check_fails(
