@@ -19,6 +19,13 @@ from typing import Any
 
 import yaml
 
+from .lark_cli_guard import (
+    HERMES_LARK_CLI_AUTHORIZED,
+    HERMES_LARK_CLI_REAL_BIN,
+    HERMES_LARK_CLI_RUN_TOKEN,
+)
+from .runtime import strict_context_enabled
+
 try:
     from tools.registry import registry, tool_error, tool_result
 except ModuleNotFoundError:
@@ -71,6 +78,10 @@ _SAFE_ENV_NAMES = {
     "HERMES_FEISHU_USER_OPEN_ID",
     "HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS",
     "HERMES_LARK_CLI_BIN",
+    "HERMES_LARK_CLI_AUTHORIZED",
+    "HERMES_LARK_CLI_RUN_TOKEN",
+    "HERMES_LARK_CLI_REAL_BIN",
+    "HERMES_MT_SECURITY_AUDIT_PATH",
     "LARKSUITE_CLI_AUTH_PROXY",
     "LARKSUITE_CLI_PROXY_KEY",
     "LARKSUITE_CLI_APP_ID",
@@ -666,6 +677,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         return tool_error("lark-cli binary not found; set HERMES_LARK_CLI_BIN or install lark-cli")
 
     env = _safe_env()
+    run_token = str(os.environ.get(HERMES_LARK_CLI_RUN_TOKEN) or "")
+    if strict_context_enabled() and run_token:
+        env[HERMES_LARK_CLI_AUTHORIZED] = run_token
     requested_identity = str(args.get("identity") or "auto").strip().lower()
     allow_explicit_bot = requested_identity == "bot" and (
         _personal_bot_im_send_allowed(env, mode, argv)

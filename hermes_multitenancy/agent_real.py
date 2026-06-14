@@ -38,11 +38,18 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from .credential_broker import lease_signing_secret, mint_lease
+from .lark_cli_guard import (
+    HERMES_LARK_CLI_REAL_BIN,
+    HERMES_LARK_CLI_RUN_TOKEN,
+    generate_lark_cli_run_token,
+    install_lark_cli_shim,
+)
 from .lark_cli_auth_broker import (
     LarkCliAuthBrokerContext,
     start_lark_cli_auth_broker_server,
 )
 from .runtime import strict_context_enabled
+from .security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
 from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
@@ -1252,6 +1259,10 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MULTITENANCY_CRED_BROKER_URL",
     "HERMES_MULTITENANCY_CRED_LEASE",
     "HERMES_MULTITENANCY_RUN_ID",
+    "HERMES_LARK_CLI_RUN_TOKEN",
+    "HERMES_LARK_CLI_AUTHORIZED",
+    "HERMES_LARK_CLI_REAL_BIN",
+    "HERMES_MT_SECURITY_AUDIT_PATH",
 })
 
 _FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
@@ -1344,6 +1355,20 @@ def _build_subprocess_env(
     path_parts = [part for part in existing_path.split(os.pathsep) if part]
     deduped = [part for part in path_parts if part != shared_bin]
     env["PATH"] = os.pathsep.join([shared_bin, *deduped])
+    if strict_context_enabled():
+        real_bin = _resolve_lark_cli_authsidecar_binary(profile_home)
+        shim_dir = profile_home / "tmp" / "lark-cli-shim"
+        install_lark_cli_shim(shim_dir, real_binary=real_bin)
+        env[HERMES_LARK_CLI_REAL_BIN] = str(real_bin)
+        env[HERMES_LARK_CLI_RUN_TOKEN] = generate_lark_cli_run_token()
+        env.setdefault(
+            "HERMES_MT_SECURITY_AUDIT_PATH",
+            str(_default_security_audit_path_for_subprocess(profile_home)),
+        )
+        strict_path_parts = [part for part in env["PATH"].split(os.pathsep) if part]
+        env["PATH"] = os.pathsep.join(
+            [str(shim_dir), *[part for part in strict_path_parts if part != str(shim_dir)]]
+        )
 
     # Mirror _wrap_with_sandbox's toggle + per-profile gate so the subprocess
     # knows it's running inside a sandbox host. tools/approval.py reads
@@ -1425,6 +1450,17 @@ def _resolve_lark_cli_authsidecar_binary(profile_home: Path) -> Path:
     if configured_bin:
         return Path(configured_bin).expanduser()
     return _resolve_shared_hermes_home(profile_home) / "bin" / "lark-cli-authsidecar"
+
+
+def _default_security_audit_path_for_subprocess(profile_home: Path) -> Path:
+    configured = str(os.environ.get("HERMES_MT_SECURITY_AUDIT_PATH") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        DEFAULT_SECURITY_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        return DEFAULT_SECURITY_AUDIT_PATH
+    except OSError:
+        return profile_home / "tmp" / DEFAULT_SECURITY_AUDIT_PATH.name
 
 
 def _resolve_lark_cli_app_id(profile_home: Path) -> str:
