@@ -99,6 +99,26 @@ def test_redaction_unit():
     assert "secret_chat_id" not in out2
 
 
+def test_conversation_audit_profile_is_redacted(monkeypatch, tmp_path):
+    """Review concern: the sibling conversation-audit sink also wrote `profile`
+    raw — same leak class, folded into this fix."""
+    from hermes_multitenancy.conversation_audit import append_conversation_audit_event
+
+    audit = tmp_path / "conv.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit))
+
+    append_conversation_audit_event(
+        profile_name="feishu_group_oc_1914a6e2c17a197a",
+        platform="feishu", chat_type="group", session_id="s1",
+        message_id=1, role="user", content="hi", timestamp=1700000000,
+    )
+    raw = audit.read_text()
+    assert "oc_1914a6e2c17a197a" not in raw
+    row = _rows(audit)[-1]
+    assert row["profile"] == f"feishu_group_oc_{_h('oc_1914a6e2c17a197a')}"
+
+
 def test_shim_denied_path_redacts_profile(monkeypatch, tmp_path):
     """Finding #1: the self-contained lark-cli shim writes its own audit line
     (no plugin import), so it must redact HERMES_PROFILE itself."""

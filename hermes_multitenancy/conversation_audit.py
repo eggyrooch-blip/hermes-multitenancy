@@ -65,10 +65,16 @@ def append_conversation_audit_event(
     if not conversation_audit_enabled():
         return
 
+    # Same leak class as the security audit: prod profile names embed
+    # chat_id/open_id (feishu_group_<chat_id> / feishu_ou_<open_id>). Scrub the
+    # embedded id from the profile field before write. (content stays raw — it
+    # is the conversation body this audit exists to capture.)
+    from .security_audit import _redact_embedded_ids
+
     event = {
         "@timestamp": _timestamp_iso(timestamp),
         "event_type": "conversation_message",
-        "profile": profile_name,
+        "profile": _redact_embedded_ids(str(profile_name or "")),
         "platform": platform,
         "chat_type": chat_type,
         "session_id": session_id,
