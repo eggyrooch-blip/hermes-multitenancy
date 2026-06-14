@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .runtime import require_sandbox_enabled
 
 
 _SECRET_KEYS = {
@@ -60,6 +64,7 @@ def upstream_capability_health(
             router_config=router_config,
             router_profile_home=router_profile_home,
         ),
+        _required_sandbox_check(),
     ]
     attention = [check["name"] for check in checks if not check.get("ok")]
     return {
@@ -70,6 +75,50 @@ def upstream_capability_health(
         "checks": checks,
         "attention": attention,
         "secret_free": True,
+    }
+
+
+def _required_sandbox_check() -> dict[str, Any]:
+    if not require_sandbox_enabled():
+        return {
+            "name": "required_sandbox",
+            "ok": True,
+            "status": "skipped",
+            "owner": "multitenancy_subprocess_sandbox",
+            "reason": "HERMES_MULTITENANCY_REQUIRE_SANDBOX is off",
+        }
+    try:
+        from . import agent_real
+
+        if sys.platform == "darwin":
+            available = agent_real._SANDBOX_POLICY_FILE.is_file() and os.access(
+                agent_real._SANDBOX_EXEC, os.X_OK
+            )
+            status = "available" if available else "unavailable"
+        elif sys.platform.startswith("linux"):
+            available = agent_real._BWRAP_ARGS_FILE.is_file() and os.access(
+                agent_real._BWRAP_EXEC, os.X_OK
+            )
+            status = "available" if available else "unavailable"
+        else:
+            available = False
+            status = "unsupported_platform"
+    except Exception as exc:
+        return {
+            "name": "required_sandbox",
+            "ok": False,
+            "status": "unavailable",
+            "owner": "multitenancy_subprocess_sandbox",
+            "reason": exc.__class__.__name__,
+        }
+    return {
+        "name": "required_sandbox",
+        "ok": available,
+        "status": status,
+        "owner": "multitenancy_subprocess_sandbox",
+        "reason": "required sandbox backend is not available"
+        if not available
+        else "required sandbox backend is available",
     }
 
 

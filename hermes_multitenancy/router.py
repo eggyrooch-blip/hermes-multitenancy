@@ -33,6 +33,8 @@ from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
+from .security_audit import append_security_event
+
 SYNTHETIC_AUTH_COMPLETE_TEXT = "我已完成飞书账号授权，请继续执行之前的操作。"
 
 _SKILL_SLASH_ALIASES = {
@@ -1360,6 +1362,22 @@ def _should_deliver_as_feishu_document(path: Path) -> bool:
     return path.suffix.lower() in _MARKDOWN_DOCUMENT_EXTENSIONS
 
 
+def _append_media_denied_security_event(*, reason: str, path: Path | str) -> None:
+    try:
+        try:
+            open_id = _current_sender_open_id()
+        except Exception:
+            open_id = None
+        append_security_event(
+            event_type="media.denied",
+            reason=reason,
+            path=str(path),
+            open_id=open_id,
+        )
+    except Exception:
+        logger.exception("multitenancy: failed to append media denied audit event")
+
+
 def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
     """Drop MEDIA directives outside profile scope and publish artifacts to workspace."""
     root = profile_home.expanduser().resolve(strict=False)
@@ -1381,6 +1399,10 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
                     resolved,
                     root,
                 )
+                _append_media_denied_security_event(
+                    reason="non_deliverable_profile_file",
+                    path=resolved,
+                )
                 return ""
             workspace_artifact = _publish_profile_media_artifact(resolved, root)
             deliver_path = workspace_artifact or resolved
@@ -1397,6 +1419,10 @@ def _profile_scoped_media_response(response: str, profile_home: Path) -> str:
             "multitenancy: blocked outbound MEDIA outside profile home path=%s profile_home=%s",
             raw_path,
             root,
+        )
+        _append_media_denied_security_event(
+            reason="outside_profile_home",
+            path=raw_path,
         )
         return ""
 

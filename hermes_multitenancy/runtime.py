@@ -55,6 +55,16 @@ def strict_context_enabled() -> bool:
     }
 
 
+def require_sandbox_enabled() -> bool:
+    """True when HERMES_MULTITENANCY_REQUIRE_SANDBOX requires fail-closed sandboxing."""
+    return os.environ.get("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 # Serializes os.environ HERMES_HOME mutations across concurrent dispatches.
 # We key locks by event loop because asyncio.Lock binds to the loop on first
 # acquire — pytest spawns a fresh loop per test so a module-level lock would

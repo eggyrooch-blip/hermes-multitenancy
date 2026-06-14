@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_AUDIT_PATH = Path("/var/log/hermes/multitenancy-security.jsonl")
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 _ENSURED_PARENT_DIRS: set[Path] = set()
-_SAFE_FIELD_NAMES = frozenset({"profile", "command_name", "reason"})
+_SAFE_FIELD_NAMES = frozenset({"profile", "command_name", "reason", "path_hash", "path_kind"})
 
 
 def _truthy(value: str | None) -> bool:
@@ -41,6 +41,20 @@ def _timestamp_iso(timestamp: float | int | None = None) -> str:
     return datetime.fromtimestamp(value, tz=_SHANGHAI_TZ).isoformat(timespec="seconds")
 
 
+def _redacted_path_fields(candidate: Any) -> dict[str, str]:
+    raw = str(candidate or "").strip()
+    if not raw:
+        return {
+            "path_hash": hashlib.sha256(b"").hexdigest()[:12],
+            "path_kind": "<empty>",
+        }
+    suffix = Path(raw).suffix.lower()
+    return {
+        "path_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12],
+        "path_kind": suffix if suffix else "<no-ext>",
+    }
+
+
 def append_security_event(*, event_type: str, **fields: Any) -> None:
     if not security_audit_enabled():
         return
@@ -49,6 +63,8 @@ def append_security_event(*, event_type: str, **fields: Any) -> None:
         "@timestamp": _timestamp_iso(),
         "event_type": str(event_type),
     }
+    path_fields = _redacted_path_fields(fields.get("path")) if "path" in fields else {}
+    fields = {**fields, **path_fields}
     for name in _SAFE_FIELD_NAMES:
         value = str(fields.get(name) or "").strip()
         if value:

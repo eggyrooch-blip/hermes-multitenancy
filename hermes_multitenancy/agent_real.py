@@ -48,8 +48,9 @@ from .lark_cli_auth_broker import (
     LarkCliAuthBrokerContext,
     start_lark_cli_auth_broker_server,
 )
-from .runtime import strict_context_enabled
+from .runtime import require_sandbox_enabled, strict_context_enabled
 from .security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
+from .security_audit import append_security_event
 from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
@@ -2231,6 +2232,17 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
         return _wrap_macos_sandbox(cmd, profile_home)
     if sys.platform.startswith("linux"):
         return _wrap_linux_bwrap(cmd, profile_home)
+    if require_sandbox_enabled():
+        msg = (
+            f"[multitenancy] HERMES_USE_SANDBOX=1 but platform {sys.platform} "
+            f"has no sandbox backend — refusing to spawn unsandboxed."
+        )
+        logger.error(msg)
+        append_security_event(
+            event_type="sandbox.denied",
+            reason=f"unsupported_platform:{sys.platform}",
+        )
+        raise RuntimeError(msg)
     logger.info(
         "[multitenancy] HERMES_USE_SANDBOX=1 but platform %s has no sandbox "
         "backend — spawning subprocess unsandboxed.",
@@ -2248,6 +2260,18 @@ def _wrap_macos_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     tests/test_aiagent_subprocess.py:1099-1222 assert this exact shape.
     """
     if not _SANDBOX_POLICY_FILE.is_file():
+        if require_sandbox_enabled():
+            msg = (
+                f"[multitenancy] HERMES_USE_SANDBOX=1 but policy "
+                f"{_SANDBOX_POLICY_FILE} is missing — refusing to spawn unsandboxed."
+            )
+            logger.error(msg)
+            append_security_event(
+                event_type="sandbox.denied",
+                reason="macos_policy_missing",
+                path=str(_SANDBOX_POLICY_FILE),
+            )
+            raise RuntimeError(msg)
         logger.warning(
             "[multitenancy] HERMES_USE_SANDBOX=1 but policy %s is missing — "
             "spawning subprocess unsandboxed. Investigate the deployment.",
@@ -2255,6 +2279,18 @@ def _wrap_macos_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
         )
         return cmd
     if not os.access(_SANDBOX_EXEC, os.X_OK):
+        if require_sandbox_enabled():
+            msg = (
+                f"[multitenancy] HERMES_USE_SANDBOX=1 but {_SANDBOX_EXEC} is not "
+                f"executable on this platform — refusing to spawn unsandboxed."
+            )
+            logger.error(msg)
+            append_security_event(
+                event_type="sandbox.denied",
+                reason="macos_sandbox_exec_not_executable",
+                path=str(_SANDBOX_EXEC),
+            )
+            raise RuntimeError(msg)
         logger.warning(
             "[multitenancy] HERMES_USE_SANDBOX=1 but %s is not executable on "
             "this platform — spawning subprocess unsandboxed.",
@@ -2468,6 +2504,11 @@ def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
             f"{_BWRAP_ARGS_FILE} is missing — refusing to spawn unsandboxed."
         )
         logger.error(msg)
+        append_security_event(
+            event_type="sandbox.denied",
+            reason="linux_bwrap_policy_missing",
+            path=str(_BWRAP_ARGS_FILE),
+        )
         raise RuntimeError(msg)
     if not os.access(_BWRAP_EXEC, os.X_OK):
         msg = (
@@ -2476,6 +2517,11 @@ def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
             f"`dnf install -y bubblewrap` (or apt equivalent)."
         )
         logger.error(msg)
+        append_security_event(
+            event_type="sandbox.denied",
+            reason="linux_bwrap_not_executable",
+            path=str(_BWRAP_EXEC),
+        )
         raise RuntimeError(msg)
 
     venv = Path(sys.prefix).resolve()
