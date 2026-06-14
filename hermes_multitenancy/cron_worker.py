@@ -1352,14 +1352,19 @@ def _mirror_cron_delivery_to_owner(job: dict, content: str) -> None:
     try:
         from . import router
 
-        key = (owner_profile, owner_open_id)
+        # Use the typed SessionScope construction point (channel="cron") rather
+        # than a raw (profile, open_id) tuple, so cron history goes through the
+        # single key authority. Default mode → byte-identical (owner_profile,
+        # owner_open_id); strict mode → an isolated cron-channel key so cron
+        # deliveries don't cross into the owner's DM/webui sessions.
+        key = router._history_key(owner_profile, owner_open_id, None, channel="cron")
         existing = router._session_history.get(key, [])
         router._session_history[key] = router._trim_history(
             existing + [{"role": "assistant", "content": mirrored_content}]
         )
         store = router._get_session_store()
         if store is not None:
-            store.append(owner_profile, owner_open_id, "assistant", mirrored_content)
+            store.append(key[0], key[1], "assistant", mirrored_content)
         logger.info(
             "[multitenancy] mirrored cron delivery to profile session profile=%s job=%s",
             owner_profile,

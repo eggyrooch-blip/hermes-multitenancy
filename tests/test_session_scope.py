@@ -235,3 +235,21 @@ def test_dispatch_scope_strict_channel_isolation(monkeypatch):
         "p", "ou_a", None, "oc", None, channel="webui"
     )
     assert feishu.history_key != webui.history_key
+
+
+def test_cron_mirror_uses_cron_channel_key(monkeypatch):
+    """Re-review (round 2): the cron delivery mirror must go through the typed
+    construction point with channel='cron' — default-mode byte-identical, strict
+    isolated from the owner's DM/webui sessions."""
+    from hermes_multitenancy import router
+
+    # Default: byte-identical to the legacy raw (profile, open_id) tuple.
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    assert router._history_key("p", "ou_owner", None, channel="cron") == ("p", "ou_owner")
+
+    # Strict: cron key is isolated from the owner's feishu DM key.
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    cron_key = router._history_key("p", "ou_owner", None, channel="cron")
+    dm_key = router._history_key("p", "ou_owner", None, channel="feishu")
+    assert cron_key != dm_key
+    assert cron_key[0] == "p"  # still a 2-tuple, SessionStore signature intact
