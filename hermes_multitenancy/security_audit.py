@@ -39,10 +39,25 @@ def _truthy(value: str | None) -> bool:
 
 
 def security_audit_enabled() -> bool:
+    """Whether security-audit JSONL is written.
+
+    DEFAULT OFF so a default-off deploy is byte-identical to pre-merge prod (no
+    new /var/log/hermes/multitenancy-security.jsonl side-effect). Turned on by
+    an explicit HERMES_MT_SECURITY_AUDIT_ENABLED, OR automatically under strict
+    context (strict = the hardened security posture, where audit belongs). An
+    explicit HERMES_MT_SECURITY_AUDIT_ENABLED=0 wins even under strict (operator
+    override).
+    """
     raw = os.getenv("HERMES_MT_SECURITY_AUDIT_ENABLED")
-    if raw is None:
-        return True
-    return _truthy(raw)
+    if raw is not None:
+        return _truthy(raw)
+    # No explicit flag: follow the strict-context posture (default off).
+    try:
+        from .runtime import strict_context_enabled
+
+        return strict_context_enabled()
+    except Exception:  # pragma: no cover - defensive: never break callers
+        return False
 
 
 def security_audit_path() -> Path:

@@ -117,16 +117,28 @@ def _sandbox_required_available_check() -> dict[str, Any]:
     check = dict(_required_sandbox_check())
     check["name"] = "sandbox_required_available"
     check["required_when"] = "HERMES_MULTITENANCY_REQUIRE_SANDBOX"
-    # Under strict context the sandbox must be ACTIVELY enforced. The upstream
-    # check returns ok/"skipped" when REQUIRE_SANDBOX is off — a fail-open hole
-    # a strict startup gate must catch (else prod boots without sandboxing).
-    if runtime.strict_context_enabled() and not runtime.require_sandbox_enabled():
-        check["ok"] = False
-        check["status"] = "disabled"
-        check["reason"] = (
-            "sandbox enforcement (HERMES_MULTITENANCY_REQUIRE_SANDBOX) must be "
-            "on under strict context"
-        )
+    if runtime.strict_context_enabled():
+        # The REAL master on/off switch is HERMES_USE_SANDBOX — agent_real
+        # returns the command UNWRAPPED whenever it != "1", regardless of
+        # REQUIRE_SANDBOX. REQUIRE_SANDBOX only flips warn-fallback into
+        # fail-closed. A strict startup gate must therefore verify BOTH, else it
+        # reports GREEN while every subprocess spawns unsandboxed.
+        use_sandbox = os.getenv("HERMES_USE_SANDBOX") == "1"
+        if not use_sandbox:
+            check["ok"] = False
+            check["status"] = "disabled"
+            check["reason"] = (
+                "sandbox is OFF (HERMES_USE_SANDBOX != 1) — subprocesses run "
+                "unsandboxed; the master switch must be on under strict context"
+            )
+        elif not runtime.require_sandbox_enabled():
+            check["ok"] = False
+            check["status"] = "disabled"
+            check["reason"] = (
+                "sandbox enforcement (HERMES_MULTITENANCY_REQUIRE_SANDBOX) must "
+                "be on under strict context so a missing backend fails closed "
+                "instead of warn-falling-back to unsandboxed exec"
+            )
     return check
 
 

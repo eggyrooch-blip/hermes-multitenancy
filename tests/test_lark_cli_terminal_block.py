@@ -147,7 +147,8 @@ def test_append_security_event_hashes_open_id_and_drops_secret_fields(monkeypatc
 
     audit_path = tmp_path / "security-audit.jsonl"
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit_path))
-    monkeypatch.delenv("HERMES_MT_SECURITY_AUDIT_ENABLED", raising=False)
+    # Audit now defaults OFF; this test asserts audit CONTENT so it opts in.
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
 
     append_security_event(
         event_type="lark_cli.direct_exec.denied",

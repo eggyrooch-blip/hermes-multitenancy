@@ -40,6 +40,7 @@ def _strict_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HERMES_MULTITENANCY_AUTO_PROVISION", raising=False)
     monkeypatch.delenv("HERMES_MULTITENANCY_DEV_MODE", raising=False)
     monkeypatch.delenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)
 
 
 def _checks(report: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -54,9 +55,11 @@ def test_build_report_passes_when_configured(
 
     shared_home, db_path = _configured_home(tmp_path)
 
-    # A genuinely locked-down strict deployment: sandbox enforced + available
-    # and the trusted authsidecar binary present. (Monkeypatched because the
-    # real sandbox policy file / Go sidecar aren't in the unit-test sandbox.)
+    # A genuinely locked-down strict deployment: sandbox master switch ON
+    # (HERMES_USE_SANDBOX — the real wrap gate) + enforcement ON + backend
+    # available + trusted authsidecar present. (Monkeypatched because the real
+    # sandbox policy file / Go sidecar aren't in the unit-test sandbox.)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
     monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
     monkeypatch.setattr(
         doctor,
@@ -93,6 +96,33 @@ def test_strict_fails_when_sandbox_not_enforced(
 
     row = _checks(report)["sandbox_required_available"]
     assert row["ok"] is False
+    assert "sandbox_required_available" in report["failed_required"]
+
+
+def test_strict_fails_when_use_sandbox_off_despite_require_and_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration finding (issue 3): the real wrap gate is HERMES_USE_SANDBOX
+    (agent_real returns the command UNWRAPPED when it != '1'). With REQUIRE=1 and
+    a healthy backend but USE_SANDBOX off, subprocesses run unsandboxed — the
+    doctor must FAIL, not report GREEN."""
+    from hermes_multitenancy import doctor
+    from hermes_multitenancy.doctor import build_report
+
+    shared_home, db_path = _configured_home(tmp_path)
+    monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)  # master switch OFF
+    monkeypatch.setattr(
+        doctor,
+        "_required_sandbox_check",
+        lambda: {"name": "required_sandbox", "ok": True, "status": "available"},
+    )
+
+    report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
+
+    row = _checks(report)["sandbox_required_available"]
+    assert row["ok"] is False
+    assert "HERMES_USE_SANDBOX" in row["reason"]
     assert "sandbox_required_available" in report["failed_required"]
 
 
