@@ -124,12 +124,25 @@ def _sandbox_required_available_check() -> dict[str, Any]:
         # fail-closed. A strict startup gate must therefore verify BOTH, else it
         # reports GREEN while every subprocess spawns unsandboxed.
         use_sandbox = os.getenv("HERMES_USE_SANDBOX") == "1"
+        pilot_profiles = (os.getenv("HERMES_SANDBOX_PROFILES") or "").strip()
         if not use_sandbox:
             check["ok"] = False
             check["status"] = "disabled"
             check["reason"] = (
                 "sandbox is OFF (HERMES_USE_SANDBOX != 1) — subprocesses run "
                 "unsandboxed; the master switch must be on under strict context"
+            )
+        elif pilot_profiles:
+            # HERMES_SANDBOX_PROFILES restricts sandboxing to a pilot allowlist;
+            # profiles NOT in it run UNWRAPPED (agent_real._wrap_with_sandbox).
+            # Under strict, "doctor green" must mean ALL subprocesses sandboxed —
+            # a partial pilot is not a fully-locked-down posture, so fail closed.
+            check["ok"] = False
+            check["status"] = "partial_pilot"
+            check["reason"] = (
+                "sandbox is scoped to a pilot allowlist "
+                "(HERMES_SANDBOX_PROFILES set) — unlisted profiles run "
+                "unsandboxed; strict context requires global sandboxing (unset it)"
             )
         elif not runtime.require_sandbox_enabled():
             check["ok"] = False

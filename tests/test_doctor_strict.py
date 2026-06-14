@@ -41,6 +41,7 @@ def _strict_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HERMES_MULTITENANCY_DEV_MODE", raising=False)
     monkeypatch.delenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", raising=False)
     monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
 
 
 def _checks(report: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -123,6 +124,33 @@ def test_strict_fails_when_use_sandbox_off_despite_require_and_backend(
     row = _checks(report)["sandbox_required_available"]
     assert row["ok"] is False
     assert "HERMES_USE_SANDBOX" in row["reason"]
+    assert "sandbox_required_available" in report["failed_required"]
+
+
+def test_strict_fails_when_sandbox_scoped_to_pilot_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding: with HERMES_USE_SANDBOX=1 but HERMES_SANDBOX_PROFILES set
+    (pilot scoping), unlisted profiles run UNWRAPPED — strict 'doctor green' must
+    mean ALL subprocesses sandboxed, so a partial pilot must FAIL."""
+    from hermes_multitenancy import doctor
+    from hermes_multitenancy.doctor import build_report
+
+    shared_home, db_path = _configured_home(tmp_path)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "spike_test")  # partial pilot
+    monkeypatch.setattr(
+        doctor,
+        "_required_sandbox_check",
+        lambda: {"name": "required_sandbox", "ok": True, "status": "available"},
+    )
+
+    report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
+
+    row = _checks(report)["sandbox_required_available"]
+    assert row["ok"] is False
+    assert row["status"] == "partial_pilot"
     assert "sandbox_required_available" in report["failed_required"]
 
 
