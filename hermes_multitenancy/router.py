@@ -1889,22 +1889,37 @@ def _install_auxiliary_main_runtime_patch(runtime: Optional[dict[str, str]]) -> 
 
     setattr(auxiliary_client, "_read_main_provider", lambda: provider)
     setattr(auxiliary_client, "_read_main_model", lambda: model)
+    return auxiliary_client, saved
 
-    # Override the per-provider vision model where the core's hardcoded choice is
-    # unavailable on our account. The vision auto-detect resolves a multimodal
-    # model via auxiliary_client._PROVIDER_VISION_MODELS[provider]; for zai it
-    # picks ``glm-5v-turbo``, which our z.ai plan does NOT include (HTTP 429 code
-    # 1311), so image vision fails even though TEXT works. ``glm-4.6v`` is on the
-    # plan and is multimodal. Patch the map (restored after the prep call) so the
-    # image-prep vision call uses the working model.
+
+def _install_vision_model_override(provider: str) -> tuple[Optional[Any], dict[str, tuple[bool, Any]]]:
+    """Override the auto-detected vision model for ``provider`` when the core's
+    hardcoded choice is unavailable on our account.
+
+    The vision auto-detect resolves the multimodal model via
+    ``auxiliary_client._PROVIDER_VISION_MODELS[provider]``; for zai it picks
+    ``glm-5v-turbo``, which our z.ai plan does NOT include (HTTP 429 code 1311),
+    so image vision fails even though TEXT works. ``glm-4.6v`` is on the plan and
+    is multimodal. This runs independently of the main-runtime patch (which is a
+    no-op when no complete custom runtime can be built, e.g. plain zai profiles),
+    so the override applies for those profiles too. Restored after the prep call.
+    """
     override_model = _VISION_MODEL_OVERRIDE.get(str(provider or "").strip().lower())
-    if override_model:
-        current_map = getattr(auxiliary_client, "_PROVIDER_VISION_MODELS", None)
-        if isinstance(current_map, dict) and current_map.get(provider) != override_model:
-            saved["_PROVIDER_VISION_MODELS"] = (True, current_map)
-            patched_map = dict(current_map)
-            patched_map[provider] = override_model
-            setattr(auxiliary_client, "_PROVIDER_VISION_MODELS", patched_map)
+    if not override_model:
+        return None, {}
+    try:
+        auxiliary_client = importlib.import_module("agent.auxiliary_client")
+    except Exception as exc:
+        logger.debug("multitenancy: agent.auxiliary_client unavailable for vision override (%s)", exc)
+        return None, {}
+    current_map = getattr(auxiliary_client, "_PROVIDER_VISION_MODELS", None)
+    key = str(provider or "").strip().lower()
+    if not isinstance(current_map, dict) or current_map.get(key) == override_model:
+        return None, {}
+    saved = {"_PROVIDER_VISION_MODELS": (True, current_map)}
+    patched_map = dict(current_map)
+    patched_map[key] = override_model
+    setattr(auxiliary_client, "_PROVIDER_VISION_MODELS", patched_map)
     return auxiliary_client, saved
 
 
@@ -1939,11 +1954,26 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
             old_home = os.environ.get(HERMES_HOME_ENV)
             auxiliary_client = None
             saved_aux: dict[str, tuple[bool, Any]] = {}
+            vis_client = None
+            saved_vis: dict[str, tuple[bool, Any]] = {}
             try:
                 os.environ[HERMES_HOME_ENV] = str(profile_home)
                 auxiliary_client, saved_aux = _install_auxiliary_main_runtime_patch(runtime)
+                # Apply the vision-model override independently of the main-runtime
+                # patch (which no-ops for plain provider profiles like zai). Read
+                # the profile's provider from its merged config.
+                try:
+                    from .agent_real import _load_profile_config
+                    _prof_cfg = _load_profile_config(profile_home)
+                    _prof_provider = str(((_prof_cfg.get("model") or {}).get("provider") or "")).strip()
+                except Exception as exc:
+                    _prof_provider = ""
+                    logger.debug("multitenancy: vision-override provider read failed (%s)", exc)
+                if _prof_provider:
+                    vis_client, saved_vis = _install_vision_model_override(_prof_provider)
                 yield
             finally:
+                _restore_auxiliary_main_runtime_patch(vis_client, saved_vis)
                 _restore_auxiliary_main_runtime_patch(auxiliary_client, saved_aux)
                 if had_home:
                     os.environ[HERMES_HOME_ENV] = old_home or ""
