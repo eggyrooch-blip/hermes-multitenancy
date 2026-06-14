@@ -129,9 +129,32 @@ _RECENT_FILE_CONTEXT_TRIGGER_RE = re.compile(
 )
 
 
-def _history_key(profile_name: str, sender: str, sender_alt: Optional[str]) -> tuple[str, str]:
-    """Return the per-(profile, user) key used to look up conversation history."""
-    return (profile_name, _tenant_user_key(sender, sender_alt))
+def _history_key(
+    profile_name: str,
+    sender: str,
+    sender_alt: Optional[str],
+    *,
+    channel: str = "feishu",
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    route_version: int = 0,
+) -> tuple[str, str]:
+    """Return the per-(profile, user) key used to look up conversation history.
+
+    Constructed via the typed SessionScope (P1-7). With strict context OFF the
+    result is byte-identical to the legacy ``(profile, user_key)`` tuple; with
+    strict ON channel/chat/thread/route_version isolate surfaces & threads.
+    """
+    from .session_scope import build_session_scope
+
+    return build_session_scope(
+        profile_name=profile_name,
+        user_key=_tenant_user_key(sender, sender_alt),
+        channel=channel,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        route_version=route_version,
+    ).history_key
 
 
 def _pending_auth_replay_key(profile_name: str, open_id: str) -> str:
@@ -177,11 +200,25 @@ def _inflight_key(
     sender: str,
     sender_alt: Optional[str],
     chat_id: str,
+    *,
+    channel: str = "feishu",
+    thread_id: Optional[str] = None,
 ) -> tuple[str, str, str]:
-    """Return the profile/chat/user scoped key for replace, /stop, and /status."""
-    profile_key = str(profile_name or "").strip() or "_unrouted"
-    chat_key = str(chat_id or "").strip() or "unknown"
-    return (profile_key, chat_key, _tenant_user_key(sender, sender_alt))
+    """Return the profile/chat/user scoped key for replace, /stop, and /status.
+
+    Delegates to the typed SessionScope (P1-7): byte-identical to the legacy
+    ``(profile, chat, user_key)`` tuple with strict context OFF; channel/thread
+    folded into the user dimension with strict ON.
+    """
+    from .session_scope import build_session_scope
+
+    return build_session_scope(
+        profile_name=profile_name,
+        user_key=_tenant_user_key(sender, sender_alt),
+        channel=channel,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    ).inflight_key
 
 
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
