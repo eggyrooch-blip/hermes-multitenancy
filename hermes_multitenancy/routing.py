@@ -842,17 +842,21 @@ class RoutingTable:
 
     # -- diagnostics -------------------------------------------------------
 
-    def count_active(self, *, kind: Optional[str] = None) -> int:
-        if kind is None:
-            cur = self._conn.execute(
-                "SELECT COUNT(*) FROM multitenancy_routing WHERE active = 1"
-            )
-        else:
-            cur = self._conn.execute(
-                "SELECT COUNT(*) FROM multitenancy_routing "
-                "WHERE active = 1 AND kind = ?",
-                (kind,),
-            )
+    def count_active(
+        self, *, kind: Optional[str] = None, provenance: Optional[str] = None
+    ) -> int:
+        clauses = ["active = 1"]
+        params: list[Any] = []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if provenance is not None:
+            clauses.append("provenance = ?")
+            params.append(provenance)
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM multitenancy_routing WHERE " + " AND ".join(clauses),
+            tuple(params),
+        )
         return int(cur.fetchone()[0])
 
     def close(self) -> None:

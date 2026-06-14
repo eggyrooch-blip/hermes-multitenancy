@@ -226,16 +226,33 @@ def _db_not_world_readable_check(*, db_path: Path) -> dict[str, Any]:
     )
 
 
+def _resolve_authsidecar_binary() -> str | None:
+    """Resolve the ACTUAL lark-cli-authsidecar binary for the strict gate.
+
+    Unlike the runtime's ``_resolve_binary`` we deliberately do NOT fall back to
+    ``shutil.which("lark-cli")`` — a generic lark-cli on PATH (e.g. the npm
+    package) is not the trusted Go authsidecar and must not satisfy the strict
+    "lark-cli-authsidecar 在" gate. Only an explicit HERMES_LARK_CLI_BIN or the
+    canonical shared_home/bin/lark-cli-authsidecar counts.
+    """
+    configured = os.getenv("HERMES_LARK_CLI_BIN")
+    if configured and Path(configured).expanduser().is_file():
+        return configured
+    base_home = Path(os.getenv("HERMES_BASE_HOME") or Path.home() / ".hermes").expanduser()
+    sidecar = base_home / "bin" / "lark-cli-authsidecar"
+    if sidecar.is_file():
+        return str(sidecar)
+    return None
+
+
 def _lark_cli_authsidecar_check() -> dict[str, Any]:
     check = dict(_lark_cli_registration_check())
     check["name"] = "lark_cli_authsidecar"
-    # Tool-schema registration alone is not enough — verify the actual
-    # authsidecar binary is resolvable (shared_home/bin or PATH via the same
-    # resolver the runtime uses), else strict prod would pass with no CLI.
+    # Tool-schema registration alone is not enough — verify the actual trusted
+    # authsidecar binary is present (NOT a generic lark-cli on PATH), else strict
+    # prod would pass with no real auth bridge.
     try:
-        from . import lark_cli_tool
-
-        binary = lark_cli_tool._resolve_binary()
+        binary = _resolve_authsidecar_binary()
     except Exception as exc:  # pragma: no cover - defensive
         binary = None
         check["reason"] = f"authsidecar probe failed: {exc.__class__.__name__}"
@@ -244,7 +261,8 @@ def _lark_cli_authsidecar_check() -> dict[str, Any]:
         check["status"] = "binary_missing"
         check.setdefault(
             "reason",
-            "lark-cli-authsidecar binary not found (shared_home/bin or PATH)",
+            "lark-cli-authsidecar binary not found "
+            "(HERMES_LARK_CLI_BIN or shared_home/bin/lark-cli-authsidecar)",
         )
     else:
         check["binary"] = str(binary)
@@ -254,15 +272,20 @@ def _lark_cli_authsidecar_check() -> dict[str, Any]:
 def _route_table_active_users_check(*, db_path: Path) -> dict[str, Any]:
     table = RoutingTable(db_path)
     try:
-        active_users = table.count_active(kind="user")
+        # SPEC: "active SYNCED users". An auto-provisioned (provenance='auto')
+        # row must NOT satisfy the gate — only genuinely directory-synced users
+        # prove the route table is populated from the real source of truth.
+        synced_users = table.count_active(kind="user", provenance="sync")
     finally:
         table.close()
     return _row(
         "route_table_active_users",
-        active_users > 0,
-        "active" if active_users > 0 else "empty",
-        active_users=active_users,
-        reason="active user routes found" if active_users > 0 else "no active user routes",
+        synced_users > 0,
+        "active" if synced_users > 0 else "empty",
+        active_users=synced_users,
+        reason="active synced user routes found"
+        if synced_users > 0
+        else "no active synced user routes (auto-provisioned rows don't count)",
     )
 
 

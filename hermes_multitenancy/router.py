@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import socket
 import time
@@ -181,6 +182,34 @@ def _inflight_key(
     profile_key = str(profile_name or "").strip() or "_unrouted"
     chat_key = str(chat_id or "").strip() or "unknown"
     return (profile_key, chat_key, _tenant_user_key(sender, sender_alt))
+
+
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _safe_command_kind(command: str) -> str:
+    """Extract ONLY the executable basename for the approval audit — never a raw
+    path nor any secret. Uses shlex so a quoted env-assignment value
+    (``VAR='top secret' cmd``) stays one token and is skipped; leading
+    ``VAR=...`` env assignments are dropped, then the real executable's basename
+    is returned. Any pathological result containing '=' or whitespace falls back
+    to a sentinel rather than risk leaking a fragment."""
+    stripped = str(command or "").strip()
+    if not stripped:
+        return "<empty>"
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        return "<unparseable>"
+    idx = 0
+    while idx < len(tokens) and _ENV_ASSIGN_RE.match(tokens[idx]):
+        idx += 1
+    if idx >= len(tokens):
+        return "<env-only>" if tokens else "<empty>"
+    base = os.path.basename(tokens[idx]) or tokens[idx]
+    if "=" in base or any(ch.isspace() for ch in base):
+        return "<redacted>"
+    return base[:32]
 
 
 def _tenant_user_key(sender: str, sender_alt: Optional[str]) -> str:
@@ -3904,27 +3933,14 @@ async def _handle_child_approval_required(adapter: Any, chat_id: str, payload: A
         str(data.get("approval_id") or ""),
         command[:120],
     )
-    stripped_command = command.strip()
-    # Record only the executable basename, never a raw token — both an absolute
-    # path (/Users/alice/secret-bin/doit) AND a leading "VAR=secret" env
-    # assignment would otherwise leak into the audit log (SPEC: 无 raw 路径/无
-    # secret). Skip env-assignment prefixes, then basename the real executable.
-    # The full command stays correlatable via command_hash.
-    tokens = stripped_command.split() if stripped_command else []
-    _env_assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-    idx = 0
-    while idx < len(tokens) and _env_assign.match(tokens[idx]):
-        idx += 1
-    exe = tokens[idx] if idx < len(tokens) else ""
-    if exe:
-        command_kind = (os.path.basename(exe) or exe)[:32]
-    else:
-        command_kind = "<env-only>" if tokens else "<empty>"
+    # Audit only the executable basename — never a raw path or any secret
+    # fragment (SPEC: 无 raw 路径/无 secret). _safe_command_kind handles quoted
+    # env-assignment values via shlex. Full command stays correlatable by hash.
     append_security_event(
         event_type="approval.requested",
         open_id=str(data.get("open_id") or "").strip() or None,
         command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest()[:12],
-        command_kind=command_kind,
+        command_kind=_safe_command_kind(command),
         reason="dangerous_command",
         decision="requested",
     )

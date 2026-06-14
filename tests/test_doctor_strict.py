@@ -49,14 +49,14 @@ def _checks(report: dict[str, object]) -> dict[str, dict[str, object]]:
 def test_build_report_passes_when_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from hermes_multitenancy import doctor, lark_cli_tool
+    from hermes_multitenancy import doctor
     from hermes_multitenancy.doctor import build_report
 
     shared_home, db_path = _configured_home(tmp_path)
 
     # A genuinely locked-down strict deployment: sandbox enforced + available
-    # and the authsidecar binary present. (Monkeypatched because the real
-    # sandbox policy file / Go sidecar aren't in the unit-test sandbox.)
+    # and the trusted authsidecar binary present. (Monkeypatched because the
+    # real sandbox policy file / Go sidecar aren't in the unit-test sandbox.)
     monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
     monkeypatch.setattr(
         doctor,
@@ -65,7 +65,7 @@ def test_build_report_passes_when_configured(
     )
     sidecar = tmp_path / "lark-cli-authsidecar"
     sidecar.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(lark_cli_tool, "_resolve_binary", lambda: str(sidecar))
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(sidecar))
 
     report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
 
@@ -101,11 +101,14 @@ def test_strict_fails_when_authsidecar_binary_missing(
 ) -> None:
     """Re-review gap B: tool-schema registration is not enough — the actual
     authsidecar binary must resolve, else the check is a false PASS."""
-    from hermes_multitenancy import lark_cli_tool
     from hermes_multitenancy.doctor import build_report
 
     shared_home, db_path = _configured_home(tmp_path)
-    monkeypatch.setattr(lark_cli_tool, "_resolve_binary", lambda: None)
+    # No HERMES_LARK_CLI_BIN, and HERMES_BASE_HOME points at a dir with no
+    # bin/lark-cli-authsidecar → resolver returns None (a generic lark-cli on
+    # PATH must NOT satisfy the gate).
+    monkeypatch.delenv("HERMES_LARK_CLI_BIN", raising=False)
+    monkeypatch.setenv("HERMES_BASE_HOME", str(tmp_path / "empty-home"))
 
     report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
 
@@ -113,6 +116,47 @@ def test_strict_fails_when_authsidecar_binary_missing(
     assert row["ok"] is False
     assert row["status"] == "binary_missing"
     assert "lark_cli_authsidecar" in report["failed_required"]
+
+
+def test_strict_authsidecar_rejects_generic_lark_cli_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review (round 3) gap: a generic `lark-cli` on PATH (e.g. npm package)
+    must NOT satisfy the authsidecar gate — only the trusted Go sidecar does."""
+    from hermes_multitenancy import doctor
+
+    monkeypatch.delenv("HERMES_LARK_CLI_BIN", raising=False)
+    monkeypatch.setenv("HERMES_BASE_HOME", str(tmp_path / "empty-home"))
+    # Even if a generic lark-cli is on PATH, the strict resolver ignores it.
+    assert doctor._resolve_authsidecar_binary() is None
+
+
+def test_strict_route_table_rejects_auto_provisioned_only(
+    tmp_path: Path,
+) -> None:
+    """Re-review (round 3) gap: SPEC says 'active SYNCED users' — an active
+    auto-provisioned row must NOT satisfy the gate."""
+    from hermes_multitenancy.doctor import _route_table_active_users_check
+    from hermes_multitenancy.routing import RoutingTable
+
+    db_path = tmp_path / "auto.db"
+    table = RoutingTable(db_path)
+    try:
+        # Router auto-provision writes user_id == open_id; the routing migration
+        # derives provenance='auto' from exactly that identity equality (the
+        # passed provenance is normalized deterministically on open).
+        table.upsert(
+            user_id="ou_auto",
+            profile_name="auto_profile",
+            open_id="ou_auto",
+        )
+    finally:
+        table.close()
+    db_path.chmod(0o600)
+
+    row = _route_table_active_users_check(db_path=db_path)
+    assert row["ok"] is False  # auto-provisioned (user_id==open_id) isn't synced
+    assert row["active_users"] == 0
 
 
 def test_strict_exits_nonzero_when_required_check_fails(

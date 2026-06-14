@@ -153,6 +153,42 @@ def test_approval_requested_env_only_command(monkeypatch, tmp_path):
     assert "bar" not in _raw(audit) and "qux" not in _raw(audit)
 
 
+def test_approval_requested_handles_quoted_env_value(monkeypatch, tmp_path):
+    """Re-review round 3: a QUOTED env-assignment value must not leak a fragment
+    via naive .split() — shlex keeps it one token so it's skipped entirely."""
+    from hermes_multitenancy import router
+
+    audit = tmp_path / "security.jsonl"
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit))
+    payload = {
+        "command": "AWS_SECRET_ACCESS_KEY='top secret value' /opt/bin/deploy --prod",
+        "description": "dangerous",
+        "open_id": "ou_q",
+        "session_key": "sk",
+        "approval_id": "ap4",
+    }
+    asyncio.run(router._handle_child_approval_required(None, "oc_chat", payload))
+    row = [r for r in _rows(audit) if r["event_type"] == "approval.requested"][-1]
+    assert row["command_kind"] == "deploy"
+    raw = _raw(audit)
+    assert "secret" not in raw  # no fragment of the quoted value leaks
+    assert "top" not in raw
+    assert "AWS_SECRET_ACCESS_KEY" not in raw
+
+
+def test_safe_command_kind_unit():
+    from hermes_multitenancy.router import _safe_command_kind
+
+    assert _safe_command_kind("rm -rf /") == "rm"
+    assert _safe_command_kind("/a/b/c/doit x") == "doit"
+    assert _safe_command_kind("FOO=bar /x/y run") == "y"  # /x/y is the exe, run is its arg
+    assert _safe_command_kind("FOO='a b c' run") == "run"
+    assert _safe_command_kind("FOO=bar") == "<env-only>"
+    assert _safe_command_kind("") == "<empty>"
+    # Unbalanced quote → shlex raises → safe sentinel, never a partial leak.
+    assert _safe_command_kind("FOO='unterminated secret") == "<unparseable>"
+
+
 # --------------------------------------------------------------------------- #
 # Gap 3 — fork suppression path audits, deduped by message id
 # --------------------------------------------------------------------------- #
@@ -317,3 +353,49 @@ def test_denied_lease_attributed_to_token_not_request_body(monkeypatch, tmp_path
     raw = _raw(audit)
     assert "ou_spoofed_victim" not in raw
     assert "victim_profile" not in raw
+
+
+def test_denied_lease_kind_clamped_to_known_enum(monkeypatch, tmp_path):
+    """Re-review round 3: lease_kind is attacker-controlled request JSON; it must
+    be clamped to a known enum so an injected secret can't reach the audit log."""
+    import asyncio as _asyncio
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_credential_broker_token,
+    )
+
+    audit = tmp_path / "security.jsonl"
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    async def runner():
+        app = create_run_broker_app()
+        register_credential_broker_token(
+            token="tok-k", profile_name="alice", open_id="ou_o", run_id="run-k"
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/run-broker/credentials/lease",
+                headers={"Authorization": "Bearer tok-k"},
+                json={
+                    "lease": "invalid-lease",
+                    "kind": "access_token=SECRET123",  # injection attempt
+                    "profile_name": "alice",
+                    "open_id": "ou_o",
+                    "run_id": "run-k",
+                },
+            )
+            assert resp.status == 403
+        finally:
+            await client.close()
+
+    _asyncio.run(runner())
+
+    row = [r for r in _rows(audit) if r["event_type"] == "credential.lease.denied"][-1]
+    assert row["lease_kind"] == "<invalid>"  # clamped, not the raw injection
+    assert "SECRET123" not in _raw(audit)

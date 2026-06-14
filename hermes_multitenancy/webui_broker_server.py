@@ -2151,6 +2151,11 @@ def create_run_broker_app(
             return web.json_response({"error": "bad_request"}, status=400)
         lease = str(payload.get("lease") or "").strip()
         kind = str(payload.get("kind") or "").strip()
+        # The audit must never log a raw, attacker-controlled `kind` (it could
+        # carry an injected secret/log-injection payload). Clamp to the known
+        # enum; anything else is recorded as <invalid>. The real branch logic
+        # below still uses `kind` and simply no-ops on an unknown value.
+        audit_kind = kind if kind in {"feishu_uat", "provider_env"} else "<invalid>"
         profile_name = str(payload.get("profile_name") or "").strip()
         open_id = str(payload.get("open_id") or "").strip()
         run_id = str(payload.get("run_id") or "").strip()
@@ -2172,7 +2177,7 @@ def create_run_broker_app(
                 event_type="credential.lease.granted",
                 open_id=claims.open_id,
                 profile=claims.profile_name,
-                lease_kind=kind,
+                lease_kind=audit_kind,
                 decision="granted",
             )
         except LeaseError:
@@ -2184,7 +2189,7 @@ def create_run_broker_app(
                 event_type="credential.lease.denied",
                 open_id=token_record["open_id"],
                 profile=token_record["profile_name"],
-                lease_kind=kind,
+                lease_kind=audit_kind,
                 decision="denied",
                 reason="lease_verification_failed",
             )
