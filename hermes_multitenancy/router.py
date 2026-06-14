@@ -1751,6 +1751,14 @@ _AUX_MAIN_RUNTIME_FIELDS = (
     "_RUNTIME_MAIN_API_MODE",
 )
 
+# Per-provider override for the auto-detected image-vision model when the core's
+# hardcoded choice is unavailable on our account. zai → glm-5v-turbo is not in
+# our z.ai plan (HTTP 429 code 1311); glm-4.6v is, and is multimodal. Applied
+# (and restored) inside the image-prep runtime patch under the env lock.
+_VISION_MODEL_OVERRIDE: dict[str, str] = {
+    "zai": "glm-4.6v",
+}
+
 
 def _matching_custom_provider_entry(config: dict[str, Any], provider: str) -> Optional[dict[str, Any]]:
     """Return the custom provider entry that backs ``provider`` if present."""
@@ -1881,6 +1889,22 @@ def _install_auxiliary_main_runtime_patch(runtime: Optional[dict[str, str]]) -> 
 
     setattr(auxiliary_client, "_read_main_provider", lambda: provider)
     setattr(auxiliary_client, "_read_main_model", lambda: model)
+
+    # Override the per-provider vision model where the core's hardcoded choice is
+    # unavailable on our account. The vision auto-detect resolves a multimodal
+    # model via auxiliary_client._PROVIDER_VISION_MODELS[provider]; for zai it
+    # picks ``glm-5v-turbo``, which our z.ai plan does NOT include (HTTP 429 code
+    # 1311), so image vision fails even though TEXT works. ``glm-4.6v`` is on the
+    # plan and is multimodal. Patch the map (restored after the prep call) so the
+    # image-prep vision call uses the working model.
+    override_model = _VISION_MODEL_OVERRIDE.get(str(provider or "").strip().lower())
+    if override_model:
+        current_map = getattr(auxiliary_client, "_PROVIDER_VISION_MODELS", None)
+        if isinstance(current_map, dict) and current_map.get(provider) != override_model:
+            saved["_PROVIDER_VISION_MODELS"] = (True, current_map)
+            patched_map = dict(current_map)
+            patched_map[provider] = override_model
+            setattr(auxiliary_client, "_PROVIDER_VISION_MODELS", patched_map)
     return auxiliary_client, saved
 
 

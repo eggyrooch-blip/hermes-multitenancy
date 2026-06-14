@@ -610,57 +610,12 @@ def _normalize_model_spec_inplace(config: dict[str, Any]) -> None:
         model["default"] = f"{provider}/{default_model}"
 
 
-# Per-provider vision aux model overrides. The core vision auto-detect hardcodes
-# a default multimodal model per provider; some are wrong for our accounts:
-#   - zai: auto-detect picks ``glm-5v-turbo``, but our shared z.ai plan does NOT
-#     include it (HTTP 429 code 1311 "subscription plan does not yet include
-#     GLM-5V-Turbo"). ``glm-4.6v`` IS available on the plan and is multimodal.
-# When the main provider matches and no explicit ``auxiliary.vision.model`` is
-# set, point vision at the working model instead of letting auto-detect fail.
-_VISION_AUX_MODEL_BY_PROVIDER: dict[str, str] = {
-    "zai": "glm-4.6v",
-}
-
-
-def _normalize_vision_aux_inplace(config: dict[str, Any]) -> None:
-    """Runtime safety net: route image vision to a model the account can use.
-
-    vision_analyze fails ("provider rejected the request" / "vision unavailable")
-    when the core auto-detected vision model is not available for the profile's
-    account, even though TEXT works (the main loop uses the configured chat
-    model). Inject ``auxiliary.vision`` = a known-good multimodal model for the
-    provider. Runs at every config READ so no write path can leave it broken.
-    """
-    model = config.get("model")
-    if not isinstance(model, dict):
-        return
-    provider = str(model.get("provider") or "").strip().lower()
-    target_model = _VISION_AUX_MODEL_BY_PROVIDER.get(provider)
-    if not target_model:
-        return
-    aux = config.get("auxiliary")
-    if not isinstance(aux, dict):
-        aux = {}
-        config["auxiliary"] = aux
-    vision = aux.get("vision")
-    if isinstance(vision, dict) and str(vision.get("model") or "").strip():
-        return  # explicit operator override wins — do not clobber
-    merged_vision = dict(vision) if isinstance(vision, dict) else {}
-    # Force provider to the main provider (not "auto") so the resolved model is
-    # used directly — leaving provider="auto" lets the core auto-detect re-pick
-    # its hardcoded (broken) vision model and ignore our override.
-    merged_vision["provider"] = provider
-    merged_vision["model"] = target_model
-    aux["vision"] = merged_vision
-
-
 def _load_profile_config(profile_home: Path) -> dict[str, Any]:
     shared_home = _resolve_shared_hermes_home(profile_home)
     shared = _load_yaml(shared_home / "config.yaml")
     profile = _load_yaml(profile_home / "config.yaml")
     merged = _merge_profile_config(shared, profile)
     _normalize_model_spec_inplace(merged)
-    _normalize_vision_aux_inplace(merged)
     return merged
 
 
