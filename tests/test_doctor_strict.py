@@ -131,6 +131,46 @@ def test_strict_authsidecar_rejects_generic_lark_cli_on_path(
     assert doctor._resolve_authsidecar_binary() is None
 
 
+def test_authsidecar_resolved_via_doctor_shared_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review (round 4) gap: the resolver must honor the doctor's --shared-home,
+    not just HERMES_BASE_HOME/~/.hermes."""
+    from hermes_multitenancy import doctor
+
+    monkeypatch.delenv("HERMES_LARK_CLI_BIN", raising=False)
+    monkeypatch.setenv("HERMES_BASE_HOME", str(tmp_path / "elsewhere"))
+    shared_home = tmp_path / "shared"
+    (shared_home / "bin").mkdir(parents=True)
+    sidecar = shared_home / "bin" / "lark-cli-authsidecar"
+    sidecar.write_text("#!/bin/sh\n")
+
+    assert doctor._resolve_authsidecar_binary(shared_home) == str(sidecar)
+    row = doctor._lark_cli_authsidecar_check(shared_home=shared_home)
+    assert row["ok"] is True
+    assert row["binary"] == str(sidecar)
+
+
+def test_non_strict_preserves_upstream_health_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review (round 4) gap / SPEC regression guard: non-strict build_report
+    must NOT flip ok=false from strict gate rows — it preserves upstream health."""
+    from hermes_multitenancy.doctor import build_report
+
+    shared_home, db_path = _configured_home(tmp_path)
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+
+    report = build_report(shared_home=shared_home, db_path=db_path, strict=False)
+
+    # Strict rows still present (informational) but they must NOT drive ok.
+    assert report["failed_required"] == []
+    assert report["ok"] == bool(report["upstream"].get("ready", True))
+    # Sanity: a strict run on the same posture WOULD fail (proves the rows exist).
+    strict_report = build_report(shared_home=shared_home, db_path=db_path, strict=True)
+    assert strict_report["failed_required"]  # strict still gates
+
+
 def test_strict_route_table_rejects_auto_provisioned_only(
     tmp_path: Path,
 ) -> None:

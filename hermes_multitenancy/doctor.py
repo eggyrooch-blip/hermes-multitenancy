@@ -226,33 +226,40 @@ def _db_not_world_readable_check(*, db_path: Path) -> dict[str, Any]:
     )
 
 
-def _resolve_authsidecar_binary() -> str | None:
+def _resolve_authsidecar_binary(shared_home: Path | None = None) -> str | None:
     """Resolve the ACTUAL lark-cli-authsidecar binary for the strict gate.
 
     Unlike the runtime's ``_resolve_binary`` we deliberately do NOT fall back to
     ``shutil.which("lark-cli")`` — a generic lark-cli on PATH (e.g. the npm
     package) is not the trusted Go authsidecar and must not satisfy the strict
-    "lark-cli-authsidecar 在" gate. Only an explicit HERMES_LARK_CLI_BIN or the
-    canonical shared_home/bin/lark-cli-authsidecar counts.
+    "lark-cli-authsidecar 在" gate. We honor the doctor's own ``shared_home``
+    (the --shared-home the gate is being run against) FIRST, then the explicit
+    HERMES_LARK_CLI_BIN override, then HERMES_BASE_HOME/~/.hermes.
     """
     configured = os.getenv("HERMES_LARK_CLI_BIN")
     if configured and Path(configured).expanduser().is_file():
         return configured
-    base_home = Path(os.getenv("HERMES_BASE_HOME") or Path.home() / ".hermes").expanduser()
-    sidecar = base_home / "bin" / "lark-cli-authsidecar"
-    if sidecar.is_file():
-        return str(sidecar)
+    candidate_homes = []
+    if shared_home is not None:
+        candidate_homes.append(Path(shared_home).expanduser())
+    candidate_homes.append(
+        Path(os.getenv("HERMES_BASE_HOME") or Path.home() / ".hermes").expanduser()
+    )
+    for home in candidate_homes:
+        sidecar = home / "bin" / "lark-cli-authsidecar"
+        if sidecar.is_file():
+            return str(sidecar)
     return None
 
 
-def _lark_cli_authsidecar_check() -> dict[str, Any]:
+def _lark_cli_authsidecar_check(*, shared_home: Path | None = None) -> dict[str, Any]:
     check = dict(_lark_cli_registration_check())
     check["name"] = "lark_cli_authsidecar"
     # Tool-schema registration alone is not enough — verify the actual trusted
     # authsidecar binary is present (NOT a generic lark-cli on PATH), else strict
     # prod would pass with no real auth bridge.
     try:
-        binary = _resolve_authsidecar_binary()
+        binary = _resolve_authsidecar_binary(shared_home)
     except Exception as exc:  # pragma: no cover - defensive
         binary = None
         check["reason"] = f"authsidecar probe failed: {exc.__class__.__name__}"
@@ -323,7 +330,7 @@ def _strict_checks(*, shared_home: Path, db_path: Path) -> list[dict[str, Any]]:
         _guarded("child_env_no_vault_key", _child_env_no_vault_key_check),
         _guarded("profile_dirs_0700", lambda: _profile_dirs_0700_check(shared_home=shared_home)),
         _guarded("db_not_world_readable", lambda: _db_not_world_readable_check(db_path=db_path)),
-        _guarded("lark_cli_authsidecar", _lark_cli_authsidecar_check),
+        _guarded("lark_cli_authsidecar", lambda: _lark_cli_authsidecar_check(shared_home=shared_home)),
         _guarded("route_table_active_users", lambda: _route_table_active_users_check(db_path=db_path)),
         _guarded("deleted_user_cannot_route", _deleted_user_cannot_route_check),
     ]
@@ -339,9 +346,17 @@ def build_report(*, shared_home: Path, db_path: Path, strict: bool) -> dict[str,
         for check in checks
         if check.get("name") in REQUIRED_CHECK_NAMES and not check.get("ok")
     ]
+    if strict:
+        ok = not failed_required
+    else:
+        # Non-strict mode must PRESERVE the existing upstream_health output
+        # (SPEC regression guard): the strict gate rows are informational only
+        # and must NOT flip ok / failed_required when --strict was not requested.
+        ok = bool(upstream.get("ready", True))
+        failed_required = []
     return {
         "strict": bool(strict),
-        "ok": not failed_required,
+        "ok": ok,
         "checks": checks,
         "upstream": upstream,
         "failed_required": failed_required,
