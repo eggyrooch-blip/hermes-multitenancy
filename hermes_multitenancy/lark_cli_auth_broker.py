@@ -5,6 +5,7 @@ import hashlib
 import http.server
 import hmac
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -258,6 +259,23 @@ class LarkCliAuthBroker:
             store.close()
 
     def _resolve_user_payload(self, store: object, *, json_payload: dict | None = None) -> dict:
+        from .credential_broker import BrokerClientError, fetch_via_broker, running_as_broker_child
+
+        if running_as_broker_child():
+            try:
+                payload = fetch_via_broker(
+                    kind="feishu_uat",
+                    profile_name=self.context.profile_name,
+                    open_id=self.context.user_open_id,
+                    run_id=os.environ.get("HERMES_MULTITENANCY_RUN_ID", ""),
+                )
+            except BrokerClientError:
+                raise PermissionError("credential unavailable")
+            if not payload:
+                raise PermissionError("credential unavailable")
+            if _payload_is_expired(payload):
+                raise CredentialExpiredError("credential expired")
+            return payload
         json_payload = json_payload or {}
         try:
             vault_payload = store.get_secret_for_runtime(

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -21,6 +22,12 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
 from . import cron_api
+from .credential_broker import (
+    LeaseError,
+    assert_lease_binding,
+    lease_signing_secret,
+    verify_lease,
+)
 from .run_broker import RunBroker, RunRejected
 from .run_models import RunEvent, RunRequest
 
@@ -57,6 +64,8 @@ _pending_clarifies: dict[str, dict[str, Any]] = {}
 _SESSION_COMMAND_RE = re.compile(r"^/([A-Za-z][\w-]*)(?:\s+([\s\S]*))?$")
 _SESSION_HISTORY_COMMANDS = frozenset({"new", "reset", "status"})
 _GOAL_COMMANDS = frozenset({"goal", "subgoal"})
+_credential_broker_tokens: dict[str, dict[str, str]] = {}
+_credential_broker_tokens_lock = threading.Lock()
 
 
 def _session_history_slash_commands() -> list[dict[str, str]]:
@@ -188,6 +197,41 @@ def _run_broker_port() -> int:
 
 def _run_broker_key() -> str:
     return os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_KEY", "").strip()
+
+
+def credential_broker_url() -> str:
+    return f"http://{_run_broker_host()}:{_run_broker_port()}"
+
+
+def register_credential_broker_token(*, token: str, profile_name: str, open_id: str, run_id: str) -> None:
+    key = str(token or "").strip()
+    if not key:
+        return
+    with _credential_broker_tokens_lock:
+        _credential_broker_tokens[key] = {
+            "profile_name": str(profile_name or "").strip(),
+            "open_id": str(open_id or "").strip(),
+            "run_id": str(run_id or "").strip(),
+        }
+
+
+def unregister_credential_broker_token(token: str) -> None:
+    key = str(token or "").strip()
+    if not key:
+        return
+    with _credential_broker_tokens_lock:
+        _credential_broker_tokens.pop(key, None)
+
+
+def _lookup_credential_broker_token(token: str) -> dict[str, str] | None:
+    key = str(token or "").strip()
+    if not key:
+        return None
+    with _credential_broker_tokens_lock:
+        record = _credential_broker_tokens.get(key)
+        if record is None or not hmac.compare_digest(key, token):
+            return None
+        return dict(record)
 
 
 def _positive_int_env(name: str) -> Optional[int]:
@@ -2092,6 +2136,58 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI credential hub failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_credential_lease(request):
+        header = request.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        token_record = _lookup_credential_broker_token(header[len(prefix):].strip())
+        if token_record is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad_request"}, status=400)
+        lease = str(payload.get("lease") or "").strip()
+        kind = str(payload.get("kind") or "").strip()
+        profile_name = str(payload.get("profile_name") or "").strip()
+        open_id = str(payload.get("open_id") or "").strip()
+        run_id = str(payload.get("run_id") or "").strip()
+        try:
+            claims = verify_lease(lease, secret=lease_signing_secret())
+            assert_lease_binding(
+                claims,
+                profile_name=profile_name,
+                open_id=open_id,
+                run_id=run_id,
+            )
+            assert_lease_binding(
+                claims,
+                profile_name=token_record["profile_name"],
+                open_id=token_record["open_id"],
+                run_id=token_record["run_id"],
+            )
+        except LeaseError:
+            return web.json_response({"error": "forbidden"}, status=403)
+        try:
+            if kind == "feishu_uat":
+                from .feishu_uat_auth import _load_vault_uat_payload
+                from .provider_adapter import _resolve_shared_home
+
+                profile_home = _profile_home_for_name(claims.profile_name)
+                shared_home = _resolve_shared_home(profile_home)
+                payload_value = _load_vault_uat_payload(shared_home, claims.profile_name, claims.open_id)
+                return web.json_response({"payload": payload_value})
+            if kind == "provider_env":
+                from .provider_adapter import provider_env_for_aiagent
+
+                profile_home = _profile_home_for_name(claims.profile_name)
+                payload_value = provider_env_for_aiagent(profile_home)
+                return web.json_response({"payload": payload_value})
+            return web.json_response({"error": "bad_request"}, status=400)
+        except Exception:
+            return web.json_response({"error": "internal"}, status=500)
+
     async def handle_kep_cli_callback(request):
         """Public OAuth callback for kep-cli in-Feishu auth: forwards the OAuth
         result to the kep-auth localhost server (same host). Intentionally NOT
@@ -2528,6 +2624,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
+    app.router.add_post("/api/run-broker/credentials/lease", handle_credential_lease)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
     app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)

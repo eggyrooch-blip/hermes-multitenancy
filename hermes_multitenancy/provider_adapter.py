@@ -54,6 +54,19 @@ def provider_env_for_aiagent(
     existing_env: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Return provider env vars selected from the vault for this profile."""
+    from .credential_broker import BrokerClientError, fetch_via_broker, running_as_broker_child
+
+    if running_as_broker_child():
+        try:
+            result = fetch_via_broker(
+                kind="provider_env",
+                profile_name=Path(profile_home).name,
+                open_id=os.environ.get("HERMES_FEISHU_USER_OPEN_ID", ""),
+                run_id=os.environ.get("HERMES_MULTITENANCY_RUN_ID", ""),
+            )
+        except BrokerClientError:
+            return {}
+        return {k: str(v) for k, v in (result or {}).items()}
     existing_env = existing_env or {}
     env: dict[str, str] = {}
     for item in _resolve_profile_provider_status(profile_home, existing_env=existing_env, include_secret=True):

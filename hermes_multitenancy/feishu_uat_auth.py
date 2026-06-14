@@ -640,6 +640,18 @@ def _load_best_uat_payload(shared_home: Path, profile_name: str, open_id: str) -
 
 
 def _load_vault_uat_payload(shared_home: Path, profile_name: str, open_id: str) -> dict[str, Any] | None:
+    from .credential_broker import BrokerClientError, fetch_via_broker, running_as_broker_child
+
+    if running_as_broker_child():
+        try:
+            return fetch_via_broker(
+                kind="feishu_uat",
+                profile_name=profile_name,
+                open_id=open_id,
+                run_id=os.environ.get("HERMES_MULTITENANCY_RUN_ID", ""),
+            )
+        except BrokerClientError:
+            return None
     store = CredentialStore(shared_home / "multitenancy.db")
     try:
         return store.get_secret_for_runtime(

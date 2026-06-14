@@ -45,6 +45,16 @@ def get_current_profile_home() -> Optional[Path]:
     return _PROFILE_HOME_VAR.get()
 
 
+def strict_context_enabled() -> bool:
+    """True when HERMES_MULTITENANCY_STRICT_CONTEXT enables the broker boundary."""
+    return os.environ.get("HERMES_MULTITENANCY_STRICT_CONTEXT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 # Serializes os.environ HERMES_HOME mutations across concurrent dispatches.
 # We key locks by event loop because asyncio.Lock binds to the loop on first
 # acquire — pytest spawns a fresh loop per test so a module-level lock would

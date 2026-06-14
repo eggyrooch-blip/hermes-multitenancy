@@ -37,10 +37,12 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from .credential_broker import lease_signing_secret, mint_lease
 from .lark_cli_auth_broker import (
     LarkCliAuthBrokerContext,
     start_lark_cli_auth_broker_server,
 )
+from .runtime import strict_context_enabled
 from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
@@ -1246,6 +1248,10 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MULTITENANCY_RUN_BROKER_KEY",
     "HERMES_RUN_BROKER_URL",
     "HERMES_MULTITENANCY_RUN_BROKER_URL",
+    "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
+    "HERMES_MULTITENANCY_CRED_BROKER_URL",
+    "HERMES_MULTITENANCY_CRED_LEASE",
+    "HERMES_MULTITENANCY_RUN_ID",
 })
 
 _FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
@@ -1293,6 +1299,9 @@ def _build_subprocess_env(
     env: dict[str, str] = {
         key: parent[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in parent
     }
+    if strict_context_enabled():
+        env.pop("HERMES_MULTITENANCY_CREDENTIAL_KEY", None)
+        env.pop("HERMES_CREDENTIAL_KEY", None)
 
     profile_home = profile_home.expanduser()
     env.update(_profile_env_for_aiagent(profile_home))
@@ -1731,21 +1740,60 @@ def _aiagent_subprocess_env_scope(
     extra: Optional[dict[str, str]] = None,
 ) -> Iterator[dict[str, str]]:
     """Build child env while keeping per-run broker lifetime scoped to spawn."""
+    from .webui_broker_server import (
+        credential_broker_url,
+        register_credential_broker_token,
+        unregister_credential_broker_token,
+    )
+
     sender_open_id = _resolve_subprocess_sender_open_id(event)
     merged_extra = dict(extra or {})
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
+    broker_token = ""
+    if strict_context_enabled():
+        scoped_open_id = str(
+            merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
+            or sender_open_id
+            or _profile_owner_open_id(profile_home)
+        ).strip()
+        if scoped_open_id:
+            run_id = secrets.token_urlsafe(24)
+            broker_token = secrets.token_urlsafe(32)
+            merged_extra.update(
+                {
+                    "HERMES_MULTITENANCY_CRED_BROKER_TOKEN": broker_token,
+                    "HERMES_MULTITENANCY_CRED_BROKER_URL": credential_broker_url(),
+                    "HERMES_MULTITENANCY_CRED_LEASE": mint_lease(
+                        profile_name=profile_home.name,
+                        open_id=scoped_open_id,
+                        run_id=run_id,
+                        secret=lease_signing_secret(),
+                    ),
+                    "HERMES_MULTITENANCY_RUN_ID": run_id,
+                }
+            )
+            register_credential_broker_token(
+                token=broker_token,
+                profile_name=profile_home.name,
+                open_id=scoped_open_id,
+                run_id=run_id,
+            )
     with _lark_cli_auth_broker_scope(
         profile_home,
         str(merged_extra.get("HERMES_FEISHU_USER_OPEN_ID") or sender_open_id),
     ) as lark_cli_env:
-        merged_extra.update(lark_cli_env)
-        yield _build_subprocess_env(
-            profile_home,
-            approval_dir=approval_dir,
-            event_stream=event_stream,
-            extra=merged_extra,
-        )
+        try:
+            merged_extra.update(lark_cli_env)
+            yield _build_subprocess_env(
+                profile_home,
+                approval_dir=approval_dir,
+                event_stream=event_stream,
+                extra=merged_extra,
+            )
+        finally:
+            if broker_token:
+                unregister_credential_broker_token(broker_token)
 
 
 def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
