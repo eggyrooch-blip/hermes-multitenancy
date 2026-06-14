@@ -30,6 +30,7 @@ from .credential_broker import (
 )
 from .run_broker import RunBroker, RunRejected
 from .run_models import RunEvent, RunRequest
+from .security_audit import append_security_event
 
 logger = logging.getLogger(__name__)
 
@@ -2167,7 +2168,22 @@ def create_run_broker_app(
                 open_id=token_record["open_id"],
                 run_id=token_record["run_id"],
             )
+            append_security_event(
+                event_type="credential.lease.granted",
+                open_id=claims.open_id,
+                profile=claims.profile_name,
+                lease_kind=kind,
+                decision="granted",
+            )
         except LeaseError:
+            append_security_event(
+                event_type="credential.lease.denied",
+                open_id=open_id,
+                profile=profile_name,
+                lease_kind=kind,
+                decision="denied",
+                reason="lease_verification_failed",
+            )
             return web.json_response({"error": "forbidden"}, status=403)
         try:
             if kind == "feishu_uat":

@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from .router import _get_routing_table
+from .security_audit import append_security_event
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,36 @@ def _is_ignorable_at_everyone(adapter: Any, message: Any) -> bool:
         return False
 
 
+def _sender_open_id(message: Any) -> str | None:
+    sender_id = getattr(message, "sender_id", None)
+    if sender_id:
+        return str(sender_id)
+    sender = getattr(message, "sender", None)
+    if isinstance(sender, str) and sender:
+        return sender
+    if sender is not None:
+        for name in ("open_id", "user_id", "id"):
+            value = getattr(sender, name, None)
+            if value:
+                return str(value)
+    return None
+
+
+def _audit_everyone_ignored(message: Any) -> None:
+    try:
+        append_security_event(
+            event_type="group.everyone.ignored",
+            chat_id=str(getattr(message, "chat_id", "") or ""),
+            open_id=_sender_open_id(message),
+            reason="at_everyone_broadcast",
+        )
+    except Exception:
+        logger.debug(
+            "[multitenancy] @everyone audit failed; continuing valve suppression",
+            exc_info=True,
+        )
+
+
 def _patch_admit(FeishuAdapter: Any) -> None:
     """Prod path: an @everyone (@_all) broadcast never wakes the bot — in ANY
     reply mode.
@@ -174,6 +205,7 @@ def _patch_admit(FeishuAdapter: Any) -> None:
         try:
             is_group = getattr(message, "chat_type", "p2p") != "p2p"
             if is_group and _is_ignorable_at_everyone(self, message):
+                _audit_everyone_ignored(message)
                 return "group_at_everyone_ignored"
         except Exception:
             logger.debug(

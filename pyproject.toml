@@ -55,6 +55,7 @@ test = [
 hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
 hermes-multitenancy-credentials = "hermes_multitenancy.credential_materializer:main"
 hermes-multitenancy-analytics = "hermes_multitenancy.analytics.cli:main"
+hermes-multitenancy-doctor = "hermes_multitenancy.doctor:main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"

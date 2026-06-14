@@ -13,7 +13,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_AUDIT_PATH = Path("/var/log/hermes/multitenancy-security.jsonl")
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 _ENSURED_PARENT_DIRS: set[Path] = set()
-_SAFE_FIELD_NAMES = frozenset({"profile", "command_name", "reason", "path_hash", "path_kind"})
+_SAFE_FIELD_NAMES = frozenset(
+    {
+        "profile",
+        "command_name",
+        "reason",
+        "path_hash",
+        "path_kind",
+        "command_hash",
+        "command_kind",
+        "chat_id_hash",
+        "lease_kind",
+        "decision",
+    }
+)
 
 
 def _truthy(value: str | None) -> bool:
@@ -55,6 +68,10 @@ def _redacted_path_fields(candidate: Any) -> dict[str, str]:
     }
 
 
+def _hash_id(candidate: Any) -> str:
+    return hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()[:12]
+
+
 def append_security_event(*, event_type: str, **fields: Any) -> None:
     if not security_audit_enabled():
         return
@@ -71,7 +88,10 @@ def append_security_event(*, event_type: str, **fields: Any) -> None:
             event[name] = value
     open_id = str(fields.get("open_id") or "").strip()
     if open_id:
-        event["open_id_hash"] = hashlib.sha256(open_id.encode("utf-8")).hexdigest()[:12]
+        event["open_id_hash"] = _hash_id(open_id)
+    chat_id = str(fields.get("chat_id") or "").strip()
+    if chat_id:
+        event["chat_id_hash"] = _hash_id(chat_id)
 
     try:
         path = security_audit_path()

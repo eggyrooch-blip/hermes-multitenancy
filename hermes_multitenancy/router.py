@@ -3904,6 +3904,15 @@ async def _handle_child_approval_required(adapter: Any, chat_id: str, payload: A
         str(data.get("approval_id") or ""),
         command[:120],
     )
+    stripped_command = command.strip()
+    append_security_event(
+        event_type="approval.requested",
+        open_id=str(data.get("open_id") or "").strip() or None,
+        command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest()[:12],
+        command_kind=(stripped_command.split()[0][:32] if stripped_command else "<empty>"),
+        reason="dangerous_command",
+        decision="requested",
+    )
     preview = command[:200] + "..." if len(command) > 200 else command
     message = (
         "⚠️ Dangerous command requires approval:\n"
