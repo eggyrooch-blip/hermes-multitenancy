@@ -1965,7 +1965,16 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
                 try:
                     from .agent_real import _load_profile_config
                     _prof_cfg = _load_profile_config(profile_home)
-                    _prof_provider = str(((_prof_cfg.get("model") or {}).get("provider") or "")).strip()
+                    _model_cfg = _prof_cfg.get("model") or {}
+                    _prof_provider = str(_model_cfg.get("provider") or "").strip()
+                    if not _prof_provider:
+                        # Common shape: model.default == "zai/glm-5.1" with no
+                        # separate provider field. _load_profile_config already
+                        # ran _normalize_model_spec_inplace, so the prefix is the
+                        # provider. Derive it so default-only profiles aren't missed.
+                        _default = str(_model_cfg.get("default") or "").strip()
+                        if "/" in _default:
+                            _prof_provider = _default.split("/", 1)[0].strip()
                 except Exception as exc:
                     _prof_provider = ""
                     logger.debug("multitenancy: vision-override provider read failed (%s)", exc)

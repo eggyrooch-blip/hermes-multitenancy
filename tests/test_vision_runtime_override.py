@@ -39,3 +39,28 @@ def test_vision_override_noop_for_unmapped(monkeypatch):
     client, saved = router._install_vision_model_override("anthropic")
     assert saved == {}
     assert fake._PROVIDER_VISION_MODELS == {"zai": "glm-5v-turbo"}
+
+
+def test_context_manager_derives_provider_from_default_only_config(monkeypatch, tmp_path):
+    """Codex-flagged shape: model.default == 'zai/glm-5.1' with NO provider field
+    must still trigger the override (derive provider from the default prefix)."""
+    import asyncio
+    fake = _install_fake_aux(monkeypatch, {"zai": "glm-5v-turbo"})
+    # no complete main-runtime (the early-return path the override must survive)
+    monkeypatch.setattr(router, "_profile_main_runtime_for_image_prep", lambda _h: None)
+    # default-only config (no model.provider)
+    from hermes_multitenancy import agent_real
+    monkeypatch.setattr(
+        agent_real, "_load_profile_config",
+        lambda _h: {"model": {"default": "zai/glm-5.1"}},
+    )
+    seen = {}
+
+    async def drive():
+        async with router._profile_image_prep_runtime(tmp_path):
+            seen["inside"] = fake._PROVIDER_VISION_MODELS.get("zai")
+        seen["after"] = fake._PROVIDER_VISION_MODELS.get("zai")
+
+    asyncio.run(drive())
+    assert seen["inside"] == "glm-4.6v"   # derived provider 'zai' → patched
+    assert seen["after"] == "glm-5v-turbo"  # restored
