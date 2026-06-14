@@ -505,7 +505,9 @@ def _parse_session_history_command(raw: Any) -> tuple[str, str]:
     return name, (match.group(2) or "").strip()
 
 
-def _dispatch_session_history_command(*, profile_name: str, user_key: str, command: Any) -> dict[str, Any]:
+def _dispatch_session_history_command(
+    *, profile_name: str, user_key: str, command: Any, session_id: str = ""
+) -> dict[str, Any]:
     from . import router as router_mod
 
     command_name, _args = _parse_session_history_command(command)
@@ -517,9 +519,13 @@ def _dispatch_session_history_command(*, profile_name: str, user_key: str, comma
             "message": f"not a supported Run Broker session-history command: /{command_name}",
         }
 
-    # WebUI sessions must not cross with Feishu DM sessions under strict context,
-    # so tag the channel explicitly (default-mode keys are unchanged).
-    key = router_mod._history_key(profile_name, user_key, None, channel="webui")
+    # WebUI sessions must not cross with Feishu DM sessions (channel="webui") and,
+    # under strict context, distinct WebUI sessions for the same owner must not
+    # collapse into one key — so carry session_id as the thread dimension. In
+    # default mode both are ignored and the key stays byte-identical.
+    key = router_mod._history_key(
+        profile_name, user_key, None, channel="webui", thread_id=(session_id or None)
+    )
     if command_name in {"new", "reset"}:
         cleared = bool(router_mod._clear_history(key))
         return {
@@ -752,6 +758,7 @@ async def _dispatch_session_command(*, profile_name: str, user_key: str, session
             profile_name=profile_name,
             user_key=user_key,
             command=command,
+            session_id=session_id,
         )
     if command_name == "plan":
         return _dispatch_plan_command(profile_name=profile_name, command=command)

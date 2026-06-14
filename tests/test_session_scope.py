@@ -253,3 +253,21 @@ def test_cron_mirror_uses_cron_channel_key(monkeypatch):
     dm_key = router._history_key("p", "ou_owner", None, channel="feishu")
     assert cron_key != dm_key
     assert cron_key[0] == "p"  # still a 2-tuple, SessionStore signature intact
+
+
+def test_webui_sessions_isolated_by_session_id(monkeypatch):
+    """Re-review (round 3 concern): distinct WebUI sessions for the same owner
+    must not collapse into one key — session_id maps to the thread dimension."""
+    from hermes_multitenancy import router
+
+    # Default: session_id ignored → byte-identical legacy key.
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    assert router._history_key(
+        "p", "ou_a", None, channel="webui", thread_id="s1"
+    ) == ("p", "ou_a")
+
+    # Strict: two different webui session_ids → two different keys.
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    s1 = router._history_key("p", "ou_a", None, channel="webui", thread_id="s1")
+    s2 = router._history_key("p", "ou_a", None, channel="webui", thread_id="s2")
+    assert s1 != s2
