@@ -3905,11 +3905,17 @@ async def _handle_child_approval_required(adapter: Any, chat_id: str, payload: A
         command[:120],
     )
     stripped_command = command.strip()
+    # Record only the executable basename, never the raw first token — an
+    # absolute path like /Users/alice/secret-bin/doit would otherwise leak a
+    # filesystem path into the audit log (SPEC: 无 raw 路径). The full command
+    # is still correlatable via command_hash.
+    first_token = stripped_command.split()[0] if stripped_command else ""
+    command_kind = (os.path.basename(first_token) or first_token)[:32] if first_token else "<empty>"
     append_security_event(
         event_type="approval.requested",
         open_id=str(data.get("open_id") or "").strip() or None,
         command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest()[:12],
-        command_kind=(stripped_command.split()[0][:32] if stripped_command else "<empty>"),
+        command_kind=command_kind,
         reason="dangerous_command",
         decision="requested",
     )

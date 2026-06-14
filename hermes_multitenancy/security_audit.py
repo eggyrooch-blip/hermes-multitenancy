@@ -25,6 +25,9 @@ _SAFE_FIELD_NAMES = frozenset(
         "chat_id_hash",
         "lease_kind",
         "decision",
+        "run_id",
+        "ttl_seconds",
+        "point",
     }
 )
 

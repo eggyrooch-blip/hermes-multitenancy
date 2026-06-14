@@ -5,6 +5,7 @@ plain dict descriptors while production returns SDK response objects.
 """
 from __future__ import annotations
 
+import collections
 import functools
 import logging
 from typing import Any
@@ -168,8 +169,31 @@ def _sender_open_id(message: Any) -> str | None:
     return None
 
 
+_AUDITED_EVERYONE_MSG_IDS: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+_AUDITED_EVERYONE_MAX = 4096
+
+
+def _message_audit_id(message: Any) -> str | None:
+    for name in ("message_id", "msg_id", "id"):
+        value = getattr(message, name, None)
+        if value:
+            return str(value)
+    return None
+
+
 def _audit_everyone_ignored(message: Any) -> None:
+    # Both the `_admit` valve and the fork's `_should_accept_group_message`
+    # suppression path may fire for the same broadcast; dedupe by message id so
+    # one ignored broadcast yields exactly one audit row (best-effort — a
+    # message with no id always audits).
     try:
+        msg_id = _message_audit_id(message)
+        if msg_id is not None:
+            if msg_id in _AUDITED_EVERYONE_MSG_IDS:
+                return
+            _AUDITED_EVERYONE_MSG_IDS[msg_id] = None
+            if len(_AUDITED_EVERYONE_MSG_IDS) > _AUDITED_EVERYONE_MAX:
+                _AUDITED_EVERYONE_MSG_IDS.popitem(last=False)
         append_security_event(
             event_type="group.everyone.ignored",
             chat_id=str(getattr(message, "chat_id", "") or ""),
@@ -233,8 +257,10 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
         chat_id = args[2] if len(args) >= 3 else kwargs.get("chat_id", "")
         normalized_chat_id = str(chat_id or "")
         # Global, mode-independent: an @everyone broadcast that doesn't @ the bot
-        # never wakes it — even in 'all' reply mode.
+        # never wakes it — even in 'all' reply mode. Audit the suppression here
+        # too (deduped by message id) so this fork-only path isn't a blind spot.
         if message is not None and _is_ignorable_at_everyone(self, message):
+            _audit_everyone_ignored(message)
             return False
         # 'all' reply-mode groups answer everything else; the group-policy gate
         # (_allow_group_message) is still honored. ANY failure => fail-open to

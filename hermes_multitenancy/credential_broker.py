@@ -83,6 +83,23 @@ def mint_lease(
     payload_bytes = _canonical_payload(payload)
     secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
     signature = _hmac_sha256(secret_bytes, payload_bytes)
+    # Audit at the issuance ("发放") point — not only at later HTTP redemption —
+    # so every minted lease is accounted for even if the child never redeems.
+    # Fail-open: an audit hiccup must never block credential delivery.
+    try:
+        from .security_audit import append_security_event
+
+        append_security_event(
+            event_type="credential.lease.granted",
+            open_id=payload["open_id"] or None,
+            profile=payload["profile_name"],
+            run_id=payload["run_id"],
+            ttl_seconds=int(ttl_seconds),
+            decision="granted",
+            point="mint",
+        )
+    except Exception:  # pragma: no cover - audit must never break minting
+        pass
     return f"{_LEASE_VERSION}:{_urlsafe_b64encode(payload_bytes)}.{_urlsafe_b64encode(signature)}"
 
 
