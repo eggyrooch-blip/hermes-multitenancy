@@ -41,3 +41,9 @@ def test_handler_forwards_in_background(monkeypatch):
     handler({"header": {"event_type": "helpdesk.ticket_message.created_v1"}, "event": {"ticket_id": "T1"}})
     assert sent.get("_hermes_event_type") == "helpdesk.ticket_message.created_v1"
     assert sent.get("event", {}).get("ticket_id") == "T1"
+
+
+def test_prod_it_helpdesk_is_hard_denied():
+    """The real company IT helpdesk id must be in the deny-weld set."""
+    from hermes_multitenancy.feishu_helpdesk_event import DENY_HELPDESK_IDS
+    assert "6909040876777979905" in DENY_HELPDESK_IDS

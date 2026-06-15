@@ -2714,25 +2714,39 @@ def create_run_broker_app(
         post_enabled = os.environ.get("HERMES_HELPDESK_POST", "").strip().lower() in ("1", "true", "yes")
         reply_fn = client.send_ticket_message if post_enabled else None
 
-        try:
-            result = handle_helpdesk_event(
-                payload, index=index, membership_check=_membership_check, reply_fn=reply_fn, post=post_enabled
-            )
-        except Exception as exc:
-            logger.exception("[multitenancy] helpdesk event handling failed")
-            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        # SAFETY WELD: never operate against a denied (production) helpdesk, even if the
+        # env is misconfigured to point at it.
+        from .feishu_helpdesk_event import DENY_HELPDESK_IDS
 
-        # Always log the decision/draft so a human can review (esp. in shadow mode).
-        logger.info(
-            "[multitenancy] helpdesk event action=%s ticket=%s posted=%s q=%r",
-            result.get("action"), result.get("ticket_id"), result.get("posted"),
-            (result.get("question") or "")[:80],
-        )
-        if result.get("answer"):
-            logger.info("[multitenancy] helpdesk draft answer: %s", str(result.get("answer"))[:600])
-        return web.json_response(
-            {"ok": True, **{k: result.get(k) for k in ("action", "ticket_id", "helpdesk_id", "question", "posted")}}
-        )
+        configured_id = os.environ.get("HERMES_HELPDESK_ID", "").strip()
+        if configured_id in DENY_HELPDESK_IDS:
+            logger.error(
+                "[multitenancy] REFUSING helpdesk events: HERMES_HELPDESK_ID=%s is a denied (production) "
+                "helpdesk — never auto-answer real employee tickets",
+                configured_id,
+            )
+            return web.json_response({"ok": False, "error": "configured helpdesk is denied"}, status=403)
+
+        def _process() -> None:
+            # heavy work OFF the event loop: membership API + RAG + inference (+ reply)
+            try:
+                result = handle_helpdesk_event(
+                    payload, index=index, membership_check=_membership_check, reply_fn=reply_fn, post=post_enabled
+                )
+            except Exception:
+                logger.exception("[multitenancy] helpdesk event handling failed")
+                return
+            logger.info(
+                "[multitenancy] helpdesk event action=%s ticket=%s posted=%s q=%r",
+                result.get("action"), result.get("ticket_id"), result.get("posted"),
+                (result.get("question") or "")[:80],
+            )
+            if result.get("answer"):
+                logger.info("[multitenancy] helpdesk draft answer: %s", str(result.get("answer"))[:600])
+
+        # fast-ack: never block the broker event loop on RAG/inference/Feishu I/O
+        asyncio.get_event_loop().run_in_executor(None, _process)
+        return web.json_response({"ok": True, "accepted": True})
 
     app = web.Application(client_max_size=_run_broker_client_max_size())
     app.router.add_get("/api/run-broker/health", handle_health)

@@ -283,3 +283,24 @@ def test_request_json_does_not_retry_http_error(monkeypatch):
     with pytest.raises(urllib.error.HTTPError):
         client._request_json("https://open.feishu.cn/x")
     assert calls["n"] == 1  # not retried
+
+
+def test_paginated_items_offset_mode(monkeypatch):
+    """Tickets use page/total offset pagination — must advance past page 1."""
+    from hermes_multitenancy.feishu_helpdesk_client import HelpdeskClient
+    c = HelpdeskClient(app_id="a", app_secret="s", helpdesk_id="h", helpdesk_token="t")
+    pages = {
+        1: {"tickets": [{"ticket_id": "1"}, {"ticket_id": "2"}], "total": 3},
+        2: {"tickets": [{"ticket_id": "3"}], "total": 3},
+    }
+    seen = []
+
+    def fake_get(path, query=None):
+        q = dict(query or {})
+        seen.append(q)
+        return pages[int(q.get("page", 1))]
+
+    monkeypatch.setattr(c, "_helpdesk_get", fake_get)
+    got = [t["ticket_id"] for t in c._iter_paginated_items("/x", ("tickets",), page_size=2)]
+    assert got == ["1", "2", "3"]           # all 3 across 2 pages (not stuck on page 1)
+    assert seen[0]["page"] == 1 and seen[1]["page"] == 2

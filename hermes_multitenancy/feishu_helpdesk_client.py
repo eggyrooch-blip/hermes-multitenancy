@@ -137,13 +137,23 @@ class HelpdeskClient:
         self,
         path: str,
         items_keys: tuple[str, ...],
+        *,
+        page_size: int = 50,
         **filters: Any,
     ) -> Iterator[dict[str, Any]]:
+        # Helpdesk list endpoints differ: some return a `page_token`, others use
+        # `page`/`total` offset pagination (e.g. tickets). Support both, else ingest
+        # silently stops after the first page.
         page_token = ""
+        page = 1
+        collected = 0
         while True:
             query = dict(filters)
+            query.setdefault("page_size", page_size)
             if page_token:
                 query["page_token"] = page_token
+            else:
+                query["page"] = page
             data = self._helpdesk_get(path, query)
             items: list[dict[str, Any]] = []
             for key in items_keys:
@@ -155,10 +165,22 @@ class HelpdeskClient:
                 break
             for item in items:
                 yield item
-            next_page_token = str(data.get("page_token") or "")
-            if not next_page_token:
+            collected += len(items)
+            total = data.get("total")
+            if isinstance(total, int) and collected >= total:
                 break
-            page_token = next_page_token
+            next_page_token = str(data.get("page_token") or "")
+            if next_page_token:
+                page_token = next_page_token
+                continue
+            # No usable page_token. Advance by page offset ONLY when `total` confirms
+            # more remain — otherwise stop. (Without this guard, an API that returns
+            # neither a token nor a total loops forever on a full page.) Hard cap as a
+            # paranoia backstop.
+            if isinstance(total, int) and collected < total and page < 5000:
+                page += 1
+                continue
+            break
 
     def list_categories(self) -> list[dict[str, Any]]:
         data = self._helpdesk_get("/open-apis/helpdesk/v1/categories")

@@ -26,6 +26,15 @@ SENDER_TYPE_BOT = 1
 SENDER_TYPE_GUEST = 2
 SENDER_TYPE_AGENT = 3
 
+# Helpdesks we must NEVER auto-answer, even if misconfigured to point at one. The real
+# company IT helpdesk (1259 employees) — its tickets are real people; a bot reply there
+# is an incident. This is a hard weld on top of the per-event membership gate.
+DENY_HELPDESK_IDS = frozenset(
+    h.strip()
+    for h in os.environ.get("HERMES_HELPDESK_DENY_IDS", "6909040876777979905").split(",")
+    if h.strip()
+)
+
 
 def _event_type(payload: dict[str, Any]) -> str:
     header = payload.get("header")
