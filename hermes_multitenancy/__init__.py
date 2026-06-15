@@ -99,6 +99,8 @@ def register(ctx) -> None:
         install_gateway_startup_watcher()
         from .group_inviter_hook import install_feishu_bot_added_hook
         install_feishu_bot_added_hook()
+        from .feishu_helpdesk_events import install_feishu_helpdesk_events_patch
+        install_feishu_helpdesk_events_patch()
         webui_broker_server.ensure_run_broker_server_started()
         _start_credential_renewal_subsystem()
     else:

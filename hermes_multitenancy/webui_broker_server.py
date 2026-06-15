@@ -2655,8 +2655,68 @@ def create_run_broker_app(
             "service": "hermes-multitenancy-run-broker",
         })
 
+    _helpdesk_cache: dict = {}
+
+    async def handle_feishu_helpdesk_events(request):
+        # Internal endpoint: the Feishu ws-adapter forwards helpdesk ticket events
+        # here. Business logic + the hard test-helpdesk safety filter live in
+        # feishu_helpdesk_event.handle_helpdesk_event. Shadow by default (post gate).
+        if not _authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": f"bad json: {exc}"}, status=400)
+
+        from .feishu_helpdesk_event import handle_helpdesk_event
+
+        index = _helpdesk_cache.get("index")
+        if index is None:
+            from .helpdesk_rag import HelpdeskRagIndex
+
+            db = os.path.expanduser(
+                os.environ.get("HERMES_HELPDESK_INDEX_DB", "~/.hermes/profiles/helpdesk/ticket_index.db")
+            )
+            index = HelpdeskRagIndex(db)
+            _helpdesk_cache["index"] = index
+
+        post_enabled = os.environ.get("HERMES_HELPDESK_POST", "").strip().lower() in ("1", "true", "yes")
+        reply_fn = None
+        if post_enabled:
+            client = _helpdesk_cache.get("client")
+            if client is None:
+                from .feishu_helpdesk_client import HelpdeskClient
+
+                client = HelpdeskClient(
+                    app_id=os.environ.get("HERMES_HELPDESK_REPLY_APP_ID", ""),
+                    app_secret=os.environ.get("HERMES_HELPDESK_REPLY_APP_SECRET", ""),
+                    helpdesk_id=os.environ.get("HERMES_HELPDESK_REPLY_HELPDESK_ID", ""),
+                    helpdesk_token=os.environ.get("HERMES_HELPDESK_REPLY_HELPDESK_TOKEN", ""),
+                )
+                _helpdesk_cache["client"] = client
+            reply_fn = client.send_ticket_message
+
+        try:
+            result = handle_helpdesk_event(payload, index=index, reply_fn=reply_fn, post=post_enabled)
+        except Exception as exc:
+            logger.exception("[multitenancy] helpdesk event handling failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+        # Always log the decision/draft so a human can review (esp. in shadow mode).
+        logger.info(
+            "[multitenancy] helpdesk event action=%s ticket=%s posted=%s q=%r",
+            result.get("action"), result.get("ticket_id"), result.get("posted"),
+            (result.get("question") or "")[:80],
+        )
+        if result.get("answer"):
+            logger.info("[multitenancy] helpdesk draft answer: %s", str(result.get("answer"))[:600])
+        return web.json_response(
+            {"ok": True, **{k: result.get(k) for k in ("action", "ticket_id", "helpdesk_id", "question", "posted")}}
+        )
+
     app = web.Application(client_max_size=_run_broker_client_max_size())
     app.router.add_get("/api/run-broker/health", handle_health)
+    app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/ingest", handle_ingest)
     app.router.add_get("/api/run-broker/ingest/agents", handle_ingest_agents)
