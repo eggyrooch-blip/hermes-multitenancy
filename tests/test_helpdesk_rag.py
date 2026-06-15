@@ -285,8 +285,8 @@ def test_pii_scrubbed_from_title_not_just_body(tmp_path):
     assert "13800138000" not in doc["title"]
     assert "[EMAIL]" in doc["title"] and "[PHONE]" in doc["title"]
     assert doc["category"] == "bot"  # ticket_type carried as metadata
-    fdoc = faq_to_doc({"faq_id": "f", "question": "联系 admin@example.com 怎么办", "answer": "x"})
-    assert "admin@example.com" not in fdoc["title"]
+    fdoc = faq_to_doc({"faq_id": "f", "question": "联系 alice@example.com 怎么办", "answer": "x"})
+    assert "alice@example.com" not in fdoc["title"]
 
 
 def test_index_search_works_across_threads(tmp_path):
