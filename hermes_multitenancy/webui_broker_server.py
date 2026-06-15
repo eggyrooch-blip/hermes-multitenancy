@@ -2689,24 +2689,35 @@ def create_run_broker_app(
             else:
                 logger.info("[multitenancy] helpdesk RAG index loaded: %d docs (%s)", doc_count, db)
 
-        post_enabled = os.environ.get("HERMES_HELPDESK_POST", "").strip().lower() in ("1", "true", "yes")
-        reply_fn = None
-        if post_enabled:
-            client = _helpdesk_cache.get("client")
-            if client is None:
-                from .feishu_helpdesk_client import HelpdeskClient
+        # The test-helpdesk client is needed even in shadow mode: the event carries no
+        # helpdesk_id, so we confirm ticket membership by querying it with this helpdesk's
+        # token (real IT-helpdesk tickets fail and are dropped).
+        client = _helpdesk_cache.get("client")
+        if client is None:
+            from .feishu_helpdesk_client import HelpdeskClient
 
-                client = HelpdeskClient(
-                    app_id=os.environ.get("HERMES_HELPDESK_REPLY_APP_ID", ""),
-                    app_secret=os.environ.get("HERMES_HELPDESK_REPLY_APP_SECRET", ""),
-                    helpdesk_id=os.environ.get("HERMES_HELPDESK_REPLY_HELPDESK_ID", ""),
-                    helpdesk_token=os.environ.get("HERMES_HELPDESK_REPLY_HELPDESK_TOKEN", ""),
-                )
-                _helpdesk_cache["client"] = client
-            reply_fn = client.send_ticket_message
+            client = HelpdeskClient(
+                app_id=os.environ.get("HERMES_HELPDESK_APP_ID", ""),
+                app_secret=os.environ.get("HERMES_HELPDESK_APP_SECRET", ""),
+                helpdesk_id=os.environ.get("HERMES_HELPDESK_ID", ""),
+                helpdesk_token=os.environ.get("HERMES_HELPDESK_TOKEN", ""),
+            )
+            _helpdesk_cache["client"] = client
+
+        def _membership_check(ticket_id: str) -> bool:
+            try:
+                client.get_ticket(ticket_id)
+                return True
+            except Exception:
+                return False
+
+        post_enabled = os.environ.get("HERMES_HELPDESK_POST", "").strip().lower() in ("1", "true", "yes")
+        reply_fn = client.send_ticket_message if post_enabled else None
 
         try:
-            result = handle_helpdesk_event(payload, index=index, reply_fn=reply_fn, post=post_enabled)
+            result = handle_helpdesk_event(
+                payload, index=index, membership_check=_membership_check, reply_fn=reply_fn, post=post_enabled
+            )
         except Exception as exc:
             logger.exception("[multitenancy] helpdesk event handling failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)

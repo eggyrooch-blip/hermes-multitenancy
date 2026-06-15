@@ -242,26 +242,36 @@ def test_query_stopwords_dont_drown_rare_term(tmp_path):
     assert r and r[0]["doc_id"] == "a"
 
 
-def test_event_handler_drops_non_allowed_helpdesk(tmp_path):
-    """Hard safety: events from a non-allowlisted helpdesk are dropped, never answered."""
-    import json
+def test_event_handler_real_schema_membership_and_sender(tmp_path):
+    """Real ticket_message schema: guest message in an allowed-helpdesk ticket -> draft;
+    a ticket failing the membership gate (e.g. real IT helpdesk) -> drop; a bot's own
+    message -> skip. Composer/RAG must never run for dropped/skipped events."""
     from hermes_multitenancy.helpdesk_rag import HelpdeskRagIndex
     from hermes_multitenancy import feishu_helpdesk_event as evt
     idx = HelpdeskRagIndex(str(tmp_path / "e.db"))
     idx.upsert({"doc_id": "a", "source": "faq", "title": "x", "body": "y", "tags": "", "category": "", "status": "", "url": "", "updated_at": ""})
-    def mk(hid):
+
+    def event(*, ticket_id="T1", text="vpn 连不上", sender_type=2):
+        # real schema: text at event.text, ticket_id at event.ticket.ticket_id, sender_type top-level
         return {"header": {"event_type": "helpdesk.ticket_message.created_v1"},
-                "event": {"ticket": {"ticket_id": "T", "helpdesk_id": hid},
-                          "message": {"content": json.dumps({"content": "hi"}), "user_id": "u"}}}
-    # real IT helpdesk -> drop, composer never called
+                "event": {"ticket": {"ticket_id": ticket_id}, "text": text,
+                          "sender_id": {"open_id": "ou_emp"}, "sender_type": sender_type}}
+
     called = {"n": 0}
-    def composer(q, h): called["n"] += 1; return "X"
-    r = evt.handle_helpdesk_event(mk("6909040876777979905"), index=idx, composer=composer, post=False)
-    assert r["action"] == "drop"
-    assert called["n"] == 0  # never composed/answered for the wrong helpdesk
-    # allowed test helpdesk -> draft, composer called
-    r2 = evt.handle_helpdesk_event(mk("7651445701632691164"), index=idx, composer=composer, post=False)
+    def composer(q, h): called["n"] += 1; return "ANSWER"
+
+    # membership gate FALSE (ticket not in the allowed helpdesk) -> drop, no compose
+    r = evt.handle_helpdesk_event(event(), index=idx, membership_check=lambda t: False, composer=composer, post=False)
+    assert r["action"] == "drop" and called["n"] == 0
+
+    # membership TRUE + guest sender -> draft, composer called, nothing posted
+    r2 = evt.handle_helpdesk_event(event(), index=idx, membership_check=lambda t: True, composer=composer, post=False)
     assert r2["action"] == "draft" and called["n"] == 1 and r2["posted"] is False
+    assert r2["question"] == "vpn 连不上"
+
+    # bot's own message (sender_type=1) -> skip BEFORE membership/compose (loop guard)
+    r3 = evt.handle_helpdesk_event(event(sender_type=1), index=idx, membership_check=lambda t: True, composer=composer, post=False)
+    assert r3["action"] == "skip" and called["n"] == 1  # composer not called again
 
 
 def test_pii_scrubbed_from_title_not_just_body(tmp_path):

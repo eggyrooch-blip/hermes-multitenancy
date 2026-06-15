@@ -167,6 +167,11 @@ class HelpdeskClient:
             return [item for item in categories if isinstance(item, dict)]
         return []
 
+    def get_ticket(self, ticket_id: str) -> dict[str, Any]:
+        """Fetch one ticket. Raises HelpdeskApiError if it is not in THIS helpdesk —
+        used as the membership gate (helpdesk events carry no helpdesk_id)."""
+        return self._helpdesk_get(f"/open-apis/helpdesk/v1/tickets/{urllib.parse.quote(ticket_id)}")
+
     def iter_tickets(self, **filters: Any) -> Iterator[dict[str, Any]]:
         yield from self._iter_paginated_items("/open-apis/helpdesk/v1/tickets", ("tickets",), **filters)
 
