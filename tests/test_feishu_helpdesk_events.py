@@ -20,7 +20,8 @@ def test_helpdesk_processors_attach_to_existing_dispatcher():
     after = set(built._processorMap.keys())
 
     assert "p2.helpdesk.ticket_message.created_v1" in after
-    assert "p2.helpdesk.ticket.created_v1" in after
+    # ticket.created is intentionally NOT registered (handler doesn't act on it)
+    assert "p2.helpdesk.ticket.created_v1" not in after
     assert before <= after  # existing processors preserved, nothing clobbered
 
     # idempotent: a second attach does not raise (keys already present are skipped)

@@ -2679,6 +2679,15 @@ def create_run_broker_app(
             )
             index = HelpdeskRagIndex(db)
             _helpdesk_cache["index"] = index
+            doc_count = index.count()
+            if doc_count == 0:
+                logger.warning(
+                    "[multitenancy] helpdesk RAG index at %s is EMPTY (0 docs) — answers will be "
+                    "ungrounded; build the index (ingest faqs/tickets) before relying on it",
+                    db,
+                )
+            else:
+                logger.info("[multitenancy] helpdesk RAG index loaded: %d docs (%s)", doc_count, db)
 
         post_enabled = os.environ.get("HERMES_HELPDESK_POST", "").strip().lower() in ("1", "true", "yes")
         reply_fn = None

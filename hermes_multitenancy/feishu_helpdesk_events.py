@@ -27,9 +27,11 @@ from urllib import request as urlrequest
 
 logger = logging.getLogger(__name__)
 
+# Only the message event carries a user question (fires for every guest message,
+# including the first one that opens a ticket). ticket.created is just an open
+# notification the handler doesn't act on, so we don't register it (no dead path).
 HELPDESK_EVENT_TYPES = (
     "helpdesk.ticket_message.created_v1",
-    "helpdesk.ticket.created_v1",
 )
 _PATCH_FLAG = "_hermes_mt_helpdesk_events_patched"
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -44,11 +46,10 @@ def _broker_url() -> str:
 
 
 def _broker_key() -> str:
-    for name in ("HERMES_FEISHU_HELPDESK_EVENT_KEY", "HERMES_MULTITENANCY_RUN_BROKER_KEY"):
-        val = str(os.environ.get(name, "") or "").strip()
-        if val:
-            return val
-    return ""
+    # Must be the key the broker's _authorized() accepts (the master run-broker key),
+    # otherwise every forward 401s. An optional dedicated key is only honoured if the
+    # broker is also configured to accept it.
+    return str(os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_KEY", "") or "").strip()
 
 
 def _to_plain(value: Any) -> Any:
