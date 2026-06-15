@@ -279,14 +279,14 @@ def test_pii_scrubbed_from_title_not_just_body(tmp_path):
     from hermes_multitenancy.helpdesk_rag import ticket_to_doc, faq_to_doc
     doc = ticket_to_doc(
         {"ticket_id": "t1", "status": "closed", "channel": "feishu", "ticket_type": "bot"},
-        [{"content": '{"content":"我的邮箱 zhangsan@keep.com 手机 13800138000 登录不了"}'}],
+        [{"content": '{"content":"我的邮箱 zhangsan@example.com 手机 13800138000 登录不了"}'}],
     )
-    assert "zhangsan@keep.com" not in doc["title"]
+    assert "zhangsan@example.com" not in doc["title"]
     assert "13800138000" not in doc["title"]
     assert "[EMAIL]" in doc["title"] and "[PHONE]" in doc["title"]
     assert doc["category"] == "bot"  # ticket_type carried as metadata
-    fdoc = faq_to_doc({"faq_id": "f", "question": "联系 admin@keep.com 怎么办", "answer": "x"})
-    assert "admin@keep.com" not in fdoc["title"]
+    fdoc = faq_to_doc({"faq_id": "f", "question": "联系 admin@example.com 怎么办", "answer": "x"})
+    assert "admin@example.com" not in fdoc["title"]
 
 
 def test_index_search_works_across_threads(tmp_path):
