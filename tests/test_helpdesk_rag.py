@@ -262,3 +262,18 @@ def test_event_handler_drops_non_allowed_helpdesk(tmp_path):
     # allowed test helpdesk -> draft, composer called
     r2 = evt.handle_helpdesk_event(mk("7651445701632691164"), index=idx, composer=composer, post=False)
     assert r2["action"] == "draft" and called["n"] == 1 and r2["posted"] is False
+
+
+def test_pii_scrubbed_from_title_not_just_body(tmp_path):
+    """Employee phone/email in the first ticket message must NOT survive in the title."""
+    from hermes_multitenancy.helpdesk_rag import ticket_to_doc, faq_to_doc
+    doc = ticket_to_doc(
+        {"ticket_id": "t1", "status": "closed", "channel": "feishu", "ticket_type": "bot"},
+        [{"content": '{"content":"我的邮箱 zhangsan@keep.com 手机 13800138000 登录不了"}'}],
+    )
+    assert "zhangsan@keep.com" not in doc["title"]
+    assert "13800138000" not in doc["title"]
+    assert "[EMAIL]" in doc["title"] and "[PHONE]" in doc["title"]
+    assert doc["category"] == "bot"  # ticket_type carried as metadata
+    fdoc = faq_to_doc({"faq_id": "f", "question": "联系 admin@keep.com 怎么办", "answer": "x"})
+    assert "admin@keep.com" not in fdoc["title"]

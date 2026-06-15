@@ -201,7 +201,7 @@ def faq_to_doc(faq: dict[str, Any]) -> dict[str, str]:
     return {
         "doc_id": str(faq.get("faq_id") or ""),
         "source": "faq",
-        "title": question,
+        "title": scrub_pii(question),
         "body": scrub_pii(f"{question}\n{answer}"),
         "tags": tag_text,
         "category": category,
@@ -253,13 +253,15 @@ def ticket_to_doc(ticket: dict[str, Any], messages: list[dict[str, Any]]) -> dic
     ]
     fallback_title = " ".join(part for part in (str(ticket.get("channel") or ""), str(ticket.get("status") or "")) if part)
     title = texts[0] if texts else fallback_title
+    # tags carry searchable metadata; body holds the full problem→resolution thread
+    tag_parts = [str(ticket.get("channel") or ""), str(ticket.get("ticket_type") or "")]
     return {
         "doc_id": str(ticket.get("ticket_id") or ""),
         "source": "ticket",
-        "title": title,
+        "title": scrub_pii(title),
         "body": scrub_pii("\n".join(texts)),
-        "tags": str(ticket.get("channel") or ""),
-        "category": "",
+        "tags": " ".join(p for p in tag_parts if p),
+        "category": str(ticket.get("ticket_type") or ""),
         "status": str(ticket.get("status") or ""),
         "url": "",
         "updated_at": str(ticket.get("updated_at") or ""),
