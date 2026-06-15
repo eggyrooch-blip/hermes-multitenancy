@@ -294,3 +294,127 @@ def test_credential_status_never_returns_raw_payload(tmp_path: Path) -> None:
     encoded = json.dumps(status, ensure_ascii=False)
     assert "uat-secret" not in encoded
     assert "refresh-secret" not in encoded
+
+
+def _materialize_uat(shared_home: Path, *, profile_name: str, open_id: str, access_token: str) -> None:
+    """Write the materialized plaintext UAT json (NO vault row) — the gap case."""
+    d = shared_home / "profiles" / profile_name / "feishu_uat"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{open_id}.json").write_text(
+        json.dumps({"access_token": access_token, "expires_at": int(time.time() * 1000) + 3600_000}),
+        encoding="utf-8",
+    )
+
+
+def test_credential_lease_route_serves_materialized_when_vault_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """strict-rollout canary fix: a profile that is materialized-but-not-vaulted
+    (e.g. multitenancy_router, or a user whose vault write lagged) must still be
+    served by the broker — the route now uses _load_best_uat_payload."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.credential_broker import lease_signing_secret, mint_lease
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_credential_broker_token,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared_home = tmp_path / ".hermes"
+    (shared_home / "profiles" / "infra").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+    # materialized only — deliberately NO _store_uat (no vault row)
+    _materialize_uat(shared_home, profile_name="infra", open_id="ou_infra", access_token="mat-secret")
+
+    async def runner() -> dict:
+        app = create_run_broker_app()
+        register_credential_broker_token(
+            token="bearer-1", profile_name="infra", open_id="ou_infra", run_id="run-1"
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            lease = mint_lease(
+                profile_name="infra", open_id="ou_infra", run_id="run-1",
+                secret=lease_signing_secret(), ttl_seconds=60,
+            )
+            resp = await client.post(
+                "/api/run-broker/credentials/lease",
+                headers={"Authorization": "Bearer bearer-1"},
+                json={"lease": lease, "kind": "feishu_uat",
+                      "profile_name": "infra", "open_id": "ou_infra", "run_id": "run-1"},
+            )
+            assert resp.status == 200
+            return await resp.json()
+        finally:
+            await client.close()
+
+    body = asyncio.run(runner())
+    assert body["payload"] is not None  # served from materialized, not None
+    assert body["payload"]["access_token"] == "mat-secret"
+
+
+def test_credential_lease_route_prefers_vault_when_both_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both exist, _load_best_uat_payload picks the freshest — here the
+    fresher vault row wins, so existing vaulted users are unchanged."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.credential_broker import lease_signing_secret, mint_lease
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_credential_broker_token,
+    )
+
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared_home = tmp_path / ".hermes"
+    (shared_home / "profiles" / "alice").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+    now = int(time.time() * 1000)
+    # stale materialized (old granted_at) + fresher vault (recent granted_at) —
+    # _payload_freshness keys on granted_at then expires_at.
+    d = shared_home / "profiles" / "alice" / "feishu_uat"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ou_alice.json").write_text(
+        json.dumps({"access_token": "stale-mat", "granted_at": 1000, "expires_at": now + 1000}),
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared_home / "multitenancy.db", encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="alice", subject_id="ou_alice", provider="feishu", secret_kind="uat",
+            payload={"access_token": "fresh-vault", "refresh_token": "r",
+                     "granted_at": now, "expires_at": now + 3600_000},
+            expires_at=now + 3600_000,
+        )
+    finally:
+        store.close()
+
+    async def runner() -> dict:
+        app = create_run_broker_app()
+        register_credential_broker_token(
+            token="bearer-2", profile_name="alice", open_id="ou_alice", run_id="run-2"
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            lease = mint_lease(
+                profile_name="alice", open_id="ou_alice", run_id="run-2",
+                secret=lease_signing_secret(), ttl_seconds=60,
+            )
+            resp = await client.post(
+                "/api/run-broker/credentials/lease",
+                headers={"Authorization": "Bearer bearer-2"},
+                json={"lease": lease, "kind": "feishu_uat",
+                      "profile_name": "alice", "open_id": "ou_alice", "run_id": "run-2"},
+            )
+            return await resp.json()
+        finally:
+            await client.close()
+
+    body = asyncio.run(runner())
+    assert body["payload"]["access_token"] == "fresh-vault"  # vault preferred when fresher

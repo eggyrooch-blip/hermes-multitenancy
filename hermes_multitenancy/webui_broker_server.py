@@ -2205,12 +2205,19 @@ def create_run_broker_app(
             return web.json_response({"error": "forbidden"}, status=403)
         try:
             if kind == "feishu_uat":
-                from .feishu_uat_auth import _load_vault_uat_payload
+                # Use _load_best_uat_payload (vault + materialized plaintext,
+                # freshest wins) — the SAME source the normal non-strict path
+                # uses — so strict credential coverage via the broker == actual
+                # coverage. The vault-only _load_vault_uat_payload dropped any
+                # profile that is materialized-but-not-yet-vaulted. This runs in
+                # the PARENT broker server, so it does NOT let the child read
+                # creds locally — the child still fetches via this broker route.
+                from .feishu_uat_auth import _load_best_uat_payload
                 from .provider_adapter import _resolve_shared_home
 
                 profile_home = _profile_home_for_name(claims.profile_name)
                 shared_home = _resolve_shared_home(profile_home)
-                payload_value = _load_vault_uat_payload(shared_home, claims.profile_name, claims.open_id)
+                payload_value = _load_best_uat_payload(shared_home, claims.profile_name, claims.open_id)
                 return web.json_response({"payload": payload_value})
             if kind == "provider_env":
                 from .provider_adapter import provider_env_for_aiagent
