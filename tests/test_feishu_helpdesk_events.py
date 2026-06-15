@@ -4,6 +4,9 @@ from __future__ import annotations
 def test_helpdesk_processors_attach_to_existing_dispatcher():
     """Injects helpdesk processors into an already-built dispatcher WITHOUT a new
     ws client, and without clobbering existing (IM) processors."""
+    import pytest
+
+    pytest.importorskip("lark_oapi")  # optional dep; present in the gateway runtime, maybe not in CI
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from hermes_multitenancy import feishu_helpdesk_events as he
 
