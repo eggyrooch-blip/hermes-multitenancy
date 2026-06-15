@@ -26,13 +26,20 @@ SENDER_TYPE_BOT = 1
 SENDER_TYPE_GUEST = 2
 SENDER_TYPE_AGENT = 3
 
-# Helpdesks we must NEVER auto-answer, even if misconfigured to point at one. The real
-# company IT helpdesk (1259 employees) — its tickets are real people; a bot reply there
-# is an incident. This is a hard weld on top of the per-event membership gate.
-DENY_HELPDESK_IDS = frozenset(
+# Positive allowlist (deny-by-default): the configured active helpdesk MUST be one of
+# these or the broker refuses. Default is the isolated test desk.
+ALLOWED_HELPDESK_IDS = frozenset(
     h.strip()
-    for h in os.environ.get("HERMES_HELPDESK_DENY_IDS", "6909040876777979905").split(",")
+    for h in os.environ.get("HERMES_HELPDESK_ALLOWED_IDS", "7651445701632691164").split(",")
     if h.strip()
+)
+
+# The real company IT helpdesk (1259 employees) is ALWAYS denied — hardcoded, NOT removable
+# via env (env may only ADD more denies). Deny wins over allow. A bot reply on a real
+# employee ticket is an incident.
+_PROD_IT_HELPDESK_ID = "6909040876777979905"
+DENY_HELPDESK_IDS = frozenset({_PROD_IT_HELPDESK_ID}) | frozenset(
+    h.strip() for h in os.environ.get("HERMES_HELPDESK_DENY_IDS", "").split(",") if h.strip()
 )
 
 

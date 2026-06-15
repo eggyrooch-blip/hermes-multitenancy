@@ -2716,16 +2716,16 @@ def create_run_broker_app(
 
         # SAFETY WELD: never operate against a denied (production) helpdesk, even if the
         # env is misconfigured to point at it.
-        from .feishu_helpdesk_event import DENY_HELPDESK_IDS
+        from .feishu_helpdesk_event import ALLOWED_HELPDESK_IDS, DENY_HELPDESK_IDS
 
         configured_id = os.environ.get("HERMES_HELPDESK_ID", "").strip()
-        if configured_id in DENY_HELPDESK_IDS:
+        if configured_id in DENY_HELPDESK_IDS or configured_id not in ALLOWED_HELPDESK_IDS:
             logger.error(
-                "[multitenancy] REFUSING helpdesk events: HERMES_HELPDESK_ID=%s is a denied (production) "
-                "helpdesk — never auto-answer real employee tickets",
-                configured_id,
+                "[multitenancy] REFUSING helpdesk events: HERMES_HELPDESK_ID=%r is denied or not in the "
+                "allowlist %s — never auto-answer non-allowlisted / real-employee helpdesks",
+                configured_id, sorted(ALLOWED_HELPDESK_IDS),
             )
-            return web.json_response({"ok": False, "error": "configured helpdesk is denied"}, status=403)
+            return web.json_response({"ok": False, "error": "helpdesk not allowlisted"}, status=403)
 
         def _process() -> None:
             # heavy work OFF the event loop: membership API + RAG + inference (+ reply)

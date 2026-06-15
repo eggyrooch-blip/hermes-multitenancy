@@ -287,3 +287,18 @@ def test_pii_scrubbed_from_title_not_just_body(tmp_path):
     assert doc["category"] == "bot"  # ticket_type carried as metadata
     fdoc = faq_to_doc({"faq_id": "f", "question": "联系 admin@keep.com 怎么办", "answer": "x"})
     assert "admin@keep.com" not in fdoc["title"]
+
+
+def test_index_search_works_across_threads(tmp_path):
+    """Built on one thread, searched on another (the broker's executor) — must not raise
+    sqlite3.ProgrammingError."""
+    import threading
+    from hermes_multitenancy.helpdesk_rag import HelpdeskRagIndex
+    idx = HelpdeskRagIndex(str(tmp_path / "t.db"))  # connection created on this thread
+    idx.upsert({"doc_id": "a", "source": "faq", "title": "vpn 连不上", "body": "重连飞连客户端",
+                "tags": "", "category": "", "status": "", "url": "", "updated_at": ""})
+    out = {}
+    def worker():
+        out["r"] = idx.search("vpn", k=2)  # different thread
+    th = threading.Thread(target=worker); th.start(); th.join()
+    assert out["r"] and out["r"][0]["doc_id"] == "a"

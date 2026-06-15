@@ -47,3 +47,14 @@ def test_prod_it_helpdesk_is_hard_denied():
     """The real company IT helpdesk id must be in the deny-weld set."""
     from hermes_multitenancy.feishu_helpdesk_event import DENY_HELPDESK_IDS
     assert "6909040876777979905" in DENY_HELPDESK_IDS
+
+
+def test_allowlist_default_test_desk_and_prod_always_denied(monkeypatch):
+    import importlib
+    from hermes_multitenancy import feishu_helpdesk_event as m
+    # prod IT desk must stay denied even if env tries to clear the deny list
+    monkeypatch.setenv("HERMES_HELPDESK_DENY_IDS", "")
+    importlib.reload(m)
+    assert "6909040876777979905" in m.DENY_HELPDESK_IDS            # hardcoded, env can't remove
+    assert "7651445701632691164" in m.ALLOWED_HELPDESK_IDS         # test desk allowlisted by default
+    importlib.reload(m)  # restore default env state

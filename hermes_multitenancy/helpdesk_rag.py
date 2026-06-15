@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from typing import Any
 
 from .feishu_helpdesk_client import HelpdeskClient
@@ -70,8 +71,12 @@ class HelpdeskRagIndex:
         parent = os.path.dirname(self._db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path)
+        # check_same_thread=False: the broker builds the index on the aiohttp thread but
+        # search() runs in an executor thread. A lock serialises access (reads are the hot
+        # path; ingest writes happen separately via the CLI).
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._initialize()
 
     def _initialize(self) -> None:
@@ -109,7 +114,7 @@ class HelpdeskRagIndex:
         doc_id = values[0]
         # title weighted x2, then body + tags; same tokenizer as the query
         fts_text = index_tokens(" ".join((values[2], values[2], values[3], values[4])))
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO docs (doc_id, source, title, body, tags, category, status, url, updated_at)
@@ -148,39 +153,41 @@ class HelpdeskRagIndex:
             return []
         # OR over bigram/char tokens; bm25 ranks the doc with the most (and rarest) overlap first
         fts_query = " OR ".join(f'"{token}"' for token in seen)
-        cursor = self._conn.execute(
-            """
-            SELECT
-                docs.doc_id,
-                docs.source,
-                docs.title,
-                docs.body,
-                docs.tags,
-                docs.category,
-                docs.status,
-                docs.url,
-                docs.updated_at,
-                bm25(docs_fts) AS score
-            FROM docs_fts
-            JOIN docs ON docs.rowid = docs_fts.rowid
-            WHERE docs_fts MATCH ?
-            ORDER BY score ASC
-            LIMIT ?
-            """,
-            (fts_query, max(int(k), 0)),
-        )
-        try:
-            rows = cursor.fetchall()
-        finally:
-            cursor.close()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT
+                    docs.doc_id,
+                    docs.source,
+                    docs.title,
+                    docs.body,
+                    docs.tags,
+                    docs.category,
+                    docs.status,
+                    docs.url,
+                    docs.updated_at,
+                    bm25(docs_fts) AS score
+                FROM docs_fts
+                JOIN docs ON docs.rowid = docs_fts.rowid
+                WHERE docs_fts MATCH ?
+                ORDER BY score ASC
+                LIMIT ?
+                """,
+                (fts_query, max(int(k), 0)),
+            )
+            try:
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
         return [dict(row) for row in rows]
 
     def count(self) -> int:
-        cursor = self._conn.execute("SELECT COUNT(*) FROM docs")
-        try:
-            row = cursor.fetchone()
-        finally:
-            cursor.close()
+        with self._lock:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM docs")
+            try:
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
         return int(row[0] if row is not None else 0)
 
     def close(self) -> None:
