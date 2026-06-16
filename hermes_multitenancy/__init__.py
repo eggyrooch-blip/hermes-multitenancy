@@ -94,6 +94,12 @@ def register(ctx) -> None:
 
     override_pool(_build_runtime_pool(_real_factory))
     install_gateway_ownership_guard()
+    # Make core skill resolution honor the CURRENT HERMES_HOME (not the frozen
+    # import-time value). Unconditional: in the router gateway it fixes
+    # cross-profile "skill not found" for cron jobs; in profile-native runtimes
+    # dynamic == static, so it is harmless. See skills_dir_dynamic for why.
+    from .skills_dir_dynamic import install_dynamic_skills_dir_patch
+    install_dynamic_skills_dir_patch()
     if is_router_profile_runtime():
         install_cron_runtime_patches()
         install_gateway_startup_watcher()
