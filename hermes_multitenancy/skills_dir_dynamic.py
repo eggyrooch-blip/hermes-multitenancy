@@ -41,11 +41,23 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
 _PATCH_FLAG = "_hermes_mt_dynamic_skills_dir"
 _WRAP_FLAG = "_hermes_mt_dynamic_wrapped"
+# Serialize "refresh SKILLS_DIR + run the resolver" so two concurrent callers
+# with different HERMES_HOME can't cross-contaminate the shared module global
+# (A refreshes to A, B refreshes to B, A reads B's dir). Re-entrant because
+# skills_list -> _find_all_skills are both wrapped and nest within one call.
+# Skill resolution is not a hot path (cron ticks + occasional skill loads), so
+# process-wide serialization here is cheap. NOTE: HERMES_HOME itself is a
+# process-global env var; this lock makes the wrapped reads consistent, but a
+# fully context-isolated resolution would require core to read the dir per-call
+# (which we will not fork). In practice the only in-gateway-process caller is
+# the serial cron tick — agent skill loads run in per-profile subprocesses.
+_resolution_lock = threading.RLock()
 # Public + internal entry points whose bare-global SKILLS_DIR references must
 # see the live profile dir. skills_list delegates to _find_all_skills, so both
 # are wrapped (the inner call re-hits the wrapper — a harmless double refresh).
@@ -84,8 +96,9 @@ def install_dynamic_skills_dir_patch() -> None:
     def _wrap(orig):
         @functools.wraps(orig)
         def wrapper(*args, **kwargs):
-            _refresh_skills_dir()
-            return orig(*args, **kwargs)
+            with _resolution_lock:
+                _refresh_skills_dir()
+                return orig(*args, **kwargs)
 
         setattr(wrapper, _WRAP_FLAG, True)
         return wrapper
