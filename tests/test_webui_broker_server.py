@@ -903,6 +903,111 @@ def test_webui_streamed_remote_media_additions_runs_scoping_off_event_loop(tmp_p
     assert all(thread_id != loop_thread for thread_id in scoped_threads)
 
 
+def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monkeypatch):
+    import threading
+    import time
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import cron_api
+    from hermes_multitenancy import cron_worker
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    def acquire_cron_patch_lock():
+        with cron_worker._cron_module_patch_lock:
+            return "released"
+
+    def start_lock_holder():
+        held = threading.Event()
+
+        def holder():
+            with cron_worker._cron_module_patch_lock:
+                held.set()
+                time.sleep(0.4)
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        assert held.wait(timeout=1.0)
+        return thread
+
+    async def measure_ticks(awaitable_factory):
+        done = asyncio.Event()
+        ticks = 0
+
+        async def sentinel():
+            nonlocal ticks
+            while not done.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        sentinel_task = asyncio.create_task(sentinel())
+        await asyncio.sleep(0)
+        try:
+            result = await awaitable_factory()
+        finally:
+            done.set()
+            await sentinel_task
+        return result, ticks
+
+    async def call_directly():
+        return acquire_cron_patch_lock()
+
+    async def runner():
+        direct_holder = start_lock_holder()
+        try:
+            _result, direct_ticks = await measure_ticks(call_directly)
+        finally:
+            direct_holder.join(timeout=1.0)
+
+        list_jobs_calls: list[tuple[str, bool, int]] = []
+        loop_thread = threading.get_ident()
+
+        def blocking_list_jobs(profile_name, include_disabled=False):
+            list_jobs_calls.append((profile_name, include_disabled, threading.get_ident()))
+            with cron_worker._cron_module_patch_lock:
+                return [{"id": "abc123abc123"}]
+
+        monkeypatch.setattr(cron_api, "list_jobs", blocking_list_jobs)
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+        app = create_run_broker_app(
+            dispatch_agent=lambda request: f"echo:{request.content}",
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            route_holder = start_lock_holder()
+            try:
+                response, route_ticks = await measure_ticks(
+                    lambda: client.get(
+                        "/api/run-broker/jobs?include_disabled=true",
+                        headers={
+                            "Authorization": "Bearer broker-secret",
+                            "X-Hermes-Profile": "owner",
+                            "X-Hermes-User-Key": "ou_owner",
+                        },
+                    )
+                )
+                body = await response.json()
+            finally:
+                route_holder.join(timeout=1.0)
+        finally:
+            await client.close()
+
+        # Regression for the 2026-06-16 gateway deadlock: waiting on the cron
+        # patch lock must happen off the aiohttp event loop.
+        assert direct_ticks <= 1
+        assert route_ticks >= 5
+        assert response.status == 200
+        assert body == {"jobs": [{"id": "abc123abc123"}]}
+        assert list_jobs_calls == [("owner", True, list_jobs_calls[0][2])]
+        assert list_jobs_calls[0][2] != loop_thread
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 

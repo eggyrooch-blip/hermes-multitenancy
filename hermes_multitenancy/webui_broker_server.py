@@ -1970,7 +1970,11 @@ def create_run_broker_app(
         try:
             profile_name, _user_key = _tenant_from_request(request)
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
-            jobs = cron_api.list_jobs(profile_name, include_disabled=include_disabled)
+            jobs = await asyncio.to_thread(
+                cron_api.list_jobs,
+                profile_name,
+                include_disabled=include_disabled,
+            )
             return web.json_response({"jobs": jobs})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -1984,7 +1988,7 @@ def create_run_broker_app(
         try:
             payload = await request.json()
             profile_name, user_key = _tenant_from_request(request, payload)
-            job = cron_api.create_job(profile_name, user_key, payload)
+            job = await asyncio.to_thread(cron_api.create_job, profile_name, user_key, payload)
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -1997,7 +2001,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             profile_name, _user_key = _tenant_from_request(request)
-            job = cron_api.get_job(profile_name, request.match_info["job_id"])
+            job = await asyncio.to_thread(cron_api.get_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2013,7 +2017,13 @@ def create_run_broker_app(
             shadow = request.query.get("shadow", "1").lower() in {"1", "true", "yes", "on"}
             due_raw = request.query.get("due")
             due = None if due_raw is None else due_raw.lower() in {"1", "true", "yes", "on"}
-            plan = cron_api.plan_job(profile_name, request.match_info["job_id"], shadow=shadow, due=due)
+            plan = await asyncio.to_thread(
+                cron_api.plan_job,
+                profile_name,
+                request.match_info["job_id"],
+                shadow=shadow,
+                due=due,
+            )
             return web.json_response({"plan": plan})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2027,7 +2037,12 @@ def create_run_broker_app(
         try:
             payload = await request.json()
             profile_name, _user_key = _tenant_from_request(request, payload)
-            job = cron_api.update_job(profile_name, request.match_info["job_id"], payload)
+            job = await asyncio.to_thread(
+                cron_api.update_job,
+                profile_name,
+                request.match_info["job_id"],
+                payload,
+            )
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2040,7 +2055,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             profile_name, _user_key = _tenant_from_request(request)
-            cron_api.delete_job(profile_name, request.match_info["job_id"])
+            await asyncio.to_thread(cron_api.delete_job, profile_name, request.match_info["job_id"])
             return web.json_response({"ok": True})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2053,7 +2068,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             profile_name, _user_key = _tenant_from_request(request)
-            job = cron_api.pause_job(profile_name, request.match_info["job_id"])
+            job = await asyncio.to_thread(cron_api.pause_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2066,7 +2081,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             profile_name, _user_key = _tenant_from_request(request)
-            job = cron_api.resume_job(profile_name, request.match_info["job_id"])
+            job = await asyncio.to_thread(cron_api.resume_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2079,7 +2094,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             profile_name, _user_key = _tenant_from_request(request)
-            job = cron_api.trigger_job(profile_name, request.match_info["job_id"])
+            job = await asyncio.to_thread(cron_api.trigger_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job, "queued": True})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
