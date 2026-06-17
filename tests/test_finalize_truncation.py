@@ -63,24 +63,32 @@ def test_empty_but_successful_returns_empty_string():
     assert _finalize_aiagent_result({"final_response": ""}) == ""
 
 
-def test_partial_truncation_returns_notice_not_raise():
-    # core rollback case: partial=True, final_response=None, completed=False
+def test_textless_truncation_raises_for_retry_not_notice():
+    # NEW POLICY (regression fix): a TEXTLESS "output length" turn is the core's
+    # #2 case — a truncated TOOL-CALL argument, not a long answer. A "回复太长/继续"
+    # notice is meaningless (no text to continue) and misleading, so we raise and
+    # let the legacy fallback retry. (A genuine long answer leaves partial text,
+    # which is preserved + hinted by the content-preserving branch — see
+    # test_partial_with_salvageable_text_keeps_content_and_appends_notice.)
     res = {
         "final_response": None,
         "partial": True,
         "error": "Response truncated due to output length limit",
     }
-    assert _finalize_aiagent_result(res) == _TRUNCATION_NOTICE
+    with pytest.raises(RuntimeError, match="AIAgent turn failed"):
+        _finalize_aiagent_result(res)
 
 
-def test_first_message_truncation_failed_returns_notice():
-    # first-message truncation: failed=True but the error is truncation -> graceful, not raise
+def test_textless_first_message_truncation_raises_for_retry():
+    # Same policy for a textless first-message truncation: retry beats a "继续"
+    # hint with nothing to continue.
     res = {
         "final_response": None,
         "failed": True,
         "error": "First response truncated due to output length limit",
     }
-    assert _finalize_aiagent_result(res) == _TRUNCATION_NOTICE
+    with pytest.raises(RuntimeError, match="AIAgent turn failed"):
+        _finalize_aiagent_result(res)
 
 
 def test_genuine_failure_still_raises():

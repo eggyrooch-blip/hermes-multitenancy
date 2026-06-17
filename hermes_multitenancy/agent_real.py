@@ -3683,26 +3683,24 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
             return text.rstrip() + "\n\n" + _TRUNCATION_NOTICE
         return text
 
-    # No answer text at all. Distinguish the cases (the core result dict carries
-    # ``partial``/``failed``/``completed``/``error`` but NOT finish_reason, so the
-    # error string is the only available discriminator):
-    #   #1 hallucinated tool name -> "Model generated invalid tool call: X"
-    #   #2 truncated tool-call args -> "Response truncated due to output length limit"
-    #   #3 genuine answer-length truncation that left no rolled-back text
+    # No answer text at all. The "回复太长，回复『继续』" notice is meaningless here —
+    # there is nothing to continue — so we never emit it on a textless turn.
+    # Crucially, a genuine answer-length truncation almost always leaves rolled-back
+    # partial text (handled above), so a TEXTLESS turn whose error mentions
+    # "output length" is the core's #2 case (a truncated TOOL-CALL argument), NOT a
+    # long answer — exactly the class that must retry, not show "太长". So for every
+    # textless turn we RAISE, letting real_run_agent / stream_run_agent fall back to
+    # the legacy retry that still produces an answer (pre-1f2974a behavior). The
+    # error string (logged below; also surfaced by the callers' fallback warnings)
+    # distinguishes #1 ("invalid tool call") from #2 ("Response truncated …") in the
+    # journal — the diagnostic the SPEC asked for. (finish_reason is not in the core
+    # result dict; the error string is the available discriminator.)
     err = err or "agent turn failed without a final response"
     logger.warning(
-        "[multitenancy][finalize-diag] empty turn (no answer text): "
+        "[multitenancy][finalize-diag] textless turn -> raising for legacy retry: "
         "partial=%s failed=%s completed=%s truncation=%s error=%r",
         res.get("partial"), res.get("failed"), res.get("completed"), is_truncation, err,
     )
-    # Only a genuine output-length truncation earns the "回复太长/继续" notice. The
-    # 1f2974a regression returned it whenever ``partial`` was set — including
-    # tool-call failures (#1), where "太长/继续" is false and useless. Restrict the
-    # notice to real truncation; everything else raises so real_run_agent /
-    # stream_run_agent fall back and retry (pre-1f2974a behavior that still
-    # produced an answer).
-    if is_truncation:
-        return _TRUNCATION_NOTICE
     raise RuntimeError(f"AIAgent turn failed: {err}")
 
 
