@@ -123,6 +123,27 @@ def test_partial_with_salvageable_text_keeps_content_and_appends_notice():
     assert _TRUNCATION_NOTICE in out
 
 
+def test_failed_true_with_text_keeps_content_not_notice_only():
+    # codex review finding #3: a length-truncated turn can carry rolled-back text
+    # AND failed=True. Content must be preserved (text + hint), never dropped to
+    # the notice alone.
+    res = {
+        "final_response": "已经生成的一大段回答",
+        "failed": True,
+        "partial": True,
+        "error": "Response truncated due to output length limit",
+    }
+    out = _finalize_aiagent_result(res)
+    assert "已经生成的一大段回答" in out
+    assert _TRUNCATION_NOTICE in out
+
+
+def test_failed_true_with_text_non_truncation_returns_text():
+    # Even a non-truncation failure must not throw away usable answer text.
+    res = {"final_response": "有用的部分答案", "failed": True, "error": "some tool hiccup"}
+    assert _finalize_aiagent_result(res) == "有用的部分答案"
+
+
 @pytest.mark.asyncio
 async def test_streaming_failure_after_partial_content_does_not_duplicate(monkeypatch, tmp_path):
     """If content already streamed and the subprocess then raises, we must NOT

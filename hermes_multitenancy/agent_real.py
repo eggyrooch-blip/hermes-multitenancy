@@ -3663,32 +3663,46 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
     res = result or {}
     final_response = res.get("final_response")
     err = res.get("error") or ""
-    if final_response is not None and not res.get("failed"):
-        text = final_response or ""
-        # Genuine output-length truncation of the ANSWER that still produced
-        # partial text: hand the text back WITH the continue hint instead of
-        # dropping either. This is the only legitimate "回复太长/继续" case —
-        # there is real answer text the user can ask to continue.
-        if text.strip() and res.get("partial") and _is_output_truncation_error(err):
+    text = final_response if isinstance(final_response, str) else ""
+    is_truncation = _is_output_truncation_error(err)
+
+    # Genuine success (incl. a legitimately empty turn): final_response present,
+    # no failure/partial/error flags. Return it verbatim ("" stays "").
+    if final_response is not None and not res.get("failed") and not res.get("partial") and not err:
+        return final_response or ""
+
+    # CONTENT-PRESERVING FIRST: if the turn produced ANY answer text, never drop
+    # it — not even when ``failed``/``partial`` is set alongside it (a
+    # length-truncated turn can carry both a rolled-back ``final_response`` AND
+    # ``failed:True``; the old ``not res.get("failed")`` gate discarded that text
+    # and returned the notice alone — a real content-loss bug).
+    if text.strip():
+        if is_truncation:
+            # Genuine output-length truncation with salvageable text: hand the
+            # partial answer back WITH the continue hint, never the notice alone.
             return text.rstrip() + "\n\n" + _TRUNCATION_NOTICE
         return text
-    # No final answer text at all. Only a GENUINE output-length truncation
-    # warrants the "回复太长/继续" notice. 1f2974a returned that notice whenever
-    # `res.get("partial")` was set — but partial=True ALSO covers tool-call
-    # failures (#1 hallucinated tool name after 3 retries -> error like
-    # "Model generated invalid tool call: X"), where "太长/继续" is false and
-    # useless. That over-broad mapping is the production regression. Restrict the
-    # notice to real truncation; everything else raises so real_run_agent /
-    # stream_run_agent fall back and retry (the pre-1f2974a behavior that still
-    # produced an answer).
+
+    # No answer text at all. Distinguish the cases (the core result dict carries
+    # ``partial``/``failed``/``completed``/``error`` but NOT finish_reason, so the
+    # error string is the only available discriminator):
+    #   #1 hallucinated tool name -> "Model generated invalid tool call: X"
+    #   #2 truncated tool-call args -> "Response truncated due to output length limit"
+    #   #3 genuine answer-length truncation that left no rolled-back text
     err = err or "agent turn failed without a final response"
-    if _is_output_truncation_error(err):
-        return _TRUNCATION_NOTICE
     logger.warning(
-        "[multitenancy][finalize-diag] non-truncation empty/partial turn -> raising "
-        "for legacy retry: partial=%s failed=%s error=%r",
-        res.get("partial"), res.get("failed"), err,
+        "[multitenancy][finalize-diag] empty turn (no answer text): "
+        "partial=%s failed=%s completed=%s truncation=%s error=%r",
+        res.get("partial"), res.get("failed"), res.get("completed"), is_truncation, err,
     )
+    # Only a genuine output-length truncation earns the "回复太长/继续" notice. The
+    # 1f2974a regression returned it whenever ``partial`` was set — including
+    # tool-call failures (#1), where "太长/继续" is false and useless. Restrict the
+    # notice to real truncation; everything else raises so real_run_agent /
+    # stream_run_agent fall back and retry (pre-1f2974a behavior that still
+    # produced an answer).
+    if is_truncation:
+        return _TRUNCATION_NOTICE
     raise RuntimeError(f"AIAgent turn failed: {err}")
 
 
