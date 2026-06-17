@@ -192,11 +192,11 @@ async def stream_run_agent(  # type: ignore[override]
         if final_text and not content_text.strip():
             yield "content", final_text
             content_text = final_text
-        elif final_text == _TRUNCATION_NOTICE and _TRUNCATION_NOTICE not in content_text:
-            # Output-length truncation AFTER partial content already streamed into
-            # the card: the streamed text is incomplete, so append the recovery
-            # hint as a trailing delta (the normal-completion branch above only
-            # fires when nothing streamed, dropping the notice otherwise).
+        elif final_text.endswith(_TRUNCATION_NOTICE) and _TRUNCATION_NOTICE not in content_text:
+            # Genuine output-length truncation AFTER partial answer text already
+            # streamed into the card: the streamed text is incomplete, so append
+            # the continue hint as a trailing delta. (_finalize_aiagent_result now
+            # returns "<partial text>\n\n<notice>", so match on the suffix.)
             tail = "\n\n" + _TRUNCATION_NOTICE
             yield "content", tail
             content_text += tail
@@ -212,6 +212,14 @@ async def stream_run_agent(  # type: ignore[override]
             "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
             exc, exc_info=True,
         )
+        # If we already streamed partial content into the card, re-running the
+        # legacy stream below would DUPLICATE everything the user has seen. Stop
+        # with an honest recovery hint instead of re-streaming. (Only fall through
+        # to the legacy stream when nothing was shown yet — e.g. a tool-call
+        # failure that raised before any answer token.)
+        if content_parts:
+            yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
+            return
 
     async for kind, text in _stream_loop(event, profile_home, messages=messages):
         yield kind, text
@@ -3654,11 +3662,33 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
     """
     res = result or {}
     final_response = res.get("final_response")
+    err = res.get("error") or ""
     if final_response is not None and not res.get("failed"):
-        return final_response or ""
-    err = res.get("error") or "agent turn failed without a final response"
-    if res.get("partial") or _is_output_truncation_error(err):
+        text = final_response or ""
+        # Genuine output-length truncation of the ANSWER that still produced
+        # partial text: hand the text back WITH the continue hint instead of
+        # dropping either. This is the only legitimate "回复太长/继续" case —
+        # there is real answer text the user can ask to continue.
+        if text.strip() and res.get("partial") and _is_output_truncation_error(err):
+            return text.rstrip() + "\n\n" + _TRUNCATION_NOTICE
+        return text
+    # No final answer text at all. Only a GENUINE output-length truncation
+    # warrants the "回复太长/继续" notice. 1f2974a returned that notice whenever
+    # `res.get("partial")` was set — but partial=True ALSO covers tool-call
+    # failures (#1 hallucinated tool name after 3 retries -> error like
+    # "Model generated invalid tool call: X"), where "太长/继续" is false and
+    # useless. That over-broad mapping is the production regression. Restrict the
+    # notice to real truncation; everything else raises so real_run_agent /
+    # stream_run_agent fall back and retry (the pre-1f2974a behavior that still
+    # produced an answer).
+    err = err or "agent turn failed without a final response"
+    if _is_output_truncation_error(err):
         return _TRUNCATION_NOTICE
+    logger.warning(
+        "[multitenancy][finalize-diag] non-truncation empty/partial turn -> raising "
+        "for legacy retry: partial=%s failed=%s error=%r",
+        res.get("partial"), res.get("failed"), err,
+    )
     raise RuntimeError(f"AIAgent turn failed: {err}")
 
 
@@ -3666,6 +3696,11 @@ _TRUNCATION_NOTICE = (
     "⚠️ 这次回复内容太长，超出了单条输出的长度上限被截断了。\n"
     "你可以回复「继续」让我接着往下说，或把问题拆小一点、分几次问，我就能完整回答。"
 )
+
+# Shown only in the streaming path when partial content was ALREADY streamed into
+# the card and the turn then failed (so we cannot cleanly retry without dupes).
+# Distinct from _TRUNCATION_NOTICE: this is "the turn broke", not "answer too long".
+_PARTIAL_FAILURE_NOTICE = "⚠️ 这次回答中途出错了，没能说完。麻烦再发一次试试。"
 
 
 def _is_output_truncation_error(err: Any) -> bool:

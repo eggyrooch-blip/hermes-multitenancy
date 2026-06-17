@@ -8,6 +8,7 @@ from hermes_multitenancy.agent_real import (
     _finalize_aiagent_result,
     _is_output_truncation_error,
     _TRUNCATION_NOTICE,
+    _PARTIAL_FAILURE_NOTICE,
 )
 
 
@@ -93,6 +94,78 @@ def test_none_final_response_without_truncation_still_raises():
     res = {"final_response": None, "error": "agent crashed somewhere"}
     with pytest.raises(RuntimeError):
         _finalize_aiagent_result(res)
+
+
+def test_invalid_tool_call_partial_raises_not_notice():
+    # REGRESSION: core returns partial=True for a hallucinated tool name (#1).
+    # This is NOT "回复太长" — it must raise so the legacy fallback retries,
+    # never surface the truncation notice. (Fails before the partial-notice fix.)
+    res = {
+        "final_response": None,
+        "partial": True,
+        "completed": False,
+        "error": "Model generated invalid tool call: frobnicate_widget",
+    }
+    with pytest.raises(RuntimeError, match="AIAgent turn failed"):
+        _finalize_aiagent_result(res)
+
+
+def test_partial_with_salvageable_text_keeps_content_and_appends_notice():
+    # Genuine answer-length truncation that still produced partial text: the user
+    # must get the partial answer AND the continue hint — never the notice alone.
+    res = {
+        "final_response": "这是回答的前半部分",
+        "partial": True,
+        "error": "Response truncated due to output length limit",
+    }
+    out = _finalize_aiagent_result(res)
+    assert "这是回答的前半部分" in out
+    assert _TRUNCATION_NOTICE in out
+
+
+@pytest.mark.asyncio
+async def test_streaming_failure_after_partial_content_does_not_duplicate(monkeypatch, tmp_path):
+    """If content already streamed and the subprocess then raises, we must NOT
+    re-run the legacy stream (that duplicates the visible answer). Append an
+    honest failure hint and stop."""
+    from hermes_multitenancy import agent_real
+
+    async def fake_stream(event, profile_home):
+        yield ("content", "已经显示给用户的一段")
+        raise RuntimeError("AIAgent subprocess failed: AIAgent turn failed: invalid tool call")
+
+    def legacy_must_not_run(*_a, **_k):
+        raise AssertionError("legacy _stream_loop must not re-stream after partial content")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", fake_stream, raising=False)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_must_not_run)
+
+    chunks = [c async for c in agent_real.stream_run_agent(_event(), tmp_path)]
+    texts = [t for k, t in chunks if k == "content"]
+    assert "已经显示给用户的一段" in texts
+    assert any(_PARTIAL_FAILURE_NOTICE in str(t) for t in texts)
+    # no duplicate of the already-shown content
+    assert texts.count("已经显示给用户的一段") == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_failure_before_any_content_falls_back_to_legacy(monkeypatch, tmp_path):
+    """If nothing streamed yet and the subprocess raises, fall back to the legacy
+    stream so the user still gets an answer (no duplication risk)."""
+    from hermes_multitenancy import agent_real
+
+    async def fake_stream(event, profile_home):
+        raise RuntimeError("AIAgent subprocess failed: AIAgent turn failed: invalid tool call")
+        yield  # pragma: no cover (make it an async generator)
+
+    async def fake_legacy(event, profile_home, *, messages=None):
+        yield ("content", "legacy 兜底回答")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", fake_stream, raising=False)
+    monkeypatch.setattr(agent_real, "_stream_loop", fake_legacy)
+
+    chunks = [c async for c in agent_real.stream_run_agent(_event(), tmp_path)]
+    assert ("content", "legacy 兜底回答") in chunks
 
 
 def test_is_output_truncation_error_matching():
