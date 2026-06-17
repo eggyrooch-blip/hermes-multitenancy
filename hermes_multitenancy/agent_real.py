@@ -3681,7 +3681,13 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
             # Genuine output-length truncation with salvageable text: hand the
             # partial answer back WITH the continue hint, never the notice alone.
             return text.rstrip() + "\n\n" + _TRUNCATION_NOTICE
-        return text
+        if not res.get("failed"):
+            # A non-failed turn that produced text (e.g. a non-truncation partial):
+            # return what we have.
+            return text
+        # failed=True, non-truncation, but some text leaked: this is a HARD failure
+        # (provider 400, tool crash). Don't surface possibly-garbage partial text —
+        # fall through to raise so the "模型暂时不可用" fallback / retry fires.
 
     # No answer text at all. The "回复太长，回复『继续』" notice is meaningless here —
     # there is nothing to continue — so we never emit it on a textless turn.
@@ -3697,8 +3703,8 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
     # result dict; the error string is the available discriminator.)
     err = err or "agent turn failed without a final response"
     logger.warning(
-        "[multitenancy][finalize-diag] textless turn -> raising for legacy retry: "
-        "partial=%s failed=%s completed=%s truncation=%s error=%r",
+        "[multitenancy][finalize-diag] no usable answer (textless or hard-failed) -> "
+        "raising for legacy retry: partial=%s failed=%s completed=%s truncation=%s error=%r",
         res.get("partial"), res.get("failed"), res.get("completed"), is_truncation, err,
     )
     raise RuntimeError(f"AIAgent turn failed: {err}")
