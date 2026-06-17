@@ -4058,6 +4058,22 @@ def _run_with_aiagent(
                     pass
             _retag_source_now("finally-post-close")
 
+    # Raw subprocess diagnostic (child-side, BEFORE finalize collapses the dict to
+    # a string): one line of the core's raw result for any non-clean turn so prod
+    # can confirm the dominant failure class (#1 invalid tool name vs #2 truncated
+    # tool-call args vs textless truncation). finish_reason is not part of the core
+    # result dict; the error string is the discriminator.
+    _r = result or {}
+    if _r.get("failed") or _r.get("partial") or not (
+        (_r.get("final_response") or "").strip() if isinstance(_r.get("final_response"), str) else _r.get("final_response")
+    ):
+        logger.warning(
+            "[multitenancy][finalize-diag] raw child result: partial=%s failed=%s "
+            "completed=%s has_text=%s error=%r",
+            _r.get("partial"), _r.get("failed"), _r.get("completed"),
+            bool(isinstance(_r.get("final_response"), str) and _r["final_response"].strip()),
+            _r.get("error"),
+        )
     return _finalize_aiagent_result(result)
 
 
