@@ -766,17 +766,18 @@ def gitlab_status(*, profile_dir: Path, installed: bool = False) -> CredentialRo
     return row
 
 
-def collect_credential_statuses(
+def _collect_credential_rows(
     *,
     profile_name: str,
     open_id: str,
     shared_home: Optional[Path] = None,
     home_dir: Optional[Path] = None,
 ) -> list[CredentialRow]:
-    """Aggregate all five credentials' status for one profile/open_id, in order.
+    """Low-level reader: aggregate all five credentials' status, in order.
 
-    ``home_dir`` is the profile's HOME-redirect dir (where per-profile tools drop
-    dotfiles). Callers that already know it (the router has the authoritative
+    This is the canonical reader the Connector Registry wraps. ``home_dir`` is
+    the profile's HOME-redirect dir (where per-profile tools drop dotfiles).
+    Callers that already know it (the router has the authoritative
     ``profile_home``) should pass it; otherwise it is derived from ``shared_home``
     — which honors ``HERMES_SHARED_HOME``/``HERMES_HOME``.
     """
@@ -807,6 +808,34 @@ def collect_credential_statuses(
                        installed=kep_installed, required_by=req.get(KEP_CLI)),
         gitlab_status(profile_dir=p_dir, installed=gitlab_installed),
     ]
+
+
+def collect_credential_statuses(
+    *,
+    profile_name: str,
+    open_id: str,
+    shared_home: Optional[Path] = None,
+    home_dir: Optional[Path] = None,
+) -> list[CredentialRow]:
+    """Aggregate all five credentials' status for one profile/open_id, in order.
+
+    Adapter over the Connector Registry (the control plane): this routes through
+    ``connectors.registry`` so the registry is the source of truth, then maps the
+    enriched ``ConnectorStatus`` back to the legacy ``CredentialRow`` — output is
+    byte-identical to the pre-registry behavior (the registry only ADDS scope
+    fields; ``compat.to_credential_row`` drops them). The lazy import keeps the
+    dependency acyclic: ``credential_hub`` is importable without the registry;
+    the registry imports ``credential_hub`` readers.
+    """
+    from .connectors import compat, registry
+
+    statuses = registry.collect_connector_statuses(
+        profile_name=profile_name,
+        open_id=open_id,
+        shared_home=shared_home,
+        home_dir=home_dir,
+    )
+    return [compat.to_credential_row(status) for status in statuses]
 
 
 # --- display helpers --------------------------------------------------------

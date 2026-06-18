@@ -2265,6 +2265,41 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI credential hub failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_connectors(request):
+        """Connector Registry status for one tenant — the NEW control-plane shape.
+
+        Same five connectors as ``/credentials/hub`` but each row carries the
+        additive 防串号 fields (profile / scope / acting_identity /
+        credential_owner / runtime_policy_owner). The legacy ``/credentials/hub``
+        endpoint stays byte-stable for the current WebUI; this endpoint is what
+        the WebUI converges onto in a later phase. Redacted — never emits a
+        secret, raw env, keyring path, or real profile-home secret path.
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from .connectors import registry
+
+        try:
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            # Offload to a thread: collection may shell out to meegle/kep-auth.
+            statuses = await asyncio.to_thread(
+                registry.collect_connector_statuses,
+                profile_name=profile_name,
+                open_id=user_key,
+            )
+            return web.json_response(
+                {
+                    "profile_name": profile_name,
+                    "subject_id": user_key,
+                    "connectors": [status.to_dict() for status in statuses],
+                }
+            )
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI connectors failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_credential_lease(request):
         header = request.headers.get("Authorization", "")
         prefix = "Bearer "
@@ -2881,6 +2916,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/credentials/lease", handle_credential_lease)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
+    app.router.add_get("/api/run-broker/connectors", handle_connectors)
     app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
