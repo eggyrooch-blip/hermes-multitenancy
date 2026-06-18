@@ -304,6 +304,92 @@ def _skillhub_authorized(request: Any) -> bool:
     return False
 
 
+def _ingest_bearer_token(request: Any) -> str:
+    header = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    return header[len(prefix):].strip() if header.startswith(prefix) else ""
+
+
+def _ingest_file_bindings() -> list[dict[str, str]]:
+    path = os.environ.get("HERMES_INGEST_KEYS_FILE", "").strip()
+    if not path:
+        return []
+    try:
+        raw = json.loads(Path(path).expanduser().read_text())
+    except Exception:
+        logger.exception("[multitenancy] failed to load ingest key bindings file")
+        return []
+    entries = raw.get("keys", raw.get("bindings", [])) if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return []
+    bindings: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        token = str(entry.get("token") or "").strip()
+        owner = str(entry.get("owner") or "").strip()
+        profile = str(entry.get("profile") or "").strip()
+        if not token or (not owner and not profile):
+            continue
+        binding = {
+            "owner": owner,
+            "profile": profile,
+            "agent": str(entry.get("agent") or entry.get("agent_id") or "").strip(),
+            "name": str(entry.get("name") or entry.get("display_label") or "").strip(),
+            "source": "file",
+        }
+        bindings.append({"token": token, **binding})
+    return bindings
+
+
+def _legacy_ingest_binding() -> dict[str, str]:
+    owner = _ingest_owner()
+    return {
+        "owner": owner,
+        "profile": "" if owner else os.environ.get("HERMES_INGEST_PROFILE", "").strip(),
+        "agent": "",
+        "name": "",
+        "source": "legacy",
+    }
+
+
+def _ingest_binding_for_request(request: Any) -> Optional[dict[str, str]]:
+    token = _ingest_bearer_token(request)
+    if not token:
+        return None
+    for binding in _ingest_file_bindings():
+        expected = binding.pop("token", "")
+        if expected and hmac.compare_digest(token, expected):
+            return binding
+    dedicated = os.environ.get("HERMES_INGEST_KEY", "").strip()
+    if dedicated and hmac.compare_digest(token, dedicated):
+        return _legacy_ingest_binding()
+    master = _run_broker_key()
+    if master and hmac.compare_digest(token, master):
+        return _legacy_ingest_binding()
+    return None
+
+
+def _ingest_bound_agent_label(binding: dict[str, str]) -> str:
+    return binding.get("name") or binding.get("agent") or binding.get("profile") or ""
+
+
+def _ingest_bound_agent_id(binding: dict[str, str]) -> str:
+    return binding.get("agent") or binding.get("profile") or ""
+
+
+def _ingest_agent_matches_binding(binding: dict[str, str], agent_str: str) -> bool:
+    target = (agent_str or "").strip()
+    if not target:
+        return True
+    candidates = {
+        binding.get("name"),
+        binding.get("agent"),
+        binding.get("profile"),
+    }
+    return target in {str(v) for v in candidates if v}
+
+
 def _ingest_authorized(request: Any) -> bool:
     """Auth for the synchronous ingest ingress — **fail-closed**.
 
@@ -314,20 +400,7 @@ def _ingest_authorized(request: Any) -> bool:
     master ``HERMES_MULTITENANCY_RUN_BROKER_KEY`` for internal callers. If
     NEITHER key is configured, refuse — never serve this route open.
     """
-    dedicated = os.environ.get("HERMES_INGEST_KEY", "").strip()
-    master = _run_broker_key()
-    if not dedicated and not master:
-        return False  # public route must never be open
-    header = request.headers.get("Authorization", "")
-    prefix = "Bearer "
-    token = header[len(prefix):].strip() if header.startswith(prefix) else ""
-    if not token:
-        return False
-    if dedicated and hmac.compare_digest(token, dedicated):
-        return True
-    if master and hmac.compare_digest(token, master):
-        return True
-    return False
+    return _ingest_binding_for_request(request) is not None
 
 
 def _ingest_public_interaction(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1397,11 +1470,13 @@ def create_run_broker_app(
         duplicate submissions return the original result.
         See SPEC run-broker-ingest.
         """
-        if not _ingest_authorized(request):
+        ingest_binding = _ingest_binding_for_request(request)
+        if ingest_binding is None:
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
 
-        owner = _ingest_owner()
-        default_profile = os.environ.get("HERMES_INGEST_PROFILE", "").strip()
+        owner = ingest_binding.get("owner", "")
+        bound_profile_from_key = ingest_binding.get("profile", "")
+        default_profile = bound_profile_from_key or os.environ.get("HERMES_INGEST_PROFILE", "").strip()
         # Review B2: in v1 mode (no owner), an unconfigured profile must 503
         # immediately after auth — same precedence as before this feature,
         # independent of body validity.
@@ -1436,7 +1511,20 @@ def create_run_broker_app(
         #   THIS owner's agents, never another owner's, never an arbitrary profile.
         # - v1 mode (no owner): fixed HERMES_INGEST_PROFILE; ``agent``/``profile``
         #   in the body are ignored. Behavior is byte-for-byte unchanged.
-        if owner:
+        profile_bound_by_key = bool(bound_profile_from_key and ingest_binding.get("source") == "file")
+        if profile_bound_by_key:
+            agent_str = str(payload.get("agent") or "").strip()
+            if not _ingest_agent_matches_binding(ingest_binding, agent_str):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "agent not found or not owned by this key's owner",
+                        "agents": [_ingest_bound_agent_label(ingest_binding)],
+                    },
+                    status=403,
+                )
+            bound_profile = bound_profile_from_key
+        elif owner:
             agent_str = str(payload.get("agent") or "").strip()
             if not agent_str:
                 return web.json_response(
@@ -1666,9 +1754,25 @@ def create_run_broker_app(
         /ingest. Same fail-closed Bearer auth as /ingest. Returns 503 when the
         endpoint is not in OWNER mode (no HERMES_INGEST_OWNER configured).
         """
-        if not _ingest_authorized(request):
+        ingest_binding = _ingest_binding_for_request(request)
+        if ingest_binding is None:
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-        owner = _ingest_owner()
+        owner = ingest_binding.get("owner", "")
+        bound_profile_from_key = ingest_binding.get("profile", "")
+        if bound_profile_from_key and ingest_binding.get("source") == "file":
+            return web.json_response(
+                {
+                    "ok": True,
+                    "owner": owner,
+                    "agents": [
+                        {
+                            "name": _ingest_bound_agent_label(ingest_binding),
+                            "id": _ingest_bound_agent_id(ingest_binding),
+                        }
+                    ],
+                },
+                status=200,
+            )
         if not owner:
             return web.json_response(
                 {"ok": False, "error": "owner mode not configured"}, status=503

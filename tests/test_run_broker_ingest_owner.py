@@ -116,6 +116,139 @@ def test_owner_mode_runs_specified_agent(monkeypatch):
     assert seen[0].profile_name == "webui_aaa_ecom_bbb"
 
 
+def test_key_file_keeps_owner_key_and_adds_profile_bound_key(monkeypatch, tmp_path):
+    qin_owner = "ou_qinchuan"
+    key_file = tmp_path / "ingest-keys.json"
+    key_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {"token": "han-key", "owner": OWNER},
+                    {
+                        "token": "qin-key",
+                        "owner": qin_owner,
+                        "profile": "daryu-agent",
+                        "agent": "d3d59ea6ed55",
+                        "name": "daryu 对账定时广播",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_OWNER", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_PROFILE", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file))
+    _install_fake_routing(monkeypatch)
+
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request)
+        return f"echo:{request.profile_name}:{request.content}"
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _r: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            han_resp = await client.post(
+                ING,
+                json={"content": "hi", "agent": "电商文案助手"},
+                headers={"Authorization": "Bearer han-key"},
+            )
+            han_body = json.loads(await han_resp.text())
+            qin_list_resp = await client.get(
+                AGENTS,
+                headers={"Authorization": "Bearer qin-key"},
+            )
+            qin_list_body = json.loads(await qin_list_resp.text())
+            qin_resp = await client.post(
+                ING,
+                json={"content": "对账查询"},
+                headers={"Authorization": "Bearer qin-key"},
+            )
+            qin_body = json.loads(await qin_resp.text())
+            return han_resp.status, han_body, qin_list_resp.status, qin_list_body, qin_resp.status, qin_body
+        finally:
+            await client.close()
+
+    han_status, han, qin_list_status, qin_list, qin_status, qin = asyncio.run(runner())
+
+    assert han_status == 200
+    assert han["profile"] == "webui_aaa_ecom_bbb"
+    assert qin_list_status == 200
+    assert qin_list["owner"] == qin_owner
+    assert qin_list["agents"] == [{"name": "daryu 对账定时广播", "id": "d3d59ea6ed55"}]
+    assert qin_status == 200
+    assert qin["profile"] == "daryu-agent"
+    assert qin["result"] == "echo:daryu-agent:对账查询"
+    assert seen[-1].profile_name == "daryu-agent"
+
+
+def test_profile_bound_key_rejects_mismatched_agent(monkeypatch, tmp_path):
+    key_file = tmp_path / "ingest-keys.json"
+    key_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "token": "qin-key",
+                        "owner": "ou_qinchuan",
+                        "profile": "daryu-agent",
+                        "agent": "d3d59ea6ed55",
+                        "name": "daryu 对账定时广播",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_OWNER", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_PROFILE", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file))
+    _install_fake_routing(monkeypatch)
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request)
+        return "should-not-run"
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _r: True,
+        sandbox_available=lambda: True,
+    )
+
+    status, text = _req(
+        app,
+        "POST",
+        ING,
+        body={"content": "hi", "agent": "电商文案助手"},
+        headers={"Authorization": "Bearer qin-key"},
+    )
+    assert status == 403
+    d = json.loads(text)
+    assert d["error"] == "agent not found or not owned by this key's owner"
+    assert d["agents"] == ["daryu 对账定时广播"]
+    assert seen == []
+
+
 def test_owner_mode_accepts_agent_by_id(monkeypatch):
     app, seen = _app(monkeypatch)
     status, _ = _req(app, "POST", ING, body={"content": "hi", "agent": f"webui:{OWNER}:数据分析助手"}, headers=AUTH)
