@@ -357,6 +357,29 @@ hermes-multitenancy-analytics summary --include-profiles --include-samples  # + 
 
 ---
 
+## 🔑 Ingest API key 管理
+
+`/api/run-broker/ingest` 支持把外部调用方的 Bearer token 绑定到 owner 模式或固定 profile/agent。不要手工编辑生产 key 文件；用 CLI 生成、查看、轮换和吊销，默认输出只显示脱敏 token：
+
+```bash
+hermes-multitenancy-ingest grant \
+  --keys-file "$HERMES_INGEST_KEYS_FILE" \
+  --owner <owner_open_id> \
+  --profile <bound_profile> \
+  --agent <external_agent_id> \
+  --name "<display_name>" \
+  --show-token
+
+hermes-multitenancy-ingest list --keys-file "$HERMES_INGEST_KEYS_FILE"
+hermes-multitenancy-ingest rotate --keys-file "$HERMES_INGEST_KEYS_FILE" --profile <bound_profile> --agent <external_agent_id> --show-token
+hermes-multitenancy-ingest revoke --keys-file "$HERMES_INGEST_KEYS_FILE" --profile <bound_profile> --agent <external_agent_id>
+hermes-multitenancy-ingest smoke --base-url <run_broker_base_url> --token <bearer_token>
+```
+
+`grant` / `rotate` 默认会生成新 token 但只打印 masked 值；只有显式 `--show-token` 才会把完整 token 打到 stdout，便于一次性发给调用方。key 文件会以 `0600` 保存，格式为 `{"keys":[...]}`，可直接作为 `HERMES_INGEST_KEYS_FILE` 被 gateway runtime 读取。
+
+---
+
 ## 🚢 生产部署 runbook
 
 1. 本地更新并验证规范仓。

@@ -56,6 +56,7 @@ hermes-multitenancy-sync = "hermes_multitenancy.sync.cli:main"
 hermes-multitenancy-credentials = "hermes_multitenancy.credential_materializer:main"
 hermes-multitenancy-analytics = "hermes_multitenancy.analytics.cli:main"
 hermes-multitenancy-doctor = "hermes_multitenancy.doctor:main"
+hermes-multitenancy-ingest = "hermes_multitenancy.ingest_key_admin_cli:main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"
