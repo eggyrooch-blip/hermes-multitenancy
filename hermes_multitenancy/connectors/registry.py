@@ -195,13 +195,16 @@ def _cache_get(profile_name: str, open_id: str) -> Optional[list[ConnectorStatus
         if now - ts > _cache_ttl_ms():
             _cache.pop(key, None)
             return None
-        return value
+        # Return a fresh list so a caller can't mutate the cached sequence
+        # (e.g. sort/append) and corrupt what later same-profile callers see.
+        return list(value)
 
 
 def _cache_put(profile_name: str, open_id: str, statuses: list[ConnectorStatus]) -> None:
     key = _cache_key(profile_name, open_id)
     with _cache_lock:
-        _cache[key] = (time.time() * 1000, statuses)
+        # Store a copy so a post-put mutation of the caller's list can't leak in.
+        _cache[key] = (time.time() * 1000, list(statuses))
 
 
 def clear_cache() -> None:
