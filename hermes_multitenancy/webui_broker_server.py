@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -267,6 +268,17 @@ def _lookup_session_search_broker_token(token: str) -> dict[str, str] | None:
         if record is None or not hmac.compare_digest(key, token):
             return None
         return dict(record)
+
+
+def _call_session_search_compat(session_search: Callable[..., str], **kwargs: Any) -> str:
+    try:
+        signature = inspect.signature(session_search)
+    except (TypeError, ValueError):
+        return session_search(**kwargs)
+    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return session_search(**kwargs)
+    accepted = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    return session_search(**accepted)
 
 
 def _positive_int_env(name: str) -> Optional[int]:
@@ -2394,7 +2406,8 @@ def create_run_broker_app(
             profile_home = _profile_home_for_name(profile_name)
             db = SessionDB(db_path=profile_home / "state.db")
             try:
-                result = session_search(
+                result = _call_session_search_compat(
+                    session_search,
                     query=str(payload.get("query") or ""),
                     role_filter=payload.get("role_filter"),
                     limit=payload.get("limit", 3),
