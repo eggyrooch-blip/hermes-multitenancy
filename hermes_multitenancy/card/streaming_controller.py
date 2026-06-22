@@ -63,7 +63,7 @@ from .tool_use_display import (
     _merge_raw_tool_intents,
     _render_tool_calls_section,
 )
-from hermes_multitenancy.card.unavailable_guard import UnavailableGuard
+from .unavailable_guard import UnavailableGuard
 
 # Preserve the legacy logger name so existing log filters / alerts / collectors
 # that match on logger name (hermes_multitenancy.feishu_cardkit_compat) keep

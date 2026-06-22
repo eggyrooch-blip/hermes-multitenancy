@@ -563,6 +563,8 @@ make skills-uat-strict
 
 **"plugin loaded but no replies"** — `pkill -f gateway && hermes gateway run`. Plugins load at gateway startup; any change requires a restart.
 
+**"gateway logs `Failed to load plugin 'multitenancy': No module named 'hermes_multitenancy'`"** — the repo is being loaded as a Hermes directory plugin under the `hermes_plugins.<name>` namespace, so package-internal imports must be relative. Check `tests/test_plugin_install_layout.py`; this failure means `register(ctx)` may abort before `pre_gateway_dispatch` is registered, even if router sidecars such as Run Broker start.
+
 **"all bots stopped responding"** — your routing rule probably has the wrong `open_id`/`union_id`. Add a temporary `print(event.source)` in `router.on_pre_gateway_dispatch` and watch the gateway log.
 
 **"org sync routed someone incorrectly"** — stop cron/systemd first, run `pull-feishu --dry-run`. The user can `/status` in Feishu; locally inspect `sqlite3 ~/.hermes/multitenancy.db 'select user_id, open_id, profile_name, active from multitenancy_routing;'`.
