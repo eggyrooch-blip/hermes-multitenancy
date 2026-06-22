@@ -68,6 +68,8 @@ _SESSION_HISTORY_COMMANDS = frozenset({"new", "reset", "status"})
 _GOAL_COMMANDS = frozenset({"goal", "subgoal"})
 _credential_broker_tokens: dict[str, dict[str, str]] = {}
 _credential_broker_tokens_lock = threading.Lock()
+_session_search_broker_tokens: dict[str, dict[str, str]] = {}
+_session_search_broker_tokens_lock = threading.Lock()
 
 
 def _session_history_slash_commands() -> list[dict[str, str]]:
@@ -231,6 +233,37 @@ def _lookup_credential_broker_token(token: str) -> dict[str, str] | None:
         return None
     with _credential_broker_tokens_lock:
         record = _credential_broker_tokens.get(key)
+        if record is None or not hmac.compare_digest(key, token):
+            return None
+        return dict(record)
+
+
+def register_session_search_broker_token(*, token: str, profile_name: str, open_id: str, run_id: str) -> None:
+    key = str(token or "").strip()
+    if not key:
+        return
+    with _session_search_broker_tokens_lock:
+        _session_search_broker_tokens[key] = {
+            "profile_name": str(profile_name or "").strip(),
+            "open_id": str(open_id or "").strip(),
+            "run_id": str(run_id or "").strip(),
+        }
+
+
+def unregister_session_search_broker_token(token: str) -> None:
+    key = str(token or "").strip()
+    if not key:
+        return
+    with _session_search_broker_tokens_lock:
+        _session_search_broker_tokens.pop(key, None)
+
+
+def _lookup_session_search_broker_token(token: str) -> dict[str, str] | None:
+    key = str(token or "").strip()
+    if not key:
+        return None
+    with _session_search_broker_tokens_lock:
+        record = _session_search_broker_tokens.get(key)
         if record is None or not hmac.compare_digest(key, token):
             return None
         return dict(record)
@@ -2331,6 +2364,64 @@ def create_run_broker_app(
             **result,
         })
 
+    async def handle_internal_session_search(request):
+        token = _ingest_bearer_token(request)
+        claims = _lookup_session_search_broker_token(token)
+        if claims is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "json object required"}, status=400)
+
+        profile_name = cron_api.validate_profile_name(str(claims.get("profile_name") or ""))
+        requested_profile = str(payload.get("profile") or "").strip()
+        if requested_profile:
+            try:
+                requested_profile = cron_api.validate_profile_name(requested_profile)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            if requested_profile != profile_name:
+                return web.json_response({"error": "profile is not accessible for this run"}, status=403)
+
+        try:
+            from hermes_state import SessionDB
+            from tools.session_search_tool import session_search
+
+            profile_home = _profile_home_for_name(profile_name)
+            db = SessionDB(db_path=profile_home / "state.db")
+            try:
+                result = session_search(
+                    query=str(payload.get("query") or ""),
+                    role_filter=payload.get("role_filter"),
+                    limit=payload.get("limit", 3),
+                    session_id=payload.get("session_id"),
+                    around_message_id=payload.get("around_message_id"),
+                    window=payload.get("window", 5),
+                    sort=payload.get("sort"),
+                    profile=None,
+                    db=db,
+                    current_session_id=payload.get("current_session_id"),
+                )
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.exception("[multitenancy] internal session_search broker failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
+        return web.json_response({
+            "ok": True,
+            "profile_name": profile_name,
+            "run_id": str(claims.get("run_id") or ""),
+            "result": result,
+        })
+
     async def handle_goal_evaluate(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -3340,6 +3431,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/ingest/agents", handle_ingest_agents)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
     app.router.add_post("/api/run-broker/session-commands", handle_session_command)
+    app.router.add_post("/api/run-broker/internal/session-search", handle_internal_session_search)
     app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)

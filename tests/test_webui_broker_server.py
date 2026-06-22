@@ -137,6 +137,100 @@ def test_webui_run_broker_client_max_size_can_be_overridden(monkeypatch):
     assert app._client_max_size == 8 * 1024 * 1024
 
 
+def test_internal_session_search_broker_uses_parent_profile_db(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session("session-one", source="feishu")
+        db.append_message(
+            session_id="session-one",
+            role="user",
+            content="please remember HERMES_PROXY_SEARCH_MARKER",
+        )
+    finally:
+        db.close()
+
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
+    token = "session-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owner",
+        open_id="ou_owner",
+        run_id="run-one",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "HERMES_PROXY_SEARCH_MARKER", "limit": 3},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert response.status == 200
+        result = json.loads(body["result"])
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "session-one"
+
+    asyncio.run(runner())
+
+
+def test_internal_session_search_broker_rejects_bad_token_and_profile(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: tmp_path / profile_name)
+    token = "session-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owner",
+        open_id="ou_owner",
+        run_id="run-one",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            missing = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "x"},
+            )
+            cross = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "x", "profile": "other"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            missing_body = await missing.json()
+            cross_body = await cross.json()
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert missing.status == 401
+        assert missing_body["error"] == "unauthorized"
+        assert cross.status == 403
+        assert "profile" in cross_body["error"]
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_rejects_body_over_configured_limit(monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

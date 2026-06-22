@@ -1807,7 +1807,9 @@ def _aiagent_subprocess_env_scope(
     from .webui_broker_server import (
         credential_broker_url,
         register_credential_broker_token,
+        register_session_search_broker_token,
         unregister_credential_broker_token,
+        unregister_session_search_broker_token,
     )
 
     sender_open_id = _resolve_subprocess_sender_open_id(event)
@@ -1815,6 +1817,8 @@ def _aiagent_subprocess_env_scope(
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
     broker_token = ""
+    session_search_token = secrets.token_urlsafe(32)
+    session_search_run_id = secrets.token_urlsafe(24)
     if strict_context_enabled():
         scoped_open_id = str(
             merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
@@ -1824,6 +1828,7 @@ def _aiagent_subprocess_env_scope(
         if scoped_open_id:
             run_id = secrets.token_urlsafe(24)
             broker_token = secrets.token_urlsafe(32)
+            session_search_run_id = run_id
             merged_extra.update(
                 {
                     "HERMES_MULTITENANCY_CRED_BROKER_TOKEN": broker_token,
@@ -1843,6 +1848,24 @@ def _aiagent_subprocess_env_scope(
                 open_id=scoped_open_id,
                 run_id=run_id,
             )
+    scoped_open_id_for_search = str(
+        merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
+        or sender_open_id
+        or _profile_owner_open_id(profile_home)
+        or ""
+    ).strip()
+    merged_extra.update(
+        {
+            "HERMES_MULTITENANCY_SESSION_SEARCH_URL": credential_broker_url(),
+            "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN": session_search_token,
+        }
+    )
+    register_session_search_broker_token(
+        token=session_search_token,
+        profile_name=profile_home.name,
+        open_id=scoped_open_id_for_search,
+        run_id=session_search_run_id,
+    )
     with _lark_cli_auth_broker_scope(
         profile_home,
         str(merged_extra.get("HERMES_FEISHU_USER_OPEN_ID") or sender_open_id),
@@ -1858,6 +1881,7 @@ def _aiagent_subprocess_env_scope(
         finally:
             if broker_token:
                 unregister_credential_broker_token(broker_token)
+            unregister_session_search_broker_token(session_search_token)
 
 
 def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
@@ -2583,6 +2607,106 @@ def _aiagent_subprocess_cwd(profile_home: Path) -> str:
     workspace = profile_home.expanduser() / "workspace"
     workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
     return str(workspace)
+
+
+def _install_session_search_proxy_for_aiagent() -> None:
+    """Route session_search through the multitenancy parent process when present."""
+    base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
+    token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
+    if not base_url or not token:
+        return
+
+    try:
+        import urllib.error
+        import urllib.request
+        from tools import session_search_tool
+    except Exception:
+        logger.debug("[multitenancy] session_search proxy install skipped", exc_info=True)
+        return
+
+    current = getattr(session_search_tool, "session_search", None)
+    tool_already_proxied = getattr(current, "_hermes_multitenancy_proxy", False)
+
+    endpoint = f"{base_url}/api/run-broker/internal/session-search"
+    proxy_db = object()
+
+    if not tool_already_proxied:
+        def _proxy_session_search(
+            query: str = "",
+            role_filter: str = None,
+            limit: int = 3,
+            db=None,
+            current_session_id: str = None,
+            session_id: str = None,
+            around_message_id: int = None,
+            window: int = 5,
+            sort: str = None,
+            profile: str = None,
+        ) -> str:
+            payload = {
+                "query": query,
+                "role_filter": role_filter,
+                "limit": limit,
+                "current_session_id": current_session_id,
+                "session_id": session_id,
+                "around_message_id": around_message_id,
+                "window": window,
+                "sort": sort,
+                "profile": profile,
+            }
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                endpoint,
+                data=data,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            timeout = float(os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TIMEOUT", "15") or "15")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = json.loads(exc.read().decode("utf-8"))
+                    error = body.get("error") or str(exc)
+                except Exception:
+                    error = str(exc)
+                return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+            except Exception as exc:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Session search proxy unavailable: {type(exc).__name__}: {exc}",
+                }, ensure_ascii=False)
+
+            if isinstance(body, dict) and body.get("ok") and isinstance(body.get("result"), str):
+                return body["result"]
+            error = body.get("error") if isinstance(body, dict) else None
+            return json.dumps({"success": False, "error": error or "Session search proxy failed"}, ensure_ascii=False)
+
+        _proxy_session_search._hermes_multitenancy_proxy = True  # type: ignore[attr-defined]
+        session_search_tool.session_search = _proxy_session_search
+
+
+def _install_session_search_recall_db_proxy(aiagent_cls: Any) -> None:
+    base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
+    token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
+    if not base_url or not token:
+        return
+
+    current_getter = getattr(aiagent_cls, "_get_session_db_for_recall", None)
+    if getattr(current_getter, "_hermes_multitenancy_proxy", False):
+        return
+
+    proxy_db = object()
+
+    def _get_session_db_for_recall(_self):
+        return proxy_db
+
+    _get_session_db_for_recall._hermes_multitenancy_proxy = True  # type: ignore[attr-defined]
+    aiagent_cls._get_session_db_for_recall = _get_session_db_for_recall
 
 
 def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -> None:
@@ -3772,6 +3896,7 @@ def _run_with_aiagent(
     # 3) Lazy-import hermes core (only when this code path is hit).
     _install_credential_env_passthrough(profile_home)
     _install_skill_runtime_compat(profile_home)
+    _install_session_search_proxy_for_aiagent()
     try:
         from .browser_policy import install_browser_guard
 
@@ -3779,6 +3904,7 @@ def _run_with_aiagent(
     except Exception:
         logger.debug("[multitenancy] browser guard install skipped", exc_info=True)
     from run_agent import AIAgent
+    _install_session_search_recall_db_proxy(AIAgent)
     sender_open_id_scope, current_sender_open_id, shared_hermes_home = _load_feishu_oapi_runtime(profile_home)
     try:
         from hermes_cli.tools_config import _get_platform_tools

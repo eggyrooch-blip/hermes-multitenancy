@@ -285,6 +285,66 @@ print(run.__module__)
     assert completed.stdout.strip() == "hermes_multitenancy.agent_real"
 
 
+def test_session_search_proxy_installs_http_wrapper(monkeypatch):
+    import urllib.request
+
+    from hermes_multitenancy import agent_real
+    from tools import session_search_tool
+
+    class FakeAIAgent:
+        def _get_session_db_for_recall(self):
+            return None
+
+    original = session_search_tool.session_search
+    original_getter = FakeAIAgent._get_session_db_for_recall
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://127.0.0.1:8766")
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "tok-session")
+    calls = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "ok": True,
+                "result": json.dumps({"success": True, "count": 1}),
+            }).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        calls["url"] = req.full_url
+        calls["timeout"] = timeout
+        calls["authorization"] = req.headers.get("Authorization")
+        calls["body"] = json.loads(req.data.decode("utf-8"))
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    try:
+        agent_real._install_session_search_proxy_for_aiagent()
+        agent_real._install_session_search_recall_db_proxy(FakeAIAgent)
+        result = session_search_tool.session_search(
+            query="marker",
+            limit=2,
+            current_session_id="current-session",
+            profile="owner",
+        )
+        recall_db = FakeAIAgent._get_session_db_for_recall(object())
+    finally:
+        session_search_tool.session_search = original
+        FakeAIAgent._get_session_db_for_recall = original_getter
+
+    assert calls["url"] == "http://127.0.0.1:8766/api/run-broker/internal/session-search"
+    assert calls["authorization"] == "Bearer tok-session"
+    assert calls["body"]["query"] == "marker"
+    assert calls["body"]["current_session_id"] == "current-session"
+    assert calls["body"]["profile"] == "owner"
+    assert json.loads(result) == {"success": True, "count": 1}
+    assert recall_db is not None
+
+
 def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypatch, tmp_path: Path):
     """OpenClaw/ClawHub skills often use ``{baseDir}``.
 
