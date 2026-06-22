@@ -249,6 +249,76 @@ def test_profile_bound_key_rejects_mismatched_agent(monkeypatch, tmp_path):
     assert seen == []
 
 
+def test_async_profile_bound_run_is_not_visible_to_another_valid_key(monkeypatch, tmp_path):
+    key_file = tmp_path / "ingest-keys.json"
+    key_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "token": "qin-key",
+                        "owner": "ou_qinchuan",
+                        "profile": "daryu-agent",
+                        "agent": "d3d59ea6ed55",
+                        "name": "daryu 对账定时广播",
+                    },
+                    {
+                        "token": "other-key",
+                        "owner": "ou_other",
+                        "profile": "other-agent",
+                        "agent": "other-agent-id",
+                        "name": "另一个智能体",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_OWNER", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_PROFILE", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file))
+    _install_fake_routing(monkeypatch)
+
+    async def dispatch(request):
+        return f"echo:{request.profile_name}:{request.content}"
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _r: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "hi"},
+                headers={"Authorization": "Bearer qin-key"},
+            )
+            submit_body = json.loads(await submit.text())
+            poll = await client.get(
+                f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                headers={"Authorization": "Bearer other-key"},
+            )
+            return submit.status, submit_body, poll.status, await poll.text()
+        finally:
+            await client.close()
+
+    submit_status, submit_body, poll_status, poll_text = asyncio.run(runner())
+    assert submit_status == 202
+    assert submit_body["profile"] == "daryu-agent"
+    assert poll_status == 404
+    assert json.loads(poll_text)["ok"] is False
+
+
 def test_owner_mode_accepts_agent_by_id(monkeypatch):
     app, seen = _app(monkeypatch)
     status, _ = _req(app, "POST", ING, body={"content": "hi", "agent": f"webui:{OWNER}:数据分析助手"}, headers=AUTH)

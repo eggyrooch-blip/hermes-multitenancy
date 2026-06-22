@@ -357,6 +357,47 @@ It reads the conversation-audit log and reports usage volume, completion-proxy m
 
 ---
 
+## 🔑 Ingest API key management
+
+`/api/run-broker/ingest` binds an external caller's Bearer token to either owner mode or a fixed profile/agent. Do not hand-edit production key files; use the CLI to create, inspect, rotate, and revoke bindings. The default output only prints masked tokens:
+
+```bash
+hermes-multitenancy-ingest grant \
+  --keys-file "$HERMES_INGEST_KEYS_FILE" \
+  --owner <owner_open_id> \
+  --profile <bound_profile> \
+  --agent <external_agent_id> \
+  --name "<display_name>" \
+  --show-token
+
+hermes-multitenancy-ingest list --keys-file "$HERMES_INGEST_KEYS_FILE"
+hermes-multitenancy-ingest rotate --keys-file "$HERMES_INGEST_KEYS_FILE" --profile <bound_profile> --agent <external_agent_id> --show-token
+hermes-multitenancy-ingest revoke --keys-file "$HERMES_INGEST_KEYS_FILE" --profile <bound_profile> --agent <external_agent_id>
+hermes-multitenancy-ingest smoke --base-url <run_broker_base_url> --token <bearer_token>
+```
+
+`grant` / `rotate` generate a new token by default but only print the masked value unless `--show-token` is explicit. The key file is saved as `0600` JSON shaped like `{"keys":[...]}` and can be loaded by the gateway runtime through `HERMES_INGEST_KEYS_FILE`.
+
+### Async polling ingest
+
+Slow external-ingest jobs should use the polling API instead of holding one HTTP request open until the synchronous `HERMES_INGEST_TIMEOUT` is hit:
+
+```bash
+curl -X POST "$RUN_BROKER_BASE_URL/api/run-broker/ingest/async" \
+  -H "Authorization: Bearer <bearer_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"<agent-name-or-id>","content":"...","idempotency_key":"optional-stable-key"}'
+# -> {"ok":true,"status":"accepted","run_id":"ing_...","profile":"...","poll_url":"/api/run-broker/ingest/runs/ing_...","duplicate":false}
+
+curl "$RUN_BROKER_BASE_URL/api/run-broker/ingest/runs/ing_..." \
+  -H "Authorization: Bearer <bearer_token>"
+# -> {"ok":true,"status":"succeeded","run_id":"ing_...","profile":"...","result":"...","duplicate":false}
+```
+
+The async route reuses the same authentication, owner/profile binding, `agent`, `skill`, `model`, `metadata`, `requires_host_tools`, `interactive`, and idempotency semantics as synchronous ingest. A duplicate submission with the same Bearer scope and effective idempotency key returns the same `run_id` and does not dispatch a second run. Polling requires the same Bearer scope; another valid key cannot read the result. Runtime bounds are `HERMES_INGEST_ASYNC_TIMEOUT` (default `1800` seconds), `HERMES_INGEST_ASYNC_TTL` (default `3600` seconds), and `HERMES_INGEST_ASYNC_CAP` (default `256` in-process records).
+
+---
+
 ## 🚢 Production deployment runbook
 
 1. Update and verify the canonical repository locally.

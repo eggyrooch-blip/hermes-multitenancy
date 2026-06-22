@@ -473,6 +473,339 @@ def test_ingest_times_out_on_slow_run(monkeypatch):
     assert json.loads(text)["status"] == "timeout"
 
 
+# ── Async polling ingest ─────────────────────────────────────────────────
+
+def test_ingest_async_submit_returns_run_id_and_poll_eventually_succeeds(monkeypatch):
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def slow_dispatch(request):
+        calls["n"] += 1
+        await release.wait()
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "summarize this"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            run_id = submit_body["run_id"]
+
+            first_poll = await client.get(
+                f"/api/run-broker/ingest/runs/{run_id}",
+                headers={"Authorization": "Bearer testkey"},
+            )
+            first_body = json.loads(await first_poll.text())
+
+            release.set()
+            final_body = None
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{run_id}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                final_body = json.loads(await poll.text())
+                if final_body["status"] == "succeeded":
+                    return submit.status, submit_body, first_poll.status, first_body, poll.status, final_body
+                await asyncio.sleep(0.01)
+            return submit.status, submit_body, first_poll.status, first_body, poll.status, final_body
+        finally:
+            await client.close()
+
+    submit_status, submit_body, first_status, first_body, final_status, final_body = asyncio.run(runner())
+
+    assert submit_status == 202
+    assert submit_body["ok"] is True
+    assert submit_body["status"] == "accepted"
+    assert submit_body["profile"] == "owner"
+    assert submit_body["run_id"].startswith("ing_")
+    assert submit_body["poll_url"] == f"/api/run-broker/ingest/runs/{submit_body['run_id']}"
+    assert submit_body["duplicate"] is False
+    assert first_status == 200
+    assert first_body["status"] in {"pending", "running"}
+    assert final_status == 200
+    assert final_body["ok"] is True
+    assert final_body["status"] == "succeeded"
+    assert final_body["result"] == "async:summarize this"
+    assert calls["n"] == 1
+
+
+def test_ingest_async_duplicate_idempotency_returns_same_run_without_dispatching_twice(monkeypatch):
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def slow_dispatch(request):
+        calls["n"] += 1
+        await release.wait()
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            body = {"content": "same work", "idempotency_key": "same-key"}
+            first = await client.post(
+                "/api/run-broker/ingest/async",
+                json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            first_body = json.loads(await first.text())
+            await asyncio.sleep(0.01)
+            second = await client.post(
+                "/api/run-broker/ingest/async",
+                json=body,
+                headers={"Authorization": "Bearer testkey"},
+            )
+            second_body = json.loads(await second.text())
+            release.set()
+            return first.status, first_body, second.status, second_body
+        finally:
+            await client.close()
+
+    first_status, first_body, second_status, second_body = asyncio.run(runner())
+
+    assert first_status == 202
+    assert second_status == 202
+    assert second_body["duplicate"] is True
+    assert second_body["run_id"] == first_body["run_id"]
+    assert calls["n"] == 1
+
+
+def test_ingest_async_poll_rejects_wrong_bearer(monkeypatch):
+    async def dispatch(request):
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "hi"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            poll = await client.get(
+                f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                headers={"Authorization": "Bearer WRONG"},
+            )
+            return poll.status, await poll.text()
+        finally:
+            await client.close()
+
+    status, text = asyncio.run(runner())
+    assert status == 401
+    assert json.loads(text)["ok"] is False
+
+
+def test_ingest_async_timeout_is_pollable_status(monkeypatch):
+    monkeypatch.setenv("HERMES_INGEST_ASYNC_TIMEOUT", "0.05")
+
+    async def slow_dispatch(_request):
+        await asyncio.sleep(5)
+        return "too late"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "slow"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            run_id = submit_body["run_id"]
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{run_id}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                poll_body = json.loads(await poll.text())
+                if poll_body["status"] == "timeout":
+                    return submit.status, poll.status, poll_body
+                await asyncio.sleep(0.02)
+            return submit.status, poll.status, poll_body
+        finally:
+            await client.close()
+
+    submit_status, poll_status, poll_body = asyncio.run(runner())
+    assert submit_status == 202
+    assert poll_status == 200
+    assert poll_body["ok"] is False
+    assert poll_body["status"] == "timeout"
+    assert poll_body["profile"] == "owner"
+
+
+def test_ingest_async_does_not_prune_active_run_before_it_finishes(monkeypatch):
+    monkeypatch.setenv("HERMES_INGEST_ASYNC_TTL", "0.01")
+    release = asyncio.Event()
+
+    async def slow_dispatch(request):
+        await release.wait()
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "slow"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            await asyncio.sleep(0.03)
+            poll = await client.get(
+                f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                headers={"Authorization": "Bearer testkey"},
+            )
+            poll_body = json.loads(await poll.text())
+            release.set()
+            return poll.status, poll_body
+        finally:
+            await client.close()
+
+    poll_status, poll_body = asyncio.run(runner())
+    assert poll_status == 200
+    assert poll_body["status"] in {"pending", "running"}
+
+
+def test_ingest_async_rejects_new_submission_when_only_active_jobs_fill_cap(monkeypatch):
+    monkeypatch.setenv("HERMES_INGEST_ASYNC_CAP", "1")
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def slow_dispatch(request):
+        calls["n"] += 1
+        await release.wait()
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "first"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            first_body = json.loads(await first.text())
+            await asyncio.sleep(0.01)
+            second = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "second"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            second_body = json.loads(await second.text())
+            first_poll = await client.get(
+                f"/api/run-broker/ingest/runs/{first_body['run_id']}",
+                headers={"Authorization": "Bearer testkey"},
+            )
+            first_poll_body = json.loads(await first_poll.text())
+            release.set()
+            return second.status, second_body, first_poll.status, first_poll_body
+        finally:
+            await client.close()
+
+    second_status, second_body, first_poll_status, first_poll_body = asyncio.run(runner())
+    assert second_status == 503
+    assert second_body["ok"] is False
+    assert second_body["status"] == "capacity_reached"
+    assert first_poll_status == 200
+    assert first_poll_body["status"] in {"pending", "running"}
+    assert calls["n"] == 1
+
+
 # ── NB2: stale cache entry is not returned ───────────────────────────────
 
 def test_ingest_duplicate_with_stale_cache_does_not_return_stale(monkeypatch):

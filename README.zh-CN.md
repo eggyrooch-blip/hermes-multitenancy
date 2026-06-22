@@ -378,6 +378,24 @@ hermes-multitenancy-ingest smoke --base-url <run_broker_base_url> --token <beare
 
 `grant` / `rotate` 默认会生成新 token 但只打印 masked 值；只有显式 `--show-token` 才会把完整 token 打到 stdout，便于一次性发给调用方。key 文件会以 `0600` 保存，格式为 `{"keys":[...]}`，可直接作为 `HERMES_INGEST_KEYS_FILE` 被 gateway runtime 读取。
 
+### 异步轮询 ingest
+
+慢任务不要长时间占住一次同步 HTTP 请求，否则会撞上同步 `HERMES_INGEST_TIMEOUT`。改用异步提交 + 轮询：
+
+```bash
+curl -X POST "$RUN_BROKER_BASE_URL/api/run-broker/ingest/async" \
+  -H "Authorization: Bearer <bearer_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"<agent-name-or-id>","content":"...","idempotency_key":"optional-stable-key"}'
+# -> {"ok":true,"status":"accepted","run_id":"ing_...","profile":"...","poll_url":"/api/run-broker/ingest/runs/ing_...","duplicate":false}
+
+curl "$RUN_BROKER_BASE_URL/api/run-broker/ingest/runs/ing_..." \
+  -H "Authorization: Bearer <bearer_token>"
+# -> {"ok":true,"status":"succeeded","run_id":"ing_...","profile":"...","result":"...","duplicate":false}
+```
+
+异步接口复用同步 ingest 的鉴权、owner/profile 绑定、`agent`、`skill`、`model`、`metadata`、`requires_host_tools`、`interactive` 和幂等语义。同一个 Bearer scope + 同一个有效幂等键重复提交会返回同一个 `run_id`，不会重复派发 agent。轮询也要求同一个 Bearer scope；另一把有效 key 不能读取结果。运行边界由 `HERMES_INGEST_ASYNC_TIMEOUT`（默认 `1800` 秒）、`HERMES_INGEST_ASYNC_TTL`（默认 `3600` 秒）和 `HERMES_INGEST_ASYNC_CAP`（默认进程内 `256` 条记录）控制。
+
 ---
 
 ## 🚢 生产部署 runbook

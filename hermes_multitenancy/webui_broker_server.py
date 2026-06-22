@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -430,6 +431,50 @@ def _ingest_timeout() -> float:
     except (TypeError, ValueError):
         return 180.0
     return value if value > 0 else 180.0
+
+
+def _ingest_async_timeout() -> float:
+    raw = os.getenv("HERMES_INGEST_ASYNC_TIMEOUT", "1800")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1800.0
+    return value if value > 0 else 1800.0
+
+
+def _ingest_async_ttl() -> float:
+    raw = os.getenv("HERMES_INGEST_ASYNC_TTL", "3600")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 3600.0
+    return value if value > 0 else 3600.0
+
+
+def _ingest_async_cap() -> int:
+    raw = os.getenv("HERMES_INGEST_ASYNC_CAP", "256")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 256
+    return value if value > 0 else 256
+
+
+def _ingest_auth_fingerprint(request: Any, binding: dict[str, str]) -> str:
+    token_hash = hashlib.sha256(_ingest_bearer_token(request).encode("utf-8")).hexdigest()
+    scope = json.dumps(
+        {
+            "owner": binding.get("owner", ""),
+            "profile": binding.get("profile", ""),
+            "agent": binding.get("agent", ""),
+            "name": binding.get("name", ""),
+            "source": binding.get("source", ""),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    scope_hash = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    return f"{binding.get('source', '')}:{scope_hash}:{token_hash}"
 
 
 def _ingest_owner() -> str:
@@ -1443,6 +1488,389 @@ def create_run_broker_app(
             _ingest_results_at.pop(key, None)
             return None
         return _ingest_results.get(key)
+
+    async def _prepare_ingest_run_request(request, *, delivery_mode: str):
+        ingest_binding = _ingest_binding_for_request(request)
+        if ingest_binding is None:
+            return None, web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        owner = ingest_binding.get("owner", "")
+        bound_profile_from_key = ingest_binding.get("profile", "")
+        default_profile = bound_profile_from_key or os.environ.get("HERMES_INGEST_PROFILE", "").strip()
+        # Preserve the v1 precedence: an authenticated but unconfigured fixed
+        # profile fails before body validation.
+        if not owner and not default_profile:
+            return None, web.json_response(
+                {"ok": False, "error": "ingest profile not configured"},
+                status=503,
+            )
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return None, web.json_response(
+                {"ok": False, "error": "invalid json"}, status=400
+            )
+        if not isinstance(payload, dict):
+            return None, web.json_response(
+                {"ok": False, "error": "body must be a JSON object"}, status=400
+            )
+
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            return None, web.json_response(
+                {"ok": False, "error": "content is required"}, status=400
+            )
+
+        profile_bound_by_key = bool(bound_profile_from_key and ingest_binding.get("source") == "file")
+        if profile_bound_by_key:
+            agent_str = str(payload.get("agent") or "").strip()
+            if not _ingest_agent_matches_binding(ingest_binding, agent_str):
+                return None, web.json_response(
+                    {
+                        "ok": False,
+                        "error": "agent not found or not owned by this key's owner",
+                        "agents": [_ingest_bound_agent_label(ingest_binding)],
+                    },
+                    status=403,
+                )
+            bound_profile = bound_profile_from_key
+        elif owner:
+            agent_str = str(payload.get("agent") or "").strip()
+            if not agent_str:
+                return None, web.json_response(
+                    {
+                        "ok": False,
+                        "error": "agent required",
+                        "agents": [_ingest_agent_label(r) for r in _ingest_list_owner_agents(owner)],
+                    },
+                    status=400,
+                )
+            bound_profile, available = _ingest_resolve_agent(owner, agent_str)
+            if not bound_profile:
+                return None, web.json_response(
+                    {
+                        "ok": False,
+                        "error": "agent not found or not owned by this key's owner",
+                        "agents": available,
+                    },
+                    status=403,
+                )
+        else:
+            bound_profile = default_profile
+
+        skill = str(payload.get("skill") or "").strip()
+        if skill:
+            content = f"/{skill.lstrip('/')} {content}"
+
+        metadata: dict[str, Any] = {}
+        extra_meta = payload.get("metadata")
+        if isinstance(extra_meta, dict):
+            metadata.update(extra_meta)
+        model = str(payload.get("model") or "").strip()
+        if model:
+            metadata["model"] = model
+        metadata["source"] = "ingest"
+
+        requires_host_tools = bool(payload.get("requires_host_tools", True))
+        interactive = bool(payload.get("interactive", False))
+
+        try:
+            run_request = RunRequest(
+                channel="webui",
+                profile_name=bound_profile,
+                user_key=bound_profile,
+                content=content,
+                idempotency_key=str(payload.get("idempotency_key") or "").strip() or None,
+                delivery_mode=delivery_mode,
+                credential_subject=bound_profile,
+                requires_host_tools=requires_host_tools,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            return None, web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+        cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        return SimpleNamespace(
+            binding=ingest_binding,
+            auth_fingerprint=_ingest_auth_fingerprint(request, ingest_binding),
+            bound_profile=bound_profile,
+            cache_key=cache_key,
+            interactive=interactive,
+            run_request=run_request,
+        ), None
+
+    _ingest_async_jobs: dict[str, dict[str, Any]] = {}
+    _ingest_async_by_cache: dict[str, str] = {}
+    _INGEST_ASYNC_ACTIVE_STATUSES = {"pending", "running"}
+
+    def _ingest_async_is_active(job: dict[str, Any]) -> bool:
+        return str(job.get("status") or "") in _INGEST_ASYNC_ACTIVE_STATUSES
+
+    def _ingest_async_remove(run_id: str) -> None:
+        job = _ingest_async_jobs.pop(run_id, None)
+        if not job:
+            return
+        cache = str(job.get("async_cache_key") or "")
+        if cache and _ingest_async_by_cache.get(cache) == run_id:
+            _ingest_async_by_cache.pop(cache, None)
+
+    def _ingest_async_prune() -> None:
+        now = time.time()
+        for run_id, job in list(_ingest_async_jobs.items()):
+            if not _ingest_async_is_active(job) and float(job.get("expires_at") or 0) <= now:
+                _ingest_async_remove(run_id)
+        cap = _ingest_async_cap()
+        if len(_ingest_async_jobs) <= cap:
+            return
+        overflow = sorted(
+            [(run_id, job) for run_id, job in _ingest_async_jobs.items() if not _ingest_async_is_active(job)],
+            key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or 0),
+        )
+        for run_id, _job in overflow[: max(0, len(_ingest_async_jobs) - cap)]:
+            _ingest_async_remove(run_id)
+
+    def _ingest_async_make_room() -> bool:
+        _ingest_async_prune()
+        cap = _ingest_async_cap()
+        if len(_ingest_async_jobs) < cap:
+            return True
+        removable = sorted(
+            [(run_id, job) for run_id, job in _ingest_async_jobs.items() if not _ingest_async_is_active(job)],
+            key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or 0),
+        )
+        if removable:
+            _ingest_async_remove(removable[0][0])
+            return True
+        return False
+
+    def _ingest_async_touch(job: dict[str, Any], status: str) -> None:
+        now = time.time()
+        job["status"] = status
+        job["updated_at"] = now
+        job["expires_at"] = now + _ingest_async_ttl()
+
+    def _ingest_async_submit_response(job: dict[str, Any], *, duplicate: bool) -> dict[str, Any]:
+        run_id = str(job["run_id"])
+        return {
+            "ok": True,
+            "status": "accepted",
+            "run_id": run_id,
+            "profile": job["profile"],
+            "poll_url": f"/api/run-broker/ingest/runs/{run_id}",
+            "duplicate": duplicate,
+        }
+
+    def _ingest_async_poll_response(job: dict[str, Any]) -> dict[str, Any]:
+        status = str(job.get("status") or "pending")
+        resp: dict[str, Any] = {
+            "ok": status in {"pending", "running", "succeeded"},
+            "status": status,
+            "run_id": job["run_id"],
+            "profile": job["profile"],
+            "duplicate": bool(job.get("duplicate", False)),
+        }
+        if status == "succeeded":
+            resp["result"] = str(job.get("result") or "")
+        elif status == "needs_clarification":
+            resp["clarify"] = dict(job.get("clarify") or {})
+            resp["result"] = str(job.get("result") or "")
+        elif status == "needs_approval":
+            resp["approval"] = dict(job.get("approval") or {})
+            resp["result"] = str(job.get("result") or "")
+        elif status in {"failed", "timeout"}:
+            if job.get("error"):
+                resp["error"] = str(job.get("error"))
+        return resp
+
+    async def _run_ingest_async_job(run_id: str, prepared: Any) -> None:
+        job = _ingest_async_jobs.get(run_id)
+        if job is None:
+            return
+
+        collected: list[str] = []
+        error_text: dict[str, str] = {}
+        clarify_holder: dict[str, Any] = {}
+        approval_holder: dict[str, Any] = {}
+        interrupt = asyncio.Event()
+
+        async def emit_event(event: RunEvent) -> None:
+            if event.kind == "content" and event.text:
+                collected.append(event.text)
+            elif event.kind == "error":
+                error_text["error"] = event.text or "agent error"
+            elif event.kind == "clarify_required" and "payload" not in clarify_holder:
+                clarify_holder["payload"] = event.payload or {}
+                interrupt.set()
+            elif event.kind == "approval_required" and "payload" not in approval_holder:
+                approval_holder["payload"] = event.payload or {}
+                interrupt.set()
+
+        sink = emit_event if prepared.interactive else None
+        broker_dispatch = dispatch_agent or (
+            lambda req: _default_dispatch_agent(req, emit_event=sink)
+        )
+        broker = RunBroker(
+            dispatch_agent=broker_dispatch,
+            emit_event=sink,
+            mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+            sandbox_available=sandbox_available or _default_sandbox_available,
+        )
+        timeout_s = _ingest_async_timeout()
+        result = None
+
+        try:
+            _ingest_async_touch(job, "running")
+            if prepared.interactive:
+                run_task = asyncio.ensure_future(broker.run(prepared.run_request, admitted=True))
+                interrupt_task = asyncio.ensure_future(interrupt.wait())
+                done, _pending = await asyncio.wait(
+                    {run_task, interrupt_task},
+                    timeout=timeout_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    run_task.cancel()
+                    interrupt_task.cancel()
+                    logger.warning("[multitenancy] async ingest run timed out after %ss", timeout_s)
+                    job["error"] = "timeout"
+                    _ingest_async_touch(job, "timeout")
+                    return
+                if interrupt.is_set() and not run_task.done():
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("[multitenancy] async ingest interactive cleanup error")
+                    interrupt_task.cancel()
+                else:
+                    interrupt_task.cancel()
+                    result = run_task.result()
+            else:
+                result = await asyncio.wait_for(
+                    broker.run(prepared.run_request, admitted=True),
+                    timeout=timeout_s,
+                )
+        except asyncio.TimeoutError:
+            logger.warning("[multitenancy] async ingest run timed out after %ss", timeout_s)
+            job["error"] = "timeout"
+            _ingest_async_touch(job, "timeout")
+            return
+        except RunRejected as exc:
+            job["error"] = str(exc)
+            _ingest_async_touch(job, "failed")
+            return
+        except Exception:
+            logger.exception("[multitenancy] async ingest run failed")
+            job["error"] = "internal error"
+            _ingest_async_touch(job, "failed")
+            return
+
+        text = "".join(collected).strip() or (result.content if result else "")
+        if error_text.get("error"):
+            logger.error("[multitenancy] async ingest agent error: %s", error_text["error"])
+            job["error"] = "agent run failed"
+            _ingest_async_touch(job, "failed")
+            return
+        if clarify_holder:
+            _clear_pending_clarify(clarify_holder["payload"])
+            job["clarify"] = _ingest_public_interaction(clarify_holder["payload"])
+            job["result"] = text
+            _ingest_async_touch(job, "needs_clarification")
+            return
+        if approval_holder:
+            job["approval"] = _ingest_public_interaction(approval_holder["payload"])
+            job["result"] = text
+            _ingest_async_touch(job, "needs_approval")
+            return
+        job["result"] = text
+        _ingest_async_touch(job, "succeeded")
+
+    async def handle_ingest_async(request):
+        prepared, error_response = await _prepare_ingest_run_request(
+            request,
+            delivery_mode="async",
+        )
+        if error_response is not None:
+            return error_response
+        _ingest_async_prune()
+
+        async_cache_key = f"{prepared.auth_fingerprint}\x00{prepared.cache_key}"
+        existing_id = _ingest_async_by_cache.get(async_cache_key)
+        existing = _ingest_async_jobs.get(existing_id or "")
+        if existing is not None:
+            return web.json_response(
+                _ingest_async_submit_response(existing, duplicate=True),
+                status=202,
+            )
+
+        if not _ingest_async_make_room():
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "capacity_reached",
+                    "error": "async ingest capacity reached",
+                    "profile": prepared.bound_profile,
+                },
+                status=503,
+            )
+
+        try:
+            admission_broker = RunBroker(
+                dispatch_agent=lambda _req: "",
+                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+                sandbox_available=sandbox_available or _default_sandbox_available,
+            )
+            admission = await admission_broker.admit(prepared.run_request)
+        except RunRejected as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=403)
+
+        if admission.duplicate:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "duplicate_pending",
+                    "profile": prepared.bound_profile,
+                    "duplicate": True,
+                },
+                status=200,
+            )
+
+        run_id = "ing_" + secrets.token_urlsafe(16)
+        now = time.time()
+        job = {
+            "run_id": run_id,
+            "async_cache_key": async_cache_key,
+            "auth_fingerprint": prepared.auth_fingerprint,
+            "profile": prepared.bound_profile,
+            "status": "pending",
+            "result": "",
+            "error": "",
+            "duplicate": False,
+            "created_at": now,
+            "updated_at": now,
+            "expires_at": now + _ingest_async_ttl(),
+        }
+        _ingest_async_jobs[run_id] = job
+        _ingest_async_by_cache[async_cache_key] = run_id
+        job["task"] = asyncio.create_task(_run_ingest_async_job(run_id, prepared))
+        return web.json_response(
+            _ingest_async_submit_response(job, duplicate=False),
+            status=202,
+        )
+
+    async def handle_ingest_async_result(request):
+        ingest_binding = _ingest_binding_for_request(request)
+        if ingest_binding is None:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        _ingest_async_prune()
+        run_id = str(request.match_info.get("run_id") or "").strip()
+        job = _ingest_async_jobs.get(run_id)
+        if job is None or job.get("auth_fingerprint") != _ingest_auth_fingerprint(request, ingest_binding):
+            return web.json_response({"ok": False, "error": "run not found"}, status=404)
+        return web.json_response(_ingest_async_poll_response(job), status=200)
 
     async def handle_ingest(request):
         """Synchronous external-ingest entry.
@@ -2906,6 +3334,8 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post("/api/run-broker/ingest/async", handle_ingest_async)
+    app.router.add_get("/api/run-broker/ingest/runs/{run_id}", handle_ingest_async_result)
     app.router.add_post("/api/run-broker/ingest", handle_ingest)
     app.router.add_get("/api/run-broker/ingest/agents", handle_ingest_agents)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
