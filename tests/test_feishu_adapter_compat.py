@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
 import sys
 import types
 from typing import Any
@@ -161,6 +162,62 @@ def test_feishu_module_falls_back_on_bare_candidate_module_errors(monkeypatch) -
 
     assert feishu_adapter_compat.load_feishu_module() is plugin_module
     assert seen == ["gateway.platforms.feishu", "plugins.platforms.feishu.adapter"]
+
+
+def test_feishu_adapter_load_error_logger_distinguishes_expected_missing_modules() -> None:
+    class FakeLogger:
+        def __init__(self) -> None:
+            self.info_calls: list[str] = []
+            self.warning_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def info(self, message: str) -> None:
+            self.info_calls.append(message)
+
+        def warning(self, *args: Any, **kwargs: Any) -> None:
+            self.warning_calls.append((args, kwargs))
+
+    logger = FakeLogger()
+    feishu_adapter_compat.log_feishu_adapter_load_error(
+        logger,
+        "missing",
+        ModuleNotFoundError("gateway.platforms.feishu"),
+    )
+    assert logger.info_calls == ["missing"]
+    assert logger.warning_calls == []
+
+    feishu_adapter_compat.log_feishu_adapter_load_error(
+        logger,
+        "unexpected",
+        ModuleNotFoundError("No module named 'legacy_dependency'", name="legacy_dependency"),
+    )
+    assert len(logger.warning_calls) == 1
+    assert logger.warning_calls[0][1]["exc_info"] is True
+
+
+def test_inbound_richtext_patch_defers_missing_plugin_layout_without_error_log(
+    monkeypatch,
+    caplog,
+) -> None:
+    from hermes_multitenancy import feishu_inbound_richtext
+
+    real_import_module = feishu_adapter_compat.import_module
+
+    def import_module(name: str) -> types.ModuleType:
+        if name in {"gateway.platforms.feishu", "plugins.platforms.feishu.adapter"}:
+            raise ModuleNotFoundError(name)
+        return real_import_module(name)
+
+    monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+    caplog.set_level(logging.INFO, logger=feishu_inbound_richtext.logger.name)
+
+    install_feishu_inbound_richtext_patch()
+
+    assert "inbound richtext patch deferred" in caplog.text
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == feishu_inbound_richtext.logger.name and record.levelno >= logging.WARNING
+    ]
 
 
 def test_inbound_richtext_patch_installs_with_plugin_adapter_layout(monkeypatch) -> None:

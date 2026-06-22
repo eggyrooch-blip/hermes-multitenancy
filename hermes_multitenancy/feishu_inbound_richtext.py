@@ -8,7 +8,11 @@ import os
 import re
 from typing import Any, Iterable
 
-from .feishu_adapter_compat import load_feishu_module, load_normalize_feishu_message
+from .feishu_adapter_compat import (
+    load_feishu_module,
+    load_normalize_feishu_message,
+    log_feishu_adapter_load_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +32,12 @@ def install_feishu_inbound_richtext_patch() -> None:
     try:
         feishu_module = load_feishu_module()
         normalize_feishu_message = load_normalize_feishu_message()
-    except Exception:
-        logger.exception("[multitenancy] failed to patch Feishu inbound richtext normalization")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; inbound richtext patch deferred",
+            exc,
+        )
         return
 
     original = getattr(feishu_module, "normalize_feishu_message", None) or normalize_feishu_message
