@@ -55,13 +55,55 @@ def _install_plugin_feishu_module(monkeypatch) -> types.ModuleType:
 
     def import_module(name: str) -> types.ModuleType:
         if name == "gateway.platforms.feishu":
-            raise ModuleNotFoundError(name)
+            raise ModuleNotFoundError(f"No module named '{name}'", name="gateway")
         if name == "plugins.platforms.feishu.adapter":
             return fake_module
         return real_import_module(name)
 
     monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
     return fake_module
+
+
+def test_feishu_module_prefers_legacy_gateway_adapter_layout(monkeypatch) -> None:
+    legacy_module = types.ModuleType("gateway.platforms.feishu")
+    plugin_module = types.ModuleType("plugins.platforms.feishu.adapter")
+    seen: list[str] = []
+
+    def import_module(name: str) -> types.ModuleType:
+        seen.append(name)
+        if name == "gateway.platforms.feishu":
+            return legacy_module
+        if name == "plugins.platforms.feishu.adapter":
+            return plugin_module
+        raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+
+    monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+
+    assert feishu_adapter_compat.load_feishu_module() is legacy_module
+    assert seen == ["gateway.platforms.feishu"]
+
+
+def test_feishu_module_does_not_hide_legacy_import_errors(monkeypatch) -> None:
+    plugin_module = types.ModuleType("plugins.platforms.feishu.adapter")
+    seen: list[str] = []
+
+    def import_module(name: str) -> types.ModuleType:
+        seen.append(name)
+        if name == "gateway.platforms.feishu":
+            raise ModuleNotFoundError("No module named 'legacy_dependency'", name="legacy_dependency")
+        if name == "plugins.platforms.feishu.adapter":
+            return plugin_module
+        raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+
+    monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+
+    try:
+        feishu_adapter_compat.load_feishu_module()
+    except ModuleNotFoundError as exc:
+        assert exc.name == "legacy_dependency"
+    else:
+        raise AssertionError("expected legacy import error to be raised")
+    assert seen == ["gateway.platforms.feishu"]
 
 
 def test_inbound_richtext_patch_installs_with_plugin_adapter_layout(monkeypatch) -> None:

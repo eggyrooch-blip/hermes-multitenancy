@@ -10,12 +10,21 @@ _FEISHU_MODULE_NAMES = (
 )
 
 
+def _is_missing_candidate_module(exc: ModuleNotFoundError, module_name: str) -> bool:
+    missing_name = exc.name
+    if missing_name is None:
+        return False
+    return missing_name == module_name or module_name.startswith(f"{missing_name}.")
+
+
 def load_feishu_module() -> ModuleType:
     last_error: Exception | None = None
     for module_name in _FEISHU_MODULE_NAMES:
         try:
             return import_module(module_name)
-        except Exception as exc:
+        except ModuleNotFoundError as exc:
+            if not _is_missing_candidate_module(exc, module_name):
+                raise
             last_error = exc
     if last_error is not None:
         raise last_error
