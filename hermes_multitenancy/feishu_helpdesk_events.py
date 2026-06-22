@@ -25,6 +25,8 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from .feishu_adapter_compat import load_feishu_adapter
+
 logger = logging.getLogger(__name__)
 
 # Only the message event carries a user question (fires for every guest message,
@@ -136,7 +138,7 @@ def _register_helpdesk_processors(handler: Any) -> None:
 def install_feishu_helpdesk_events_patch() -> None:
     """Idempotent — safe to call from plugin register()."""
     try:
-        from gateway.platforms.feishu import FeishuAdapter  # type: ignore
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.info("[multitenancy] FeishuAdapter not importable yet; helpdesk events patch deferred")
         return

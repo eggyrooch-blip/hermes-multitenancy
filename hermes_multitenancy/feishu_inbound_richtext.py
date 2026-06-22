@@ -8,6 +8,8 @@ import os
 import re
 from typing import Any, Iterable
 
+from .feishu_adapter_compat import load_feishu_module, load_normalize_feishu_message
+
 logger = logging.getLogger(__name__)
 
 _WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
@@ -24,8 +26,8 @@ _APPROVER_LABELS = ("审批人", "approver")
 def install_feishu_inbound_richtext_patch() -> None:
     """Patch Feishu inbound normalization with fail-open rich-text enrichment."""
     try:
-        import gateway.platforms.feishu as feishu_module
-        from gateway.platforms.feishu import normalize_feishu_message
+        feishu_module = load_feishu_module()
+        normalize_feishu_message = load_normalize_feishu_message()
     except Exception:
         logger.exception("[multitenancy] failed to patch Feishu inbound richtext normalization")
         return

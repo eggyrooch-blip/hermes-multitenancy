@@ -25,6 +25,7 @@ import functools
 import logging
 from typing import Any
 
+from .feishu_adapter_compat import load_feishu_adapter
 from .feishu_auth_cards import send_auth_card
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ def install_feishu_bot_added_hook() -> None:
     if _HOOK_INSTALLED:
         return
     try:
-        from gateway.platforms.feishu import FeishuAdapter  # type: ignore
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.info(
             "[multitenancy] FeishuAdapter not importable yet; bot-added hook deferred"

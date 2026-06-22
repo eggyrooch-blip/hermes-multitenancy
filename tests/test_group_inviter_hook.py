@@ -399,29 +399,37 @@ def test_install_hook_welcome_p2p_falls_through_to_original():
 def test_install_hook_skips_when_module_not_importable():
     """If FeishuAdapter cannot be imported (e.g. in a unit-test process), the
     helper must log + return rather than raise."""
+    from hermes_multitenancy import feishu_adapter_compat
     from hermes_multitenancy import group_inviter_hook
-    import builtins
     import sys
 
     saved_modules = {}
-    for name in ("gateway", "gateway.platforms", "gateway.platforms.feishu"):
+    for name in (
+        "gateway",
+        "gateway.platforms",
+        "gateway.platforms.feishu",
+        "plugins",
+        "plugins.platforms",
+        "plugins.platforms.feishu",
+        "plugins.platforms.feishu.adapter",
+    ):
         if name in sys.modules:
             saved_modules[name] = sys.modules.pop(name)
     group_inviter_hook._HOOK_INSTALLED = False
-    real_import = builtins.__import__
+    real_import_module = feishu_adapter_compat.import_module
 
-    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "gateway.platforms.feishu":
+    def blocked_import_module(name: str):
+        if name in {"gateway.platforms.feishu", "plugins.platforms.feishu.adapter"}:
             raise ModuleNotFoundError(name)
-        return real_import(name, globals, locals, fromlist, level)
+        return real_import_module(name)
 
     try:
-        builtins.__import__ = blocked_import
+        feishu_adapter_compat.import_module = blocked_import_module
         group_inviter_hook.install_feishu_bot_added_hook()  # must not raise
         # And the install flag must NOT be set so a later retry can succeed.
         assert group_inviter_hook._HOOK_INSTALLED is False
     finally:
-        builtins.__import__ = real_import
+        feishu_adapter_compat.import_module = real_import_module
         for name, mod in saved_modules.items():
             sys.modules[name] = mod
         group_inviter_hook._HOOK_INSTALLED = False

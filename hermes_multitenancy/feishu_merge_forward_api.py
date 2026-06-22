@@ -35,6 +35,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from .feishu_adapter_compat import load_feishu_adapter, load_normalize_feishu_message
+
 logger = logging.getLogger(__name__)
 
 _HOOK_INSTALLED = False
@@ -198,9 +200,7 @@ def _item_text(item: dict) -> str:
         raw_content = json.dumps(raw_content, ensure_ascii=False)
     raw_content = str(raw_content or "")
     try:
-        from gateway.platforms.feishu import normalize_feishu_message  # type: ignore
-
-        normalized = normalize_feishu_message(message_type=msg_type, raw_content=raw_content)
+        normalized = load_normalize_feishu_message()(message_type=msg_type, raw_content=raw_content)
         text = str(getattr(normalized, "text_content", "") or "").strip()
         if text:
             return text
@@ -438,7 +438,7 @@ def install_feishu_merge_forward_api_patch() -> None:
     if _HOOK_INSTALLED:
         return
     try:
-        from gateway.platforms.feishu import FeishuAdapter  # type: ignore
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.info("[multitenancy] FeishuAdapter not importable yet; merge_forward API patch deferred")
         return

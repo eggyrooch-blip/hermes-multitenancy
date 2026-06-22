@@ -49,6 +49,7 @@ from .credential_renewal_common import (
     payload_refresh_expired,
     read_needs_reauth_marker,
 )
+from .feishu_adapter_compat import load_feishu_adapter
 from .feishu_inbound_richtext import install_feishu_inbound_richtext_patch
 from .run_broker import RunBroker
 from .run_models import RunRequest
@@ -1376,7 +1377,7 @@ def _mirror_cron_delivery_to_owner(job: dict, content: str) -> None:
 
 def _patch_feishu_open_id_send() -> None:
     try:
-        from gateway.platforms.feishu import FeishuAdapter
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.exception("[multitenancy] failed to patch Feishu open_id delivery")
         return
@@ -1714,7 +1715,7 @@ def _patch_feishu_outbound_link_render() -> None:
     render markdown links and are left untouched.
     """
     try:
-        from gateway.platforms.feishu import FeishuAdapter
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.exception("[multitenancy] failed to patch Feishu outbound link render")
         return

@@ -28,6 +28,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from .feishu_adapter_compat import load_feishu_adapter, load_normalize_feishu_message
 # Intentional private-helper reuse: keep UAT, host, normalization, and contact
 # lookup behavior aligned with the proven merge-forward implementation.
 from .feishu_merge_forward_api import (
@@ -181,9 +182,7 @@ def _unique_strings(values: list[str]) -> list[str]:
 
 def _normalize_parent_item(item: dict[str, Any]) -> Any:
     try:
-        from gateway.platforms.feishu import normalize_feishu_message  # type: ignore
-
-        return normalize_feishu_message(
+        return load_normalize_feishu_message()(
             message_type=str(item.get("msg_type") or ""),
             raw_content=_item_raw_content(item),
             mentions=item.get("mentions"),
@@ -323,7 +322,7 @@ def install_feishu_reply_quote_api_patch() -> None:
     if _HOOK_INSTALLED:
         return
     try:
-        from gateway.platforms.feishu import FeishuAdapter  # type: ignore
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.info("[multitenancy] FeishuAdapter not importable yet; reply quote API patch deferred")
         return

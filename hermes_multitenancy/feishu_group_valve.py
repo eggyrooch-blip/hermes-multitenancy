@@ -10,6 +10,7 @@ import functools
 import logging
 from typing import Any
 
+from .feishu_adapter_compat import load_feishu_adapter, load_normalize_feishu_message
 from .router import _get_routing_table
 from .security_audit import append_security_event
 
@@ -28,7 +29,7 @@ def install_feishu_group_valve_patch() -> None:
     if _HOOK_INSTALLED:
         return
     try:
-        from gateway.platforms.feishu import FeishuAdapter  # type: ignore
+        FeishuAdapter = load_feishu_adapter()
     except Exception:
         logger.info(
             "[multitenancy] FeishuAdapter not importable yet; group valve patch deferred"
@@ -82,9 +83,7 @@ def _patch_require_mention_for(FeishuAdapter: Any) -> None:
 
 def _load_normalize() -> Any:
     """Lazy handle to the core post-payload normalizer (indirected for tests)."""
-    from gateway.platforms.feishu import normalize_feishu_message  # type: ignore
-
-    return normalize_feishu_message
+    return load_normalize_feishu_message()
 
 
 def _genuinely_mentions_bot(adapter: Any, message: Any) -> bool:
