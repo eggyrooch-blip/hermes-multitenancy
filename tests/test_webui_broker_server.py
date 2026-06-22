@@ -231,6 +231,63 @@ def test_internal_session_search_broker_rejects_bad_token_and_profile(monkeypatc
     asyncio.run(runner())
 
 
+def test_internal_session_search_broker_rejects_implicit_cross_profile_lookup(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+    from tools import session_search_tool
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.close()
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
+
+    def fail_locate(_session_id):
+        raise AssertionError("broker must not allow global session_id lookup")
+
+    monkeypatch.setattr(session_search_tool, "_locate_session_db", fail_locate, raising=False)
+
+    token = "session-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owner",
+        open_id="ou_owner",
+        run_id="run-one",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            bare = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"session_id": "foreign-session"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            embedded = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"session_id": "other/foreign-session"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            bare_body = await bare.json()
+            embedded_body = await embedded.json()
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert bare.status == 200
+        bare_result = json.loads(bare_body["result"])
+        assert bare_result["success"] is False
+        assert "session_id not found" in bare_result["error"]
+        assert embedded.status == 403
+        assert "profile" in embedded_body["error"]
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_rejects_body_over_configured_limit(monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

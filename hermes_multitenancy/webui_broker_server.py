@@ -2399,6 +2399,20 @@ def create_run_broker_app(
             if requested_profile != profile_name:
                 return web.json_response({"error": "profile is not accessible for this run"}, status=403)
 
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str):
+            session_id = session_id.strip()
+            if "/" in session_id:
+                embedded_profile, _, embedded_session_id = session_id.partition("/")
+                if embedded_profile and embedded_session_id:
+                    try:
+                        embedded_profile = cron_api.validate_profile_name(embedded_profile)
+                    except Exception as exc:
+                        return web.json_response({"error": str(exc)}, status=400)
+                    if embedded_profile != profile_name:
+                        return web.json_response({"error": "profile is not accessible for this run"}, status=403)
+                    session_id = embedded_session_id.strip()
+
         try:
             from hermes_state import SessionDB
             from tools.session_search_tool import session_search
@@ -2406,12 +2420,24 @@ def create_run_broker_app(
             profile_home = _profile_home_for_name(profile_name)
             db = SessionDB(db_path=profile_home / "state.db")
             try:
+                if session_id:
+                    if not db.get_session(session_id):
+                        result = json.dumps({
+                            "success": False,
+                            "error": f"session_id not found: {session_id}",
+                        }, ensure_ascii=False)
+                        return web.json_response({
+                            "ok": True,
+                            "profile_name": profile_name,
+                            "run_id": str(claims.get("run_id") or ""),
+                            "result": result,
+                        })
                 result = _call_session_search_compat(
                     session_search,
                     query=str(payload.get("query") or ""),
                     role_filter=payload.get("role_filter"),
                     limit=payload.get("limit", 3),
-                    session_id=payload.get("session_id"),
+                    session_id=session_id,
                     around_message_id=payload.get("around_message_id"),
                     window=payload.get("window", 5),
                     sort=payload.get("sort"),
