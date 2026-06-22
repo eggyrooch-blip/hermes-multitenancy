@@ -26,7 +26,7 @@ import functools
 import logging
 from typing import Any
 
-from .feishu_adapter_compat import load_feishu_adapter
+from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,12 @@ def install_feishu_reaction_lifecycle_patch() -> None:
         return
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.info("[multitenancy] FeishuAdapter not importable yet; reaction-lifecycle patch deferred")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; reaction-lifecycle patch deferred",
+            exc,
+        )
         return
 
     original_complete = getattr(FeishuAdapter, "on_processing_complete", None)

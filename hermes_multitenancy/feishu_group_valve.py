@@ -10,7 +10,11 @@ import functools
 import logging
 from typing import Any
 
-from .feishu_adapter_compat import load_feishu_adapter, load_normalize_feishu_message
+from .feishu_adapter_compat import (
+    load_feishu_adapter,
+    load_normalize_feishu_message,
+    log_feishu_adapter_load_error,
+)
 from .router import _get_routing_table
 from .security_audit import append_security_event
 
@@ -30,9 +34,11 @@ def install_feishu_group_valve_patch() -> None:
         return
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.info(
-            "[multitenancy] FeishuAdapter not importable yet; group valve patch deferred"
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; group valve patch deferred",
+            exc,
         )
         return
     # Two gate shapes across core versions:

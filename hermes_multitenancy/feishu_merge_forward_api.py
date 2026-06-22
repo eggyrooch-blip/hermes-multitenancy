@@ -35,7 +35,11 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from .feishu_adapter_compat import load_feishu_adapter, load_normalize_feishu_message
+from .feishu_adapter_compat import (
+    load_feishu_adapter,
+    load_normalize_feishu_message,
+    log_feishu_adapter_load_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -439,8 +443,12 @@ def install_feishu_merge_forward_api_patch() -> None:
         return
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.info("[multitenancy] FeishuAdapter not importable yet; merge_forward API patch deferred")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; merge_forward API patch deferred",
+            exc,
+        )
         return
     _patch_process_inbound(FeishuAdapter)
     _patch_extract(FeishuAdapter)

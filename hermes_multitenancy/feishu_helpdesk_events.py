@@ -25,7 +25,7 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from .feishu_adapter_compat import load_feishu_adapter
+from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +139,12 @@ def install_feishu_helpdesk_events_patch() -> None:
     """Idempotent — safe to call from plugin register()."""
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.info("[multitenancy] FeishuAdapter not importable yet; helpdesk events patch deferred")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; helpdesk events patch deferred",
+            exc,
+        )
         return
     original = getattr(FeishuAdapter, "_build_event_handler", None)
     if original is None or getattr(original, _PATCH_FLAG, False):

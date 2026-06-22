@@ -28,7 +28,11 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from .feishu_adapter_compat import load_feishu_adapter, load_normalize_feishu_message
+from .feishu_adapter_compat import (
+    load_feishu_adapter,
+    load_normalize_feishu_message,
+    log_feishu_adapter_load_error,
+)
 # Intentional private-helper reuse: keep UAT, host, normalization, and contact
 # lookup behavior aligned with the proven merge-forward implementation.
 from .feishu_merge_forward_api import (
@@ -323,8 +327,12 @@ def install_feishu_reply_quote_api_patch() -> None:
         return
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.info("[multitenancy] FeishuAdapter not importable yet; reply quote API patch deferred")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; reply quote API patch deferred",
+            exc,
+        )
         return
     _patch_process_inbound(FeishuAdapter)
     _patch_fetch_message_text(FeishuAdapter)
