@@ -220,6 +220,32 @@ def test_inbound_richtext_patch_defers_missing_plugin_layout_without_error_log(
     ]
 
 
+def test_cron_feishu_patches_defer_missing_plugin_layout_without_error_log(
+    monkeypatch,
+    caplog,
+) -> None:
+    real_import_module = feishu_adapter_compat.import_module
+
+    def import_module(name: str) -> types.ModuleType:
+        if name in {"gateway.platforms.feishu", "plugins.platforms.feishu.adapter"}:
+            raise ModuleNotFoundError(name)
+        return real_import_module(name)
+
+    monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+    caplog.set_level(logging.INFO, logger=cron_worker.logger.name)
+
+    cron_worker._patch_feishu_open_id_send()
+    cron_worker._patch_feishu_outbound_link_render()
+
+    assert "open_id delivery patch deferred" in caplog.text
+    assert "outbound link render patch deferred" in caplog.text
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == cron_worker.logger.name and record.levelno >= logging.WARNING
+    ]
+
+
 def test_inbound_richtext_patch_installs_with_plugin_adapter_layout(monkeypatch) -> None:
     fake_module = _install_plugin_feishu_module(monkeypatch)
 

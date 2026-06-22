@@ -49,7 +49,7 @@ from .credential_renewal_common import (
     payload_refresh_expired,
     read_needs_reauth_marker,
 )
-from .feishu_adapter_compat import load_feishu_adapter
+from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
 from .feishu_inbound_richtext import install_feishu_inbound_richtext_patch
 from .run_broker import RunBroker
 from .run_models import RunRequest
@@ -1378,8 +1378,12 @@ def _mirror_cron_delivery_to_owner(job: dict, content: str) -> None:
 def _patch_feishu_open_id_send() -> None:
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.exception("[multitenancy] failed to patch Feishu open_id delivery")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; open_id delivery patch deferred",
+            exc,
+        )
         return
 
     original = getattr(FeishuAdapter, "_send_raw_message", None)
@@ -1716,8 +1720,12 @@ def _patch_feishu_outbound_link_render() -> None:
     """
     try:
         FeishuAdapter = load_feishu_adapter()
-    except Exception:
-        logger.exception("[multitenancy] failed to patch Feishu outbound link render")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; outbound link render patch deferred",
+            exc,
+        )
         return
 
     original = getattr(FeishuAdapter, "_build_outbound_payload", None)
