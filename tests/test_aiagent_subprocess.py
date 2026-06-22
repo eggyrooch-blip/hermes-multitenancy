@@ -299,7 +299,7 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
     original_getter = FakeAIAgent._get_session_db_for_recall
     monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://127.0.0.1:8766")
     monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "tok-session")
-    calls = {}
+    requests = []
 
     class _Response:
         def __enter__(self):
@@ -315,10 +315,12 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
             }).encode("utf-8")
 
     def fake_urlopen(req, timeout):
-        calls["url"] = req.full_url
-        calls["timeout"] = timeout
-        calls["authorization"] = req.headers.get("Authorization")
-        calls["body"] = json.loads(req.data.decode("utf-8"))
+        requests.append({
+            "url": req.full_url,
+            "timeout": timeout,
+            "authorization": req.headers.get("Authorization"),
+            "body": json.loads(req.data.decode("utf-8")),
+        })
         return _Response()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -336,13 +338,110 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
         session_search_tool.session_search = original
         FakeAIAgent._get_session_db_for_recall = original_getter
 
-    assert calls["url"] == "http://127.0.0.1:8766/api/run-broker/internal/session-search"
-    assert calls["authorization"] == "Bearer tok-session"
-    assert calls["body"]["query"] == "marker"
-    assert calls["body"]["current_session_id"] == "current-session"
-    assert calls["body"]["profile"] == "owner"
+    assert len(requests) == 1
+    assert requests[0]["url"] == "http://127.0.0.1:8766/api/run-broker/internal/session-search"
+    assert requests[0]["authorization"] == "Bearer tok-session"
+    assert requests[0]["body"]["query"] == "marker"
+    assert requests[0]["body"]["current_session_id"] == "current-session"
+    assert requests[0]["body"]["profile"] == "owner"
     assert json.loads(result) == {"success": True, "count": 1}
     assert recall_db is not None
+
+
+def test_session_search_proxy_covers_real_agent_tool_dispatch():
+    code = r'''
+import json
+import urllib.request
+
+from agent import agent_runtime_helpers
+import hermes_cli.middleware as middleware
+from hermes_multitenancy import agent_real
+
+
+class FakeAIAgent:
+    session_id = "current-session"
+    _current_turn_id = ""
+    _current_api_request_id = ""
+    _memory_manager = None
+    valid_tool_names = set()
+    enabled_toolsets = None
+    disabled_toolsets = None
+
+    def _get_session_db_for_recall(self):
+        return None
+
+
+class _Response:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+
+requests = []
+
+
+def fake_urlopen(req, timeout):
+    url = getattr(req, "full_url", str(req))
+    if url != "http://127.0.0.1:8766/api/run-broker/internal/session-search":
+        return _Response({"error": "blocked in test"})
+    request = {
+        "url": url,
+        "timeout": timeout,
+        "body": json.loads(req.data.decode("utf-8")),
+    }
+    requests.append(request)
+    return _Response({
+        "ok": True,
+        "result": json.dumps({"success": True, "count": 1}),
+    })
+
+
+urllib.request.urlopen = fake_urlopen
+middleware.run_tool_execution_middleware = lambda _name, args, execute, **_kwargs: execute(args)
+
+agent_real._install_session_search_proxy_for_aiagent()
+agent_real._install_session_search_recall_db_proxy(FakeAIAgent)
+result = agent_runtime_helpers.invoke_tool(
+    FakeAIAgent(),
+    "session_search",
+    {"query": "marker", "limit": 2},
+    "task-id",
+    pre_tool_block_checked=True,
+    skip_tool_request_middleware=True,
+)
+print("RESULT_JSON=" + json.dumps({"requests": requests, "result": json.loads(result)}))
+'''
+    env = os.environ.copy()
+    env["HERMES_MULTITENANCY_SESSION_SEARCH_URL"] = "http://127.0.0.1:8766"
+    env["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] = "tok-session"
+    env["PYTHONPATH"] = os.pathsep.join([
+        str(Path.cwd()),
+        "/Users/kite/.hermes/hermes-feishu-uat",
+        env.get("PYTHONPATH", ""),
+    ])
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path.cwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result_line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT_JSON="))
+    payload = json.loads(result_line.removeprefix("RESULT_JSON="))
+    assert len(payload["requests"]) == 1
+    assert payload["requests"][0]["body"]["query"] == "marker"
+    assert payload["requests"][0]["body"]["current_session_id"] == "current-session"
+    assert payload["result"] == {"success": True, "count": 1}
 
 
 def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypatch, tmp_path: Path):
