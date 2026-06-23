@@ -14,13 +14,68 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from agent.image_gen_provider import (
-    DEFAULT_ASPECT_RATIO,
-    ImageGenProvider,
-    error_response,
-    resolve_aspect_ratio,
-    success_response,
-)
+try:
+    from agent.image_gen_provider import (
+        DEFAULT_ASPECT_RATIO,
+        ImageGenProvider,
+        error_response,
+        resolve_aspect_ratio,
+        success_response,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in {"agent", "agent.image_gen_provider"}:
+        raise
+
+    DEFAULT_ASPECT_RATIO = "landscape"
+
+    class ImageGenProvider:
+        pass
+
+    def resolve_aspect_ratio(value: str) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"portrait", "vertical", "9:16"}:
+            return "portrait"
+        if text in {"square", "1:1"}:
+            return "square"
+        return DEFAULT_ASPECT_RATIO
+
+    def success_response(
+        *,
+        image: str,
+        model: str,
+        prompt: str,
+        aspect_ratio: str,
+        provider: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "success": True,
+            "image": image,
+            "model": model,
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "provider": provider,
+            **(extra or {}),
+        }
+
+    def error_response(
+        *,
+        error: str,
+        error_type: str,
+        provider: str,
+        model: str = "",
+        prompt: str = "",
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    ) -> dict[str, Any]:
+        return {
+            "success": False,
+            "error": error,
+            "error_type": error_type,
+            "provider": provider,
+            "model": model,
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+        }
 
 logger = logging.getLogger(__name__)
 
