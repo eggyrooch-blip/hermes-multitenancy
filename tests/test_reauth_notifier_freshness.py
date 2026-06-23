@@ -31,7 +31,13 @@ def _write_marker(
     )
 
 
-def _write_valid_uat(shared: Path, profile: str, open_id: str) -> None:
+def _write_valid_uat(
+    shared: Path,
+    profile: str,
+    open_id: str,
+    *,
+    access_expired: bool = False,
+) -> None:
     now_ms = int(time.time() * 1000)
     d = shared / "profiles" / profile / "feishu_uat"
     d.mkdir(parents=True, exist_ok=True)
@@ -41,7 +47,7 @@ def _write_valid_uat(shared: Path, profile: str, open_id: str) -> None:
                 "access_token": "access",
                 "refresh_token": "refresh",
                 "scope": "im:message offline_access",
-                "expires_at": now_ms + 3600_000,
+                "expires_at": now_ms + (-60_000 if access_expired else 3600_000),
                 "refresh_expires_at": now_ms + 7 * 24 * 3600_000,
             }
         ),
@@ -194,6 +200,29 @@ def test_authoritative_marker_is_cleared_not_sent_when_newer_valid_uat_exists(se
 
     os.utime(marker, (old_ts, old_ts))
     _write_valid_uat(tmp_path, "stt", "ou_stt")
+
+    N._scan_once(tmp_path, {})
+
+    assert sent == []
+    assert not marker.exists()
+
+
+def test_authoritative_marker_is_cleared_when_newer_uat_has_valid_refresh_only(sent, tmp_path):
+    now = int(time.time())
+    _write_marker(
+        tmp_path,
+        "stt",
+        "ou_stt",
+        ts=now - 60,
+        reason=common.REASON_REFRESH_REJECTED,
+        extra={"authoritative": True, "refresh_class": "invalid"},
+    )
+    marker = tmp_path / "profiles" / "stt" / "feishu_uat" / "ou_stt.needs_reauth"
+    old_ts = time.time() - 60
+    marker.touch()
+    os.utime(marker, (old_ts, old_ts))
+
+    _write_valid_uat(tmp_path, "stt", "ou_stt", access_expired=True)
 
     N._scan_once(tmp_path, {})
 

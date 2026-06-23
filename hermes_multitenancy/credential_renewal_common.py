@@ -253,10 +253,8 @@ def classify_uat_payload(payload: dict[str, Any]) -> Optional[str]:
 
 
 def payload_is_currently_usable(payload: dict[str, Any]) -> bool:
-    """True when local UAT material is structurally valid and not expired."""
+    """True when local UAT material is structurally valid and refreshable."""
     if classify_uat_payload(payload) is not None:
-        return False
-    if payload_access_expired(payload) or payload_refresh_expired(payload):
         return False
     return True
 

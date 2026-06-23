@@ -255,7 +255,7 @@ python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
 
 ### 凭证重授权 marker
 
-`.needs_reauth` 是用户可见状态，不是泛化的刷新错误日志。refresh token 过期、refresh token 缺失、缺少 `offline_access` 这类本地 payload 已经确定不可用的问题可以立即写 marker。`refresh_rejected` 只有在刷新层解析到飞书明确返回 invalid/revoked refresh token，并把 marker 标成 authoritative 时才是用户可操作问题。本地基础设施错误（例如缺凭证加密 key）、网络错误、未解析的 HTTP 错误只能写入非用户可见的 `.refresh_diagnostic` sidecar 和日志，不能提示用户执行 `/feishu_auth`，也不能让 cron 把 profile 判成 `needs_auth`。
+`.needs_reauth` 是用户可见状态，不是泛化的刷新错误日志。refresh token 过期、refresh token 缺失、缺少 `offline_access` 这类本地 payload 已经确定不可用的问题可以立即写 marker。access token 已过期但 refresh token 仍有效属于可刷新状态，不能新建或保留重授权 marker。`refresh_rejected` 只有在刷新层解析到飞书明确返回 invalid/revoked refresh token，并把 marker 标成 authoritative 时才是用户可操作问题。本地基础设施错误（例如缺凭证加密 key）、网络错误、未解析的 HTTP 错误只能写入非用户可见的 `.refresh_diagnostic` sidecar 和日志，不能提示用户执行 `/feishu_auth`，也不能让 cron 把 profile 判成 `needs_auth`。
 
 已知 gotcha：2026-06-23 生产曾因本地凭证加密 key 缺失，把一批仍有可用 Feishu UAT 的用户写成新鲜 `refresh_rejected` marker。根因是 proactive refresh worker 曾把所有刷新异常都当作用户可操作的重授权状态。守卫规则是：只有飞书明确返回 invalid/revoked refresh token 的权威 code 才能写 actionable `refresh_rejected`；未知 code 或基础设施错误必须只进入 diagnostic。
 

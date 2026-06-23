@@ -367,6 +367,48 @@ def test_l4_ignores_stale_marker_when_valid_uat_was_refreshed_later(
     assert not (profile_home / "cron" / "output" / "JOB-RESTORED.deferred.json").exists()
 
 
+def test_l4_ignores_stale_marker_when_refreshed_uat_access_expired_but_refresh_valid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy import cron_worker
+
+    open_id = "ou_user_refreshable"
+    profile_name = "refreshable_profile"
+    shared = tmp_path
+    profile_home = shared / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    marker_dir = profile_home / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(marker_dir, open_id),
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="old authoritative refresh failure",
+        extra={"layer": "L2", "profile": profile_name, "authoritative": True, "refresh_class": "invalid"},
+    )
+    marker_path = marker_dir / f"{open_id}.needs_reauth"
+    old_ts = time.time() - 60
+    os.utime(marker_path, (old_ts, old_ts))
+
+    payload = _valid_payload(open_id)
+    payload["expires_at"] = int((time.time() - 60) * 1000)
+    assert common.classify_uat_payload(payload) is None
+    assert common.payload_access_expired(payload) is True
+    assert common.payload_refresh_expired(payload) is False
+    uat_path = _seed_uat(shared, profile_name, open_id, payload)
+    new_ts = time.time()
+    os.utime(uat_path, (new_ts, new_ts))
+
+    job = {"id": "JOB-REFRESHABLE", "name": "refreshable", "owner_open_id": open_id}
+    result = cron_worker._l4_check_needs_reauth_and_defer(job)
+
+    assert result is None
+    assert not marker_path.exists()
+    assert not (profile_home / "cron" / "output" / "JOB-REFRESHABLE.deferred.json").exists()
+
+
 def test_l4_ignores_non_authoritative_refresh_rejected_when_current_uat_valid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

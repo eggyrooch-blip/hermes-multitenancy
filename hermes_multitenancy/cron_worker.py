@@ -42,12 +42,9 @@ from typing import Any, Optional
 
 from .credential_renewal_common import (
     clear_needs_reauth_marker,
-    classify_uat_payload,
+    clear_reauth_markers_if_uat_recovered,
     find_marker_for_open_id,
-    iter_uat_locations,
     marker_requires_reauth,
-    payload_access_expired,
-    payload_refresh_expired,
     read_needs_reauth_marker,
 )
 from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
@@ -569,39 +566,8 @@ def _clear_stale_reauth_markers_if_uat_recovered(
     marker: Path,
 ) -> bool:
     """Return True when a newer, valid UAT makes existing reauth markers stale."""
-    try:
-        marker_mtime = marker.stat().st_mtime
-    except OSError:
+    if not clear_reauth_markers_if_uat_recovered(shared_home, owner_open_id, marker):
         return False
-
-    recovered_mtime: float | None = None
-    for loc in iter_uat_locations(shared_home):
-        if loc.open_id != owner_open_id:
-            continue
-        try:
-            uat_mtime = loc.path.stat().st_mtime
-            if uat_mtime <= marker_mtime:
-                continue
-            payload = json.loads(loc.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if classify_uat_payload(payload) is not None:
-            continue
-        if payload_access_expired(payload) or payload_refresh_expired(payload):
-            continue
-        recovered_mtime = max(recovered_mtime or 0.0, uat_mtime)
-
-    if recovered_mtime is None:
-        return False
-
-    for stale_marker in _iter_reauth_markers_for_open_id(shared_home, owner_open_id):
-        try:
-            if stale_marker.stat().st_mtime <= recovered_mtime:
-                clear_needs_reauth_marker(stale_marker)
-        except OSError:
-            continue
     logger.info(
         "[multitenancy] L4 ignored stale reauth marker for owner=%s because a newer valid UAT exists",
         owner_open_id,
