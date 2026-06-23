@@ -492,8 +492,8 @@ def _l4_check_needs_reauth_and_defer(
     Returns ``(success=False, output_text, final_response, error)`` shaped like
     ``cron.scheduler.run_job`` so the scheduler records the skip. Side effect:
     writes ``<profile>/cron/output/<job_id>.deferred.json`` recording the
-    skip metadata for the audit trail. The L3 notifier still owns the
-    user-facing DM; L4 only refuses to enter the lark_cli policy black hole.
+    skip metadata for the audit trail. This is the passive user-facing auth
+    guidance path; background credential scans never send DMs.
     """
     owner_open_id = str(job.get("owner_open_id") or "").strip()
     if not owner_open_id.startswith("ou_"):
@@ -560,8 +560,9 @@ def _l4_check_needs_reauth_and_defer(
         f"**Job ID:** {job_id}\n"
         f"**Status:** DEFERRED — feishu credential needs re-auth\n"
         f"**Reason:** {reason}\n\n"
-        f"该任务已暂缓发送，因为 owner 的飞书 UAT 失效（{reason}）。"
-        f"待 owner 重新授权 / 管理员修正 app scope 后会自动恢复。"
+        f"本次任务未发送，因为 owner 的飞书用户授权当前不可用（{reason}）。"
+        f"请 owner 在飞书私聊 Hermes 发送 `/feishu_auth` 重新授权后重试；"
+        f"如果原因是 app scope 配置，请管理员修正并发布后再重试。"
     )
     return False, output, "", error_msg
 

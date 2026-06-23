@@ -189,73 +189,34 @@ def test_l5_skips_fixtures_dir(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# L3 — DM router (pure function, no network)
+# L3 — passive marker maintenance, no proactive DM
 # ---------------------------------------------------------------------------
 
 
-def test_l3_routes_scope_stripped_to_owner():
-    recipient, msg = notifier._route_message(
-        subject_open_id="ou_user",
-        reason=common.REASON_SCOPE_STRIPPED_BY_FEISHU,
-        owner_open_id="ou_owner",
-        marker_body={"detail": "test"},
+def test_credential_renewal_subsystem_does_not_start_proactive_reauth_notifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import hermes_multitenancy as plugin
+    from hermes_multitenancy import feishu_uat_auth
+
+    calls: list[str] = []
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(plugin, "run_startup_audit", lambda shared_home: calls.append("audit"))
+    monkeypatch.setattr(plugin, "ensure_renewal_worker_started", lambda shared_home: calls.append("renewal"))
+    monkeypatch.setattr(
+        plugin,
+        "ensure_reauth_notifier_started",
+        lambda shared_home: calls.append("notifier"),
+        raising=False,
     )
-    assert recipient == "ou_owner"
-    assert "offline_access" in msg
-    assert "ou_user" in msg
+
+    plugin._start_credential_renewal_subsystem()
+
+    assert calls == ["audit", "renewal"]
 
 
-def test_l3_refuses_to_misroute_scope_stripped_when_owner_unset():
-    recipient, msg = notifier._route_message(
-        subject_open_id="ou_user",
-        reason=common.REASON_SCOPE_STRIPPED_BY_FEISHU,
-        owner_open_id="",
-        marker_body={"detail": "test"},
-    )
-    assert recipient == ""  # caller logs + skips
-    assert msg == ""
-
-
-def test_l3_routes_empty_refresh_token_to_user():
-    recipient, msg = notifier._route_message(
-        subject_open_id="ou_user",
-        reason=common.REASON_EMPTY_REFRESH_TOKEN,
-        owner_open_id="ou_owner",
-        marker_body={"detail": "test"},
-    )
-    assert recipient == "ou_user"
-    assert "/feishu_auth" in msg
-
-
-def test_l3_open_id_from_marker_filename():
-    p1 = Path("/some/dir/ou_user_a.needs_reauth")
-    p2 = Path("/some/dir/ou_user_b.json.needs_reauth")
-    assert notifier._open_id_from_marker(p1) == "ou_user_a"
-    assert notifier._open_id_from_marker(p2) == "ou_user_b"
-
-
-def test_l3_scan_defaults_to_dry_run_without_sending_dm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    marker_dir = tmp_path / "feishu_uat"
-    common.write_needs_reauth_marker(
-        common.marker_path_for_open_id(marker_dir, "ou_user"),
-        reason=common.REASON_EMPTY_REFRESH_TOKEN,
-        detail="seeded by test",
-    )
-    sent: list[tuple[str, str, str]] = []
-
-    monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", raising=False)
-    monkeypatch.setattr(notifier, "_get_bot_token", lambda shared_home: "tenant-token")
-    monkeypatch.setattr(notifier, "_send_feishu_dm", lambda *args: sent.append(args) or True)
-
-    seen: dict[str, dict[str, Any]] = {}
-    changed = notifier._scan_once(tmp_path, seen)
-
-    assert changed is True
-    assert sent == []
-    assert seen["ou_user:empty_refresh_token"]["dry_run"] is True
-
-
-def test_l3_scan_sends_dm_only_when_explicitly_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_l3_scan_never_sends_dm_even_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     marker_dir = tmp_path / "feishu_uat"
     common.write_needs_reauth_marker(
         common.marker_path_for_open_id(marker_dir, "ou_user"),
@@ -265,16 +226,39 @@ def test_l3_scan_sends_dm_only_when_explicitly_enabled(tmp_path: Path, monkeypat
     sent: list[tuple[str, str, str]] = []
 
     monkeypatch.setenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", "1")
-    monkeypatch.setattr(notifier, "_get_bot_token", lambda shared_home: "tenant-token")
-    monkeypatch.setattr(notifier, "_send_feishu_dm", lambda *args: sent.append(args) or True)
+    monkeypatch.setattr(notifier, "_get_bot_token", lambda shared_home: "tenant-token", raising=False)
+    monkeypatch.setattr(notifier, "_send_feishu_dm", lambda *args: sent.append(args) or True, raising=False)
 
     seen: dict[str, dict[str, Any]] = {}
     changed = notifier._scan_once(tmp_path, seen)
 
-    assert changed is True
-    assert len(sent) == 1
-    assert sent[0][1] == "ou_user"
-    assert seen["ou_user:empty_refresh_token"]["dry_run"] is False
+    assert changed is False
+    assert sent == []
+    assert seen == {}
+
+
+def test_l3_open_id_from_marker_filename():
+    p1 = Path("/some/dir/ou_user_a.needs_reauth")
+    p2 = Path("/some/dir/ou_user_b.json.needs_reauth")
+    assert notifier._open_id_from_marker(p1) == "ou_user_a"
+    assert notifier._open_id_from_marker(p2) == "ou_user_b"
+
+
+def test_l3_scan_preserves_actionable_marker_for_passive_task_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    marker_dir = tmp_path / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(marker_dir, "ou_user"),
+        reason=common.REASON_EMPTY_REFRESH_TOKEN,
+        detail="seeded by test",
+    )
+    marker = marker_dir / "ou_user.needs_reauth"
+
+    seen: dict[str, dict[str, Any]] = {}
+    changed = notifier._scan_once(tmp_path, seen)
+
+    assert changed is False
+    assert seen == {}
+    assert marker.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +293,8 @@ def test_l4_defers_job_when_marker_present(tmp_path: Path, monkeypatch: pytest.M
     assert success is False
     assert "DEFERRED" in output
     assert common.REASON_EMPTY_REFRESH_TOKEN in (error or "")
+    assert "/feishu_auth" in output
+    assert "本次任务" in output
 
     deferred_file = profile_home / "cron" / "output" / "JOB-DEFER.deferred.json"
     assert deferred_file.is_file()

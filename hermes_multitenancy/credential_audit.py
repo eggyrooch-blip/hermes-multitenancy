@@ -2,7 +2,7 @@
 
 Runs once when the multitenancy plugin registers. Scans every UAT on disk,
 classifies it, and writes `.needs_reauth` markers for the broken ones so the
-L3 notifier can DM the right recipient. Also audits the multitenancy routing
+task gate can attribute the right owner. Also audits the multitenancy routing
 DB for orphan profiles (a running gateway under ``profiles/<name>`` with no
 ``active=1, kind='user'`` row pointing back at it) and surfaces the count in
 the gateway log.

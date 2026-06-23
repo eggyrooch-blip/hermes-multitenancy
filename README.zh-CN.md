@@ -21,7 +21,7 @@
 <tr><td><b>隐私与沙箱内建</b></td><td>每 profile 的 HOME/XDG/TMPDIR 切换 + 子进程环境白名单，凭证经本地 broker 物化、绝不进模型，流式输出脱敏，出站文件按 secret 路径过滤。</td></tr>
 <tr><td><b>成本与用量可观测</b></td><td>逐回合 token 台账 + <b>按 owner 归属</b>（一个人的群和智能体全部累加到本人）汇入企业排行榜。另有会话分析 CLI 输出需求与完成率代理指标。</td></tr>
 <tr><td><b>复用而非重造飞书 UX</b></td><td>CardKit 流式卡片、表情回应、多轮会话、视觉 / 语音转写 / 文件注入、群聊、定时投递 —— 全部委托给 hermes-agent。经 <code>lark-cli</code> 桥接打通完整飞书 OpenAPI，每次请求做 user/bot 身份隔离。</td></tr>
-<tr><td><b>生产级安全护栏</b></td><td>群里 <code>@所有人</code> 绝不触发 Bot，危险命令审批跨飞书边界传递，超长输出优雅降级，凭证重认证通知做了新鲜度门控、开启时绝不轰炸陈旧积压。</td></tr>
+<tr><td><b>生产级安全护栏</b></td><td>群里 <code>@所有人</code> 绝不触发 Bot，危险命令审批跨飞书边界传递，超长输出优雅降级，凭证重授权 marker 永不触发后台主动私信轰炸。</td></tr>
 </table>
 
 ### 🧭 它的定位
@@ -152,7 +152,7 @@ flowchart TB
 | **成本与分摊** | 逐回合 token 台账 → 每小时上传器，**按 owner 归属**：一个人的 DM、他的智能体、以及每个他拉 Bot 进的群，全部累加到*他本人*，经路由表解析成企业邮箱/部门。「漏记不误记」—— 解析不到归属的回合丢弃，绝不算到错误的人头上。 |
 | **需求分析** | `hermes-multitenancy-analytics summary` 读会话审计日志，在可配置窗口内输出用量、活跃 profile Top、完成率代理指标（markdown 或 JSON，可选脱敏需求样本）。 |
 | **群安全** | `@所有人` 在任何回复模式都在准入处忽略，故广播不会唤醒每个智能体。刚建的群在发送时正确路由。 |
-| **可靠性** | 超长输出返回友好提示而非硬失败（含流式路径）；裸模型名在运行时归一化以根治反复的 provider 前缀失败；凭证重认证通知做新鲜度门控、mode-aware 和权威失败判定，开启实发时绝不轰炸陈旧积压，也不会把本地刷新基础设施错误当成用户授权失效。 |
+| **可靠性** | 超长输出返回友好提示而非硬失败（含流式路径）；裸模型名在运行时归一化以根治反复的 provider 前缀失败；凭证重授权 marker 只作为诊断/任务阻断状态，后台扫描永不主动群发授权私信，也不会把本地刷新基础设施错误当成用户授权失效。 |
 | **升级安全** | 零内核补丁 + 锁定 `hermes-agent` 版本 + 一套集成测试在契约漂移时大声失败。`upstream_health.py` 在宣告部署可用前跑无密钥健康检查。 |
 
 ### 角色
@@ -255,9 +255,9 @@ python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
 
 ### 凭证重授权 marker
 
-`.needs_reauth` 是用户可见状态，不是泛化的刷新错误日志。refresh token 过期、refresh token 缺失、缺少 `offline_access` 这类本地 payload 已经确定不可用的问题可以立即写 marker。access token 已过期但 refresh token 仍有效属于可刷新状态，不能新建或保留重授权 marker。`refresh_rejected` 只有在刷新层解析到飞书明确返回 invalid/revoked refresh token，并把 marker 标成 authoritative 时才是用户可操作问题。本地基础设施错误（例如缺凭证加密 key）、网络错误、未解析的 HTTP 错误只能写入非用户可见的 `.refresh_diagnostic` sidecar 和日志，不能提示用户执行 `/feishu_auth`，也不能让 cron 把 profile 判成 `needs_auth`。清理历史非权威 `refresh_rejected` marker 前，会把其 detail 保留为 `.refresh_diagnostic`。
+`.needs_reauth` 是任务阻断状态，不是泛化的刷新错误日志，也不是主动私信触发器。refresh token 过期、refresh token 缺失、缺少 `offline_access` 这类本地 payload 已经确定不可用的问题可以立即写 marker。access token 已过期但 refresh token 仍有效属于可刷新状态，不能新建或保留重授权 marker。`refresh_rejected` 只有在刷新层解析到飞书明确返回 invalid/revoked refresh token，并把 marker 标成 authoritative 时才允许阻断任务。本地基础设施错误（例如缺凭证加密 key）、网络错误、未解析的 HTTP 错误只能写入非用户可见的 `.refresh_diagnostic` sidecar 和日志，不能提示用户执行 `/feishu_auth`，也不能让 cron 把 profile 判成 `needs_auth`。清理历史非权威 `refresh_rejected` marker 前，会把其 detail 保留为 `.refresh_diagnostic`。
 
-已知 gotcha：2026-06-23 生产曾因本地凭证加密 key 缺失，把一批仍有可用 Feishu UAT 的用户写成新鲜 `refresh_rejected` marker。根因是 proactive refresh worker 曾把所有刷新异常都当作用户可操作的重授权状态。守卫规则是：只有飞书明确返回 invalid/revoked refresh token 的权威 code 才能写 actionable `refresh_rejected`；未知 code 或基础设施错误必须只进入 diagnostic。
+已知 gotcha：2026-06-23 生产曾因本地凭证加密 key 缺失，把一批仍有可用 Feishu UAT 的用户写成新鲜 `refresh_rejected` marker。根因是 proactive refresh worker 曾把所有刷新异常都当作用户可操作的重授权状态。守卫规则是：后台 marker 扫描永不发送飞书私信；只有真实任务被阻断时，才在任务结果里被动提示 `/feishu_auth`；未知 code 或基础设施错误必须只进入 diagnostic。
 
 ### 4. 同步 profile 和路由
 

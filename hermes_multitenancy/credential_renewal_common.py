@@ -273,8 +273,8 @@ def iter_uat_locations(shared_home: Path) -> Iterator[UatLocation]:
 def classify_uat_payload(payload: dict[str, Any]) -> Optional[str]:
     """Return a `.needs_reauth` reason if the payload is unusable; else None.
 
-    Order matters — most actionable reason first so the L3 notifier picks the
-    right recipient (scope_stripped_by_feishu escalates to owner).
+    Order matters — most actionable reason first for the passive task gate
+    (scope_stripped_by_feishu requires owner/admin action).
     """
     if not payload_has_offline_access(payload):
         return REASON_SCOPE_STRIPPED_BY_FEISHU
@@ -346,7 +346,7 @@ def clear_reauth_markers_if_uat_recovered(
 
 
 def marker_requires_reauth(marker_body: dict[str, Any]) -> bool:
-    """Whether a marker is authoritative enough to notify/defer as reauth.
+    """Whether a marker is authoritative enough to defer a real task as reauth.
 
     ``refresh_rejected`` is only user-actionable when the refresh layer has
     parsed a Feishu invalid/revoked refresh-token response. Legacy catch-all

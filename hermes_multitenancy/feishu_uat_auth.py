@@ -574,8 +574,8 @@ def _store_uat(shared_home: Path, profile_name: str, open_id: str, payload: dict
     can be born broken: (a) Feishu didn't grant ``offline_access`` so no
     refresh_token will ever come (app-config bug, owner-actionable), (b) the
     response payload literally lacks ``refresh_token``. Either case writes a
-    `.needs_reauth` marker keyed by reason so the L3 notifier can route to the
-    right recipient — owner for scope_stripped (app config), end-user for
+    `.needs_reauth` marker keyed by reason so task gates can attribute the
+    right owner — owner/admin for scope_stripped (app config), end-user for
     empty_refresh_token (re-auth).
     """
     rejection = _l1_validate_uat(payload)

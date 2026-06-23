@@ -58,8 +58,13 @@ def _write_valid_uat(
 @pytest.fixture
 def sent(monkeypatch):
     calls = []
-    monkeypatch.setattr(N, "_get_bot_token", lambda _sh: "tok")
-    monkeypatch.setattr(N, "_send_feishu_dm", lambda token, recipient, text: calls.append((recipient, text)) or True)
+    monkeypatch.setattr(N, "_get_bot_token", lambda _sh: "tok", raising=False)
+    monkeypatch.setattr(
+        N,
+        "_send_feishu_dm",
+        lambda token, recipient, text: calls.append((recipient, text)) or True,
+        raising=False,
+    )
     monkeypatch.setenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", "1")
     monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_MAX_AGE_SECONDS", raising=False)
     return calls
@@ -78,8 +83,9 @@ def test_stale_marker_is_not_sent(sent, tmp_path):
     assert sent == []  # gated by default 24h freshness window
 
 
-def test_fresh_marker_is_sent(sent, tmp_path):
+def test_fresh_marker_is_not_sent_from_background_scan(sent, tmp_path):
     now = int(time.time())
+    seen = {}
     _write_marker(
         tmp_path,
         "stt",
@@ -87,14 +93,17 @@ def test_fresh_marker_is_sent(sent, tmp_path):
         ts=now - 60,
         reason=common.REASON_EMPTY_REFRESH_TOKEN,
     )  # just rejected
-    N._scan_once(tmp_path, {})
-    assert len(sent) == 1
-    recipient, text = sent[0]
-    assert recipient == "ou_stt"
-    assert "/feishu_auth" in text  # actionable re-auth prompt
+    marker = tmp_path / "profiles" / "stt" / "feishu_uat" / "ou_stt.needs_reauth"
+
+    changed = N._scan_once(tmp_path, seen)
+
+    assert changed is False
+    assert sent == []
+    assert seen == {}
+    assert marker.exists()
 
 
-def test_gate_disabled_with_zero_sends_stale(sent, tmp_path, monkeypatch):
+def test_gate_disabled_with_zero_still_does_not_send_dm(sent, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_MAX_AGE_SECONDS", "0")
     now = int(time.time())
     _write_marker(
@@ -105,7 +114,7 @@ def test_gate_disabled_with_zero_sends_stale(sent, tmp_path, monkeypatch):
         reason=common.REASON_EMPTY_REFRESH_TOKEN,
     )
     N._scan_once(tmp_path, {})
-    assert len(sent) == 1  # gate off -> even ancient markers send
+    assert sent == []
 
 
 def test_resolve_max_marker_age_env(monkeypatch):
@@ -117,46 +126,45 @@ def test_resolve_max_marker_age_env(monkeypatch):
     assert N._resolve_max_marker_age() == N._DEFAULT_MAX_MARKER_AGE_SECONDS
 
 
-def test_dryrun_seen_does_not_block_first_live_send(sent, tmp_path, monkeypatch):
-    # codex review: a marker seen during dry-run must still send once SEND=1 is flipped
-    # (a dry-run seen entry must not win the 24h dedupe).
+def test_dryrun_scan_does_not_record_notification_state(sent, tmp_path, monkeypatch):
     now = int(time.time())
     _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60, reason=common.REASON_EMPTY_REFRESH_TOKEN)
     seen = {}
-    # First pass: dry-run (SEND not set) records a dry_run seen entry.
+
     monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", raising=False)
-    N._scan_once(tmp_path, seen)
+
+    changed = N._scan_once(tmp_path, seen)
+
+    assert changed is False
     assert sent == []
-    assert seen.get("ou_stt:empty_refresh_token", {}).get("dry_run") is True
-    # Now enable live sends: the dry-run entry must NOT dedupe-block the real send.
-    monkeypatch.setenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", "1")
-    N._scan_once(tmp_path, seen)
-    assert len(sent) == 1 and sent[0][0] == "ou_stt"
+    assert seen == {}
 
 
-def test_dryrun_self_dedupes_no_relog(sent, tmp_path, monkeypatch):
-    # codex round 2: dry-run must still dedupe its OWN entries (no re-log/churn every scan).
+def test_repeated_background_scans_do_not_send_or_record_dedupe_state(sent, tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_CREDENTIAL_REAUTH_NOTIFIER_SEND", raising=False)
     now = int(time.time())
     _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60, reason=common.REASON_EMPTY_REFRESH_TOKEN)
     seen = {}
-    changed1 = N._scan_once(tmp_path, seen)   # records dry-run entry
-    changed2 = N._scan_once(tmp_path, seen)   # same entry within 24h -> deduped, no churn
-    assert changed1 is True and changed2 is False
+
+    changed1 = N._scan_once(tmp_path, seen)
+    changed2 = N._scan_once(tmp_path, seen)
+
+    assert changed1 is False and changed2 is False
     assert sent == []
+    assert seen == {}
 
 
-def test_real_send_then_dedupes(sent, tmp_path):
+def test_send_enabled_marker_still_does_not_send_from_background_scan(sent, tmp_path):
     now = int(time.time())
     _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60, reason=common.REASON_EMPTY_REFRESH_TOKEN)
     seen = {}
-    N._scan_once(tmp_path, seen)          # real send (SEND=1 via fixture)
-    N._scan_once(tmp_path, seen)          # second pass: deduped (real send within 24h)
-    assert len(sent) == 1
+    N._scan_once(tmp_path, seen)
+    N._scan_once(tmp_path, seen)
+    assert sent == []
+    assert seen == {}
 
 
 def test_marker_with_no_ts_is_not_gated(sent, tmp_path):
-    # A marker missing ts (ts=0) must not be skipped by the age gate (treat as send-eligible).
     d = tmp_path / "profiles" / "p" / "feishu_uat"
     d.mkdir(parents=True, exist_ok=True)
     (d / "ou_nots.needs_reauth").write_text(
@@ -164,10 +172,10 @@ def test_marker_with_no_ts_is_not_gated(sent, tmp_path):
         encoding="utf-8",
     )
     N._scan_once(tmp_path, {})
-    assert len(sent) == 1
+    assert sent == []
 
 
-def test_authoritative_refresh_rejected_marker_is_sent(sent, tmp_path):
+def test_authoritative_refresh_rejected_marker_is_not_sent_by_background_scan(sent, tmp_path):
     now = int(time.time())
     _write_marker(
         tmp_path,
@@ -177,11 +185,12 @@ def test_authoritative_refresh_rejected_marker_is_sent(sent, tmp_path):
         reason=common.REASON_REFRESH_REJECTED,
         extra={"authoritative": True, "refresh_class": "invalid"},
     )
+    marker = tmp_path / "profiles" / "stt" / "feishu_uat" / "ou_stt.needs_reauth"
 
     N._scan_once(tmp_path, {})
 
-    assert len(sent) == 1
-    assert sent[0][0] == "ou_stt"
+    assert sent == []
+    assert marker.exists()
 
 
 def test_authoritative_marker_is_cleared_not_sent_when_newer_valid_uat_exists(sent, tmp_path):

@@ -25,7 +25,6 @@ from .cron_worker import (
 )
 from .credential_audit import run_startup_audit
 from .credential_renewal_worker import ensure_renewal_worker_started
-from .credential_reauth_notifier import ensure_reauth_notifier_started
 from .router import on_pre_gateway_dispatch
 from . import webui_broker_server
 from .gateway_ownership import install_gateway_ownership_guard, is_router_profile_runtime
@@ -118,7 +117,7 @@ def register(ctx) -> None:
 
 
 def _start_credential_renewal_subsystem() -> None:
-    """Wire L5 (startup audit) + L3 (notifier) + L2 (renewal worker).
+    """Wire L5 (startup audit) + L2 (renewal worker).
 
     Router-only — these subsystems own the credential lifecycle for the whole
     Mac. Running per-profile would race on the same marker files.
@@ -135,11 +134,6 @@ def _start_credential_renewal_subsystem() -> None:
         run_startup_audit(shared_home)
     except Exception:
         logger.exception("[credential_renewal] L5 startup audit failed")
-
-    try:
-        ensure_reauth_notifier_started(shared_home)
-    except Exception:
-        logger.exception("[credential_renewal] L3 reauth notifier failed to start")
 
     try:
         ensure_renewal_worker_started(shared_home)
