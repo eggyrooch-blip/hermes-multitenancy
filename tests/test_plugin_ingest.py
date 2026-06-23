@@ -148,6 +148,24 @@ def test_profile_mode_does_not_hijack_or_delete_foreign_skill(tmp_path):
     assert _personal_target(pskills) == foreign_src
 
 
+def test_profile_mode_does_not_overwrite_managed_skill(tmp_path):
+    # org already MANAGES kep-halo-cli for this profile (.hermes-managed.json)
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    pskills = home / "profiles" / "feishu_test" / "skills"
+    (pskills / "kep-halo-cli").mkdir(parents=True)
+    (pskills / "kep-halo-cli" / "SKILL.md").write_text("org default\n", encoding="utf-8")
+    (pskills / ".hermes-managed.json").write_text(
+        json.dumps({"version": 1, "skills": {"kep-halo-cli": {"source": str(home / "skills" / "kep-halo-cli")}}}),
+        encoding="utf-8")
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    acts = {i["skill"]: i["action"] for i in report["skills"]["installed"]}
+    assert acts["kep-halo-cli"] == "skipped-managed"
+    assert "kep-halo-cli" not in report["skills"]["owned"].get("feishu_test", [])
+    pi.uninstall("test-plugin", shared_home=home)
+    assert (pskills / "kep-halo-cli").exists()  # managed skill untouched
+
+
 def _personal_target(pskills):
     d = json.loads((pskills / ".hermes-personal-installs.json").read_text())
     return d["skills"]["kep-halo-cli"]["target"]

@@ -303,6 +303,22 @@ def _personal_install_target(profile_home: Path, name: str) -> Optional[str]:
     return entry.get("target") if isinstance(entry, dict) else None
 
 
+def _managed_skill_present(profile_home: Path, name: str) -> bool:
+    """True if the org-managed manifest (`.hermes-managed.json`) already owns this skill.
+
+    Overwriting a managed/default skill is unsafe: `_link_skill` would delete it, but
+    `uninstall_personal_skill_for_profile` refuses to remove a managed path, so it could
+    not be rolled back. Treat a managed skill as foreign → never hijack it.
+    """
+    mf = profile_home / "skills" / ".hermes-managed.json"
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    skills = data.get("skills") if isinstance(data, dict) else None
+    return isinstance(skills, dict) and name in skills
+
+
 def _install_skills_to_profile(
     plugin: dict[str, Any],
     audience: Audience,
@@ -328,10 +344,13 @@ def _install_skills_to_profile(
         for name in names:
             my_source = str(shared_skills / name)
             existing = _personal_install_target(profile_home, name)
-            # COEXISTENCE GUARD: if this profile already has a personal install of the
-            # same skill path from a DIFFERENT source (an employee's own upload, or
-            # another plugin), do NOT hijack it — and never record it as ours, so
-            # --uninstall can't delete someone else's skill.
+            # COEXISTENCE GUARD: never hijack a skill this profile already has from
+            # someone else — a personal install from a DIFFERENT source (employee upload
+            # / another plugin) OR an org-managed/default skill (which uninstall can't
+            # roll back). Skip it, and never record it as ours.
+            if _managed_skill_present(profile_home, name):
+                installed.append({"profile": profile, "skill": name, "action": "skipped-managed"})
+                continue
             if existing is not None and existing != my_source:
                 installed.append({"profile": profile, "skill": name, "action": "skipped-foreign", "target": existing})
                 continue
