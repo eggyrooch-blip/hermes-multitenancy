@@ -404,6 +404,30 @@ curl "$RUN_BROKER_BASE_URL/api/run-broker/ingest/runs/ing_..." \
 
 异步接口复用同步 ingest 的鉴权、owner/profile 绑定、`agent`、`skill`、`model`、`metadata`、`interactive` 和幂等语义。Ingest run 由服务端统一按可能使用 host tools 处理，调用方不能降低 sandbox admission 要求。同一个 Bearer scope + 同一个有效幂等键重复提交会返回同一个 `run_id`，不会重复派发 agent。轮询也要求同一个 Bearer scope；另一把有效 key 不能读取结果。运行边界由 `HERMES_INGEST_ASYNC_TIMEOUT`（默认 `1800` 秒）、`HERMES_INGEST_ASYNC_TTL`（默认 `3600` 秒）和 `HERMES_INGEST_ASYNC_CAP`（默认进程内 `256` 条记录）控制。
 
+### Per-run ingest secrets
+
+同步和异步 ingest 请求都支持可选 `secrets` 对象，用来传本次 run 临时使用的 JWT、Bearer token、API key、Cookie 或 Basic auth 值。不要把原始凭证写进 `content`、`metadata` 或幂等键；`content` 只放模型可见的业务指令。
+
+```json
+{
+  "agent": "<agent-name-or-id>",
+  "content": "查询 2026-06-01 到 2026-06-22 的对账数据。",
+  "secrets": {
+    "cms_bearer": {
+      "type": "bearer_token",
+      "value": "<完整 token>"
+    }
+  },
+  "idempotency_key": "reconcile-20260623-001"
+}
+```
+
+Secret name 必须匹配 `[A-Za-z0-9_.-]{1,64}`。支持的 `type` 是 `bearer_token`、`api_key`、`cookie`、`basic`、`opaque`。单个 value 最大 16 KiB，单次请求 secrets 总量最大 64 KiB。
+
+模型只会看到 secret 的 name、type 和 usage hint。真实值写入 profile-scoped per-run 目录下的 `0600` 文件，并通过 `HERMES_INGEST_SECRET_DIR` 和 `HERMES_INGEST_SECRET_MANIFEST` 暴露给工具运行时。例如工具可以读取 `$HERMES_INGEST_SECRET_DIR/cms_bearer` 来构造 `Authorization: Bearer ...`。原始值不会复制到 `RunRequest.content`、调用方 metadata、raw event metadata、poll result 或 exact-result 文本；终端结果会按 exact secret value 脱敏。
+
+Secret 生命周期绑定 run：同步 run 结束立即清理，异步 run 进入终态后按 `HERMES_INGEST_ASYNC_TTL` 清理。幂等逻辑包含服务端 secret 指纹：同一个 Bearer scope、同一个 agent/profile、同一个 `idempotency_key` 且 secret 指纹相同会复用原 run；secret 指纹不同返回 `409 secret_mismatch`，不会静默复用带错误凭证的 run。
+
 ---
 
 ## 🚢 生产部署 runbook

@@ -404,6 +404,30 @@ curl "$RUN_BROKER_BASE_URL/api/run-broker/ingest/runs/ing_..." \
 
 The async route reuses the same authentication, owner/profile binding, `agent`, `skill`, `model`, `metadata`, `interactive`, and idempotency semantics as synchronous ingest. Ingest runs are always treated as host-tool-capable by the server, so callers cannot downgrade sandbox admission. A duplicate submission with the same Bearer scope and effective idempotency key returns the same `run_id` and does not dispatch a second run. Polling requires the same Bearer scope; another valid key cannot read the result. Runtime bounds are `HERMES_INGEST_ASYNC_TIMEOUT` (default `1800` seconds), `HERMES_INGEST_ASYNC_TTL` (default `3600` seconds), and `HERMES_INGEST_ASYNC_CAP` (default `256` in-process records).
 
+### Per-run ingest secrets
+
+Synchronous and async ingest requests also accept an optional `secrets` object for one-run credentials such as JWTs, Bearer tokens, API keys, cookies, and Basic auth values. Keep raw credentials out of `content`, `metadata`, and idempotency keys; `content` should only contain model-visible business instructions.
+
+```json
+{
+  "agent": "<agent-name-or-id>",
+  "content": "Fetch reconciliation data for 2026-06-01 through 2026-06-22.",
+  "secrets": {
+    "cms_bearer": {
+      "type": "bearer_token",
+      "value": "<full token>"
+    }
+  },
+  "idempotency_key": "reconcile-20260623-001"
+}
+```
+
+Secret names must match `[A-Za-z0-9_.-]{1,64}`. Supported `type` values are `bearer_token`, `api_key`, `cookie`, `basic`, and `opaque`. Each value is limited to 16 KiB and the request's total secret payload is limited to 64 KiB.
+
+The model sees only a manifest with each secret's name, type, and usage hint. The real values are written as `0600` files under a profile-scoped per-run directory, exposed to tool execution through `HERMES_INGEST_SECRET_DIR` and `HERMES_INGEST_SECRET_MANIFEST`. For example, an agent tool can read `$HERMES_INGEST_SECRET_DIR/cms_bearer` to build `Authorization: Bearer ...`. Raw values are not copied into `RunRequest.content`, caller metadata, raw event metadata, poll results, or exact-result text; terminal results are redacted by exact secret value.
+
+Secrets are tied to the run lifetime: synchronous runs clean up immediately after completion, and async runs clean up after the run reaches a terminal state subject to `HERMES_INGEST_ASYNC_TTL`. Idempotency includes a server-side secret fingerprint. Reusing the same Bearer scope, agent/profile, and `idempotency_key` with the same secret fingerprint returns the existing run; using a different secret fingerprint returns `409 secret_mismatch` instead of silently reusing a run with the wrong credential.
+
 ---
 
 ## 🚢 Production deployment runbook
