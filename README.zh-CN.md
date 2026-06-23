@@ -394,7 +394,7 @@ curl "$RUN_BROKER_BASE_URL/api/run-broker/ingest/runs/ing_..." \
 # -> {"ok":true,"status":"succeeded","run_id":"ing_...","profile":"...","result":"...","duplicate":false}
 ```
 
-异步接口复用同步 ingest 的鉴权、owner/profile 绑定、`agent`、`skill`、`model`、`metadata`、`requires_host_tools`、`interactive` 和幂等语义。同一个 Bearer scope + 同一个有效幂等键重复提交会返回同一个 `run_id`，不会重复派发 agent。轮询也要求同一个 Bearer scope；另一把有效 key 不能读取结果。运行边界由 `HERMES_INGEST_ASYNC_TIMEOUT`（默认 `1800` 秒）、`HERMES_INGEST_ASYNC_TTL`（默认 `3600` 秒）和 `HERMES_INGEST_ASYNC_CAP`（默认进程内 `256` 条记录）控制。
+异步接口复用同步 ingest 的鉴权、owner/profile 绑定、`agent`、`skill`、`model`、`metadata`、`interactive` 和幂等语义。Ingest run 由服务端统一按可能使用 host tools 处理，调用方不能降低 sandbox admission 要求。同一个 Bearer scope + 同一个有效幂等键重复提交会返回同一个 `run_id`，不会重复派发 agent。轮询也要求同一个 Bearer scope；另一把有效 key 不能读取结果。运行边界由 `HERMES_INGEST_ASYNC_TIMEOUT`（默认 `1800` 秒）、`HERMES_INGEST_ASYNC_TTL`（默认 `3600` 秒）和 `HERMES_INGEST_ASYNC_CAP`（默认进程内 `256` 条记录）控制。
 
 ---
 

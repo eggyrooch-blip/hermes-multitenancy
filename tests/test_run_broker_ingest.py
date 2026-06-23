@@ -188,15 +188,16 @@ def test_ingest_host_tools_default_requires_sandbox(monkeypatch):
     assert seen == []
 
 
-def test_ingest_host_tools_opt_out_runs_without_sandbox(monkeypatch):
+def test_ingest_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatch):
     app, seen = _app(monkeypatch, sandbox=False)
-    status, _ = _post(
+    status, text = _post(
         app,
         {"content": "hi", "requires_host_tools": False},
         headers={"Authorization": "Bearer testkey"},
     )
-    assert status == 200
-    assert seen[0].requires_host_tools is False
+    assert status == 403
+    assert json.loads(text)["ok"] is False
+    assert seen == []
 
 
 # ── Gap C: model / metadata passthrough ──────────────────────────────────
@@ -474,6 +475,47 @@ def test_ingest_times_out_on_slow_run(monkeypatch):
 
 
 # ── Async polling ingest ─────────────────────────────────────────────────
+
+def test_ingest_async_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatch):
+    calls = {"n": 0}
+
+    async def dispatch(request):
+        calls["n"] += 1
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: False,
+    )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "hi", "requires_host_tools": False},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            return submit.status, json.loads(await submit.text())
+        finally:
+            await client.close()
+
+    status, body = asyncio.run(runner())
+
+    assert status == 403
+    assert body["ok"] is False
+    assert "run_id" not in body
+    assert calls["n"] == 0
 
 def test_ingest_async_submit_returns_run_id_and_poll_eventually_succeeds(monkeypatch):
     release = asyncio.Event()

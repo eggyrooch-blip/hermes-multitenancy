@@ -394,7 +394,7 @@ curl "$RUN_BROKER_BASE_URL/api/run-broker/ingest/runs/ing_..." \
 # -> {"ok":true,"status":"succeeded","run_id":"ing_...","profile":"...","result":"...","duplicate":false}
 ```
 
-The async route reuses the same authentication, owner/profile binding, `agent`, `skill`, `model`, `metadata`, `requires_host_tools`, `interactive`, and idempotency semantics as synchronous ingest. A duplicate submission with the same Bearer scope and effective idempotency key returns the same `run_id` and does not dispatch a second run. Polling requires the same Bearer scope; another valid key cannot read the result. Runtime bounds are `HERMES_INGEST_ASYNC_TIMEOUT` (default `1800` seconds), `HERMES_INGEST_ASYNC_TTL` (default `3600` seconds), and `HERMES_INGEST_ASYNC_CAP` (default `256` in-process records).
+The async route reuses the same authentication, owner/profile binding, `agent`, `skill`, `model`, `metadata`, `interactive`, and idempotency semantics as synchronous ingest. Ingest runs are always treated as host-tool-capable by the server, so callers cannot downgrade sandbox admission. A duplicate submission with the same Bearer scope and effective idempotency key returns the same `run_id` and does not dispatch a second run. Polling requires the same Bearer scope; another valid key cannot read the result. Runtime bounds are `HERMES_INGEST_ASYNC_TIMEOUT` (default `1800` seconds), `HERMES_INGEST_ASYNC_TTL` (default `3600` seconds), and `HERMES_INGEST_ASYNC_CAP` (default `256` in-process records).
 
 ---
 

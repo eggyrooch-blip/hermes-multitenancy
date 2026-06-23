@@ -1617,7 +1617,9 @@ def create_run_broker_app(
             metadata["model"] = model
         metadata["source"] = "ingest"
 
-        requires_host_tools = bool(payload.get("requires_host_tools", True))
+        # Ingest is an external execution surface: the caller cannot downgrade
+        # sandbox admission by declaring that host tools are unnecessary.
+        requires_host_tools = True
         interactive = bool(payload.get("interactive", False))
 
         try:
@@ -1938,8 +1940,8 @@ def create_run_broker_app(
 
         A hard ``HERMES_INGEST_TIMEOUT`` (default 180s) bounds either path.
 
-        Capability parity with the cron/WebUI run paths: host tools on by
-        default (``requires_host_tools``); ``model`` / ``metadata`` passthrough;
+        Capability parity with the cron/WebUI run paths: host-tool-capable
+        admission is server-owned; ``model`` / ``metadata`` passthrough;
         duplicate submissions return the original result.
         See SPEC run-broker-ingest.
         """
@@ -2042,9 +2044,11 @@ def create_run_broker_app(
             metadata["model"] = model
         metadata["source"] = "ingest"
 
-        # Gap A — host tools on by default (parity with cron/kanban), so
-        # credential-backed skills work. Caller may opt out.
-        requires_host_tools = bool(payload.get("requires_host_tools", True))
+        # Gap A — host tools on (parity with cron/kanban), so credential-backed
+        # skills work. Ingest is an external execution surface: the caller
+        # cannot downgrade sandbox admission by declaring that host tools are
+        # unnecessary.
+        requires_host_tools = True
         interactive = bool(payload.get("interactive", False))
 
         try:
