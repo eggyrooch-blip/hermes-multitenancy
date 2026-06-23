@@ -448,6 +448,145 @@ def test_ingest_same_idempotency_with_different_secret_fingerprint_is_409(monkey
     assert calls["n"] == 1
 
 
+def test_ingest_sync_idempotency_is_scoped_by_ingest_caller(monkeypatch, tmp_path):
+    keys_file = tmp_path / "ingest-keys.json"
+    keys_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {"token": "caller-a", "profile": "owner", "name": "caller a"},
+                    {"token": "caller-b", "profile": "owner", "name": "caller b"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(keys_file))
+
+    dispatched = {"n": 0}
+    seen_keys: set[str] = set()
+
+    def mark_seen(request):
+        key = request.effective_idempotency_key
+        if key in seen_keys:
+            return False
+        seen_keys.add(key)
+        return True
+
+    async def dispatch(request):
+        dispatched["n"] += 1
+        return f"run-{dispatched['n']}:{request.content}"
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+    body = {
+        "content": "same work",
+        "idempotency_key": "same-key",
+        "secrets": {"cms": {"type": "opaque", "value": "same-secret"}},
+    }
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.post(
+                "/api/run-broker/ingest",
+                json=body,
+                headers={"Authorization": "Bearer caller-a"},
+            )
+            first_body = json.loads(await first.text())
+            second = await client.post(
+                "/api/run-broker/ingest",
+                json=body,
+                headers={"Authorization": "Bearer caller-b"},
+            )
+            second_body = json.loads(await second.text())
+            return first.status, first_body, second.status, second_body
+        finally:
+            await client.close()
+
+    first_status, first_body, second_status, second_body = asyncio.run(runner())
+
+    assert first_status == 200
+    assert first_body["result"] == "run-1:same work"
+    assert second_status == 200
+    assert second_body["ok"] is True
+    assert second_body["duplicate"] is False
+    assert second_body["result"] == "run-2:same work"
+    assert dispatched["n"] == 2
+
+
+def test_ingest_sync_secret_mismatch_is_scoped_by_ingest_caller(monkeypatch, tmp_path):
+    keys_file = tmp_path / "ingest-keys.json"
+    keys_file.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {"token": "caller-a", "profile": "owner", "name": "caller a"},
+                    {"token": "caller-b", "profile": "owner", "name": "caller b"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_INGEST_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(keys_file))
+
+    dispatched = {"n": 0}
+
+    async def dispatch(request):
+        dispatched["n"] += 1
+        return f"run-{dispatched['n']}:{request.content}"
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    base = {"content": "same work", "idempotency_key": "same-key"}
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.post(
+                "/api/run-broker/ingest",
+                json={**base, "secrets": {"cms": {"type": "opaque", "value": "old"}}},
+                headers={"Authorization": "Bearer caller-a"},
+            )
+            first_body = json.loads(await first.text())
+            second = await client.post(
+                "/api/run-broker/ingest",
+                json={**base, "secrets": {"cms": {"type": "opaque", "value": "new"}}},
+                headers={"Authorization": "Bearer caller-b"},
+            )
+            second_body = json.loads(await second.text())
+            return first.status, first_body, second.status, second_body
+        finally:
+            await client.close()
+
+    first_status, first_body, second_status, second_body = asyncio.run(runner())
+
+    assert first_status == 200
+    assert first_body["result"] == "run-1:same work"
+    assert second_status == 200
+    assert second_body["ok"] is True
+    assert second_body["result"] == "run-2:same work"
+    assert dispatched["n"] == 2
+
+
 # ── Gap B: clarify is surfaced (default-dispatch path) ────────────────────
 
 def test_ingest_surfaces_clarify_instead_of_empty(monkeypatch, tmp_path):

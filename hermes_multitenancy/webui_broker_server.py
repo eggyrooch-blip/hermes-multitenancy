@@ -705,6 +705,25 @@ def _ingest_secret_mismatch_response(profile_name: str):
     )
 
 
+def _ingest_scoped_broker_idempotency_key(
+    *,
+    auth_fingerprint: str,
+    profile_name: str,
+    effective_idempotency_key: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "auth": auth_fingerprint,
+            "profile": profile_name,
+            "key": effective_idempotency_key,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return "ingest:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _ingest_owner() -> str:
     """Owner (Feishu open_id) bound to the ingest key, or '' for v1 fixed-profile mode.
 
@@ -2319,12 +2338,24 @@ def create_run_broker_app(
         # Review B3: namespace the idempotency cache by the resolved profile so
         # the same explicit idempotency_key used against two different owner
         # agents can never replay the wrong agent's cached result.
-        idempotency_cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        auth_fingerprint = _ingest_auth_fingerprint(request, ingest_binding)
+        original_effective_idempotency_key = run_request.effective_idempotency_key
+        idempotency_cache_key = (
+            f"{auth_fingerprint}\x00{bound_profile}\x00{original_effective_idempotency_key}"
+        )
         secret_fingerprint = secret_spec.fingerprint if secret_spec else ""
         known_fingerprint = _ingest_secret_fingerprints.get(idempotency_cache_key)
         if known_fingerprint and known_fingerprint != secret_fingerprint:
             return _ingest_secret_mismatch_response(bound_profile)
         cache_key = f"{idempotency_cache_key}\x00secret:{secret_fingerprint}"
+        run_request = replace(
+            run_request,
+            idempotency_key=_ingest_scoped_broker_idempotency_key(
+                auth_fingerprint=auth_fingerprint,
+                profile_name=bound_profile,
+                effective_idempotency_key=original_effective_idempotency_key,
+            ),
+        )
         secret_dir = ""
         try:
             secret_dir = _ingest_materialize_secret_dir(
