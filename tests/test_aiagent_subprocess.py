@@ -2871,33 +2871,43 @@ def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeyp
     )
     (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
 
-    class FakeAgent:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-        def run_conversation(self, user_message, task_id):
-            return {"final_response": "done"}
-
-        def cleanup(self):
-            pass
-
     captured_session_vars: list[dict] = []
+    observed: dict[str, object] = {}
+    async_delivery_state = contextvars.ContextVar("async_delivery_state", default=True)
 
     def set_session_vars(**kwargs):
         captured_session_vars.append(kwargs)
-        return object()
+        return async_delivery_state.set(bool(kwargs.get("async_delivery", True)))
 
-    def clear_session_vars(_token):
-        pass
+    def clear_session_vars(token):
+        async_delivery_state.reset(token)
+
+    def async_delivery_supported():
+        return async_delivery_state.get()
 
     fake_session_context = SimpleNamespace(
         set_session_vars=set_session_vars,
         clear_session_vars=clear_session_vars,
+        async_delivery_supported=async_delivery_supported,
     )
     gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
     gateway_mod.session_context = fake_session_context
     monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
     monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            from gateway.session_context import async_delivery_supported
+
+            observed["async_delivery_supported"] = async_delivery_supported()
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
     _install_fake_feishu_oapi(monkeypatch)
 
@@ -2914,6 +2924,7 @@ def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeyp
     assert agent_real._run_with_aiagent(event, profile_home) == "done"
     assert captured_session_vars
     assert captured_session_vars[0]["async_delivery"] is False
+    assert observed["async_delivery_supported"] is False
 
 
 def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
