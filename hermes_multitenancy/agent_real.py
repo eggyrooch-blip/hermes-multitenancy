@@ -3958,10 +3958,6 @@ def _normalize_webui_uploaded_image_path(raw_path: str) -> str:
         return value[len("/workspace/"):]
     if value.startswith("workspace/"):
         return value[len("workspace/"):]
-    marker = "/workspace/"
-    marker_index = value.find(marker)
-    if marker_index >= 0:
-        return value[marker_index + len(marker):]
     return value
 
 
