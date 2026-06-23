@@ -4,6 +4,13 @@ import json
 from pathlib import Path
 import sqlite3
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_lark_cli_app_id(monkeypatch):
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+
 
 def test_preflight_reports_missing_credentials_without_secret_values(tmp_path: Path):
     from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
