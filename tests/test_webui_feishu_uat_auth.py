@@ -210,6 +210,64 @@ def test_feishu_uat_status_prefers_runtime_profile_json_over_keyless_vault_metad
     assert "refresh_token" not in raw
 
 
+def test_feishu_uat_status_does_not_mark_reauth_when_keyless_refresh_needs_app_creds(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    now_ms = int(time.time() * 1000)
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__global__",
+            subject_id="feishu_app",
+            provider="feishu",
+            secret_kind="app",
+            payload={"app_id": "cli_test", "app_secret": "vault-app-secret"},
+        )
+    finally:
+        store.close()
+
+    profile_uat = shared / "profiles" / "owner" / "feishu_uat"
+    profile_uat.mkdir(parents=True)
+    (profile_uat / "ou_owner.json").write_text(
+        json.dumps(
+            {
+                "access_token": "expired-profile-access-secret",
+                "refresh_token": "profile-refresh-secret",
+                "user_open_id": "ou_owner",
+                "scope": "offline_access wiki:wiki:readonly",
+                "expires_at": now_ms - 1000,
+                "refresh_expires_at": now_ms + 86400_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+
+    status = feishu_uat_auth.credential_status(
+        profile_name="owner",
+        open_id="ou_owner",
+        required_scopes="wiki:wiki:readonly",
+        shared_home=shared,
+    )
+    raw = json.dumps(status, ensure_ascii=False)
+
+    assert status["status"] == "expired"
+    assert status["storage"] == "profile_feishu_uat_json"
+    assert status["runtime_available"] is False
+    assert status["needs_reauth"] is False
+    assert "credential encryption key is required" not in raw
+    assert "expired-profile-access-secret" not in raw
+    assert "profile-refresh-secret" not in raw
+    assert "vault-app-secret" not in raw
+    assert "access_token" not in raw
+    assert "refresh_token" not in raw
+
+
 def test_feishu_uat_status_prefers_valid_runtime_vault_over_fresher_scope_missing_json(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
     from hermes_multitenancy.credentials import CredentialStore
@@ -690,6 +748,7 @@ def test_feishu_uat_status_reports_unexpected_refresh_error(tmp_path, monkeypatc
 
     assert status["status"] == "expired"
     assert "unexpected refresh error" in status["refresh_error"]
+    assert status["needs_reauth"] is False
     assert "old-access" not in str(status)
 
 

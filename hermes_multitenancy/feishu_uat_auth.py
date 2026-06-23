@@ -197,6 +197,7 @@ def credential_status(
     _assert_route(shared, profile_name, open_id)
     required = parse_scopes(required_scopes)
     refresh_error = ""
+    refresh_needs_reauth = False
     try:
         refresh_uat_if_needed(
             profile_name=profile_name,
@@ -205,7 +206,8 @@ def credential_status(
             headroom_seconds=300,
         )
     except FeishuUatAuthError as exc:
-        refresh_error = exc.message
+        refresh_error = _redact_status_refresh_error(exc.message)
+        refresh_needs_reauth = _refresh_error_requires_reauth(exc)
     except Exception as exc:
         refresh_error = f"unexpected refresh error: {exc}"
 
@@ -251,10 +253,25 @@ def credential_status(
         status["runtime_available"] = bool(payload) and status.get("status") == "valid"
     status.pop("_runtime_payload_available", None)
     if refresh_error:
-        status["needs_reauth"] = status.get("status") == "expired"
+        status["needs_reauth"] = bool(refresh_needs_reauth and status.get("status") == "expired")
         status["refresh_error"] = refresh_error
     status["lark_cli"] = _lark_cli_status(shared, profile_name, open_id)
     return status
+
+
+def _refresh_error_requires_reauth(exc: FeishuUatAuthError) -> bool:
+    if exc.refresh_class == "invalid":
+        return True
+    if exc.status != 401:
+        return False
+    message = exc.message.lower()
+    return "refresh_token" in message or "refresh token" in message
+
+
+def _redact_status_refresh_error(message: str) -> str:
+    if "credential encryption key is required" in message:
+        return "Feishu app credentials are unavailable for background refresh"
+    return message
 
 
 def _profile_uat_status(
