@@ -153,6 +153,40 @@ def _personal_target(pskills):
     return d["skills"]["kep-halo-cli"]["target"]
 
 
+def test_uninstall_rejects_unsafe_plugin_id(tmp_path):
+    home = _shared_home(tmp_path)
+    with pytest.raises(pi.PluginIngestError, match="unsafe plugin id"):
+        pi.uninstall("../../evil", shared_home=home)
+
+
+def test_resolve_audience_rejects_traversal_token(tmp_path):
+    home = _shared_home(tmp_path)
+    with pytest.raises(pi.PluginIngestError, match="unsafe --audience token"):
+        pi.resolve_audience("../../etc", profiles_root=home / "profiles")
+
+
+def test_load_manifest_rejects_flag_injection_cli_install(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"],
+                              clis=[{"id": "x", "install": "--all"}])
+    with pytest.raises(pi.PluginIngestError, match=r"unsafe clis\[\].install"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_governance_failure_leaves_recoverable_manifest(tmp_path):
+    # orchestrator installed but its SKILL.md lacks the gate → governance fails AFTER the
+    # manifest is persisted, so --uninstall can still roll the partial install back.
+    repo = tmp_path / "plug"
+    _write_plugin_repo(repo, skills=["using-resource-delivery", "kep-trevi-delivery-orchestrate"])
+    (repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").write_text(
+        "---\nname: o\n---\nno gate text here\n", encoding="utf-8")
+    home = _shared_home(tmp_path)
+    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home)
+    assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()  # tracked despite failure
+    pi.uninstall("test-plugin", shared_home=home)
+    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+
+
 def test_skills_dir_honored(tmp_path):
     # plugin keeps skills under a custom dir; manifest.skills.dir points at it
     repo = tmp_path / "plug"

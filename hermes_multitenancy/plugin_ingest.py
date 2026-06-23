@@ -146,6 +146,9 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
         if not isinstance(cli, dict) or "id" not in cli or "install" not in cli:
             raise PluginIngestError(f"{path}: each clis[] entry needs id+install, got {cli!r}")
         _safe_component(cli["id"], kind="cli id")  # used as <shared>/bin/<id>
+        inst = str(cli["install"])  # passed as `kep-cli install <inst>` — block flag injection
+        if not inst or inst.startswith("-") or not all(c.isalnum() or c in "-_." for c in inst):
+            raise PluginIngestError(f"{path}: unsafe clis[].install token: {inst!r}")
     for con in data.get("connectors") or []:
         if not isinstance(con, dict) or "id" not in con:
             raise PluginIngestError(f"{path}: each connectors[] entry needs id, got {con!r}")
@@ -186,6 +189,9 @@ def resolve_audience(value: str, *, profiles_root: Path) -> Audience:
     if not raw:
         raise PluginIngestError("--audience is required (a profile id or numeric department_ids)")
     tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    for t in tokens:  # a profile token becomes `profiles_root / t` — block traversal
+        if "/" in t or "\\" in t or t in (".", "..") or "\x00" in t:
+            raise PluginIngestError(f"unsafe --audience token: {t!r}")
 
     profile_hits = [t for t in tokens if (profiles_root / t).is_dir()]
     if profile_hits and len(profile_hits) == len(tokens):
@@ -542,10 +548,6 @@ def ingest(
         report["skills"] = _install_skills_to_profile(
             plugin, aud, shared_home=shared_home, profiles_root=profiles_root, dry_run=dry_run, force=force
         )
-        if not dry_run:
-            report["profile_governance"] = [
-                assert_profile_governance(plugin, profiles_root / p) for p in aud.profiles
-            ]
     else:
         report["skills"] = _register_department_distribution(
             plugin, aud, shared_home=shared_home, dry_run=dry_run, allow_create=allow_create_distribution
@@ -566,6 +568,15 @@ def ingest(
         "install_mode": plugin.get("install_mode") or "copy",
     }
     report["managed_manifest"] = str(_write_managed_manifest(shared_home, manifest, dry_run=dry_run))
+
+    # Governance assertion runs AFTER the managed manifest is persisted: if it raises,
+    # the partial install is already tracked, so `--uninstall <plugin_id>` cleanly rolls
+    # back. (It must run post-install because it inspects the installed skill content.)
+    if aud.mode == "profile" and not dry_run:
+        report["profile_governance"] = [
+            assert_profile_governance(plugin, profiles_root / p) for p in aud.profiles
+        ]
+
     report["note"] = (
         "skills cached in .skills_prompt_snapshot.json — restart the gateway for the "
         "target profile to see the new slash commands."
@@ -581,6 +592,7 @@ def uninstall(
     dry_run: bool = False,
     purge_clis: bool = False,
 ) -> dict[str, Any]:
+    _safe_component(plugin_id, kind="plugin id")  # CLI arg → managed-manifest filename
     shared_home = (shared_home or _default_shared_home()).expanduser()
     profiles_root = (profiles_root or shared_home / "profiles").expanduser()
     path = _managed_path(shared_home, plugin_id)
