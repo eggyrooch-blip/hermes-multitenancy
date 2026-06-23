@@ -4084,8 +4084,8 @@ def _run_with_aiagent(
                     raise
                 logger.warning(
                     "[multitenancy] Hermes gateway.session_context.set_session_vars "
-                    "does not accept async_delivery; delegate_task background "
-                    "results may not return to WebUI on this runtime "
+                    "does not accept async_delivery; falling back to legacy "
+                    "session context behavior on this runtime "
                     "(platform=%s profile=%s)",
                     platform_key,
                     profile_home.name,

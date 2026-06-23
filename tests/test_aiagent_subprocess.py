@@ -3034,7 +3034,8 @@ def test_run_with_aiagent_warns_when_runtime_rejects_async_delivery_kwarg(
     assert captured_session_vars[0]["async_delivery"] is False
     assert "async_delivery" not in captured_session_vars[1]
     assert "does not accept async_delivery" in caplog.text
-    assert "delegate_task background results may not return to WebUI" in caplog.text
+    assert "falling back to legacy session context behavior" in caplog.text
+    assert "WebUI" not in caplog.text
 
 
 def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
