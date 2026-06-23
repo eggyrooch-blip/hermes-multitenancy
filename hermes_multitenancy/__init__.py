@@ -88,7 +88,9 @@ def register(ctx) -> None:
     from .runtime import ProfileRuntime
     try:
         from .tencent_vod_image_gen import register_vod_image_gen_provider
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if exc.name != "agent":
+            raise
         register_vod_image_gen_provider = None
 
     def _real_factory(profile_name, profile_home):
@@ -116,10 +118,7 @@ def register(ctx) -> None:
 
     register_credential_status_tool(ctx)
     if register_vod_image_gen_provider is not None:
-        try:
-            register_vod_image_gen_provider(ctx)
-        except Exception:
-            logger.debug("[multitenancy] optional VOD image provider registration skipped", exc_info=True)
+        register_vod_image_gen_provider(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
 
 

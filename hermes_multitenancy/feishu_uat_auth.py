@@ -226,8 +226,6 @@ def credential_status(
             secret_kind="uat",
             required_scopes=required,
         )
-        if _prefer_status(vault_status, status):
-            status = vault_status
         try:
             payload = store.get_secret_for_runtime(
                 profile_name=profile_name,
@@ -237,6 +235,9 @@ def credential_status(
             )
         except Exception:
             payload = {}
+        vault_status["runtime_available"] = bool(payload)
+        if _prefer_status(vault_status, status):
+            status = vault_status
     finally:
         if store is not None:
             store.close()
@@ -309,6 +310,12 @@ def _profile_uat_status(
 def _prefer_status(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
     candidate_has = bool(candidate.get("has_payload"))
     current_has = bool(current.get("has_payload"))
+    candidate_runtime = bool(candidate.get("runtime_available"))
+    current_runtime = bool(current.get("runtime_available"))
+    if current_runtime and not candidate_runtime:
+        return False
+    if candidate_runtime and not current_runtime:
+        return True
     if candidate_has and not current_has:
         return True
     if not candidate_has:

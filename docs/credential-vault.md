@@ -29,6 +29,7 @@ reports current-profile status:
   "scopes": ["contact:user.base:readonly"],
   "missing_scopes": [],
   "has_credential": true,
+  "runtime_available": true,
   "sandbox_note": ".env/auth.json are masked by design"
 }
 ```
@@ -39,9 +40,11 @@ Cross-profile status queries are rejected.
 Redacted status reads are intentionally weaker than runtime secret reads:
 `CredentialStore.get_status()` may read scope/expiry metadata without
 `HERMES_MULTITENANCY_CREDENTIAL_KEY` / `HERMES_CREDENTIAL_KEY`, but
-`put_credential()` and `get_secret_for_runtime()` still require the key. Feishu
-UAT status uses the same runtime fallback order as lark-cli: vault metadata when
-available, then the current profile's
+`put_credential()` and `get_secret_for_runtime()` still require the key.
+For Feishu UAT, `has_credential` means the selected source is usable by the
+runtime, not merely that a vault row contains encrypted bytes. Keyless vault
+metadata may still be reported for diagnosis with `runtime_available=false`,
+but it must not override a runtime-usable
 `profiles/<profile>/feishu_uat/<open_id>.json` compatibility file. This lets
 `multitenancy_credential_status`, Connector Registry, and the lark-cli canary
 report a usable local connector when the profile-local UAT JSON is valid, while

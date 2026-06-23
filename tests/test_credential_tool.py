@@ -107,6 +107,52 @@ def test_credential_status_tool_uses_profile_json_without_vault_key(monkeypatch,
     assert "refresh_token" not in raw
 
 
+def test_credential_status_tool_does_not_report_keyless_vault_metadata_as_usable(monkeypatch, tmp_path):
+    from hermes_multitenancy.credential_tool import credential_status
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    profile.mkdir(parents=True)
+    RoutingTable(shared / "multitenancy.db").upsert(
+        user_id="owner",
+        profile_name="owner",
+        open_id="ou_owner",
+    )
+    store = CredentialStore(shared / "multitenancy.db", encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+            secret_kind="uat",
+            payload={"access_token": "vault-only-access-secret", "refresh_token": "vault-only-refresh-secret"},
+            scopes=["docx:document:create"],
+            expires_at=int(time.time() * 1000) + 3600_000,
+        )
+    finally:
+        store.close()
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+
+    payload = json.loads(credential_status({"provider": "feishu"}))
+    raw = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["status"] == "valid"
+    assert payload["storage"] == "multitenancy_db"
+    assert payload["runtime_available"] is False
+    assert payload["has_credential"] is False
+    assert "vault-only-access-secret" not in raw
+    assert "vault-only-refresh-secret" not in raw
+    assert "access_token" not in raw
+    assert "refresh_token" not in raw
+
+
 def test_credential_status_tool_rejects_cross_profile_query(monkeypatch, tmp_path):
     from hermes_multitenancy.credential_tool import credential_status
 
