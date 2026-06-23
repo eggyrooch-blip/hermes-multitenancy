@@ -171,7 +171,15 @@ def test_credential_status_tool_rejects_cross_profile_query(monkeypatch, tmp_pat
 
 
 def test_register_adds_credential_status_tool_without_raw_secret_access(monkeypatch):
+    import builtins
     import hermes_multitenancy
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_multitenancy.tencent_vod_image_gen":
+            raise AssertionError("credential-tool registration must not import optional VOD provider")
+        return real_import(name, globals, locals, fromlist, level)
 
     calls = []
 
@@ -182,6 +190,7 @@ def test_register_adds_credential_status_tool_without_raw_secret_access(monkeypa
         def register_tool(self, **kwargs):
             calls.append(kwargs)
 
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
     hermes_multitenancy.register(FakeCtx())
 
     tool = next(call for call in calls if call["name"] == "multitenancy_credential_status")

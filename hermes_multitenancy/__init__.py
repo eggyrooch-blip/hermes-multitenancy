@@ -86,7 +86,6 @@ def register(ctx) -> None:
     from .credential_tool import register_credential_status_tool
     from .router import override_pool
     from .runtime import ProfileRuntime
-    from .tencent_vod_image_gen import register_vod_image_gen_provider
 
     def _real_factory(profile_name, profile_home):
         return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
@@ -112,8 +111,24 @@ def register(ctx) -> None:
         install_profile_native_cron_guard()
 
     register_credential_status_tool(ctx)
-    register_vod_image_gen_provider(ctx)
+    _register_optional_vod_image_gen_provider(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
+
+
+def _register_optional_vod_image_gen_provider(ctx) -> bool:
+    register = getattr(ctx, "register_image_gen_provider", None)
+    if not callable(register):
+        logger.debug("[tencent-vod] image_gen provider registration unavailable on ctx")
+        return False
+    try:
+        from .tencent_vod_image_gen import register_vod_image_gen_provider
+    except ModuleNotFoundError as exc:
+        missing = str(getattr(exc, "name", "") or "")
+        if missing == "agent" or missing.startswith("agent."):
+            logger.info("[tencent-vod] optional image_gen provider API unavailable; skipping registration")
+            return False
+        raise
+    return bool(register_vod_image_gen_provider(ctx))
 
 
 def _start_credential_renewal_subsystem() -> None:
