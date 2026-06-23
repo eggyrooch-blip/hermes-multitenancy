@@ -28,9 +28,9 @@ Design redlines (cross-model reviewed — see vault PLAN §4):
   * online-by-default is forbidden: governance.env_default must be `pre`.
 
 Usage:
-    python -m hermes_multitenancy.plugin_ingest <plugin-repo> --audience <ids|profile>
-    python -m hermes_multitenancy.plugin_ingest <plugin-repo> --audience X --dry-run
-    python -m hermes_multitenancy.plugin_ingest --uninstall <plugin-id>
+    python3 -m hermes_multitenancy.plugin_ingest <plugin-repo> --audience <ids|profile>
+    python3 -m hermes_multitenancy.plugin_ingest <plugin-repo> --audience X --dry-run
+    python3 -m hermes_multitenancy.plugin_ingest --uninstall <plugin-id>
 """
 from __future__ import annotations
 
@@ -306,20 +306,23 @@ def _register_department_distribution(
     skills_list = raw.get("skills")
     if not isinstance(skills_list, list):
         skills_list = []
-    by_path = {str(item.get("path")): item for item in skills_list if isinstance(item, dict)}
-
     plugin_id = plugin["id"]
-    entries = []
-    for name in names:
-        entry = {
+    # NON-DESTRUCTIVE merge: keep EVERY other entry — including same-path entries owned
+    # by other plugins/departments. The loader (_default_profile_skill_specs) keeps
+    # multiple entries and filters them PER EMPLOYEE by audience, so collapsing by path
+    # here would silently delete another distribution's audience. Replace only THIS
+    # plugin's prior entries (idempotent re-ingest), then append ours.
+    kept = [it for it in skills_list if not (isinstance(it, dict) and it.get("plugin") == plugin_id)]
+    entries = [
+        {
             "path": name,
             "install_mode": install_mode,
             "audience": {"department_ids": list(audience.department_ids)},
             "plugin": plugin_id,
         }
-        entries.append(entry)
-        by_path[name] = entry
-    raw["skills"] = sorted(by_path.values(), key=lambda it: str(it.get("path")))
+        for name in names
+    ]
+    raw["skills"] = sorted(kept + entries, key=lambda it: (str(it.get("path")), str(it.get("plugin") or "")))
 
     if not dry_run:
         config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")

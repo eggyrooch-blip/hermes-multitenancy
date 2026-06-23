@@ -242,6 +242,29 @@ def test_ingest_department_mode_writes_distribution_and_strips(tmp_path):
     assert all(it.get("plugin") != "test-plugin" for it in (raw2.get("skills") or []))
 
 
+def test_department_mode_does_not_clobber_other_plugin_same_path(tmp_path):
+    # another plugin already distributes the SAME skill path to a different audience
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["kep-halo-cli"])
+    home = _shared_home(tmp_path)
+    dist = home / pi.SKILL_DISTRIBUTION_FILE
+    other = {"path": "kep-halo-cli", "install_mode": "copy",
+             "audience": {"department_ids": ["999"]}, "plugin": "other-plugin"}
+    dist.write_text(yaml.safe_dump({"skills": [other]}, allow_unicode=True), encoding="utf-8")
+
+    pi.ingest(repo, audience="101", shared_home=home)
+    entries = yaml.safe_load(dist.read_text())["skills"]
+    # both the other plugin's entry AND ours survive for the same path
+    owners = {(e["path"], e["plugin"]): e for e in entries}
+    assert ("kep-halo-cli", "other-plugin") in owners
+    assert ("kep-halo-cli", "test-plugin") in owners
+    assert owners[("kep-halo-cli", "other-plugin")]["audience"]["department_ids"] == ["999"]
+
+    # uninstall removes only ours; the other plugin's entry is untouched
+    pi.uninstall("test-plugin", shared_home=home)
+    remain = yaml.safe_load(dist.read_text())["skills"]
+    assert [e["plugin"] for e in remain] == ["other-plugin"]
+
+
 # ─────────────────────────── CLI install (no real kep-cli) ──────────────
 
 def test_install_clis_skips_when_present(tmp_path):
