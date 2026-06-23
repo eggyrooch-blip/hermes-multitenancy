@@ -45,15 +45,16 @@ def _uat_expires_at(payload: dict[str, Any]) -> int:
 def _public_app_id_source(shared_home: Path, profile_name: str) -> tuple[bool, str]:
     if str(os.getenv("HERMES_LARK_CLI_APP_ID") or "").strip():
         return True, "env_or_config"
-
-    config_path = Path(shared_home) / "config.yaml"
     try:
-        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        loaded = {}
-    extra = (((loaded.get("platforms") or {}).get("feishu") or {}).get("extra") or {})
-    if str(extra.get("app_id") or extra.get("FEISHU_APP_ID") or "").strip():
-        return True, "env_or_config"
+        for raw_line in (Path(shared_home) / ".env").read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "HERMES_LARK_CLI_APP_ID" and value.strip().strip('"').strip("'"):
+                return True, "env_or_config"
+    except OSError:
+        pass
 
     uat_dir = Path(shared_home) / "profiles" / profile_name / "feishu_uat"
     try:

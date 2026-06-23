@@ -53,6 +53,10 @@ still never exposing token fields to the model or WebUI.
 Profile-local Feishu UAT fallback reads the same access-token expiry aliases as
 runtime status (`expires_at`, `expire_at`, and `access_token_expires_at`), so
 canary checks do not report an expired compatibility JSON as ready.
+The lark-cli canary only treats app ids from sources the runtime can inject:
+current env/shared `.env`, profile-local UAT JSON, or decryptable vault app
+credentials. `config.yaml` remains an import source for migration, not a
+runtime-ready signal by itself.
 
 ## Group credential materialization
 

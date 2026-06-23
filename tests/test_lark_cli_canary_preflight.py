@@ -165,6 +165,53 @@ def test_preflight_ready_with_profile_json_and_app_id_without_vault_key(monkeypa
     assert "profile-json-refresh-secret" not in str(result)
 
 
+def test_preflight_does_not_treat_config_app_id_as_runtime_source(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_LARK_CLI_APP_ID", raising=False)
+    shared = tmp_path / ".hermes"
+    shared.mkdir(parents=True)
+    (shared / "config.yaml").write_text(
+        "platforms:\n  feishu:\n    extra:\n      app_id: cli_from_config\n      app_secret: app-secret\n",
+        encoding="utf-8",
+    )
+    binary = shared / "bin" / "lark-cli-authsidecar"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    uat_dir = shared / "profiles" / "alice" / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    (uat_dir / "ou_alice.json").write_text(
+        json.dumps(
+            {
+                "access_token": "profile-json-uat-secret",
+                "refresh_token": "profile-json-refresh-secret",
+                "expires_at": 4102444800000,
+                "scope": "offline_access contact:user.base:readonly",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = lark_cli_canary_preflight(
+        shared_home=shared,
+        profile_name="alice",
+        open_id="ou_alice",
+        binary_path=binary,
+    )
+
+    app_check = next(check for check in result["checks"] if check["name"] == "feishu_app_credential")
+    assert result["ready"] is False
+    assert "feishu_app_credential" in result["missing"]
+    assert "user_uat_credential" not in result["missing"]
+    assert app_check["ok"] is False
+    assert app_check["status"] == "missing_db"
+    assert "app-secret" not in str(result)
+    assert "profile-json-uat-secret" not in str(result)
+
+
 @pytest.mark.parametrize("expiry_key", ["expire_at", "access_token_expires_at"])
 def test_preflight_treats_profile_json_expiry_aliases_as_expired(monkeypatch, tmp_path: Path, expiry_key: str):
     from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
