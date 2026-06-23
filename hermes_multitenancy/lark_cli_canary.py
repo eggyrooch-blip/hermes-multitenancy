@@ -27,6 +27,21 @@ def _credential_key_available() -> bool:
     return bool(os.getenv("HERMES_MULTITENANCY_CREDENTIAL_KEY") or os.getenv("HERMES_CREDENTIAL_KEY"))
 
 
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _uat_expires_at(payload: dict[str, Any]) -> int:
+    return _as_int(
+        payload.get("expires_at")
+        or payload.get("expire_at")
+        or payload.get("access_token_expires_at")
+    )
+
+
 def _public_app_id_source(shared_home: Path, profile_name: str) -> tuple[bool, str]:
     if str(os.getenv("HERMES_LARK_CLI_APP_ID") or "").strip():
         return True, "env_or_config"
@@ -59,21 +74,18 @@ def _public_app_id_source(shared_home: Path, profile_name: str) -> tuple[bool, s
     return False, ""
 
 
-def _profile_uat_json_status(shared_home: Path, profile_name: str, open_id: str) -> tuple[bool, int | None]:
+def _profile_uat_json_status(shared_home: Path, profile_name: str, open_id: str) -> tuple[bool, int | None, str]:
     path = Path(shared_home) / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False, None
+        return False, None, "missing"
     if not isinstance(payload, dict) or not str(payload.get("access_token") or "").strip():
-        return False, None
-    try:
-        expires_at = int(payload.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        expires_at = 0
+        return False, None, "missing"
+    expires_at = _uat_expires_at(payload)
     if expires_at and expires_at <= int(time.time() * 1000) + 60_000:
-        return False, expires_at
-    return True, expires_at or None
+        return False, expires_at, "expired"
+    return True, expires_at or None, "valid"
 
 
 def import_legacy_uat_to_vault(
@@ -214,7 +226,7 @@ def lark_cli_canary_preflight(
     uat_ok = False
     key_available = _credential_key_available()
     fallback_app_ok, fallback_app_source = _public_app_id_source(shared_home, profile_name)
-    local_uat_ok, local_uat_exp = _profile_uat_json_status(shared_home, profile_name, open_id)
+    local_uat_ok, local_uat_exp, local_uat_status = _profile_uat_json_status(shared_home, profile_name, open_id)
     db_path = shared_home / "multitenancy.db"
     if db_path.exists():
         try:
@@ -265,11 +277,13 @@ def lark_cli_canary_preflight(
                 if local_uat_ok:
                     uat_ok = True
                     uat_source = "profile_feishu_uat_json"
+                elif local_uat_status != "missing":
+                    uat_source = "profile_feishu_uat_json"
                 checks.append(
                     {
                         "name": "user_uat_credential",
                         "ok": uat_ok,
-                        "status": "valid" if uat_ok else uat_status["status"],
+                        "status": "valid" if uat_ok else (local_uat_status if uat_source == "profile_feishu_uat_json" else uat_status["status"]),
                         "profile_name": profile_name,
                         "subject_id": open_id,
                         "expires_at": local_uat_exp or uat_status.get("expires_at"),
@@ -299,15 +313,15 @@ def lark_cli_canary_preflight(
                     "app_id_present": bool(app_ok),
                     "source": fallback_app_source or "env_or_config",
                 },
-                {
-                    "name": "user_uat_credential",
-                    "ok": uat_ok,
-                    "status": "valid" if uat_ok else "missing_db",
-                    "profile_name": profile_name,
-                    "subject_id": open_id,
-                    "expires_at": local_uat_exp,
-                    "source": "profile_feishu_uat_json" if uat_ok else "multitenancy_db",
-                },
+                    {
+                        "name": "user_uat_credential",
+                        "ok": uat_ok,
+                        "status": "valid" if uat_ok else (local_uat_status if local_uat_status != "missing" else "missing_db"),
+                        "profile_name": profile_name,
+                        "subject_id": open_id,
+                        "expires_at": local_uat_exp,
+                        "source": "profile_feishu_uat_json" if local_uat_status != "missing" else "multitenancy_db",
+                    },
             ]
         )
     if db_path.exists() and not key_available and not (app_ok and uat_ok):

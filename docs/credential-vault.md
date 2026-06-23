@@ -50,6 +50,9 @@ some payload. Keyless vault metadata may still be reported for diagnosis with
 `multitenancy_credential_status`, Connector Registry, and the lark-cli canary
 report a usable local connector when the profile-local UAT JSON is valid, while
 still never exposing token fields to the model or WebUI.
+Profile-local Feishu UAT fallback reads the same access-token expiry aliases as
+runtime status (`expires_at`, `expire_at`, and `access_token_expires_at`), so
+canary checks do not report an expired compatibility JSON as ready.
 
 ## Group credential materialization
 

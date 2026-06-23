@@ -125,6 +125,52 @@ def test_preflight_ready_with_profile_json_and_app_id_without_vault_key(monkeypa
     assert "profile-json-refresh-secret" not in str(result)
 
 
+@pytest.mark.parametrize("expiry_key", ["expire_at", "access_token_expires_at"])
+def test_preflight_treats_profile_json_expiry_aliases_as_expired(monkeypatch, tmp_path: Path, expiry_key: str):
+    from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    shared = tmp_path / ".hermes"
+    binary = shared / "bin" / "lark-cli-authsidecar"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    sqlite3.connect(shared / "multitenancy.db").close()
+    uat_dir = shared / "profiles" / "alice" / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    expired_at = 1
+    (uat_dir / "ou_alice.json").write_text(
+        json.dumps(
+            {
+                "access_token": "profile-json-uat-secret",
+                "refresh_token": "profile-json-refresh-secret",
+                expiry_key: expired_at,
+                "scope": "offline_access contact:user.base:readonly",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = lark_cli_canary_preflight(
+        shared_home=shared,
+        profile_name="alice",
+        open_id="ou_alice",
+        binary_path=binary,
+    )
+
+    uat_check = next(check for check in result["checks"] if check["name"] == "user_uat_credential")
+    assert result["ready"] is False
+    assert "user_uat_credential" in result["missing"]
+    assert uat_check["ok"] is False
+    assert uat_check["status"] == "expired"
+    assert uat_check["expires_at"] == expired_at
+    assert uat_check["source"] == "profile_feishu_uat_json"
+    assert "profile-json-uat-secret" not in str(result)
+    assert "profile-json-refresh-secret" not in str(result)
+
+
 def test_preflight_reports_missing_vault_key_without_traceback(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
 
