@@ -41,10 +41,11 @@ Redacted status reads are intentionally weaker than runtime secret reads:
 `CredentialStore.get_status()` may read scope/expiry metadata without
 `HERMES_MULTITENANCY_CREDENTIAL_KEY` / `HERMES_CREDENTIAL_KEY`, but
 `put_credential()` and `get_secret_for_runtime()` still require the key.
-For Feishu UAT, `has_credential` means the selected source is usable by the
-runtime, not merely that a vault row contains encrypted bytes. Keyless vault
-metadata may still be reported for diagnosis with `runtime_available=false`,
-but it must not override a runtime-usable
+For Feishu UAT, `has_credential` / `runtime_available` mean the selected source
+is usable by the runtime for the requested scopes and current expiry, not
+merely that a vault row contains encrypted bytes or a local JSON file contains
+some payload. Keyless vault metadata may still be reported for diagnosis with
+`runtime_available=false`, but it must not override a runtime-usable
 `profiles/<profile>/feishu_uat/<open_id>.json` compatibility file. This lets
 `multitenancy_credential_status`, Connector Registry, and the lark-cli canary
 report a usable local connector when the profile-local UAT JSON is valid, while
