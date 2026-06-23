@@ -235,7 +235,8 @@ def credential_status(
             )
         except Exception:
             payload = {}
-        vault_status["runtime_available"] = bool(payload)
+        vault_status["_runtime_payload_available"] = bool(payload)
+        vault_status["runtime_available"] = bool(payload) and vault_status.get("status") == "valid"
         if _prefer_status(vault_status, status):
             status = vault_status
     finally:
@@ -245,9 +246,10 @@ def credential_status(
     if refresh_expires_at and status.get("storage") == "multitenancy_db":
         status["refresh_expires_at"] = refresh_expires_at
     if status.get("storage") == "profile_feishu_uat_json":
-        status["runtime_available"] = bool(status.get("has_payload"))
+        status["runtime_available"] = bool(status.get("has_payload")) and status.get("status") == "valid"
     else:
-        status["runtime_available"] = bool(payload)
+        status["runtime_available"] = bool(payload) and status.get("status") == "valid"
+    status.pop("_runtime_payload_available", None)
     if refresh_error:
         status["needs_reauth"] = status.get("status") == "expired"
         status["refresh_error"] = refresh_error
@@ -270,6 +272,7 @@ def _profile_uat_status(
         "storage": "profile_feishu_uat_json",
         "has_payload": False,
         "runtime_available": False,
+        "_runtime_payload_available": False,
         "scopes": [],
         "missing_scopes": [],
         "expires_at": None,
@@ -296,7 +299,8 @@ def _profile_uat_status(
         **base,
         "status": status,
         "has_payload": True,
-        "runtime_available": True,
+        "runtime_available": status == "valid",
+        "_runtime_payload_available": True,
         "scopes": scopes,
         "missing_scopes": missing,
         "expires_at": expires_at,
@@ -316,6 +320,16 @@ def _prefer_status(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
         return False
     if candidate_runtime and not current_runtime:
         return True
+    candidate_payload = bool(candidate.get("_runtime_payload_available"))
+    current_payload = bool(current.get("_runtime_payload_available"))
+    if current_payload and not candidate_payload:
+        return False
+    if candidate_payload and not current_payload:
+        return True
+    candidate_rank = _status_rank(candidate)
+    current_rank = _status_rank(current)
+    if candidate_rank != current_rank:
+        return candidate_rank > current_rank
     if candidate_has and not current_has:
         return True
     if not candidate_has:
@@ -323,6 +337,15 @@ def _prefer_status(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
     if current_has:
         return _status_freshness(candidate) >= _status_freshness(current)
     return True
+
+
+def _status_rank(status: dict[str, Any]) -> int:
+    return {
+        "valid": 3,
+        "scope_missing": 2,
+        "expired": 1,
+        "missing": 0,
+    }.get(str(status.get("status") or ""), 0)
 
 
 def _status_freshness(status: dict[str, Any]) -> tuple[int, int]:

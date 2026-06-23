@@ -99,7 +99,8 @@ def test_credential_status_tool_uses_profile_json_without_vault_key(monkeypatch,
     assert payload["subject_id"] == "ou_owner"
     assert payload["status"] == "scope_missing"
     assert payload["storage"] == "profile_feishu_uat_json"
-    assert payload["has_credential"] is True
+    assert payload["runtime_available"] is False
+    assert payload["has_credential"] is False
     assert payload["missing_scopes"] == ["wiki:wiki:readonly"]
     assert "tool-profile-json-access-secret" not in raw
     assert "tool-profile-json-refresh-secret" not in raw
