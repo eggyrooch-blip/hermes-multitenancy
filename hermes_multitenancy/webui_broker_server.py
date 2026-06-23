@@ -1715,13 +1715,26 @@ def create_run_broker_app(
     _ingest_results: dict[str, dict[str, Any]] = {}
     _ingest_results_at: dict[str, float] = {}
     _ingest_secret_fingerprints: dict[str, str] = {}
+    _ingest_secret_fingerprints_at: dict[str, float] = {}
     _INGEST_RESULT_TTL = 3600.0
     _INGEST_RESULT_CAP = 256
+
+    def _ingest_prune_secret_fingerprints(now: float) -> None:
+        cutoff = now - _INGEST_RESULT_TTL
+        for k in [k for k, t in _ingest_secret_fingerprints_at.items() if t < cutoff]:
+            _ingest_secret_fingerprints.pop(k, None)
+            _ingest_secret_fingerprints_at.pop(k, None)
+        if len(_ingest_secret_fingerprints) > _INGEST_RESULT_CAP:
+            overflow = sorted(_ingest_secret_fingerprints_at.items(), key=lambda kv: kv[1])
+            for k, _ in overflow[: len(_ingest_secret_fingerprints) - _INGEST_RESULT_CAP]:
+                _ingest_secret_fingerprints.pop(k, None)
+                _ingest_secret_fingerprints_at.pop(k, None)
 
     def _ingest_store_result(key: str, value: dict[str, Any]) -> None:
         now = time.time()
         _ingest_results[key] = value
         _ingest_results_at[key] = now
+        _ingest_prune_secret_fingerprints(now)
         cutoff = now - _INGEST_RESULT_TTL
         for k in [k for k, t in _ingest_results_at.items() if t < cutoff]:
             _ingest_results.pop(k, None)
@@ -1854,11 +1867,21 @@ def create_run_broker_app(
         except Exception as exc:
             return None, web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-        idempotency_cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        auth_fingerprint = _ingest_auth_fingerprint(request, ingest_binding)
+        original_effective_idempotency_key = run_request.effective_idempotency_key
+        run_request = replace(
+            run_request,
+            idempotency_key=_ingest_scoped_broker_idempotency_key(
+                auth_fingerprint=auth_fingerprint,
+                profile_name=bound_profile,
+                effective_idempotency_key=original_effective_idempotency_key,
+            ),
+        )
+        idempotency_cache_key = f"{bound_profile}\x00{original_effective_idempotency_key}"
         cache_key = f"{idempotency_cache_key}\x00secret:{secret_spec.fingerprint if secret_spec else ''}"
         return SimpleNamespace(
             binding=ingest_binding,
-            auth_fingerprint=_ingest_auth_fingerprint(request, ingest_binding),
+            auth_fingerprint=auth_fingerprint,
             bound_profile=bound_profile,
             cache_key=cache_key,
             idempotency_cache_key=idempotency_cache_key,
@@ -2344,6 +2367,7 @@ def create_run_broker_app(
             f"{auth_fingerprint}\x00{bound_profile}\x00{original_effective_idempotency_key}"
         )
         secret_fingerprint = secret_spec.fingerprint if secret_spec else ""
+        _ingest_prune_secret_fingerprints(time.time())
         known_fingerprint = _ingest_secret_fingerprints.get(idempotency_cache_key)
         if known_fingerprint and known_fingerprint != secret_fingerprint:
             return _ingest_secret_mismatch_response(bound_profile)
@@ -2372,6 +2396,7 @@ def create_run_broker_app(
                 metadata={**run_request.metadata, "ingest_secret_dir": secret_dir},
             )
         _ingest_secret_fingerprints[idempotency_cache_key] = secret_fingerprint
+        _ingest_secret_fingerprints_at[idempotency_cache_key] = time.time()
         collected: list[str] = []
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
