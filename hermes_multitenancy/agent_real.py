@@ -3927,6 +3927,16 @@ _WEBUI_IMAGE_ANALYSIS_PROMPT = (
     "details. Do not infer content that is not visible."
 )
 _WEBUI_IMAGE_PREFLIGHT_MAX_BYTES = 20 * 1024 * 1024
+_WEBUI_IMAGE_PREFLIGHT_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+}
 
 
 def _is_output_truncation_error(err: Any) -> bool:
@@ -3935,23 +3945,8 @@ def _is_output_truncation_error(err: Any) -> bool:
 
 
 def _profile_workspace_root(profile_home: Path, config: Mapping[str, Any] | None = None) -> Path:
-    terminal_cfg = (config or {}).get("terminal") if isinstance(config, Mapping) else None
-    configured = terminal_cfg.get("cwd") if isinstance(terminal_cfg, Mapping) else None
-    if configured:
-        configured_text = str(configured).strip()
-        configured_normalized = configured_text.replace("\\", "/")
-        if configured_normalized == "/workspace" or configured_normalized == "workspace":
-            root = profile_home / "workspace"
-        elif configured_normalized.startswith("/workspace/"):
-            root = profile_home / "workspace" / configured_normalized[len("/workspace/"):]
-        elif configured_normalized.startswith("workspace/"):
-            root = profile_home / "workspace" / configured_normalized[len("workspace/"):]
-        else:
-            configured_path = Path(configured_text).expanduser()
-            root = configured_path if configured_path.is_absolute() else profile_home / configured_path
-    else:
-        root = profile_home / "workspace"
-    return root.resolve(strict=False)
+    del config
+    return (profile_home / "workspace").resolve(strict=False)
 
 
 def _normalize_webui_uploaded_image_path(raw_path: str) -> str:
@@ -3989,8 +3984,14 @@ def _resolve_webui_uploaded_image_path(
         resolved.relative_to(workspace_root)
     except ValueError:
         return None, "outside profile workspace"
+    try:
+        resolved.relative_to((workspace_root / "uploads").resolve(strict=False))
+    except ValueError:
+        return None, "not a WebUI upload image"
     if not resolved.exists() or not resolved.is_file():
         return None, "file not found"
+    if resolved.suffix.lower() not in _WEBUI_IMAGE_PREFLIGHT_EXTENSIONS:
+        return None, "not a supported image file"
     try:
         if resolved.stat().st_size > _WEBUI_IMAGE_PREFLIGHT_MAX_BYTES:
             return None, "file too large"
