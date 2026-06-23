@@ -3100,8 +3100,10 @@ def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeyp
     )
 
     observed: dict[str, object] = {}
+    vision_calls: list[dict[str, object]] = []
 
     async def failing_vision_analyze_tool(image_url, user_prompt=None):
+        vision_calls.append({"image_url": image_url, "user_prompt": user_prompt})
         return json.dumps({
             "success": False,
             "analysis": "No LLM provider configured for task=vision provider=auto.",
@@ -3163,6 +3165,10 @@ def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeyp
     )
 
     assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert vision_calls == [{
+        "image_url": str(upload_path),
+        "user_prompt": "Describe everything visible in this uploaded WebUI image. Include all visible text, UI labels, numbers, objects, layout, colors, and any notable visual details. Do not infer content that is not visible.",
+    }]
     assert observed["openai_client"] == {
         "api_key": "test-key",
         "base_url": "https://litellm.example/v1",

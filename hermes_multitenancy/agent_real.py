@@ -4081,21 +4081,8 @@ def _analyze_webui_uploaded_image(
     fallback_api_key: str | None = None,
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
-    prefer_openai_compatible: bool = False,
 ) -> tuple[bool, str]:
     import asyncio
-
-    tried_fallback = False
-    if prefer_openai_compatible:
-        tried_fallback = True
-        fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
-            path,
-            api_key=fallback_api_key,
-            base_url=fallback_base_url,
-            model=fallback_model,
-        )
-        if fallback_analysis:
-            return True, fallback_analysis
 
     analysis = ""
     try:
@@ -4118,15 +4105,14 @@ def _analyze_webui_uploaded_image(
         logger.warning("[multitenancy] WebUI image preflight failed for %s: %s", path, exc)
         analysis = f"vision_analyze failed: {exc}"
 
-    if not tried_fallback:
-        fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
-            path,
-            api_key=fallback_api_key,
-            base_url=fallback_base_url,
-            model=fallback_model,
-        )
-        if fallback_analysis:
-            return True, fallback_analysis
+    fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
+        path,
+        api_key=fallback_api_key,
+        base_url=fallback_base_url,
+        model=fallback_model,
+    )
+    if fallback_analysis:
+        return True, fallback_analysis
     return False, analysis
 
 
@@ -4139,7 +4125,6 @@ def _enrich_webui_image_attachments_for_aiagent(
     fallback_api_key: str | None = None,
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
-    prefer_openai_compatible: bool = False,
     metadata_source: str | None = None,
 ) -> str:
     if (
@@ -4174,7 +4159,6 @@ def _enrich_webui_image_attachments_for_aiagent(
             fallback_api_key=fallback_api_key,
             fallback_base_url=fallback_base_url,
             fallback_model=fallback_model,
-            prefer_openai_compatible=prefer_openai_compatible,
         )
         status = "success" if success else "failed"
         failure_guard = [] if success else [
@@ -4303,7 +4287,6 @@ def _run_with_aiagent(
         fallback_api_key=api_key,
         fallback_base_url=base_url,
         fallback_model=model_only,
-        prefer_openai_compatible=provider.startswith("custom"),
         metadata_source=str(event_metadata.get("source") or ""),
     )
     session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)

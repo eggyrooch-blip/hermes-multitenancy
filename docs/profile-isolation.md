@@ -169,11 +169,12 @@ paths such as `/workspace/uploads/...`, checks the filename extension, and
 injects the vision result into the current user turn. If a marker points outside
 `uploads/`, uses a non-image extension, or cannot be read, the injected block
 says the image was not analyzed and tells the model not to infer unseen contents.
-OpenAI-compatible custom providers use the routed profile model as a fallback
-for the image analysis, so WebUI vision does not depend solely on Hermes'
-auxiliary `vision_analyze` provider wiring. External ingest requests may also
-use `channel=webui`, but they are tagged with `metadata.source=ingest` and do
-not trigger this WebUI chat attachment preflight.
+Hermes' `vision_analyze` tool is attempted first. If that auxiliary provider
+cannot produce an analysis, OpenAI-compatible custom providers use the routed
+profile model as a fallback, so WebUI vision does not depend solely on Hermes'
+auxiliary provider wiring. External ingest requests may also use
+`channel=webui`, but they are tagged with `metadata.source=ingest` and do not
+trigger this WebUI chat attachment preflight.
 
 For group-scoped credentials, keep one encrypted payload in the credential
 vault and let `hermes-multitenancy-sync pull-feishu` materialize only the
