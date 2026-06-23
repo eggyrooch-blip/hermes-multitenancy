@@ -89,34 +89,70 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
         if not subject_id:
             return _error("subject_id is required when HERMES_FEISHU_USER_OPEN_ID is unset")
 
+        if provider == "feishu" and secret_kind == "uat":
+            from . import feishu_uat_auth
+
+            status = feishu_uat_auth.credential_status(
+                profile_name=profile_name,
+                open_id=subject_id,
+                required_scopes=required_scopes,
+                shared_home=_shared_home(),
+            )
+            return _status_payload(
+                profile_name=profile_name,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+                status=status,
+            )
+
         store = CredentialStore(_shared_home() / "multitenancy.db")
-        status = store.get_status(
+        try:
+            status = store.get_status(
+                profile_name=profile_name,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+                required_scopes=required_scopes,
+            )
+        finally:
+            store.close()
+        return _status_payload(
             profile_name=profile_name,
             subject_id=subject_id,
             provider=provider,
             secret_kind=secret_kind,
-            required_scopes=required_scopes,
-        )
-        store.close()
-        return json.dumps(
-            {
-                "profile": profile_name,
-                "provider": provider,
-                "subject_id": subject_id,
-                "credential_kind": secret_kind,
-                "status": status["status"],
-                "storage": status["storage"],
-                "expires_at": status["expires_at"],
-                "refresh_expires_at": status.get("refresh_expires_at"),
-                "scopes": status["scopes"],
-                "missing_scopes": status["missing_scopes"],
-                "has_credential": status["has_payload"],
-                "sandbox_note": ".env/auth.json are masked by design",
-            },
-            ensure_ascii=False,
+            status=status,
         )
     except Exception as exc:
         return _error(str(exc))
+
+
+def _status_payload(
+    *,
+    profile_name: str,
+    subject_id: str,
+    provider: str,
+    secret_kind: str,
+    status: dict[str, Any],
+) -> str:
+    return json.dumps(
+        {
+            "profile": profile_name,
+            "provider": provider,
+            "subject_id": subject_id,
+            "credential_kind": secret_kind,
+            "status": status["status"],
+            "storage": status["storage"],
+            "expires_at": status["expires_at"],
+            "refresh_expires_at": status.get("refresh_expires_at"),
+            "scopes": status["scopes"],
+            "missing_scopes": status["missing_scopes"],
+            "has_credential": status["has_payload"],
+            "sandbox_note": ".env/auth.json are masked by design",
+        },
+        ensure_ascii=False,
+    )
 
 
 def register_credential_status_tool(ctx: Any) -> None:

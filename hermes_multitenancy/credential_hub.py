@@ -421,11 +421,13 @@ def lark_cli_status(
         )
     except Exception as exc:
         logger.debug("credential_hub: lark-cli status read failed (%s)", exc)
-        row.status = S_UNKNOWN
-        row.detail = "Lark-cli 状态读取失败"
-        return row
+        raw = {"status": "", "lark_cli": {}}
+        status_read_failed = True
+    else:
+        status_read_failed = False
 
     raw_status = str(raw.get("status") or "")
+    raw_runtime_available = raw.get("runtime_available")
     lark = raw.get("lark_cli") or {}
     default_identity = lark.get("default_identity")
     # Display the REFRESH window, not the ~1h access token: the access token is
@@ -442,7 +444,11 @@ def lark_cli_status(
         row.expires_at = local_exp
 
     # Status vocab matches the WebUI SkillCredentialState (no 'expired'):
-    connected = raw_status == "valid" or local_connected or default_identity == "user"
+    connected = (
+        (raw_status == "valid" and raw_runtime_available is not False)
+        or local_connected
+        or default_identity == "user"
+    )
     if connected:
         row.status = S_AUTHENTICATED
         row.default_identity = default_identity or ("user" if local_connected else None)
@@ -450,6 +456,8 @@ def lark_cli_status(
         row.action["label"] = "重新授权"
     elif raw_status in ("missing", "scope_missing", "expired"):
         row.status, row.detail = S_NEEDS_AUTH, "Lark-cli 需要用户授权后才能访问私有飞书资源。"
+    elif status_read_failed:
+        row.status, row.detail = S_UNKNOWN, "Lark-cli 状态读取失败"
     else:
         row.status, row.detail = S_UNKNOWN, "Lark-cli 状态待验证。"
     return row

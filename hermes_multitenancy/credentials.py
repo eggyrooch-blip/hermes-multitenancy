@@ -55,7 +55,7 @@ class CredentialStore:
     def __init__(self, db_path: Path | str, *, encryption_key: str | bytes | None = None) -> None:
         self.db_path = str(db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._key = _resolve_key(encryption_key)
+        self._key = _resolve_optional_key(encryption_key)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
@@ -78,7 +78,7 @@ class CredentialStore:
         secret_kind = _clean_id("secret_kind", secret_kind)
         scopes_list = _normalize_scopes(scopes)
         now = _now_ms()
-        sealed = _seal_json(payload, self._key)
+        sealed = _seal_json(payload, _require_key(self._key))
         self._conn.execute(
             """
             INSERT INTO multitenancy_credentials
@@ -156,13 +156,14 @@ class CredentialStore:
             "missing_scopes": missing,
             "expires_at": expires_at,
         }
-        try:
-            payload = _open_json(row["encrypted_payload"], self._key)
-            refresh_expires_at = int(payload.get("refresh_expires_at"))
-            if refresh_expires_at > 0:
-                result["refresh_expires_at"] = refresh_expires_at
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
+        if self._key is not None:
+            try:
+                payload = _open_json(row["encrypted_payload"], self._key)
+                refresh_expires_at = int(payload.get("refresh_expires_at"))
+                if refresh_expires_at > 0:
+                    result["refresh_expires_at"] = refresh_expires_at
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
 
         return result
 
@@ -183,7 +184,7 @@ class CredentialStore:
         )
         if row is None:
             raise PermissionError("credential not found for current profile/subject/provider")
-        return _open_json(row["encrypted_payload"], self._key)
+        return _open_json(row["encrypted_payload"], _require_key(self._key))
 
     def close(self) -> None:
         self._conn.close()
@@ -229,6 +230,27 @@ def _resolve_key(value: str | bytes | None) -> bytes:
     if not raw:
         raise RuntimeError("credential encryption key is required")
     return hashlib.sha256(raw).digest()
+
+
+def _resolve_optional_key(value: str | bytes | None) -> bytes | None:
+    raw = value
+    if raw is None:
+        raw = (
+            os.getenv("HERMES_MULTITENANCY_CREDENTIAL_KEY")
+            or os.getenv("HERMES_CREDENTIAL_KEY")
+            or ""
+        )
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not raw:
+        return None
+    return hashlib.sha256(raw).digest()
+
+
+def _require_key(key: bytes | None) -> bytes:
+    if key is None:
+        raise RuntimeError("credential encryption key is required")
+    return key
 
 
 def _clean_id(name: str, value: str) -> str:

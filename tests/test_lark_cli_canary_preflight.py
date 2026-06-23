@@ -74,6 +74,50 @@ def test_preflight_ready_when_binary_app_and_uat_exist(monkeypatch, tmp_path: Pa
     assert "secret" not in str(result).replace("secret_free", "")
 
 
+def test_preflight_ready_with_profile_json_and_app_id_without_vault_key(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    shared = tmp_path / ".hermes"
+    binary = shared / "bin" / "lark-cli-authsidecar"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    sqlite3.connect(shared / "multitenancy.db").close()
+    uat_dir = shared / "profiles" / "alice" / "feishu_uat"
+    uat_dir.mkdir(parents=True)
+    (uat_dir / "ou_alice.json").write_text(
+        json.dumps(
+            {
+                "access_token": "profile-json-uat-secret",
+                "refresh_token": "profile-json-refresh-secret",
+                "expires_at": 4102444800000,
+                "scope": "offline_access contact:user.base:readonly",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = lark_cli_canary_preflight(
+        shared_home=shared,
+        profile_name="alice",
+        open_id="ou_alice",
+        binary_path=binary,
+    )
+
+    assert result["ready"] is True
+    assert result["missing"] == []
+    app_check = next(check for check in result["checks"] if check["name"] == "feishu_app_credential")
+    uat_check = next(check for check in result["checks"] if check["name"] == "user_uat_credential")
+    assert app_check["source"] == "env_or_config"
+    assert uat_check["source"] == "profile_feishu_uat_json"
+    assert "credential_vault_key" not in result["missing"]
+    assert "profile-json-uat-secret" not in str(result)
+    assert "profile-json-refresh-secret" not in str(result)
+
+
 def test_preflight_reports_missing_vault_key_without_traceback(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
 

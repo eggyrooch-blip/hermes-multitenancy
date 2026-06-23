@@ -127,6 +127,55 @@ def test_credential_status_surfaces_refresh_token_expiry_from_payload(tmp_path):
     assert status["refresh_expires_at"] == refresh_expires_at
 
 
+def test_credential_status_redacted_read_does_not_require_encryption_key(monkeypatch, tmp_path):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    db_path = tmp_path / "multitenancy.db"
+    expires_at = int(time.time() * 1000) + 3600_000
+    refresh_expires_at = expires_at + 86_400_000
+    store = CredentialStore(db_path, encryption_key="test-key")
+    try:
+        store.put_credential(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+            secret_kind="uat",
+            payload={
+                "access_token": "uat-access-secret",
+                "refresh_token": "uat-refresh-secret",
+                "refresh_expires_at": refresh_expires_at,
+            },
+            scopes=["contact:user.base:readonly"],
+            expires_at=expires_at,
+        )
+    finally:
+        store.close()
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+
+    keyless = CredentialStore(db_path)
+    try:
+        status = keyless.get_status(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+            required_scopes=["wiki:wiki:readonly"],
+        )
+    finally:
+        keyless.close()
+
+    assert status["status"] == "scope_missing"
+    assert status["storage"] == "multitenancy_db"
+    assert status["has_payload"] is True
+    assert status["expires_at"] == expires_at
+    assert status["missing_scopes"] == ["wiki:wiki:readonly"]
+    assert "refresh_expires_at" not in status
+    encoded = json.dumps(status, ensure_ascii=False)
+    assert "uat-access-secret" not in encoded
+    assert "uat-refresh-secret" not in encoded
+
+
 def test_credential_status_omits_refresh_token_expiry_when_missing(tmp_path):
     from hermes_multitenancy.credentials import CredentialStore
 

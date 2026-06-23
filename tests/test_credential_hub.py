@@ -381,6 +381,59 @@ def test_lark_cli_authenticated_via_file_cache_when_db_missing(monkeypatch, tmp_
     assert row.status == "authenticated"
 
 
+def test_lark_cli_authenticated_via_file_cache_when_status_reader_keyless_error(monkeypatch, tmp_path):
+    """P0: keyless vault status errors must not hide a valid profile-local UAT."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    def _keyless_error(**kw):
+        raise RuntimeError("credential encryption key is required")
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", _keyless_error)
+    uat = tmp_path / "feishu_uat"
+    uat.mkdir()
+    future = int(time.time() * 1000) + 3600_000
+    (uat / "ou_s.json").write_text(
+        json.dumps({"access_token": "tok", "expires_at": future}),
+        encoding="utf-8",
+    )
+
+    row = credential_hub.lark_cli_status(
+        profile_name="s",
+        open_id="ou_s",
+        shared_home=tmp_path,
+        profile_dir=tmp_path,
+    )
+
+    assert row.status == "authenticated"
+    assert row.expires_at == future
+    assert row.default_identity == "user"
+
+
+def test_lark_cli_not_authenticated_when_keyless_vault_metadata_has_no_runtime_access(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "credential_status",
+        lambda **kw: {
+            "status": "valid",
+            "storage": "multitenancy_db",
+            "has_payload": True,
+            "runtime_available": False,
+            "lark_cli": {},
+        },
+    )
+
+    row = credential_hub.lark_cli_status(
+        profile_name="s",
+        open_id="ou_s",
+        shared_home=tmp_path,
+        profile_dir=tmp_path,
+    )
+
+    assert row.status == "unknown"
+
+
 def test_lark_cli_authenticated_via_default_identity_user(monkeypatch, tmp_path):
     """C1 parity: DB missing, no file cache, but lark_cli.default_identity == user."""
     from hermes_multitenancy import credential_hub, feishu_uat_auth

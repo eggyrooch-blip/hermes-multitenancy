@@ -84,6 +84,38 @@ def test_collect_returns_five_statuses_with_scope_fields(monkeypatch, tmp_path):
             assert key in d, (status.id, key)
 
 
+def test_registry_lark_cli_uses_profile_json_when_status_reader_keyless_error(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+    from hermes_multitenancy.connectors import registry
+
+    shared, _ = _mk_profile_home(tmp_path, "owner")
+    uat = shared / "profiles" / "owner" / "feishu_uat"
+    uat.mkdir(parents=True)
+    future = int(time.time() * 1000) + 3600_000
+    (uat / "ou_owner.json").write_text(
+        json.dumps({"access_token": "registry-profile-json-secret", "expires_at": future}),
+        encoding="utf-8",
+    )
+
+    def _keyless_error(**kw):
+        raise RuntimeError("credential encryption key is required")
+
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", _keyless_error)
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+
+    statuses = registry.collect_connector_statuses(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+    lark = next(status for status in statuses if status.id == "lark-cli")
+    blob = json.dumps(lark.to_dict(), ensure_ascii=False)
+
+    assert lark.status == "authenticated"
+    assert lark.expires_at == future
+    assert "registry-profile-json-secret" not in blob
+
+
 def test_credential_owner_is_redacted_profile_name_not_a_path(monkeypatch, tmp_path):
     from hermes_multitenancy.connectors import registry
 

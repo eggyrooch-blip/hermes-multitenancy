@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,59 @@ def _normalize_scopes(data: dict[str, Any]) -> list[str]:
     if isinstance(scopes, list):
         return sorted({str(part).strip() for part in scopes if str(part).strip()})
     return []
+
+
+def _credential_key_available() -> bool:
+    return bool(os.getenv("HERMES_MULTITENANCY_CREDENTIAL_KEY") or os.getenv("HERMES_CREDENTIAL_KEY"))
+
+
+def _public_app_id_source(shared_home: Path, profile_name: str) -> tuple[bool, str]:
+    if str(os.getenv("HERMES_LARK_CLI_APP_ID") or "").strip():
+        return True, "env_or_config"
+
+    config_path = Path(shared_home) / "config.yaml"
+    try:
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        loaded = {}
+    extra = (((loaded.get("platforms") or {}).get("feishu") or {}).get("extra") or {})
+    if str(extra.get("app_id") or extra.get("FEISHU_APP_ID") or "").strip():
+        return True, "env_or_config"
+
+    uat_dir = Path(shared_home) / "profiles" / profile_name / "feishu_uat"
+    try:
+        candidates = sorted(
+            (path for path in uat_dir.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return False, ""
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("app_id") or payload.get("client_id") or "").strip():
+            return True, "profile_feishu_uat_json"
+    return False, ""
+
+
+def _profile_uat_json_status(shared_home: Path, profile_name: str, open_id: str) -> tuple[bool, int | None]:
+    path = Path(shared_home) / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, None
+    if not isinstance(payload, dict) or not str(payload.get("access_token") or "").strip():
+        return False, None
+    try:
+        expires_at = int(payload.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at and expires_at <= int(time.time() * 1000) + 60_000:
+        return False, expires_at
+    return True, expires_at or None
 
 
 def import_legacy_uat_to_vault(
@@ -158,30 +212,11 @@ def lark_cli_canary_preflight(
 
     app_ok = False
     uat_ok = False
+    key_available = _credential_key_available()
+    fallback_app_ok, fallback_app_source = _public_app_id_source(shared_home, profile_name)
+    local_uat_ok, local_uat_exp = _profile_uat_json_status(shared_home, profile_name, open_id)
     db_path = shared_home / "multitenancy.db"
     if db_path.exists():
-        if not (
-            os.getenv("HERMES_MULTITENANCY_CREDENTIAL_KEY")
-            or os.getenv("HERMES_CREDENTIAL_KEY")
-        ):
-            checks.append(
-                {
-                    "name": "credential_vault_key",
-                    "ok": False,
-                    "status": "missing",
-                    "reason": "credential encryption key is required",
-                }
-            )
-            missing = [check["name"] for check in checks if not check.get("ok")]
-            return {
-                "ready": False,
-                "shared_home": str(shared_home),
-                "profile_name": profile_name,
-                "open_id": open_id,
-                "checks": checks,
-                "missing": missing,
-                "secret_free": True,
-            }
         try:
             store = CredentialStore(db_path)
             try:
@@ -205,12 +240,17 @@ def lark_cli_canary_preflight(
                 app_ok = app_status["status"] == "valid" and bool(
                     (app_payload or {}).get("app_id") or (app_payload or {}).get("FEISHU_APP_ID")
                 )
+                app_source = "multitenancy_db" if app_ok else ""
+                if not app_ok and fallback_app_ok:
+                    app_ok = True
+                    app_source = fallback_app_source
                 checks.append(
                     {
                         "name": "feishu_app_credential",
                         "ok": app_ok,
-                        "status": app_status["status"],
+                        "status": "valid" if app_ok else app_status["status"],
                         "app_id_present": bool(app_ok),
+                        "source": app_source or "multitenancy_db",
                     }
                 )
 
@@ -220,14 +260,20 @@ def lark_cli_canary_preflight(
                     provider="feishu",
                     secret_kind="uat",
                 )
-                uat_ok = uat_status["status"] == "valid"
+                uat_ok = uat_status["status"] == "valid" and key_available
+                uat_source = "multitenancy_db" if uat_ok else ""
+                if local_uat_ok:
+                    uat_ok = True
+                    uat_source = "profile_feishu_uat_json"
                 checks.append(
                     {
                         "name": "user_uat_credential",
                         "ok": uat_ok,
-                        "status": uat_status["status"],
+                        "status": "valid" if uat_ok else uat_status["status"],
                         "profile_name": profile_name,
                         "subject_id": open_id,
+                        "expires_at": local_uat_exp or uat_status.get("expires_at"),
+                        "source": uat_source or "multitenancy_db",
                     }
                 )
             finally:
@@ -242,17 +288,36 @@ def lark_cli_canary_preflight(
                 }
             )
     else:
+        app_ok = fallback_app_ok
+        uat_ok = local_uat_ok
         checks.extend(
             [
-                {"name": "feishu_app_credential", "ok": False, "status": "missing_db"},
+                {
+                    "name": "feishu_app_credential",
+                    "ok": app_ok,
+                    "status": "valid" if app_ok else "missing_db",
+                    "app_id_present": bool(app_ok),
+                    "source": fallback_app_source or "env_or_config",
+                },
                 {
                     "name": "user_uat_credential",
-                    "ok": False,
-                    "status": "missing_db",
+                    "ok": uat_ok,
+                    "status": "valid" if uat_ok else "missing_db",
                     "profile_name": profile_name,
                     "subject_id": open_id,
+                    "expires_at": local_uat_exp,
+                    "source": "profile_feishu_uat_json" if uat_ok else "multitenancy_db",
                 },
             ]
+        )
+    if db_path.exists() and not key_available and not (app_ok and uat_ok):
+        checks.append(
+            {
+                "name": "credential_vault_key",
+                "ok": False,
+                "status": "missing",
+                "reason": "credential encryption key is required",
+            }
         )
 
     missing = [check["name"] for check in checks if not check.get("ok")]

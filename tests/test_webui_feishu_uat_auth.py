@@ -107,6 +107,48 @@ def test_feishu_uat_status_reports_lark_cli_bot_fallback(tmp_path, monkeypatch):
     }
 
 
+def test_feishu_uat_status_uses_profile_json_without_vault_key(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+    now_ms = int(time.time() * 1000)
+    profile_uat = shared / "profiles" / "owner" / "feishu_uat"
+    profile_uat.mkdir(parents=True)
+    (profile_uat / "ou_owner.json").write_text(
+        json.dumps(
+            {
+                "access_token": "profile-json-access-secret",
+                "refresh_token": "profile-json-refresh-secret",
+                "user_open_id": "ou_owner",
+                "scope": "contact:user.base:readonly offline_access",
+                "expires_at": now_ms + 3600_000,
+                "refresh_expires_at": now_ms + 30 * 24 * 3600_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = feishu_uat_auth.credential_status(
+        profile_name="owner",
+        open_id="ou_owner",
+        required_scopes="wiki:wiki:readonly",
+        shared_home=shared,
+    )
+    raw = json.dumps(status, ensure_ascii=False)
+
+    assert status["status"] == "scope_missing"
+    assert status["storage"] == "profile_feishu_uat_json"
+    assert status["has_payload"] is True
+    assert status["missing_scopes"] == ["wiki:wiki:readonly"]
+    assert status["refresh_expires_at"] == now_ms + 30 * 24 * 3600_000
+    assert "profile-json-access-secret" not in raw
+    assert "profile-json-refresh-secret" not in raw
+    assert "access_token" not in raw
+    assert "refresh_token" not in raw
+
+
 def test_feishu_uat_status_does_not_use_provider_fallback(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
     from hermes_multitenancy.credentials import CredentialStore

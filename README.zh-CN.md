@@ -253,6 +253,8 @@ python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
 
 用户 UAT 是 profile 域的 —— OAuth/设备流写入或导入用户 token，再由 multitenancy 镜像到 `$HERMES_HOME/profiles/<profile>/feishu_uat/<open_id>.json` 和 `multitenancy_credentials`。**绝不提交** `.env`、`auth.json`、`feishu_uat/*.json`、`tokens/`、`workspace/credentials/`、cookie、原始 OAuth 载荷。
 
+状态和 canary 面是无 secret 输出的：当凭证保险库 key 不可用时，可以把当前 profile 的本地 UAT JSON 作为 lark-cli 连接器可用性的 fallback。运行时解密和写 vault 仍必须有 `HERMES_MULTITENANCY_CREDENTIAL_KEY` / `HERMES_CREDENTIAL_KEY`；这个 fallback 只用于让 `multitenancy_credential_status`、Connector Registry 和 canary 正确报告 authsidecar broker 可用，不暴露 token 字段。
+
 ### 凭证重授权 marker
 
 `.needs_reauth` 是任务阻断状态，不是泛化的刷新错误日志，也不是主动私信触发器。refresh token 过期、refresh token 缺失、缺少 `offline_access` 这类本地 payload 已经确定不可用的问题可以立即写 marker。access token 已过期但 refresh token 仍有效属于可刷新状态，不能新建或保留重授权 marker。`refresh_rejected` 只有在刷新层解析到飞书明确返回 invalid/revoked refresh token，并把 marker 标成 authoritative 时才允许阻断任务。本地基础设施错误（例如缺凭证加密 key）、网络错误、未解析的 HTTP 错误只能写入非用户可见的 `.refresh_diagnostic` sidecar 和日志，不能提示用户执行 `/feishu_auth`，也不能让 cron 把 profile 判成 `needs_auth`。清理历史非权威 `refresh_rejected` marker 前，会把其 detail 保留为 `.refresh_diagnostic`。

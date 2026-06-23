@@ -195,6 +195,7 @@ def credential_status(
     shared = shared_home or resolve_shared_home()
     _load_shared_env(shared)
     _assert_route(shared, profile_name, open_id)
+    required = parse_scopes(required_scopes)
     refresh_error = ""
     try:
         refresh_uat_if_needed(
@@ -207,15 +208,26 @@ def credential_status(
         refresh_error = exc.message
     except Exception as exc:
         refresh_error = f"unexpected refresh error: {exc}"
-    store = CredentialStore(shared / "multitenancy.db")
+
+    status = _profile_uat_status(
+        shared_home=shared,
+        profile_name=profile_name,
+        open_id=open_id,
+        required_scopes=required,
+    )
+    payload: dict[str, Any] = {}
+    store = None
     try:
-        status = store.get_status(
+        store = CredentialStore(shared / "multitenancy.db")
+        vault_status = store.get_status(
             profile_name=profile_name,
             subject_id=open_id,
             provider="feishu",
             secret_kind="uat",
-            required_scopes=parse_scopes(required_scopes),
+            required_scopes=required,
         )
+        if _prefer_status(vault_status, status):
+            status = vault_status
         try:
             payload = store.get_secret_for_runtime(
                 profile_name=profile_name,
@@ -226,15 +238,91 @@ def credential_status(
         except Exception:
             payload = {}
     finally:
-        store.close()
+        if store is not None:
+            store.close()
     refresh_expires_at = _as_int((payload or {}).get("refresh_expires_at"))
-    if refresh_expires_at:
+    if refresh_expires_at and status.get("storage") == "multitenancy_db":
         status["refresh_expires_at"] = refresh_expires_at
+    if status.get("storage") == "profile_feishu_uat_json":
+        status["runtime_available"] = bool(status.get("has_payload"))
+    else:
+        status["runtime_available"] = bool(payload)
     if refresh_error:
         status["needs_reauth"] = status.get("status") == "expired"
         status["refresh_error"] = refresh_error
     status["lark_cli"] = _lark_cli_status(shared, profile_name, open_id)
     return status
+
+
+def _profile_uat_status(
+    *,
+    shared_home: Path,
+    profile_name: str,
+    open_id: str,
+    required_scopes: str | Iterable[str] | None = None,
+) -> dict[str, Any]:
+    base = {
+        "profile_name": str(profile_name),
+        "subject_id": str(open_id),
+        "provider": "feishu",
+        "secret_kind": "uat",
+        "storage": "profile_feishu_uat_json",
+        "has_payload": False,
+        "runtime_available": False,
+        "scopes": [],
+        "missing_scopes": [],
+        "expires_at": None,
+    }
+    payload = _load_profile_uat_payload(shared_home, profile_name, open_id)
+    if not payload or not str(payload.get("access_token") or "").strip():
+        return {**base, "status": "missing"}
+
+    scopes = parse_scopes(payload.get("scope") or payload.get("scopes"))
+    required = parse_scopes(required_scopes)
+    missing = [scope for scope in required if scope not in set(scopes)]
+    expires_at = _as_int(
+        payload.get("expires_at")
+        or payload.get("expire_at")
+        or payload.get("access_token_expires_at")
+    ) or None
+    status = "valid"
+    if expires_at is not None and expires_at <= _now_ms():
+        status = "expired"
+    elif missing:
+        status = "scope_missing"
+
+    result = {
+        **base,
+        "status": status,
+        "has_payload": True,
+        "runtime_available": True,
+        "scopes": scopes,
+        "missing_scopes": missing,
+        "expires_at": expires_at,
+    }
+    refresh_expires_at = _as_int(payload.get("refresh_expires_at"))
+    if refresh_expires_at:
+        result["refresh_expires_at"] = refresh_expires_at
+    return result
+
+
+def _prefer_status(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+    candidate_has = bool(candidate.get("has_payload"))
+    current_has = bool(current.get("has_payload"))
+    if candidate_has and not current_has:
+        return True
+    if not candidate_has:
+        return False
+    if current_has:
+        return _status_freshness(candidate) >= _status_freshness(current)
+    return True
+
+
+def _status_freshness(status: dict[str, Any]) -> tuple[int, int]:
+    return (
+        _as_int(status.get("refresh_expires_at")),
+        _as_int(status.get("expires_at")),
+    )
 
 
 def refresh_uat_if_needed(

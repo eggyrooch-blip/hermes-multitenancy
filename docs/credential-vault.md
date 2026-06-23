@@ -36,6 +36,17 @@ reports current-profile status:
 It never returns `access_token`, `refresh_token`, API keys, or raw payloads.
 Cross-profile status queries are rejected.
 
+Redacted status reads are intentionally weaker than runtime secret reads:
+`CredentialStore.get_status()` may read scope/expiry metadata without
+`HERMES_MULTITENANCY_CREDENTIAL_KEY` / `HERMES_CREDENTIAL_KEY`, but
+`put_credential()` and `get_secret_for_runtime()` still require the key. Feishu
+UAT status uses the same runtime fallback order as lark-cli: vault metadata when
+available, then the current profile's
+`profiles/<profile>/feishu_uat/<open_id>.json` compatibility file. This lets
+`multitenancy_credential_status`, Connector Registry, and the lark-cli canary
+report a usable local connector when the profile-local UAT JSON is valid, while
+still never exposing token fields to the model or WebUI.
+
 ## Group credential materialization
 
 Some existing skills are not vault-aware and expect a filesystem token, for
@@ -60,7 +71,7 @@ profile sync when the config exists; operators can also run
 Generated files stay inside the profile, are written atomically, and are mode
 `0600`.
 
-Feishu UAT migration is read-through:
+Feishu UAT runtime migration is read-through:
 
 1. The sandboxed AIAgent asks Feishu tools for the current user's UAT.
 2. `agent_real._configure_feishu_uat_home()` has already rebound Feishu UAT
@@ -71,12 +82,18 @@ Feishu UAT migration is read-through:
    the vault as a sealed credential row.
 
 This keeps existing profile-local JSON behavior working while moving the
-long-term source of truth into the multitenancy broker.
+long-term source of truth into the multitenancy broker. Operators should treat
+the profile-local JSON as a compatibility mirror and fallback, not as a file the
+model or status surfaces may inspect directly for secrets.
 
 Operational rules:
 
 - Set `HERMES_MULTITENANCY_CREDENTIAL_KEY` or `HERMES_CREDENTIAL_KEY` before
   enabling DB-backed credentials in production.
+- Do not classify a missing credential key as user re-auth by itself. If a valid
+  profile-local Feishu UAT JSON exists, lark-cli can still run through the
+  authsidecar broker; status and canary checks should report that connector path
+  as available.
 - Keep `.env`, `auth.json`, and shared `feishu_uat` masked in bwrap. Seeing
   `/dev/null` for those files inside the sandbox is expected.
 - Agent-visible diagnostics should call `multitenancy_credential_status`; they
