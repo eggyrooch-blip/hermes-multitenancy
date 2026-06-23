@@ -392,6 +392,71 @@ def test_webui_run_broker_default_dispatch_streams_tool_events(monkeypatch, tmp_
     asyncio.run(runner())
 
 
+def test_webui_run_broker_requests_replay_distinct_child_sessions(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import aiagent_subprocess
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    child_session_ids: list[str] = []
+
+    async def fake_stream_run_agent(event, profile_home, *, messages=None):
+        payload = agent_real._event_to_subprocess_payload(event, profile_home, messages=messages)
+        replayed = aiagent_subprocess._ReplayedEvent(payload["event"])
+        child_session_ids.append(
+            agent_real._resolve_aiagent_session_id(
+                replayed,
+                profile_home,
+                replayed.sender_open_id,
+            )
+        )
+        yield "content", "ok"
+
+    async def fake_real_run_agent(event, profile_home, *, messages=None):  # pragma: no cover
+        raise AssertionError("stream_run_agent should satisfy the request")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            for session_id in ("webui-doc-session-one", "webui-doc-session-two"):
+                response = await client.post("/api/run-broker/runs", json={
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_webui",
+                    "content": "create a Feishu cloud doc",
+                    "session_id": session_id,
+                    "requires_host_tools": True,
+                })
+                body = await response.text()
+                assert response.status == 200
+                assert '"kind": "content"' in body
+                assert '"text": "ok"' in body
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+    assert child_session_ids == [
+        "agent:profile:owner:platform:webui:session:webui-doc-session-one",
+        "agent:profile:owner:platform:webui:session:webui-doc-session-two",
+    ]
+
+
 def test_webui_run_broker_clarify_response_is_owner_scoped(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 
