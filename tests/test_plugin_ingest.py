@@ -182,9 +182,45 @@ def test_ingest_profile_mode_install_idempotent_uninstall(tmp_path):
 
 # ─────────────────────────── ingest: department mode ────────────────────
 
+def test_ingest_profile_mode_asserts_profile_governance(tmp_path):
+    repo = tmp_path / "plug"
+    # build a repo whose orchestrator SKILL.md actually contains the gate text
+    skills = ["using-resource-delivery", "kep-trevi-delivery-orchestrate"]
+    _write_plugin_repo(repo, skills=skills)
+    orch = repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md"
+    orch.write_text("---\nname: orch\n---\nGates: x approve must be confirmed.\n", encoding="utf-8")
+    home = _shared_home(tmp_path)
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    pg = report["profile_governance"][0]
+    assert pg["profile"] == "feishu_test"
+    assert pg["env_default"] == "pre"
+    assert pg["gates_present_in_installed_skills"] == 1  # "x approve" present in orchestrator doc
+    assert "kep-trevi-delivery-orchestrate" in pg["governance_skills_live"]
+
+
+def test_assert_profile_governance_raises_if_orchestrator_absent(tmp_path):
+    # orchestrator declared by plugin but never installed in the profile → fatal
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery", "kep-trevi-delivery-orchestrate"])
+    home = _shared_home(tmp_path)
+    plugin = pi.load_plugin_manifest(repo)
+    empty_profile = home / "profiles" / "feishu_test"  # has empty skills/ dir
+    with pytest.raises(pi.PluginIngestError, match="gates cannot be enforced"):
+        pi.assert_profile_governance(plugin, empty_profile)
+
+
+def test_ingest_department_mode_refuses_to_create_config(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)  # no skill-distribution.yaml
+    with pytest.raises(pi.PluginIngestError, match="refusing to create"):
+        pi.ingest(repo, audience="101,202", shared_home=home)
+
+
 def test_ingest_department_mode_writes_distribution_and_strips(tmp_path):
     repo = _write_plugin_repo(tmp_path / "plug")
     home = _shared_home(tmp_path)
+    # production env: the distribution config already exists
+    (home / pi.SKILL_DISTRIBUTION_FILE).write_text("skills: []\n", encoding="utf-8")
 
     pi.ingest(repo, audience="101,202", shared_home=home)
     dist = home / pi.SKILL_DISTRIBUTION_FILE

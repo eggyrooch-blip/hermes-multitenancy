@@ -277,8 +277,22 @@ def _register_department_distribution(
     *,
     shared_home: Path,
     dry_run: bool,
+    allow_create: bool = False,
 ) -> dict[str, Any]:
     """Add audience-scoped entries to shared `skill-distribution.yaml` for the org fan-out."""
+    config_path = shared_home / SKILL_DISTRIBUTION_FILE
+    # SAFETY: when this file is absent, `_default_profile_skill_specs` sources every
+    # profile's default skills from the OTHER (profile-skill-defaults) config or the
+    # curator. CREATING skill-distribution.yaml here flips that switch and would drop
+    # all profiles' defaults to whatever audience-scoped entries we write. So only
+    # APPEND to an existing config unless the operator explicitly opts in.
+    if not config_path.exists() and not allow_create:
+        raise PluginIngestError(
+            f"no {SKILL_DISTRIBUTION_FILE} at {shared_home} — refusing to create it "
+            "(creating it would override every profile's default-skill source; this env "
+            "is likely curator-driven). Use --allow-create-distribution to override, or "
+            "target an explicit profile with --audience <profile-id>."
+        )
     repo = Path(plugin["_repo"])
     shared_skills = shared_home / "skills"
     names = list(plugin["skills"]["list"])
@@ -286,7 +300,6 @@ def _register_department_distribution(
     for name in names:  # ensure source registered so the fan-out has something to copy
         _register_shared_skill_source(repo, shared_skills, name, dry_run=dry_run, force=False)
 
-    config_path = shared_home / SKILL_DISTRIBUTION_FILE
     raw: dict[str, Any] = {}
     if config_path.exists():
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -338,6 +351,7 @@ def validate_connectors(connectors: list[dict[str, Any]]) -> dict[str, Any]:
 # ─────────────────────────── governance assertion ────────────────────────
 
 def assert_governance(plugin: dict[str, Any]) -> dict[str, Any]:
+    """Contract-level governance check (the plugin declaration)."""
     gov = plugin.get("governance") or {}
     env_default = gov.get("env_default") or "pre"
     if env_default != "pre":
@@ -347,6 +361,48 @@ def assert_governance(plugin: dict[str, Any]) -> dict[str, Any]:
         # not fatal, but loud: a plugin with high-risk writes and no gates is suspicious
         sys.stderr.write("WARN: plugin declares no approval_required gates\n")
     return {"env_default": env_default, "approval_gates": gates, "online_requires": gov.get("online_requires") or "explicit_action"}
+
+
+def assert_profile_governance(plugin: dict[str, Any], profile_home: Path) -> dict[str, Any]:
+    """Post-ingest assertion: the governance-bearing skills actually landed in the
+    target profile, and the high-risk approval gates are present in the installed
+    content (not just declared in the manifest). This is what makes "目标 profile
+    门禁存活" checkable rather than asserted from the plugin JSON.
+    """
+    gov = plugin.get("governance") or {}
+    gates = list(gov.get("approval_required") or [])
+    skills_root = profile_home / "skills"
+    installed = {p.name for p in skills_root.iterdir() if p.is_dir() or p.is_symlink()} if skills_root.is_dir() else set()
+
+    # the orchestrator skill (its SKILL.md enforces the staged gates) must be live
+    orchestrate = next((s for s in plugin["skills"]["list"] if "orchestrat" in s), None)
+    entry = plugin.get("entry_skill")
+    missing_skills = [s for s in (orchestrate, entry) if s and s not in installed]
+    if missing_skills:
+        raise PluginIngestError(
+            f"governance check failed: required governance skill(s) {missing_skills} "
+            f"not installed in {profile_home} — gates cannot be enforced"
+        )
+
+    # each declared gate must appear verbatim in some installed skill doc
+    corpus = ""
+    for name in (orchestrate, entry):
+        if not name:
+            continue
+        doc = skills_root / name / "SKILL.md"
+        try:
+            corpus += doc.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    ungoverned = [g for g in gates if g and g not in corpus]
+    return {
+        "profile": profile_home.name,
+        "env_default": gov.get("env_default") or "pre",
+        "gates_declared": len(gates),
+        "gates_present_in_installed_skills": len(gates) - len(ungoverned),
+        "gates_missing_from_content": ungoverned,
+        "governance_skills_live": [s for s in (orchestrate, entry) if s],
+    }
 
 
 # ─────────────────────────── managed manifest ────────────────────────────
@@ -377,6 +433,7 @@ def ingest(
     profiles_root: Optional[Path] = None,
     dry_run: bool = False,
     force: bool = False,
+    allow_create_distribution: bool = False,
 ) -> dict[str, Any]:
     shared_home = (shared_home or _default_shared_home()).expanduser()
     profiles_root = (profiles_root or shared_home / "profiles").expanduser()
@@ -398,8 +455,14 @@ def ingest(
         report["skills"] = _install_skills_to_profile(
             plugin, aud, shared_home=shared_home, profiles_root=profiles_root, dry_run=dry_run, force=force
         )
+        if not dry_run:
+            report["profile_governance"] = [
+                assert_profile_governance(plugin, profiles_root / p) for p in aud.profiles
+            ]
     else:
-        report["skills"] = _register_department_distribution(plugin, aud, shared_home=shared_home, dry_run=dry_run)
+        report["skills"] = _register_department_distribution(
+            plugin, aud, shared_home=shared_home, dry_run=dry_run, allow_create=allow_create_distribution
+        )
 
     manifest = {
         "plugin_id": plugin["id"],
@@ -458,6 +521,16 @@ def uninstall(
             if not dry_run:
                 config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
             report["removed"].append({"distribution_config": str(config_path), "action": "stripped"})
+        # Department-mode skills materialize into profiles via the org sync, not this
+        # tool. Removing the distribution entry makes them UNDESIRED; the next
+        # `_sync_default_profile_skills` prunes them via `_prune_removed_managed_skills`.
+        # Rollback is therefore entry-removal here + prune-on-next-sync (the same
+        # lifecycle that distributed them) — report it instead of silently leaving copies.
+        report["fanout_rollback"] = (
+            "distribution entries removed; already fanned-out copies are now UNDESIRED and "
+            "are pruned by the managed sync (`_prune_removed_managed_skills`) on its next run "
+            "for each affected profile — run the org skill-sync to complete rollback immediately"
+        )
 
     if purge_clis:
         shared_bin = shared_home / "bin"
@@ -490,6 +563,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--uninstall", metavar="PLUGIN_ID", help="roll back a previously ingested plugin by id")
     ap.add_argument("--dry-run", action="store_true", help="print all actions, write nothing")
     ap.add_argument("--force", action="store_true", help="reinstall CLIs/skills even if present")
+    ap.add_argument("--allow-create-distribution", action="store_true",
+                    help="(department mode) permit CREATING skill-distribution.yaml when absent "
+                         "(DANGEROUS: overrides every profile's default-skill source)")
     ap.add_argument("--purge-clis", action="store_true", help="(uninstall) also remove shared CLIs")
     ap.add_argument("--shared-home", type=Path, help="override HERMES_HOME (default ~/.hermes)")
     ap.add_argument("--profiles-root", type=Path, help="override profiles root (default <shared-home>/profiles)")
@@ -511,6 +587,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             report = ingest(
                 Path(args.repo), audience=args.audience, shared_home=args.shared_home,
                 profiles_root=args.profiles_root, dry_run=args.dry_run, force=args.force,
+                allow_create_distribution=args.allow_create_distribution,
             )
     except PluginIngestError as exc:
         sys.stderr.write(f"plugin-ingest: {exc}\n")
