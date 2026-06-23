@@ -89,6 +89,52 @@ def test_load_manifest_unknown_audience_key_rejected(tmp_path):
         pi.load_plugin_manifest(repo)
 
 
+def test_load_manifest_rejects_path_traversal_skill(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"])
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["skills"]["list"] = ["../../../etc/evil"]
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="unsafe skill path"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_load_manifest_rejects_absolute_skill(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"])
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["skills"]["list"] = ["/abs/evil"]
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="unsafe skill path"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_skills_dir_honored(tmp_path):
+    # plugin keeps skills under a custom dir; manifest.skills.dir points at it
+    repo = tmp_path / "plug"
+    for name in ["using-resource-delivery", "kep-trevi-delivery-orchestrate"]:
+        d = repo / "custom_skills" / name
+        d.mkdir(parents=True)
+        body = "# x\n" + ("Gates: x approve confirmed.\n" if "orchestrat" in name else "")
+        (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}", encoding="utf-8")
+    manifest = {
+        "schema": pi.SUPPORTED_SCHEMA, "id": "dirplug", "version": "1",
+        "entry_skill": "using-resource-delivery",
+        "skills": {"dir": "./custom_skills/", "list": ["using-resource-delivery", "kep-trevi-delivery-orchestrate"]},
+        "install_mode": "copy", "audience": {"department_ids": []}, "clis": [],
+        "connectors": [{"id": "kep-cli", "required": True}],
+        "governance": {"env_default": "pre", "approval_required": ["x approve"]},
+    }
+    out = repo / ".hermes-plugin" / "plugin.json"
+    out.parent.mkdir(parents=True)
+    out.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    home = _shared_home(tmp_path)
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    assert (home / "skills" / "using-resource-delivery" / "SKILL.md").exists()
+    assert len(report["skills"]["installed"]) == 2
+
+
 def test_load_manifest_online_default_rejected(tmp_path):
     repo = _write_plugin_repo(tmp_path / "plug", env_default="online")
     with pytest.raises(pi.PluginIngestError, match="online-by-default is forbidden"):

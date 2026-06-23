@@ -42,7 +42,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 import yaml
@@ -62,6 +62,30 @@ ENV_KEP_NO_AUTO_LOGIN = {"KEP_NO_AUTO_LOGIN": "1"}
 
 class PluginIngestError(RuntimeError):
     """Any operator-facing failure (bad manifest, unknown audience, missing connector)."""
+
+
+def _safe_skill_name(name: Any) -> str:
+    """Reject path-traversal / absolute skill names from an (untrusted) plugin manifest.
+
+    The ingester copies `repo/<skills.dir>/<name>` → `~/.hermes/skills/<name>`; an
+    unsanitized `name` like `../../x` would escape both trees. Allow only relative,
+    non-empty, dot-free path segments.
+    """
+    raw = str(name or "").strip()
+    p = PurePosixPath(raw)
+    if not raw or raw.startswith("/") or p.is_absolute() or any(part in ("", ".", "..") for part in p.parts):
+        raise PluginIngestError(f"unsafe skill path in manifest: {name!r}")
+    return raw
+
+
+def _normalize_skills_dir(value: Any) -> str:
+    """Honor the manifest's `skills.dir` contract (default 'skills'); reject escapes."""
+    raw = str(value or "skills").strip().strip("/")
+    raw = raw[2:] if raw.startswith("./") else raw
+    p = PurePosixPath(raw or "skills")
+    if p.is_absolute() or any(part in ("", "..") for part in p.parts):
+        raise PluginIngestError(f"unsafe skills.dir in manifest: {value!r}")
+    return str(p)
 
 
 # ─────────────────────────── manifest loading ────────────────────────────
@@ -86,6 +110,13 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
     skills = data.get("skills") or {}
     if not isinstance(skills, dict) or not isinstance(skills.get("list"), list) or not skills["list"]:
         raise PluginIngestError(f"{path}: skills.list must be a non-empty array")
+    # validate every skill path (untrusted manifest → no traversal/absolute escapes)
+    for name in skills["list"]:
+        _safe_skill_name(name)
+    data["_skills_dir"] = _normalize_skills_dir(skills.get("dir"))
+    entry = data.get("entry_skill")
+    if entry:
+        _safe_skill_name(entry)
 
     audience = data.get("audience") or {}
     if not isinstance(audience, dict):
@@ -219,9 +250,12 @@ def _resolve_installed_binary(cli_id: str, *, env: dict[str, str]) -> Optional[P
 
 # ─────────────────────────── skill distribution ──────────────────────────
 
-def _register_shared_skill_source(repo: Path, shared_skills: Path, name: str, *, dry_run: bool, force: bool) -> str:
+def _register_shared_skill_source(
+    repo: Path, shared_skills: Path, name: str, *, skills_dir: str, dry_run: bool, force: bool
+) -> str:
     """Copy the plugin's skill dir into the shared distribution source."""
-    src = repo / "skills" / name
+    _safe_skill_name(name)  # defense in depth (already validated at manifest load)
+    src = repo / skills_dir / name
     if not src.is_dir():
         raise PluginIngestError(f"plugin declares skill {name!r} but {src} is missing")
     dst = shared_skills / name
@@ -229,7 +263,7 @@ def _register_shared_skill_source(repo: Path, shared_skills: Path, name: str, *,
         return "present"
     if dry_run:
         return "would-register"
-    shared_skills.mkdir(parents=True, exist_ok=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)  # nested (category/skill) skill paths
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
@@ -249,7 +283,8 @@ def _install_skills_to_profile(
     shared_skills = shared_home / "skills"
     names = list(plugin["skills"]["list"])
     version = str(plugin.get("version") or "")
-    source_actions = {name: _register_shared_skill_source(repo, shared_skills, name, dry_run=dry_run, force=force) for name in names}
+    skills_dir = plugin["_skills_dir"]
+    source_actions = {name: _register_shared_skill_source(repo, shared_skills, name, skills_dir=skills_dir, dry_run=dry_run, force=force) for name in names}
 
     installed: list[dict[str, Any]] = []
     for profile in audience.profiles:
@@ -298,7 +333,7 @@ def _register_department_distribution(
     names = list(plugin["skills"]["list"])
     install_mode = plugin.get("install_mode") or "copy"
     for name in names:  # ensure source registered so the fan-out has something to copy
-        _register_shared_skill_source(repo, shared_skills, name, dry_run=dry_run, force=False)
+        _register_shared_skill_source(repo, shared_skills, name, skills_dir=plugin["_skills_dir"], dry_run=dry_run, force=False)
 
     raw: dict[str, Any] = {}
     if config_path.exists():
