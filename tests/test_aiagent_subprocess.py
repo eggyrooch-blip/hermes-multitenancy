@@ -2858,6 +2858,64 @@ def test_run_with_aiagent_bridges_webui_clarify_to_event_sink(monkeypatch, tmp_p
     assert events[1]["response"] == "brief"
 
 
+def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    captured_session_vars: list[dict] = []
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(kwargs)
+        return object()
+
+    def clear_session_vars(_token):
+        pass
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=clear_session_vars,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="analyze image",
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert captured_session_vars
+    assert captured_session_vars[0]["async_delivery"] is False
+
+
 def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 

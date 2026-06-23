@@ -4067,15 +4067,23 @@ def _run_with_aiagent(
         )
         session_tokens = None
         if set_session_vars is not None:
-            session_tokens = set_session_vars(
-                platform=platform_value,
-                chat_id=str(getattr(source, "chat_id", "") or "") if source else "",
-                chat_name=str(getattr(source, "chat_name", "") or "") if source else "",
-                thread_id=str(getattr(source, "thread_id", "") or "") if source else "",
-                user_id=str(getattr(source, "user_id", "") or "") if source else "",
-                user_name=str(getattr(source, "user_name", "") or "") if source else "",
-                session_key=str(gateway_session_key),
-            )
+            session_var_kwargs = {
+                "platform": platform_value,
+                "chat_id": str(getattr(source, "chat_id", "") or "") if source else "",
+                "chat_name": str(getattr(source, "chat_name", "") or "") if source else "",
+                "thread_id": str(getattr(source, "thread_id", "") or "") if source else "",
+                "user_id": str(getattr(source, "user_id", "") or "") if source else "",
+                "user_name": str(getattr(source, "user_name", "") or "") if source else "",
+                "session_key": str(gateway_session_key),
+                "async_delivery": (platform_key != "webui"),
+            }
+            try:
+                session_tokens = set_session_vars(**session_var_kwargs)
+            except TypeError as exc:
+                if "async_delivery" not in str(exc):
+                    raise
+                session_var_kwargs.pop("async_delivery", None)
+                session_tokens = set_session_vars(**session_var_kwargs)
         def _emit(event_name: str, **payload: Any) -> None:
             if event_sink is None:
                 return
