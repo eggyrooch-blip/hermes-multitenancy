@@ -81,6 +81,46 @@ def test_preflight_ready_when_binary_app_and_uat_exist(monkeypatch, tmp_path: Pa
     assert "secret" not in str(result).replace("secret_free", "")
 
 
+def test_preflight_does_not_trust_db_uat_status_without_runtime_payload(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
+
+    shared = tmp_path / ".hermes"
+    binary = shared / "bin" / "lark-cli-authsidecar"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setenv("HERMES_LARK_CLI_APP_ID", "cli_public")
+    store = CredentialStore(shared / "multitenancy.db", encryption_key="correct-key")
+    try:
+        store.put_credential(
+            profile_name="alice",
+            subject_id="ou_alice",
+            provider="feishu",
+            secret_kind="uat",
+            payload={"access_token": "vault-uat-secret", "refresh_token": "vault-refresh-secret"},
+        )
+    finally:
+        store.close()
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "wrong-key")
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+
+    result = lark_cli_canary_preflight(
+        shared_home=shared,
+        profile_name="alice",
+        open_id="ou_alice",
+        binary_path=binary,
+    )
+
+    uat_check = next(check for check in result["checks"] if check["name"] == "user_uat_credential")
+    assert result["ready"] is False
+    assert "user_uat_credential" in result["missing"]
+    assert uat_check["ok"] is False
+    assert uat_check["source"] == "multitenancy_db"
+    assert "vault-uat-secret" not in str(result)
+    assert "vault-refresh-secret" not in str(result)
+
+
 def test_preflight_ready_with_profile_json_and_app_id_without_vault_key(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.lark_cli_canary import lark_cli_canary_preflight
 

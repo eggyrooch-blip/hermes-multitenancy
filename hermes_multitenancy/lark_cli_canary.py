@@ -272,7 +272,18 @@ def lark_cli_canary_preflight(
                     provider="feishu",
                     secret_kind="uat",
                 )
-                uat_ok = uat_status["status"] == "valid" and key_available
+                uat_payload = None
+                if uat_status["status"] == "valid" and key_available:
+                    try:
+                        uat_payload = store.get_secret_for_runtime(
+                            profile_name=profile_name,
+                            subject_id=open_id,
+                            provider="feishu",
+                            secret_kind="uat",
+                        )
+                    except Exception:
+                        uat_payload = None
+                uat_ok = uat_status["status"] == "valid" and bool((uat_payload or {}).get("access_token"))
                 uat_source = "multitenancy_db" if uat_ok else ""
                 if local_uat_ok:
                     uat_ok = True
