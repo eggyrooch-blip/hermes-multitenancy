@@ -231,6 +231,24 @@ def test_skills_dir_honored(tmp_path):
     assert len(report["skills"]["installed"]) == 2
 
 
+def test_load_manifest_rejects_nondict_governance(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"])
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text()); data["governance"] = "online"
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="governance must be an object"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_load_manifest_rejects_absolute_skills_dir(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"])
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text()); data["skills"]["dir"] = "/tmp/skills"
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="unsafe skills.dir"):
+        pi.load_plugin_manifest(repo)
+
+
 def test_load_manifest_online_default_rejected(tmp_path):
     repo = _write_plugin_repo(tmp_path / "plug", env_default="online")
     with pytest.raises(pi.PluginIngestError, match="online-by-default is forbidden"):

@@ -93,10 +93,12 @@ def _safe_component(value: Any, *, kind: str) -> str:
 
 def _normalize_skills_dir(value: Any) -> str:
     """Honor the manifest's `skills.dir` contract (default 'skills'); reject escapes."""
-    raw = str(value or "skills").strip().strip("/")
-    raw = raw[2:] if raw.startswith("./") else raw
+    raw = str(value or "skills").strip()
+    if raw.startswith("/") or PurePosixPath(raw).is_absolute():  # reject absolute, don't relativize it
+        raise PluginIngestError(f"unsafe skills.dir in manifest: {value!r}")
+    raw = (raw[2:] if raw.startswith("./") else raw).strip("/")
     p = PurePosixPath(raw or "skills")
-    if p.is_absolute() or any(part in ("", "..") for part in p.parts):
+    if any(part in ("", "..") for part in p.parts):
         raise PluginIngestError(f"unsafe skills.dir in manifest: {value!r}")
     return str(p)
 
@@ -154,6 +156,8 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
             raise PluginIngestError(f"{path}: each connectors[] entry needs id, got {con!r}")
 
     gov = data.get("governance") or {}
+    if not isinstance(gov, dict):
+        raise PluginIngestError(f"{path}: governance must be an object")
     if gov.get("env_default") not in (None, "pre"):
         raise PluginIngestError(
             f"{path}: governance.env_default={gov.get('env_default')!r} — online-by-default is "
