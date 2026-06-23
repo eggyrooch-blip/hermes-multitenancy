@@ -112,6 +112,18 @@ def refresh_diagnostic_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
     return parent_dir / f"{open_id}.refresh_diagnostic"
 
 
+def refresh_diagnostic_path_for_reauth_marker(marker_path: Path) -> Path:
+    """Compute the diagnostic sidecar path corresponding to a reauth marker."""
+    name = marker_path.name
+    if name.endswith(".json.needs_reauth"):
+        open_id = name[: -len(".json.needs_reauth")]
+    elif name.endswith(".needs_reauth"):
+        open_id = name[: -len(".needs_reauth")]
+    else:
+        open_id = marker_path.stem
+    return refresh_diagnostic_path_for_open_id(marker_path.parent, open_id)
+
+
 def write_needs_reauth_marker(
     marker_path: Path,
     *,
@@ -169,6 +181,29 @@ def write_refresh_diagnostic_marker(
                 tmp.unlink()
         except OSError:
             pass
+
+
+def preserve_reauth_marker_as_refresh_diagnostic(
+    marker_path: Path,
+    marker_body: dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    """Preserve a cleared non-actionable reauth marker as diagnostic state."""
+    source_reason = str(marker_body.get("reason") or "unknown")
+    detail = str(marker_body.get("detail") or f"cleared non-actionable reauth marker: {source_reason}")
+    extra: dict[str, Any] = {
+        "source": source,
+        "source_reason": source_reason,
+    }
+    for key in ("ts", "profile", "layer", "authoritative", "refresh_class"):
+        if key in marker_body:
+            extra[f"source_{key}" if key == "ts" else key] = marker_body[key]
+    write_refresh_diagnostic_marker(
+        refresh_diagnostic_path_for_reauth_marker(marker_path),
+        detail=detail,
+        extra=extra,
+    )
 
 
 def read_needs_reauth_marker(marker_path: Path) -> Optional[dict[str, Any]]:

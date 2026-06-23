@@ -36,6 +36,7 @@ from .credential_renewal_common import (
     current_valid_uat_exists,
     is_fixture_path,
     marker_requires_reauth,
+    preserve_reauth_marker_as_refresh_diagnostic,
     read_needs_reauth_marker,
 )
 from .credentials import CredentialStore
@@ -134,6 +135,11 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
             )
             continue
         if not marker_requires_reauth(body):
+            preserve_reauth_marker_as_refresh_diagnostic(
+                marker,
+                body,
+                source="credential_reauth_notifier",
+            )
             clear_needs_reauth_marker(marker)
             if current_valid_uat_exists(shared_home, open_id):
                 logger.info(

@@ -489,6 +489,15 @@ def test_l4_rechecks_older_actionable_marker_after_clearing_non_authoritative_ne
     assert common.REASON_REFRESH_TOKEN_EXPIRED in (error or "")
     assert older_marker.exists()
     assert not newer_marker.exists()
+    diagnostic = common.read_refresh_diagnostic_marker(
+        profile_marker_dir / f"{open_id}.refresh_diagnostic"
+    )
+    assert diagnostic is not None
+    assert diagnostic["reason"] == common.REASON_REFRESH_DIAGNOSTIC
+    assert diagnostic["source_reason"] == common.REASON_REFRESH_REJECTED
+    assert diagnostic["detail"] == "RuntimeError: credential encryption key is required"
+    assert diagnostic["profile"] == profile_name
+    assert diagnostic["layer"] == "L2"
 
 
 def test_l4_skips_jobs_without_owner_open_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

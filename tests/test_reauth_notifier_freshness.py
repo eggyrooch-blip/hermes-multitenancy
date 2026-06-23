@@ -233,9 +233,25 @@ def test_authoritative_marker_is_cleared_when_newer_uat_has_valid_refresh_only(s
 def test_non_authoritative_refresh_rejected_with_valid_uat_is_cleared_not_sent(sent, tmp_path):
     now = int(time.time())
     _write_valid_uat(tmp_path, "stt", "ou_stt")
-    _write_marker(tmp_path, "stt", "ou_stt", ts=now - 60, reason=common.REASON_REFRESH_REJECTED)
+    _write_marker(
+        tmp_path,
+        "stt",
+        "ou_stt",
+        ts=now - 60,
+        reason=common.REASON_REFRESH_REJECTED,
+        extra={"layer": "L2", "detail": "RuntimeError: credential encryption key is required"},
+    )
 
     N._scan_once(tmp_path, {})
 
     assert sent == []
     assert not (tmp_path / "profiles" / "stt" / "feishu_uat" / "ou_stt.needs_reauth").exists()
+    diagnostic = common.read_refresh_diagnostic_marker(
+        tmp_path / "profiles" / "stt" / "feishu_uat" / "ou_stt.refresh_diagnostic"
+    )
+    assert diagnostic is not None
+    assert diagnostic["reason"] == common.REASON_REFRESH_DIAGNOSTIC
+    assert diagnostic["source_reason"] == common.REASON_REFRESH_REJECTED
+    assert diagnostic["detail"] == "RuntimeError: credential encryption key is required"
+    assert diagnostic["profile"] == "stt"
+    assert diagnostic["layer"] == "L2"

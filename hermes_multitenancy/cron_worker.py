@@ -45,6 +45,7 @@ from .credential_renewal_common import (
     clear_reauth_markers_if_uat_recovered,
     find_marker_for_open_id,
     marker_requires_reauth,
+    preserve_reauth_marker_as_refresh_diagnostic,
     read_needs_reauth_marker,
 )
 from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
@@ -512,6 +513,11 @@ def _l4_check_needs_reauth_and_defer(
         for non_actionable_marker in _iter_reauth_markers_for_open_id(shared_home, owner_open_id):
             body = read_needs_reauth_marker(non_actionable_marker) or {}
             if not marker_requires_reauth(body):
+                preserve_reauth_marker_as_refresh_diagnostic(
+                    non_actionable_marker,
+                    body,
+                    source="cron_worker_l4",
+                )
                 clear_needs_reauth_marker(non_actionable_marker)
                 cleared = True
         logger.warning(
