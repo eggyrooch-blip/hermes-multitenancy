@@ -31,7 +31,11 @@ from typing import Any, Iterable, Optional
 
 from .credential_renewal_common import (
     REASON_SCOPE_STRIPPED_BY_FEISHU,
+    clear_reauth_markers_if_uat_recovered,
+    clear_needs_reauth_marker,
+    current_valid_uat_exists,
     is_fixture_path,
+    marker_requires_reauth,
     read_needs_reauth_marker,
 )
 from .credentials import CredentialStore
@@ -122,6 +126,28 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
             continue
         reason = str(body.get("reason") or "")
         ts = int(body.get("ts") or 0)
+        if clear_reauth_markers_if_uat_recovered(shared_home, open_id, marker):
+            logger.info(
+                "[credential_reauth_notifier] cleared stale reauth marker for open_id=%s because "
+                "a newer valid UAT exists",
+                open_id,
+            )
+            continue
+        if not marker_requires_reauth(body):
+            clear_needs_reauth_marker(marker)
+            if current_valid_uat_exists(shared_home, open_id):
+                logger.info(
+                    "[credential_reauth_notifier] cleared non-authoritative refresh_rejected marker "
+                    "for open_id=%s because current UAT is still usable",
+                    open_id,
+                )
+            else:
+                logger.warning(
+                    "[credential_reauth_notifier] cleared non-authoritative refresh_rejected marker "
+                    "for open_id=%s without sending DM",
+                    open_id,
+                )
+            continue
         key = f"{open_id}:{reason}"
         last = seen.get(key)
         # Mode-aware dedupe:

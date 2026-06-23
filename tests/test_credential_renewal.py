@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.error
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -365,6 +367,88 @@ def test_l4_ignores_stale_marker_when_valid_uat_was_refreshed_later(
     assert not (profile_home / "cron" / "output" / "JOB-RESTORED.deferred.json").exists()
 
 
+def test_l4_ignores_non_authoritative_refresh_rejected_when_current_uat_valid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy import cron_worker
+
+    open_id = "ou_user_infra"
+    profile_name = "infra_profile"
+    shared = tmp_path
+    profile_home = shared / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    _seed_uat(shared, profile_name, open_id, _valid_payload(open_id))
+    marker_dir = profile_home / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(marker_dir, open_id),
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="RuntimeError: credential encryption key is required",
+        extra={"layer": "L2", "profile": profile_name},
+    )
+    marker_path = marker_dir / f"{open_id}.needs_reauth"
+    new_ts = time.time()
+    os.utime(marker_path, (new_ts, new_ts))
+
+    job = {"id": "JOB-INFRA", "name": "infra", "owner_open_id": open_id}
+    result = cron_worker._l4_check_needs_reauth_and_defer(job)
+
+    assert result is None
+    assert not marker_path.exists()
+    assert not (profile_home / "cron" / "output" / "JOB-INFRA.deferred.json").exists()
+
+
+def test_l4_rechecks_older_actionable_marker_after_clearing_non_authoritative_newer_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy import cron_worker
+
+    open_id = "ou_user_masked"
+    profile_name = "masked_profile"
+    shared = tmp_path
+    profile_home = shared / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    legacy_marker_dir = shared / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(legacy_marker_dir, open_id),
+        reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+        detail="authoritative older marker",
+        extra={"layer": "TEST"},
+    )
+    older_marker = legacy_marker_dir / f"{open_id}.needs_reauth"
+    old_ts = time.time() - 60
+    os.utime(older_marker, (old_ts, old_ts))
+
+    profile_marker_dir = profile_home / "feishu_uat"
+    common.write_needs_reauth_marker(
+        common.marker_path_for_open_id(profile_marker_dir, open_id),
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="RuntimeError: credential encryption key is required",
+        extra={"layer": "L2", "profile": profile_name},
+    )
+    newer_marker = profile_marker_dir / f"{open_id}.needs_reauth"
+    new_ts = time.time()
+    os.utime(newer_marker, (new_ts, new_ts))
+
+    job = {"id": "JOB-MASKED", "name": "masked", "owner_open_id": open_id}
+    result = cron_worker._l4_check_needs_reauth_and_defer(job)
+
+    assert result is not None
+    success, output, _final_response, error = result
+    assert success is False
+    assert common.REASON_REFRESH_TOKEN_EXPIRED in output
+    assert common.REASON_REFRESH_TOKEN_EXPIRED in (error or "")
+    assert older_marker.exists()
+    assert not newer_marker.exists()
+
+
 def test_l4_skips_jobs_without_owner_open_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from hermes_multitenancy import cron_worker
 
@@ -440,6 +524,98 @@ def test_l2_refresh_preserves_existing_refresh_token_when_feishu_omits_new_one(
     assert refreshed["access_token"] == "fresh-access"
     assert refreshed["refresh_token"] == "t_refresh_xxxx"
     assert stored["refresh_token"] == "t_refresh_xxxx"
+
+
+def test_l2_infra_refresh_failure_does_not_write_user_reauth_marker(tmp_path: Path):
+    credential_renewal_worker._record_failure(
+        tmp_path,
+        "alice",
+        "ou_infra",
+        RuntimeError("credential encryption key is required"),
+    )
+
+    marker = tmp_path / "profiles" / "alice" / "feishu_uat" / "ou_infra.needs_reauth"
+    diagnostic = tmp_path / "profiles" / "alice" / "feishu_uat" / "ou_infra.refresh_diagnostic"
+    assert not marker.exists()
+    body = common.read_refresh_diagnostic_marker(diagnostic)
+    assert body is not None
+    assert body["reason"] == common.REASON_REFRESH_DIAGNOSTIC
+    assert body["actionable"] is False
+    assert "credential encryption key is required" in body["detail"]
+
+
+def test_l2_authoritative_invalid_refresh_writes_reauth_marker(tmp_path: Path):
+    credential_renewal_worker._record_failure(
+        tmp_path,
+        "alice",
+        "ou_invalid",
+        fua.FeishuUatAuthError(
+            "Feishu UAT refresh failed: code=20026 msg=invalid refresh token",
+            status=401,
+            refresh_class="invalid",
+        ),
+    )
+
+    marker = tmp_path / "profiles" / "alice" / "feishu_uat" / "ou_invalid.needs_reauth"
+    body = common.read_needs_reauth_marker(marker)
+    assert body is not None
+    assert body["reason"] == common.REASON_REFRESH_REJECTED
+    assert body["refresh_class"] == "invalid"
+    assert body["authoritative"] is True
+
+
+def test_l2_refresh_http_error_json_body_is_classified_invalid(monkeypatch: pytest.MonkeyPatch):
+    payload = json.dumps(
+        {"code": fua.LARK_REFRESH_ERROR["REFRESH_TOKEN_INVALID"], "msg": "invalid refresh token"}
+    ).encode("utf-8")
+    http_error = urllib.error.HTTPError(
+        url="https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+        code=400,
+        msg="Bad Request",
+        hdrs={},
+        fp=BytesIO(payload),
+    )
+
+    def raise_http_error(*args, **kwargs):
+        raise http_error
+
+    monkeypatch.setattr(fua.urllib.request, "urlopen", raise_http_error)
+
+    with pytest.raises(fua.FeishuUatAuthError) as excinfo:
+        fua._refresh_uat_token("refresh-token", "client-id", "client-secret")
+
+    assert excinfo.value.refresh_class == "invalid"
+
+
+def test_l2_refresh_http_error_unknown_json_body_is_diagnostic_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = json.dumps({"code": 999999, "msg": "rate limit or app error"}).encode("utf-8")
+    http_error = urllib.error.HTTPError(
+        url="https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+        code=400,
+        msg="Bad Request",
+        hdrs={},
+        fp=BytesIO(payload),
+    )
+
+    def raise_http_error(*args, **kwargs):
+        raise http_error
+
+    monkeypatch.setattr(fua.urllib.request, "urlopen", raise_http_error)
+
+    with pytest.raises(fua.FeishuUatAuthError) as excinfo:
+        fua._refresh_uat_token("refresh-token", "client-id", "client-secret")
+
+    assert excinfo.value.refresh_class == "unknown"
+
+    credential_renewal_worker._record_failure(tmp_path, "alice", "ou_unknown", excinfo.value)
+
+    marker = tmp_path / "profiles" / "alice" / "feishu_uat" / "ou_unknown.needs_reauth"
+    diagnostic = tmp_path / "profiles" / "alice" / "feishu_uat" / "ou_unknown.refresh_diagnostic"
+    assert not marker.exists()
+    assert common.read_refresh_diagnostic_marker(diagnostic) is not None
 
 
 # ---------------------------------------------------------------------------

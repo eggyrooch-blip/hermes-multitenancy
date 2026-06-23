@@ -6,8 +6,10 @@ A single background thread per gateway process. Every ``interval`` seconds:
   2. For each, load the freshest UAT payload (vault vs profile JSON).
   3. If the payload enters its refresh-headroom window, force-refresh via
      ``refresh_uat_if_needed(force=True)``.
-  4. On exception, write a ``.needs_reauth`` marker (L1 helpers) so L3 picks
-     it up and notifies the right party.
+  4. On authoritative Feishu invalid/revoked refresh-token responses, write a
+     ``.needs_reauth`` marker (L1 helpers) so L3 picks it up and notifies the
+     right party. Local infra / network / unknown-code failures write
+     non-user-facing ``.refresh_diagnostic`` state instead.
 
 Reads only — never overwrites a valid UAT outside of the existing
 ``feishu_uat_auth`` machinery. L1 sits underneath the actual write, so a
@@ -27,6 +29,8 @@ from .credential_renewal_common import (
     classify_uat_payload,
     is_fixture_path,
     marker_path_for_open_id,
+    refresh_diagnostic_path_for_open_id,
+    write_refresh_diagnostic_marker,
     write_needs_reauth_marker,
 )
 
@@ -193,13 +197,36 @@ def _record_failure(
     # exception path in feishu_uat_auth raises with curated messages only.
     if len(detail) > 240:
         detail = detail[:237] + "..."
+    from .feishu_uat_auth import FeishuUatAuthError
+
+    if not (isinstance(exc, FeishuUatAuthError) and exc.refresh_class == "invalid"):
+        write_refresh_diagnostic_marker(
+            refresh_diagnostic_path_for_open_id(
+                shared_home / "profiles" / profile_name / "feishu_uat", open_id
+            ),
+            detail=detail,
+            extra={"layer": "L2", "profile": profile_name},
+        )
+        logger.warning(
+            "[credential_renewal] refresh failed without user-actionable reauth marker "
+            "user=%s profile=%s reason=%s",
+            open_id,
+            profile_name,
+            detail,
+        )
+        return
     write_needs_reauth_marker(
         marker_path_for_open_id(
             shared_home / "profiles" / profile_name / "feishu_uat", open_id
         ),
         reason=REASON_REFRESH_REJECTED,
         detail=detail,
-        extra={"layer": "L2", "profile": profile_name},
+        extra={
+            "layer": "L2",
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": exc.refresh_class,
+        },
     )
     logger.warning(
         "[credential_renewal] refresh failed user=%s profile=%s reason=%s",

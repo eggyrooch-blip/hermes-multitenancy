@@ -35,7 +35,7 @@ def _valid_payload(open_id: str = "ou_user_a") -> dict[str, Any]:
         (20037, "invalid"),
         (20064, "invalid"),
         (20073, "invalid"),
-        (12345, "invalid"),
+        (12345, "unknown"),
     ],
 )
 def test_classify_refresh_error_covers_known_and_unknown_codes(code: int | None, expected: str) -> None:
@@ -55,9 +55,27 @@ def test_refresh_uat_token_retries_retryable_code_once_then_raises(monkeypatch: 
         fua._refresh_uat_token("r-token", "app-id", "app-secret")
 
     assert len(calls) == 2
-    assert raised.value.status == 401
+    assert raised.value.status == 502
     assert raised.value.refresh_class == "retryable_exhausted"
     assert "code=20050" in str(raised.value)
+
+
+def test_refresh_uat_token_retry_then_invalid_stays_authoritative(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = [
+        {"code": 20050, "msg": "server error"},
+        {"code": 20026, "msg": "invalid refresh token"},
+    ]
+
+    def fake_refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> dict[str, Any]:
+        return responses.pop(0)
+
+    monkeypatch.setattr(fua, "_refresh_access_token", fake_refresh_access_token)
+
+    with pytest.raises(fua.FeishuUatAuthError) as raised:
+        fua._refresh_uat_token("r-token", "app-id", "app-secret")
+
+    assert raised.value.status == 401
+    assert raised.value.refresh_class == "invalid"
 
 
 def test_refresh_uat_token_returns_normalised_token_after_retry_success(

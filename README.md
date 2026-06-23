@@ -152,7 +152,7 @@ State lives in `~/.hermes/multitenancy.db` — a separate SQLite file from herme
 | **Cost & chargeback** | Per-turn token ledger → hourly uploader with **owner-based attribution**: a person's DMs, their agents, and every group they invited the bot into all roll up to *them*, resolved to the enterprise email/department via the routing table. "Under-count, never mis-count" — a turn whose owner can't be resolved is dropped, never billed to the wrong person. |
 | **Demand analytics** | `hermes-multitenancy-analytics summary` reads the conversation-audit log and reports usage volume, top active profiles, and completion-proxy metrics over a configurable window (markdown or JSON, with optional redacted demand samples). |
 | **Group safety** | `@everyone` / `@所有人` is ignored at admission in every reply mode, so a broadcast can't wake every agent. Freshly-created groups route correctly at send time. |
-| **Reliability** | Output-length truncation returns a friendly notice instead of a hard failure (streaming path included); bare model names are runtime-normalized to heal recurring provider-prefix failures; credential re-auth notifications are freshness-gated and mode-aware so enabling live sends never blasts a stale backlog. |
+| **Reliability** | Output-length truncation returns a friendly notice instead of a hard failure (streaming path included); bare model names are runtime-normalized to heal recurring provider-prefix failures; credential re-auth notifications are freshness-gated, mode-aware, and only sent for authoritative credential failures so enabling live sends never blasts a stale backlog. |
 | **Upgrade safety** | Zero core patches + pinned `hermes-agent` version + an integration test suite that fails loudly on any contract drift. `upstream_health.py` runs secret-free health checks before declaring a deploy usable. |
 
 ### Roles
@@ -252,6 +252,12 @@ python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
 ```
 
 User UAT is profile-scoped — OAuth/device-flow writes or imports a user token, then multitenancy mirrors it to `$HERMES_HOME/profiles/<profile>/feishu_uat/<open_id>.json` and `multitenancy_credentials`. **Never commit** `.env`, `auth.json`, `feishu_uat/*.json`, `tokens/`, `workspace/credentials/`, cookies, or raw OAuth payloads.
+
+### Credential re-auth markers
+
+`.needs_reauth` is user-facing state, not a generic refresh-error log. Concrete local payload problems such as an expired refresh token, a missing refresh token, or missing `offline_access` can produce markers immediately. `refresh_rejected` is only actionable when the refresh layer parsed a Feishu invalid/revoked refresh-token response and marks the marker as authoritative. Local infrastructure errors such as missing credential encryption keys, network failures, or unparsed HTTP errors are recorded as non-user-facing `.refresh_diagnostic` sidecars and logs; they must not notify users to run `/feishu_auth` or make cron classify the profile as `needs_auth`.
+
+Known gotcha: a 2026-06-23 production incident produced fresh `refresh_rejected` markers from a local credential-encryption-key failure while affected users still had usable Feishu UAT material. The root cause was treating every proactive refresh exception as user-actionable reauth. The guardrail is that only authoritative Feishu invalid/revoked refresh-token codes may create actionable `refresh_rejected`; unknown or infrastructure failures must remain diagnostic-only.
 
 ### 4. Sync profiles and routes
 

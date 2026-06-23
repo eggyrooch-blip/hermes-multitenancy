@@ -45,6 +45,7 @@ from .credential_renewal_common import (
     classify_uat_payload,
     find_marker_for_open_id,
     iter_uat_locations,
+    marker_requires_reauth,
     payload_access_expired,
     payload_refresh_expired,
     read_needs_reauth_marker,
@@ -500,13 +501,29 @@ def _l4_check_needs_reauth_and_defer(
     if not owner_open_id.startswith("ou_"):
         return None
     shared_home = _resolve_shared_home()
-    marker = find_marker_for_open_id(shared_home, owner_open_id)
-    if marker is None:
-        return None
-    if _clear_stale_reauth_markers_if_uat_recovered(shared_home, owner_open_id, marker):
-        return None
-    marker_body = read_needs_reauth_marker(marker) or {}
-    reason = str(marker_body.get("reason") or "unknown")
+    while True:
+        marker = find_marker_for_open_id(shared_home, owner_open_id)
+        if marker is None:
+            return None
+        if _clear_stale_reauth_markers_if_uat_recovered(shared_home, owner_open_id, marker):
+            return None
+        marker_body = read_needs_reauth_marker(marker) or {}
+        reason = str(marker_body.get("reason") or "unknown")
+        if marker_requires_reauth(marker_body):
+            break
+        cleared = False
+        for non_actionable_marker in _iter_reauth_markers_for_open_id(shared_home, owner_open_id):
+            body = read_needs_reauth_marker(non_actionable_marker) or {}
+            if not marker_requires_reauth(body):
+                clear_needs_reauth_marker(non_actionable_marker)
+                cleared = True
+        logger.warning(
+            "[multitenancy] L4 ignored non-authoritative reauth marker owner=%s reason=%s",
+            owner_open_id,
+            reason,
+        )
+        if not cleared:
+            return None
 
     job_id = str(job.get("id") or "")
     job_name = str(job.get("name") or job_id or "scheduled task")

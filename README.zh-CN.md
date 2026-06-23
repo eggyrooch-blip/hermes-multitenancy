@@ -152,7 +152,7 @@ flowchart TB
 | **成本与分摊** | 逐回合 token 台账 → 每小时上传器，**按 owner 归属**：一个人的 DM、他的智能体、以及每个他拉 Bot 进的群，全部累加到*他本人*，经路由表解析成企业邮箱/部门。「漏记不误记」—— 解析不到归属的回合丢弃，绝不算到错误的人头上。 |
 | **需求分析** | `hermes-multitenancy-analytics summary` 读会话审计日志，在可配置窗口内输出用量、活跃 profile Top、完成率代理指标（markdown 或 JSON，可选脱敏需求样本）。 |
 | **群安全** | `@所有人` 在任何回复模式都在准入处忽略，故广播不会唤醒每个智能体。刚建的群在发送时正确路由。 |
-| **可靠性** | 超长输出返回友好提示而非硬失败（含流式路径）；裸模型名在运行时归一化以根治反复的 provider 前缀失败；凭证重认证通知做新鲜度门控且 mode-aware，开启实发时绝不轰炸陈旧积压。 |
+| **可靠性** | 超长输出返回友好提示而非硬失败（含流式路径）；裸模型名在运行时归一化以根治反复的 provider 前缀失败；凭证重认证通知做新鲜度门控、mode-aware 和权威失败判定，开启实发时绝不轰炸陈旧积压，也不会把本地刷新基础设施错误当成用户授权失效。 |
 | **升级安全** | 零内核补丁 + 锁定 `hermes-agent` 版本 + 一套集成测试在契约漂移时大声失败。`upstream_health.py` 在宣告部署可用前跑无密钥健康检查。 |
 
 ### 角色
@@ -252,6 +252,12 @@ python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
 ```
 
 用户 UAT 是 profile 域的 —— OAuth/设备流写入或导入用户 token，再由 multitenancy 镜像到 `$HERMES_HOME/profiles/<profile>/feishu_uat/<open_id>.json` 和 `multitenancy_credentials`。**绝不提交** `.env`、`auth.json`、`feishu_uat/*.json`、`tokens/`、`workspace/credentials/`、cookie、原始 OAuth 载荷。
+
+### 凭证重授权 marker
+
+`.needs_reauth` 是用户可见状态，不是泛化的刷新错误日志。refresh token 过期、refresh token 缺失、缺少 `offline_access` 这类本地 payload 已经确定不可用的问题可以立即写 marker。`refresh_rejected` 只有在刷新层解析到飞书明确返回 invalid/revoked refresh token，并把 marker 标成 authoritative 时才是用户可操作问题。本地基础设施错误（例如缺凭证加密 key）、网络错误、未解析的 HTTP 错误只能写入非用户可见的 `.refresh_diagnostic` sidecar 和日志，不能提示用户执行 `/feishu_auth`，也不能让 cron 把 profile 判成 `needs_auth`。
+
+已知 gotcha：2026-06-23 生产曾因本地凭证加密 key 缺失，把一批仍有可用 Feishu UAT 的用户写成新鲜 `refresh_rejected` marker。根因是 proactive refresh worker 曾把所有刷新异常都当作用户可操作的重授权状态。守卫规则是：只有飞书明确返回 invalid/revoked refresh token 的权威 code 才能写 actionable `refresh_rejected`；未知 code 或基础设施错误必须只进入 diagnostic。
 
 ### 4. 同步 profile 和路由
 

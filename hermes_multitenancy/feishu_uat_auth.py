@@ -53,6 +53,15 @@ LARK_REFRESH_ERROR = MappingProxyType(
     }
 )
 REFRESH_RETRYABLE_CODES: frozenset[int] = frozenset({LARK_REFRESH_ERROR["REFRESH_SERVER_ERROR"]})
+REFRESH_INVALID_CODES: frozenset[int] = frozenset(
+    {
+        LARK_REFRESH_ERROR["TOKEN_INVALID"],
+        LARK_REFRESH_ERROR["REFRESH_TOKEN_INVALID"],
+        LARK_REFRESH_ERROR["REFRESH_TOKEN_EXPIRED"],
+        LARK_REFRESH_ERROR["REFRESH_TOKEN_REVOKED"],
+        LARK_REFRESH_ERROR["REFRESH_TOKEN_ALREADY_USED"],
+    }
+)
 
 
 def classify_refresh_error(code: int | None) -> str:
@@ -60,7 +69,9 @@ def classify_refresh_error(code: int | None) -> str:
         return "ok"
     if code in REFRESH_RETRYABLE_CODES:
         return "retryable"
-    return "invalid"
+    if code in REFRESH_INVALID_CODES:
+        return "invalid"
+    return "unknown"
 
 
 @dataclass
@@ -715,8 +726,18 @@ def _refresh_access_token(client_id: str, client_secret: str, refresh_token: str
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed Feishu host.
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed Feishu host.
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise
+        if isinstance(data, dict):
+            return data
+        raise
 
 
 def _mint_tenant_access_token(client_id: str, client_secret: str, *, timeout: int = 10) -> str:
@@ -796,12 +817,19 @@ def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -
         logger.warning("Feishu UAT refresh transient error: code=%s; retrying once", code)
         data = _refresh_access_token(client_id, client_secret, refresh_token)
         code = int(data.get("code") or 0)
+        refresh_class = classify_refresh_error(code)
         if code != 0:
             msg = str(data.get("msg") or data.get("message") or "refresh rejected").strip()
+            if refresh_class == "invalid":
+                raise FeishuUatAuthError(
+                    f"Feishu UAT refresh failed: code={code} msg={msg}",
+                    status=401,
+                    refresh_class="invalid",
+                )
             raise FeishuUatAuthError(
                 f"Feishu UAT refresh failed after retry: code={code} msg={msg}",
-                status=401,
-                refresh_class="retryable_exhausted",
+                status=502,
+                refresh_class="retryable_exhausted" if refresh_class == "retryable" else refresh_class,
             )
     elif refresh_class == "invalid":
         msg = str(data.get("msg") or data.get("message") or "refresh rejected").strip()
@@ -809,6 +837,13 @@ def _refresh_uat_token(refresh_token: str, client_id: str, client_secret: str) -
             f"Feishu UAT refresh failed: code={code} msg={msg}",
             status=401,
             refresh_class="invalid",
+        )
+    elif refresh_class == "unknown":
+        msg = str(data.get("msg") or data.get("message") or "refresh rejected").strip()
+        raise FeishuUatAuthError(
+            f"Feishu UAT refresh failed with non-token error: code={code} msg={msg}",
+            status=502,
+            refresh_class="unknown",
         )
     if isinstance(data.get("data"), dict):
         data = data["data"]

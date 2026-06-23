@@ -22,6 +22,7 @@ REASON_SCOPE_STRIPPED_BY_FEISHU = "scope_stripped_by_feishu"
 REASON_ACCESS_TOKEN_EXPIRED = "access_token_expired"
 REASON_REFRESH_TOKEN_EXPIRED = "refresh_token_expired"
 REASON_REFRESH_REJECTED = "refresh_rejected"
+REASON_REFRESH_DIAGNOSTIC = "refresh_diagnostic"
 
 SCOPE_STRIPPED_REASONS = frozenset({REASON_SCOPE_STRIPPED_BY_FEISHU})
 
@@ -106,6 +107,11 @@ def marker_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
     return parent_dir / f"{open_id}.needs_reauth"
 
 
+def refresh_diagnostic_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
+    """Compute the non-user-facing refresh diagnostic sidecar path."""
+    return parent_dir / f"{open_id}.refresh_diagnostic"
+
+
 def write_needs_reauth_marker(
     marker_path: Path,
     *,
@@ -136,7 +142,44 @@ def write_needs_reauth_marker(
             pass
 
 
+def write_refresh_diagnostic_marker(
+    marker_path: Path,
+    *,
+    detail: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """Atomic write of non-user-facing refresh diagnostic state."""
+    payload: dict[str, Any] = {
+        "reason": REASON_REFRESH_DIAGNOSTIC,
+        "ts": int(time.time()),
+        "detail": detail,
+        "actionable": False,
+    }
+    if extra:
+        payload.update({k: v for k, v in extra.items() if k not in payload})
+    marker_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = marker_path.with_name(f".{marker_path.name}.{secrets.token_hex(6)}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, marker_path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
 def read_needs_reauth_marker(marker_path: Path) -> Optional[dict[str, Any]]:
+    try:
+        data = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def read_refresh_diagnostic_marker(marker_path: Path) -> Optional[dict[str, Any]]:
     try:
         data = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -209,6 +252,79 @@ def classify_uat_payload(payload: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def payload_is_currently_usable(payload: dict[str, Any]) -> bool:
+    """True when local UAT material is structurally valid and not expired."""
+    if classify_uat_payload(payload) is not None:
+        return False
+    if payload_access_expired(payload) or payload_refresh_expired(payload):
+        return False
+    return True
+
+
+def current_valid_uat_exists(shared_home: Path, open_id: str) -> bool:
+    """Return True if any current on-disk UAT for ``open_id`` is usable now."""
+    for loc in iter_uat_locations(shared_home):
+        if loc.open_id != open_id:
+            continue
+        try:
+            payload = json.loads(loc.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload_is_currently_usable(payload):
+            return True
+    return False
+
+
+def clear_reauth_markers_if_uat_recovered(
+    shared_home: Path,
+    open_id: str,
+    marker_path: Path,
+) -> bool:
+    """Clear reauth markers when a newer valid UAT proves recovery."""
+    try:
+        marker_mtime = marker_path.stat().st_mtime
+    except OSError:
+        return False
+
+    recovered_mtime: float | None = None
+    for loc in iter_uat_locations(shared_home):
+        if loc.open_id != open_id:
+            continue
+        try:
+            uat_mtime = loc.path.stat().st_mtime
+            if uat_mtime <= marker_mtime:
+                continue
+            payload = json.loads(loc.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload_is_currently_usable(payload):
+            recovered_mtime = max(recovered_mtime or 0.0, uat_mtime)
+
+    if recovered_mtime is None:
+        return False
+
+    for stale_marker in _iter_reauth_markers_for_open_id(shared_home, open_id):
+        try:
+            if stale_marker.stat().st_mtime <= recovered_mtime:
+                clear_needs_reauth_marker(stale_marker)
+        except OSError:
+            continue
+    return True
+
+
+def marker_requires_reauth(marker_body: dict[str, Any]) -> bool:
+    """Whether a marker is authoritative enough to notify/defer as reauth.
+
+    ``refresh_rejected`` is only user-actionable when the refresh layer has
+    parsed a Feishu invalid/revoked refresh-token response. Legacy catch-all
+    markers and local infra failures must not become user-facing reauth prompts.
+    """
+    reason = str(marker_body.get("reason") or "")
+    if reason != REASON_REFRESH_REJECTED:
+        return True
+    return bool(marker_body.get("authoritative")) and str(marker_body.get("refresh_class") or "") == "invalid"
+
+
 def find_marker_for_open_id(shared_home: Path, open_id: str) -> Optional[Path]:
     """Return the most-recent marker file for ``open_id`` (legacy or per-profile)."""
     candidates: list[Path] = []
@@ -226,3 +342,16 @@ def find_marker_for_open_id(shared_home: Path, open_id: str) -> Optional[Path]:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _iter_reauth_markers_for_open_id(shared_home: Path, open_id: str) -> list[Path]:
+    markers = [shared_home / "feishu_uat" / f"{open_id}.needs_reauth"]
+    profiles_dir = shared_home / "profiles"
+    try:
+        profile_dirs = list(profiles_dir.iterdir())
+    except OSError:
+        profile_dirs = []
+    for profile_dir in profile_dirs:
+        if profile_dir.is_dir():
+            markers.append(profile_dir / "feishu_uat" / f"{open_id}.needs_reauth")
+    return markers
