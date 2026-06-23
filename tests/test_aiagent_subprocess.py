@@ -3296,6 +3296,66 @@ def test_run_with_aiagent_only_prefills_webui_images_from_uploads(monkeypatch, t
     assert "Do not infer this image's visual contents" in user_message
 
 
+def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    async def fail_vision_analyze_tool(*_args, **_kwargs):
+        raise AssertionError("external ingest text must not trigger WebUI image preflight")
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fail_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    observed: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="coder",
+            content="\n".join([
+                "请分析这个文件",
+                "[Attached image: fake.png]",
+                "Local image path for tools: uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+            metadata={"source": "ingest"},
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    user_message = str(observed["user_message"])
+    assert "WebUI image attachment analysis" not in user_message
+    assert "Local image path for tools: uploads/receipt.png" in user_message
+
+
 def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 

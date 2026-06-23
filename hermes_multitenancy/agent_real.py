@@ -3968,7 +3968,6 @@ def _normalize_webui_uploaded_image_path(raw_path: str) -> str:
 def _resolve_webui_uploaded_image_path(
     raw_path: str,
     *,
-    profile_home: Path,
     workspace_root: Path,
 ) -> tuple[Path | None, str | None]:
     normalized = _normalize_webui_uploaded_image_path(raw_path)
@@ -4086,7 +4085,9 @@ def _analyze_webui_uploaded_image(
 ) -> tuple[bool, str]:
     import asyncio
 
+    tried_fallback = False
     if prefer_openai_compatible:
+        tried_fallback = True
         fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
             path,
             api_key=fallback_api_key,
@@ -4117,14 +4118,15 @@ def _analyze_webui_uploaded_image(
         logger.warning("[multitenancy] WebUI image preflight failed for %s: %s", path, exc)
         analysis = f"vision_analyze failed: {exc}"
 
-    fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
-        path,
-        api_key=fallback_api_key,
-        base_url=fallback_base_url,
-        model=fallback_model,
-    )
-    if fallback_analysis:
-        return True, fallback_analysis
+    if not tried_fallback:
+        fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
+            path,
+            api_key=fallback_api_key,
+            base_url=fallback_base_url,
+            model=fallback_model,
+        )
+        if fallback_analysis:
+            return True, fallback_analysis
     return False, analysis
 
 
@@ -4138,8 +4140,13 @@ def _enrich_webui_image_attachments_for_aiagent(
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
     prefer_openai_compatible: bool = False,
+    metadata_source: str | None = None,
 ) -> str:
-    if platform_key != "webui" or "Local image path for tools:" not in str(user_text or ""):
+    if (
+        platform_key != "webui"
+        or str(metadata_source or "").strip().lower() == "ingest"
+        or "Local image path for tools:" not in str(user_text or "")
+    ):
         return user_text
 
     workspace_root = _profile_workspace_root(profile_home, config)
@@ -4148,7 +4155,6 @@ def _enrich_webui_image_attachments_for_aiagent(
         normalized = _normalize_webui_uploaded_image_path(raw_path)
         resolved, skip_reason = _resolve_webui_uploaded_image_path(
             raw_path,
-            profile_home=profile_home,
             workspace_root=workspace_root,
         )
         if resolved is None:
@@ -4286,6 +4292,7 @@ def _run_with_aiagent(
 
     # 6) Pull source / session metadata for AIAgent kwargs.
     source = getattr(event, "source", None)
+    event_metadata = _event_metadata(event)
     user_text = getattr(event, "text", "") or ""
     original_user_text = user_text
     user_text = _enrich_webui_image_attachments_for_aiagent(
@@ -4297,6 +4304,7 @@ def _run_with_aiagent(
         fallback_base_url=base_url,
         fallback_model=model_only,
         prefer_openai_compatible=provider.startswith("custom"),
+        metadata_source=str(event_metadata.get("source") or ""),
     )
     session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
     gateway_session_key = _resolve_multitenant_gateway_session_key(
