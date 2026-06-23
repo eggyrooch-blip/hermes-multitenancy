@@ -2927,6 +2927,116 @@ def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeyp
     assert observed["async_delivery_supported"] is False
 
 
+def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured_session_vars: list[dict] = []
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(kwargs)
+        return object()
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=lambda token: None,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home) == "done"
+    assert captured_session_vars
+    assert captured_session_vars[0]["async_delivery"] is True
+
+
+def test_run_with_aiagent_warns_when_runtime_rejects_async_delivery_kwarg(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - delegate_task\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured_session_vars: list[dict] = []
+
+    def set_session_vars(**kwargs):
+        captured_session_vars.append(dict(kwargs))
+        if "async_delivery" in kwargs:
+            raise TypeError("set_session_vars() got an unexpected keyword argument 'async_delivery'")
+        return object()
+
+    fake_session_context = SimpleNamespace(
+        set_session_vars=set_session_vars,
+        clear_session_vars=lambda token: None,
+    )
+    gateway_mod = sys.modules.get("gateway") or types.ModuleType("gateway")
+    gateway_mod.session_context = fake_session_context
+    monkeypatch.setitem(sys.modules, "gateway", gateway_mod)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="analyze image",
+            session_id="webui-session-1",
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.agent_real"):
+        assert agent_real._run_with_aiagent(event, profile_home) == "done"
+
+    assert len(captured_session_vars) == 2
+    assert captured_session_vars[0]["async_delivery"] is False
+    assert "async_delivery" not in captured_session_vars[1]
+    assert "does not accept async_delivery" in caplog.text
+    assert "delegate_task background results may not return to WebUI" in caplog.text
+
+
 def test_approval_bridge_exposes_session_key_to_tool_worker_threads(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 

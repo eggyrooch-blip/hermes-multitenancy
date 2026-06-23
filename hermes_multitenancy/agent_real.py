@@ -4082,6 +4082,14 @@ def _run_with_aiagent(
             except TypeError as exc:
                 if "async_delivery" not in str(exc):
                     raise
+                logger.warning(
+                    "[multitenancy] Hermes gateway.session_context.set_session_vars "
+                    "does not accept async_delivery; delegate_task background "
+                    "results may not return to WebUI on this runtime "
+                    "(platform=%s profile=%s)",
+                    platform_key,
+                    profile_home.name,
+                )
                 session_var_kwargs.pop("async_delivery", None)
                 session_tokens = set_session_vars(**session_var_kwargs)
         def _emit(event_name: str, **payload: Any) -> None:
