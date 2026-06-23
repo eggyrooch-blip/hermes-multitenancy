@@ -162,6 +162,16 @@ use Hermes' normal asynchronous completion flow. If an older Hermes runtime does
 not accept the `async_delivery` context field, multitenancy logs an explicit
 warning before retrying the compatibility path.
 
+WebUI image attachments also get a profile-local preflight before the AIAgent
+conversation starts. The preflight only accepts local file markers that resolve
+inside the routed profile workspace, normalizes common WebUI paths such as
+`/workspace/uploads/...` to that workspace, and injects the vision result into
+the current user turn. If a marker points outside the workspace or cannot be
+read, the injected block says the image was not analyzed and tells the model not
+to infer unseen contents. OpenAI-compatible custom providers use the routed
+profile model as a fallback for the image analysis, so WebUI vision does not
+depend solely on Hermes' auxiliary `vision_analyze` provider wiring.
+
 For group-scoped credentials, keep one encrypted payload in the credential
 vault and let `hermes-multitenancy-sync pull-feishu` materialize only the
 compatibility file into each authorized profile:

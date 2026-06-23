@@ -3920,10 +3920,259 @@ _TRUNCATION_NOTICE = (
 # Distinct from _TRUNCATION_NOTICE: this is "the turn broke", not "answer too long".
 _PARTIAL_FAILURE_NOTICE = "⚠️ 这次回答中途出错了，没能说完。麻烦再发一次试试。"
 
+_WEBUI_IMAGE_LOCAL_PATH_RE = re.compile(r"(?im)^\s*Local image path for tools:\s*(?P<path>.+?)\s*$")
+_WEBUI_IMAGE_ANALYSIS_PROMPT = (
+    "Describe everything visible in this uploaded WebUI image. Include all visible "
+    "text, UI labels, numbers, objects, layout, colors, and any notable visual "
+    "details. Do not infer content that is not visible."
+)
+_WEBUI_IMAGE_PREFLIGHT_MAX_BYTES = 20 * 1024 * 1024
+
 
 def _is_output_truncation_error(err: Any) -> bool:
     text = str(err or "").lower()
     return "truncat" in text and "output length" in text
+
+
+def _profile_workspace_root(profile_home: Path, config: Mapping[str, Any] | None = None) -> Path:
+    terminal_cfg = (config or {}).get("terminal") if isinstance(config, Mapping) else None
+    configured = terminal_cfg.get("cwd") if isinstance(terminal_cfg, Mapping) else None
+    root = Path(str(configured)).expanduser() if configured else profile_home / "workspace"
+    return root.resolve(strict=False)
+
+
+def _normalize_webui_uploaded_image_path(raw_path: str) -> str:
+    value = str(raw_path or "").strip().strip("\"'`")
+    value = value.replace("\\", "/")
+    if value == "/workspace" or value == "workspace":
+        return "."
+    if value.startswith("/workspace/"):
+        return value[len("/workspace/"):]
+    if value.startswith("workspace/"):
+        return value[len("workspace/"):]
+    marker = "/workspace/"
+    marker_index = value.find(marker)
+    if marker_index >= 0:
+        return value[marker_index + len(marker):]
+    return value
+
+
+def _resolve_webui_uploaded_image_path(
+    raw_path: str,
+    *,
+    profile_home: Path,
+    workspace_root: Path,
+) -> tuple[Path | None, str | None]:
+    normalized = _normalize_webui_uploaded_image_path(raw_path)
+    if not normalized:
+        return None, "empty path"
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", normalized):
+        return None, "not a local profile-workspace path"
+    candidate = Path(normalized).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace_root / candidate
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(workspace_root)
+    except ValueError:
+        return None, "outside profile workspace"
+    if not resolved.exists() or not resolved.is_file():
+        return None, "file not found"
+    try:
+        if resolved.stat().st_size > _WEBUI_IMAGE_PREFLIGHT_MAX_BYTES:
+            return None, "file too large"
+    except OSError:
+        return None, "file not readable"
+    return resolved, None
+
+
+def _webui_image_attachment_paths(user_text: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in _WEBUI_IMAGE_LOCAL_PATH_RE.finditer(str(user_text or "")):
+        raw_path = match.group("path")
+        normalized = _normalize_webui_uploaded_image_path(raw_path)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        paths.append(raw_path)
+    return paths
+
+
+def _image_file_to_data_url(path: Path) -> str:
+    import base64
+    import mimetypes
+
+    mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+    if not mime_type.startswith("image/"):
+        mime_type = "image/png"
+    return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def _extract_openai_message_text(response: Any) -> str:
+    if isinstance(response, Mapping):
+        choices = response.get("choices") or []
+        if choices:
+            message = (choices[0] or {}).get("message") or {}
+            return str(message.get("content") or "").strip()
+        return ""
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    if isinstance(message, Mapping):
+        return str(message.get("content") or "").strip()
+    return str(getattr(message, "content", "") or "").strip()
+
+
+def _analyze_webui_image_with_openai_compatible_model(
+    path: Path,
+    *,
+    api_key: str | None,
+    base_url: str | None,
+    model: str | None,
+) -> str | None:
+    if not api_key or not model:
+        return None
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, base_url=base_url or None)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _WEBUI_IMAGE_ANALYSIS_PROMPT},
+                        {"type": "image_url", "image_url": {"url": _image_file_to_data_url(path)}},
+                    ],
+                }
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        return _extract_openai_message_text(response) or None
+    except Exception as exc:
+        logger.warning(
+            "[multitenancy] WebUI custom-provider image preflight failed for %s: %s",
+            path,
+            exc,
+        )
+        return None
+
+
+def _analyze_webui_uploaded_image(
+    path: Path,
+    *,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
+    prefer_openai_compatible: bool = False,
+) -> tuple[bool, str]:
+    import asyncio
+
+    if prefer_openai_compatible:
+        fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
+            path,
+            api_key=fallback_api_key,
+            base_url=fallback_base_url,
+            model=fallback_model,
+        )
+        if fallback_analysis:
+            return True, fallback_analysis
+
+    analysis = ""
+    try:
+        from tools.vision_tools import vision_analyze_tool
+
+        result_json = asyncio.run(
+            vision_analyze_tool(
+                image_url=str(path),
+                user_prompt=_WEBUI_IMAGE_ANALYSIS_PROMPT,
+            )
+        )
+        result = json.loads(result_json) if isinstance(result_json, str) else {}
+        analysis = str(result.get("analysis") or "").strip()
+        success = bool(result.get("success")) and bool(analysis)
+        if success:
+            return success, analysis
+        if not analysis:
+            analysis = "vision_analyze returned no analysis."
+    except Exception as exc:
+        logger.warning("[multitenancy] WebUI image preflight failed for %s: %s", path, exc)
+        analysis = f"vision_analyze failed: {exc}"
+
+    fallback_analysis = _analyze_webui_image_with_openai_compatible_model(
+        path,
+        api_key=fallback_api_key,
+        base_url=fallback_base_url,
+        model=fallback_model,
+    )
+    if fallback_analysis:
+        return True, fallback_analysis
+    return False, analysis
+
+
+def _enrich_webui_image_attachments_for_aiagent(
+    user_text: str,
+    *,
+    platform_key: str,
+    profile_home: Path,
+    config: Mapping[str, Any] | None = None,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
+    prefer_openai_compatible: bool = False,
+) -> str:
+    if platform_key != "webui" or "Local image path for tools:" not in str(user_text or ""):
+        return user_text
+
+    workspace_root = _profile_workspace_root(profile_home, config)
+    analysis_blocks: list[str] = []
+    for raw_path in _webui_image_attachment_paths(user_text):
+        normalized = _normalize_webui_uploaded_image_path(raw_path)
+        resolved, skip_reason = _resolve_webui_uploaded_image_path(
+            raw_path,
+            profile_home=profile_home,
+            workspace_root=workspace_root,
+        )
+        if resolved is None:
+            analysis_blocks.append(
+                "\n".join([
+                    "[WebUI image attachment analysis]",
+                    f"Image path: {normalized}",
+                    f"Status: not analyzed ({skip_reason}).",
+                    "Do not infer this image's visual contents without a successful vision analysis.",
+                    "[End WebUI image attachment analysis]",
+                ])
+            )
+            continue
+
+        success, analysis = _analyze_webui_uploaded_image(
+            resolved,
+            fallback_api_key=fallback_api_key,
+            fallback_base_url=fallback_base_url,
+            fallback_model=fallback_model,
+            prefer_openai_compatible=prefer_openai_compatible,
+        )
+        status = "success" if success else "failed"
+        analysis_blocks.append(
+            "\n".join([
+                "[WebUI image attachment analysis]",
+                f"Image path: {normalized}",
+                f"Resolved file: {resolved}",
+                "Source: WebUI image preflight on the uploaded profile-workspace file.",
+                f"Status: {status}",
+                "Analysis:",
+                analysis,
+                "[End WebUI image attachment analysis]",
+            ])
+        )
+
+    if not analysis_blocks:
+        return user_text
+    return "\n\n".join(analysis_blocks + [user_text])
 
 
 def _run_with_aiagent(
@@ -4020,13 +4269,24 @@ def _run_with_aiagent(
     # 6) Pull source / session metadata for AIAgent kwargs.
     source = getattr(event, "source", None)
     user_text = getattr(event, "text", "") or ""
+    original_user_text = user_text
+    user_text = _enrich_webui_image_attachments_for_aiagent(
+        user_text,
+        platform_key=platform_key,
+        profile_home=profile_home,
+        config=config,
+        fallback_api_key=api_key,
+        fallback_base_url=base_url,
+        fallback_model=model_only,
+        prefer_openai_compatible=provider.startswith("custom"),
+    )
     session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
     gateway_session_key = _resolve_multitenant_gateway_session_key(
         event,
         profile_home,
         sender_open_id,
     )
-    conversation_history = _conversation_history_for_aiagent(messages, user_text)
+    conversation_history = _conversation_history_for_aiagent(messages, original_user_text)
 
     runtime_kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:

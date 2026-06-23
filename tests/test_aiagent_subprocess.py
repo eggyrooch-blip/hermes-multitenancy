@@ -2927,6 +2927,232 @@ def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeyp
     assert observed["async_delivery_supported"] is False
 
 
+def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    observed: dict[str, object] = {}
+    vision_calls: list[dict[str, object]] = []
+
+    async def fake_vision_analyze_tool(image_url, user_prompt=None):
+        vision_calls.append({"image_url": image_url, "user_prompt": user_prompt})
+        return json.dumps({
+            "success": True,
+            "analysis": "账单详情：Keep停车费收款码，金额 385.00，交易成功。",
+        })
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fake_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: IMG_4057.PNG]",
+                "Local image path for tools: uploads/receipt.png",
+                'If analyzing this image, call vision_analyze with image_url "uploads/receipt.png" directly.',
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert vision_calls == [{
+        "image_url": str(upload_path),
+        "user_prompt": "Describe everything visible in this uploaded WebUI image. Include all visible text, UI labels, numbers, objects, layout, colors, and any notable visual details. Do not infer content that is not visible.",
+    }]
+    assert "WebUI image attachment analysis" in str(observed["user_message"])
+    assert "账单详情" in str(observed["user_message"])
+    assert "385.00" in str(observed["user_message"])
+
+
+def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "\n".join([
+            "model:",
+            "  default: custom:litellm-sre/tencent-sonnet-4-6",
+            "  base_url: https://litellm.example/v1",
+            "custom_providers:",
+            "  - name: litellm-sre",
+            "    base_url: https://litellm.example/v1",
+            "    api_key: test-key",
+            "platform_toolsets:",
+            "  webui:",
+            "    - lark-cli",
+        ]),
+        encoding="utf-8",
+    )
+
+    observed: dict[str, object] = {}
+
+    async def failing_vision_analyze_tool(image_url, user_prompt=None):
+        return json.dumps({
+            "success": False,
+            "analysis": "No LLM provider configured for task=vision provider=auto.",
+        })
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = failing_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    openai_calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            openai_calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="账单详情：Keep停车费收款码，金额 385.00，交易成功。"
+                        )
+                    )
+                ]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key, base_url=None):
+            observed["openai_client"] = {"api_key": api_key, "base_url": base_url}
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: IMG_4057.PNG]",
+                "Local image path for tools: uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    assert observed["openai_client"] == {
+        "api_key": "test-key",
+        "base_url": "https://litellm.example/v1",
+    }
+    assert openai_calls[0]["model"] == "tencent-sonnet-4-6"
+    assert openai_calls[0]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "账单详情" in str(observed["user_message"])
+    assert "385.00" in str(observed["user_message"])
+    assert "No LLM provider configured" not in str(observed["user_message"])
+
+
+def test_run_with_aiagent_does_not_prefill_webui_image_outside_workspace(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    (profile_home / "workspace" / "uploads").mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    async def fail_vision_analyze_tool(*_args, **_kwargs):
+        raise AssertionError("outside-workspace markers must not be analyzed")
+
+    fake_vision = types.ModuleType("tools.vision_tools")
+    fake_vision.vision_analyze_tool = fail_vision_analyze_tool
+    monkeypatch.setitem(sys.modules, "tools.vision_tools", fake_vision)
+
+    observed: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: fake.png]",
+                "Local image path for tools: /etc/passwd",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    user_message = str(observed["user_message"])
+    assert "Status: not analyzed (outside profile workspace)." in user_message
+    assert "Do not infer this image's visual contents" in user_message
+
+
 def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
