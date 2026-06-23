@@ -15,9 +15,11 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +50,17 @@ _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE = 32 * 1024 * 1024
 # disk-fill / DoS on an internet-exposed route (the 32MB broker default is for
 # WebUI run submissions, not webhooks).
 _SKILLHUB_MAX_BODY_BYTES = 256 * 1024
+_INGEST_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_INGEST_SECRET_TYPES = frozenset({"bearer_token", "api_key", "cookie", "basic", "opaque"})
+_INGEST_SECRET_MAX_VALUE_BYTES = 16 * 1024
+_INGEST_SECRET_MAX_TOTAL_BYTES = 64 * 1024
+_INGEST_SECRET_USAGE = {
+    "bearer_token": "Authorization Bearer",
+    "api_key": "API key/header/query credential",
+    "cookie": "Cookie header",
+    "basic": "HTTP Basic authorization",
+    "opaque": "caller-defined opaque secret",
+}
 
 _runner: Any = None
 _site: Any = None
@@ -463,6 +476,20 @@ def _ingest_public_interaction(payload: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+_INGEST_RESERVED_METADATA_KEYS = {
+    "ingest_secret_dir",
+    "ingest_secret_fingerprint",
+    "ingest_secrets",
+}
+
+
+def _sanitize_ingest_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(metadata or {})
+    for key in _INGEST_RESERVED_METADATA_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
+
+
 def _ingest_timeout() -> float:
     """Hard wall-clock cap (seconds) for a synchronous ingest run.
 
@@ -520,6 +547,162 @@ def _ingest_auth_fingerprint(request: Any, binding: dict[str, str]) -> str:
     )
     scope_hash = hashlib.sha256(scope.encode("utf-8")).hexdigest()
     return f"{binding.get('source', '')}:{scope_hash}:{token_hash}"
+
+
+def _parse_ingest_secrets(payload: dict[str, Any]) -> tuple[SimpleNamespace | None, str | None]:
+    raw = payload.get("secrets")
+    if raw is None:
+        entries: list[dict[str, str]] = []
+        manifest: list[dict[str, str]] = []
+        fingerprint_source: list[dict[str, str]] = []
+        fingerprint = hashlib.sha256(b"[]").hexdigest()
+        return SimpleNamespace(
+            entries=entries,
+            manifest=manifest,
+            fingerprint=fingerprint,
+        ), None
+    if not isinstance(raw, dict):
+        return None, "secrets must be a JSON object"
+
+    entries = []
+    manifest = []
+    fingerprint_source = []
+    total_bytes = 0
+    for name, item in sorted(raw.items(), key=lambda kv: str(kv[0])):
+        name = str(name or "")
+        if not _INGEST_SECRET_NAME_RE.fullmatch(name):
+            return None, "invalid secret name"
+        if not isinstance(item, dict):
+            return None, "secret entry must be an object"
+        secret_type = str(item.get("type") or "").strip()
+        if secret_type not in _INGEST_SECRET_TYPES:
+            return None, "invalid secret type"
+        value = item.get("value")
+        if not isinstance(value, str) or not value:
+            return None, "secret value must be a non-empty string"
+        value_bytes = value.encode("utf-8")
+        if len(value_bytes) > _INGEST_SECRET_MAX_VALUE_BYTES:
+            return None, "secret value too large"
+        total_bytes += len(value_bytes)
+        if total_bytes > _INGEST_SECRET_MAX_TOTAL_BYTES:
+            return None, "secrets payload too large"
+        value_sha = hashlib.sha256(value_bytes).hexdigest()
+        usage = _INGEST_SECRET_USAGE.get(secret_type, "caller-defined secret")
+        entries.append(
+            {
+                "name": name,
+                "type": secret_type,
+                "value": value,
+                "sha256": value_sha,
+                "usage": usage,
+            }
+        )
+        manifest.append({"name": name, "type": secret_type, "usage": usage})
+        fingerprint_source.append({"name": name, "type": secret_type, "sha256": value_sha})
+
+    fingerprint_payload = json.dumps(
+        fingerprint_source,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return SimpleNamespace(
+        entries=entries,
+        manifest=manifest,
+        fingerprint=hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest(),
+    ), None
+
+
+def _ingest_secret_manifest_prompt(manifest: list[dict[str, str]]) -> str:
+    if not manifest:
+        return ""
+    lines = [
+        "Ingest runtime secrets are available to tools only; their values are not visible here.",
+        "Use files under $HERMES_INGEST_SECRET_DIR by secret name when a tool needs them:",
+    ]
+    for item in manifest:
+        lines.append(
+            f"- `{item['name']}`: type `{item['type']}`, usage: {item.get('usage') or 'secret'}"
+        )
+    return "\n".join(lines)
+
+
+def _ingest_redact_text(text: Any, secret_spec: SimpleNamespace | None) -> str:
+    value = str(text or "")
+    if not secret_spec:
+        return value
+    entries = list(getattr(secret_spec, "entries", []) or [])
+    for item in sorted(entries, key=lambda entry: len(entry.get("value") or ""), reverse=True):
+        secret_value = str(item.get("value") or "")
+        if secret_value:
+            value = value.replace(secret_value, f"[REDACTED:{item.get('name') or 'secret'}]")
+    return value
+
+
+def _ingest_materialize_secret_dir(
+    *,
+    profile_name: str,
+    run_id: str,
+    secret_spec: SimpleNamespace | None,
+) -> str:
+    if not secret_spec or not getattr(secret_spec, "entries", None):
+        return ""
+    root = _profile_home_for_name(profile_name) / "tmp" / "ingest-secrets"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.chmod(0o700)
+    except Exception:
+        pass
+    secret_dir = root / run_id
+    secret_dir.mkdir(parents=False, exist_ok=False, mode=0o700)
+    for item in secret_spec.entries:
+        path = secret_dir / item["name"]
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, item["value"].encode("utf-8"))
+        finally:
+            os.close(fd)
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+    logger.info(
+        "[multitenancy] ingest secrets materialized profile=%s run_id=%s secrets=%s",
+        profile_name,
+        run_id,
+        [
+            {
+                "name": item["name"],
+                "type": item["type"],
+                "sha256": str(item["sha256"])[:12],
+            }
+            for item in secret_spec.entries
+        ],
+    )
+    return str(secret_dir)
+
+
+def _ingest_cleanup_secret_dir(secret_dir: str | os.PathLike[str] | None) -> None:
+    if not secret_dir:
+        return
+    try:
+        shutil.rmtree(Path(secret_dir), ignore_errors=True)
+    except Exception:
+        logger.debug("[multitenancy] failed to cleanup ingest secret dir", exc_info=True)
+
+
+def _ingest_secret_mismatch_response(profile_name: str):
+    from aiohttp import web
+
+    return web.json_response(
+        {
+            "ok": False,
+            "status": "secret_mismatch",
+            "error": "secret_mismatch",
+            "profile": profile_name,
+        },
+        status=409,
+    )
 
 
 def _ingest_owner() -> str:
@@ -1188,8 +1371,15 @@ def _metadata_with_webui_runtime_context(metadata: dict[str, Any] | None) -> dic
 
 def _build_webui_event(request: RunRequest) -> Any:
     """Create the smallest event shape expected by ProfileRuntime/agent_real."""
+    metadata = _metadata_with_webui_runtime_context(request.metadata)
+    secret_prompt = _ingest_secret_manifest_prompt(
+        list(metadata.get("ingest_secrets") or [])
+        if isinstance(metadata.get("ingest_secrets"), list)
+        else []
+    )
+    event_text = request.content if not secret_prompt else f"{secret_prompt}\n\n{request.content}"
     return SimpleNamespace(
-        text=request.content,
+        text=event_text,
         message_id=request.message_id,
         channel="webui",
         sender_open_id=request.user_key if str(request.user_key or "").startswith("ou_") else "",
@@ -1205,7 +1395,7 @@ def _build_webui_event(request: RunRequest) -> Any:
         raw_event={
             "channel": request.channel,
             "session_id": request.session_id,
-            "metadata": _metadata_with_webui_runtime_context(request.metadata),
+            "metadata": metadata,
         },
     )
 
@@ -1431,7 +1621,7 @@ def create_run_broker_app(
                 delivery_mode=payload.get("delivery_mode") or "socket",
                 credential_subject=trusted_owner or payload.get("credential_subject"),
                 requires_host_tools=bool(payload.get("requires_host_tools")),
-                metadata=payload.get("metadata") or {},
+                metadata=_sanitize_ingest_metadata(payload.get("metadata") or {}),
                 messages=payload.get("messages") or [],
             )
         except Exception as exc:
@@ -1505,6 +1695,7 @@ def create_run_broker_app(
     # in-memory dedup — survives within one broker process, not across.
     _ingest_results: dict[str, dict[str, Any]] = {}
     _ingest_results_at: dict[str, float] = {}
+    _ingest_secret_fingerprints: dict[str, str] = {}
     _INGEST_RESULT_TTL = 3600.0
     _INGEST_RESULT_CAP = 256
 
@@ -1566,6 +1757,11 @@ def create_run_broker_app(
             return None, web.json_response(
                 {"ok": False, "error": "content is required"}, status=400
             )
+        secret_spec, secret_error = _parse_ingest_secrets(payload)
+        if secret_error:
+            return None, web.json_response(
+                {"ok": False, "error": secret_error}, status=400
+            )
 
         profile_bound_by_key = bool(bound_profile_from_key and ingest_binding.get("source") == "file")
         if profile_bound_by_key:
@@ -1611,11 +1807,13 @@ def create_run_broker_app(
         metadata: dict[str, Any] = {}
         extra_meta = payload.get("metadata")
         if isinstance(extra_meta, dict):
-            metadata.update(extra_meta)
+            metadata.update(_sanitize_ingest_metadata(extra_meta))
         model = str(payload.get("model") or "").strip()
         if model:
             metadata["model"] = model
         metadata["source"] = "ingest"
+        if secret_spec and secret_spec.manifest:
+            metadata["ingest_secrets"] = list(secret_spec.manifest)
 
         # Ingest is an external execution surface: the caller cannot downgrade
         # sandbox admission by declaring that host tools are unnecessary.
@@ -1637,18 +1835,23 @@ def create_run_broker_app(
         except Exception as exc:
             return None, web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-        cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        idempotency_cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        cache_key = f"{idempotency_cache_key}\x00secret:{secret_spec.fingerprint if secret_spec else ''}"
         return SimpleNamespace(
             binding=ingest_binding,
             auth_fingerprint=_ingest_auth_fingerprint(request, ingest_binding),
             bound_profile=bound_profile,
             cache_key=cache_key,
+            idempotency_cache_key=idempotency_cache_key,
             interactive=interactive,
             run_request=run_request,
+            secret_spec=secret_spec,
+            secret_fingerprint=secret_spec.fingerprint if secret_spec else "",
         ), None
 
     _ingest_async_jobs: dict[str, dict[str, Any]] = {}
     _ingest_async_by_cache: dict[str, str] = {}
+    _ingest_async_secret_fingerprints: dict[str, str] = {}
     _INGEST_ASYNC_ACTIVE_STATUSES = {"pending", "running"}
 
     def _ingest_async_is_active(job: dict[str, Any]) -> bool:
@@ -1658,9 +1861,20 @@ def create_run_broker_app(
         job = _ingest_async_jobs.pop(run_id, None)
         if not job:
             return
+        _ingest_cleanup_secret_dir(str(job.get("secret_dir") or ""))
         cache = str(job.get("async_cache_key") or "")
         if cache and _ingest_async_by_cache.get(cache) == run_id:
             _ingest_async_by_cache.pop(cache, None)
+        idempotency_cache = str(job.get("async_idempotency_cache_key") or "")
+        if (
+            idempotency_cache
+            and idempotency_cache in _ingest_async_secret_fingerprints
+            and not any(
+                str(other.get("async_idempotency_cache_key") or "") == idempotency_cache
+                for other in _ingest_async_jobs.values()
+            )
+        ):
+            _ingest_async_secret_fingerprints.pop(idempotency_cache, None)
 
     def _ingest_async_prune() -> None:
         now = time.time()
@@ -1696,6 +1910,9 @@ def create_run_broker_app(
         job["status"] = status
         job["updated_at"] = now
         job["expires_at"] = now + _ingest_async_ttl()
+        if status not in _INGEST_ASYNC_ACTIVE_STATUSES:
+            _ingest_cleanup_secret_dir(str(job.get("secret_dir") or ""))
+            job["secret_dir"] = ""
 
     def _ingest_async_submit_response(job: dict[str, Any], *, duplicate: bool) -> dict[str, Any]:
         run_id = str(job["run_id"])
@@ -1806,7 +2023,7 @@ def create_run_broker_app(
             _ingest_async_touch(job, "timeout")
             return
         except RunRejected as exc:
-            job["error"] = str(exc)
+            job["error"] = _ingest_redact_text(str(exc), prepared.secret_spec)
             _ingest_async_touch(job, "failed")
             return
         except Exception:
@@ -1816,8 +2033,12 @@ def create_run_broker_app(
             return
 
         text = "".join(collected).strip() or (result.content if result else "")
+        text = _ingest_redact_text(text, prepared.secret_spec)
         if error_text.get("error"):
-            logger.error("[multitenancy] async ingest agent error: %s", error_text["error"])
+            logger.error(
+                "[multitenancy] async ingest agent error: %s",
+                _ingest_redact_text(error_text["error"], prepared.secret_spec),
+            )
             job["error"] = "agent run failed"
             _ingest_async_touch(job, "failed")
             return
@@ -1843,6 +2064,11 @@ def create_run_broker_app(
         if error_response is not None:
             return error_response
         _ingest_async_prune()
+
+        idempotency_secret_key = f"{prepared.auth_fingerprint}\x00{prepared.idempotency_cache_key}"
+        known_fingerprint = _ingest_async_secret_fingerprints.get(idempotency_secret_key)
+        if known_fingerprint and known_fingerprint != prepared.secret_fingerprint:
+            return _ingest_secret_mismatch_response(prepared.bound_profile)
 
         async_cache_key = f"{prepared.auth_fingerprint}\x00{prepared.cache_key}"
         existing_id = _ingest_async_by_cache.get(async_cache_key)
@@ -1886,10 +2112,25 @@ def create_run_broker_app(
             )
 
         run_id = "ing_" + secrets.token_urlsafe(16)
+        try:
+            secret_dir = _ingest_materialize_secret_dir(
+                profile_name=prepared.bound_profile,
+                run_id=run_id,
+                secret_spec=prepared.secret_spec,
+            )
+        except Exception:
+            logger.exception("[multitenancy] async ingest secret store failed")
+            return web.json_response({"ok": False, "error": "invalid secrets"}, status=400)
+        if secret_dir:
+            prepared.run_request = replace(
+                prepared.run_request,
+                metadata={**prepared.run_request.metadata, "ingest_secret_dir": secret_dir},
+            )
         now = time.time()
         job = {
             "run_id": run_id,
             "async_cache_key": async_cache_key,
+            "async_idempotency_cache_key": idempotency_secret_key,
             "auth_fingerprint": prepared.auth_fingerprint,
             "profile": prepared.bound_profile,
             "status": "pending",
@@ -1899,9 +2140,11 @@ def create_run_broker_app(
             "created_at": now,
             "updated_at": now,
             "expires_at": now + _ingest_async_ttl(),
+            "secret_dir": secret_dir,
         }
         _ingest_async_jobs[run_id] = job
         _ingest_async_by_cache[async_cache_key] = run_id
+        _ingest_async_secret_fingerprints[idempotency_secret_key] = prepared.secret_fingerprint
         job["task"] = asyncio.create_task(_run_ingest_async_job(run_id, prepared))
         return web.json_response(
             _ingest_async_submit_response(job, duplicate=False),
@@ -1977,6 +2220,11 @@ def create_run_broker_app(
             return web.json_response(
                 {"ok": False, "error": "content is required"}, status=400
             )
+        secret_spec, secret_error = _parse_ingest_secrets(payload)
+        if secret_error:
+            return web.json_response(
+                {"ok": False, "error": secret_error}, status=400
+            )
 
         # Identity resolution (owner/default computed above, right after auth).
         # - OWNER mode (HERMES_INGEST_OWNER set): the caller MUST name one of the
@@ -2038,11 +2286,13 @@ def create_run_broker_app(
         metadata: dict[str, Any] = {}
         extra_meta = payload.get("metadata")
         if isinstance(extra_meta, dict):
-            metadata.update(extra_meta)
+            metadata.update(_sanitize_ingest_metadata(extra_meta))
         model = str(payload.get("model") or "").strip()
         if model:
             metadata["model"] = model
         metadata["source"] = "ingest"
+        if secret_spec and secret_spec.manifest:
+            metadata["ingest_secrets"] = list(secret_spec.manifest)
 
         # Gap A — host tools on (parity with cron/kanban), so credential-backed
         # skills work. Ingest is an external execution surface: the caller
@@ -2069,7 +2319,28 @@ def create_run_broker_app(
         # Review B3: namespace the idempotency cache by the resolved profile so
         # the same explicit idempotency_key used against two different owner
         # agents can never replay the wrong agent's cached result.
-        cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        idempotency_cache_key = f"{bound_profile}\x00{run_request.effective_idempotency_key}"
+        secret_fingerprint = secret_spec.fingerprint if secret_spec else ""
+        known_fingerprint = _ingest_secret_fingerprints.get(idempotency_cache_key)
+        if known_fingerprint and known_fingerprint != secret_fingerprint:
+            return _ingest_secret_mismatch_response(bound_profile)
+        cache_key = f"{idempotency_cache_key}\x00secret:{secret_fingerprint}"
+        secret_dir = ""
+        try:
+            secret_dir = _ingest_materialize_secret_dir(
+                profile_name=bound_profile,
+                run_id="sync_" + secrets.token_urlsafe(16),
+                secret_spec=secret_spec,
+            )
+        except Exception:
+            logger.exception("[multitenancy] ingest secret store failed")
+            return web.json_response({"ok": False, "error": "invalid secrets"}, status=400)
+        if secret_dir:
+            run_request = replace(
+                run_request,
+                metadata={**run_request.metadata, "ingest_secret_dir": secret_dir},
+            )
+        _ingest_secret_fingerprints[idempotency_cache_key] = secret_fingerprint
         collected: list[str] = []
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
@@ -2157,7 +2428,10 @@ def create_run_broker_app(
             )
         except RunRejected as exc:
             # Policy rejection text is safe-ish, but keep it short.
-            return web.json_response({"ok": False, "error": str(exc)}, status=403)
+            return web.json_response(
+                {"ok": False, "error": _ingest_redact_text(str(exc), secret_spec)},
+                status=403,
+            )
         except Exception:
             # Review NB3: do not leak internal exception text to an
             # internet-facing caller — log server-side, return generic.
@@ -2165,15 +2439,21 @@ def create_run_broker_app(
             return web.json_response(
                 {"ok": False, "error": "internal error"}, status=500
             )
+        finally:
+            _ingest_cleanup_secret_dir(secret_dir)
 
         if error_text.get("error"):
-            logger.error("[multitenancy] ingest agent error: %s", error_text["error"])
+            logger.error(
+                "[multitenancy] ingest agent error: %s",
+                _ingest_redact_text(error_text["error"], secret_spec),
+            )
             return web.json_response(
                 {"ok": False, "error": "agent run failed", "profile": bound_profile},
                 status=500,
             )
 
         text = "".join(collected).strip() or (result.content if result else "")
+        text = _ingest_redact_text(text, secret_spec)
 
         # Gap D — duplicate submission returns the ORIGINAL structured response
         # (success OR needs_*), not empty. Review NB-new2: caching the full

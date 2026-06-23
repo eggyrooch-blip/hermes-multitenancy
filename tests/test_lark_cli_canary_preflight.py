@@ -52,7 +52,7 @@ def test_preflight_ready_when_binary_app_and_uat_exist(monkeypatch, tmp_path: Pa
             subject_id="feishu_app",
             provider="feishu",
             secret_kind="app",
-            payload={"app_id": "cli_public", "app_secret": "secret"},
+            payload={"app_id": "cli_public", "app_secret": "app-secret-value"},
         )
         store.put_credential(
             profile_name="alice",
@@ -76,9 +76,9 @@ def test_preflight_ready_when_binary_app_and_uat_exist(monkeypatch, tmp_path: Pa
     assert result["canary"]["mode"] == "api"
     assert result["canary"]["argv"] == ["api", "GET", "/open-apis/authen/v1/user_info"]
     assert result["canary"]["identity"] == "user"
+    assert "app-secret-value" not in str(result)
     assert "uat-secret" not in str(result)
     assert "refresh-secret" not in str(result)
-    assert "secret" not in str(result).replace("secret_free", "")
 
 
 def test_preflight_does_not_trust_db_uat_status_without_runtime_payload(monkeypatch, tmp_path: Path):

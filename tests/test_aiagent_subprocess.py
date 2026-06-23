@@ -4122,6 +4122,57 @@ def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatc
         assert env["HERMES_AIAGENT_EVENT_STREAM"] == "1"
 
 
+def test_aiagent_subprocess_env_scope_exposes_ingest_secret_dir_without_values(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    secret_dir = tmp_path / "profiles" / "alice" / "tmp" / "ingest-secrets" / "run1"
+    approval_dir.mkdir(parents=True)
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text("full-secret-token", encoding="utf-8")
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": [
+                {
+                    "name": "cms_bearer",
+                    "type": "bearer_token",
+                    "usage": "Authorization Bearer",
+                }
+            ],
+        }
+    }
+
+    @contextmanager
+    def fake_scope(_profile_home, _sender_open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_scope)
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-env-must-not-leak")
+
+    with agent_real._aiagent_subprocess_env_scope(
+        event,
+        profile,
+        approval_dir=approval_dir,
+    ) as env:
+        assert env["HERMES_INGEST_SECRET_DIR"] == str(secret_dir)
+        manifest = json.loads(env["HERMES_INGEST_SECRET_MANIFEST"])
+        assert manifest == [
+            {
+                "name": "cms_bearer",
+                "type": "bearer_token",
+                "usage": "Authorization Bearer",
+            }
+        ]
+        assert "full-secret-token" not in json.dumps(env)
+        assert "OPENAI_API_KEY" not in env
+
+
 def test_aiagent_subprocess_env_scope_prefers_raw_feishu_open_id_for_broker(monkeypatch, tmp_path: Path):
     """Feishu route ids like g41a5b5g must not be used as UAT broker subjects."""
     from hermes_multitenancy import agent_real

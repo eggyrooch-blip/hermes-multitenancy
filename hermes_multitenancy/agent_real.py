@@ -1243,6 +1243,39 @@ def _event_to_subprocess_payload(
     return payload
 
 
+def _ingest_secret_env_from_event(event: Any) -> dict[str, str]:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return {}
+    metadata = raw_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    secret_dir = str(metadata.get("ingest_secret_dir") or "").strip()
+    manifest_raw = metadata.get("ingest_secrets")
+    if not secret_dir or not isinstance(manifest_raw, list):
+        return {}
+
+    manifest: list[dict[str, str]] = []
+    for item in manifest_raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        secret_type = str(item.get("type") or "").strip()
+        usage = str(item.get("usage") or "").strip()
+        if name and secret_type:
+            manifest.append({"name": name, "type": secret_type, "usage": usage})
+    if not manifest:
+        return {}
+    return {
+        "HERMES_INGEST_SECRET_DIR": secret_dir,
+        "HERMES_INGEST_SECRET_MANIFEST": json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+
+
 # Whitelisted parent-process env keys carried into AIAgent subprocesses.
 #
 # Anything not listed here is dropped before spawning the child — this is the
@@ -1817,6 +1850,7 @@ def _aiagent_subprocess_env_scope(
 
     sender_open_id = _resolve_subprocess_sender_open_id(event)
     merged_extra = dict(extra or {})
+    merged_extra.update(_ingest_secret_env_from_event(event))
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
     broker_token = ""

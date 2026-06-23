@@ -68,6 +68,58 @@ def test_webui_run_broker_endpoint_streams_channel_neutral_events():
     asyncio.run(runner())
 
 
+def test_webui_run_broker_strips_ingest_secret_metadata_from_caller(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def runner():
+        captured = {}
+
+        async def dispatch(request):
+            event = broker_mod._build_webui_event(request)
+            captured["metadata"] = dict(request.metadata)
+            captured["event_text"] = event.text
+            captured["raw_event_metadata"] = dict(event.raw_event["metadata"])
+            return f"echo:{request.content}"
+
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "hello broker",
+                "metadata": {
+                    "trace": "t1",
+                    "ingest_secret_dir": str(tmp_path / "fake-secrets"),
+                    "ingest_secrets": [
+                        {"name": "fake", "type": "opaque", "usage": "spoofed"}
+                    ],
+                },
+            })
+            await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert captured["metadata"]["trace"] == "t1"
+        assert "ingest_secret_dir" not in captured["metadata"]
+        assert "ingest_secrets" not in captured["metadata"]
+        assert "ingest_secret_dir" not in captured["raw_event_metadata"]
+        assert "ingest_secrets" not in captured["raw_event_metadata"]
+        assert captured["event_text"] == "hello broker"
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_accepts_image_sized_json_body(monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

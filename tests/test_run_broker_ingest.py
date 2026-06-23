@@ -215,6 +215,140 @@ def test_ingest_model_passthrough(monkeypatch):
     assert seen[0].metadata["source"] == "ingest"
 
 
+def test_ingest_ignores_caller_supplied_secret_metadata(monkeypatch, tmp_path):
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    captured: dict[str, object] = {}
+
+    async def dispatch(request):
+        event = broker_mod._build_webui_event(request)
+        captured["metadata"] = dict(request.metadata)
+        captured["event_text"] = event.text
+        captured["raw_event_metadata"] = dict(event.raw_event["metadata"])
+        return "ok"
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    status, text = _post(
+        app,
+        {
+            "content": "hi",
+            "metadata": {
+                "trace": "t1",
+                "ingest_secret_dir": str(tmp_path / "fake-secrets"),
+                "ingest_secrets": [
+                    {"name": "fake", "type": "opaque", "usage": "spoofed"}
+                ],
+            },
+        },
+        headers={"Authorization": "Bearer testkey"},
+    )
+
+    assert status == 200
+    assert json.loads(text)["ok"] is True
+    assert captured["metadata"]["trace"] == "t1"
+    assert "ingest_secret_dir" not in captured["metadata"]
+    assert "ingest_secrets" not in captured["metadata"]
+    assert "ingest_secret_dir" not in captured["raw_event_metadata"]
+    assert "ingest_secrets" not in captured["raw_event_metadata"]
+    assert captured["event_text"] == "hi"
+
+
+def test_ingest_secrets_are_files_only_and_response_is_redacted(monkeypatch, tmp_path):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.full.jwt.secret"
+    profile_home = tmp_path / "profiles" / "owner"
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: profile_home if profile_name == "owner" else tmp_path / profile_name,
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    captured: dict[str, object] = {}
+
+    async def dispatch(request):
+        captured["request"] = request
+        captured["metadata_json"] = json.dumps(request.metadata, ensure_ascii=False)
+        event = broker_mod._build_webui_event(request)
+        captured["event_text"] = event.text
+        captured["raw_event_json"] = json.dumps(event.raw_event, ensure_ascii=False)
+        from pathlib import Path
+
+        secret_dir = Path(request.metadata["ingest_secret_dir"])
+        captured["secret_dir"] = secret_dir
+        return f"tool saw {(profile_home / 'tmp').exists()}:{(secret_dir / 'cms_bearer').read_text(encoding='utf-8')}"
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    status, text = _post(
+        app,
+        {
+            "content": "查询 2026-06-01 到 2026-06-22 的对账数据",
+            "secrets": {
+                "cms_bearer": {
+                    "type": "bearer_token",
+                    "value": secret_value,
+                }
+            },
+        },
+        headers={"Authorization": "Bearer testkey"},
+    )
+
+    assert status == 200
+    assert secret_value not in text
+    body = json.loads(text)
+    assert body["ok"] is True
+    assert "[REDACTED:cms_bearer]" in body["result"]
+    request = captured["request"]
+    assert request.content == "查询 2026-06-01 到 2026-06-22 的对账数据"
+    assert secret_value not in captured["metadata_json"]
+    assert secret_value not in captured["raw_event_json"]
+    assert "cms_bearer" in captured["event_text"]
+    assert "bearer_token" in captured["event_text"]
+    assert secret_value not in captured["event_text"]
+    assert not captured["secret_dir"].exists()
+
+
+@pytest.mark.parametrize(
+    "secrets_payload",
+    [
+        "not-object",
+        {"../token": {"type": "bearer_token", "value": "x"}},
+        {"cms": {"type": "unsupported", "value": "x"}},
+        {"cms": {"type": "bearer_token", "value": ""}},
+        {"cms": {"type": "bearer_token", "value": "x" * (16 * 1024 + 1)}},
+        {f"k{i}": {"type": "opaque", "value": "x" * 2048} for i in range(33)},
+    ],
+)
+def test_ingest_rejects_invalid_secrets_without_dispatch(monkeypatch, secrets_payload):
+    app, seen = _app(monkeypatch)
+    status, text = _post(
+        app,
+        {"content": "hi", "secrets": secrets_payload},
+        headers={"Authorization": "Bearer testkey"},
+    )
+    assert status == 400
+    assert json.loads(text)["ok"] is False
+    assert seen == []
+
+
 # ── Gap D: duplicate returns the original result ──────────────────────────
 
 def test_ingest_duplicate_returns_cached_result(monkeypatch):
@@ -225,7 +359,11 @@ def test_ingest_duplicate_returns_cached_result(monkeypatch):
         return calls["n"] == 1  # first new, second is a duplicate
 
     app, seen = _app(monkeypatch, mark_seen=mark_seen)
-    body = {"content": "summarize", "idempotency_key": "k1"}
+    body = {
+        "content": "summarize",
+        "idempotency_key": "k1",
+        "secrets": {"cms": {"type": "opaque", "value": "same-secret"}},
+    }
 
     # Both posts must share ONE event loop (the app binds to the first loop),
     # so issue them inside a single runner against one client.
@@ -258,6 +396,56 @@ def test_ingest_duplicate_returns_cached_result(monkeypatch):
     assert d2["duplicate"] is True
     assert d2["result"] == "echo:summarize"  # original result, not empty
     assert len(seen) == 1  # agent ran only once
+
+
+def test_ingest_same_idempotency_with_different_secret_fingerprint_is_409(monkeypatch):
+    calls = {"n": 0}
+
+    async def dispatch(request):
+        calls["n"] += 1
+        return f"echo:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            base = {"content": "same work", "idempotency_key": "same-key"}
+            first = await client.post(
+                "/api/run-broker/ingest",
+                json={**base, "secrets": {"cms": {"type": "opaque", "value": "old"}}},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            first_body = json.loads(await first.text())
+            second = await client.post(
+                "/api/run-broker/ingest",
+                json={**base, "secrets": {"cms": {"type": "opaque", "value": "new"}}},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            second_body = json.loads(await second.text())
+            return first.status, first_body, second.status, second_body
+        finally:
+            await client.close()
+
+    first_status, first_body, second_status, second_body = asyncio.run(runner())
+
+    assert first_status == 200
+    assert first_body["ok"] is True
+    assert second_status == 409
+    assert second_body["error"] == "secret_mismatch"
+    assert calls["n"] == 1
 
 
 # ── Gap B: clarify is surfaced (default-dispatch path) ────────────────────
@@ -591,6 +779,79 @@ def test_ingest_async_submit_returns_run_id_and_poll_eventually_succeeds(monkeyp
     assert calls["n"] == 1
 
 
+def test_ingest_async_ignores_caller_supplied_secret_metadata(monkeypatch, tmp_path):
+    from hermes_multitenancy import webui_broker_server as broker_mod
+
+    captured: dict[str, object] = {}
+
+    async def dispatch(request):
+        event = broker_mod._build_webui_event(request)
+        captured["metadata"] = dict(request.metadata)
+        captured["event_text"] = event.text
+        captured["raw_event_metadata"] = dict(event.raw_event["metadata"])
+        return "ok"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={
+                    "content": "hi",
+                    "metadata": {
+                        "trace": "t1",
+                        "ingest_secret_dir": str(tmp_path / "fake-secrets"),
+                        "ingest_secrets": [
+                            {"name": "fake", "type": "opaque", "usage": "spoofed"}
+                        ],
+                    },
+                },
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            poll_body = {}
+            poll_status = 0
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                poll_status = poll.status
+                poll_body = json.loads(await poll.text())
+                if poll_body["status"] == "succeeded":
+                    return submit.status, poll_status, poll_body
+                await asyncio.sleep(0.02)
+            return submit.status, poll_status, poll_body
+        finally:
+            await client.close()
+
+    submit_status, poll_status, poll_body = asyncio.run(runner())
+
+    assert submit_status == 202
+    assert poll_status == 200
+    assert poll_body["ok"] is True
+    assert captured["metadata"]["trace"] == "t1"
+    assert "ingest_secret_dir" not in captured["metadata"]
+    assert "ingest_secrets" not in captured["metadata"]
+    assert "ingest_secret_dir" not in captured["raw_event_metadata"]
+    assert "ingest_secrets" not in captured["raw_event_metadata"]
+    assert captured["event_text"] == "hi"
+
+
 def test_ingest_async_duplicate_idempotency_returns_same_run_without_dispatching_twice(monkeypatch):
     release = asyncio.Event()
     calls = {"n": 0}
@@ -618,7 +879,11 @@ def test_ingest_async_duplicate_idempotency_returns_same_run_without_dispatching
         client = TestClient(TestServer(app))
         await client.start_server()
         try:
-            body = {"content": "same work", "idempotency_key": "same-key"}
+            body = {
+                "content": "same work",
+                "idempotency_key": "same-key",
+                "secrets": {"cms": {"type": "opaque", "value": "same-secret"}},
+            }
             first = await client.post(
                 "/api/run-broker/ingest/async",
                 json=body,
@@ -643,6 +908,60 @@ def test_ingest_async_duplicate_idempotency_returns_same_run_without_dispatching
     assert second_status == 202
     assert second_body["duplicate"] is True
     assert second_body["run_id"] == first_body["run_id"]
+    assert calls["n"] == 1
+
+
+def test_ingest_async_same_idempotency_with_different_secret_fingerprint_is_409(monkeypatch):
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def slow_dispatch(request):
+        calls["n"] += 1
+        await release.wait()
+        return f"async:{request.content}"
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=slow_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            base = {"content": "same work", "idempotency_key": "same-key"}
+            first = await client.post(
+                "/api/run-broker/ingest/async",
+                json={**base, "secrets": {"cms": {"type": "opaque", "value": "old"}}},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            first_body = json.loads(await first.text())
+            await asyncio.sleep(0.01)
+            second = await client.post(
+                "/api/run-broker/ingest/async",
+                json={**base, "secrets": {"cms": {"type": "opaque", "value": "new"}}},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            second_body = json.loads(await second.text())
+            release.set()
+            return first.status, first_body, second.status, second_body
+        finally:
+            await client.close()
+
+    first_status, first_body, second_status, second_body = asyncio.run(runner())
+
+    assert first_status == 202
+    assert first_body["run_id"].startswith("ing_")
+    assert second_status == 409
+    assert second_body["error"] == "secret_mismatch"
     assert calls["n"] == 1
 
 
