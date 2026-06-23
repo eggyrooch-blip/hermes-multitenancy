@@ -372,12 +372,15 @@ def assert_profile_governance(plugin: dict[str, Any], profile_home: Path) -> dic
     gov = plugin.get("governance") or {}
     gates = list(gov.get("approval_required") or [])
     skills_root = profile_home / "skills"
-    installed = {p.name for p in skills_root.iterdir() if p.is_dir() or p.is_symlink()} if skills_root.is_dir() else set()
 
-    # the orchestrator skill (its SKILL.md enforces the staged gates) must be live
+    # the orchestrator skill (its SKILL.md enforces the staged gates) must be live.
+    # Resolve by the plugin's own (possibly nested) skill path, not a flat dir name.
     orchestrate = next((s for s in plugin["skills"]["list"] if "orchestrat" in s), None)
     entry = plugin.get("entry_skill")
-    missing_skills = [s for s in (orchestrate, entry) if s and s not in installed]
+    def _installed(name: str) -> bool:
+        p = skills_root / name
+        return p.is_dir() or p.is_symlink()
+    missing_skills = [s for s in (orchestrate, entry) if s and not _installed(s)]
     if missing_skills:
         raise PluginIngestError(
             f"governance check failed: required governance skill(s) {missing_skills} "
@@ -395,6 +398,13 @@ def assert_profile_governance(plugin: dict[str, Any], profile_home: Path) -> dic
         except OSError:
             pass
     ungoverned = [g for g in gates if g and g not in corpus]
+    # "3 门禁存活" — if the plugin declares high-risk gates but NONE of them survive in
+    # the installed governance skills, the gates are effectively gone: fail hard.
+    if gates and len(ungoverned) == len(gates):
+        raise PluginIngestError(
+            f"governance check failed: none of the {len(gates)} declared approval gate(s) "
+            f"appear in the installed governance skills for {profile_home.name} — gates not enforced"
+        )
     return {
         "profile": profile_home.name,
         "env_default": gov.get("env_default") or "pre",

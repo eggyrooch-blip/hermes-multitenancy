@@ -18,12 +18,19 @@ from hermes_multitenancy import plugin_ingest as pi
 
 # ─────────────────────────── fixtures ────────────────────────────────────
 
+GATE = "x approve"
+
+
 def _write_plugin_repo(root: Path, *, env_default="pre", audience=None, clis=None, connectors=None, skills=None) -> Path:
-    skills = skills or ["using-resource-delivery", "kep-halo-cli"]
+    # default repo carries a governance-bearing orchestrator whose SKILL.md states the gate
+    skills = skills or ["using-resource-delivery", "kep-trevi-delivery-orchestrate", "kep-halo-cli"]
     for name in skills:
         sk = root / "skills" / name
         sk.mkdir(parents=True, exist_ok=True)
-        (sk / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
+        body = f"# {name}\n"
+        if "orchestrat" in name:
+            body += f"Gates: `{GATE}` requires explicit confirmation.\n"
+        (sk / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}", encoding="utf-8")
     manifest = {
         "schema": pi.SUPPORTED_SCHEMA,
         "id": "test-plugin",
@@ -167,7 +174,7 @@ def test_ingest_profile_mode_install_idempotent_uninstall(tmp_path):
     profile_skill = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
     assert profile_skill.exists()
     assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()
-    assert len(r1["skills"]["installed"]) == 2  # 2 skills × 1 profile
+    assert len(r1["skills"]["installed"]) == 3  # 3 skills × 1 profile
 
     # idempotent: re-run does not error and source already present
     r2 = pi.ingest(repo, audience="feishu_test", shared_home=home)
