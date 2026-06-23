@@ -2937,7 +2937,15 @@ def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tm
     upload_path.parent.mkdir(parents=True)
     upload_path.write_bytes(b"fake-png")
     (profile_home / "config.yaml").write_text(
-        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        "\n".join([
+            "model:",
+            "  default: openai/test-model",
+            "terminal:",
+            "  cwd: /workspace",
+            "platform_toolsets:",
+            "  webui:",
+            "  - lark-cli",
+        ]),
         encoding="utf-8",
     )
     (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
@@ -2979,7 +2987,7 @@ def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tm
             content="\n".join([
                 "图片中都有什么内容",
                 "[Attached image: IMG_4057.PNG]",
-                "Local image path for tools: uploads/receipt.png",
+                "Local image path for tools: /workspace/uploads/receipt.png",
                 'If analyzing this image, call vision_analyze with image_url "uploads/receipt.png" directly.',
             ]),
             session_id="webui-session-1",
@@ -2994,6 +3002,76 @@ def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tm
     assert "WebUI image attachment analysis" in str(observed["user_message"])
     assert "账单详情" in str(observed["user_message"])
     assert "385.00" in str(observed["user_message"])
+
+
+def test_run_with_aiagent_guards_against_inference_when_webui_image_analysis_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    profile_home = tmp_path / "profiles" / "coder"
+    upload_path = profile_home / "workspace" / "uploads" / "receipt.png"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"fake-png")
+    (profile_home / "config.yaml").write_text(
+        "\n".join([
+            "model:",
+            "  default: openai/test-model",
+            "terminal:",
+            "  cwd: /workspace",
+            "platform_toolsets:",
+            "  webui:",
+            "  - lark-cli",
+        ]),
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        agent_real,
+        "_analyze_webui_uploaded_image",
+        lambda *_args, **_kwargs: (False, "vision provider unavailable"),
+    )
+
+    observed: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            observed["user_message"] = user_message
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _build_webui_event(
+        RunRequest(
+            channel="webui",
+            profile_name="coder",
+            user_key="ou_owner",
+            content="\n".join([
+                "图片中都有什么内容",
+                "[Attached image: IMG_4057.PNG]",
+                "Local image path for tools: /workspace/uploads/receipt.png",
+            ]),
+            session_id="webui-session-1",
+        )
+    )
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "done"
+    user_message = str(observed["user_message"])
+    assert "Status: failed" in user_message
+    assert "vision provider unavailable" in user_message
+    assert "Do not infer this image's visual contents" in user_message
 
 
 def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeypatch, tmp_path: Path):

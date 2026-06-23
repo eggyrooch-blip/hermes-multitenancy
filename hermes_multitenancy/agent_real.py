@@ -3937,7 +3937,20 @@ def _is_output_truncation_error(err: Any) -> bool:
 def _profile_workspace_root(profile_home: Path, config: Mapping[str, Any] | None = None) -> Path:
     terminal_cfg = (config or {}).get("terminal") if isinstance(config, Mapping) else None
     configured = terminal_cfg.get("cwd") if isinstance(terminal_cfg, Mapping) else None
-    root = Path(str(configured)).expanduser() if configured else profile_home / "workspace"
+    if configured:
+        configured_text = str(configured).strip()
+        configured_normalized = configured_text.replace("\\", "/")
+        if configured_normalized == "/workspace" or configured_normalized == "workspace":
+            root = profile_home / "workspace"
+        elif configured_normalized.startswith("/workspace/"):
+            root = profile_home / "workspace" / configured_normalized[len("/workspace/"):]
+        elif configured_normalized.startswith("workspace/"):
+            root = profile_home / "workspace" / configured_normalized[len("workspace/"):]
+        else:
+            configured_path = Path(configured_text).expanduser()
+            root = configured_path if configured_path.is_absolute() else profile_home / configured_path
+    else:
+        root = profile_home / "workspace"
     return root.resolve(strict=False)
 
 
@@ -4157,6 +4170,9 @@ def _enrich_webui_image_attachments_for_aiagent(
             prefer_openai_compatible=prefer_openai_compatible,
         )
         status = "success" if success else "failed"
+        failure_guard = [] if success else [
+            "Do not infer this image's visual contents without a successful vision analysis."
+        ]
         analysis_blocks.append(
             "\n".join([
                 "[WebUI image attachment analysis]",
@@ -4164,6 +4180,7 @@ def _enrich_webui_image_attachments_for_aiagent(
                 f"Resolved file: {resolved}",
                 "Source: WebUI image preflight on the uploaded profile-workspace file.",
                 f"Status: {status}",
+                *failure_guard,
                 "Analysis:",
                 analysis,
                 "[End WebUI image attachment analysis]",
