@@ -974,6 +974,90 @@ def test_ingest_async_submit_returns_run_id_and_poll_eventually_succeeds(monkeyp
     assert calls["n"] == 1
 
 
+def test_ingest_async_secrets_are_files_only_and_terminal_cleanup_redacts_poll(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import router as router_mod
+
+    from pathlib import Path
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.async.full.jwt.secret"
+    profile_home = tmp_path / "profiles" / "owner"
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: profile_home if profile_name == "owner" else tmp_path / profile_name,
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    captured: dict[str, object] = {}
+
+    async def dispatch(request):
+        secret_dir = Path(request.metadata["ingest_secret_dir"])
+        captured["secret_dir"] = secret_dir
+        captured["metadata_json"] = json.dumps(request.metadata, ensure_ascii=False)
+        return f"async tool saw:{(secret_dir / 'cms_bearer').read_text(encoding='utf-8')}"
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={
+                    "content": "查异步对账",
+                    "secrets": {
+                        "cms_bearer": {
+                            "type": "bearer_token",
+                            "value": secret_value,
+                        }
+                    },
+                },
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_text = await submit.text()
+            submit_body = json.loads(submit_text)
+            final_body = {}
+            poll_text = ""
+            poll_status = 0
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                poll_status = poll.status
+                poll_text = await poll.text()
+                final_body = json.loads(poll_text)
+                if final_body["status"] == "succeeded":
+                    return submit.status, submit_text, poll_status, poll_text, final_body
+                await asyncio.sleep(0.02)
+            return submit.status, submit_text, poll_status, poll_text, final_body
+        finally:
+            await client.close()
+
+    submit_status, submit_text, poll_status, poll_text, final_body = asyncio.run(runner())
+
+    assert submit_status == 202
+    assert poll_status == 200
+    assert final_body["ok"] is True
+    assert final_body["result"] == "async tool saw:[REDACTED:cms_bearer]"
+    assert secret_value not in submit_text
+    assert secret_value not in poll_text
+    assert secret_value not in captured["metadata_json"]
+    assert not captured["secret_dir"].exists()
+
+
 def test_ingest_async_ignores_caller_supplied_secret_metadata(monkeypatch, tmp_path):
     from hermes_multitenancy import webui_broker_server as broker_mod
 
