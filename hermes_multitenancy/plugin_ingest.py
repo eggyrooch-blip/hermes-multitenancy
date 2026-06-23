@@ -78,6 +78,19 @@ def _safe_skill_name(name: Any) -> str:
     return raw
 
 
+def _safe_component(value: Any, *, kind: str) -> str:
+    """Reject ids used as FILENAMES (plugin_id → manifest file; cli id → shared_bin/<id>).
+
+    No path separators, no `..`, no leading dot — an id from an untrusted manifest must
+    not let us write/unlink outside `.hermes-plugin-managed/` or `<shared>/bin`.
+    """
+    raw = str(value or "").strip()
+    if (not raw or "/" in raw or "\\" in raw or raw in (".", "..") or raw.startswith(".")
+            or "\x00" in raw):
+        raise PluginIngestError(f"unsafe {kind} in manifest: {value!r}")
+    return raw
+
+
 def _normalize_skills_dir(value: Any) -> str:
     """Honor the manifest's `skills.dir` contract (default 'skills'); reject escapes."""
     raw = str(value or "skills").strip().strip("/")
@@ -106,6 +119,7 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
         raise PluginIngestError(f"{path}: unsupported schema {data.get('schema')!r}, need {SUPPORTED_SCHEMA!r}")
     if not data.get("id"):
         raise PluginIngestError(f"{path}: missing plugin id")
+    _safe_component(data["id"], kind="plugin id")  # used as the managed-manifest filename
 
     skills = data.get("skills") or {}
     if not isinstance(skills, dict) or not isinstance(skills.get("list"), list) or not skills["list"]:
@@ -131,6 +145,7 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
     for cli in data.get("clis") or []:
         if not isinstance(cli, dict) or "id" not in cli or "install" not in cli:
             raise PluginIngestError(f"{path}: each clis[] entry needs id+install, got {cli!r}")
+        _safe_component(cli["id"], kind="cli id")  # used as <shared>/bin/<id>
     for con in data.get("connectors") or []:
         if not isinstance(con, dict) or "id" not in con:
             raise PluginIngestError(f"{path}: each connectors[] entry needs id, got {con!r}")
@@ -270,6 +285,18 @@ def _register_shared_skill_source(
     return "registered"
 
 
+def _personal_install_target(profile_home: Path, name: str) -> Optional[str]:
+    """The `target` (source path) recorded for a personal skill install, or None."""
+    mf = profile_home / "skills" / ".hermes-personal-installs.json"
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    skills = data.get("skills") if isinstance(data, dict) else None
+    entry = skills.get(name) if isinstance(skills, dict) else None
+    return entry.get("target") if isinstance(entry, dict) else None
+
+
 def _install_skills_to_profile(
     plugin: dict[str, Any],
     audience: Audience,
@@ -287,13 +314,24 @@ def _install_skills_to_profile(
     source_actions = {name: _register_shared_skill_source(repo, shared_skills, name, skills_dir=skills_dir, dry_run=dry_run, force=force) for name in names}
 
     installed: list[dict[str, Any]] = []
+    owned: dict[str, list[str]] = {}
     for profile in audience.profiles:
         profile_home = profiles_root / profile
         if not profile_home.is_dir():
             raise PluginIngestError(f"profile home {profile_home} does not exist")
         for name in names:
+            my_source = str(shared_skills / name)
+            existing = _personal_install_target(profile_home, name)
+            # COEXISTENCE GUARD: if this profile already has a personal install of the
+            # same skill path from a DIFFERENT source (an employee's own upload, or
+            # another plugin), do NOT hijack it — and never record it as ours, so
+            # --uninstall can't delete someone else's skill.
+            if existing is not None and existing != my_source:
+                installed.append({"profile": profile, "skill": name, "action": "skipped-foreign", "target": existing})
+                continue
             if dry_run:
                 installed.append({"profile": profile, "skill": name, "action": "would-install"})
+                owned.setdefault(profile, []).append(name)
                 continue
             install_shared_skill_for_profile(
                 shared_home=shared_home,
@@ -303,7 +341,8 @@ def _install_skills_to_profile(
                 version=version,
             )
             installed.append({"profile": profile, "skill": name, "action": "ensured"})
-    return {"source_actions": source_actions, "installed": installed}
+            owned.setdefault(profile, []).append(name)
+    return {"source_actions": source_actions, "installed": installed, "owned": owned}
 
 
 def _register_department_distribution(
@@ -519,6 +558,9 @@ def ingest(
         "ingested_at": int(time.time()),
         "audience": {"mode": aud.mode, "profiles": aud.profiles, "department_ids": aud.department_ids},
         "skills": list(plugin["skills"]["list"]),
+        # per-profile skills we actually OWN (installed, not skipped-foreign) — uninstall
+        # removes ONLY these, never a coexisting employee/other-plugin install.
+        "owned_skills": report["skills"].get("owned", {}) if aud.mode == "profile" else {},
         "clis": [c["id"] for c in plugin.get("clis") or []],
         "connectors": [c["id"] for c in plugin.get("connectors") or []],
         "install_mode": plugin.get("install_mode") or "copy",
@@ -551,9 +593,21 @@ def uninstall(
     skills = manifest.get("skills") or []
 
     if aud.get("mode") == "profile":
-        for profile in aud.get("profiles") or []:
+        # remove ONLY skills we own; fall back to the flat list for manifests written
+        # before owned_skills existed.
+        owned = manifest.get("owned_skills")
+        if not isinstance(owned, dict) or not owned:
+            owned = {p: list(skills) for p in (aud.get("profiles") or [])}
+        for profile, names in owned.items():
             profile_home = profiles_root / profile
-            for name in skills:
+            for name in names:
+                # COEXISTENCE GUARD: if the personal install no longer points at our
+                # source (employee re-installed over it), leave it alone.
+                tgt = _personal_install_target(profile_home, name)
+                my_source = str(shared_home / "skills" / name)
+                if tgt is not None and tgt != my_source:
+                    report["removed"].append({"profile": profile, "skill": name, "action": "kept-foreign"})
+                    continue
                 if dry_run:
                     report["removed"].append({"profile": profile, "skill": name, "action": "would-remove"})
                     continue

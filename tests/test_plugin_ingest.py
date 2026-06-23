@@ -109,6 +109,50 @@ def test_load_manifest_rejects_absolute_skill(tmp_path):
         pi.load_plugin_manifest(repo)
 
 
+def test_load_manifest_rejects_unsafe_plugin_id(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"])
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text()); data["id"] = "../../evil"
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="unsafe plugin id"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_load_manifest_rejects_unsafe_cli_id(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"],
+                              clis=[{"id": "../evil", "install": "x"}])
+    with pytest.raises(pi.PluginIngestError, match="unsafe cli id"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_profile_mode_does_not_hijack_or_delete_foreign_skill(tmp_path):
+    # an employee already has their OWN personal install of kep-halo-cli (different source)
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    pskills = home / "profiles" / "feishu_test" / "skills"
+    foreign_src = str(tmp_path / "employee_upload" / "kep-halo-cli")
+    (pskills / "kep-halo-cli").mkdir(parents=True)
+    (pskills / "kep-halo-cli" / "SKILL.md").write_text("employee's own\n", encoding="utf-8")
+    (pskills / ".hermes-personal-installs.json").write_text(
+        json.dumps({"version": 1, "skills": {"kep-halo-cli": {"source": "personal", "target": foreign_src}}}),
+        encoding="utf-8")
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    acts = {(i["skill"]): i["action"] for i in report["skills"]["installed"]}
+    assert acts["kep-halo-cli"] == "skipped-foreign"  # NOT hijacked
+    assert "kep-halo-cli" not in report["skills"]["owned"].get("feishu_test", [])
+
+    # uninstall must NOT delete the employee's skill
+    pi.uninstall("test-plugin", shared_home=home)
+    assert (pskills / "kep-halo-cli").exists()  # employee's skill survived
+    assert _personal_target(pskills) == foreign_src
+
+
+def _personal_target(pskills):
+    d = json.loads((pskills / ".hermes-personal-installs.json").read_text())
+    return d["skills"]["kep-halo-cli"]["target"]
+
+
 def test_skills_dir_honored(tmp_path):
     # plugin keeps skills under a custom dir; manifest.skills.dir points at it
     repo = tmp_path / "plug"
