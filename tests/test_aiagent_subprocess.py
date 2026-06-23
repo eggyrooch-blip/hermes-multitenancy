@@ -4169,8 +4169,26 @@ def test_aiagent_subprocess_env_scope_exposes_ingest_secret_dir_without_values(
                 "usage": "Authorization Bearer",
             }
         ]
+        from tools.code_execution_tool import _scrub_child_env
+        import tools
+
+        registered_passthrough: set[str] = set()
+        fake_env_passthrough_mod = SimpleNamespace(
+            _config_passthrough=frozenset(),
+            register_env_passthrough=lambda names: registered_passthrough.update(names),
+        )
+        monkeypatch.setattr(tools, "env_passthrough", fake_env_passthrough_mod, raising=False)
+        monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough_mod)
+
+        agent_real._install_ingest_secret_env_passthrough(env)
+        allowed = registered_passthrough | set(fake_env_passthrough_mod._config_passthrough)
+        execute_code_env = _scrub_child_env(env, is_passthrough=lambda name: name in allowed)
+        assert execute_code_env["HERMES_INGEST_SECRET_DIR"] == str(secret_dir)
+        assert json.loads(execute_code_env["HERMES_INGEST_SECRET_MANIFEST"]) == manifest
         assert "full-secret-token" not in json.dumps(env)
+        assert "full-secret-token" not in json.dumps(execute_code_env)
         assert "OPENAI_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in execute_code_env
 
 
 def test_aiagent_subprocess_env_scope_prefers_raw_feishu_open_id_for_broker(monkeypatch, tmp_path: Path):

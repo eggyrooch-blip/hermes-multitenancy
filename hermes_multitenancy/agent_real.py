@@ -35,7 +35,7 @@ import secrets
 import importlib
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from .credential_broker import lease_signing_secret, mint_lease
 from .lark_cli_guard import (
@@ -2087,6 +2087,45 @@ def _install_credential_env_passthrough(profile_home: Path) -> None:
         logger.debug("[multitenancy] credential env passthrough skipped", exc_info=True)
 
 
+def _register_env_passthrough_process_wide(env_names: list[str]) -> None:
+    """Register env passthrough for current ContextVar and worker threads."""
+    if not env_names:
+        return
+    from tools import env_passthrough as env_passthrough_mod
+
+    env_passthrough_mod.register_env_passthrough(env_names)
+    # Hermes' passthrough registry is ContextVar-backed. Tool execution can hop
+    # into worker threads, where that context is not always inherited, so these
+    # broker-managed handle env vars also need a process-level allowlist entry.
+    config_passthrough = getattr(env_passthrough_mod, "_config_passthrough", None)
+    merged = set(config_passthrough or ())
+    merged.update(env_names)
+    setattr(env_passthrough_mod, "_config_passthrough", frozenset(merged))
+
+
+def _install_ingest_secret_env_passthrough(env: Optional[Mapping[str, str]] = None) -> None:
+    """Allow per-run ingest secret handles through execute_code env scrubbing."""
+    source = os.environ if env is None else env
+    env_names = [
+        name
+        for name in (
+            "HERMES_INGEST_SECRET_DIR",
+            "HERMES_INGEST_SECRET_MANIFEST",
+        )
+        if str(source.get(name) or "").strip()
+    ]
+    if not env_names:
+        return
+    try:
+        _register_env_passthrough_process_wide(env_names)
+        logger.info(
+            "[multitenancy] registered ingest secret env passthrough count=%d",
+            len(env_names),
+        )
+    except Exception:
+        logger.debug("[multitenancy] ingest secret env passthrough skipped", exc_info=True)
+
+
 def _apply_runtime_env_for_aiagent(profile_home: Path):
     """Temporarily expose profile/credential env for in-process AIAgent runs."""
     runtime_env = _profile_env_for_aiagent(profile_home)
@@ -3932,6 +3971,7 @@ def _run_with_aiagent(
 
     # 3) Lazy-import hermes core (only when this code path is hit).
     _install_credential_env_passthrough(profile_home)
+    _install_ingest_secret_env_passthrough()
     _install_skill_runtime_compat(profile_home)
     _install_session_search_proxy_for_aiagent()
     try:
