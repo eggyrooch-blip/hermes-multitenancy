@@ -1,0 +1,216 @@
+"""Hermetic tests for the reusable plugin ingester.
+
+Every test builds a throwaway plugin repo + shared_home under tmp_path — none
+touch the real ~/.hermes. CLI installation (kep-cli) is exercised only via the
+"already present" / dry-run paths so no global state is mutated; the real
+kep-cli install is covered by the live UAT probe, not here.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from hermes_multitenancy import plugin_ingest as pi
+
+
+# ─────────────────────────── fixtures ────────────────────────────────────
+
+def _write_plugin_repo(root: Path, *, env_default="pre", audience=None, clis=None, connectors=None, skills=None) -> Path:
+    skills = skills or ["using-resource-delivery", "kep-halo-cli"]
+    for name in skills:
+        sk = root / "skills" / name
+        sk.mkdir(parents=True, exist_ok=True)
+        (sk / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
+    manifest = {
+        "schema": pi.SUPPORTED_SCHEMA,
+        "id": "test-plugin",
+        "name": "测试插件",
+        "version": "9.9.9",
+        "entry_skill": "using-resource-delivery",
+        "skills": {"dir": "./skills/", "list": skills},
+        "install_mode": "copy",
+        "audience": audience if audience is not None else {"department_ids": []},
+        "clis": clis if clis is not None else [],
+        "connectors": connectors if connectors is not None else [{"id": "kep-cli", "required": True}],
+        "governance": {"env_default": env_default, "approval_required": ["x approve"], "online_requires": "explicit_action"},
+        "persona_policy": "skill_inline",
+    }
+    out = root / ".hermes-plugin" / "plugin.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return root
+
+
+def _shared_home(root: Path, profiles=("feishu_test",)) -> Path:
+    home = root / "hermes_home"
+    (home / "skills").mkdir(parents=True, exist_ok=True)
+    (home / "bin").mkdir(parents=True, exist_ok=True)
+    for p in profiles:
+        (home / "profiles" / p / "skills").mkdir(parents=True, exist_ok=True)
+    return home
+
+
+# ─────────────────────────── manifest loading ────────────────────────────
+
+def test_load_manifest_valid(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    data = pi.load_plugin_manifest(repo)
+    assert data["id"] == "test-plugin"
+    assert data["skills"]["list"]
+
+
+def test_load_manifest_missing(tmp_path):
+    with pytest.raises(pi.PluginIngestError, match="no plugin manifest"):
+        pi.load_plugin_manifest(tmp_path / "nope")
+
+
+def test_load_manifest_bad_schema(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text()); data["schema"] = "bogus/v0"
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="unsupported schema"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_load_manifest_unknown_audience_key_rejected(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", audience={"dept": ["技术部"]})
+    with pytest.raises(pi.PluginIngestError, match="unknown key"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_load_manifest_online_default_rejected(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", env_default="online")
+    with pytest.raises(pi.PluginIngestError, match="online-by-default is forbidden"):
+        pi.load_plugin_manifest(repo)
+
+
+# ─────────────────────────── audience resolution ─────────────────────────
+
+def test_resolve_audience_profile(tmp_path):
+    home = _shared_home(tmp_path, profiles=("feishu_test",))
+    aud = pi.resolve_audience("feishu_test", profiles_root=home / "profiles")
+    assert aud.mode == "profile" and aud.profiles == ["feishu_test"]
+
+
+def test_resolve_audience_department_ids(tmp_path):
+    home = _shared_home(tmp_path)
+    aud = pi.resolve_audience("101,202", profiles_root=home / "profiles")
+    assert aud.mode == "department_ids" and aud.department_ids == ["101", "202"]
+
+
+def test_resolve_audience_department_name_rejected(tmp_path):
+    home = _shared_home(tmp_path)
+    with pytest.raises(pi.PluginIngestError, match="department NAMES are rejected"):
+        pi.resolve_audience("技术部", profiles_root=home / "profiles")
+
+
+def test_resolve_audience_mixed_rejected(tmp_path):
+    home = _shared_home(tmp_path, profiles=("feishu_test",))
+    with pytest.raises(pi.PluginIngestError, match="mixes known profiles"):
+        pi.resolve_audience("feishu_test,999notaprofile_x", profiles_root=home / "profiles")
+
+
+def test_resolve_audience_empty_rejected(tmp_path):
+    home = _shared_home(tmp_path)
+    with pytest.raises(pi.PluginIngestError):
+        pi.resolve_audience("", profiles_root=home / "profiles")
+
+
+# ─────────────────────────── connectors / governance ─────────────────────
+
+def test_validate_connectors_ok_kep_cli():
+    # kep-cli is a real built-in connector
+    res = pi.validate_connectors([{"id": "kep-cli", "required": True}])
+    assert res["connectors"][0]["registered"] is True
+
+
+def test_validate_connectors_required_missing():
+    with pytest.raises(pi.PluginIngestError, match="not in registry"):
+        pi.validate_connectors([{"id": "does-not-exist-xyz", "required": True}])
+
+
+def test_validate_connectors_optional_missing_ok():
+    res = pi.validate_connectors([{"id": "does-not-exist-xyz", "required": False}])
+    assert res["connectors"][0]["registered"] is False
+
+
+def test_assert_governance_pre_ok(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    plugin = pi.load_plugin_manifest(repo)
+    assert pi.assert_governance(plugin)["env_default"] == "pre"
+
+
+# ─────────────────────────── ingest: dry-run ─────────────────────────────
+
+def test_ingest_dry_run_writes_nothing(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home, dry_run=True)
+    assert report["dry_run"] is True
+    # nothing materialized
+    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+    assert not (home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli").exists()
+    assert not (home / "skills" / "kep-halo-cli").exists()
+
+
+# ─────────────────────────── ingest: profile mode ───────────────────────
+
+def test_ingest_profile_mode_install_idempotent_uninstall(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+
+    r1 = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    profile_skill = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
+    assert profile_skill.exists()
+    assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+    assert len(r1["skills"]["installed"]) == 2  # 2 skills × 1 profile
+
+    # idempotent: re-run does not error and source already present
+    r2 = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    assert all(v == "present" for v in r2["skills"]["source_actions"].values())
+
+    # uninstall removes profile skill installs + manifest
+    u = pi.uninstall("test-plugin", shared_home=home)
+    assert not profile_skill.exists()
+    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+    assert any(item.get("action") == "removed" for item in u["removed"])
+
+
+# ─────────────────────────── ingest: department mode ────────────────────
+
+def test_ingest_department_mode_writes_distribution_and_strips(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+
+    pi.ingest(repo, audience="101,202", shared_home=home)
+    dist = home / pi.SKILL_DISTRIBUTION_FILE
+    assert dist.exists()
+    raw = yaml.safe_load(dist.read_text())
+    entries = {it["path"]: it for it in raw["skills"]}
+    assert entries["kep-halo-cli"]["audience"]["department_ids"] == ["101", "202"]
+    assert entries["kep-halo-cli"]["plugin"] == "test-plugin"
+
+    pi.uninstall("test-plugin", shared_home=home)
+    raw2 = yaml.safe_load(dist.read_text()) or {}
+    assert all(it.get("plugin") != "test-plugin" for it in (raw2.get("skills") or []))
+
+
+# ─────────────────────────── CLI install (no real kep-cli) ──────────────
+
+def test_install_clis_skips_when_present(tmp_path):
+    home = _shared_home(tmp_path)
+    binp = home / "bin" / "halo-cli"
+    binp.write_text("#!/bin/sh\n"); binp.chmod(0o755)
+    res = pi.install_clis([{"id": "halo-cli", "install": "halo"}], shared_bin=home / "bin", dry_run=False, force=False)
+    assert res[0]["action"] == "skipped"
+
+
+def test_install_clis_dry_run_no_write(tmp_path):
+    home = _shared_home(tmp_path)
+    res = pi.install_clis([{"id": "newcli", "install": "new"}], shared_bin=home / "bin", dry_run=True, force=False)
+    assert res[0]["action"] == "would-install"
+    assert not (home / "bin" / "newcli").exists()
