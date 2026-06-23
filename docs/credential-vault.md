@@ -102,3 +102,14 @@ Operational rules:
   `/dev/null` for those files inside the sandbox is expected.
 - Agent-visible diagnostics should call `multitenancy_credential_status`; they
   must not inspect `.env` or token files directly.
+
+Follow-up hardening tracked outside this P0:
+
+- Quarantine or audit unmanaged profile-local skill remnants so WebUI skill
+  distribution cannot be confused with stale self-installed skill directories.
+- Add an immutable denylist for subprocess env overrides that must not be
+  supplied by model-visible arguments or connector payloads.
+- Make profile/skill manifest writes atomic so interrupted connector or skill
+  sync cannot leave partial state.
+- Evaluate SQLite WAL and a write mutex for credential/profile sync paths that
+  can run concurrently.
