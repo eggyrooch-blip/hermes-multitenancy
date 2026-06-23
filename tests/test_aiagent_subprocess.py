@@ -1714,6 +1714,35 @@ def test_event_payload_carries_router_messages(tmp_path: Path):
     assert payload["messages"] == messages
 
 
+def test_event_payload_preserves_webui_raw_session_for_child_replay(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import aiagent_subprocess
+
+    profile_home = tmp_path / "profiles" / "coder"
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.source.chat_id = ""
+    event.source.chat_type = "webui"
+    event.raw_event = {
+        "channel": "webui",
+        "session_id": "webui-doc-session-123",
+        "metadata": {"conversation": "webui:webui-doc-session-123"},
+    }
+
+    payload = agent_real._event_to_subprocess_payload(event, profile_home)
+    replayed = aiagent_subprocess._ReplayedEvent(payload["event"])
+    child_session_id = agent_real._resolve_aiagent_session_id(
+        replayed,
+        profile_home,
+        replayed.sender_open_id,
+    )
+
+    assert payload["event"]["raw_event"]["session_id"] == "webui-doc-session-123"
+    assert "platform:webui" in child_session_id
+    assert "session:webui-doc-session-123" in child_session_id
+    assert "chat_type:webui:user" not in child_session_id
+
+
 def test_configure_feishu_uat_home_binds_to_profile_local_dir(tmp_path: Path):
     """档 A change: FEISHU_UAT_DIR points at <profile>/feishu_uat/, not shared."""
     from hermes_multitenancy import agent_real

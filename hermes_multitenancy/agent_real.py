@@ -1234,6 +1234,9 @@ def _event_to_subprocess_payload(
         },
         "profile_home": str(profile_home),
     }
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        payload["event"]["raw_event"] = _jsonable_deep(raw_event)
     payload_messages = _jsonable_messages(messages)
     if payload_messages is not None:
         payload["messages"] = payload_messages

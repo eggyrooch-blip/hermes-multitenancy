@@ -40,6 +40,7 @@ class _ReplayedEvent:
         self.message_id = d.get("message_id", "")
         self.sender_open_id = d.get("sender_open_id", "")
         self.source = _ReplayedSource(d.get("source") or {})
+        self.raw_event = d.get("raw_event") if isinstance(d.get("raw_event"), dict) else {}
 
 
 def _load_run_with_aiagent():

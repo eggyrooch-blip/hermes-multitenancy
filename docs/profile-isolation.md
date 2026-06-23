@@ -134,6 +134,23 @@ matching common OpenClaw/ClawHub packages such as `keep-record`. This bridge
 lives in `agent_real._install_skill_runtime_compat()` and is intentionally not
 a change to the skill package or to hermes-agent.
 
+### WebUI Run Broker session boundary
+
+WebUI requests enter the multitenancy layer through the Run Broker. The
+parent process constructs a routed event whose `raw_event` contains the
+server-side WebUI `session_id`. That value is part of the tenant/session
+identity, not a credential. When the request is executed in an AIAgent
+subprocess, `agent_real._event_to_subprocess_payload()` must preserve
+`raw_event`, and `aiagent_subprocess._ReplayedEvent` must restore it before
+session id resolution runs.
+
+This keeps independent WebUI chats on the same profile from sharing the
+fallback `platform:webui:chat_type:webui:user:<open_id>` conversation history.
+If an older caller does not provide `raw_event`, the replayed event exposes an
+empty dict and the legacy fallback behavior remains unchanged. This boundary
+does not change lark-cli credentials, Feishu UAT refresh, bot/user identity
+selection, or authsidecar host allowlisting.
+
 For group-scoped credentials, keep one encrypted payload in the credential
 vault and let `hermes-multitenancy-sync pull-feishu` materialize only the
 compatibility file into each authorized profile:
