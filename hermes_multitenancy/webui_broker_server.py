@@ -3523,7 +3523,7 @@ def create_run_broker_app(
         _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id, actor_principal_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
-        if not table.revoke_agent_share_by_id(grantee_open_id):
+        if not table.revoke_agent_share_by_id(agent_id, grantee_open_id):
             table.revoke_agent_share(agent_id, grantee_open_id)
         return web.json_response({"ok": True})
 

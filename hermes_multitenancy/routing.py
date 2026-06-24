@@ -1545,18 +1545,19 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def revoke_agent_share_by_id(self, share_id: str) -> bool:
+    def revoke_agent_share_by_id(self, agent_id: str, share_id: str) -> bool:
+        agent_id = (agent_id or "").strip()
         share_id = (share_id or "").strip()
-        if not share_id:
+        if not agent_id or not share_id:
             return False
         now = _now()
         cur = self._conn.execute(
             """
             UPDATE multitenancy_agent_shares
             SET status = 'revoked', revoked_at = ?, updated_at = ?
-            WHERE share_id = ? AND status = 'active'
+            WHERE agent_id = ? AND share_id = ? AND status = 'active'
             """,
-            (now, now, share_id),
+            (now, now, agent_id, share_id),
         )
         self._conn.commit()
         return cur.rowcount > 0

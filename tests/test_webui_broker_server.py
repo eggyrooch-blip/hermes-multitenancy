@@ -2635,12 +2635,30 @@ def test_webui_run_broker_agent_share_principal_management_endpoints(tmp_path, m
         owner_open_id="ou_owner",
         display_label="Shared principal analyst",
     )
+    seeded.upsert_owned_agent(
+        agent_id="agent-other",
+        profile_name="other_agent_profile",
+        owner_open_id="ou_other_owner",
+        display_label="Other principal analyst",
+    )
     owner_principal = seeded.upsert_principal(
         provider="feishu",
         tenant_key="tenant_a",
         canonical_id_type="user_id",
         canonical_id="u_owner",
         aliases=[{"id_type": "open_id", "id_value": "ou_owner", "app_id": "cli_web"}],
+    )
+    other_principal = seeded.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_other_viewer",
+    )
+    other_share = seeded.grant_agent_share_principal(
+        agent_id="agent-other",
+        grantee_principal_id=other_principal.principal_id,
+        role="viewer",
+        created_by_open_id="ou_other_owner",
     )
     seeded.close()
 
@@ -2695,6 +2713,19 @@ def test_webui_run_broker_agent_share_principal_management_endpoints(tmp_path, m
                 )
                 grant_body = await grant.json()
 
+                cross_agent_revoke = await client.delete(
+                    f"/api/run-broker/agents/agent-principal/shares/{other_share.share_id}",
+                    headers=owner_headers,
+                )
+                other_after_cross_revoke = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_other_viewer_current",
+                        "X-Hermes-Actor-Principal-Id": other_principal.principal_id,
+                    },
+                )
+                other_after_cross_revoke_body = await other_after_cross_revoke.json()
+
                 principal_id = grant_body["share"]["grantee_principal_id"]
                 shared = await client.get(
                     "/api/run-broker/agents/shared",
@@ -2734,6 +2765,15 @@ def test_webui_run_broker_agent_share_principal_management_endpoints(tmp_path, m
         assert grant.status == 200
         assert grant_body["share"]["share_id"].startswith("shr_")
         assert grant_body["share"]["grantee_principal_id"].startswith("prn_")
+        assert cross_agent_revoke.status == 200
+        assert other_after_cross_revoke.status == 200
+        assert other_after_cross_revoke_body["agents"] == [{
+            "agent_id": "agent-other",
+            "profile_name": "other_agent_profile",
+            "owner_open_id": "ou_other_owner",
+            "display_label": "Other principal analyst",
+            "role": "viewer",
+        }]
         assert grant_body["share"]["principal"] == {
             "provider": "feishu",
             "display_name": "Editor User",

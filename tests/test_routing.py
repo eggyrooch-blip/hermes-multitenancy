@@ -410,8 +410,40 @@ def test_agent_share_principal_acl_grant_lookup_and_revoke(table):
         "agent-principal",
     ]
 
-    assert table.revoke_agent_share_by_id(share.share_id) is True
+    assert table.revoke_agent_share_by_id("agent-principal", share.share_id) is True
     assert table.get_agent_share_role_for_principal("agent-principal", principal.principal_id) is None
+
+
+def test_agent_share_id_revoke_is_scoped_to_agent(table):
+    table.upsert_owned_agent(
+        agent_id="agent-a",
+        profile_name="agent_a_profile",
+        owner_open_id="ou_owner_a",
+        display_label="Agent A",
+    )
+    table.upsert_owned_agent(
+        agent_id="agent-b",
+        profile_name="agent_b_profile",
+        owner_open_id="ou_owner_b",
+        display_label="Agent B",
+    )
+    principal = table.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_viewer",
+    )
+    share_b = table.grant_agent_share_principal(
+        agent_id="agent-b",
+        grantee_principal_id=principal.principal_id,
+        role="viewer",
+        created_by_open_id="ou_owner_b",
+    )
+
+    assert table.revoke_agent_share_by_id("agent-a", share_b.share_id) is False
+    assert table.get_agent_share_role_for_principal("agent-b", principal.principal_id) == "viewer"
+    assert table.revoke_agent_share_by_id("agent-b", share_b.share_id) is True
+    assert table.get_agent_share_role_for_principal("agent-b", principal.principal_id) is None
 
 
 def test_open_id_alias_lookup_requires_app_id(table):
