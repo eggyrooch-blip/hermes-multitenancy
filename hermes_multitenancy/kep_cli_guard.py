@@ -70,6 +70,18 @@ def install_kep_cli_shim(shim_dir: Path, *, real_bin_dir: Path) -> Path:
     shim_dir = Path(shim_dir)
     real_bin_dir = Path(real_bin_dir)
     shim_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean stale shims first: the dir is exclusively ours and persists across runs, so a
+    # name we no longer manage (e.g. ``kep-cli`` after it was removed from the set, or a CLI
+    # the profile uninstalled) must NOT linger — a stale ``kep-cli`` shim would re-break
+    # ``kep-cli install``. Remove every existing entry, then write the current set.
+    for stale in shim_dir.iterdir():
+        if stale.is_file() or stale.is_symlink():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
     primary = shim_dir / "kep-auth"
     for name in KEP_CLI_SHIM_NAMES:
         real = real_bin_dir / name
