@@ -580,6 +580,7 @@ def _ingest_public_interaction(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 _INGEST_RESERVED_METADATA_KEYS = {
+    _AGENT_SHARE_CONTEXT_METADATA_KEY,
     "ingest_secret_dir",
     "ingest_secret_fingerprint",
     "ingest_secrets",
@@ -3649,6 +3650,7 @@ def create_run_broker_app(
             )
             return web.json_response({"error": "forbidden"}, status=403)
         try:
+            shared_role = str(token_record.get("share_role") or "")
             if kind == "feishu_uat":
                 # Use _load_best_uat_payload (vault + materialized plaintext,
                 # freshest wins) — the SAME source the normal non-strict path
@@ -3657,17 +3659,21 @@ def create_run_broker_app(
                 # profile that is materialized-but-not-yet-vaulted. This runs in
                 # the PARENT broker server, so it does NOT let the child read
                 # creds locally — the child still fetches via this broker route.
+                # Shared-agent runs may lease only the grantee actor's own UAT,
+                # never the owner fallback. The broker token binding above has
+                # already been verified against the lease claims.
                 from .feishu_uat_auth import _load_best_uat_payload
                 from .provider_adapter import _resolve_shared_home
 
                 profile_home = _profile_home_for_name(claims.profile_name)
                 shared_home = _resolve_shared_home(profile_home)
-                payload_value = _load_best_uat_payload(shared_home, claims.profile_name, claims.open_id)
+                open_id_for_uat = token_record["open_id"] if shared_role in _AGENT_SHARED_ROLES else claims.open_id
+                payload_value = _load_best_uat_payload(shared_home, claims.profile_name, open_id_for_uat)
                 return web.json_response({"payload": payload_value})
             if kind == "provider_env":
                 from .provider_adapter import provider_env_for_aiagent
 
-                if str(token_record.get("share_role") or "") in _AGENT_SHARED_ROLES:
+                if shared_role in _AGENT_SHARED_ROLES:
                     return web.json_response({"payload": {}})
                 profile_home = _profile_home_for_name(claims.profile_name)
                 payload_value = provider_env_for_aiagent(profile_home)

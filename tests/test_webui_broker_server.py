@@ -2291,6 +2291,20 @@ def test_webui_run_broker_agent_share_viewer_can_run_owned_agent(tmp_path):
     asyncio.run(runner())
 
 
+def test_ingest_metadata_strips_client_agent_share_context():
+    from hermes_multitenancy.webui_broker_server import _sanitize_ingest_metadata
+
+    sanitized = _sanitize_ingest_metadata({
+        "agent_share_context": {
+            "actor_open_id": "ou_attacker",
+            "share_role": "manager",
+        },
+        "keep": "visible",
+    })
+
+    assert sanitized == {"keep": "visible"}
+
+
 def test_shared_agent_credential_lease_blocks_owner_provider_env(monkeypatch, tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -2350,6 +2364,73 @@ def test_shared_agent_credential_lease_blocks_owner_provider_env(monkeypatch, tm
         assert body["payload"] == {}
 
     asyncio.run(runner())
+
+
+def test_shared_agent_credential_lease_uses_actor_feishu_uat(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import provider_adapter
+    from hermes_multitenancy import webui_broker_server as broker
+    from hermes_multitenancy.credential_broker import lease_signing_secret, mint_lease
+
+    profile_home = tmp_path / "profiles" / "owned_agent_profile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-shared-uat-key")
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
+    monkeypatch.setattr(provider_adapter, "_resolve_shared_home", lambda _profile_home: tmp_path)
+
+    calls: list[tuple[Path, str, str]] = []
+
+    def fake_load_best(shared_home: Path, profile_name: str, open_id: str):
+        calls.append((shared_home, profile_name, open_id))
+        return {"access_token": f"token-for-{open_id}", "open_id": open_id}
+
+    monkeypatch.setattr(feishu_uat_auth, "_load_best_uat_payload", fake_load_best)
+
+    token = "shared-uat-token"
+    run_id = "run-shared-uat"
+    lease = mint_lease(
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        secret=lease_signing_secret(),
+    )
+    broker.register_credential_broker_token(
+        token=token,
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        agent_id="agent-shared",
+        share_role="viewer",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/credentials/lease",
+                json={
+                    "lease": lease,
+                    "kind": "feishu_uat",
+                    "profile_name": "owned_agent_profile",
+                    "open_id": "ou_viewer",
+                    "run_id": run_id,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+            broker.unregister_credential_broker_token(token)
+
+        assert response.status == 200
+        assert body["payload"] == {"access_token": "token-for-ou_viewer", "open_id": "ou_viewer"}
+
+    asyncio.run(runner())
+    assert calls == [(tmp_path, "owned_agent_profile", "ou_viewer")]
 
 
 def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path):
