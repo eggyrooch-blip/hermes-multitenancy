@@ -51,6 +51,11 @@ _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE = 32 * 1024 * 1024
 # WebUI run submissions, not webhooks).
 _SKILLHUB_MAX_BODY_BYTES = 256 * 1024
 _INGEST_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_INGEST_AUTH_BEARER_RE = re.compile(
+    r"\b(authorization\s*[:=]\s*bearer\s+)([A-Za-z0-9._~+/=-]{8,})",
+    re.IGNORECASE,
+)
+_INGEST_JWT_LIKE_RE = re.compile(r"\beyJ[A-Za-z0-9._-]{16,}\b")
 _INGEST_SECRET_TYPES = frozenset({"bearer_token", "api_key", "cookie", "basic", "opaque"})
 _INGEST_SECRET_MAX_VALUE_BYTES = 16 * 1024
 _INGEST_SECRET_MAX_TOTAL_BYTES = 64 * 1024
@@ -624,19 +629,89 @@ def _ingest_secret_manifest_prompt(manifest: list[dict[str, str]]) -> str:
         lines.append(
             f"- `{item['name']}`: type `{item['type']}`, usage: {item.get('usage') or 'secret'}"
         )
+    lines.extend([
+        "",
+        "Secret handling rules:",
+        "- Do not print, echo, log, save, or summarize secret values, token previews, token prefixes, Authorization header values, Cookie header values, Basic credentials, or raw secret file contents.",
+        "- It is safe to print only the secret name, type, file existence, and value length when needed.",
+        "- For bearer tokens, read the file inside terminal or execute_code and pass it directly as an Authorization header without displaying it.",
+        "",
+        "Execution rules for ingest API runs:",
+        "- Do not delegate this task to delegate_task, subagents, or background tasks; complete it directly in this run.",
+        "- Use terminal or execute_code for authenticated business API calls that need secrets; do not use web_extract/web_search for authenticated business APIs.",
+    ])
     return "\n".join(lines)
 
 
 def _ingest_redact_text(text: Any, secret_spec: SimpleNamespace | None) -> str:
     value = str(text or "")
     if not secret_spec:
-        return value
+        return _ingest_redact_secret_like_text(value)
     entries = list(getattr(secret_spec, "entries", []) or [])
     for item in sorted(entries, key=lambda entry: len(entry.get("value") or ""), reverse=True):
         secret_value = str(item.get("value") or "")
         if secret_value:
             value = value.replace(secret_value, f"[REDACTED:{item.get('name') or 'secret'}]")
+            value = _ingest_redact_secret_prefixes(
+                value,
+                secret_name=str(item.get("name") or "secret"),
+                secret_value=secret_value,
+            )
+    return _ingest_redact_secret_like_text(value)
+
+
+def _ingest_redact_secret_prefixes(
+    text: str,
+    *,
+    secret_name: str,
+    secret_value: str,
+) -> str:
+    if len(secret_value) < 8:
+        return text
+    value = text
+    for length in range(min(len(secret_value) - 1, 64), 7, -1):
+        prefix = secret_value[:length]
+        if prefix:
+            value = value.replace(prefix, f"[REDACTED:{secret_name}:prefix]")
     return value
+
+
+def _ingest_redact_secret_like_text(text: str) -> str:
+    value = _INGEST_AUTH_BEARER_RE.sub(
+        lambda match: f"{match.group(1)}[REDACTED:authorization]",
+        text,
+    )
+    value = _INGEST_JWT_LIKE_RE.sub("[REDACTED:jwt]", value)
+    return value
+
+
+def _ingest_compact_error_text(text: Any, *, limit: int = 320) -> str:
+    value = " ".join(str(text or "").strip().split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def _ingest_classify_agent_error(error: Any) -> str:
+    text = _ingest_compact_error_text(error)
+    lower = text.lower()
+    if "max_iterations_reached" in lower or "maximum iterations" in lower:
+        return f"agent_max_iterations: {text or 'agent exhausted tool iterations'}"
+    if "cannot schedule new futures after interpreter shutdown" in lower:
+        return f"agent_tool_loop_error: {text}"
+    if "outer loop error" in lower or "tool loop" in lower:
+        return f"agent_tool_loop_error: {text}"
+    if "aiagent subprocess" in lower:
+        return f"agent_runtime_error: {text}"
+    if isinstance(error, BaseException):
+        detail = text or type(error).__name__
+        return f"agent_runtime_error: {type(error).__name__}: {detail}"
+    return f"agent_runtime_error: {text or 'agent run failed'}"
+
+
+def _ingest_run_session_id(prepared: Any) -> str:
+    run_request = getattr(prepared, "run_request", None)
+    return str(getattr(run_request, "session_id", "") or "")
 
 
 def _ingest_materialize_secret_dir(
@@ -1993,6 +2068,7 @@ def create_run_broker_app(
         job = _ingest_async_jobs.get(run_id)
         if job is None:
             return
+        session_id = _ingest_run_session_id(prepared)
 
         collected: list[str] = []
         error_text: dict[str, str] = {}
@@ -2038,7 +2114,13 @@ def create_run_broker_app(
                 if not done:
                     run_task.cancel()
                     interrupt_task.cancel()
-                    logger.warning("[multitenancy] async ingest run timed out after %ss", timeout_s)
+                    logger.warning(
+                        "[multitenancy] async ingest run timed out run_id=%s profile=%s session_id=%s timeout_s=%s",
+                        run_id,
+                        prepared.bound_profile,
+                        session_id,
+                        timeout_s,
+                    )
                     job["error"] = "timeout"
                     _ingest_async_touch(job, "timeout")
                     return
@@ -2060,7 +2142,13 @@ def create_run_broker_app(
                     timeout=timeout_s,
                 )
         except asyncio.TimeoutError:
-            logger.warning("[multitenancy] async ingest run timed out after %ss", timeout_s)
+            logger.warning(
+                "[multitenancy] async ingest run timed out run_id=%s profile=%s session_id=%s timeout_s=%s",
+                run_id,
+                prepared.bound_profile,
+                session_id,
+                timeout_s,
+            )
             job["error"] = "timeout"
             _ingest_async_touch(job, "timeout")
             return
@@ -2068,20 +2156,36 @@ def create_run_broker_app(
             job["error"] = _ingest_redact_text(str(exc), prepared.secret_spec)
             _ingest_async_touch(job, "failed")
             return
-        except Exception:
-            logger.exception("[multitenancy] async ingest run failed")
-            job["error"] = "internal error"
+        except Exception as exc:
+            classified_error = _ingest_classify_agent_error(
+                _ingest_redact_text(str(exc), prepared.secret_spec)
+            )
+            logger.error(
+                "[multitenancy] async ingest run failed run_id=%s profile=%s session_id=%s exc_type=%s error=%s",
+                run_id,
+                prepared.bound_profile,
+                session_id,
+                type(exc).__name__,
+                classified_error,
+            )
+            job["error"] = classified_error
             _ingest_async_touch(job, "failed")
             return
 
         text = "".join(collected).strip() or (result.content if result else "")
         text = _ingest_redact_text(text, prepared.secret_spec)
         if error_text.get("error"):
-            logger.error(
-                "[multitenancy] async ingest agent error: %s",
-                _ingest_redact_text(error_text["error"], prepared.secret_spec),
+            classified_error = _ingest_classify_agent_error(
+                _ingest_redact_text(error_text["error"], prepared.secret_spec)
             )
-            job["error"] = "agent run failed"
+            logger.error(
+                "[multitenancy] async ingest agent error run_id=%s profile=%s session_id=%s error=%s",
+                run_id,
+                prepared.bound_profile,
+                session_id,
+                classified_error,
+            )
+            job["error"] = classified_error
             _ingest_async_touch(job, "failed")
             return
         if clarify_holder:
@@ -2463,12 +2567,18 @@ def create_run_broker_app(
                         await run_task
                     except asyncio.CancelledError:
                         pass  # expected: we cancelled it
-                    except Exception:
+                    except Exception as exc:
                         # Review NB-new3: don't silently swallow cleanup
                         # failures — log them, but still surface the
                         # interaction request to the caller.
-                        logger.exception(
-                            "[multitenancy] ingest interactive run cleanup error"
+                        logger.error(
+                            "[multitenancy] ingest interactive run cleanup error profile=%s session_id=%s exc_type=%s error=%s",
+                            bound_profile,
+                            run_request.session_id,
+                            type(exc).__name__,
+                            _ingest_classify_agent_error(
+                                _ingest_redact_text(str(exc), secret_spec)
+                            ),
                         )
                     interrupt_task.cancel()
                 else:
@@ -2488,10 +2598,18 @@ def create_run_broker_app(
                 {"ok": False, "error": _ingest_redact_text(str(exc), secret_spec)},
                 status=403,
             )
-        except Exception:
+        except Exception as exc:
             # Review NB3: do not leak internal exception text to an
             # internet-facing caller — log server-side, return generic.
-            logger.exception("[multitenancy] ingest run failed")
+            logger.error(
+                "[multitenancy] ingest run failed profile=%s session_id=%s exc_type=%s error=%s",
+                bound_profile,
+                run_request.session_id,
+                type(exc).__name__,
+                _ingest_classify_agent_error(
+                    _ingest_redact_text(str(exc), secret_spec)
+                ),
+            )
             return web.json_response(
                 {"ok": False, "error": "internal error"}, status=500
             )

@@ -1174,6 +1174,106 @@ def test_stream_aiagent_subprocess_initializes_state_db_schema_for_fresh_profile
         ]
 
 
+def test_stream_aiagent_subprocess_redacts_ingest_secret_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.stream.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_stream"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_bearer", "type": "bearer_token", "usage": "Authorization Bearer"}]
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps(
+                    {"event": "content", "text": f"content Authorization: Bearer {secret_value}"},
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+                json.dumps(
+                    {"event": "thinking", "text": f"thinking Authorization: Bearer {secret_value}"},
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+                json.dumps(
+                    {
+                        "event": "tool_started",
+                        "name": "terminal",
+                        "preview": f"curl -H 'Authorization: Bearer {secret_value}'",
+                        "args": {"command": f"curl -H 'Authorization: Bearer {secret_value}'"},
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+                json.dumps(
+                    {"event": "done", "result": f"done Authorization: Bearer {secret_value}"},
+                    ensure_ascii=False,
+                ).encode("utf-8") + b"\n",
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(event, tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+    encoded_events = json.dumps(events, ensure_ascii=False)
+
+    assert secret_value not in encoded_events
+    assert secret_value[:16] not in encoded_events
+    assert "Authorization: Bearer eyJ" not in encoded_events
+    assert "[REDACTED:cms_bearer]" in encoded_events
+
+
 def test_stream_aiagent_subprocess_forwards_child_clarify_events(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -2399,6 +2499,366 @@ def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp
     }
 
 
+def test_run_with_aiagent_removes_delegation_toolset_for_ingest_runs(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "ingest", "ingest_secrets": []}}
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "file", "lark-cli", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["file", "lark-cli", "terminal", "web"],
+    }
+
+
+def test_run_with_aiagent_adds_terminal_for_ingest_strict_toolsets(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "ingest", "ingest_secrets": []}}
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "lark-cli"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["lark-cli", "terminal"],
+    }
+
+
+def test_ingest_enabled_toolsets_removes_composite_delegate_task(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    fake_toolsets = SimpleNamespace(
+        resolve_toolset=lambda name: ["delegate_task", "terminal"]
+        if name == "composite-delegating"
+        else [name],
+    )
+    monkeypatch.setitem(sys.modules, "toolsets", fake_toolsets)
+
+    assert agent_real._ingest_enabled_toolsets(
+        ["composite-delegating", "lark-cli"],
+        "webui",
+    ) == ["lark-cli", "terminal"]
+
+
+def test_run_with_aiagent_ingest_secret_env_builds_authorization_header(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.env.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_run"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [
+        {
+            "name": "cms_bearer",
+            "type": "bearer_token",
+            "usage": "Authorization Bearer",
+        }
+    ]
+    monkeypatch.setenv("HERMES_INGEST_SECRET_DIR", str(secret_dir))
+    monkeypatch.setenv("HERMES_INGEST_SECRET_MANIFEST", json.dumps(manifest, ensure_ascii=False))
+
+    registered_passthrough: set[str] = set()
+    fake_env_passthrough_mod = SimpleNamespace(
+        _config_passthrough=frozenset(),
+        register_env_passthrough=lambda names: registered_passthrough.update(names),
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough_mod
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough_mod)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "lark-cli"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            env_secret_dir = Path(os.environ["HERMES_INGEST_SECRET_DIR"])
+            bearer = (env_secret_dir / "cms_bearer").read_text(encoding="utf-8")
+            authorization = f"Bearer {bearer}"
+            captured["authorization_matches"] = authorization == f"Bearer {secret_value}"
+            captured["authorization_len"] = len(authorization)
+            captured["manifest"] = json.loads(os.environ["HERMES_INGEST_SECRET_MANIFEST"])
+            return {"final_response": f"ok auth_len={captured['authorization_len']}"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    result = agent_real._run_with_aiagent(event, profile_home)
+
+    assert result == f"ok auth_len={len('Bearer ' + secret_value)}"
+    assert captured["platform_key"] == "webui"
+    assert captured["enabled_toolsets"] == ["lark-cli", "terminal"]
+    assert captured["authorization_matches"] is True
+    assert captured["manifest"] == manifest
+    assert registered_passthrough == {
+        "HERMES_INGEST_SECRET_DIR",
+        "HERMES_INGEST_SECRET_MANIFEST",
+    }
+    assert set(fake_env_passthrough_mod._config_passthrough) == registered_passthrough
+    assert secret_value not in json.dumps(captured, ensure_ascii=False)
+    assert secret_value not in result
+
+
+def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    pytest.importorskip("hermes_cli.tools_config")
+    toolsets_mod = pytest.importorskip("toolsets")
+    from hermes_multitenancy import agent_real
+
+    assert "delegate_task" in set(toolsets_mod.resolve_toolset("delegation"))
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: openai/test-model\n"
+        "platform_toolsets:\n"
+        "  webui:\n"
+        "  - hermes-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "ingest", "ingest_secrets": []}}
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    enabled_toolsets = set(captured["enabled_toolsets"] or [])
+    assert "delegation" not in enabled_toolsets
+    assert "terminal" in enabled_toolsets
+    assert "code_execution" in enabled_toolsets
+    expanded_tools: set[str] = set()
+    for toolset_name in enabled_toolsets:
+        expanded_tools.update(toolsets_mod.resolve_toolset(toolset_name))
+    assert "delegate_task" not in expanded_tools
+
+
+def test_run_with_aiagent_redacts_ingest_secret_from_finalize_logs(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.finalize.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_finalize"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_bearer", "type": "bearer_token", "usage": "Authorization Bearer"}]
+    monkeypatch.setenv("HERMES_INGEST_SECRET_DIR", str(secret_dir))
+    monkeypatch.setenv("HERMES_INGEST_SECRET_MANIFEST", json.dumps(manifest, ensure_ascii=False))
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        return ["terminal"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id):
+            return {
+                "failed": True,
+                "final_response": None,
+                "error": f"tool failed Authorization: Bearer {secret_value}",
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.agent_real"):
+        with pytest.raises(RuntimeError) as excinfo:
+            agent_real._run_with_aiagent(event, profile_home)
+
+    assert "[REDACTED:cms_bearer]" in str(excinfo.value)
+    assert "[REDACTED:cms_bearer]" in caplog.text
+    assert secret_value not in str(excinfo.value)
+    assert secret_value not in caplog.text
+    assert secret_value[:16] not in caplog.text
+    assert "Authorization: Bearer eyJ" not in caplog.text
+
+
+def test_ingest_runtime_redactor_redacts_opaque_secret_prefix(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    secret_value = "sk-live-1234567890abcdef"
+    leaked_prefix = secret_value[:10]
+    secret_dir = tmp_path / "ingest-secrets" / "ing_prefix"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_api_key").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_api_key", "type": "api_key", "usage": "API key"}]
+    monkeypatch.setenv("HERMES_INGEST_SECRET_DIR", str(secret_dir))
+    monkeypatch.setenv("HERMES_INGEST_SECRET_MANIFEST", json.dumps(manifest, ensure_ascii=False))
+
+    redacted = agent_real._redact_ingest_runtime_text(
+        f"tool failed after token prefix {leaked_prefix}"
+    )
+
+    assert "[REDACTED:cms_api_key:prefix]" in redacted
+    assert leaked_prefix not in redacted
+    assert secret_value not in redacted
+
+
+def test_run_with_aiagent_keeps_delegation_toolset_for_non_ingest_runs(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.raw_event = {"metadata": {"source": "webui"}}
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "file", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["delegation", "file", "terminal", "web"],
+    }
+
+
 def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -3001,6 +3461,56 @@ async def test_run_aiagent_subprocess_executes_sibling_script(monkeypatch, tmp_p
     assert seen_args[0] == sys.executable
     assert seen_args[1].endswith("aiagent_subprocess.py")
     assert "-m" not in seen_args
+
+
+@pytest.mark.asyncio
+async def test_run_aiagent_subprocess_redacts_ingest_secret_from_child_errors(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+):
+    from hermes_multitenancy import agent_real
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.subprocess.fake.jwt.signature"
+    secret_dir = tmp_path / "ingest-secrets" / "ing_child"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "cms_bearer").write_text(secret_value, encoding="utf-8")
+    manifest = [{"name": "cms_bearer", "type": "bearer_token", "usage": "Authorization Bearer"}]
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "source": "ingest",
+            "ingest_secret_dir": str(secret_dir),
+            "ingest_secrets": manifest,
+        }
+    }
+
+    class FakeProc:
+        returncode = 1
+
+        async def communicate(self, _payload):
+            stdout = json.dumps(
+                {"result": None, "error": f"child Authorization: Bearer {secret_value}"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            stderr = f"stderr Authorization: Bearer {secret_value}".encode("utf-8")
+            return stdout, stderr
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_multitenancy.agent_real"):
+        with pytest.raises(RuntimeError) as excinfo:
+            await agent_real._run_aiagent_subprocess(event, tmp_path)
+
+    assert "[REDACTED:cms_bearer]" in str(excinfo.value)
+    assert "[REDACTED:cms_bearer]" in caplog.text
+    assert secret_value not in str(excinfo.value)
+    assert secret_value not in caplog.text
+    assert secret_value[:16] not in caplog.text
+    assert "Authorization: Bearer eyJ" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
