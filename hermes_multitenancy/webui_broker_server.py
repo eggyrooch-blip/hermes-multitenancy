@@ -3513,7 +3513,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         actor_open_id = _trusted_owner_from_request(request)
         agent_id = str(request.match_info.get("agent_id") or "").strip()
-        grantee_open_id = str(request.match_info.get("grantee_open_id") or "").strip()
+        share_key = str(request.match_info.get("share_key") or "").strip()
         from . import router as router_mod
 
         table = router_mod._get_routing_table()
@@ -3523,8 +3523,8 @@ def create_run_broker_app(
         _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id, actor_principal_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
-        if not table.revoke_agent_share_by_id(agent_id, grantee_open_id):
-            table.revoke_agent_share(agent_id, grantee_open_id)
+        if not table.revoke_agent_share_by_id(agent_id, share_key):
+            table.revoke_agent_share(agent_id, share_key)
         return web.json_response({"ok": True})
 
     async def handle_slash_commands(request):
@@ -4422,7 +4422,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/agents/shared", handle_list_shared_agents)
     app.router.add_get("/api/run-broker/agents/{agent_id}/shares", handle_list_agent_shares)
     app.router.add_post("/api/run-broker/agents/{agent_id}/shares", handle_grant_agent_share)
-    app.router.add_delete("/api/run-broker/agents/{agent_id}/shares/{grantee_open_id}", handle_revoke_agent_share)
+    app.router.add_delete("/api/run-broker/agents/{agent_id}/shares/{share_key}", handle_revoke_agent_share)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_post("/api/run-broker/credentials/lease", handle_credential_lease)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
