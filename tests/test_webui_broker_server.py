@@ -2613,6 +2613,326 @@ def test_webui_run_broker_agent_share_management_endpoints(tmp_path):
     asyncio.run(runner())
 
 
+def test_webui_run_broker_agent_share_principal_management_endpoints(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-principal",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared principal analyst",
+    )
+    owner_principal = seeded.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_owner",
+        aliases=[{"id_type": "open_id", "id_value": "ou_owner", "app_id": "cli_web"}],
+    )
+    seeded.close()
+
+    def fake_resolve_identity_lookup(table, lookup, requester):
+        assert requester.principal_id == owner_principal.principal_id
+        assert lookup == {"provider": "feishu", "type": "email", "value": "editor@example.test"}
+        return table.upsert_principal(
+            provider="feishu",
+            tenant_key="tenant_a",
+            canonical_id_type="user_id",
+            canonical_id="u_editor",
+            display_name="Editor User",
+            avatar_url="https://example.test/editor.png",
+            email="editor@example.test",
+            aliases=[
+                {"id_type": "email", "id_value": "editor@example.test"},
+                {"id_type": "open_id", "id_value": "ou_editor_current", "app_id": "cli_web"},
+            ],
+        )
+
+    monkeypatch.setattr(broker_mod, "_resolve_identity_lookup", fake_resolve_identity_lookup)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                owner_headers = {
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                    "X-Hermes-Actor-Principal-Id": owner_principal.principal_id,
+                    "X-Hermes-Actor-Provider": "feishu",
+                    "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                    "X-Hermes-Actor-App-Id": "cli_web",
+                }
+                grant = await client.post(
+                    "/api/run-broker/agents/agent-principal/shares",
+                    headers=owner_headers,
+                    json={
+                        "grantee": {
+                            "provider": "feishu",
+                            "type": "email",
+                            "value": "editor@example.test",
+                        },
+                        "role": "editor",
+                    },
+                )
+                grant_body = await grant.json()
+
+                principal_id = grant_body["share"]["grantee_principal_id"]
+                shared = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_editor_current",
+                        "X-Hermes-Actor-Principal-Id": principal_id,
+                        "X-Hermes-Actor-Provider": "feishu",
+                        "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                        "X-Hermes-Actor-App-Id": "cli_web",
+                    },
+                )
+                shared_body = await shared.json()
+
+                members = await client.get(
+                    "/api/run-broker/agents/agent-principal/shares",
+                    headers=owner_headers,
+                )
+                members_body = await members.json()
+
+                revoke = await client.delete(
+                    f"/api/run-broker/agents/agent-principal/shares/{grant_body['share']['share_id']}",
+                    headers=owner_headers,
+                )
+                after_revoke = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_editor_current",
+                        "X-Hermes-Actor-Principal-Id": principal_id,
+                    },
+                )
+                after_revoke_body = await after_revoke.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert grant.status == 200
+        assert grant_body["share"]["share_id"].startswith("shr_")
+        assert grant_body["share"]["grantee_principal_id"].startswith("prn_")
+        assert grant_body["share"]["principal"] == {
+            "provider": "feishu",
+            "display_name": "Editor User",
+            "avatar_url": "https://example.test/editor.png",
+            "email": "editor@example.test",
+            "user_id": "u_editor",
+        }
+        assert shared.status == 200
+        assert shared_body["agents"] == [{
+            "agent_id": "agent-principal",
+            "profile_name": "owned_agent_profile",
+            "owner_open_id": "ou_owner",
+            "display_label": "Shared principal analyst",
+            "role": "editor",
+        }]
+        assert members.status == 200
+        assert members_body["shares"][0]["principal"]["display_name"] == "Editor User"
+        assert "ou_editor_current" not in str(members_body["shares"][0])
+        assert revoke.status == 200
+        assert after_revoke_body["agents"] == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_materializes_actor_principal_from_trusted_headers(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-trusted-headers",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Trusted header analyst",
+    )
+    seeded.close()
+
+    def fake_resolve_identity_lookup(table, lookup, requester):
+        assert requester.provider == "feishu"
+        assert requester.tenant_key == "tenant_a"
+        assert requester.canonical_id_type == "user_id"
+        assert requester.canonical_id == "u_owner"
+        assert requester.display_name == "Owner User"
+        assert lookup == {"provider": "feishu", "type": "email", "value": "viewer@example.test"}
+        return table.upsert_principal(
+            provider="feishu",
+            tenant_key="tenant_a",
+            canonical_id_type="user_id",
+            canonical_id="u_viewer",
+            display_name="Viewer User",
+            email="viewer@example.test",
+            aliases=[{"id_type": "email", "id_value": "viewer@example.test"}],
+        )
+
+    monkeypatch.setattr(broker_mod, "_resolve_identity_lookup", fake_resolve_identity_lookup)
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                grant = await client.post(
+                    "/api/run-broker/agents/agent-trusted-headers/shares",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_owner",
+                        "X-Hermes-Actor-Provider": "feishu",
+                        "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                        "X-Hermes-Actor-App-Id": "cli_web",
+                        "X-Hermes-Actor-User-Id": "u_owner",
+                        "X-Hermes-Actor-Display-Name": "Owner User",
+                        "X-Hermes-Actor-Avatar-Url": "https://example.test/owner.png",
+                        "X-Hermes-Actor-Email": "owner@example.test",
+                    },
+                    json={
+                        "grantee": {
+                            "provider": "feishu",
+                            "type": "email",
+                            "value": "viewer@example.test",
+                        },
+                        "role": "viewer",
+                    },
+                )
+                grant_body = await grant.json()
+
+                shared = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={
+                        "X-Hermes-Owner-Open-Id": "ou_viewer_current",
+                        "X-Hermes-Actor-Provider": "feishu",
+                        "X-Hermes-Actor-Tenant-Key": "tenant_a",
+                        "X-Hermes-Actor-App-Id": "cli_web",
+                        "X-Hermes-Actor-User-Id": "u_viewer",
+                    },
+                )
+                shared_body = await shared.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert grant.status == 200
+        assert grant_body["share"]["principal"]["display_name"] == "Viewer User"
+        assert shared.status == 200
+        assert shared_body["agents"][0]["agent_id"] == "agent-trusted-headers"
+
+        table = RoutingTable(db_path)
+        try:
+            owner = table.find_principal(
+                provider="feishu",
+                tenant_key="tenant_a",
+                canonical_id_type="user_id",
+                canonical_id="u_owner",
+            )
+            assert owner is not None
+            assert owner.display_name == "Owner User"
+            assert table.lookup_principal_by_alias(
+                provider="feishu",
+                tenant_key="tenant_a",
+                id_type="open_id",
+                id_value="ou_owner",
+                app_id="cli_web",
+            ).principal_id == owner.principal_id
+        finally:
+            table.close()
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_resolves_feishu_email_lookup_from_contact_directory(monkeypatch):
+    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.sync import feishu_org
+
+    table = RoutingTable(":memory:")
+    try:
+        table.upsert(
+            user_id="u_owner",
+            profile_name="owner_profile",
+            open_id="ou_owner",
+            provenance="sync",
+        )
+        table.upsert(
+            user_id="u_editor",
+            profile_name="editor_profile",
+            open_id="ou_editor",
+            provenance="sync",
+        )
+        requester = table.upsert_principal(
+            provider="feishu",
+            tenant_key="tenant_a",
+            canonical_id_type="user_id",
+            canonical_id="u_owner",
+        )
+        monkeypatch.setattr(feishu_org, "fetch_contact_directory", lambda **_kwargs: {
+            "ou_editor": {
+                "email": "editor@example.test",
+                "name": "Editor User",
+            },
+        })
+
+        principal = broker_mod._resolve_identity_lookup(
+            table,
+            {"provider": "feishu", "type": "email", "value": "editor@example.test"},
+            requester,
+        )
+
+        assert principal.provider == "feishu"
+        assert principal.tenant_key == "tenant_a"
+        assert principal.canonical_id_type == "user_id"
+        assert principal.canonical_id == "u_editor"
+        assert principal.display_name == "Editor User"
+        assert principal.email == "editor@example.test"
+        assert table.lookup_principal_by_alias(
+            provider="feishu",
+            tenant_key="tenant_a",
+            id_type="email",
+            id_value="editor@example.test",
+        ).principal_id == principal.principal_id
+    finally:
+        table.close()
+
+
 def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

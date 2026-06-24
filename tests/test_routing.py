@@ -372,6 +372,81 @@ def test_agent_share_acl_grant_lookup_and_revoke(table):
     assert table.get_agent_share_role("agent-shared", "ou_viewer") is None
 
 
+def test_agent_share_principal_acl_grant_lookup_and_revoke(table):
+    table.upsert_owned_agent(
+        agent_id="agent-principal",
+        profile_name="agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Principal analyst",
+    )
+    principal = table.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_editor",
+        display_name="Editor User",
+        avatar_url="https://example.test/avatar.png",
+        email="editor@example.test",
+        aliases=[
+            {"id_type": "email", "id_value": "editor@example.test"},
+            {"id_type": "open_id", "id_value": "ou_editor_web", "app_id": "cli_web"},
+        ],
+    )
+
+    share = table.grant_agent_share_principal(
+        agent_id="agent-principal",
+        grantee_principal_id=principal.principal_id,
+        role="editor",
+        created_by_open_id="ou_owner",
+    )
+
+    assert share.share_id.startswith("shr_")
+    assert share.grantee_principal_id == principal.principal_id
+    assert share.principal_display_name == "Editor User"
+    assert share.principal_avatar_url == "https://example.test/avatar.png"
+    assert share.principal_email == "editor@example.test"
+    assert table.get_agent_share_role_for_principal("agent-principal", principal.principal_id) == "editor"
+    assert [row.route.agent_id for row in table.list_shared_agents_for_principal(principal.principal_id)] == [
+        "agent-principal",
+    ]
+
+    assert table.revoke_agent_share_by_id(share.share_id) is True
+    assert table.get_agent_share_role_for_principal("agent-principal", principal.principal_id) is None
+
+
+def test_open_id_alias_lookup_requires_app_id(table):
+    principal = table.upsert_principal(
+        provider="feishu",
+        tenant_key="tenant_a",
+        canonical_id_type="user_id",
+        canonical_id="u_same_person",
+        aliases=[
+            {"id_type": "open_id", "id_value": "ou_app_scoped", "app_id": "cli_a"},
+        ],
+    )
+
+    assert table.lookup_principal_by_alias(
+        provider="feishu",
+        tenant_key="tenant_a",
+        id_type="open_id",
+        id_value="ou_app_scoped",
+        app_id="cli_a",
+    ).principal_id == principal.principal_id
+    assert table.lookup_principal_by_alias(
+        provider="feishu",
+        tenant_key="tenant_a",
+        id_type="open_id",
+        id_value="ou_app_scoped",
+        app_id="cli_b",
+    ) is None
+    assert table.lookup_principal_by_alias(
+        provider="feishu",
+        tenant_key="tenant_a",
+        id_type="open_id",
+        id_value="ou_app_scoped",
+    ) is None
+
+
 def test_list_by_owner_ordering_sync_root_first(table):
     table.upsert_group(
         chat_id="oc_early",

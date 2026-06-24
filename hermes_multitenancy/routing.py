@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,47 @@ CREATE TABLE IF NOT EXISTS multitenancy_group_reply_mode (
 CREATE TABLE IF NOT EXISTS multitenancy_agent_shares (
     agent_id           TEXT NOT NULL,
     grantee_open_id    TEXT NOT NULL,
+    share_id           TEXT,
+    grantee_principal_id TEXT,
     role               TEXT NOT NULL,
     status             TEXT NOT NULL DEFAULT 'active',
     created_by_open_id TEXT NOT NULL,
+    created_by_principal_id TEXT,
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,
     revoked_at         INTEGER,
     PRIMARY KEY (agent_id, grantee_open_id)
+);
+
+CREATE TABLE IF NOT EXISTS multitenancy_principals (
+    principal_id      TEXT PRIMARY KEY NOT NULL,
+    provider          TEXT NOT NULL,
+    tenant_key        TEXT NOT NULL DEFAULT '',
+    canonical_id_type TEXT NOT NULL,
+    canonical_id      TEXT NOT NULL,
+    display_name      TEXT,
+    avatar_url        TEXT,
+    email             TEXT,
+    status            TEXT NOT NULL DEFAULT 'active',
+    profile_json      TEXT,
+    merged_into_principal_id TEXT,
+    last_resolved_at  INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    UNIQUE(provider, tenant_key, canonical_id_type, canonical_id)
+);
+
+CREATE TABLE IF NOT EXISTS multitenancy_principal_aliases (
+    provider      TEXT NOT NULL,
+    tenant_key    TEXT NOT NULL DEFAULT '',
+    id_type       TEXT NOT NULL,
+    id_value      TEXT NOT NULL,
+    app_id        TEXT NOT NULL DEFAULT '',
+    principal_id  TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY(provider, tenant_key, id_type, id_value, app_id),
+    FOREIGN KEY(principal_id) REFERENCES multitenancy_principals(principal_id)
 );
 """
 
@@ -115,6 +150,12 @@ _NEW_COLUMNS: tuple[tuple[str, str], ...] = (
 
 _PENDING_INVITER_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("inviter_union_id", "TEXT"),
+)
+
+_AGENT_SHARE_NEW_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("share_id", "TEXT"),
+    ("grantee_principal_id", "TEXT"),
+    ("created_by_principal_id", "TEXT"),
 )
 
 # Old (pre-group) index name to drop before recreating a kind-aware version.
@@ -169,6 +210,23 @@ _NEW_INDEXES: tuple[tuple[str, str], ...] = (
         "CREATE INDEX IF NOT EXISTS idx_agent_shares_grantee_active "
         "ON multitenancy_agent_shares(grantee_open_id, agent_id) "
         "WHERE status = 'active'",
+    ),
+    (
+        "idx_agent_shares_share_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_shares_share_id "
+        "ON multitenancy_agent_shares(share_id) "
+        "WHERE share_id IS NOT NULL",
+    ),
+    (
+        "idx_agent_shares_principal_active",
+        "CREATE INDEX IF NOT EXISTS idx_agent_shares_principal_active "
+        "ON multitenancy_agent_shares(grantee_principal_id, agent_id) "
+        "WHERE status = 'active' AND grantee_principal_id IS NOT NULL",
+    ),
+    (
+        "idx_principal_aliases_principal",
+        "CREATE INDEX IF NOT EXISTS idx_principal_aliases_principal "
+        "ON multitenancy_principal_aliases(principal_id)",
     ),
 )
 
@@ -229,12 +287,66 @@ class AgentShareRow:
     created_at: int
     updated_at: int
     revoked_at: Optional[int] = None
+    share_id: Optional[str] = None
+    grantee_principal_id: Optional[str] = None
+    created_by_principal_id: Optional[str] = None
+    principal_provider: Optional[str] = None
+    principal_tenant_key: Optional[str] = None
+    principal_canonical_id_type: Optional[str] = None
+    principal_canonical_id: Optional[str] = None
+    principal_display_name: Optional[str] = None
+    principal_avatar_url: Optional[str] = None
+    principal_email: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PrincipalRow:
+    principal_id: str
+    provider: str
+    tenant_key: str
+    canonical_id_type: str
+    canonical_id: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    email: Optional[str] = None
+    status: str = "active"
+    profile_json: Optional[str] = None
+    merged_into_principal_id: Optional[str] = None
+    last_resolved_at: int = 0
+    created_at: int = 0
+    updated_at: int = 0
 
 
 @dataclass(frozen=True)
 class SharedAgentRow:
     route: RoutingRow
     share: AgentShareRow
+
+
+_AGENT_SHARE_SELECT_SQL = """
+SELECT
+    s.agent_id,
+    s.grantee_open_id,
+    s.share_id,
+    s.grantee_principal_id,
+    s.role,
+    s.status,
+    s.created_by_open_id,
+    s.created_by_principal_id,
+    s.created_at,
+    s.updated_at,
+    s.revoked_at,
+    p.provider AS p_provider,
+    p.tenant_key AS p_tenant_key,
+    p.canonical_id_type AS p_canonical_id_type,
+    p.canonical_id AS p_canonical_id,
+    p.display_name AS p_display_name,
+    p.avatar_url AS p_avatar_url,
+    p.email AS p_email
+FROM multitenancy_agent_shares s
+LEFT JOIN multitenancy_principals p
+  ON p.principal_id = s.grantee_principal_id
+"""
 
 
 class RoutingTable:
@@ -284,6 +396,14 @@ class RoutingTable:
                 self._conn.execute(
                     "ALTER TABLE multitenancy_pending_group_inviter "
                     f"ADD COLUMN {col_name} {col_def}"
+                )
+
+        cur = self._conn.execute("PRAGMA table_info(multitenancy_agent_shares)")
+        existing_share_cols = {row["name"] for row in cur.fetchall()}
+        for col_name, col_def in _AGENT_SHARE_NEW_COLUMNS:
+            if col_name not in existing_share_cols:
+                self._conn.execute(
+                    f"ALTER TABLE multitenancy_agent_shares ADD COLUMN {col_name} {col_def}"
                 )
 
         # Drop the legacy open_id unique index — its predicate doesn't include
@@ -345,6 +465,18 @@ class RoutingTable:
             except Exception:
                 self._conn.rollback()
                 raise
+
+        cur = self._conn.execute(
+            "SELECT agent_id, grantee_open_id FROM multitenancy_agent_shares "
+            "WHERE share_id IS NULL OR share_id = ''"
+        )
+        rows_missing_share_id = cur.fetchall()
+        for row in rows_missing_share_id:
+            self._conn.execute(
+                "UPDATE multitenancy_agent_shares SET share_id = ? "
+                "WHERE agent_id = ? AND grantee_open_id = ?",
+                (_new_share_id(), row["agent_id"], row["grantee_open_id"]),
+            )
 
     # -- read path (router) -----------------------------------------------
 
@@ -868,6 +1000,192 @@ class RoutingTable:
 
     # -- agent sharing ----------------------------------------------------
 
+    def upsert_principal(
+        self,
+        *,
+        provider: str,
+        tenant_key: str = "",
+        canonical_id_type: str,
+        canonical_id: str,
+        display_name: str | None = None,
+        avatar_url: str | None = None,
+        email: str | None = None,
+        status: str = "active",
+        profile_json: str | None = None,
+        aliases: list[dict[str, str]] | None = None,
+    ) -> PrincipalRow:
+        provider = (provider or "").strip()
+        tenant_key = (tenant_key or "").strip()
+        canonical_id_type = (canonical_id_type or "").strip()
+        canonical_id = (canonical_id or "").strip()
+        status = (status or "active").strip()
+        if not provider:
+            raise ValueError("provider is required")
+        if not tenant_key:
+            raise ValueError("tenant_key is required")
+        if not canonical_id_type:
+            raise ValueError("canonical_id_type is required")
+        if not canonical_id:
+            raise ValueError("canonical_id is required")
+
+        now = _now()
+        existing = self.find_principal(
+            provider=provider,
+            tenant_key=tenant_key,
+            canonical_id_type=canonical_id_type,
+            canonical_id=canonical_id,
+        )
+        principal_id = existing.principal_id if existing else _new_principal_id()
+        created_at = existing.created_at if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_principals
+                (principal_id, provider, tenant_key, canonical_id_type, canonical_id,
+                 display_name, avatar_url, email, status, profile_json,
+                 last_resolved_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, tenant_key, canonical_id_type, canonical_id) DO UPDATE SET
+                display_name = COALESCE(excluded.display_name, multitenancy_principals.display_name),
+                avatar_url = COALESCE(excluded.avatar_url, multitenancy_principals.avatar_url),
+                email = COALESCE(excluded.email, multitenancy_principals.email),
+                status = excluded.status,
+                profile_json = COALESCE(excluded.profile_json, multitenancy_principals.profile_json),
+                last_resolved_at = excluded.last_resolved_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                principal_id,
+                provider,
+                tenant_key,
+                canonical_id_type,
+                canonical_id,
+                (display_name or "").strip() or None,
+                (avatar_url or "").strip() or None,
+                (email or "").strip() or None,
+                status,
+                profile_json,
+                now,
+                created_at,
+                now,
+            ),
+        )
+        principal = self.find_principal(
+            provider=provider,
+            tenant_key=tenant_key,
+            canonical_id_type=canonical_id_type,
+            canonical_id=canonical_id,
+        )
+        if principal is None:
+            raise RuntimeError("principal upsert did not persist")
+        for alias in aliases or []:
+            self.upsert_principal_alias(
+                provider=provider,
+                tenant_key=tenant_key,
+                id_type=str(alias.get("id_type") or alias.get("type") or ""),
+                id_value=str(alias.get("id_value") or alias.get("value") or ""),
+                principal_id=principal.principal_id,
+                app_id=str(alias.get("app_id") or ""),
+            )
+        self._conn.commit()
+        return principal
+
+    def find_principal(
+        self,
+        *,
+        provider: str,
+        tenant_key: str,
+        canonical_id_type: str,
+        canonical_id: str,
+    ) -> Optional[PrincipalRow]:
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_principals "
+            "WHERE provider = ? AND tenant_key = ? AND canonical_id_type = ? AND canonical_id = ? "
+            "LIMIT 1",
+            (
+                (provider or "").strip(),
+                (tenant_key or "").strip(),
+                (canonical_id_type or "").strip(),
+                (canonical_id or "").strip(),
+            ),
+        )
+        row = cur.fetchone()
+        return _principal_row_to_dataclass(row) if row else None
+
+    def lookup_principal(self, principal_id: str) -> Optional[PrincipalRow]:
+        principal_id = (principal_id or "").strip()
+        if not principal_id:
+            return None
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_principals WHERE principal_id = ? LIMIT 1",
+            (principal_id,),
+        )
+        row = cur.fetchone()
+        return _principal_row_to_dataclass(row) if row else None
+
+    def upsert_principal_alias(
+        self,
+        *,
+        provider: str,
+        tenant_key: str,
+        id_type: str,
+        id_value: str,
+        principal_id: str,
+        app_id: str = "",
+    ) -> None:
+        provider = (provider or "").strip()
+        tenant_key = (tenant_key or "").strip()
+        id_type = (id_type or "").strip()
+        id_value = (id_value or "").strip()
+        principal_id = (principal_id or "").strip()
+        app_id = (app_id or "").strip()
+        if not (provider and tenant_key and id_type and id_value and principal_id):
+            raise ValueError("principal alias requires provider, tenant_key, id_type, id_value, principal_id")
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_principal_aliases
+                (provider, tenant_key, id_type, id_value, app_id, principal_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, tenant_key, id_type, id_value, app_id) DO UPDATE SET
+                principal_id = excluded.principal_id,
+                updated_at = excluded.updated_at
+            """,
+            (provider, tenant_key, id_type, id_value, app_id, principal_id, now, now),
+        )
+
+    def lookup_principal_by_alias(
+        self,
+        *,
+        provider: str,
+        tenant_key: str,
+        id_type: str,
+        id_value: str,
+        app_id: str = "",
+    ) -> Optional[PrincipalRow]:
+        provider = (provider or "").strip()
+        tenant_key = (tenant_key or "").strip()
+        id_type = (id_type or "").strip()
+        id_value = (id_value or "").strip()
+        app_id = (app_id or "").strip()
+        if not (provider and tenant_key and id_type and id_value):
+            return None
+        if id_type == "open_id" and not app_id:
+            return None
+        cur = self._conn.execute(
+            """
+            SELECT p.*
+            FROM multitenancy_principal_aliases a
+            JOIN multitenancy_principals p ON p.principal_id = a.principal_id
+            WHERE a.provider = ? AND a.tenant_key = ? AND a.id_type = ?
+              AND a.id_value = ? AND a.app_id = ?
+              AND p.status = 'active'
+            LIMIT 1
+            """,
+            (provider, tenant_key, id_type, id_value, app_id),
+        )
+        row = cur.fetchone()
+        return _principal_row_to_dataclass(row) if row else None
+
     def grant_agent_share(
         self,
         *,
@@ -896,13 +1214,16 @@ class RoutingTable:
             raise ValueError("owner is already an implicit manager")
 
         now = _now()
+        existing = self.lookup_agent_share(agent_id, grantee_open_id)
+        share_id = existing.share_id if existing and existing.share_id else _new_share_id()
         self._conn.execute(
             """
             INSERT INTO multitenancy_agent_shares
-                (agent_id, grantee_open_id, role, status,
+                (agent_id, grantee_open_id, share_id, role, status,
                  created_by_open_id, created_at, updated_at, revoked_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)
             ON CONFLICT(agent_id, grantee_open_id) DO UPDATE SET
+                share_id = COALESCE(multitenancy_agent_shares.share_id, excluded.share_id),
                 role = excluded.role,
                 status = 'active',
                 updated_at = excluded.updated_at,
@@ -911,6 +1232,7 @@ class RoutingTable:
             (
                 agent_id,
                 grantee_open_id,
+                share_id,
                 role,
                 created_by_open_id,
                 now,
@@ -923,6 +1245,72 @@ class RoutingTable:
             raise RuntimeError("agent share grant did not persist")
         return share
 
+    def grant_agent_share_principal(
+        self,
+        *,
+        agent_id: str,
+        grantee_principal_id: str,
+        role: str,
+        created_by_open_id: str,
+        created_by_principal_id: str | None = None,
+    ) -> AgentShareRow:
+        agent_id = (agent_id or "").strip()
+        grantee_principal_id = (grantee_principal_id or "").strip()
+        role = (role or "").strip()
+        created_by_open_id = (created_by_open_id or "").strip()
+        created_by_principal_id = (created_by_principal_id or "").strip() or None
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        if not grantee_principal_id:
+            raise ValueError("grantee_principal_id is required")
+        if role not in _VALID_AGENT_SHARE_ROLES:
+            raise ValueError(f"invalid agent share role: {role}")
+        if not created_by_open_id:
+            raise ValueError("created_by_open_id is required")
+        agent = self.lookup_agent(agent_id)
+        if agent is None or not agent.active:
+            raise ValueError("agent_id is not an active agent")
+        principal = self.lookup_principal(grantee_principal_id)
+        if principal is None or principal.status != "active":
+            raise ValueError("grantee principal is not active")
+
+        now = _now()
+        grantee_key = _principal_share_key(grantee_principal_id)
+        existing = self.lookup_agent_share(agent_id, grantee_key)
+        share_id = existing.share_id if existing and existing.share_id else _new_share_id()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_agent_shares
+                (agent_id, grantee_open_id, share_id, grantee_principal_id, role, status,
+                 created_by_open_id, created_by_principal_id, created_at, updated_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL)
+            ON CONFLICT(agent_id, grantee_open_id) DO UPDATE SET
+                share_id = COALESCE(multitenancy_agent_shares.share_id, excluded.share_id),
+                grantee_principal_id = excluded.grantee_principal_id,
+                role = excluded.role,
+                status = 'active',
+                created_by_principal_id = excluded.created_by_principal_id,
+                updated_at = excluded.updated_at,
+                revoked_at = NULL
+            """,
+            (
+                agent_id,
+                grantee_key,
+                share_id,
+                grantee_principal_id,
+                role,
+                created_by_open_id,
+                created_by_principal_id,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        share = self.lookup_agent_share_by_principal(agent_id, grantee_principal_id)
+        if share is None:
+            raise RuntimeError("agent principal share grant did not persist")
+        return share
+
     def lookup_agent_share(
         self, agent_id: str, grantee_open_id: str
     ) -> Optional[AgentShareRow]:
@@ -931,9 +1319,22 @@ class RoutingTable:
         if not agent_id or not grantee_open_id:
             return None
         cur = self._conn.execute(
-            "SELECT * FROM multitenancy_agent_shares "
-            "WHERE agent_id = ? AND grantee_open_id = ? LIMIT 1",
+            _AGENT_SHARE_SELECT_SQL + " WHERE s.agent_id = ? AND s.grantee_open_id = ? LIMIT 1",
             (agent_id, grantee_open_id),
+        )
+        row = cur.fetchone()
+        return _agent_share_row_to_dataclass(row) if row else None
+
+    def lookup_agent_share_by_principal(
+        self, agent_id: str, grantee_principal_id: str
+    ) -> Optional[AgentShareRow]:
+        agent_id = (agent_id or "").strip()
+        grantee_principal_id = (grantee_principal_id or "").strip()
+        if not agent_id or not grantee_principal_id:
+            return None
+        cur = self._conn.execute(
+            _AGENT_SHARE_SELECT_SQL + " WHERE s.agent_id = ? AND s.grantee_principal_id = ? LIMIT 1",
+            (agent_id, grantee_principal_id),
         )
         row = cur.fetchone()
         return _agent_share_row_to_dataclass(row) if row else None
@@ -946,18 +1347,26 @@ class RoutingTable:
             return None
         return share.role
 
+    def get_agent_share_role_for_principal(
+        self, agent_id: str, grantee_principal_id: str
+    ) -> Optional[str]:
+        share = self.lookup_agent_share_by_principal(agent_id, grantee_principal_id)
+        if share is None or share.status != AGENT_SHARE_STATUS_ACTIVE:
+            return None
+        return share.role
+
     def list_agent_shares(
         self, agent_id: str, *, active_only: bool = True
     ) -> list[AgentShareRow]:
         agent_id = (agent_id or "").strip()
         if not agent_id:
             return []
-        sql = "SELECT * FROM multitenancy_agent_shares WHERE agent_id = ?"
+        sql = _AGENT_SHARE_SELECT_SQL + " WHERE s.agent_id = ?"
         params: list[str] = [agent_id]
         if active_only:
-            sql += " AND status = ?"
+            sql += " AND s.status = ?"
             params.append(AGENT_SHARE_STATUS_ACTIVE)
-        sql += " ORDER BY created_at ASC, grantee_open_id ASC"
+        sql += " ORDER BY s.created_at ASC, s.grantee_open_id ASC"
         cur = self._conn.execute(sql, params)
         return [_agent_share_row_to_dataclass(row) for row in cur.fetchall()]
 
@@ -1037,6 +1446,88 @@ class RoutingTable:
             rows.append(SharedAgentRow(route=route, share=share))
         return rows
 
+    def list_shared_agents_for_principal(self, principal_id: str) -> list[SharedAgentRow]:
+        principal_id = (principal_id or "").strip()
+        if not principal_id:
+            return []
+        cur = self._conn.execute(
+            """
+            SELECT
+                r.user_id AS r_user_id,
+                r.profile_name AS r_profile_name,
+                r.open_id AS r_open_id,
+                r.union_id AS r_union_id,
+                r.active AS r_active,
+                r.deleted_at AS r_deleted_at,
+                r.synced_at AS r_synced_at,
+                r.version AS r_version,
+                r.last_active_at AS r_last_active_at,
+                r.created_at AS r_created_at,
+                r.updated_at AS r_updated_at,
+                r.kind AS r_kind,
+                r.chat_id AS r_chat_id,
+                r.owner_open_id AS r_owner_open_id,
+                r.display_label AS r_display_label,
+                r.agent_id AS r_agent_id,
+                r.upstream_profile AS r_upstream_profile,
+                r.provenance AS r_provenance,
+                s.agent_id AS s_agent_id,
+                s.grantee_open_id AS s_grantee_open_id,
+                s.share_id AS s_share_id,
+                s.grantee_principal_id AS s_grantee_principal_id,
+                s.role AS s_role,
+                s.status AS s_status,
+                s.created_by_open_id AS s_created_by_open_id,
+                s.created_by_principal_id AS s_created_by_principal_id,
+                s.created_at AS s_created_at,
+                s.updated_at AS s_updated_at,
+                s.revoked_at AS s_revoked_at
+            FROM multitenancy_agent_shares s
+            JOIN multitenancy_routing r
+              ON r.agent_id = s.agent_id
+             AND r.active = 1
+             AND r.kind = 'agent'
+            WHERE s.grantee_principal_id = ?
+              AND s.status = 'active'
+            ORDER BY r.display_label ASC, r.agent_id ASC
+            """,
+            (principal_id,),
+        )
+        rows: list[SharedAgentRow] = []
+        for row in cur.fetchall():
+            route = RoutingRow(
+                user_id=row["r_user_id"],
+                profile_name=row["r_profile_name"],
+                open_id=row["r_open_id"],
+                union_id=row["r_union_id"],
+                active=bool(row["r_active"]),
+                last_active_at=row["r_last_active_at"],
+                synced_at=row["r_synced_at"],
+                version=row["r_version"],
+                kind=row["r_kind"] or KIND_AGENT,
+                chat_id=row["r_chat_id"],
+                owner_open_id=row["r_owner_open_id"],
+                display_label=row["r_display_label"],
+                agent_id=row["r_agent_id"],
+                provenance=row["r_provenance"],
+                upstream_profile=row["r_upstream_profile"],
+            )
+            share = AgentShareRow(
+                agent_id=row["s_agent_id"],
+                grantee_open_id=row["s_grantee_open_id"],
+                role=row["s_role"],
+                status=row["s_status"],
+                created_by_open_id=row["s_created_by_open_id"],
+                created_at=row["s_created_at"],
+                updated_at=row["s_updated_at"],
+                revoked_at=row["s_revoked_at"],
+                share_id=row["s_share_id"],
+                grantee_principal_id=row["s_grantee_principal_id"],
+                created_by_principal_id=row["s_created_by_principal_id"],
+            )
+            rows.append(SharedAgentRow(route=route, share=share))
+        return rows
+
     def revoke_agent_share(self, agent_id: str, grantee_open_id: str) -> bool:
         agent_id = (agent_id or "").strip()
         grantee_open_id = (grantee_open_id or "").strip()
@@ -1050,6 +1541,22 @@ class RoutingTable:
             WHERE agent_id = ? AND grantee_open_id = ? AND status = 'active'
             """,
             (now, now, agent_id, grantee_open_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def revoke_agent_share_by_id(self, share_id: str) -> bool:
+        share_id = (share_id or "").strip()
+        if not share_id:
+            return False
+        now = _now()
+        cur = self._conn.execute(
+            """
+            UPDATE multitenancy_agent_shares
+            SET status = 'revoked', revoked_at = ?, updated_at = ?
+            WHERE share_id = ? AND status = 'active'
+            """,
+            (now, now, share_id),
         )
         self._conn.commit()
         return cur.rowcount > 0
@@ -1125,7 +1632,52 @@ def _agent_share_row_to_dataclass(row: sqlite3.Row) -> AgentShareRow:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         revoked_at=row["revoked_at"],
+        share_id=_row_get(row, "share_id"),
+        grantee_principal_id=_row_get(row, "grantee_principal_id"),
+        created_by_principal_id=_row_get(row, "created_by_principal_id"),
+        principal_provider=_row_get(row, "p_provider"),
+        principal_tenant_key=_row_get(row, "p_tenant_key"),
+        principal_canonical_id_type=_row_get(row, "p_canonical_id_type"),
+        principal_canonical_id=_row_get(row, "p_canonical_id"),
+        principal_display_name=_row_get(row, "p_display_name"),
+        principal_avatar_url=_row_get(row, "p_avatar_url"),
+        principal_email=_row_get(row, "p_email"),
     )
+
+
+def _principal_row_to_dataclass(row: sqlite3.Row) -> PrincipalRow:
+    return PrincipalRow(
+        principal_id=row["principal_id"],
+        provider=row["provider"],
+        tenant_key=row["tenant_key"],
+        canonical_id_type=row["canonical_id_type"],
+        canonical_id=row["canonical_id"],
+        display_name=row["display_name"],
+        avatar_url=row["avatar_url"],
+        email=row["email"],
+        status=row["status"],
+        profile_json=row["profile_json"],
+        merged_into_principal_id=row["merged_into_principal_id"],
+        last_resolved_at=row["last_resolved_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_get(row: sqlite3.Row, name: str) -> Optional[str]:
+    return row[name] if name in row.keys() else None
+
+
+def _new_principal_id() -> str:
+    return "prn_" + uuid4().hex
+
+
+def _new_share_id() -> str:
+    return "shr_" + uuid4().hex
+
+
+def _principal_share_key(principal_id: str) -> str:
+    return "principal:" + principal_id
 
 
 def _now() -> int:

@@ -45,6 +45,14 @@ SandboxAvailable = Callable[[], bool]
 
 _OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
 _AGENT_ID_HEADER = "X-Hermes-Agent-Id"
+_ACTOR_PRINCIPAL_ID_HEADER = "X-Hermes-Actor-Principal-Id"
+_ACTOR_PROVIDER_HEADER = "X-Hermes-Actor-Provider"
+_ACTOR_TENANT_KEY_HEADER = "X-Hermes-Actor-Tenant-Key"
+_ACTOR_APP_ID_HEADER = "X-Hermes-Actor-App-Id"
+_ACTOR_USER_ID_HEADER = "X-Hermes-Actor-User-Id"
+_ACTOR_DISPLAY_NAME_HEADER = "X-Hermes-Actor-Display-Name"
+_ACTOR_AVATAR_URL_HEADER = "X-Hermes-Actor-Avatar-Url"
+_ACTOR_EMAIL_HEADER = "X-Hermes-Actor-Email"
 _AGENT_SHARE_CONTEXT_METADATA_KEY = "agent_share_context"
 _AGENT_SHARED_ROLES = frozenset({"viewer", "editor", "manager"})
 _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE = 32 * 1024 * 1024
@@ -1022,6 +1030,43 @@ def _trusted_owner_from_request(request: Any) -> str:
     return str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
 
 
+def _actor_principal_id_from_request(request: Any) -> str:
+    return str(request.headers.get(_ACTOR_PRINCIPAL_ID_HEADER, "") or "").strip()
+
+
+def _actor_principal_id_for_request(table: Any, request: Any, actor_open_id: str = "") -> str:
+    principal_id = _actor_principal_id_from_request(request)
+    if principal_id:
+        return principal_id
+
+    provider = str(request.headers.get(_ACTOR_PROVIDER_HEADER, "") or "").strip()
+    tenant_key = str(request.headers.get(_ACTOR_TENANT_KEY_HEADER, "") or "").strip()
+    app_id = str(request.headers.get(_ACTOR_APP_ID_HEADER, "") or "").strip()
+    user_id = str(request.headers.get(_ACTOR_USER_ID_HEADER, "") or "").strip()
+    if not (provider and tenant_key and user_id):
+        return ""
+
+    email = str(request.headers.get(_ACTOR_EMAIL_HEADER, "") or "").strip()
+    aliases: list[dict[str, str]] = []
+    if email:
+        aliases.append({"id_type": "email", "id_value": email})
+    actor_open_id = (actor_open_id or _trusted_owner_from_request(request)).strip()
+    if actor_open_id and app_id:
+        aliases.append({"id_type": "open_id", "id_value": actor_open_id, "app_id": app_id})
+
+    principal = table.upsert_principal(
+        provider=provider,
+        tenant_key=tenant_key,
+        canonical_id_type="user_id",
+        canonical_id=user_id,
+        display_name=str(request.headers.get(_ACTOR_DISPLAY_NAME_HEADER, "") or "").strip() or None,
+        avatar_url=str(request.headers.get(_ACTOR_AVATAR_URL_HEADER, "") or "").strip() or None,
+        email=email or None,
+        aliases=aliases,
+    )
+    return principal.principal_id
+
+
 def _requested_profile_name(payload: dict[str, Any]) -> str:
     raw = str(payload.get("profile_name") or payload.get("profile") or "").strip()
     if not raw:
@@ -1392,33 +1437,155 @@ def _shared_agent_payload(route: Any, role: str) -> dict[str, Any]:
 
 
 def _agent_share_payload(share: Any) -> dict[str, Any]:
-    return {
+    payload = {
         "agent_id": str(getattr(share, "agent_id", "") or ""),
         "grantee_open_id": str(getattr(share, "grantee_open_id", "") or ""),
+        "share_id": str(getattr(share, "share_id", "") or ""),
+        "grantee_principal_id": str(getattr(share, "grantee_principal_id", "") or ""),
         "role": str(getattr(share, "role", "") or ""),
         "status": str(getattr(share, "status", "") or ""),
         "created_by_open_id": str(getattr(share, "created_by_open_id", "") or ""),
+        "created_by_principal_id": str(getattr(share, "created_by_principal_id", "") or ""),
         "created_at": int(getattr(share, "created_at", 0) or 0),
         "updated_at": int(getattr(share, "updated_at", 0) or 0),
         "revoked_at": getattr(share, "revoked_at", None),
     }
+    principal = _principal_payload_from_share(share)
+    if principal:
+        payload["principal"] = principal
+    return payload
 
 
-def _resolve_agent_manager(table: Any, actor_open_id: str, agent_id: str) -> tuple[Any, Optional[str], int, str]:
+def _principal_payload_from_share(share: Any) -> dict[str, Any]:
+    provider = str(getattr(share, "principal_provider", "") or "").strip()
+    if not provider:
+        return {}
+    canonical_type = str(getattr(share, "principal_canonical_id_type", "") or "").strip()
+    canonical_id = str(getattr(share, "principal_canonical_id", "") or "").strip()
+    payload: dict[str, Any] = {
+        "provider": provider,
+        "display_name": str(getattr(share, "principal_display_name", "") or ""),
+        "avatar_url": str(getattr(share, "principal_avatar_url", "") or ""),
+        "email": str(getattr(share, "principal_email", "") or ""),
+    }
+    if canonical_type == "user_id" and canonical_id:
+        payload["user_id"] = canonical_id
+    return payload
+
+
+def _resolve_agent_manager(
+    table: Any,
+    actor_open_id: str,
+    agent_id: str,
+    actor_principal_id: str = "",
+) -> tuple[Any, Optional[str], int, str]:
     actor_open_id = (actor_open_id or "").strip()
+    actor_principal_id = (actor_principal_id or "").strip()
     agent_id = (agent_id or "").strip()
-    if not actor_open_id:
-        return None, "owner identity required (X-Hermes-Owner-Open-Id)", 403, ""
+    if not actor_open_id and not actor_principal_id:
+        return None, "owner identity required (X-Hermes-Owner-Open-Id or X-Hermes-Actor-Principal-Id)", 403, ""
     if not agent_id:
         return None, "agent_id required", 400, ""
     row = table.lookup_agent(agent_id)
     if row is None or not getattr(row, "active", False):
         return None, f"agent_id '{agent_id}' not found", 404, ""
-    if getattr(row, "owner_open_id", None) == actor_open_id:
+    if actor_open_id and getattr(row, "owner_open_id", None) == actor_open_id:
         return row, None, 200, "owner"
+    if actor_principal_id and table.get_agent_share_role_for_principal(agent_id, actor_principal_id) == "manager":
+        return row, None, 200, "manager"
     if table.get_agent_share_role(agent_id, actor_open_id) == "manager":
         return row, None, 200, "manager"
     return None, "manager role required for this agent", 403, ""
+
+
+def _resolve_identity_lookup(table: Any, lookup: dict[str, Any], requester: Any) -> Any:
+    provider = str(lookup.get("provider") or "").strip()
+    lookup_type = str(lookup.get("type") or lookup.get("id_type") or "").strip()
+    value = str(lookup.get("value") or lookup.get("id_value") or "").strip()
+    tenant_key = str(getattr(requester, "tenant_key", "") or "").strip()
+    if not (provider and lookup_type and value and tenant_key):
+        raise ValueError("provider, type, value, and requester tenant are required")
+    if lookup_type == "user_id":
+        principal = table.find_principal(
+            provider=provider,
+            tenant_key=tenant_key,
+            canonical_id_type="user_id",
+            canonical_id=value,
+        )
+    else:
+        principal = table.lookup_principal_by_alias(
+            provider=provider,
+            tenant_key=tenant_key,
+            id_type=lookup_type,
+            id_value=value,
+        )
+    if principal is None and provider == "feishu":
+        principal = _resolve_feishu_identity_lookup_from_directory(
+            table,
+            tenant_key=tenant_key,
+            lookup_type=lookup_type,
+            value=value,
+        )
+    if principal is None:
+        raise ValueError("identity resolver unavailable for requested principal")
+    return principal
+
+
+def _resolve_feishu_identity_lookup_from_directory(
+    table: Any,
+    *,
+    tenant_key: str,
+    lookup_type: str,
+    value: str,
+) -> Any:
+    if lookup_type == "user_id":
+        route = table.lookup_by_user_id(value)
+        aliases: list[dict[str, str]] = []
+        if route is not None and getattr(route, "open_id", None):
+            aliases.append({"id_type": "open_id", "id_value": str(route.open_id), "app_id": ""})
+        return table.upsert_principal(
+            provider="feishu",
+            tenant_key=tenant_key,
+            canonical_id_type="user_id",
+            canonical_id=value,
+            display_name=str(getattr(route, "display_label", "") or "") or None,
+            aliases=aliases,
+        )
+
+    if lookup_type != "email":
+        return None
+
+    try:
+        api_delay = float(os.environ.get("HERMES_WEBUI_FEISHU_IDENTITY_API_DELAY_SECONDS", "0") or "0")
+    except ValueError:
+        api_delay = 0.0
+    try:
+        from .sync import feishu_org
+
+        directory = feishu_org.fetch_contact_directory(api_delay=api_delay)
+    except Exception:
+        logger.exception("[multitenancy] failed to resolve Feishu share grantee from contact directory")
+        return None
+
+    target_email = value.casefold()
+    for open_id, entry in directory.items():
+        email = str((entry or {}).get("email") or "").strip()
+        if email.casefold() != target_email:
+            continue
+        route = table.lookup_by_open_id(str(open_id))
+        user_id = str(getattr(route, "user_id", "") or "").strip() if route else ""
+        if not user_id:
+            continue
+        return table.upsert_principal(
+            provider="feishu",
+            tenant_key=tenant_key,
+            canonical_id_type="user_id",
+            canonical_id=user_id,
+            display_name=str((entry or {}).get("name") or getattr(route, "display_label", "") or "").strip() or None,
+            email=email,
+            aliases=[{"id_type": "email", "id_value": email}],
+        )
+    return None
 
 
 def _resolve_owner_scoped_profile(
@@ -1472,7 +1639,11 @@ def _resolve_owner_scoped_profile(
         )
         share_role = None
         if row.owner_open_id != trusted_owner and not matches_owner_root:
-            share_role = table.get_agent_share_role(agent_id, trusted_owner)
+            actor_principal_id = _actor_principal_id_for_request(table, request, trusted_owner)
+            if actor_principal_id:
+                share_role = table.get_agent_share_role_for_principal(agent_id, actor_principal_id)
+            if not share_role:
+                share_role = table.get_agent_share_role(agent_id, trusted_owner)
         if (
             row.owner_open_id != trusted_owner
             and not matches_owner_root
@@ -1512,7 +1683,12 @@ def _agent_share_context_for_request(
     if row.owner_open_id == trusted_owner:
         share_role = "owner"
     else:
-        share_role = table.get_agent_share_role(agent_id, trusted_owner) or ""
+        actor_principal_id = _actor_principal_id_for_request(table, request, trusted_owner)
+        share_role = (
+            table.get_agent_share_role_for_principal(agent_id, actor_principal_id)
+            if actor_principal_id
+            else None
+        ) or table.get_agent_share_role(agent_id, trusted_owner) or ""
     if not share_role:
         return {}
     return {
@@ -3242,19 +3418,27 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         actor_open_id = _trusted_owner_from_request(request)
-        if not actor_open_id:
-            return web.json_response({
-                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
-            }, status=403)
         from . import router as router_mod
 
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        agents = [
-            _shared_agent_payload(shared.route, shared.share.role)
-            for shared in table.list_shared_agents_for_actor(actor_open_id)
-        ]
+        actor_principal_id = _actor_principal_id_for_request(table, request, actor_open_id)
+        if not actor_open_id and not actor_principal_id:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id or actor principal headers)"
+            }, status=403)
+        shared_rows = []
+        if actor_principal_id:
+            shared_rows.extend(table.list_shared_agents_for_principal(actor_principal_id))
+        if actor_open_id:
+            existing = {str(getattr(row.route, "agent_id", "") or "") for row in shared_rows}
+            shared_rows.extend(
+                row
+                for row in table.list_shared_agents_for_actor(actor_open_id)
+                if str(getattr(row.route, "agent_id", "") or "") not in existing
+            )
+        agents = [_shared_agent_payload(shared.route, shared.share.role) for shared in shared_rows]
         return web.json_response({"agents": agents})
 
     async def handle_list_agent_shares(request):
@@ -3267,7 +3451,8 @@ def create_run_broker_app(
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        _row, error, status, actor_role = _resolve_agent_manager(table, actor_open_id, agent_id)
+        actor_principal_id = _actor_principal_id_for_request(table, request, actor_open_id)
+        _row, error, status, actor_role = _resolve_agent_manager(table, actor_open_id, agent_id, actor_principal_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
         return web.json_response({
@@ -3292,16 +3477,33 @@ def create_run_broker_app(
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id)
+        actor_principal_id = _actor_principal_id_for_request(table, request, actor_open_id)
+        _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id, actor_principal_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
         try:
-            share = table.grant_agent_share(
-                agent_id=agent_id,
-                grantee_open_id=str(payload.get("grantee_open_id") or payload.get("granteeOpenId") or ""),
-                role=str(payload.get("role") or ""),
-                created_by_open_id=actor_open_id,
-            )
+            grantee_principal_id = str(payload.get("grantee_principal_id") or payload.get("granteePrincipalId") or "").strip()
+            lookup = payload.get("grantee") if isinstance(payload.get("grantee"), dict) else None
+            if not grantee_principal_id and lookup is not None:
+                requester = table.lookup_principal(actor_principal_id)
+                if requester is None:
+                    return web.json_response({"error": "actor principal is required to resolve grantee"}, status=403)
+                grantee_principal_id = _resolve_identity_lookup(table, lookup, requester).principal_id
+            if grantee_principal_id:
+                share = table.grant_agent_share_principal(
+                    agent_id=agent_id,
+                    grantee_principal_id=grantee_principal_id,
+                    role=str(payload.get("role") or ""),
+                    created_by_open_id=actor_open_id,
+                    created_by_principal_id=actor_principal_id,
+                )
+            else:
+                share = table.grant_agent_share(
+                    agent_id=agent_id,
+                    grantee_open_id=str(payload.get("grantee_open_id") or payload.get("granteeOpenId") or ""),
+                    role=str(payload.get("role") or ""),
+                    created_by_open_id=actor_open_id,
+                )
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         return web.json_response({"share": _agent_share_payload(share)})
@@ -3317,10 +3519,12 @@ def create_run_broker_app(
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id)
+        actor_principal_id = _actor_principal_id_for_request(table, request, actor_open_id)
+        _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id, actor_principal_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
-        table.revoke_agent_share(agent_id, grantee_open_id)
+        if not table.revoke_agent_share_by_id(grantee_open_id):
+            table.revoke_agent_share(agent_id, grantee_open_id)
         return web.json_response({"ok": True})
 
     async def handle_slash_commands(request):
