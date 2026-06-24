@@ -87,11 +87,20 @@ def test_global_loader_state_restored_after_rewrite(two_profiles):
     assert getattr(sc, "_skill_commands", None) == before_cmds
 
 
-def test_no_profile_is_safe_noop(monkeypatch):
-    # a rewrite with an unresolvable profile must not raise (scoping fails soft)
+@requires_agent
+def test_fail_closed_when_scoping_fails_does_not_leak_global(two_profiles, monkeypatch):
+    # poison the global cache with profile A's strategy command, then make scoping FAIL.
+    # A slash command must NOT resolve from that stale global cache (fail closed).
+    run_broker._rewrite_skill_slash_request(_req("pA", "/strategy x"))  # populate global
     from hermes_multitenancy import router
-    def _boom(_name):
-        raise RuntimeError("no home")
-    monkeypatch.setattr(router, "_profile_name_to_home", _boom)
-    out = run_broker._rewrite_skill_slash_request(_req("pX", "hello world"))
-    assert out.content == "hello world"
+    monkeypatch.setattr(router, "_scope_profile_skill_loader", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = run_broker._rewrite_skill_slash_request(_req("pB", "/strategy x"))
+    assert out.content == "/strategy x"  # unresolved — did NOT fall back to A's global cache
+
+
+def test_scoping_helper_failure_is_safe_noop(monkeypatch):
+    # scoping mechanism unavailable → fail closed, no raise, text untouched
+    from hermes_multitenancy import router
+    monkeypatch.setattr(router, "_profile_name_to_home", lambda _n: (_ for _ in ()).throw(RuntimeError("no home")))
+    out = run_broker._rewrite_skill_slash_request(_req("pX", "/strategy hello"))
+    assert out.content == "/strategy hello"

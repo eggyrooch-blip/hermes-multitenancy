@@ -114,24 +114,30 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
     # _profile_home_context already hold — re-acquiring it here would deadlock). Reusing a
     # profile we're already scoped to (Feishu re-entry) is a harmless idempotent no-op.
     states: list = []
-    if request.profile_name:
-        try:
-            from . import router  # lazy import: router imports run_broker (avoid cycle)
+    scoped = False
+    try:
+        from . import router  # lazy import: router imports run_broker (avoid cycle)
 
-            profile_home = router._profile_name_to_home(request.profile_name)
-            states = router._scope_profile_skill_loader(profile_home)
-        except Exception:  # never let scoping break the slash path
-            states = []
+        profile_home = router._profile_name_to_home(request.profile_name)
+        states = router._scope_profile_skill_loader(profile_home)
+        scoped = bool(states)
+    except Exception:
+        scoped = False
+    if not scoped:
+        # FAIL CLOSED: if we cannot scope the skill loader to THIS profile, we must not
+        # run the rewrite against a stale process-global cache — that would resolve the
+        # command against whatever profile ran last (the exact cross-profile leak this
+        # fixes). Leave the text untouched; a real command just passes through unrewritten.
+        return request
     try:
         rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
     finally:
-        if states:
-            try:
-                from . import router
+        try:
+            from . import router
 
-                router._restore_profile_skill_loader(states)
-            except Exception:
-                pass
+            router._restore_profile_skill_loader(states)
+        except Exception:
+            pass
     if not rewritten or rewritten == request.content:
         return request
     return replace(request, content=rewritten)
