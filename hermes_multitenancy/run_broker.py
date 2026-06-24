@@ -123,15 +123,13 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
         states = router._scope_profile_skill_loader(profile_home)
         # `_scope_profile_skill_loader` is best-effort and silently skips a failed import,
         # so a non-empty `states` does NOT prove the loader is pointed at this profile.
-        # Verify the ACTUAL post-conditions: both the skills dir and the command cache must
-        # be scoped, or resolution would still run against the previous profile's state.
-        import tools.skills_tool as _st  # type: ignore
-        import agent.skill_commands as _sc  # type: ignore
-
-        scoped = (
-            getattr(_st, "SKILLS_DIR", None) == profile_home / "skills"
-            and getattr(_sc, "_skill_commands", None) == {}
-        )
+        # Verify BOTH required mutations actually happened by inspecting the states it
+        # returned — the SKILLS_DIR redirect AND the command-cache reset. If either was
+        # skipped, the rewrite could still resolve against the previous profile's state.
+        # (Inspecting states avoids hard-importing tools.skills_tool here, which would make
+        # every rewrite depend on that import even where the loader itself handles it.)
+        mutated = {attr for (_m, attr, _old, _had) in states}
+        scoped = "SKILLS_DIR" in mutated and "_skill_commands" in mutated
     except Exception:
         scoped = False
     if not scoped:

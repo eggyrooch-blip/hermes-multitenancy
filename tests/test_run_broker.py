@@ -351,6 +351,12 @@ def test_run_broker_rewrites_hades_alias_before_dispatch(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "agent", ModuleType("agent"))
     monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+    # the broker now scopes the skill loader per-profile before rewriting; stub
+    # tools.skills_tool so _scope_profile_skill_loader can set SKILLS_DIR in any env
+    # (the per-profile scope must establish, or the rewrite fails closed).
+    fake_skills_tool = SimpleNamespace(HERMES_HOME=None, SKILLS_DIR=None)
+    monkeypatch.setitem(sys.modules, "tools", ModuleType("tools"))
+    monkeypatch.setitem(sys.modules, "tools.skills_tool", fake_skills_tool)
 
     seen = []
 
