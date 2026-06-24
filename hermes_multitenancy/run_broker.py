@@ -115,15 +115,31 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
     # profile we're already scoped to (Feishu re-entry) is a harmless idempotent no-op.
     states: list = []
     scoped = False
+    router = None
     try:
         from . import router  # lazy import: router imports run_broker (avoid cycle)
 
         profile_home = router._profile_name_to_home(request.profile_name)
         states = router._scope_profile_skill_loader(profile_home)
-        scoped = bool(states)
+        # `_scope_profile_skill_loader` is best-effort and silently skips a failed import,
+        # so a non-empty `states` does NOT prove the loader is pointed at this profile.
+        # Verify the ACTUAL post-conditions: both the skills dir and the command cache must
+        # be scoped, or resolution would still run against the previous profile's state.
+        import tools.skills_tool as _st  # type: ignore
+        import agent.skill_commands as _sc  # type: ignore
+
+        scoped = (
+            getattr(_st, "SKILLS_DIR", None) == profile_home / "skills"
+            and getattr(_sc, "_skill_commands", None) == {}
+        )
     except Exception:
         scoped = False
     if not scoped:
+        if states and router is not None:  # restore any partial scoping before bailing
+            try:
+                router._restore_profile_skill_loader(states)
+            except Exception:
+                pass
         # FAIL CLOSED: if we cannot scope the skill loader to THIS profile, we must not
         # run the rewrite against a stale process-global cache — that would resolve the
         # command against whatever profile ran last (the exact cross-profile leak this
@@ -133,8 +149,6 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
         rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
     finally:
         try:
-            from . import router
-
             router._restore_profile_skill_loader(states)
         except Exception:
             pass

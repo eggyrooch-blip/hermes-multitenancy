@@ -87,15 +87,39 @@ def test_global_loader_state_restored_after_rewrite(two_profiles):
     assert getattr(sc, "_skill_commands", None) == before_cmds
 
 
+def _populate_stale_global_with_A(root):
+    """Leave the process-global loader state pointed at profile A with A's commands cached,
+    simulating a prior A run — the stale state a B request must NOT resolve against."""
+    import agent.skill_commands as sc
+    import tools.skills_tool as st
+    st.SKILLS_DIR = root / "pA" / "skills"
+    sc._skill_commands = {}
+    sc.get_skill_commands()  # cache A's /strategy in the global
+    assert sc._skill_commands, "precondition: A's commands populated in the global cache"
+
+
 @requires_agent
-def test_fail_closed_when_scoping_fails_does_not_leak_global(two_profiles, monkeypatch):
-    # poison the global cache with profile A's strategy command, then make scoping FAIL.
-    # A slash command must NOT resolve from that stale global cache (fail closed).
-    run_broker._rewrite_skill_slash_request(_req("pA", "/strategy x"))  # populate global
+def test_fail_closed_when_scoping_raises_does_not_leak_global(two_profiles, monkeypatch):
+    root, _st, _sc = two_profiles
+    _populate_stale_global_with_A(root)
     from hermes_multitenancy import router
-    monkeypatch.setattr(router, "_scope_profile_skill_loader", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(router, "_scope_profile_skill_loader",
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
     out = run_broker._rewrite_skill_slash_request(_req("pB", "/strategy x"))
-    assert out.content == "/strategy x"  # unresolved — did NOT fall back to A's global cache
+    assert out.content == "/strategy x"  # fail closed: NOT resolved from A's stale global cache
+
+
+@requires_agent
+def test_partial_scope_without_skills_dir_fails_closed(two_profiles, monkeypatch):
+    # codex's exact concern: scope helper returns non-empty states but did NOT set
+    # SKILLS_DIR to B (e.g. tools.skills_tool import skipped). Post-condition check must
+    # catch this and fail closed rather than rewrite against A's stale SKILLS_DIR.
+    root, _st, _sc = two_profiles
+    _populate_stale_global_with_A(root)
+    from hermes_multitenancy import router
+    monkeypatch.setattr(router, "_scope_profile_skill_loader", lambda _home: [("fake", "x", None, False)])
+    out = run_broker._rewrite_skill_slash_request(_req("pB", "/strategy x"))
+    assert out.content == "/strategy x"  # SKILLS_DIR still at A → scoped=False → fail closed
 
 
 def test_scoping_helper_failure_is_safe_noop(monkeypatch):
