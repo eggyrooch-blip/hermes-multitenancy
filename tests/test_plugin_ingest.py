@@ -21,7 +21,7 @@ from hermes_multitenancy import plugin_ingest as pi
 GATE = "x approve"
 
 
-def _write_plugin_repo(root: Path, *, env_default="pre", audience=None, clis=None, connectors=None, skills=None) -> Path:
+def _write_plugin_repo(root: Path, *, env_default="pre", audience=None, clis=None, connectors=None, skills=None, command_aliases=None) -> Path:
     # default repo carries a governance-bearing orchestrator whose SKILL.md states the gate
     skills = skills or ["using-resource-delivery", "kep-trevi-delivery-orchestrate", "kep-halo-cli"]
     for name in skills:
@@ -43,6 +43,7 @@ def _write_plugin_repo(root: Path, *, env_default="pre", audience=None, clis=Non
         "clis": clis if clis is not None else [],
         "connectors": connectors if connectors is not None else [{"id": "kep-cli", "required": True}],
         "governance": {"env_default": env_default, "approval_required": ["x approve"], "online_requires": "explicit_action"},
+        "command_aliases": command_aliases if command_aliases is not None else {},
         "persona_policy": "skill_inline",
     }
     out = root / ".hermes-plugin" / "plugin.json"
@@ -440,3 +441,56 @@ def test_install_clis_dry_run_no_write(tmp_path):
     res = pi.install_clis([{"id": "newcli", "install": "new"}], shared_bin=home / "bin", dry_run=True, force=False)
     assert res[0]["action"] == "would-install"
     assert not (home / "bin" / "newcli").exists()
+
+
+# ─────────────────────────── command_aliases (slash passthrough) ─────────
+
+_ALIASES = {"strategy": "kep-trevi-delivery-orchestrate", "recap": "kep-halo-cli"}
+
+
+def test_load_manifest_rejects_unsafe_alias_key(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", command_aliases={"a/b": "kep-halo-cli"})
+    with pytest.raises(pi.PluginIngestError, match="unsafe command_aliases key"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_load_manifest_rejects_alias_target_not_in_skills(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", command_aliases={"strategy": "not-a-real-skill"})
+    with pytest.raises(pi.PluginIngestError, match="not in this plugin's skills.list"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_ingest_writes_and_uninstall_removes_slash_aliases(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", command_aliases=_ALIASES)
+    home = _shared_home(tmp_path)
+    pi.ingest(repo, audience="feishu_test", shared_home=home)
+    cfg = home / pi.SLASH_ALIASES_FILE
+    raw = yaml.safe_load(cfg.read_text())["aliases"]
+    assert raw["strategy"]["skill"] == "kep-trevi-delivery-orchestrate"
+    assert raw["strategy"]["plugin"] == "test-plugin"
+    # uninstall strips this plugin's aliases
+    pi.uninstall("test-plugin", shared_home=home)
+    raw2 = yaml.safe_load(cfg.read_text()).get("aliases") or {}
+    assert all(v.get("plugin") != "test-plugin" for v in raw2.values())
+
+
+def test_ingest_dry_run_writes_no_aliases(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", command_aliases=_ALIASES)
+    home = _shared_home(tmp_path)
+    pi.ingest(repo, audience="feishu_test", shared_home=home, dry_run=True)
+    assert not (home / pi.SLASH_ALIASES_FILE).exists()
+
+
+def test_alias_register_preserves_other_plugin(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", command_aliases=_ALIASES)
+    home = _shared_home(tmp_path)
+    cfg = home / pi.SLASH_ALIASES_FILE
+    cfg.write_text(yaml.safe_dump(
+        {"aliases": {"otherc": {"skill": "other-skill", "plugin": "other-plugin"}}}), encoding="utf-8")
+    pi.ingest(repo, audience="feishu_test", shared_home=home)
+    al = yaml.safe_load(cfg.read_text())["aliases"]
+    assert al["otherc"]["plugin"] == "other-plugin"  # untouched
+    assert al["strategy"]["plugin"] == "test-plugin"
+    pi.uninstall("test-plugin", shared_home=home)
+    al2 = yaml.safe_load(cfg.read_text())["aliases"]
+    assert "otherc" in al2 and "strategy" not in al2
