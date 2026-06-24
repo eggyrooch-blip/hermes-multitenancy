@@ -37,6 +37,14 @@ KIND_GROUP = "group"
 KIND_AGENT = "agent"
 _DEFAULT_REPLY_MODE = "mention"
 _VALID_REPLY_MODES = frozenset({"mention", "all"})
+AGENT_SHARE_VIEWER = "viewer"
+AGENT_SHARE_EDITOR = "editor"
+AGENT_SHARE_MANAGER = "manager"
+_VALID_AGENT_SHARE_ROLES = frozenset(
+    {AGENT_SHARE_VIEWER, AGENT_SHARE_EDITOR, AGENT_SHARE_MANAGER}
+)
+AGENT_SHARE_STATUS_ACTIVE = "active"
+AGENT_SHARE_STATUS_REVOKED = "revoked"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS multitenancy_routing (
@@ -78,6 +86,18 @@ CREATE TABLE IF NOT EXISTS multitenancy_group_reply_mode (
     chat_id     TEXT PRIMARY KEY NOT NULL,
     mode        TEXT NOT NULL DEFAULT 'mention',
     updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS multitenancy_agent_shares (
+    agent_id           TEXT NOT NULL,
+    grantee_open_id    TEXT NOT NULL,
+    role               TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'active',
+    created_by_open_id TEXT NOT NULL,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    revoked_at         INTEGER,
+    PRIMARY KEY (agent_id, grantee_open_id)
 );
 """
 
@@ -144,6 +164,12 @@ _NEW_INDEXES: tuple[tuple[str, str], ...] = (
         "ON multitenancy_routing(upstream_profile) "
         "WHERE active = 1 AND upstream_profile IS NOT NULL",
     ),
+    (
+        "idx_agent_shares_grantee_active",
+        "CREATE INDEX IF NOT EXISTS idx_agent_shares_grantee_active "
+        "ON multitenancy_agent_shares(grantee_open_id, agent_id) "
+        "WHERE status = 'active'",
+    ),
 )
 
 
@@ -191,6 +217,24 @@ class TenantContext:
     @property
     def is_group(self) -> bool:
         return self.kind == KIND_GROUP
+
+
+@dataclass(frozen=True)
+class AgentShareRow:
+    agent_id: str
+    grantee_open_id: str
+    role: str
+    status: str
+    created_by_open_id: str
+    created_at: int
+    updated_at: int
+    revoked_at: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class SharedAgentRow:
+    route: RoutingRow
+    share: AgentShareRow
 
 
 class RoutingTable:
@@ -822,6 +866,194 @@ class RoutingTable:
         )
         self._conn.commit()
 
+    # -- agent sharing ----------------------------------------------------
+
+    def grant_agent_share(
+        self,
+        *,
+        agent_id: str,
+        grantee_open_id: str,
+        role: str,
+        created_by_open_id: str,
+    ) -> AgentShareRow:
+        """Grant or update non-owner access to a WebUI-owned agent."""
+        agent_id = (agent_id or "").strip()
+        grantee_open_id = (grantee_open_id or "").strip()
+        role = (role or "").strip()
+        created_by_open_id = (created_by_open_id or "").strip()
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        if not grantee_open_id:
+            raise ValueError("grantee_open_id is required")
+        if role not in _VALID_AGENT_SHARE_ROLES:
+            raise ValueError(f"invalid agent share role: {role}")
+        if not created_by_open_id:
+            raise ValueError("created_by_open_id is required")
+        agent = self.lookup_agent(agent_id)
+        if agent is None or not agent.active:
+            raise ValueError("agent_id is not an active agent")
+        if grantee_open_id == agent.owner_open_id:
+            raise ValueError("owner is already an implicit manager")
+
+        now = _now()
+        self._conn.execute(
+            """
+            INSERT INTO multitenancy_agent_shares
+                (agent_id, grantee_open_id, role, status,
+                 created_by_open_id, created_at, updated_at, revoked_at)
+            VALUES (?, ?, ?, 'active', ?, ?, ?, NULL)
+            ON CONFLICT(agent_id, grantee_open_id) DO UPDATE SET
+                role = excluded.role,
+                status = 'active',
+                updated_at = excluded.updated_at,
+                revoked_at = NULL
+            """,
+            (
+                agent_id,
+                grantee_open_id,
+                role,
+                created_by_open_id,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        share = self.lookup_agent_share(agent_id, grantee_open_id)
+        if share is None:
+            raise RuntimeError("agent share grant did not persist")
+        return share
+
+    def lookup_agent_share(
+        self, agent_id: str, grantee_open_id: str
+    ) -> Optional[AgentShareRow]:
+        agent_id = (agent_id or "").strip()
+        grantee_open_id = (grantee_open_id or "").strip()
+        if not agent_id or not grantee_open_id:
+            return None
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_agent_shares "
+            "WHERE agent_id = ? AND grantee_open_id = ? LIMIT 1",
+            (agent_id, grantee_open_id),
+        )
+        row = cur.fetchone()
+        return _agent_share_row_to_dataclass(row) if row else None
+
+    def get_agent_share_role(
+        self, agent_id: str, grantee_open_id: str
+    ) -> Optional[str]:
+        share = self.lookup_agent_share(agent_id, grantee_open_id)
+        if share is None or share.status != AGENT_SHARE_STATUS_ACTIVE:
+            return None
+        return share.role
+
+    def list_agent_shares(
+        self, agent_id: str, *, active_only: bool = True
+    ) -> list[AgentShareRow]:
+        agent_id = (agent_id or "").strip()
+        if not agent_id:
+            return []
+        sql = "SELECT * FROM multitenancy_agent_shares WHERE agent_id = ?"
+        params: list[str] = [agent_id]
+        if active_only:
+            sql += " AND status = ?"
+            params.append(AGENT_SHARE_STATUS_ACTIVE)
+        sql += " ORDER BY created_at ASC, grantee_open_id ASC"
+        cur = self._conn.execute(sql, params)
+        return [_agent_share_row_to_dataclass(row) for row in cur.fetchall()]
+
+    def list_shared_agents_for_actor(self, open_id: str) -> list[SharedAgentRow]:
+        open_id = (open_id or "").strip()
+        if not open_id:
+            return []
+        cur = self._conn.execute(
+            """
+            SELECT
+                r.user_id AS r_user_id,
+                r.profile_name AS r_profile_name,
+                r.open_id AS r_open_id,
+                r.union_id AS r_union_id,
+                r.active AS r_active,
+                r.deleted_at AS r_deleted_at,
+                r.synced_at AS r_synced_at,
+                r.version AS r_version,
+                r.last_active_at AS r_last_active_at,
+                r.created_at AS r_created_at,
+                r.updated_at AS r_updated_at,
+                r.kind AS r_kind,
+                r.chat_id AS r_chat_id,
+                r.owner_open_id AS r_owner_open_id,
+                r.display_label AS r_display_label,
+                r.agent_id AS r_agent_id,
+                r.upstream_profile AS r_upstream_profile,
+                r.provenance AS r_provenance,
+                s.agent_id AS s_agent_id,
+                s.grantee_open_id AS s_grantee_open_id,
+                s.role AS s_role,
+                s.status AS s_status,
+                s.created_by_open_id AS s_created_by_open_id,
+                s.created_at AS s_created_at,
+                s.updated_at AS s_updated_at,
+                s.revoked_at AS s_revoked_at
+            FROM multitenancy_agent_shares s
+            JOIN multitenancy_routing r
+              ON r.agent_id = s.agent_id
+             AND r.active = 1
+             AND r.kind = 'agent'
+            WHERE s.grantee_open_id = ?
+              AND s.status = 'active'
+            ORDER BY r.display_label ASC, r.agent_id ASC
+            """,
+            (open_id,),
+        )
+        rows: list[SharedAgentRow] = []
+        for row in cur.fetchall():
+            route = RoutingRow(
+                user_id=row["r_user_id"],
+                profile_name=row["r_profile_name"],
+                open_id=row["r_open_id"],
+                union_id=row["r_union_id"],
+                active=bool(row["r_active"]),
+                last_active_at=row["r_last_active_at"],
+                synced_at=row["r_synced_at"],
+                version=row["r_version"],
+                kind=row["r_kind"] or KIND_AGENT,
+                chat_id=row["r_chat_id"],
+                owner_open_id=row["r_owner_open_id"],
+                display_label=row["r_display_label"],
+                agent_id=row["r_agent_id"],
+                provenance=row["r_provenance"],
+                upstream_profile=row["r_upstream_profile"],
+            )
+            share = AgentShareRow(
+                agent_id=row["s_agent_id"],
+                grantee_open_id=row["s_grantee_open_id"],
+                role=row["s_role"],
+                status=row["s_status"],
+                created_by_open_id=row["s_created_by_open_id"],
+                created_at=row["s_created_at"],
+                updated_at=row["s_updated_at"],
+                revoked_at=row["s_revoked_at"],
+            )
+            rows.append(SharedAgentRow(route=route, share=share))
+        return rows
+
+    def revoke_agent_share(self, agent_id: str, grantee_open_id: str) -> bool:
+        agent_id = (agent_id or "").strip()
+        grantee_open_id = (grantee_open_id or "").strip()
+        if not agent_id or not grantee_open_id:
+            return False
+        now = _now()
+        cur = self._conn.execute(
+            """
+            UPDATE multitenancy_agent_shares
+            SET status = 'revoked', revoked_at = ?, updated_at = ?
+            WHERE agent_id = ? AND grantee_open_id = ? AND status = 'active'
+            """,
+            (now, now, agent_id, grantee_open_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     def soft_delete(self, user_id: str) -> bool:
         """Mark a route as inactive (kind-agnostic). Returns True on update."""
         now = _now()
@@ -880,6 +1112,19 @@ def _row_to_dataclass(row: sqlite3.Row) -> RoutingRow:
         agent_id=row["agent_id"] if "agent_id" in row.keys() else None,
         provenance=row["provenance"] if "provenance" in row.keys() else None,
         upstream_profile=row["upstream_profile"] if "upstream_profile" in row.keys() else None,
+    )
+
+
+def _agent_share_row_to_dataclass(row: sqlite3.Row) -> AgentShareRow:
+    return AgentShareRow(
+        agent_id=row["agent_id"],
+        grantee_open_id=row["grantee_open_id"],
+        role=row["role"],
+        status=row["status"],
+        created_by_open_id=row["created_by_open_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        revoked_at=row["revoked_at"],
     )
 
 

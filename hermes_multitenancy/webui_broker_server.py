@@ -1282,6 +1282,46 @@ def _owner_allowed_upstream_profiles(table: Any, trusted_owner: str, owner_root:
     return profiles
 
 
+def _shared_agent_payload(route: Any, role: str) -> dict[str, Any]:
+    return {
+        "agent_id": str(getattr(route, "agent_id", None) or getattr(route, "user_id", "")),
+        "profile_name": str(getattr(route, "profile_name", "") or ""),
+        "owner_open_id": str(getattr(route, "owner_open_id", "") or ""),
+        "display_label": str(getattr(route, "display_label", "") or ""),
+        "role": role,
+    }
+
+
+def _agent_share_payload(share: Any) -> dict[str, Any]:
+    return {
+        "agent_id": str(getattr(share, "agent_id", "") or ""),
+        "grantee_open_id": str(getattr(share, "grantee_open_id", "") or ""),
+        "role": str(getattr(share, "role", "") or ""),
+        "status": str(getattr(share, "status", "") or ""),
+        "created_by_open_id": str(getattr(share, "created_by_open_id", "") or ""),
+        "created_at": int(getattr(share, "created_at", 0) or 0),
+        "updated_at": int(getattr(share, "updated_at", 0) or 0),
+        "revoked_at": getattr(share, "revoked_at", None),
+    }
+
+
+def _resolve_agent_manager(table: Any, actor_open_id: str, agent_id: str) -> tuple[Any, Optional[str], int]:
+    actor_open_id = (actor_open_id or "").strip()
+    agent_id = (agent_id or "").strip()
+    if not actor_open_id:
+        return None, "owner identity required (X-Hermes-Owner-Open-Id)", 403
+    if not agent_id:
+        return None, "agent_id required", 400
+    row = table.lookup_agent(agent_id)
+    if row is None or not getattr(row, "active", False):
+        return None, f"agent_id '{agent_id}' not found", 404
+    if getattr(row, "owner_open_id", None) == actor_open_id:
+        return row, None, 200
+    if table.get_agent_share_role(agent_id, actor_open_id) == "manager":
+        return row, None, 200
+    return None, "manager role required for this agent", 403
+
+
 def _resolve_owner_scoped_profile(
     request: Any,
     payload: dict[str, Any],
@@ -1331,7 +1371,14 @@ def _resolve_owner_scoped_profile(
             and row.user_id == owner_root.user_id
             and row.profile_name == owner_root.profile_name
         )
+        share_role = None
         if row.owner_open_id != trusted_owner and not matches_owner_root:
+            share_role = table.get_agent_share_role(agent_id, trusted_owner)
+        if (
+            row.owner_open_id != trusted_owner
+            and not matches_owner_root
+            and share_role is None
+        ):
             return None, f"agent_id '{agent_id}' does not belong to asserted owner"
         return row.profile_name, None
 
@@ -3046,6 +3093,90 @@ def create_run_broker_app(
             "upstream_profile": effective_upstream_profile,
         })
 
+    async def handle_list_shared_agents(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        actor_open_id = _trusted_owner_from_request(request)
+        if not actor_open_id:
+            return web.json_response({
+                "error": "owner identity required (X-Hermes-Owner-Open-Id)"
+            }, status=403)
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return web.json_response({"error": "routing table unavailable"}, status=503)
+        agents = [
+            _shared_agent_payload(shared.route, shared.share.role)
+            for shared in table.list_shared_agents_for_actor(actor_open_id)
+        ]
+        return web.json_response({"agents": agents})
+
+    async def handle_list_agent_shares(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        actor_open_id = _trusted_owner_from_request(request)
+        agent_id = str(request.match_info.get("agent_id") or "").strip()
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return web.json_response({"error": "routing table unavailable"}, status=503)
+        _row, error, status = _resolve_agent_manager(table, actor_open_id, agent_id)
+        if error is not None:
+            return web.json_response({"error": error}, status=status)
+        return web.json_response({
+            "shares": [
+                _agent_share_payload(share)
+                for share in table.list_agent_shares(agent_id)
+            ]
+        })
+
+    async def handle_grant_agent_share(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        actor_open_id = _trusted_owner_from_request(request)
+        agent_id = str(request.match_info.get("agent_id") or "").strip()
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return web.json_response({"error": "routing table unavailable"}, status=503)
+        _row, error, status = _resolve_agent_manager(table, actor_open_id, agent_id)
+        if error is not None:
+            return web.json_response({"error": error}, status=status)
+        try:
+            share = table.grant_agent_share(
+                agent_id=agent_id,
+                grantee_open_id=str(payload.get("grantee_open_id") or payload.get("granteeOpenId") or ""),
+                role=str(payload.get("role") or ""),
+                created_by_open_id=actor_open_id,
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"share": _agent_share_payload(share)})
+
+    async def handle_revoke_agent_share(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        actor_open_id = _trusted_owner_from_request(request)
+        agent_id = str(request.match_info.get("agent_id") or "").strip()
+        grantee_open_id = str(request.match_info.get("grantee_open_id") or "").strip()
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return web.json_response({"error": "routing table unavailable"}, status=503)
+        _row, error, status = _resolve_agent_manager(table, actor_open_id, agent_id)
+        if error is not None:
+            return web.json_response({"error": error}, status=status)
+        table.revoke_agent_share(agent_id, grantee_open_id)
+        return web.json_response({"ok": True})
+
     async def handle_slash_commands(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -3931,6 +4062,10 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/internal/session-search", handle_internal_session_search)
     app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
     app.router.add_post("/api/run-broker/profiles", handle_provision_profile)
+    app.router.add_get("/api/run-broker/agents/shared", handle_list_shared_agents)
+    app.router.add_get("/api/run-broker/agents/{agent_id}/shares", handle_list_agent_shares)
+    app.router.add_post("/api/run-broker/agents/{agent_id}/shares", handle_grant_agent_share)
+    app.router.add_delete("/api/run-broker/agents/{agent_id}/shares/{grantee_open_id}", handle_revoke_agent_share)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_post("/api/run-broker/credentials/lease", handle_credential_lease)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)

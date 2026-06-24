@@ -2205,6 +2205,181 @@ def test_webui_run_broker_owner_header_agent_id_resolves_owned_profile(tmp_path)
     asyncio.run(runner())
 
 
+def test_webui_run_broker_agent_share_viewer_can_run_owned_agent(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-shared",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared analyst",
+    )
+    seeded.grant_agent_share(
+        agent_id="agent-shared",
+        grantee_open_id="ou_viewer",
+        role="viewer",
+        created_by_open_id="ou_owner",
+    )
+    seeded.close()
+
+    async def runner():
+        seen = []
+        router_mod.override_routing_table(db_path)
+        try:
+            async def dispatch(request):
+                seen.append(request)
+                return f"echo:{request.content}"
+
+            app = create_run_broker_app(
+                dispatch_agent=dispatch,
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_viewer",
+                    "X-Hermes-Agent-Id": "agent-shared",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "content": "hello shared agent",
+                })
+                body = await response.text()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        assert '"kind": "content"' in body
+        assert len(seen) == 1
+        assert seen[0].profile_name == "owned_agent_profile"
+        assert seen[0].user_key == "ou_viewer"
+        assert seen[0].credential_subject == "ou_viewer"
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_agent_share_management_endpoints(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.upsert_owned_agent(
+        agent_id="agent-shared",
+        profile_name="owned_agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared analyst",
+    )
+    seeded.grant_agent_share(
+        agent_id="agent-shared",
+        grantee_open_id="ou_manager",
+        role="manager",
+        created_by_open_id="ou_owner",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                owner_grant = await client.post(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                    json={"grantee_open_id": "ou_editor", "role": "editor"},
+                )
+                owner_grant_body = await owner_grant.json()
+
+                editor_shared = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
+                )
+                editor_shared_body = await editor_shared.json()
+
+                editor_members = await client.get(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
+                )
+                editor_members_body = await editor_members.json()
+
+                manager_members = await client.get(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_manager"},
+                )
+                manager_members_body = await manager_members.json()
+
+                manager_revoke = await client.delete(
+                    "/api/run-broker/agents/agent-shared/shares/ou_editor",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_manager"},
+                )
+                manager_revoke_body = await manager_revoke.json()
+
+                editor_after_revoke = await client.get(
+                    "/api/run-broker/agents/shared",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
+                )
+                editor_after_revoke_body = await editor_after_revoke.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert owner_grant.status == 200
+        assert owner_grant_body["share"]["role"] == "editor"
+        assert editor_shared.status == 200
+        assert editor_shared_body["agents"] == [{
+            "agent_id": "agent-shared",
+            "profile_name": "owned_agent_profile",
+            "owner_open_id": "ou_owner",
+            "display_label": "Shared analyst",
+            "role": "editor",
+        }]
+        assert editor_members.status == 403
+        assert "manager" in editor_members_body["error"]
+        assert manager_members.status == 200
+        assert {share["grantee_open_id"] for share in manager_members_body["shares"]} == {
+            "ou_editor",
+            "ou_manager",
+        }
+        assert manager_revoke.status == 200
+        assert manager_revoke_body == {"ok": True}
+        assert editor_after_revoke.status == 200
+        assert editor_after_revoke_body["agents"] == []
+
+    asyncio.run(runner())
+
+
 def test_webui_slash_registry_lists_only_owner_scoped_profile_skills(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

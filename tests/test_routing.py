@@ -346,6 +346,32 @@ def test_list_agents_for_owner_cross_owner_isolation(table):
     assert all(row.owner_open_id == "ou_b" for row in table.list_by_owner("ou_b"))
 
 
+def test_agent_share_acl_grant_lookup_and_revoke(table):
+    table.upsert_owned_agent(
+        agent_id="agent-shared",
+        profile_name="agent_profile",
+        owner_open_id="ou_owner",
+        display_label="Shared analyst",
+    )
+
+    share = table.grant_agent_share(
+        agent_id="agent-shared",
+        grantee_open_id="ou_viewer",
+        role="viewer",
+        created_by_open_id="ou_owner",
+    )
+
+    assert share.agent_id == "agent-shared"
+    assert share.grantee_open_id == "ou_viewer"
+    assert share.role == "viewer"
+    assert share.status == "active"
+    assert table.get_agent_share_role("agent-shared", "ou_viewer") == "viewer"
+
+    table.revoke_agent_share("agent-shared", "ou_viewer")
+
+    assert table.get_agent_share_role("agent-shared", "ou_viewer") is None
+
+
 def test_list_by_owner_ordering_sync_root_first(table):
     table.upsert_group(
         chat_id="oc_early",
