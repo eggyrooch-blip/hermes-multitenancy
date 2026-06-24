@@ -2545,6 +2545,12 @@ def test_webui_run_broker_agent_share_management_endpoints(tmp_path):
                 )
                 owner_grant_body = await owner_grant.json()
 
+                owner_members = await client.get(
+                    "/api/run-broker/agents/agent-shared/shares",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                )
+                owner_members_body = await owner_members.json()
+
                 editor_shared = await client.get(
                     "/api/run-broker/agents/shared",
                     headers={"X-Hermes-Owner-Open-Id": "ou_editor"},
@@ -2581,6 +2587,8 @@ def test_webui_run_broker_agent_share_management_endpoints(tmp_path):
 
         assert owner_grant.status == 200
         assert owner_grant_body["share"]["role"] == "editor"
+        assert owner_members.status == 200
+        assert owner_members_body["actor_role"] == "owner"
         assert editor_shared.status == 200
         assert editor_shared_body["agents"] == [{
             "agent_id": "agent-shared",
@@ -2592,6 +2600,7 @@ def test_webui_run_broker_agent_share_management_endpoints(tmp_path):
         assert editor_members.status == 403
         assert "manager" in editor_members_body["error"]
         assert manager_members.status == 200
+        assert manager_members_body["actor_role"] == "manager"
         assert {share["grantee_open_id"] for share in manager_members_body["shares"]} == {
             "ou_editor",
             "ou_manager",

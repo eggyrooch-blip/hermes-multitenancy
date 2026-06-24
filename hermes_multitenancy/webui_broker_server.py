@@ -1404,21 +1404,21 @@ def _agent_share_payload(share: Any) -> dict[str, Any]:
     }
 
 
-def _resolve_agent_manager(table: Any, actor_open_id: str, agent_id: str) -> tuple[Any, Optional[str], int]:
+def _resolve_agent_manager(table: Any, actor_open_id: str, agent_id: str) -> tuple[Any, Optional[str], int, str]:
     actor_open_id = (actor_open_id or "").strip()
     agent_id = (agent_id or "").strip()
     if not actor_open_id:
-        return None, "owner identity required (X-Hermes-Owner-Open-Id)", 403
+        return None, "owner identity required (X-Hermes-Owner-Open-Id)", 403, ""
     if not agent_id:
-        return None, "agent_id required", 400
+        return None, "agent_id required", 400, ""
     row = table.lookup_agent(agent_id)
     if row is None or not getattr(row, "active", False):
-        return None, f"agent_id '{agent_id}' not found", 404
+        return None, f"agent_id '{agent_id}' not found", 404, ""
     if getattr(row, "owner_open_id", None) == actor_open_id:
-        return row, None, 200
+        return row, None, 200, "owner"
     if table.get_agent_share_role(agent_id, actor_open_id) == "manager":
-        return row, None, 200
-    return None, "manager role required for this agent", 403
+        return row, None, 200, "manager"
+    return None, "manager role required for this agent", 403, ""
 
 
 def _resolve_owner_scoped_profile(
@@ -3267,10 +3267,11 @@ def create_run_broker_app(
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        _row, error, status = _resolve_agent_manager(table, actor_open_id, agent_id)
+        _row, error, status, actor_role = _resolve_agent_manager(table, actor_open_id, agent_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
         return web.json_response({
+            "actor_role": actor_role,
             "shares": [
                 _agent_share_payload(share)
                 for share in table.list_agent_shares(agent_id)
@@ -3291,7 +3292,7 @@ def create_run_broker_app(
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        _row, error, status = _resolve_agent_manager(table, actor_open_id, agent_id)
+        _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
         try:
@@ -3316,7 +3317,7 @@ def create_run_broker_app(
         table = router_mod._get_routing_table()
         if table is None:
             return web.json_response({"error": "routing table unavailable"}, status=503)
-        _row, error, status = _resolve_agent_manager(table, actor_open_id, agent_id)
+        _row, error, status, _actor_role = _resolve_agent_manager(table, actor_open_id, agent_id)
         if error is not None:
             return web.json_response({"error": error}, status=status)
         table.revoke_agent_share(agent_id, grantee_open_id)
