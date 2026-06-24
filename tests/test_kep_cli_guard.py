@@ -8,15 +8,31 @@ from pathlib import Path
 from hermes_multitenancy.kep_cli_guard import KEP_CLI_SHIM_NAMES, install_kep_cli_shim
 
 
-def test_install_writes_all_six_executable_shims(tmp_path):
+def test_install_writes_executable_shims_for_present_binaries(tmp_path):
     real_bin = tmp_path / "bin"
     real_bin.mkdir()
+    for name in KEP_CLI_SHIM_NAMES:  # the profile "has" all of them
+        (real_bin / name).write_text("#!/bin/sh\n", encoding="utf-8")
+        (real_bin / name).chmod(0o755)
     shim_dir = tmp_path / "shim"
     install_kep_cli_shim(shim_dir, real_bin_dir=real_bin)
     for name in KEP_CLI_SHIM_NAMES:
         p = shim_dir / name
         assert p.is_file() and os.access(p, os.X_OK)
-    assert len(KEP_CLI_SHIM_NAMES) == 6
+    assert "kep-cli" not in KEP_CLI_SHIM_NAMES  # the installer has no --profile flag
+    assert len(KEP_CLI_SHIM_NAMES) == 5
+
+
+def test_only_shims_binaries_that_exist(tmp_path):
+    # a profile with only hades-cli installed → only hades-cli gets a shim
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir()
+    (real_bin / "hades-cli").write_text("#!/bin/sh\n", encoding="utf-8")
+    (real_bin / "hades-cli").chmod(0o755)
+    shim_dir = tmp_path / "shim"
+    install_kep_cli_shim(shim_dir, real_bin_dir=real_bin)
+    assert (shim_dir / "hades-cli").is_file()
+    assert not (shim_dir / "kep-auth").exists()  # not installed → not shimmed
 
 
 def _fake_real_bin(tmp_path):
