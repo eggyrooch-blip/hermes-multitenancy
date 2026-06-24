@@ -4691,7 +4691,11 @@ def test_build_subprocess_env_prepends_shared_bin_to_path(monkeypatch, tmp_path:
 
     env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
 
-    assert env["PATH"].split(":")[0] == str(shared_home / "bin")
+    parts = env["PATH"].split(":")
+    # the kep-cli profile shim is prepended first (it must shadow the real kep binaries),
+    # with shared_bin right behind it so all other shared-managed CLIs stay callable.
+    assert parts[0] == str(profile / "tmp" / "kep-cli-shim")
+    assert parts[1] == str(shared_home / "bin")
     assert env["PATH"].endswith("/usr/bin:/bin")
 
 
