@@ -119,6 +119,8 @@ _FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FEISHU_UAT_ACCESS_TOKEN",
     "FEISHU_UAT_REFRESH_TOKEN",
 })
+_AGENT_SHARED_ROLES = frozenset({"viewer", "editor", "manager"})
+_AGENT_SHARE_CONTEXT_METADATA_KEY = "agent_share_context"
 _CREDENTIAL_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 
@@ -1459,6 +1461,24 @@ def _redact_ingest_runtime_value(value: Any, event: Any | None = None) -> Any:
     return value
 
 
+def _agent_share_context_from_event(event: Any) -> dict[str, str]:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return {}
+    metadata = raw_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    context = metadata.get(_AGENT_SHARE_CONTEXT_METADATA_KEY)
+    if not isinstance(context, dict):
+        return {}
+    return {
+        "agent_id": str(context.get("agent_id") or "").strip(),
+        "actor_open_id": str(context.get("actor_open_id") or "").strip(),
+        "agent_owner_open_id": str(context.get("agent_owner_open_id") or "").strip(),
+        "share_role": str(context.get("share_role") or "").strip(),
+    }
+
+
 # Whitelisted parent-process env keys carried into AIAgent subprocesses.
 #
 # Anything not listed here is dropped before spawning the child — this is the
@@ -1562,8 +1582,15 @@ def _build_subprocess_env(
         env.pop("HERMES_CREDENTIAL_KEY", None)
 
     profile_home = profile_home.expanduser()
-    env.update(_profile_env_for_aiagent(profile_home))
-    credential_env = _credential_env_for_aiagent(profile_home)
+    share_role = str((extra or {}).get("HERMES_AGENT_SHARE_ROLE") or "").strip()
+    shared_agent_run = share_role in _AGENT_SHARED_ROLES
+    env.update(
+        _profile_env_for_aiagent(
+            profile_home,
+            include_profile_secrets=not shared_agent_run,
+        )
+    )
+    credential_env = {} if shared_agent_run else _credential_env_for_aiagent(profile_home)
     env.update(credential_env)
     env.update(_force_env_for_terminal_passthrough(credential_env))
 
@@ -2036,6 +2063,19 @@ def _aiagent_subprocess_env_scope(
     merged_extra.update(_ingest_secret_env_from_event(event))
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
+    share_context = _agent_share_context_from_event(event)
+    share_role = str(share_context.get("share_role") or "").strip()
+    shared_agent_run = share_role in _AGENT_SHARED_ROLES
+    share_actor_open_id = str(share_context.get("actor_open_id") or "").strip()
+    share_agent_id = str(share_context.get("agent_id") or "").strip()
+    if shared_agent_run:
+        if share_actor_open_id:
+            sender_open_id = share_actor_open_id
+            merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = share_actor_open_id
+            merged_extra["HERMES_AGENT_ACTOR_OPEN_ID"] = share_actor_open_id
+        if share_agent_id:
+            merged_extra["HERMES_AGENT_ID"] = share_agent_id
+        merged_extra["HERMES_AGENT_SHARE_ROLE"] = share_role
     broker_token = ""
     session_search_token = secrets.token_urlsafe(32)
     session_search_run_id = secrets.token_urlsafe(24)
@@ -2043,7 +2083,7 @@ def _aiagent_subprocess_env_scope(
         scoped_open_id = str(
             merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
             or sender_open_id
-            or _profile_owner_open_id(profile_home)
+            or ("" if shared_agent_run else _profile_owner_open_id(profile_home))
         ).strip()
         if scoped_open_id:
             run_id = secrets.token_urlsafe(24)
@@ -2067,11 +2107,13 @@ def _aiagent_subprocess_env_scope(
                 profile_name=profile_home.name,
                 open_id=scoped_open_id,
                 run_id=run_id,
+                agent_id=share_agent_id if shared_agent_run else "",
+                share_role=share_role if shared_agent_run else "",
             )
     scoped_open_id_for_search = str(
         merged_extra.get("HERMES_FEISHU_USER_OPEN_ID")
         or sender_open_id
-        or _profile_owner_open_id(profile_home)
+        or ("" if shared_agent_run else _profile_owner_open_id(profile_home))
         or ""
     ).strip()
     merged_extra.update(
@@ -2085,6 +2127,8 @@ def _aiagent_subprocess_env_scope(
         profile_name=profile_home.name,
         open_id=scoped_open_id_for_search,
         run_id=session_search_run_id,
+        agent_id=share_agent_id if shared_agent_run else "",
+        share_role=share_role if shared_agent_run else "",
     )
     with _lark_cli_auth_broker_scope(
         profile_home,
@@ -2104,7 +2148,11 @@ def _aiagent_subprocess_env_scope(
             unregister_session_search_broker_token(session_search_token)
 
 
-def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+def _profile_env_for_aiagent(
+    profile_home: Path,
+    *,
+    include_profile_secrets: bool = True,
+) -> dict[str, str]:
     """Load profile-local env for the AIAgent process before sandboxing.
 
     The bwrap policy masks ``.env`` and ``auth.json`` from tool-visible file
@@ -2118,6 +2166,8 @@ def _profile_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     try:
         if shared_env.exists():
             loaded.update(_dotenv_values_for_aiagent(shared_env, allowed_keys=_SHARED_AIAGENT_ENV_ALLOWLIST))
+        if not include_profile_secrets:
+            return loaded
 
         profile_allowed_keys: Optional[frozenset[str]] = None
         try:

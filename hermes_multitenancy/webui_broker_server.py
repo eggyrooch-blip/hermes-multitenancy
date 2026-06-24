@@ -45,6 +45,8 @@ SandboxAvailable = Callable[[], bool]
 
 _OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
 _AGENT_ID_HEADER = "X-Hermes-Agent-Id"
+_AGENT_SHARE_CONTEXT_METADATA_KEY = "agent_share_context"
+_AGENT_SHARED_ROLES = frozenset({"viewer", "editor", "manager"})
 _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE = 32 * 1024 * 1024
 # Public SkillHub webhook bodies are small JSON envelopes; cap hard to avoid
 # disk-fill / DoS on an internet-exposed route (the 32MB broker default is for
@@ -226,7 +228,15 @@ def credential_broker_url() -> str:
     return f"http://{_run_broker_host()}:{_run_broker_port()}"
 
 
-def register_credential_broker_token(*, token: str, profile_name: str, open_id: str, run_id: str) -> None:
+def register_credential_broker_token(
+    *,
+    token: str,
+    profile_name: str,
+    open_id: str,
+    run_id: str,
+    agent_id: str = "",
+    share_role: str = "",
+) -> None:
     key = str(token or "").strip()
     if not key:
         return
@@ -235,6 +245,8 @@ def register_credential_broker_token(*, token: str, profile_name: str, open_id: 
             "profile_name": str(profile_name or "").strip(),
             "open_id": str(open_id or "").strip(),
             "run_id": str(run_id or "").strip(),
+            "agent_id": str(agent_id or "").strip(),
+            "share_role": str(share_role or "").strip(),
         }
 
 
@@ -257,7 +269,15 @@ def _lookup_credential_broker_token(token: str) -> dict[str, str] | None:
         return dict(record)
 
 
-def register_session_search_broker_token(*, token: str, profile_name: str, open_id: str, run_id: str) -> None:
+def register_session_search_broker_token(
+    *,
+    token: str,
+    profile_name: str,
+    open_id: str,
+    run_id: str,
+    agent_id: str = "",
+    share_role: str = "",
+) -> None:
     key = str(token or "").strip()
     if not key:
         return
@@ -266,6 +286,8 @@ def register_session_search_broker_token(*, token: str, profile_name: str, open_
             "profile_name": str(profile_name or "").strip(),
             "open_id": str(open_id or "").strip(),
             "run_id": str(run_id or "").strip(),
+            "agent_id": str(agent_id or "").strip(),
+            "share_role": str(share_role or "").strip(),
         }
 
 
@@ -297,6 +319,82 @@ def _call_session_search_compat(session_search: Callable[..., str], **kwargs: An
         return session_search(**kwargs)
     accepted = {key: value for key, value in kwargs.items() if key in signature.parameters}
     return session_search(**accepted)
+
+
+class _ActorScopedSessionDB:
+    """Narrow session_search DB reads to one actor inside a shared agent run."""
+
+    def __init__(self, inner: Any, actor_open_id: str) -> None:
+        self._inner = inner
+        self._actor_open_id = str(actor_open_id or "").strip()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _session_allowed(self, session: dict[str, Any] | None, *, _seen: Optional[set[str]] = None) -> bool:
+        if not session or not self._actor_open_id:
+            return False
+        if str(session.get("user_id") or "").strip() == self._actor_open_id:
+            return True
+        parent_session_id = str(session.get("parent_session_id") or "").strip()
+        if not parent_session_id:
+            return False
+        seen = _seen or set()
+        if parent_session_id in seen:
+            return False
+        seen.add(parent_session_id)
+        return self._session_allowed(self._inner.get_session(parent_session_id), _seen=seen)
+
+    def _session_id_allowed(self, session_id: str) -> bool:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return False
+        return self._session_allowed(self._inner.get_session(session_id))
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        session = self._inner.get_session(session_id)
+        return session if self._session_allowed(session) else None
+
+    def get_messages(self, session_id: str) -> list[dict[str, Any]]:
+        return self._inner.get_messages(session_id) if self._session_id_allowed(session_id) else []
+
+    def get_messages_as_conversation(self, session_id: str) -> list[dict[str, Any]]:
+        if not self._session_id_allowed(session_id):
+            return []
+        return self._inner.get_messages_as_conversation(session_id)
+
+    def search_messages(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        requested_limit = int(kwargs.get("limit") or 20)
+        expanded_kwargs = dict(kwargs)
+        expanded_kwargs["limit"] = max(requested_limit * 20, 200)
+        expanded_kwargs["offset"] = 0
+        matches = self._inner.search_messages(*args, **expanded_kwargs)
+        filtered = [
+            row for row in matches
+            if self._session_id_allowed(str(row.get("session_id") or ""))
+        ]
+        offset = int(kwargs.get("offset") or 0)
+        return filtered[offset: offset + requested_limit]
+
+    def list_sessions_rich(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        requested_limit = int(kwargs.get("limit") or 20)
+        expanded_kwargs = dict(kwargs)
+        expanded_kwargs["limit"] = max(requested_limit * 20, 200)
+        expanded_kwargs["offset"] = 0
+        rows = self._inner.list_sessions_rich(*args, **expanded_kwargs)
+        filtered = [
+            row for row in rows
+            if self._session_allowed(row)
+        ]
+        offset = int(kwargs.get("offset") or 0)
+        return filtered[offset: offset + requested_limit]
+
+
+def _session_search_db_for_claims(db: Any, claims: dict[str, str]) -> Any:
+    share_role = str(claims.get("share_role") or "").strip()
+    if share_role in {"viewer", "editor"}:
+        return _ActorScopedSessionDB(db, str(claims.get("open_id") or ""))
+    return db
 
 
 def _positive_int_env(name: str) -> Optional[int]:
@@ -1387,6 +1485,43 @@ def _resolve_owner_scoped_profile(
     return owner_root.profile_name, None
 
 
+def _agent_share_context_for_request(
+    request: Any,
+    payload: dict[str, Any],
+    *,
+    resolved_profile_name: str,
+) -> dict[str, str]:
+    trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+    agent_id = str(
+        request.headers.get(_AGENT_ID_HEADER)
+        or payload.get("agent_id")
+        or ""
+    ).strip()
+    if not (trusted_owner and agent_id and resolved_profile_name):
+        return {}
+
+    from . import router as router_mod
+
+    table = router_mod._get_routing_table()
+    if table is None:
+        return {}
+    row = table.lookup_agent(agent_id)
+    if row is None or not row.active or row.profile_name != resolved_profile_name:
+        return {}
+    if row.owner_open_id == trusted_owner:
+        share_role = "owner"
+    else:
+        share_role = table.get_agent_share_role(agent_id, trusted_owner) or ""
+    if not share_role:
+        return {}
+    return {
+        "agent_id": agent_id,
+        "agent_owner_open_id": str(row.owner_open_id or ""),
+        "actor_open_id": trusted_owner,
+        "share_role": share_role,
+    }
+
+
 async def _maybe_await(value):
     if hasattr(value, "__await__"):
         return await value
@@ -1750,6 +1885,14 @@ def create_run_broker_app(
             if resolution_error is not None:
                 return web.json_response({"error": resolution_error}, status=403)
             trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+            metadata = _sanitize_ingest_metadata(payload.get("metadata") or {})
+            share_context = _agent_share_context_for_request(
+                request,
+                payload,
+                resolved_profile_name=str(resolved_profile_name or payload.get("profile_name") or payload.get("profile") or ""),
+            )
+            if share_context:
+                metadata[_AGENT_SHARE_CONTEXT_METADATA_KEY] = share_context
             run_request = RunRequest(
                 channel=payload.get("channel"),
                 profile_name=resolved_profile_name or payload.get("profile_name") or payload.get("profile"),
@@ -1762,7 +1905,7 @@ def create_run_broker_app(
                 delivery_mode=payload.get("delivery_mode") or "socket",
                 credential_subject=trusted_owner or payload.get("credential_subject"),
                 requires_host_tools=bool(payload.get("requires_host_tools")),
-                metadata=_sanitize_ingest_metadata(payload.get("metadata") or {}),
+                metadata=metadata,
                 messages=payload.get("messages") or [],
             )
         except Exception as exc:
@@ -2924,9 +3067,10 @@ def create_run_broker_app(
 
             profile_home = _profile_home_for_name(profile_name)
             db = SessionDB(db_path=profile_home / "state.db")
+            search_db = _session_search_db_for_claims(db, claims)
             try:
                 if session_id:
-                    if not db.get_session(session_id):
+                    if not search_db.get_session(session_id):
                         result = json.dumps({
                             "success": False,
                             "error": f"session_id not found: {session_id}",
@@ -2947,7 +3091,7 @@ def create_run_broker_app(
                     window=payload.get("window", 5),
                     sort=payload.get("sort"),
                     profile=None,
-                    db=db,
+                    db=search_db,
                     current_session_id=payload.get("current_session_id"),
                 )
             finally:
@@ -3523,6 +3667,8 @@ def create_run_broker_app(
             if kind == "provider_env":
                 from .provider_adapter import provider_env_for_aiagent
 
+                if str(token_record.get("share_role") or "") in _AGENT_SHARED_ROLES:
+                    return web.json_response({"payload": {}})
                 profile_home = _profile_home_for_name(claims.profile_name)
                 payload_value = provider_env_for_aiagent(profile_home)
                 return web.json_response({"payload": payload_value})

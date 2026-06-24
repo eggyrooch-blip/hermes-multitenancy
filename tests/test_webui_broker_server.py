@@ -2259,6 +2259,20 @@ def test_webui_run_broker_agent_share_viewer_can_run_owned_agent(tmp_path):
                     "content": "hello shared agent",
                 })
                 body = await response.text()
+                revoke_table = RoutingTable(db_path)
+                try:
+                    revoke_table.revoke_agent_share("agent-shared", "ou_viewer")
+                finally:
+                    revoke_table.close()
+                revoked_response = await client.post("/api/run-broker/runs", headers={
+                    "X-Hermes-Owner-Open-Id": "ou_viewer",
+                    "X-Hermes-Agent-Id": "agent-shared",
+                }, json={
+                    "channel": "webui",
+                    "profile_name": "spoofed_client_profile",
+                    "content": "hello after revoke",
+                })
+                revoked_body = await revoked_response.json()
             finally:
                 await client.close()
         finally:
@@ -2270,6 +2284,135 @@ def test_webui_run_broker_agent_share_viewer_can_run_owned_agent(tmp_path):
         assert seen[0].profile_name == "owned_agent_profile"
         assert seen[0].user_key == "ou_viewer"
         assert seen[0].credential_subject == "ou_viewer"
+        assert revoked_response.status == 403
+        assert "does not belong" in revoked_body["error"]
+        assert len(seen) == 1
+
+    asyncio.run(runner())
+
+
+def test_shared_agent_credential_lease_blocks_owner_provider_env(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import provider_adapter
+    from hermes_multitenancy import webui_broker_server as broker
+    from hermes_multitenancy.credential_broker import lease_signing_secret, mint_lease
+
+    profile_home = tmp_path / "profiles" / "owned_agent_profile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-shared-provider-key")
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
+    monkeypatch.setattr(
+        provider_adapter,
+        "provider_env_for_aiagent",
+        lambda _profile_home: {"OPENAI_API_KEY": "owner-provider-secret"},
+    )
+
+    token = "shared-provider-token"
+    run_id = "run-shared-provider"
+    lease = mint_lease(
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        secret=lease_signing_secret(),
+    )
+    broker.register_credential_broker_token(
+        token=token,
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id=run_id,
+        agent_id="agent-shared",
+        share_role="viewer",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/credentials/lease",
+                json={
+                    "lease": lease,
+                    "kind": "provider_env",
+                    "profile_name": "owned_agent_profile",
+                    "open_id": "ou_viewer",
+                    "run_id": run_id,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+            broker.unregister_credential_broker_token(token)
+
+        assert response.status == 200
+        assert body["payload"] == {}
+
+    asyncio.run(runner())
+
+
+def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_state import SessionDB
+    from tools import session_search_tool
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    profile_home = tmp_path / "profiles" / "owned_agent_profile"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session("owner-session", source="api_server", user_id="ou_owner")
+        db.append_message(
+            session_id="owner-session",
+            role="user",
+            content="SHARED_SCOPE_MARKER owner-only context",
+        )
+        db.create_session("viewer-session", source="api_server", user_id="ou_viewer")
+        db.append_message(
+            session_id="viewer-session",
+            role="user",
+            content="SHARED_SCOPE_MARKER viewer context",
+        )
+    finally:
+        db.close()
+
+    async def fake_summarize(text, query, meta):
+        return text[:80]
+
+    monkeypatch.setattr(session_search_tool, "_summarize_session", fake_summarize)
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
+
+    token = "shared-search-token"
+    broker.register_session_search_broker_token(
+        token=token,
+        profile_name="owned_agent_profile",
+        open_id="ou_viewer",
+        run_id="run-search",
+        agent_id="agent-shared",
+        share_role="viewer",
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/internal/session-search",
+                json={"query": "SHARED_SCOPE_MARKER", "limit": 5},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+            broker.unregister_session_search_broker_token(token)
+
+        assert response.status == 200
+        result = json.loads(body["result"])
+        assert result["success"] is True
+        assert [row["session_id"] for row in result["results"]] == ["viewer-session"]
 
     asyncio.run(runner())
 

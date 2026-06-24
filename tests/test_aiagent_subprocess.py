@@ -675,6 +675,62 @@ credentials:
     assert env["_HERMES_FORCE_GITLAB_TOKEN"] == "glpat-test"
 
 
+def test_shared_agent_subprocess_does_not_inject_owner_profile_secret_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "owned_agent"
+    profile_home.mkdir(parents=True)
+    (shared / ".env").write_text("TAVILY_API_KEY=shared-tool-key\n", encoding="utf-8")
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=owner-profile-key\nOWNER_ONLY_SECRET=owner-only\n",
+        encoding="utf-8",
+    )
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    profiles: [owned_agent]
+""",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "glpat-owner"},
+        )
+    finally:
+        store.close()
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={
+            "HERMES_AGENT_ID": "agent-shared",
+            "HERMES_AGENT_SHARE_ROLE": "viewer",
+            "HERMES_AGENT_ACTOR_OPEN_ID": "ou_viewer",
+        },
+    )
+
+    assert env["TAVILY_API_KEY"] == "shared-tool-key"
+    assert "OPENAI_API_KEY" not in env
+    assert "OWNER_ONLY_SECRET" not in env
+    assert "GITLAB_TOKEN" not in env
+    assert "_HERMES_FORCE_GITLAB_TOKEN" not in env
+
+
 def test_shared_tavily_env_reaches_aiagent_without_terminal_force(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
