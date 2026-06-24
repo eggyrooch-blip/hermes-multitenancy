@@ -151,6 +151,31 @@ empty dict and the legacy fallback behavior remains unchanged. This boundary
 does not change lark-cli credentials, Feishu UAT refresh, bot/user identity
 selection, or authsidecar host allowlisting.
 
+WebUI is a request/response surface and does not have the same detached
+completion return channel as Feishu. Routed WebUI AIAgent runs therefore set
+Hermes session context `async_delivery=False`. Hermes tools that support
+background work, such as `delegate_task(background=true)`, can then fall back to
+synchronous execution and include the child result in the current response
+instead of promising a later callback that WebUI cannot receive. Non-WebUI
+surfaces keep `async_delivery=True`, so Feishu, cron and kanban paths continue to
+use Hermes' normal asynchronous completion flow. If an older Hermes runtime does
+not accept the `async_delivery` context field, multitenancy logs an explicit
+warning before retrying the compatibility path.
+
+WebUI image attachments also get a profile-local preflight before the AIAgent
+conversation starts. The preflight only accepts local image markers that resolve
+inside the routed profile's `workspace/uploads/` tree, normalizes common WebUI
+paths such as `/workspace/uploads/...`, checks the filename extension, and
+injects the vision result into the current user turn. If a marker points outside
+`uploads/`, uses a non-image extension, or cannot be read, the injected block
+says the image was not analyzed and tells the model not to infer unseen contents.
+Hermes' `vision_analyze` tool is attempted first. If that auxiliary provider
+cannot produce an analysis, OpenAI-compatible custom providers use the routed
+profile model as a fallback, so WebUI vision does not depend solely on Hermes'
+auxiliary provider wiring. External ingest requests may also use
+`channel=webui`, but they are tagged with `metadata.source=ingest` and do not
+trigger this WebUI chat attachment preflight.
+
 For group-scoped credentials, keep one encrypted payload in the credential
 vault and let `hermes-multitenancy-sync pull-feishu` materialize only the
 compatibility file into each authorized profile:

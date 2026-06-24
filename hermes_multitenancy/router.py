@@ -38,9 +38,8 @@ from .security_audit import append_security_event
 
 SYNTHETIC_AUTH_COMPLETE_TEXT = "我已完成飞书账号授权，请继续执行之前的操作。"
 
-_SKILL_SLASH_ALIASES = {
-    "hades": "kep-hades-cli",
-}
+# Skill slash aliases (hardcoded base + dynamic per-profile scan) live in
+# `skill_slash._resolve_alias`; both the Feishu and broker paths share that one source.
 
 try:  # Shared Hermes Feishu card/typewriter transport.
     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig  # type: ignore
@@ -3122,7 +3121,13 @@ def _maybe_rewrite_skill_slash_command(
         skill_cmds = get_skill_commands()
         cmd_key = resolve_skill_command_key(cmd)
         if cmd_key is None:
-            alias = _SKILL_SLASH_ALIASES.get(cmd.replace("_", "-"))
+            # Unify the Feishu path with the broker path on one alias source: hardcoded
+            # base + the routed profile's skill-declared `slash_aliases` (dynamic scan).
+            # This path already runs inside `_scope_profile_skill_loader`, so the scan
+            # sees THIS profile's installed skills.
+            from .skill_slash import _resolve_alias
+
+            alias = _resolve_alias(cmd.replace("_", "-"))
             if alias:
                 cmd_key = resolve_skill_command_key(alias)
         if cmd_key is None:

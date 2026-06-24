@@ -160,7 +160,56 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
             "type": "skill",
             "category": category,
         })
+        # short-command aliases this skill self-declares (frontmatter `slash_aliases`)
+        for alias in read_skill_slash_aliases(skill_md):
+            if alias == name or any(c["slash"] == f"/{alias}" for c in commands):
+                continue  # skip self + any already-claimed alias (deterministic, no dupes)
+            commands.append({
+                "name": alias,
+                "slash": f"/{alias}",
+                "title": meta.get("title") or alias,
+                "description": meta.get("description") or "",
+                "source": "skill-alias",
+                "type": "skill",
+                "category": category,
+                "skill": name,
+            })
     return sorted(commands, key=lambda item: (str(item.get("category") or ""), str(item.get("name") or "")))
+
+
+def read_skill_slash_aliases(path: Path) -> list[str]:
+    """A skill's self-declared `slash_aliases` (frontmatter list or str) → sanitized
+    short-command tokens. Used both by the picker list and the slash resolver so a
+    skill's short commands are per-profile and zero-maintenance.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    if not text.startswith("---"):
+        return []
+    end = text.find("\n---", 3)
+    if end < 0:
+        return []
+    try:
+        import yaml
+
+        frontmatter = yaml.safe_load(text[4:end]) or {}
+    except Exception:
+        return []
+    if not isinstance(frontmatter, dict):
+        return []
+    value = frontmatter.get("slash_aliases")
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        token = str(item or "").strip().lstrip("/").replace("_", "-")
+        if token and all(ch.isalnum() or ch == "-" for ch in token):
+            out.append(token)
+    return out
 
 
 def _slash_command_name(value: Any) -> str:
