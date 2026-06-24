@@ -1276,6 +1276,189 @@ def _ingest_secret_env_from_event(event: Any) -> dict[str, str]:
     }
 
 
+_INGEST_DISABLED_TOOLSETS: frozenset[str] = frozenset({"delegation"})
+_INGEST_KNOWN_DELEGATING_TOOLSETS: frozenset[str] = frozenset({
+    "hermes-acp",
+    "hermes-api-server",
+    "hermes-bluebubbles",
+    "hermes-cli",
+    "hermes-cron",
+    "hermes-dingtalk",
+    "hermes-discord",
+    "hermes-email",
+    "hermes-feishu",
+    "hermes-gateway",
+    "hermes-homeassistant",
+    "hermes-matrix",
+    "hermes-mattermost",
+    "hermes-qqbot",
+    "hermes-signal",
+    "hermes-slack",
+    "hermes-sms",
+    "hermes-telegram",
+    "hermes-webhook",
+    "hermes-wecom",
+    "hermes-wecom-callback",
+    "hermes-weixin",
+    "hermes-whatsapp",
+    "hermes-yuanbao",
+})
+_INGEST_REQUIRED_TOOLSETS: tuple[str, ...] = ("terminal",)
+_INGEST_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_INGEST_AUTH_BEARER_RE = re.compile(
+    r"\b(authorization\s*[:=]\s*bearer\s+)([A-Za-z0-9._~+/=-]{8,})",
+    re.IGNORECASE,
+)
+_INGEST_JWT_LIKE_RE = re.compile(r"\beyJ[A-Za-z0-9._-]{16,}\b")
+
+
+def _is_ingest_run_event(event: Any) -> bool:
+    raw_event = getattr(event, "raw_event", None)
+    if not isinstance(raw_event, dict):
+        return False
+    metadata = raw_event.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        str(metadata.get("source") or "").strip() == "ingest"
+        or "ingest_secret_dir" in metadata
+        or "ingest_secrets" in metadata
+    )
+
+
+def _ingest_enabled_toolsets(toolsets: Optional[list[str]], platform_key: str) -> Optional[list[str]]:
+    # Ingest is a one-shot API surface, not an interactive chat surface with an
+    # async child-result delivery channel. Delegation can strand the useful work
+    # in a child session while the poller only sees the parent turn.
+    # Per-run secrets are only useful when the agent can consume them inside an
+    # execution tool, so preserve terminal even for strict profile toolsets.
+    base = list(toolsets or [])
+    if not base:
+        base = _fallback_default_toolsets(platform_key)
+    filtered = [item for item in base if not _ingest_toolset_allows_delegation(item)]
+    if not filtered:
+        filtered = [
+            item for item in _fallback_default_toolsets(platform_key)
+            if not _ingest_toolset_allows_delegation(item)
+        ]
+    for required in _INGEST_REQUIRED_TOOLSETS:
+        if required not in filtered:
+            filtered.append(required)
+    return filtered or None
+
+
+def _ingest_toolset_allows_delegation(toolset_name: Any) -> bool:
+    name = str(toolset_name or "").strip()
+    if not name:
+        return False
+    if name in _INGEST_DISABLED_TOOLSETS or name in _INGEST_KNOWN_DELEGATING_TOOLSETS:
+        return True
+    try:
+        from toolsets import resolve_toolset
+
+        return "delegate_task" in set(resolve_toolset(name))
+    except Exception:
+        return False
+
+
+def _ingest_runtime_secret_manifest(event: Any | None = None) -> list[dict[str, str]]:
+    raw_manifest = os.environ.get("HERMES_INGEST_SECRET_MANIFEST")
+    if raw_manifest:
+        try:
+            manifest = json.loads(raw_manifest)
+        except Exception:
+            manifest = None
+        if isinstance(manifest, list):
+            return [item for item in manifest if isinstance(item, dict)]
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        metadata = raw_event.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("ingest_secrets"), list):
+            return [item for item in metadata["ingest_secrets"] if isinstance(item, dict)]
+    return []
+
+
+def _ingest_runtime_secret_dir(event: Any | None = None) -> str:
+    secret_dir = str(os.environ.get("HERMES_INGEST_SECRET_DIR") or "").strip()
+    if secret_dir:
+        return secret_dir
+    raw_event = getattr(event, "raw_event", None)
+    if isinstance(raw_event, dict):
+        metadata = raw_event.get("metadata")
+        if isinstance(metadata, dict):
+            return str(metadata.get("ingest_secret_dir") or "").strip()
+    return ""
+
+
+def _ingest_runtime_secret_values(event: Any | None = None) -> list[tuple[str, str]]:
+    secret_dir = _ingest_runtime_secret_dir(event)
+    if not secret_dir:
+        return []
+    root = Path(secret_dir)
+    values: list[tuple[str, str]] = []
+    for item in _ingest_runtime_secret_manifest(event):
+        name = str(item.get("name") or "").strip()
+        if not _INGEST_SECRET_NAME_RE.fullmatch(name):
+            continue
+        path = root / name
+        try:
+            value = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if value:
+            values.append((name, value))
+    values.sort(key=lambda pair: len(pair[1]), reverse=True)
+    return values
+
+
+def _redact_ingest_runtime_text(text: Any, event: Any | None = None) -> str:
+    value = str(text or "")
+    for name, secret_value in _ingest_runtime_secret_values(event):
+        value = value.replace(secret_value, f"[REDACTED:{name}]")
+        value = _redact_ingest_secret_prefixes(
+            value,
+            secret_name=name,
+            secret_value=secret_value,
+        )
+    value = _INGEST_AUTH_BEARER_RE.sub(
+        lambda match: f"{match.group(1)}[REDACTED:authorization]",
+        value,
+    )
+    value = _INGEST_JWT_LIKE_RE.sub("[REDACTED:jwt]", value)
+    return value
+
+
+def _redact_ingest_secret_prefixes(
+    text: str,
+    *,
+    secret_name: str,
+    secret_value: str,
+) -> str:
+    if len(secret_value) < 8:
+        return text
+    value = text
+    for length in range(min(len(secret_value) - 1, 64), 7, -1):
+        prefix = secret_value[:length]
+        if prefix:
+            value = value.replace(prefix, f"[REDACTED:{secret_name}:prefix]")
+    return value
+
+
+def _redact_ingest_runtime_value(value: Any, event: Any | None = None) -> Any:
+    if isinstance(value, str):
+        return _redact_ingest_runtime_text(value, event)
+    if isinstance(value, list):
+        return [_redact_ingest_runtime_value(item, event) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_ingest_runtime_value(item, event) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _redact_ingest_runtime_value(item, event)
+            for key, item in value.items()
+        }
+    return value
+
+
 # Whitelisted parent-process env keys carried into AIAgent subprocesses.
 #
 # Anything not listed here is dropped before spawning the child — this is the
@@ -2888,24 +3071,30 @@ async def _run_aiagent_subprocess(
 
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     stdout_text = stdout.decode("utf-8", errors="replace").strip()
+    redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
+    redacted_stdout_text = _redact_ingest_runtime_text(stdout_text, event)
     if stderr_text:
-        logger.debug("[multitenancy] AIAgent subprocess stderr: %s", stderr_text[-4000:])
+        logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
 
     try:
         data = json.loads(stdout_text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             "AIAgent subprocess returned invalid JSON "
-            f"(exit={proc.returncode}, stdout={stdout_text[-1000:]!r}, stderr={stderr_text[-1000:]!r})"
+            f"(exit={proc.returncode}, stdout={redacted_stdout_text[-1000:]!r}, stderr={redacted_stderr_text[-1000:]!r})"
         ) from exc
 
     if proc.returncode != 0:
+        child_error = _redact_ingest_runtime_text(data.get("error") or "", event)
         raise RuntimeError(
             f"AIAgent subprocess exited {proc.returncode}: "
-            f"{data.get('error') or stderr_text or stdout_text}"
+            f"{child_error or redacted_stderr_text or redacted_stdout_text}"
         )
     if data.get("error"):
-        raise RuntimeError(f"AIAgent subprocess failed: {data['error']}")
+        raise RuntimeError(
+            "AIAgent subprocess failed: "
+            f"{_redact_ingest_runtime_text(data['error'], event)}"
+        )
     _write_token_ledger_from_child(event, profile_home, data.get("usage"))
     return str(data.get("result") or "")
 
@@ -3334,7 +3523,10 @@ async def _stream_aiagent_subprocess(
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
-                logger.debug("[multitenancy] ignoring non-json child stream line: %r", text[-500:])
+                logger.debug(
+                    "[multitenancy] ignoring non-json child stream line: %r",
+                    _redact_ingest_runtime_text(text, event)[-500:],
+                )
                 continue
             event_name = data.get("event")
             if not first_event_logged:
@@ -3347,7 +3539,10 @@ async def _stream_aiagent_subprocess(
             if event_name == "done":
                 saw_done = True
                 if data.get("error"):
-                    raise RuntimeError(f"AIAgent subprocess failed: {data['error']}")
+                    raise RuntimeError(
+                        "AIAgent subprocess failed: "
+                        f"{_redact_ingest_runtime_text(data['error'], event)}"
+                    )
                 logger.info(
                     "[multitenancy] AIAgent subprocess done elapsed=%.3fs result_len=%s",
                     time.monotonic() - started_at,
@@ -3360,14 +3555,16 @@ async def _stream_aiagent_subprocess(
                 _mirror.retag_source()
                 _mirror.dedupe()
                 _write_token_ledger_from_child(event, profile_home, data.get("usage"))
-                yield "done", str(data.get("result") or "")
+                yield "done", _redact_ingest_runtime_text(data.get("result"), event)
                 continue
             if event_name == "content":
-                _mirror.upsert_assistant(str(data.get("text") or ""), "")
-                yield "content", str(data.get("text") or "")
+                content_text = _redact_ingest_runtime_text(data.get("text"), event)
+                _mirror.upsert_assistant(content_text, "")
+                yield "content", content_text
             elif event_name == "thinking":
-                _mirror.upsert_assistant("", str(data.get("text") or ""))
-                yield "thinking", str(data.get("text") or "")
+                thinking_text = _redact_ingest_runtime_text(data.get("text"), event)
+                _mirror.upsert_assistant("", thinking_text)
+                yield "thinking", thinking_text
             elif event_name in {
                 "tool_started",
                 "tool_completed",
@@ -3376,7 +3573,10 @@ async def _stream_aiagent_subprocess(
                 "clarify_required",
                 "clarify_resolved",
             }:
-                payload_data = {k: v for k, v in data.items() if k != "event"}
+                payload_data = _redact_ingest_runtime_value(
+                    {k: v for k, v in data.items() if k != "event"},
+                    event,
+                )
                 if event_name == "tool_started":
                     # Seal any pre-tool assistant text into its own row, then
                     # mirror the tool invocation. First tool-start is also
@@ -3399,15 +3599,18 @@ async def _stream_aiagent_subprocess(
 
         returncode = await asyncio.wait_for(proc.wait(), timeout=5)
         stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
+        redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
         if stderr_text:
-            logger.debug("[multitenancy] AIAgent subprocess stderr: %s", stderr_text[-4000:])
+            logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
         logger.info(
             "[multitenancy] AIAgent subprocess exited returncode=%s elapsed=%.3fs",
             returncode,
             time.monotonic() - started_at,
         )
         if returncode != 0:
-            raise RuntimeError(f"AIAgent subprocess exited {returncode}: {stderr_text[-1000:]}")
+            raise RuntimeError(
+                f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
+            )
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
     except asyncio.TimeoutError as exc:
@@ -3840,7 +4043,7 @@ def _configure_gateway_approval_bridge(event_sink, session_key: str):
     return _cleanup
 
 
-def _finalize_aiagent_result(result: Optional[dict]) -> str:
+def _finalize_aiagent_result(result: Optional[dict], *, redact: Any | None = None) -> str:
     """Turn the core conversation result into the user-facing reply string.
 
     Dead-air fix: core's conversation_loop returns ``{failed:True, error:...}``
@@ -3860,9 +4063,10 @@ def _finalize_aiagent_result(result: Optional[dict]) -> str:
     again, turning a long answer into a hard failure. So on truncation we return a
     graceful notice instead. Genuine failures (provider 400 etc.) still raise.
     """
+    redact_text = redact if callable(redact) else (lambda value: str(value or ""))
     res = result or {}
     final_response = res.get("final_response")
-    err = res.get("error") or ""
+    err = redact_text(res.get("error") or "")
     text = final_response if isinstance(final_response, str) else ""
     is_truncation = _is_output_truncation_error(err)
 
@@ -4016,6 +4220,16 @@ def _run_with_aiagent(
             platform_key,
             platform_tools_resolver=_get_platform_tools,
         )
+    if _is_ingest_run_event(event):
+        before_ingest_toolsets = list(enabled_toolsets or [])
+        enabled_toolsets = _ingest_enabled_toolsets(enabled_toolsets, platform_key)
+        if before_ingest_toolsets != list(enabled_toolsets or []):
+            logger.info(
+                "[multitenancy] ingest run filtered toolsets profile=%s before=%s after=%s",
+                profile_home.name,
+                before_ingest_toolsets or "<default>",
+                enabled_toolsets if enabled_toolsets is not None else "<default>",
+            )
 
     # 6) Pull source / session metadata for AIAgent kwargs.
     source = getattr(event, "source", None)
@@ -4276,14 +4490,18 @@ def _run_with_aiagent(
     if _r.get("failed") or _r.get("partial") or not (
         (_r.get("final_response") or "").strip() if isinstance(_r.get("final_response"), str) else _r.get("final_response")
     ):
+        redact_runtime_text = lambda value: _redact_ingest_runtime_text(value, event)
         logger.warning(
             "[multitenancy][finalize-diag] raw child result: partial=%s failed=%s "
             "completed=%s has_text=%s error=%r",
             _r.get("partial"), _r.get("failed"), _r.get("completed"),
             bool(isinstance(_r.get("final_response"), str) and _r["final_response"].strip()),
-            _r.get("error"),
+            redact_runtime_text(_r.get("error")),
         )
-    return _finalize_aiagent_result(result)
+    return _finalize_aiagent_result(
+        result,
+        redact=lambda value: _redact_ingest_runtime_text(value, event),
+    )
 
 
 def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -215,6 +216,36 @@ def test_ingest_model_passthrough(monkeypatch):
     assert seen[0].metadata["source"] == "ingest"
 
 
+def test_ingest_secret_prompt_requires_direct_execution_and_no_secret_echo(monkeypatch):
+    from hermes_multitenancy import webui_broker_server as broker_mod
+
+    app, seen = _app(monkeypatch)
+    status, text = _post(
+        app,
+        {
+            "content": "查询对账差异",
+            "secrets": {
+                "cms_bearer": {
+                    "type": "bearer_token",
+                    "value": "eyJ.fake.full.token",
+                }
+            },
+        },
+        headers={"Authorization": "Bearer testkey"},
+    )
+
+    assert status == 200, text
+    prompt = broker_mod._build_webui_event(seen[0]).text
+    assert "cms_bearer" in prompt
+    assert "delegate_task" in prompt
+    assert "do not delegate" in prompt.lower()
+    assert "do not print" in prompt.lower()
+    assert "token preview" in prompt.lower()
+    assert "authorization header" in prompt.lower()
+    assert "execute" in prompt.lower()
+    assert "eyJ.fake.full.token" not in prompt
+
+
 def test_ingest_ignores_caller_supplied_secret_metadata(monkeypatch, tmp_path):
     from hermes_multitenancy import webui_broker_server as broker_mod
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
@@ -324,6 +355,48 @@ def test_ingest_secrets_are_files_only_and_response_is_redacted(monkeypatch, tmp
     assert "bearer_token" in captured["event_text"]
     assert secret_value not in captured["event_text"]
     assert not captured["secret_dir"].exists()
+
+
+def test_ingest_sync_failure_log_redacts_secret_prefix_preview(monkeypatch, caplog):
+    secret_value = "sk-live-sync-1234567890abcdef"
+    leaked_prefix = secret_value[:12]
+
+    async def dispatch(_request):
+        raise RuntimeError(f"sync failed after token prefix {leaked_prefix}")
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="hermes_multitenancy.webui_broker_server"):
+        status, text = _post(
+            app,
+            {
+                "content": "sync failure",
+                "secrets": {
+                    "cms_api_key": {
+                        "type": "api_key",
+                        "value": secret_value,
+                    }
+                },
+            },
+            headers={"Authorization": "Bearer testkey"},
+        )
+
+    assert status == 500
+    assert json.loads(text)["error"] == "internal error"
+    assert "[REDACTED:cms_api_key:prefix]" in caplog.text
+    assert "Traceback" not in caplog.text
+    assert leaked_prefix not in caplog.text
+    assert secret_value not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1056,6 +1129,544 @@ def test_ingest_async_secrets_are_files_only_and_terminal_cleanup_redacts_poll(
     assert secret_value not in poll_text
     assert secret_value not in captured["metadata_json"]
     assert not captured["secret_dir"].exists()
+
+
+def test_ingest_async_fake_bearer_dry_run_constructs_authorization_without_leak(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import router as router_mod
+
+    from pathlib import Path
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.daryu.fake.jwt.signature"
+    profile_home = tmp_path / "profiles" / "owner"
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: profile_home if profile_name == "owner" else tmp_path / profile_name,
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    captured: dict[str, object] = {}
+
+    def fake_daryu_query(headers: dict[str, str]) -> dict[str, object]:
+        auth = headers.get("Authorization") or ""
+        captured["authorization_matches"] = auth == f"Bearer {secret_value}"
+        captured["authorization_len"] = len(auth)
+        captured["authorization_scheme"] = auth.split(" ", 1)[0] if auth else ""
+        return {"ok": captured["authorization_matches"], "rows": 2}
+
+    async def dispatch(request):
+        secret_dir = Path(request.metadata["ingest_secret_dir"])
+        bearer = (secret_dir / "cms_bearer").read_text(encoding="utf-8")
+        response = fake_daryu_query({"Authorization": f"Bearer {bearer}"})
+        assert response["ok"] is True
+        return (
+            "mock daryu query ok "
+            f"rows={response['rows']} "
+            f"auth_scheme={captured['authorization_scheme']} "
+            f"auth_len={captured['authorization_len']}"
+        )
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={
+                    "content": "查 2026-06-01 到 2026-06-22 的对账数据",
+                    "secrets": {
+                        "cms_bearer": {
+                            "type": "bearer_token",
+                            "value": secret_value,
+                        }
+                    },
+                },
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_text = await submit.text()
+            submit_body = json.loads(submit_text)
+            poll_text = ""
+            final_body = {}
+            poll_status = 0
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                poll_status = poll.status
+                poll_text = await poll.text()
+                final_body = json.loads(poll_text)
+                if final_body["status"] == "succeeded":
+                    return submit.status, submit_text, poll_status, poll_text, final_body
+                await asyncio.sleep(0.02)
+            return submit.status, submit_text, poll_status, poll_text, final_body
+        finally:
+            await client.close()
+
+    submit_status, submit_text, poll_status, poll_text, final_body = asyncio.run(runner())
+
+    assert submit_status == 202
+    assert poll_status == 200
+    assert final_body["ok"] is True
+    assert final_body["status"] == "succeeded"
+    assert final_body["result"].startswith("mock daryu query ok rows=2")
+    assert "auth_scheme=Bearer" in final_body["result"]
+    assert captured["authorization_matches"] is True
+    assert secret_value not in submit_text
+    assert secret_value not in poll_text
+    assert secret_value[:16] not in poll_text
+    assert f"Bearer {secret_value}" not in poll_text
+
+
+def test_ingest_async_default_dispatch_streams_terminal_with_secret_env_without_leak(
+    monkeypatch,
+    tmp_path,
+):
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    secret_value = "eyJhbGciOiJIUzI1NiJ9.default.dispatch.fake.jwt.signature"
+    result_text = f"mock daryu terminal dry-run auth_len={len('Bearer ' + secret_value)}"
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: profile_home if profile_name == "owner" else tmp_path / profile_name,
+    )
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setenv("HERMES_AIAGENT_FIRST_EVENT_HEARTBEAT_SECONDS", "0")
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0")
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def fake_lark_scope(_profile_home, _sender_open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_real, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    class FakeStdin:
+        def write(self, payload):
+            captured["child_payload"] = json.loads(payload.decode("utf-8"))
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                json.dumps(
+                    {
+                        "event": "tool_started",
+                        "name": "terminal",
+                        "preview": "python daryu_dry_run.py --secret cms_bearer",
+                        "args": {
+                            "command": (
+                                "python daryu_dry_run.py --secret cms_bearer "
+                                "--emit auth_len only"
+                            )
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                + b"\n",
+                json.dumps(
+                    {"event": "content", "text": result_text},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                + b"\n",
+                json.dumps(
+                    {"event": "done", "result": result_text, "error": None},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                + b"\n",
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 4242
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        env = dict(kwargs["env"])
+        secret_dir = Path(env["HERMES_INGEST_SECRET_DIR"])
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = str(kwargs.get("cwd") or "")
+        captured["env"] = env
+        captured["secret_file_value"] = (secret_dir / "cms_bearer").read_text(
+            encoding="utf-8"
+        )
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    app = create_run_broker_app(
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={
+                    "content": "查 2026-06-01 到 2026-06-22 的对账数据",
+                    "interactive": True,
+                    "secrets": {
+                        "cms_bearer": {
+                            "type": "bearer_token",
+                            "value": secret_value,
+                        }
+                    },
+                },
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_text = await submit.text()
+            submit_body = json.loads(submit_text)
+            poll_text = ""
+            final_body = {}
+            poll_status = 0
+            for _ in range(40):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                poll_status = poll.status
+                poll_text = await poll.text()
+                final_body = json.loads(poll_text)
+                if final_body["status"] == "succeeded":
+                    return submit.status, submit_text, poll_status, poll_text, final_body
+                await asyncio.sleep(0.02)
+            return submit.status, submit_text, poll_status, poll_text, final_body
+        finally:
+            await client.close()
+
+    submit_status, submit_text, poll_status, poll_text, final_body = asyncio.run(runner())
+
+    assert "env" in captured, {"captured": captured, "final_body": final_body}
+    env = captured["env"]
+    child_payload = captured["child_payload"]
+    child_event = child_payload["event"]
+    child_metadata = child_event["raw_event"]["metadata"]
+    secret_dir = Path(env["HERMES_INGEST_SECRET_DIR"])
+    manifest = json.loads(env["HERMES_INGEST_SECRET_MANIFEST"])
+
+    assert submit_status == 202
+    assert poll_status == 200
+    assert final_body["ok"] is True
+    assert final_body["status"] == "succeeded"
+    assert final_body["result"] == result_text
+    assert captured["secret_file_value"] == secret_value
+    assert child_metadata["source"] == "ingest"
+    assert child_metadata["ingest_secret_dir"] == env["HERMES_INGEST_SECRET_DIR"]
+    assert child_metadata["ingest_secrets"] == manifest
+    assert manifest == [
+        {
+            "name": "cms_bearer",
+            "type": "bearer_token",
+            "usage": "Authorization Bearer",
+        }
+    ]
+    assert "cms_bearer" in child_event["text"]
+    assert "Authorization Bearer" in child_event["text"]
+    assert "terminal or execute_code" in child_event["text"]
+    assert secret_value not in submit_text
+    assert secret_value not in poll_text
+    assert secret_value not in json.dumps(child_payload, ensure_ascii=False)
+    assert secret_value not in json.dumps(env, ensure_ascii=False)
+    assert f"Bearer {secret_value}" not in poll_text
+    assert not secret_dir.exists()
+
+
+def test_ingest_async_classifies_agent_max_iterations_in_poll_and_logs_run_id(
+    monkeypatch,
+    caplog,
+):
+    async def failing_dispatch(_request):
+        raise RuntimeError("AIAgent subprocess failed: max_iterations_reached(45/45)")
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=failing_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "trigger max iteration"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            final_body = {}
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                final_body = json.loads(await poll.text())
+                if final_body["status"] == "failed":
+                    return submit.status, submit_body["run_id"], poll.status, final_body
+                await asyncio.sleep(0.02)
+            return submit.status, submit_body["run_id"], 0, final_body
+        finally:
+            await client.close()
+
+    with caplog.at_level(logging.ERROR, logger="hermes_multitenancy.webui_broker_server"):
+        submit_status, run_id, poll_status, final_body = asyncio.run(runner())
+
+    assert submit_status == 202
+    assert poll_status == 200
+    assert final_body["ok"] is False
+    assert final_body["status"] == "failed"
+    assert final_body["error"].startswith("agent_max_iterations:")
+    assert "internal error" not in final_body["error"]
+    assert run_id in caplog.text
+    assert "session_id=" in caplog.text
+    assert "agent_max_iterations" in caplog.text
+
+
+def test_ingest_async_redacts_secret_before_error_truncation(monkeypatch):
+    secret_value = "eyJ" + ("A" * 520) + ".signature"
+
+    async def failing_dispatch(_request):
+        raise RuntimeError(
+            "upstream rejected Authorization: Bearer "
+            + secret_value
+            + " after request"
+        )
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=failing_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={
+                    "content": "trigger secret error",
+                    "secrets": {
+                        "cms_bearer": {
+                            "type": "bearer_token",
+                            "value": secret_value,
+                        }
+                    },
+                },
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                body_text = await poll.text()
+                body = json.loads(body_text)
+                if body["status"] == "failed":
+                    return body_text, body
+                await asyncio.sleep(0.02)
+            return "", {}
+        finally:
+            await client.close()
+
+    body_text, body = asyncio.run(runner())
+
+    assert body["error"].startswith("agent_runtime_error:")
+    assert "[REDACTED:cms_bearer]" in body["error"]
+    assert secret_value not in body_text
+    assert secret_value[:40] not in body_text
+    assert "Authorization: Bearer eyJ" not in body_text
+
+
+def test_ingest_async_redacts_jwt_like_error_even_without_declared_secret(
+    monkeypatch,
+    caplog,
+):
+    leaked_token = "eyJ" + ("B" * 80) + ".payload.signature"
+
+    async def failing_dispatch(_request):
+        raise RuntimeError(f"upstream Authorization: Bearer {leaked_token}")
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=failing_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "content only error"},
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                body_text = await poll.text()
+                body = json.loads(body_text)
+                if body["status"] == "failed":
+                    return body_text, body
+                await asyncio.sleep(0.02)
+            return "", {}
+        finally:
+            await client.close()
+
+    with caplog.at_level(logging.ERROR, logger="hermes_multitenancy.webui_broker_server"):
+        body_text, body = asyncio.run(runner())
+
+    assert body["error"].startswith("agent_runtime_error:")
+    assert "[REDACTED:authorization]" in body["error"]
+    assert leaked_token not in body_text
+    assert leaked_token[:40] not in body_text
+    assert leaked_token not in caplog.text
+    assert leaked_token[:40] not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_ingest_async_redacts_opaque_secret_prefix_preview(monkeypatch, caplog):
+    secret_value = "sk-live-1234567890abcdef"
+    leaked_prefix = secret_value[:10]
+
+    async def failing_dispatch(_request):
+        raise RuntimeError(f"upstream rejected token prefix {leaked_prefix}")
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    app = create_run_broker_app(
+        dispatch_agent=failing_dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            submit = await client.post(
+                "/api/run-broker/ingest/async",
+                json={
+                    "content": "opaque prefix failure",
+                    "secrets": {
+                        "cms_api_key": {
+                            "type": "api_key",
+                            "value": secret_value,
+                        }
+                    },
+                },
+                headers={"Authorization": "Bearer testkey"},
+            )
+            submit_body = json.loads(await submit.text())
+            for _ in range(20):
+                poll = await client.get(
+                    f"/api/run-broker/ingest/runs/{submit_body['run_id']}",
+                    headers={"Authorization": "Bearer testkey"},
+                )
+                body_text = await poll.text()
+                body = json.loads(body_text)
+                if body["status"] == "failed":
+                    return body_text, body
+                await asyncio.sleep(0.02)
+            return "", {}
+        finally:
+            await client.close()
+
+    with caplog.at_level(logging.ERROR, logger="hermes_multitenancy.webui_broker_server"):
+        body_text, body = asyncio.run(runner())
+
+    assert body["error"].startswith("agent_runtime_error:")
+    assert "[REDACTED:cms_api_key:prefix]" in body["error"]
+    assert leaked_prefix not in body_text
+    assert leaked_prefix not in caplog.text
+    assert secret_value not in body_text
+    assert secret_value not in caplog.text
 
 
 def test_ingest_async_ignores_caller_supplied_secret_metadata(monkeypatch, tmp_path):

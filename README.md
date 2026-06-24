@@ -426,7 +426,11 @@ Secret names must match `[A-Za-z0-9_.-]{1,64}`. Supported `type` values are `bea
 
 The model sees only a manifest with each secret's name, type, and usage hint. The real values are written as `0600` files under a profile-scoped per-run directory, exposed to tool execution through `HERMES_INGEST_SECRET_DIR` and `HERMES_INGEST_SECRET_MANIFEST`. For example, an agent tool can read `$HERMES_INGEST_SECRET_DIR/cms_bearer` to build `Authorization: Bearer ...`. Raw values are not copied into `RunRequest.content`, caller metadata, raw event metadata, poll results, or exact-result text; terminal results are redacted by exact secret value.
 
+Ingest prompts also tell the agent to consume secrets only inside execution tools (`terminal` / `execute_code`) and to report at most the secret name, type, file existence, or value length. It must not echo raw secret values, token prefixes/previews, Authorization/Cookie/Basic headers, or raw secret file contents. Ingest runs are intentionally direct one-shot jobs: the broker disables the delegation toolset for these runs so useful work does not get stranded in a child session while the async poller watches only the parent run.
+
 Secrets are tied to the run lifetime: synchronous runs clean up immediately after completion, and async runs clean up after the run reaches a terminal state subject to `HERMES_INGEST_ASYNC_TTL`. Idempotency includes a server-side secret fingerprint. Reusing the same Bearer scope, agent/profile, and `idempotency_key` with the same secret fingerprint returns the existing run; using a different secret fingerprint returns `409 secret_mismatch` instead of silently reusing a run with the wrong credential.
+
+Async ingest failures are returned as classified diagnostics such as `agent_max_iterations`, `agent_tool_loop_error`, or `agent_runtime_error` instead of a generic `internal error`. The server logs only run context, exception type, and the redacted classified message; it does not log traceback bodies for ingest run failures, and it applies a best-effort Bearer/JWT redaction fallback even when the caller did not use the `secrets` field.
 
 ---
 
