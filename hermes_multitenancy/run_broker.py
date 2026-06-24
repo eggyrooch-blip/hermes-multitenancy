@@ -102,7 +102,36 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
         f"{request.chat_id or 'run-broker'}:{request.user_key}"
     )
     platform = request.channel if request.channel == "feishu" else None
-    rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
+    # Scope the core skill-command loader to THIS request's profile so the slash rewrite
+    # resolves against the profile's own installed skills (incl. their slash_aliases),
+    # not a stale process-global cache left by whichever profile ran last. The Feishu
+    # path already scopes before its rewrite; the webui/cron broker entry did not, which
+    # leaked one profile's skill/alias commands into another's resolution.
+    #
+    # This whole block is SYNCHRONOUS (no await between scope-set and restore), so in
+    # single-threaded asyncio there is no interleaving point: no lock is needed, there is
+    # no race, and we never touch the non-reentrant env lock (which the Feishu path /
+    # _profile_home_context already hold — re-acquiring it here would deadlock). Reusing a
+    # profile we're already scoped to (Feishu re-entry) is a harmless idempotent no-op.
+    states: list = []
+    if request.profile_name:
+        try:
+            from . import router  # lazy import: router imports run_broker (avoid cycle)
+
+            profile_home = router._profile_name_to_home(request.profile_name)
+            states = router._scope_profile_skill_loader(profile_home)
+        except Exception:  # never let scoping break the slash path
+            states = []
+    try:
+        rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
+    finally:
+        if states:
+            try:
+                from . import router
+
+                router._restore_profile_skill_loader(states)
+            except Exception:
+                pass
     if not rewritten or rewritten == request.content:
         return request
     return replace(request, content=rewritten)
