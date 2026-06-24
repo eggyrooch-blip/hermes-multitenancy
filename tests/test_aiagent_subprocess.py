@@ -466,8 +466,8 @@ def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypat
         _substitute_template_vars=original_substitute,
     )
     agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
-    agent_pkg.skill_preprocessing = fake_skill_preprocessing
-    agent_pkg.skill_commands = fake_skill_commands
+    monkeypatch.setattr(agent_pkg, "skill_preprocessing", fake_skill_preprocessing, raising=False)
+    monkeypatch.setattr(agent_pkg, "skill_commands", fake_skill_commands, raising=False)
     monkeypatch.setitem(sys.modules, "agent", agent_pkg)
     monkeypatch.setitem(sys.modules, "agent.skill_preprocessing", fake_skill_preprocessing)
     monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
