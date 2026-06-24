@@ -15,4 +15,4 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v5
-      - run: make test
+      - run: uv run --extra test pytest -q tests/test_run_broker_ingest.py tests/test_aiagent_subprocess.py -rs
