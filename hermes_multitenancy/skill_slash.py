@@ -34,22 +34,31 @@ def _scan_slash_aliases() -> dict[str, str]:
     cmds = get_skill_commands()
     if not isinstance(cmds, dict):
         return {}
-    key = frozenset(
-        str(v.get("skill_md_path")) for v in cmds.values()
-        if isinstance(v, dict) and v.get("skill_md_path")
-    )
-    cached = _ALIAS_SCAN_CACHE.get(key)
-    if cached is not None:
-        return cached
-    out: dict[str, str] = {}
+    # cache key = (path, mtime) per skill → invalidates when an installed skill's
+    # SKILL.md changes IN PLACE (e.g. a plugin upgrade edits slash_aliases), not only
+    # when the set of skills changes.
+    entries: list[tuple[str, str]] = []
     for value in cmds.values():
         if not isinstance(value, dict):
             continue
         md_path, skill_name = value.get("skill_md_path"), value.get("name")
-        if not md_path or not skill_name:
-            continue
+        if md_path and skill_name:
+            entries.append((str(md_path), str(skill_name)))
+    def _mtime(p: str) -> float:
+        try:
+            return Path(p).stat().st_mtime
+        except OSError:
+            return 0.0
+    key = frozenset((p, _mtime(p)) for p, _ in entries)
+    cached = _ALIAS_SCAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out: dict[str, str] = {}
+    # deterministic: process skills sorted by name so duplicate aliases resolve the
+    # same way every run (first skill by name wins).
+    for md_path, skill_name in sorted(entries, key=lambda e: e[1]):
         for alias in read_skill_slash_aliases(Path(md_path)):
-            out.setdefault(alias, str(skill_name))  # first by scan order wins (deterministic)
+            out.setdefault(alias, skill_name)
     _ALIAS_SCAN_CACHE[key] = out
     return out
 

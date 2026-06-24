@@ -162,8 +162,8 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
         })
         # short-command aliases this skill self-declares (frontmatter `slash_aliases`)
         for alias in read_skill_slash_aliases(skill_md):
-            if alias == name:
-                continue
+            if alias == name or any(c["slash"] == f"/{alias}" for c in commands):
+                continue  # skip self + any already-claimed alias (deterministic, no dupes)
             commands.append({
                 "name": alias,
                 "slash": f"/{alias}",

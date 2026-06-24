@@ -76,6 +76,36 @@ def test_scan_aliases_per_profile_isolation(tmp_path, monkeypatch):
     assert skill_slash._resolve_alias("recap") == "kep-trevi-analysis"
 
 
+@requires_agent
+def test_scan_aliases_invalidates_on_frontmatter_change(tmp_path, monkeypatch):
+    p1 = _skill_md(tmp_path, "kep-trevi-strategy-recommend", ["strategy"])
+    fake = {"/kep-trevi-strategy-recommend": {"name": "kep-trevi-strategy-recommend", "skill_md_path": str(p1)}}
+    import agent.skill_commands as sc
+    monkeypatch.setattr(sc, "get_skill_commands", lambda: fake)
+    skill_slash._ALIAS_SCAN_CACHE.clear()
+    assert skill_slash._scan_slash_aliases() == {"strategy": "kep-trevi-strategy-recommend"}
+    # edit the SAME file in place (set unchanged) → bump mtime, change alias
+    import os, time
+    p1.write_text("---\nname: kep-trevi-strategy-recommend\nslash_aliases: [plan]\ndescription: d\n---\n#\n", encoding="utf-8")
+    os.utime(p1, (time.time() + 5, time.time() + 5))
+    assert skill_slash._scan_slash_aliases() == {"plan": "kep-trevi-strategy-recommend"}  # not stale
+
+
+@requires_agent
+def test_scan_aliases_duplicate_deterministic_by_name(tmp_path, monkeypatch):
+    # two skills declare the SAME alias → the name-sorted-first skill wins, every run
+    pa = _skill_md(tmp_path, "aaa-skill", ["dup"])
+    pz = _skill_md(tmp_path, "zzz-skill", ["dup"])
+    fake = {
+        "/zzz-skill": {"name": "zzz-skill", "skill_md_path": str(pz)},
+        "/aaa-skill": {"name": "aaa-skill", "skill_md_path": str(pa)},
+    }
+    import agent.skill_commands as sc
+    monkeypatch.setattr(sc, "get_skill_commands", lambda: fake)
+    skill_slash._ALIAS_SCAN_CACHE.clear()
+    assert skill_slash._scan_slash_aliases()["dup"] == "aaa-skill"  # deterministic
+
+
 # ─────────────────────── picker list includes aliases ───────────────────
 
 def test_list_profile_commands_includes_aliases(tmp_path):
