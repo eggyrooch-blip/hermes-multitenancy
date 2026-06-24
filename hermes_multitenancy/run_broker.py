@@ -102,7 +102,54 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
         f"{request.chat_id or 'run-broker'}:{request.user_key}"
     )
     platform = request.channel if request.channel == "feishu" else None
-    rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
+    # Scope the core skill-command loader to THIS request's profile so the slash rewrite
+    # resolves against the profile's own installed skills (incl. their slash_aliases),
+    # not a stale process-global cache left by whichever profile ran last. The Feishu
+    # path already scopes before its rewrite; the webui/cron broker entry did not, which
+    # leaked one profile's skill/alias commands into another's resolution.
+    #
+    # This whole block is SYNCHRONOUS (no await between scope-set and restore), so in
+    # single-threaded asyncio there is no interleaving point: no lock is needed, there is
+    # no race, and we never touch the non-reentrant env lock (which the Feishu path /
+    # _profile_home_context already hold — re-acquiring it here would deadlock). Reusing a
+    # profile we're already scoped to (Feishu re-entry) is a harmless idempotent no-op.
+    states: list = []
+    scoped = False
+    router = None
+    try:
+        from . import router  # lazy import: router imports run_broker (avoid cycle)
+
+        profile_home = router._profile_name_to_home(request.profile_name)
+        states = router._scope_profile_skill_loader(profile_home)
+        # `_scope_profile_skill_loader` is best-effort and silently skips a failed import,
+        # so a non-empty `states` does NOT prove the loader is pointed at this profile.
+        # Verify BOTH required mutations actually happened by inspecting the states it
+        # returned — the SKILLS_DIR redirect AND the command-cache reset. If either was
+        # skipped, the rewrite could still resolve against the previous profile's state.
+        # (Inspecting states avoids hard-importing tools.skills_tool here, which would make
+        # every rewrite depend on that import even where the loader itself handles it.)
+        mutated = {attr for (_m, attr, _old, _had) in states}
+        scoped = "SKILLS_DIR" in mutated and "_skill_commands" in mutated
+    except Exception:
+        scoped = False
+    if not scoped:
+        if states and router is not None:  # restore any partial scoping before bailing
+            try:
+                router._restore_profile_skill_loader(states)
+            except Exception:
+                pass
+        # FAIL CLOSED: if we cannot scope the skill loader to THIS profile, we must not
+        # run the rewrite against a stale process-global cache — that would resolve the
+        # command against whatever profile ran last (the exact cross-profile leak this
+        # fixes). Leave the text untouched; a real command just passes through unrewritten.
+        return request
+    try:
+        rewritten = rewrite_skill_slash_text(request.content, task_id=task_id, platform=platform)
+    finally:
+        try:
+            router._restore_profile_skill_loader(states)
+        except Exception:
+            pass
     if not rewritten or rewritten == request.content:
         return request
     return replace(request, content=rewritten)
