@@ -57,7 +57,6 @@ PLUGIN_MANIFEST_REL = ".hermes-plugin/plugin.json"
 SUPPORTED_SCHEMA = "hermes-plugin/v1"
 MANAGED_DIR = ".hermes-plugin-managed"  # under shared_home; distinct from skill_registry's .hermes-managed.json
 SKILL_DISTRIBUTION_FILE = "skill-distribution.yaml"
-SLASH_ALIASES_FILE = "skill-slash-aliases.yaml"  # consumed by skill_slash._load_plugin_slash_aliases
 ENV_KEP_NO_AUTO_LOGIN = {"KEP_NO_AUTO_LOGIN": "1"}
 
 
@@ -134,22 +133,6 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
     entry = data.get("entry_skill")
     if entry:
         _safe_skill_name(entry)
-
-    # command_aliases: {short_cmd: skill_name} — short slash commands (e.g. /strategy)
-    # that the multitenancy slash layer aliases to a real skill. Validate each key is a
-    # safe command token and each target is one of THIS plugin's skills.
-    aliases = data.get("command_aliases") or {}
-    if not isinstance(aliases, dict):
-        raise PluginIngestError(f"{path}: command_aliases must be an object")
-    skill_set = set(skills["list"])
-    for cmd, target in aliases.items():
-        cmd_s = str(cmd or "").strip()
-        if not cmd_s or "/" in cmd_s or "\\" in cmd_s or cmd_s in (".", "..") or "\x00" in cmd_s:
-            raise PluginIngestError(f"{path}: unsafe command_aliases key: {cmd!r}")
-        if str(target or "").strip() not in skill_set:
-            raise PluginIngestError(
-                f"{path}: command_aliases[{cmd!r}] → {target!r} is not in this plugin's skills.list"
-            )
 
     audience = data.get("audience") or {}
     if not isinstance(audience, dict):
@@ -554,51 +537,6 @@ def _write_managed_manifest(shared_home: Path, manifest: dict[str, Any], *, dry_
 
 # ─────────────────────────── top-level ingest ────────────────────────────
 
-def _register_slash_aliases(plugin: dict[str, Any], *, shared_home: Path, dry_run: bool) -> dict[str, Any]:
-    """Write the plugin's command_aliases into the shared slash-alias config.
-
-    Non-destructive (plugin-tagged): preserves other plugins' aliases, replaces only
-    this plugin's. Consumed by skill_slash._load_plugin_slash_aliases so /strategy etc.
-    resolve to the real skill (gated by core resolve_skill_command_key → safe).
-    """
-    aliases = plugin.get("command_aliases") or {}
-    if not aliases:
-        return {"written": 0, "aliases": {}}
-    path = shared_home / SLASH_ALIASES_FILE
-    raw: dict[str, Any] = {}
-    if path.exists():
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    entries = raw.get("aliases")
-    if not isinstance(entries, dict):
-        entries = {}
-    plugin_id = plugin["id"]
-    kept = {k: v for k, v in entries.items() if not (isinstance(v, dict) and v.get("plugin") == plugin_id)}
-    for cmd, skill in aliases.items():
-        kept[str(cmd)] = {"skill": str(skill), "plugin": plugin_id}
-    raw["aliases"] = dict(sorted(kept.items()))
-    if not dry_run:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    return {"written": 0 if dry_run else len(aliases), "aliases": dict(aliases), "config_path": str(path)}
-
-
-def _remove_slash_aliases(plugin_id: str, *, shared_home: Path, dry_run: bool) -> dict[str, Any]:
-    """Strip only this plugin's aliases from the shared slash-alias config."""
-    path = shared_home / SLASH_ALIASES_FILE
-    if not path.exists():
-        return {"removed": 0}
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    entries = raw.get("aliases")
-    if not isinstance(entries, dict):
-        return {"removed": 0}
-    kept = {k: v for k, v in entries.items() if not (isinstance(v, dict) and v.get("plugin") == plugin_id)}
-    removed = len(entries) - len(kept)
-    raw["aliases"] = kept
-    if not dry_run and removed:
-        path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    return {"removed": removed}
-
-
 def _default_shared_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
 
@@ -638,10 +576,6 @@ def ingest(
             plugin, aud, shared_home=shared_home, dry_run=dry_run, allow_create=allow_create_distribution
         )
 
-    # short-command slash aliases (e.g. /strategy → kep-trevi-strategy-recommend) for the
-    # webui/Feishu slash passthrough — global config, gated by skill existence at resolve time.
-    report["slash_aliases"] = _register_slash_aliases(plugin, shared_home=shared_home, dry_run=dry_run)
-
     manifest = {
         "plugin_id": plugin["id"],
         "version": plugin.get("version"),
@@ -654,7 +588,6 @@ def ingest(
         "owned_skills": report["skills"].get("owned", {}) if aud.mode == "profile" else {},
         "clis": [c["id"] for c in plugin.get("clis") or []],
         "connectors": [c["id"] for c in plugin.get("connectors") or []],
-        "command_aliases": list((plugin.get("command_aliases") or {}).keys()),
         "install_mode": plugin.get("install_mode") or "copy",
     }
     report["managed_manifest"] = str(_write_managed_manifest(shared_home, manifest, dry_run=dry_run))
@@ -751,8 +684,6 @@ def uninstall(
             "shared skill sources left intact under shared_home/skills because manifest ownership "
             "is not sufficient to prove they belong only to this plugin"
         )
-
-    report["slash_aliases"] = _remove_slash_aliases(plugin_id, shared_home=shared_home, dry_run=dry_run)
 
     if not dry_run:
         path.unlink()

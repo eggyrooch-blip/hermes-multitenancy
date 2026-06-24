@@ -1,63 +1,62 @@
 """Shared skill slash-command compatibility helpers."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 
 from .commands import normalize_command_name, split_command_text
 
-# Hardcoded base aliases (first-party). Plugin-contributed aliases are loaded
-# additively from <HERMES_HOME>/skill-slash-aliases.yaml (written by the
-# plugin_ingest tool) so a plugin's short commands (e.g. /strategy) resolve to
-# its real skill WITHOUT a core change — resolution still goes through core's
-# resolve_skill_command_key, which returns None when the skill is absent, so an
-# alias never mis-fires for a profile that doesn't have the plugin.
+# Hardcoded base aliases (first-party). Plugin short commands are NOT a maintained
+# table — each skill self-declares `slash_aliases` in its SKILL.md frontmatter, and
+# `_scan_slash_aliases` builds the map from the CURRENT (caller-scoped) profile's
+# installed skills. Resolution still goes through core resolve_skill_command_key, so
+# an alias never mis-fires for a profile whose skill isn't present.
 SKILL_SLASH_ALIASES = {
     "hades": "kep-hades-cli",
 }
 
-PLUGIN_SLASH_ALIASES_FILE = "skill-slash-aliases.yaml"
+# {frozenset(skill_md_paths) -> {alias: skill_name}} — keyed on the scoped profile's
+# skill set, so it's per-profile and invalidates when the installed skills change.
+_ALIAS_SCAN_CACHE: dict[frozenset, dict[str, str]] = {}
 
 
-def _shared_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
-
-
-def _load_plugin_slash_aliases() -> dict[str, str]:
-    """Load additive plugin aliases (`{cmd: skill_name}`) from the shared config.
-
-    Config shape (plugin-tagged for clean uninstall):
-        aliases:
-          strategy: {skill: kep-trevi-strategy-recommend, plugin: keep-resource-delivery}
-    A bare string value (`strategy: kep-...`) is also accepted. Missing/broken
-    config is a silent no-op (returns {}), never a hard failure on the slash path.
+def _scan_slash_aliases() -> dict[str, str]:
+    """Build {short_alias: skill_name} from the current profile's installed skills'
+    `slash_aliases` frontmatter. Dynamic + per-profile: reuses core get_skill_commands()
+    (already scoped to the routed profile by the caller) and reads each skill's frontmatter.
     """
-    path = _shared_home() / PLUGIN_SLASH_ALIASES_FILE
     try:
-        import yaml  # lazy: the slash path must not hard-depend on yaml import cost
+        from agent.skill_commands import get_skill_commands  # type: ignore
 
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001 — alias config must never break the /commands path
+        from .skill_registry import read_skill_slash_aliases
+    except Exception:  # noqa: BLE001 — alias scan must never break the /commands path
         return {}
-    entries = raw.get("aliases") if isinstance(raw, dict) else None
-    if not isinstance(entries, dict):
+    cmds = get_skill_commands()
+    if not isinstance(cmds, dict):
         return {}
+    key = frozenset(
+        str(v.get("skill_md_path")) for v in cmds.values()
+        if isinstance(v, dict) and v.get("skill_md_path")
+    )
+    cached = _ALIAS_SCAN_CACHE.get(key)
+    if cached is not None:
+        return cached
     out: dict[str, str] = {}
-    for cmd, val in entries.items():
-        cmd_s = str(cmd or "").strip()
-        if not cmd_s or "/" in cmd_s:
+    for value in cmds.values():
+        if not isinstance(value, dict):
             continue
-        skill = val.get("skill") if isinstance(val, dict) else val
-        skill_s = str(skill or "").strip()
-        if skill_s:
-            out[cmd_s.replace("_", "-")] = skill_s
+        md_path, skill_name = value.get("skill_md_path"), value.get("name")
+        if not md_path or not skill_name:
+            continue
+        for alias in read_skill_slash_aliases(Path(md_path)):
+            out.setdefault(alias, str(skill_name))  # first by scan order wins (deterministic)
+    _ALIAS_SCAN_CACHE[key] = out
     return out
 
 
 def _resolve_alias(cmd: str) -> Optional[str]:
-    """Hardcoded base wins; otherwise fall back to plugin-contributed aliases."""
-    return SKILL_SLASH_ALIASES.get(cmd) or _load_plugin_slash_aliases().get(cmd)
+    """Hardcoded base wins; otherwise the profile's skill-declared short aliases."""
+    return SKILL_SLASH_ALIASES.get(cmd) or _scan_slash_aliases().get(cmd)
 
 
 def rewrite_skill_slash_text(
