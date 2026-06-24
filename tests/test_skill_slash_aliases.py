@@ -1,8 +1,21 @@
 """Tests for skill-declared, dynamically-scanned slash aliases (per-profile)."""
 from __future__ import annotations
 
+import pytest
+
 from hermes_multitenancy import skill_slash
 from hermes_multitenancy.skill_registry import list_profile_skill_slash_commands, read_skill_slash_aliases
+
+# The dynamic scan delegates to core's agent.skill_commands.get_skill_commands. In the
+# real router runtime that module is always importable (upstream hermes-agent install);
+# a bare unit env may lack it. The scan itself fail-softs to {} — but the tests below
+# monkeypatch get_skill_commands, so they need the module present: skip cleanly if absent.
+try:
+    import agent.skill_commands  # noqa: F401
+    _HAS_AGENT = True
+except Exception:
+    _HAS_AGENT = False
+requires_agent = pytest.mark.skipif(not _HAS_AGENT, reason="agent.skill_commands not installed in this env")
 
 
 def _skill_md(root, name, aliases):
@@ -33,6 +46,7 @@ def test_read_aliases_sanitizes(tmp_path):
 
 # ─────────────────────── dynamic per-profile scan ───────────────────────
 
+@requires_agent
 def test_scan_aliases_dynamic_from_installed_skills(tmp_path, monkeypatch):
     p1 = _skill_md(tmp_path, "kep-trevi-strategy-recommend", ["strategy"])
     p2 = _skill_md(tmp_path, "kep-trevi-analysis", ["recap"])
@@ -50,6 +64,7 @@ def test_scan_aliases_dynamic_from_installed_skills(tmp_path, monkeypatch):
     assert skill_slash._resolve_alias("nope") is None
 
 
+@requires_agent
 def test_scan_aliases_per_profile_isolation(tmp_path, monkeypatch):
     # profile WITHOUT the strategy skill → no /strategy alias
     p2 = _skill_md(tmp_path, "kep-trevi-analysis", ["recap"])
