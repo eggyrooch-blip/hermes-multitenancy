@@ -2827,7 +2827,7 @@ def test_webui_run_broker_materializes_actor_principal_from_trusted_headers(tmp_
         assert requester.tenant_key == "tenant_a"
         assert requester.canonical_id_type == "user_id"
         assert requester.canonical_id == "u_owner"
-        assert requester.display_name == "Owner User"
+        assert requester.display_name == "孙可"
         assert lookup == {"provider": "feishu", "type": "email", "value": "viewer@example.test"}
         return table.upsert_principal(
             provider="feishu",
@@ -2860,7 +2860,7 @@ def test_webui_run_broker_materializes_actor_principal_from_trusted_headers(tmp_
                         "X-Hermes-Actor-Tenant-Key": "tenant_a",
                         "X-Hermes-Actor-App-Id": "cli_web",
                         "X-Hermes-Actor-User-Id": "u_owner",
-                        "X-Hermes-Actor-Display-Name": "Owner User",
+                        "X-Hermes-Actor-Display-Name-Encoded": "%E5%AD%99%E5%8F%AF",
                         "X-Hermes-Actor-Avatar-Url": "https://example.test/owner.png",
                         "X-Hermes-Actor-Email": "owner@example.test",
                     },
@@ -2905,7 +2905,7 @@ def test_webui_run_broker_materializes_actor_principal_from_trusted_headers(tmp_
                 canonical_id="u_owner",
             )
             assert owner is not None
-            assert owner.display_name == "Owner User"
+            assert owner.display_name == "孙可"
             assert table.lookup_principal_by_alias(
                 provider="feishu",
                 tenant_key="tenant_a",

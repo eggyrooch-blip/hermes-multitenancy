@@ -18,6 +18,7 @@ import secrets
 import shutil
 import threading
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -51,6 +52,7 @@ _ACTOR_TENANT_KEY_HEADER = "X-Hermes-Actor-Tenant-Key"
 _ACTOR_APP_ID_HEADER = "X-Hermes-Actor-App-Id"
 _ACTOR_USER_ID_HEADER = "X-Hermes-Actor-User-Id"
 _ACTOR_DISPLAY_NAME_HEADER = "X-Hermes-Actor-Display-Name"
+_ACTOR_DISPLAY_NAME_ENCODED_HEADER = "X-Hermes-Actor-Display-Name-Encoded"
 _ACTOR_AVATAR_URL_HEADER = "X-Hermes-Actor-Avatar-Url"
 _ACTOR_EMAIL_HEADER = "X-Hermes-Actor-Email"
 _AGENT_SHARE_CONTEXT_METADATA_KEY = "agent_share_context"
@@ -1034,6 +1036,16 @@ def _actor_principal_id_from_request(request: Any) -> str:
     return str(request.headers.get(_ACTOR_PRINCIPAL_ID_HEADER, "") or "").strip()
 
 
+def _actor_display_name_from_request(request: Any) -> str:
+    encoded = str(request.headers.get(_ACTOR_DISPLAY_NAME_ENCODED_HEADER, "") or "").strip()
+    if encoded:
+        try:
+            return urllib.parse.unquote(encoded, encoding="utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
+            return ""
+    return str(request.headers.get(_ACTOR_DISPLAY_NAME_HEADER, "") or "").strip()
+
+
 def _actor_principal_id_for_request(table: Any, request: Any, actor_open_id: str = "") -> str:
     principal_id = _actor_principal_id_from_request(request)
     if principal_id:
@@ -1059,7 +1071,7 @@ def _actor_principal_id_for_request(table: Any, request: Any, actor_open_id: str
         tenant_key=tenant_key,
         canonical_id_type="user_id",
         canonical_id=user_id,
-        display_name=str(request.headers.get(_ACTOR_DISPLAY_NAME_HEADER, "") or "").strip() or None,
+        display_name=_actor_display_name_from_request(request) or None,
         avatar_url=str(request.headers.get(_ACTOR_AVATAR_URL_HEADER, "") or "").strip() or None,
         email=email or None,
         aliases=aliases,
