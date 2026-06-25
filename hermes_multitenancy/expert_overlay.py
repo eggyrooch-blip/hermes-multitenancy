@@ -8,22 +8,20 @@ layer for THIS run only.
 Design redlines (cross-model reviewed — see this slug's SPEC):
   * The overlay is EPHEMERAL — it is never written to ``SOUL.md``, memory, or
     ``USER.md``.  The profile's default agent persona on disk is untouched; the
-    override lives only in the in-flight request.  (In the production AIAgent path
-    it rides the core's ``ephemeral_system_prompt`` kwarg, which core documents as
-    "used during execution but NOT saved to trajectories".)
-  * It is built in the MULTITENANCY layer — hermes-agent core is never forked.
+    override lives only in the in-flight request and is handed to hermes-agent
+    through its generic ``identity_override`` constructor seam.
+  * Expert selection is built in the MULTITENANCY layer. hermes-agent core only
+    exposes generic runtime seams; it does not know expert catalogs or tenants.
   * Credentials are unchanged: the caller's per-profile kep-auth tokens still
-    apply.  Capability (the expert's bound skills) is shared via the plugin
-    ingester; identity-of-record and credentials are not.
+    apply. Expert skills stay installed as plugin resources and are only made
+    visible for the active run; identity-of-record and credentials are not shared.
   * Fail-safe: an unknown / missing ``expert_id`` resolves to ``None`` and the run
     proceeds with the normal SOUL persona — this module never raises into the run.
 
-Composition follows the live LINCHPIN VERDICT: a single authoritative system
-message with the Role-Override block + expert ``agent.md`` + a MUST-OBEY tail.
-The override WORDING is what wins (verified: it outranks the locked SOUL persona
-regardless of block ordering), so this block is safe to either prepend before
-SOUL (legacy chat-completions path) or append after it (core's
-``ephemeral_system_prompt`` behavior in the AIAgent path).
+Composition follows the live LINCHPIN VERDICT: the Role-Override block + expert
+``agent.md`` + MUST-OBEY tail must live in the stable identity tier. The AIAgent
+path therefore passes it as ``identity_override``; append-only prompt/context
+channels are rejected because they can still leak the base Hermes identity.
 """
 from __future__ import annotations
 

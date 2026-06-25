@@ -34,6 +34,8 @@ import uuid
 import re
 import secrets
 import importlib
+import inspect
+import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
@@ -55,6 +57,7 @@ from .security_audit import append_security_event
 from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
+_EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
 
 
 # Map a model provider prefix to the env-var name that holds its API key.
@@ -602,6 +605,18 @@ def _disabled_skills_runtime_env(disabled: set[str]) -> dict[str, str]:
     return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
 
 
+def _aiagent_supports_identity_override(aiagent_cls: Any) -> bool:
+    try:
+        signature = inspect.signature(aiagent_cls)
+    except (TypeError, ValueError):
+        # Unknown callable shape: try the modern kwarg and let construction
+        # fail closed instead of silently downgrading expert identity injection.
+        return True
+    if "identity_override" in signature.parameters:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+
+
 def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
     """Return per-run env that hides inactive expert skills.
 
@@ -719,43 +734,51 @@ def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
         tmp.cleanup()
         return lambda: None
 
+    _EXPERT_SKILL_SCOPE_LOCK.acquire()
     try:
         import agent.skill_utils as skill_utils
     except Exception:
         logger.warning("[multitenancy] could not patch expert skill dirs into Hermes core", exc_info=True)
+        _EXPERT_SKILL_SCOPE_LOCK.release()
         tmp.cleanup()
         return lambda: None
 
-    original_external = getattr(skill_utils, "get_external_skills_dirs", None)
-    original_all = getattr(skill_utils, "get_all_skills_dirs", None)
+    try:
+        original_external = getattr(skill_utils, "get_external_skills_dirs", None)
+        original_all = getattr(skill_utils, "get_all_skills_dirs", None)
 
-    def _with_expert_external_dirs() -> list[Path]:
-        dirs = list(original_external() if callable(original_external) else [])
-        if tmp_root not in dirs:
-            dirs.append(tmp_root)
-        return dirs
+        def _with_expert_external_dirs() -> list[Path]:
+            dirs = list(original_external() if callable(original_external) else [])
+            if tmp_root not in dirs:
+                dirs.append(tmp_root)
+            return dirs
 
-    def _with_expert_all_dirs() -> list[Path]:
-        dirs = list(original_all() if callable(original_all) else [])
-        if tmp_root not in dirs:
-            dirs.append(tmp_root)
-        return dirs
+        def _with_expert_all_dirs() -> list[Path]:
+            dirs = list(original_all() if callable(original_all) else [])
+            if tmp_root not in dirs:
+                dirs.append(tmp_root)
+            return dirs
 
-    skill_utils.get_external_skills_dirs = _with_expert_external_dirs
-    skill_utils.get_all_skills_dirs = _with_expert_all_dirs
+        skill_utils.get_external_skills_dirs = _with_expert_external_dirs
+        skill_utils.get_all_skills_dirs = _with_expert_all_dirs
 
-    patched_module_attrs: list[tuple[Any, str, Any]] = []
-    for module_name, attr, replacement in (
-        ("agent.prompt_builder", "get_external_skills_dirs", _with_expert_external_dirs),
-        ("agent.prompt_builder", "get_all_skills_dirs", _with_expert_all_dirs),
-        ("agent.skill_commands", "get_external_skills_dirs", _with_expert_external_dirs),
-        ("agent.skill_commands", "get_all_skills_dirs", _with_expert_all_dirs),
-    ):
-        module = sys.modules.get(module_name)
-        if module is None or not hasattr(module, attr):
-            continue
-        patched_module_attrs.append((module, attr, getattr(module, attr)))
-        setattr(module, attr, replacement)
+        patched_module_attrs: list[tuple[Any, str, Any]] = []
+        for module_name, attr, replacement in (
+            ("agent.prompt_builder", "get_external_skills_dirs", _with_expert_external_dirs),
+            ("agent.prompt_builder", "get_all_skills_dirs", _with_expert_all_dirs),
+            ("agent.skill_commands", "get_external_skills_dirs", _with_expert_external_dirs),
+            ("agent.skill_commands", "get_all_skills_dirs", _with_expert_all_dirs),
+        ):
+            module = sys.modules.get(module_name)
+            if module is None or not hasattr(module, attr):
+                continue
+            patched_module_attrs.append((module, attr, getattr(module, attr)))
+            setattr(module, attr, replacement)
+    except Exception:
+        logger.warning("[multitenancy] failed to patch expert skill dirs into Hermes core", exc_info=True)
+        _EXPERT_SKILL_SCOPE_LOCK.release()
+        tmp.cleanup()
+        return lambda: None
 
     logger.info(
         "[multitenancy] expert skill scope active profile=%s skills=%s temp_root=%s",
@@ -765,13 +788,16 @@ def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
     )
 
     def _cleanup() -> None:
-        if callable(original_external):
-            skill_utils.get_external_skills_dirs = original_external
-        if callable(original_all):
-            skill_utils.get_all_skills_dirs = original_all
-        for module, attr, original in patched_module_attrs:
-            setattr(module, attr, original)
-        tmp.cleanup()
+        try:
+            if callable(original_external):
+                skill_utils.get_external_skills_dirs = original_external
+            if callable(original_all):
+                skill_utils.get_all_skills_dirs = original_all
+            for module, attr, original in patched_module_attrs:
+                setattr(module, attr, original)
+            tmp.cleanup()
+        finally:
+            _EXPERT_SKILL_SCOPE_LOCK.release()
 
     return _cleanup
 
@@ -5044,19 +5070,27 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
-        # Expert Role-Override overlay (ephemeral, this run only). Keep
-        # hermes-agent core clean: use its existing run_conversation
-        # system_message seam and force the per-agent cached prompt to rebuild
-        # for this expert run. SOUL.md / memory / USER on disk stay untouched.
-        # Do NOT route this through metadata.instructions: verdict B4 leaked
-        # the base Hermes identity from that user-message path.
+        # Expert Role-Override overlay (ephemeral, this run only). This must be
+        # a stable-tier identity override in hermes-agent core, not an appended
+        # system_message/context block; otherwise SOUL/default identity can still
+        # win "who are you" questions.
         _role_override = _role_override_block_for_event(event, profile_home)
+        if _role_override:
+            if not _aiagent_supports_identity_override(AIAgent):
+                raise RuntimeError(
+                    "Hermes core does not support identity_override; "
+                    "expert Role Override cannot run safely"
+                )
+            agent_kwargs["identity_override"] = _role_override
 
         approval_cleanup = _configure_gateway_approval_bridge(
             event_sink,
             str(gateway_session_key),
         )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
+            profile_home,
+            extra_env=_expert_skill_runtime_env_for_event(event, profile_home),
+        )
         expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
@@ -5067,14 +5101,6 @@ def _run_with_aiagent(
                 "user_message": user_text,
                 "task_id": str(session_id),
             }
-            if _role_override:
-                run_kwargs["system_message"] = _role_override
-                build_prompt = getattr(agent, "_build_system_prompt", None)
-                if callable(build_prompt):
-                    try:
-                        agent._cached_system_prompt = build_prompt(system_message=_role_override)
-                    except TypeError:
-                        agent._cached_system_prompt = build_prompt(_role_override)
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
