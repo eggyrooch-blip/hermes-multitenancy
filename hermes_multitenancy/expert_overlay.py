@@ -193,11 +193,15 @@ def resolve_expert(
     markdown can't be loaded, OR the manifest audience does not admit the caller —
     the caller then runs with the normal SOUL persona.
 
-    Authorization (fail-CLOSED): an expert is activatable ONLY when its manifest
-    audience admits this caller. ``profiles[]`` is matched against the caller's
-    profile_name (derived from ``profile_home``); ``department_ids`` is matched
-    against ``department_ids`` (resolved server-side by the caller). An expert
-    whose audience excludes the caller returns ``None`` even when its id is known.
+    Authorization (fail-CLOSED): an expert is activatable ONLY when the EFFECTIVE
+    audience admits this caller — the PLUGIN INSTALL audience (``manifest["audience"]``,
+    the PRIMARY gate since managed manifests are shared-home GLOBAL) ANDed with the
+    OPTIONAL per-expert ``expert["audience"]`` (further narrowing). An expert with no
+    per-expert audience INHERITS the install audience; it is public only when BOTH are
+    empty. ``profiles[]`` is matched against the caller's profile_name (derived from
+    ``profile_home``); ``department_ids`` is matched against the caller's departments
+    (resolved server-side). An expert whose effective audience excludes the caller
+    returns ``None`` even when its id is known.
     """
     eid = str(expert_id or "").strip()
     if not eid:
@@ -208,10 +212,12 @@ def resolve_expert(
             experts = manifest.get("experts")
             if not isinstance(experts, list):
                 continue
+            manifest_audience = manifest.get("audience")
             for expert in experts:
                 if not isinstance(expert, dict) or str(expert.get("id") or "") != eid:
                     continue
-                if not _audience_allows(
+                if not _effective_audience_allows(
+                    manifest_audience,
                     expert.get("audience"),
                     profile_name=profile_name,
                     department_ids=department_ids,
@@ -262,14 +268,15 @@ def _audience_allows(
     profile_name: Optional[str] = None,
     department_ids: Optional[list[str]] = None,
 ) -> bool:
-    """Audience filter for the expert square — covers BOTH persisted modes.
+    """Audience filter for ONE audience scope — covers BOTH persisted modes.
 
-    The ingester persists ``audience`` as
-    ``{"mode": "profile"|"department_ids", "profiles": [...], "department_ids": [...]}``
-    (plugin_ingest.py). Enforcement is fail-CLOSED for scoped experts:
+    Both the manifest-level INSTALL audience and the optional per-expert audience
+    share this shape (persisted by plugin_ingest.py):
+    ``{"mode": "profile"|"department_ids", "profiles": [...], "department_ids": [...]}``.
+    Enforcement is fail-CLOSED for scoped audiences:
 
-      * No audience / empty ``profiles`` AND empty ``department_ids`` → PUBLIC
-        (visible to everyone who has the plugin) — preserves prior behavior.
+      * No audience / empty ``profiles`` AND empty ``department_ids`` → this scope
+        admits everyone (it imposes no restriction of its own).
       * ``profiles`` non-empty → allowed ONLY if the caller's ``profile_name`` is
         in it. A None/unknown caller profile fails closed.
       * ``department_ids`` non-empty → allowed ONLY if the caller's resolved
@@ -278,12 +285,19 @@ def _audience_allows(
     When BOTH scopes are present, EITHER admitting the caller is sufficient (a
     union — the same OR semantics ``feishu_org._skill_audience_matches`` uses for
     profiles/departments). Never raises.
+
+    NOTE: an empty audience here means "this single scope adds no restriction",
+    NOT "public". A managed manifest lives in shared-home and is read by EVERY
+    profile, so visibility is gated by the EFFECTIVE audience — the manifest
+    install audience ANDed with the per-expert audience (see
+    ``_effective_audience_allows``). Never call this in isolation to decide
+    expert visibility; that was the authorization bug.
     """
     if not isinstance(audience, dict):
         return True
     want_profiles = {str(p) for p in (audience.get("profiles") or []) if str(p).strip()}
     want_depts = {str(d) for d in (audience.get("department_ids") or []) if str(d).strip()}
-    if not want_profiles and not want_depts:  # no scoping → public
+    if not want_profiles and not want_depts:  # this scope imposes no restriction
         return True
     if want_profiles and profile_name and str(profile_name) in want_profiles:
         return True
@@ -294,6 +308,45 @@ def _audience_allows(
     return False
 
 
+def _effective_audience_allows(
+    manifest_audience: Any,
+    expert_audience: Any,
+    *,
+    profile_name: Optional[str] = None,
+    department_ids: Optional[list[str]] = None,
+) -> bool:
+    """Fail-CLOSED visibility gate combining BOTH audience levels.
+
+    There are two independent audience levels, and BOTH must admit the caller:
+
+      1. ``manifest_audience`` — the PLUGIN INSTALL audience (plugin_ingest.py
+         persists ``manifest["audience"]`` = ``{"mode","profiles","department_ids"}``).
+         This is the PRIMARY gate: managed manifests live in shared-home and are
+         read by ALL profiles, so an install scoped to profile A must NOT leak to
+         any other profile — even when the expert carries no per-expert audience.
+      2. ``expert_audience`` — the OPTIONAL per-expert audience that FURTHER
+         narrows within the install audience.
+
+    Rule (AND of both scopes):
+      * manifest install audience ALWAYS gates — deny if it excludes the caller.
+      * if a per-expert audience is present it must ALSO admit — deny if it excludes.
+      * absent/empty per-expert audience → the expert INHERITS the manifest install
+        audience (it is NOT public on its own).
+      * only when BOTH the manifest install audience AND the per-expert audience are
+        empty/absent is the expert truly public.
+
+    Because ``_audience_allows`` returns True for an empty/absent scope, ANDing the
+    two scopes yields exactly the inheritance + further-narrowing semantics above.
+    """
+    if not _audience_allows(
+        manifest_audience, profile_name=profile_name, department_ids=department_ids
+    ):
+        return False
+    return _audience_allows(
+        expert_audience, profile_name=profile_name, department_ids=department_ids
+    )
+
+
 def list_experts(
     profile_home: Path, *, department_ids: Optional[list[str]] = None
 ) -> list[dict[str, Any]]:
@@ -302,6 +355,12 @@ def list_experts(
     Returns redacted display rows (no persona body, no repo path) suitable for the
     expert-square UI. De-duped by expert id (first manifest wins). Fail-safe: an
     unreadable manifest is skipped, never fatal.
+
+    Visibility is the EFFECTIVE audience (fail-CLOSED): the plugin INSTALL audience
+    (``manifest["audience"]``, the PRIMARY gate since managed manifests are
+    shared-home GLOBAL) ANDed with the OPTIONAL per-expert ``ex["audience"]``. An
+    expert with no per-expert audience INHERITS the install audience; it is listed
+    for everyone only when BOTH are empty.
     """
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -312,13 +371,15 @@ def list_experts(
             if not isinstance(experts, list):
                 continue
             plugin_id = str(manifest.get("plugin_id") or "")
+            manifest_audience = manifest.get("audience")
             for ex in experts:
                 if not isinstance(ex, dict):
                     continue
                 eid = str(ex.get("id") or "").strip()
                 if not eid or eid in seen:
                     continue
-                if not _audience_allows(
+                if not _effective_audience_allows(
+                    manifest_audience,
                     ex.get("audience"),
                     profile_name=profile_name,
                     department_ids=department_ids,

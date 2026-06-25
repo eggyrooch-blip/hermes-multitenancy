@@ -430,23 +430,84 @@ def test_resolve_caller_departments_from_snapshot(tmp_path, monkeypatch):
     assert eo.resolve_caller_departments(other / "profiles" / "feishu_test") is None
 
 
-def test_resolve_audience_public_visible_to_any_profile(tmp_path, monkeypatch):
-    """Empty/absent audience stays public — visible to any caller (regression)."""
-    repo = _plugin_repo(tmp_path / "plug")  # no audience
+def _set_install_audience(shared: Path, audience: dict | None, plugin_id="keep-resource-delivery"):
+    """Overwrite the persisted MANAGED-MANIFEST install audience (manifest['audience']).
+
+    ``pi.ingest`` always resolves a CONCRETE install audience (a profile or numeric
+    departments) — it can never produce a truly-public (empty) install audience. To
+    exercise the public case we patch the persisted manifest directly. ``audience=None``
+    removes the key entirely (absent install audience).
+    """
+    mpath = shared / pi.MANAGED_DIR / f"{plugin_id}.json"
+    manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    if audience is None:
+        manifest.pop("audience", None)
+    else:
+        manifest["audience"] = audience
+    mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_resolve_audience_install_scope_no_per_expert_audience_does_not_leak(tmp_path, monkeypatch):
+    """SAFE behavior: install scoped to A + NO per-expert audience → A only, B denied.
+
+    Managed manifests are shared-home GLOBAL, so an expert with no per-expert audience
+    must INHERIT the plugin install audience — it must NOT leak to unrelated profiles.
+    (This replaces the old test that locked in the unsafe leak.)
+    """
+    repo = _plugin_repo(tmp_path / "plug")  # NO per-expert audience
+    shared = _shared_home(tmp_path, profile="alice")
+    (shared / "profiles" / "bob" / "skills").mkdir(parents=True, exist_ok=True)
+    # install the plugin for alice ONLY → manifest install audience = profiles=[alice]
+    _ingest_for(repo, shared, "alice")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    alice_home = shared / "profiles" / "alice"
+    bob_home = shared / "profiles" / "bob"
+
+    # owner A: inherits the install audience → resolves + lists
+    assert eo.resolve_expert(alice_home, EXPERT_ID) is not None
+    assert any(r["id"] == EXPERT_ID for r in eo.list_experts(alice_home))
+
+    # unrelated B: install audience excludes B → denied on BOTH paths (no leak)
+    assert eo.resolve_expert(bob_home, EXPERT_ID) is None
+    assert all(r["id"] != EXPERT_ID for r in eo.list_experts(bob_home))
+    assert eo.role_override_block_for(bob_home, EXPERT_ID) is None
+
+
+def test_resolve_audience_public_install_narrowed_by_per_expert(tmp_path, monkeypatch):
+    """Public install audience + per-expert audience profiles=[A] → only A sees it."""
+    repo = _plugin_repo(
+        tmp_path / "plug",
+        audience={"mode": "profile", "profiles": ["alice"], "department_ids": []},
+    )
+    shared = _shared_home(tmp_path, profile="alice")
+    (shared / "profiles" / "bob" / "skills").mkdir(parents=True, exist_ok=True)
+    _ingest_for(repo, shared, "alice")
+    # force the INSTALL audience public so only the per-expert audience narrows
+    _set_install_audience(shared, {"mode": "profile", "profiles": [], "department_ids": []})
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    alice_home = shared / "profiles" / "alice"
+    bob_home = shared / "profiles" / "bob"
+
+    # per-expert audience [alice] narrows the public install → A only
+    assert eo.resolve_expert(alice_home, EXPERT_ID) is not None
+    assert any(r["id"] == EXPERT_ID for r in eo.list_experts(alice_home))
+    assert eo.resolve_expert(bob_home, EXPERT_ID) is None
+    assert all(r["id"] != EXPERT_ID for r in eo.list_experts(bob_home))
+
+
+def test_resolve_audience_both_empty_is_public(tmp_path, monkeypatch):
+    """ONLY when BOTH install audience AND per-expert audience are empty → public."""
+    repo = _plugin_repo(tmp_path / "plug")  # NO per-expert audience
     shared = _shared_home(tmp_path)
     (shared / "profiles" / "stranger" / "skills").mkdir(parents=True, exist_ok=True)
     _ingest(repo, shared)
+    # strip the install audience entirely → both scopes empty
+    _set_install_audience(shared, None)
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
     stranger_home = shared / "profiles" / "stranger"
     assert eo.resolve_expert(stranger_home, EXPERT_ID) is not None
     assert len(eo.list_experts(stranger_home)) == 1
-    # explicitly-empty audience shape is also public
-    repo2 = _plugin_repo(
-        tmp_path / "plug2",
-        audience={"mode": "profile", "profiles": [], "department_ids": []},
-    )
-    shared2 = _shared_home(tmp_path / "s2")
-    _ingest(repo2, shared2)
-    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared2))
-    any_home = shared2 / "profiles" / "feishu_test"
-    assert eo.resolve_expert(any_home, EXPERT_ID) is not None
+    # explicitly-empty install-audience shape is also public
+    _set_install_audience(shared, {"mode": "profile", "profiles": [], "department_ids": []})
+    assert eo.resolve_expert(stranger_home, EXPERT_ID) is not None
+    assert len(eo.list_experts(stranger_home)) == 1
