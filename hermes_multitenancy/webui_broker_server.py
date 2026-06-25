@@ -45,6 +45,7 @@ MarkSeen = Callable[[RunRequest], bool]
 SandboxAvailable = Callable[[], bool]
 
 _OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
+_EXPERT_ID_HEADER = "X-Hermes-Expert-Id"
 _AGENT_ID_HEADER = "X-Hermes-Agent-Id"
 _ACTOR_PRINCIPAL_ID_HEADER = "X-Hermes-Actor-Principal-Id"
 _ACTOR_PROVIDER_HEADER = "X-Hermes-Actor-Provider"
@@ -1026,6 +1027,30 @@ def _tenant_payload_from_query(request: Any) -> dict[str, Any]:
         "profile_name": request.query.get("profile_name") or request.query.get("profile"),
         "user_key": request.query.get("user_key") or request.query.get("user"),
     }
+
+
+def _apply_expert_id_to_metadata(
+    request: Any, payload: dict[str, Any], metadata: dict[str, Any]
+) -> None:
+    """Thread the per-run ``expert_id`` into ``metadata`` so ``agent_real`` can
+    overlay that expert's Role-Override persona for this run only.
+
+    Source precedence: header ``X-Hermes-Expert-Id`` > ``payload.metadata.expert_id``
+    > top-level ``payload.expert_id``. A blank value clears it (no overlay). The id
+    is clamped to a conservative charset (an untrusted value eventually keys a
+    managed-manifest lookup; this keeps it from carrying separators / control chars).
+    """
+    raw = (
+        request.headers.get(_EXPERT_ID_HEADER)
+        or metadata.get("expert_id")
+        or payload.get("expert_id")
+        or ""
+    )
+    eid = str(raw or "").strip()
+    if eid and all(c.isalnum() or c in "-_.:" for c in eid):
+        metadata["expert_id"] = eid
+    else:
+        metadata.pop("expert_id", None)
 
 
 def _trusted_owner_from_request(request: Any) -> str:
@@ -2075,6 +2100,7 @@ def create_run_broker_app(
                 return web.json_response({"error": resolution_error}, status=403)
             trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
             metadata = _sanitize_ingest_metadata(payload.get("metadata") or {})
+            _apply_expert_id_to_metadata(request, payload, metadata)
             share_context = _agent_share_context_for_request(
                 request,
                 payload,
@@ -3815,6 +3841,36 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI connectors failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_experts(request):
+        """Expert-square catalog for one tenant — the experts[] a profile can use.
+
+        Aggregates ``experts[]`` across the profile's ``.hermes-plugin-managed/*.json``
+        managed manifests, filters by audience, and returns redacted display rows
+        (no persona body, no repo path). Mirrors ``handle_connectors`` (tenant from
+        request, thread offload, 401/500 shape). An ``expert_id`` from this list is
+        what the WebUI passes back on a run to activate that expert's Role-Override.
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import expert_overlay
+
+        try:
+            profile_name, _user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            dept_raw = str(request.query.get("department_ids") or "").strip()
+            department_ids = [d.strip() for d in dept_raw.split(",") if d.strip()] or None
+            profile_home = _profile_home_for_name(profile_name)
+            experts = await asyncio.to_thread(
+                expert_overlay.list_experts,
+                profile_home,
+                department_ids=department_ids,
+            )
+            return web.json_response({"profile_name": profile_name, "experts": experts})
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            logger.exception("[multitenancy] WebUI experts failed")
+            return web.json_response({"error": str(exc)}, status=500)
+
     async def handle_credential_lease(request):
         header = request.headers.get("Authorization", "")
         prefix = "Bearer "
@@ -4446,6 +4502,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
     app.router.add_get("/api/run-broker/connectors", handle_connectors)
+    app.router.add_get("/api/run-broker/experts", handle_experts)
     app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)

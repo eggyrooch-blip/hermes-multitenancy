@@ -164,8 +164,56 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
             "forbidden; a plugin distributed to many employees must default to `pre`"
         )
 
+    _validate_experts(data.get("experts"), repo=repo, path=path)
+
     data["_repo"] = str(repo)
     return data
+
+
+def _validate_experts(experts: Any, *, repo: Path, path: Path) -> None:
+    """Validate the optional ``experts[]`` array (the expert-square contract).
+
+    Each entry is a session-scoped Role-Override persona: it carries an ``id``
+    (stable, used to select the expert at run time) and ``agent_md`` (a repo-relative
+    path to the persona markdown). ``agent_md`` must stay inside the repo and exist —
+    a declared expert with no persona file would silently fail to overlay at run time.
+    Optional: ``name``/``skills``/``governance``/``audience`` + UI display fields.
+    Absent ``experts`` is fine (a skills/CLI-only plugin).
+    """
+    if experts is None:
+        return
+    if not isinstance(experts, list):
+        raise PluginIngestError(f"{path}: experts must be an array")
+    seen: set[str] = set()
+    for ex in experts:
+        if not isinstance(ex, dict):
+            raise PluginIngestError(f"{path}: each experts[] entry must be an object, got {ex!r}")
+        eid = str(ex.get("id") or "").strip()
+        if not eid:
+            raise PluginIngestError(f"{path}: each experts[] entry needs a non-empty id")
+        if not all(c.isalnum() or c in "-_.:" for c in eid):
+            raise PluginIngestError(f"{path}: unsafe experts[].id {eid!r} (alnum / -_.: only)")
+        if eid in seen:
+            raise PluginIngestError(f"{path}: duplicate experts[].id {eid!r}")
+        seen.add(eid)
+        rel = str(ex.get("agent_md") or "").strip()
+        if not rel:
+            raise PluginIngestError(f"{path}: experts[{eid}] needs an agent_md (persona markdown path)")
+        rel_clean = rel[2:] if rel.startswith("./") else rel
+        if rel.startswith("/") or PurePosixPath(rel_clean).is_absolute() or any(
+            part in ("", "..") for part in PurePosixPath(rel_clean).parts
+        ):
+            raise PluginIngestError(f"{path}: unsafe experts[{eid}].agent_md {rel!r}")
+        if not (repo / rel_clean).is_file():
+            raise PluginIngestError(
+                f"{path}: experts[{eid}].agent_md {rel!r} not found at {repo / rel_clean}"
+            )
+        skills = ex.get("skills")
+        if skills is not None and not isinstance(skills, list):
+            raise PluginIngestError(f"{path}: experts[{eid}].skills must be an array")
+        gov = ex.get("governance")
+        if gov is not None and not isinstance(gov, dict):
+            raise PluginIngestError(f"{path}: experts[{eid}].governance must be an object")
 
 
 # ─────────────────────────── audience resolution ─────────────────────────
@@ -589,6 +637,12 @@ def ingest(
         "clis": [c["id"] for c in plugin.get("clis") or []],
         "connectors": [c["id"] for c in plugin.get("connectors") or []],
         "install_mode": plugin.get("install_mode") or "copy",
+        # repo + experts[]: the expert Role-Override overlay (expert_overlay.py)
+        # reads the persona markdown from `repo`/agent_md at run time and selects
+        # by experts[].id. Persona is NEVER copied into SOUL.md (would pollute the
+        # default agent); only the pointer + repo path live here.
+        "repo": str(plugin.get("_repo") or ""),
+        "experts": list(plugin.get("experts") or []),
     }
     report["managed_manifest"] = str(_write_managed_manifest(shared_home, manifest, dry_run=dry_run))
 

@@ -289,20 +289,23 @@ async def _stream_loop(
     candidates.extend(fallback_models)
 
     soul_text = _load_soul(profile_home)
+    # Expert Role-Override overlay (ephemeral, this run only): override block leads
+    # the single system message, SOUL demoted below it (verdict B). SOUL.md unchanged.
+    system_text = _compose_system_text(event, profile_home, soul_text)
     user_text = getattr(event, "text", "") or ""
 
     # Caller can override the message list (used for multi-turn history).
     # Default: system prompt + single user message.
     if messages is None:
         effective_messages: list[dict] = [
-            {"role": "system", "content": soul_text},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": user_text},
         ]
     else:
-        # Caller supplies the conversation. We still inject SOUL as system
-        # to guarantee the profile's persona stays in force.
+        # Caller supplies the conversation. We still inject SOUL (+ any expert
+        # overlay) as system to guarantee the active persona stays in force.
         effective_messages = [
-            {"role": "system", "content": soul_text},
+            {"role": "system", "content": system_text},
             *messages,
         ]
 
@@ -426,16 +429,20 @@ async def _legacy_real_run_agent(
     candidates.extend(fallback_models)
 
     soul_text = _load_soul(profile_home)
+    # Expert Role-Override overlay (ephemeral, this run only). Per the live verdict
+    # (composition B) the override block leads the single system message; SOUL stays
+    # as the demoted base persona. SOUL.md on disk is never modified.
+    system_text = _compose_system_text(event, profile_home, soul_text)
     user_text = getattr(event, "text", "") or ""
 
     if messages is None:
         effective_messages: list[dict] = [
-            {"role": "system", "content": soul_text},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": user_text},
         ]
     else:
         effective_messages = [
-            {"role": "system", "content": soul_text},
+            {"role": "system", "content": system_text},
             *messages,
         ]
 
@@ -501,6 +508,58 @@ def _event_metadata(event: Any) -> dict[str, Any]:
         return {}
     metadata = raw_event.get("metadata")
     return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _expert_id_for_event(event: Any) -> str:
+    """Return the per-run ``expert_id`` from WebUI broker metadata, else ''.
+
+    The broker threads ``X-Hermes-Expert-Id`` / ``metadata.expert_id`` into
+    ``event.raw_event.metadata.expert_id``; when present we overlay that expert's
+    Role-Override persona for this run only (see ``expert_overlay``).
+    """
+    return str(_event_metadata(event).get("expert_id") or "").strip()
+
+
+def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[str]:
+    """Resolve the ephemeral Role-Override system block for this run, or None.
+
+    Fail-safe: any resolution problem (unknown id, missing persona, import error)
+    yields None so the run proceeds with the normal SOUL persona — the overlay
+    must never break a run.
+    """
+    expert_id = _expert_id_for_event(event)
+    if not expert_id:
+        return None
+    try:
+        from .expert_overlay import role_override_block_for
+
+        block = role_override_block_for(profile_home, expert_id)
+        if block:
+            logger.info(
+                "[multitenancy] expert overlay active expert_id=%s profile=%s",
+                expert_id, getattr(profile_home, "name", profile_home),
+            )
+        return block
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert overlay resolution failed expert_id=%s; running without overlay",
+            expert_id, exc_info=True,
+        )
+        return None
+
+
+def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
+    """System-message text for the legacy chat-completions paths.
+
+    When the run carries an expert overlay, lead with the Role-Override block and
+    demote SOUL below it (verdict composition B — cleanest, override-first). With
+    no overlay this is exactly ``soul_text`` (byte-stable for the normal path).
+    SOUL.md on disk is never written; the override is in-memory for this run only.
+    """
+    block = _role_override_block_for_event(event, profile_home)
+    if not block:
+        return soul_text
+    return f"{block}\n\n---\n\n{soul_text}"
 
 
 def _model_spec_for_event(default_spec: str, event: Any) -> str:
@@ -4756,6 +4815,17 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
+        # Expert Role-Override overlay (ephemeral, this run only). The core's
+        # ``ephemeral_system_prompt`` is explicitly "used during execution but NOT
+        # saved to trajectories", so SOUL.md / memory / USER on disk stay untouched
+        # — exactly the redline this feature requires. Core composes it into the
+        # SINGLE system message (SOUL leads, override appended); per the live
+        # verdict the override WORDING wins regardless of block order. We do NOT
+        # route it via metadata.instructions (verdict B4 leaked the base identity).
+        _role_override = _role_override_block_for_event(event, profile_home)
+        if _role_override:
+            agent_kwargs["ephemeral_system_prompt"] = _role_override
+
         approval_cleanup = _configure_gateway_approval_bridge(
             event_sink,
             str(gateway_session_key),
@@ -4765,7 +4835,21 @@ def _run_with_aiagent(
         agent = None
         try:
             _register_aiagent_process_image_gen_providers()
-            agent = AIAgent(**agent_kwargs)
+            try:
+                agent = AIAgent(**agent_kwargs)
+            except TypeError as exc:
+                # Graceful degrade for an older core that does not accept
+                # ``ephemeral_system_prompt``: drop the overlay kwarg and retry so
+                # the run still succeeds (with the normal SOUL persona) rather than
+                # crashing. Any other TypeError re-raises.
+                if "ephemeral_system_prompt" not in str(exc) or "ephemeral_system_prompt" not in agent_kwargs:
+                    raise
+                logger.warning(
+                    "[multitenancy] AIAgent core has no ephemeral_system_prompt; "
+                    "expert overlay skipped this run (profile=%s)", profile_home.name,
+                )
+                agent_kwargs.pop("ephemeral_system_prompt", None)
+                agent = AIAgent(**agent_kwargs)
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,
                 "task_id": str(session_id),

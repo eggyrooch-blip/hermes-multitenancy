@@ -1,0 +1,285 @@
+"""Tests for the expert Role-Override overlay (expert-role-override slug).
+
+Covers:
+  * expert_overlay.resolve_expert + build_role_override_block (resolve + block format)
+  * plugin_ingest experts[] validation + persistence into the managed manifest
+  * GET /api/run-broker/experts aggregation + audience filtering
+
+Hermetic: every test builds a throwaway plugin repo + shared_home under tmp_path
+and points HERMES_SHARED_HOME at it; none touch the real ~/.hermes. The
+INVARIANT under test is that the persona overlay is RESOLVED from disk and
+COMPOSED in-memory — it is never written to SOUL.md.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_multitenancy import expert_overlay as eo
+from hermes_multitenancy import plugin_ingest as pi
+
+
+AGENT_MD = """---
+name: kep-trevi-resource-delivery-expert
+description: 资源投放专家
+---
+
+# 资源投放专家（Resource Delivery Expert）
+
+你是资源投放领域的执行型专家。默认全程 `--env pre` 演练。
+"""
+
+EXPERT_ID = "kep-trevi-resource-delivery-expert"
+
+
+def _plugin_repo(root: Path, *, experts="default", audience=None) -> Path:
+    """Build a plugin repo carrying skills + an agents/*.md persona + experts[]."""
+    skills = ["using-resource-delivery", "kep-trevi-delivery-orchestrate"]
+    for name in skills:
+        sk = root / "skills" / name
+        sk.mkdir(parents=True, exist_ok=True)
+        body = "# x\n"
+        if "orchestrat" in name:
+            body += "Gates: `x approve` requires explicit confirmation.\n"
+        (sk / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}", encoding="utf-8")
+    (root / "agents").mkdir(parents=True, exist_ok=True)
+    (root / "agents" / "kep-trevi-resource-delivery-expert.md").write_text(AGENT_MD, encoding="utf-8")
+
+    if experts == "default":
+        experts = [
+            {
+                "id": EXPERT_ID,
+                "name": "资源投放专家",
+                "title": "资源投放专家",
+                "tagline": "一句话投放意图→选题到复盘全链路",
+                "category": "营销增长",
+                "display_tags": ["资源投放", "圈人"],
+                "featured": True,
+                "agent_md": "./agents/kep-trevi-resource-delivery-expert.md",
+                "skills": skills,
+                "governance": {"env_default": "pre", "approval_required": ["x approve"]},
+                **({"audience": audience} if audience is not None else {}),
+            }
+        ]
+
+    manifest = {
+        "schema": pi.SUPPORTED_SCHEMA,
+        "id": "keep-resource-delivery",
+        "name": "资源投放专家",
+        "version": "0.1.0",
+        "entry_skill": "using-resource-delivery",
+        "skills": {"dir": "./skills/", "list": skills},
+        "install_mode": "copy",
+        "audience": {"department_ids": []},
+        "clis": [],
+        "connectors": [{"id": "kep-cli", "required": True}],
+        "governance": {"env_default": "pre", "approval_required": ["x approve"], "online_requires": "explicit_action"},
+        "persona_policy": "skill_inline",
+    }
+    if experts is not None:
+        manifest["experts"] = experts
+    out = root / pi.PLUGIN_MANIFEST_REL
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return root
+
+
+def _shared_home(root: Path, profile="feishu_test") -> Path:
+    home = root / "hermes_home"
+    (home / "skills").mkdir(parents=True, exist_ok=True)
+    (home / "bin").mkdir(parents=True, exist_ok=True)
+    (home / "profiles" / profile / "skills").mkdir(parents=True, exist_ok=True)
+    return home
+
+
+def _ingest(repo: Path, shared: Path, profile="feishu_test"):
+    return pi.ingest(repo, audience=profile, shared_home=shared, profiles_root=shared / "profiles")
+
+
+# ─────────────────────────── manifest validation ─────────────────────────────
+
+def test_load_manifest_with_experts_ok(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    data = pi.load_plugin_manifest(repo)
+    assert isinstance(data["experts"], list)
+    assert data["experts"][0]["id"] == EXPERT_ID
+
+
+def test_experts_optional_absent_is_fine(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug", experts=None)
+    data = pi.load_plugin_manifest(repo)
+    assert "experts" not in data or not data.get("experts")
+
+
+def test_experts_missing_agent_md_file_rejected(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    # point at a non-existent persona file
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["experts"][0]["agent_md"] = "./agents/nope.md"
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="agent_md"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_experts_agent_md_traversal_rejected(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["experts"][0]["agent_md"] = "../../etc/passwd"
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="agent_md"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_experts_missing_id_rejected(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["experts"][0].pop("id")
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="id"):
+        pi.load_plugin_manifest(repo)
+
+
+def test_experts_duplicate_id_rejected(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text())
+    data["experts"].append(dict(data["experts"][0]))
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(pi.PluginIngestError, match="duplicate"):
+        pi.load_plugin_manifest(repo)
+
+
+# ─────────────────────────── ingest persistence ──────────────────────────────
+
+def test_ingest_persists_experts_and_repo(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    mpath = shared / pi.MANAGED_DIR / "keep-resource-delivery.json"
+    assert mpath.is_file()
+    manifest = json.loads(mpath.read_text())
+    assert manifest["repo"] == str(repo)
+    assert manifest["experts"][0]["id"] == EXPERT_ID
+    # SOUL.md is NEVER created by ingest (persona must not pollute the default agent)
+    assert not (shared / "profiles" / "feishu_test" / "SOUL.md").exists()
+
+
+# ─────────────────────────── resolve + block format ──────────────────────────
+
+def test_resolve_expert_and_block(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    overlay = eo.resolve_expert(profile_home, EXPERT_ID)
+    assert overlay is not None
+    assert overlay.expert_id == EXPERT_ID
+    assert overlay.plugin_id == "keep-resource-delivery"
+    assert "资源投放领域的执行型专家" in overlay.agent_md
+    assert overlay.skills
+
+    block = eo.build_role_override_block(overlay)
+    # preamble leads, persona body present, MUST-OBEY tail closes
+    assert block.startswith("**Role Override:**")
+    assert "优先于任何既有人设" in block
+    assert "资源投放领域的执行型专家" in block
+    assert "最高优先级，必须遵守" in block
+    # the override wording must explicitly demote the Hermes identity
+    assert "Hermes" in block
+
+
+def test_resolve_unknown_expert_is_none(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+    assert eo.resolve_expert(profile_home, "no-such-expert") is None
+    assert eo.resolve_expert(profile_home, "") is None
+    assert eo.role_override_block_for(profile_home, "no-such-expert") is None
+
+
+def test_resolve_failsafe_on_corrupt_manifest(tmp_path, monkeypatch):
+    shared = _shared_home(tmp_path)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    bad = shared / pi.MANAGED_DIR
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "broken.json").write_text("{ not json", encoding="utf-8")
+    # must not raise — corrupt manifest is skipped
+    assert eo.resolve_expert(shared / "profiles" / "feishu_test", EXPERT_ID) is None
+
+
+# ─────────────────────────── /experts aggregation ────────────────────────────
+
+def test_list_experts_aggregation(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+    rows = eo.list_experts(profile_home)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == EXPERT_ID
+    assert row["category"] == "营销增长"
+    assert row["featured"] is True
+    # redacted: no persona body / repo path leaks into the catalog row
+    assert "agent_md" not in row
+    assert all("你是资源投放" not in str(v) for v in row.values())
+
+
+def test_list_experts_audience_filter(tmp_path, monkeypatch):
+    # expert scoped to department 42
+    repo = _plugin_repo(tmp_path / "plug", audience={"department_ids": ["42"]})
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+    # caller in dept 42 sees it; caller in dept 99 does not; unknown dept fails closed
+    assert len(eo.list_experts(profile_home, department_ids=["42"])) == 1
+    assert eo.list_experts(profile_home, department_ids=["99"]) == []
+    assert eo.list_experts(profile_home, department_ids=None) == []
+
+
+def test_experts_endpoint(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy import webui_broker_server as broker
+
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_RUN_BROKER_KEY", raising=False)
+    profile_home = shared / "profiles" / "feishu_test"
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
+
+    async def runner():
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True, sandbox_available=lambda: True
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            resp = await client.get(
+                "/api/run-broker/experts",
+                headers={"X-Hermes-Profile": "feishu_test"},
+            )
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+            return data
+        finally:
+            await client.close()
+
+    data = asyncio.get_event_loop().run_until_complete(runner())
+    assert data["profile_name"] == "feishu_test"
+    assert len(data["experts"]) == 1
+    assert data["experts"][0]["id"] == EXPERT_ID
