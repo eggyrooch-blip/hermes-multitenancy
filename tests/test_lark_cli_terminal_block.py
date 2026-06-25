@@ -133,10 +133,7 @@ def test_strict_off_build_subprocess_env_keeps_existing_path_behavior(monkeypatc
     env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
     path_parts = env["PATH"].split(os.pathsep)
 
-    # kep-cli profile shim is prepended first (always-on, independent of strict mode);
-    # shared_bin sits right behind it and still precedes node_modules.
-    assert path_parts[0] == str(profile_home / "tmp" / "kep-cli-shim")
-    assert path_parts[1] == shared_bin
+    assert path_parts[0] == shared_bin
     assert path_parts.count(shared_bin) == 1
     assert path_parts.index(node_bin) > path_parts.index(shared_bin)
     assert HERMES_LARK_CLI_RUN_TOKEN not in env

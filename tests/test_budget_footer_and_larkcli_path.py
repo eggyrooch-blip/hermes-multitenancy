@@ -112,9 +112,6 @@ def test_shared_bin_precedes_node_modules_in_subprocess_path(monkeypatch, tmp_pa
     env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
     path_parts = env["PATH"].split(os.pathsep)
 
-    # kep-cli profile shim is prepended first (must shadow real kep bins); shared_bin
-    # sits right behind it and still precedes node_modules — the original invariant.
-    assert path_parts[0] == str(profile_home / "tmp" / "kep-cli-shim")
-    assert path_parts[1] == shared_bin
+    assert path_parts[0] == shared_bin
     assert path_parts.count(shared_bin) == 1
     assert path_parts.index(node_bin) > path_parts.index(shared_bin)
