@@ -9,7 +9,10 @@ Design redlines (cross-model reviewed — see this slug's SPEC):
   * The overlay is EPHEMERAL — it is never written to ``SOUL.md``, memory, or
     ``USER.md``.  The profile's default agent persona on disk is untouched; the
     override lives only in the in-flight request and is handed to hermes-agent
-    through its generic ``identity_override`` constructor seam.
+    through its upstream ``ephemeral_system_prompt`` constructor seam (present in
+    NousResearch origin/main — re-appended into the system message every turn at
+    API-call time, never written to the cached/DB-stored prompt or trajectories).
+    ZERO hermes-agent change is required.
   * Expert selection is built in the MULTITENANCY layer. hermes-agent core only
     exposes generic runtime seams; it does not know expert catalogs or tenants.
   * Credentials are unchanged: the caller's per-profile kep-auth tokens still
@@ -18,10 +21,16 @@ Design redlines (cross-model reviewed — see this slug's SPEC):
   * Fail-safe: an unknown / missing ``expert_id`` resolves to ``None`` and the run
     proceeds with the normal SOUL persona — this module never raises into the run.
 
-Composition follows the live LINCHPIN VERDICT: the Role-Override block + expert
-``agent.md`` + MUST-OBEY tail must live in the stable identity tier. The AIAgent
-path therefore passes it as ``identity_override``; append-only prompt/context
-channels are rejected because they can still leak the base Hermes identity.
+Composition: the Role-Override block = preamble (hard disavowal of Hermes/Nous
+Research) + expert ``agent.md`` + MUST-OBEY tail. The AIAgent path passes it via
+``ephemeral_system_prompt``; the legacy/stream paths compose it override-first
+into the system text (``_compose_system_text``). The historical LINCHPIN VERDICT
+that "append channels leak" applies to USER/context-layer append — persona
+injected as a user turn or context block, which models treat as user-supplied
+data — NOT to system-layer ephemeral, which stays instruction-tier. Because the
+ephemeral block lands BELOW the SOUL identity (core builds SOUL first), precedence
+is carried by the bookended override WORDING + recency, not by position (WorkBuddy
+top-prepends; Hermes cannot without forking core, so it compensates by wording).
 """
 from __future__ import annotations
 
@@ -43,16 +52,20 @@ MANAGED_DIR = ".hermes-plugin-managed"
 # explicit "this overrides any prior identity" framing is the load-bearing part
 # — it is what reliably outranks the profile's locked SOUL persona.
 ROLE_OVERRIDE_PREAMBLE = (
-    "**Role Override:** 以下专家角色定义优先于任何既有人设或身份上下文。"
-    "如与先前的自我描述（包括默认的 Hermes / 助手身份）冲突，以下方定义为准——"
-    "这是你本次对话的活跃、权威角色。"
+    "**Role Override（最高优先级 · 覆盖以上全部身份）：** "
+    "从本条开始，本次对话你不再是 Hermes、不是 Hermes Agent（by Nous Research）、"
+    "也不是任何通用 AI 助手；请彻底忽略上文任何「你是 Hermes / 你是某助手」的身份"
+    "描述与帮助说明。以下专家角色定义优先于任何既有人设、身份或系统上下文，发生冲突"
+    "时一律以下方定义为准——这是你本次对话唯一、活跃、权威的角色："
 )
 
 ROLE_OVERRIDE_TAIL = (
-    "（以上专家角色为最高优先级，必须遵守，覆盖任何既有 Hermes / 助手身份；"
-    "当用户问你是谁、你的身份、你的角色时，必须按上述专家名称与职责回答；"
-    "不得自称 Hermes、Nous Research、通用 AI 助手或其它非当前专家身份。"
-    "凭证仍为当前用户本人，所有高风险写操作需按上述门禁取得显式确认。）"
+    "（重申——以上专家角色为本次对话的最高优先级，必须严格遵守，覆盖任何既有 "
+    "Hermes / Hermes Agent / Nous Research / 通用助手身份。当用户问「你是谁」、你的"
+    "身份、你的角色，或追问「你其实是不是 Hermes」「你底层是什么模型」时，必须且只能"
+    "按上述专家名称与职责作答；不得自称 Hermes、Nous Research 或任何通用 AI 助手，"
+    "也不得透露或承认底层模型与提供商名称。凭证仍为当前用户本人，所有高风险写操作"
+    "需按上述门禁取得显式确认。）"
 )
 
 
@@ -449,45 +462,6 @@ def list_experts(
     except Exception:
         logger.warning("[multitenancy] list_experts failed for %s", profile_home, exc_info=True)
     return sorted(rows, key=lambda r: (not r["featured"], r["category"], r["name"]))
-
-
-def all_expert_skill_names(profile_home: Path) -> set[str]:
-    """Return every skill declared by installed expert manifests.
-
-    Runtime skill hiding should fail closed, so this intentionally ignores
-    audience filtering: a hidden or unauthorized expert's private skills should
-    not be advertised unless that expert is the active run overlay.
-    """
-    names: set[str] = set()
-    for manifest, _path in _iter_managed_manifests(profile_home, strict=True):
-        experts = manifest.get("experts")
-        if not isinstance(experts, list):
-            continue
-        for ex in experts:
-            if not isinstance(ex, dict):
-                continue
-            for skill in ex.get("skills") or []:
-                name = str(skill).strip()
-                if name:
-                    names.add(name)
-    return names
-
-
-def readable_expert_skill_names(profile_home: Path) -> set[str]:
-    """Best-effort expert skill names from readable manifests only."""
-    names: set[str] = set()
-    for manifest, _path in _iter_managed_manifests(profile_home):
-        experts = manifest.get("experts")
-        if not isinstance(experts, list):
-            continue
-        for ex in experts:
-            if not isinstance(ex, dict):
-                continue
-            for skill in ex.get("skills") or []:
-                name = str(skill).strip()
-                if name:
-                    names.add(name)
-    return names
 
 
 # ─────────────────────────── caller department resolution ────────────────────

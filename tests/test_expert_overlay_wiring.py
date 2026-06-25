@@ -50,11 +50,11 @@ def test_compose_system_text_with_overlay_leads_with_override(tmp_path, monkeypa
     soul = "你是 Hermes Agent。"
     out = agent_real._compose_system_text(_event(EXPERT_ID), profile_home, soul)
     assert out != soul
-    assert out.startswith("**Role Override:**")          # override leads (verdict B)
+    assert out.startswith("**Role Override")          # override leads (verdict B)
     assert "资源投放领域的执行型专家" in out               # persona present
-    assert out.rstrip().endswith("）") or "必须遵守" in out  # MUST-OBEY tail
+    assert "必须严格遵守" in out                          # MUST-OBEY tail present
     assert soul in out                                    # SOUL demoted below, still present
-    assert out.index("**Role Override:**") < out.index(soul)
+    assert out.index("**Role Override") < out.index(soul)
     # SOUL.md on disk is never written by composition
     assert not (profile_home / "SOUL.md").exists()
 
@@ -91,104 +91,21 @@ def test_apply_expert_id_rejects_unsafe_and_clears_blank():
     assert "expert_id" not in md2  # blank clears → no overlay
 
 
-def test_expert_skill_runtime_env_disables_inactive_expert_skills(tmp_path, monkeypatch):
-    repo = _plugin_repo(tmp_path / "plug")
-    other_skill = repo / "skills" / "other-private-skill"
-    other_skill.mkdir(parents=True)
-    (other_skill / "SKILL.md").write_text("---\nname: other-private-skill\n---\n# other\n", encoding="utf-8")
-    other_agent = repo / "agents" / "other-expert.md"
-    other_agent.write_text("# 其它专家\n", encoding="utf-8")
-    manifest_path = repo / ".hermes-plugin" / "plugin.json"
-    data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    data["skills"]["list"].append("other-private-skill")
-    data["experts"].append(
-        {
-            "id": "other-expert",
-            "name": "其它专家",
-            "agent_md": "./agents/other-expert.md",
-            "skills": ["other-private-skill"],
-        }
+def test_core_aiagent_exposes_ephemeral_system_prompt_seam():
+    """CI guard against silent no-op: the 0-core-change identity seam must EXIST.
+
+    We dropped the fail-closed ``identity_override`` guard, so a core that lacked
+    ``ephemeral_system_prompt`` would SILENTLY drop the expert override instead of
+    raising. Assert the seam is present on the core actually installed here
+    (NousResearch upstream carries it at run_agent.py:376), catching the
+    silent-noop regression before it reaches a real run.
+    """
+    import inspect as _inspect
+
+    import run_agent
+
+    params = _inspect.signature(run_agent.AIAgent.__init__).parameters
+    assert "ephemeral_system_prompt" in params, (
+        "installed hermes-agent core lacks ephemeral_system_prompt — expert "
+        "Role-Override would silently no-op; do NOT ship against this core"
     )
-    manifest_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-
-    shared = _shared_home(tmp_path)
-    _ingest(repo, shared)
-    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
-    profile_home = shared / "profiles" / "feishu_test"
-
-    no_expert = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
-    assert set(no_expert["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {
-        "using-resource-delivery",
-        "kep-trevi-delivery-orchestrate",
-        "other-private-skill",
-    }
-
-    active = agent_real._expert_skill_runtime_env_for_event(_event(EXPERT_ID), profile_home)
-    assert active == {"HERMES_DISABLED_SKILLS_EXTRA": "other-private-skill"}
-
-    unknown = agent_real._expert_skill_runtime_env_for_event(_event("missing-expert"), profile_home)
-    assert set(unknown["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {
-        "using-resource-delivery",
-        "kep-trevi-delivery-orchestrate",
-        "other-private-skill",
-    }
-
-
-def test_expert_skill_runtime_env_fail_closed_on_manifest_error(tmp_path, monkeypatch):
-    shared = _shared_home(tmp_path)
-    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
-    profile_home = shared / "profiles" / "feishu_test"
-    skill_root = profile_home / "skills"
-    (skill_root / "private-a").mkdir(parents=True)
-    (skill_root / "private-a" / "SKILL.md").write_text("---\nname: private-a\n---\n", encoding="utf-8")
-    (skill_root / "private-b").mkdir(parents=True)
-    (skill_root / "private-b" / "SKILL.md").write_text("---\nname: private-b\n---\n", encoding="utf-8")
-
-    managed = shared / ".hermes-plugin-managed"
-    managed.mkdir(parents=True)
-    (managed / "broken.json").write_text("{not-json", encoding="utf-8")
-
-    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
-
-    assert set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {"private-a", "private-b"}
-
-
-def test_expert_skill_runtime_env_manifest_error_prefers_readable_expert_names(tmp_path, monkeypatch):
-    repo = _plugin_repo(tmp_path / "plug")
-    shared = _shared_home(tmp_path)
-    _ingest(repo, shared)
-    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
-    profile_home = shared / "profiles" / "feishu_test"
-
-    non_expert = profile_home / "skills" / "ordinary-skill"
-    non_expert.mkdir(parents=True)
-    (non_expert / "SKILL.md").write_text("---\nname: ordinary-skill\n---\n", encoding="utf-8")
-
-    managed = shared / ".hermes-plugin-managed"
-    (managed / "broken.json").write_text("{not-json", encoding="utf-8")
-
-    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
-    disabled = set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(","))
-
-    assert "using-resource-delivery" in disabled
-    assert "kep-trevi-delivery-orchestrate" in disabled
-    assert "ordinary-skill" not in disabled
-
-
-def test_expert_skill_runtime_env_manifest_absent_does_not_disable_profile_skills(tmp_path, monkeypatch):
-    shared = _shared_home(tmp_path)
-    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
-    profile_home = shared / "profiles" / "feishu_test"
-    skill_root = profile_home / "skills"
-    (skill_root / "private-a").mkdir(parents=True)
-    (skill_root / "private-a" / "SKILL.md").write_text("---\nname: private-a\n---\n", encoding="utf-8")
-    (skill_root / "ordinary-skill").mkdir(parents=True)
-    (skill_root / "ordinary-skill" / "SKILL.md").write_text("---\nname: ordinary-skill\n---\n", encoding="utf-8")
-    (skill_root / ".hermes-personal-installs.json").write_text(
-        json.dumps({"version": 1, "skills": {"private-a": {"source": "personal"}}}),
-        encoding="utf-8",
-    )
-
-    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
-
-    assert env == {}

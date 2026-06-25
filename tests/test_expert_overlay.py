@@ -188,15 +188,19 @@ def test_resolve_expert_and_block(tmp_path, monkeypatch):
 
     block = eo.build_role_override_block(overlay)
     # preamble leads, persona body present, MUST-OBEY tail closes
-    assert block.startswith("**Role Override:**")
+    assert block.startswith("**Role Override")
     assert "优先于任何既有人设" in block
     assert "资源投放领域的执行型专家" in block
-    assert "最高优先级，必须遵守" in block
+    assert "必须严格遵守" in block
     # the override wording must explicitly demote the Hermes identity
     assert "Hermes" in block
-    assert "当用户问你是谁" in block
+    assert "你是谁" in block
     assert "不得自称 Hermes" in block
     assert "Nous Research" in block
+    # bottom-placement compensator (ephemeral lands BELOW SOUL): the block must
+    # OPEN with a hard disavowal of the base identity, naming the exact strings.
+    assert "不再是 Hermes" in block
+    assert "Hermes Agent" in block
 
 
 def test_resolve_unknown_expert_is_none(tmp_path, monkeypatch):

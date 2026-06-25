@@ -34,7 +34,6 @@ import uuid
 import re
 import secrets
 import importlib
-import inspect
 import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -558,112 +557,6 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
             expert_id, exc_info=True,
         )
         return None
-
-
-def _parse_csv_env_names(value: str) -> set[str]:
-    names: set[str] = set()
-    for line in str(value or "").splitlines():
-        for item in line.split(","):
-            name = item.strip()
-            if name:
-                names.add(name)
-    return names
-
-
-def _installed_profile_skill_names(profile_home: Path) -> set[str]:
-    """Best-effort fail-closed skill list for expert gating errors."""
-    personal_manifest = Path(profile_home).expanduser() / "skills" / ".hermes-personal-installs.json"
-    try:
-        data = json.loads(personal_manifest.read_text(encoding="utf-8"))
-        skills = data.get("skills") if isinstance(data, dict) else None
-        if isinstance(skills, dict):
-            return {str(name).strip() for name in skills if str(name).strip()}
-    except (OSError, json.JSONDecodeError):
-        pass
-
-    names: set[str] = set()
-    skills_root = Path(profile_home).expanduser() / "skills"
-    try:
-        for child in skills_root.iterdir():
-            if child.name.startswith("."):
-                continue
-            if child.is_dir() or child.is_symlink():
-                names.add(child.name)
-    except OSError:
-        logger.warning(
-            "[multitenancy] could not enumerate profile skills for fail-closed expert gating: %s",
-            skills_root,
-            exc_info=True,
-        )
-    return names
-
-
-def _disabled_skills_runtime_env(disabled: set[str]) -> dict[str, str]:
-    disabled = set(disabled) | _parse_csv_env_names(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA", ""))
-    if not disabled:
-        return {}
-    return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
-
-
-def _aiagent_supports_identity_override(aiagent_cls: Any) -> bool:
-    try:
-        signature = inspect.signature(aiagent_cls)
-    except (TypeError, ValueError):
-        # Unknown callable shape: try the modern kwarg and let construction
-        # fail closed instead of silently downgrading expert identity injection.
-        return True
-    if "identity_override" in signature.parameters:
-        return True
-    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
-
-
-def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
-    """Return per-run env that hides inactive expert skills.
-
-    Expert skill files are installed long-term under the profile, but WorkBuddy
-    semantics are session-scoped: only the active expert's private skills should
-    be advertised/loadable in this run. Hermes core consumes
-    ``HERMES_DISABLED_SKILLS_EXTRA`` as a generic disabled-skill overlay.
-    """
-    try:
-        from .expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
-
-        all_expert_skills = all_expert_skill_names(profile_home)
-        if not all_expert_skills:
-            return {}
-
-        active_skills: set[str] = set()
-        expert_id = _expert_id_for_event(event)
-        if expert_id:
-            try:
-                sender_open_id = _resolve_subprocess_sender_open_id(event) or None
-            except Exception:
-                sender_open_id = None
-            overlay = resolve_expert(
-                profile_home,
-                expert_id,
-                department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
-            )
-            if overlay is not None:
-                active_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
-
-        return _disabled_skills_runtime_env(all_expert_skills - active_skills)
-    except Exception:
-        logger.warning(
-            "[multitenancy] expert skill runtime scope failed for %s; using fail-closed skill fallback",
-            profile_home,
-            exc_info=True,
-        )
-        fallback_names: set[str] = set()
-        try:
-            from .expert_overlay import readable_expert_skill_names
-
-            fallback_names = readable_expert_skill_names(profile_home)
-        except Exception:
-            logger.debug("[multitenancy] readable expert skill fallback failed", exc_info=True)
-        if not fallback_names:
-            fallback_names = _installed_profile_skill_names(profile_home)
-        return _disabled_skills_runtime_env(fallback_names)
 
 
 def _expert_skill_dirs_for_event(event: Any, profile_home: Path) -> list[Path]:
@@ -5070,27 +4963,34 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
-        # Expert Role-Override overlay (ephemeral, this run only). This must be
-        # a stable-tier identity override in hermes-agent core, not an appended
-        # system_message/context block; otherwise SOUL/default identity can still
-        # win "who are you" questions.
+        # Expert Role-Override overlay (ephemeral, this run only). Rides the
+        # UPSTREAM ``ephemeral_system_prompt`` constructor kwarg: core re-appends
+        # it to the system message every turn at API-call time and NEVER writes it
+        # to the cached/DB-stored prompt or trajectories (run_agent.py:6208,12746).
+        # That makes the overlay switch per-run/per-expert, survive the gateway's
+        # fresh-AIAgent-per-message model, and support mid-conversation switching —
+        # all with ZERO hermes-agent change (``ephemeral_system_prompt`` is in
+        # NousResearch origin/main, so prod honors it without any core fork).
+        #
+        # The block lands BELOW the SOUL/base identity tier (core builds SOUL
+        # first), so precedence is carried by the bookended Role-Override WORDING
+        # (ROLE_OVERRIDE_PREAMBLE/TAIL — explicit disavowal of Hermes/Nous
+        # Research), not by position. The previously-wired ``identity_override``
+        # kwarg required FORKING core and would RAISE on upstream (see SPEC dead
+        # ends); it is gone.
         _role_override = _role_override_block_for_event(event, profile_home)
         if _role_override:
-            if not _aiagent_supports_identity_override(AIAgent):
-                raise RuntimeError(
-                    "Hermes core does not support identity_override; "
-                    "expert Role Override cannot run safely"
-                )
-            agent_kwargs["identity_override"] = _role_override
+            agent_kwargs["ephemeral_system_prompt"] = _role_override
 
         approval_cleanup = _configure_gateway_approval_bridge(
             event_sink,
             str(gateway_session_key),
         )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
-            profile_home,
-            extra_env=_expert_skill_runtime_env_for_event(event, profile_home),
-        )
+        # Skill scope is purely ADDITIVE (active expert's dirs via
+        # _apply_expert_skill_scope_for_aiagent below). No subtractive
+        # HERMES_DISABLED_SKILLS_EXTRA hiding — that altered NON-expert runs and
+        # has no WorkBuddy analogue (WorkBuddy registers skills additively).
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
         expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
