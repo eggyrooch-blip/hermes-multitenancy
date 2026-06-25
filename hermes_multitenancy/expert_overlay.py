@@ -67,6 +67,7 @@ class ExpertOverlay:
     agent_md: str
     plugin_id: str = ""
     skills: list[str] = field(default_factory=list)
+    skill_dirs: list[Path] = field(default_factory=list)
     governance: dict[str, Any] = field(default_factory=dict)
     audience: dict[str, Any] = field(default_factory=dict)
 
@@ -172,6 +173,43 @@ def _read_agent_md(manifest: dict[str, Any], expert: dict[str, Any]) -> Optional
     return text or None
 
 
+def _repo_root(manifest: dict[str, Any]) -> Optional[Path]:
+    repo_raw = str(manifest.get("repo") or "").strip()
+    if not repo_raw:
+        return None
+    try:
+        return Path(repo_raw).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _expert_skill_dirs(manifest: dict[str, Any], skills: list[str]) -> list[Path]:
+    """Return declared expert skill directories, constrained to the plugin repo."""
+    repo = _repo_root(manifest)
+    if repo is None:
+        return []
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for skill in skills:
+        rel = str(skill or "").strip()
+        if not rel:
+            continue
+        candidate = repo / "skills" / rel
+        try:
+            resolved = candidate.resolve()
+            if os.path.commonpath([str(resolved), str(repo)]) != str(repo):
+                logger.warning("[multitenancy] expert skill path escapes repo: %r", rel)
+                continue
+        except (OSError, ValueError):
+            continue
+        if resolved in seen:
+            continue
+        if (resolved / "SKILL.md").is_file():
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
 # ─────────────────────────── public API ──────────────────────────────────────
 
 def _caller_profile_name(profile_home: Path) -> str:
@@ -239,12 +277,14 @@ def resolve_expert(
                 skills = expert.get("skills")
                 gov = expert.get("governance")
                 aud = expert.get("audience")
+                skill_names = [str(s) for s in skills] if isinstance(skills, list) else []
                 return ExpertOverlay(
                     expert_id=eid,
                     name=str(expert.get("name") or expert.get("title") or eid),
                     agent_md=agent_md,
                     plugin_id=str(manifest.get("plugin_id") or ""),
-                    skills=[str(s) for s in skills] if isinstance(skills, list) else [],
+                    skills=skill_names,
+                    skill_dirs=_expert_skill_dirs(manifest, skill_names),
                     governance=dict(gov) if isinstance(gov, dict) else {},
                     audience=dict(aud) if isinstance(aud, dict) else {},
                 )
@@ -422,6 +462,23 @@ def all_expert_skill_names(profile_home: Path) -> set[str]:
     """
     names: set[str] = set()
     for manifest, _path in _iter_managed_manifests(profile_home, strict=True):
+        experts = manifest.get("experts")
+        if not isinstance(experts, list):
+            continue
+        for ex in experts:
+            if not isinstance(ex, dict):
+                continue
+            for skill in ex.get("skills") or []:
+                name = str(skill).strip()
+                if name:
+                    names.add(name)
+    return names
+
+
+def readable_expert_skill_names(profile_home: Path) -> set[str]:
+    """Best-effort expert skill names from readable manifests only."""
+    names: set[str] = set()
+    for manifest, _path in _iter_managed_manifests(profile_home):
         experts = manifest.get("experts")
         if not isinstance(experts, list):
             continue

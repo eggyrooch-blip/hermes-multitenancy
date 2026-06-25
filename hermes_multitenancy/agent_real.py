@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import hashlib
@@ -625,11 +626,145 @@ def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[
         return _disabled_skills_runtime_env(all_expert_skills - active_skills)
     except Exception:
         logger.warning(
-            "[multitenancy] expert skill runtime scope failed for %s; disabling installed profile skills",
+            "[multitenancy] expert skill runtime scope failed for %s; using fail-closed skill fallback",
             profile_home,
             exc_info=True,
         )
-        return _disabled_skills_runtime_env(_installed_profile_skill_names(profile_home))
+        fallback_names: set[str] = set()
+        try:
+            from .expert_overlay import readable_expert_skill_names
+
+            fallback_names = readable_expert_skill_names(profile_home)
+        except Exception:
+            logger.debug("[multitenancy] readable expert skill fallback failed", exc_info=True)
+        if not fallback_names:
+            fallback_names = _installed_profile_skill_names(profile_home)
+        return _disabled_skills_runtime_env(fallback_names)
+
+
+def _expert_skill_dirs_for_event(event: Any, profile_home: Path) -> list[Path]:
+    """Return active expert skill dirs for this run.
+
+    Expert skills stay installed in the plugin repo, outside the profile's
+    default ``skills/`` scan root. Selecting an expert exposes only that
+    expert's declared skill dirs via a temporary external skill root for this
+    AIAgent subprocess.
+    """
+    expert_id = _expert_id_for_event(event)
+    if not expert_id:
+        return []
+    try:
+        from .expert_overlay import resolve_caller_departments, resolve_expert
+
+        try:
+            sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+        except Exception:
+            sender_open_id = None
+        overlay = resolve_expert(
+            profile_home,
+            expert_id,
+            department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
+        )
+        if overlay is None:
+            return []
+        return [
+            Path(p)
+            for p in getattr(overlay, "skill_dirs", [])
+            if (Path(p) / "SKILL.md").is_file()
+        ]
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert skill dir resolution failed for %s; running without expert skills",
+            profile_home,
+            exc_info=True,
+        )
+        return []
+
+
+def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
+    """Temporarily add active expert skills to Hermes core's external skill dirs."""
+    skill_dirs = _expert_skill_dirs_for_event(event, profile_home)
+    if not skill_dirs:
+        return lambda: None
+
+    tmp = tempfile.TemporaryDirectory(prefix=f"hermes-expert-skills-{profile_home.name}-")
+    tmp_root = Path(tmp.name)
+    copied = False
+    try:
+        for src in skill_dirs:
+            dst = tmp_root / src.name
+            if dst.exists():
+                continue
+            shutil.copytree(src, dst)
+            copied = True
+    except Exception:
+        logger.warning(
+            "[multitenancy] failed to prepare temporary expert skill root for %s",
+            profile_home,
+            exc_info=True,
+        )
+        tmp.cleanup()
+        return lambda: None
+
+    if not copied:
+        tmp.cleanup()
+        return lambda: None
+
+    try:
+        import agent.skill_utils as skill_utils
+    except Exception:
+        logger.warning("[multitenancy] could not patch expert skill dirs into Hermes core", exc_info=True)
+        tmp.cleanup()
+        return lambda: None
+
+    original_external = getattr(skill_utils, "get_external_skills_dirs", None)
+    original_all = getattr(skill_utils, "get_all_skills_dirs", None)
+
+    def _with_expert_external_dirs() -> list[Path]:
+        dirs = list(original_external() if callable(original_external) else [])
+        if tmp_root not in dirs:
+            dirs.append(tmp_root)
+        return dirs
+
+    def _with_expert_all_dirs() -> list[Path]:
+        dirs = list(original_all() if callable(original_all) else [])
+        if tmp_root not in dirs:
+            dirs.append(tmp_root)
+        return dirs
+
+    skill_utils.get_external_skills_dirs = _with_expert_external_dirs
+    skill_utils.get_all_skills_dirs = _with_expert_all_dirs
+
+    patched_module_attrs: list[tuple[Any, str, Any]] = []
+    for module_name, attr, replacement in (
+        ("agent.prompt_builder", "get_external_skills_dirs", _with_expert_external_dirs),
+        ("agent.prompt_builder", "get_all_skills_dirs", _with_expert_all_dirs),
+        ("agent.skill_commands", "get_external_skills_dirs", _with_expert_external_dirs),
+        ("agent.skill_commands", "get_all_skills_dirs", _with_expert_all_dirs),
+    ):
+        module = sys.modules.get(module_name)
+        if module is None or not hasattr(module, attr):
+            continue
+        patched_module_attrs.append((module, attr, getattr(module, attr)))
+        setattr(module, attr, replacement)
+
+    logger.info(
+        "[multitenancy] expert skill scope active profile=%s skills=%s temp_root=%s",
+        profile_home.name,
+        [p.name for p in skill_dirs],
+        tmp_root,
+    )
+
+    def _cleanup() -> None:
+        if callable(original_external):
+            skill_utils.get_external_skills_dirs = original_external
+        if callable(original_all):
+            skill_utils.get_all_skills_dirs = original_all
+        for module, attr, original in patched_module_attrs:
+            setattr(module, attr, original)
+        tmp.cleanup()
+
+    return _cleanup
 
 
 def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:

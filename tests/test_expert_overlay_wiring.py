@@ -151,3 +151,25 @@ def test_expert_skill_runtime_env_fail_closed_on_manifest_error(tmp_path, monkey
     env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
 
     assert set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {"private-a", "private-b"}
+
+
+def test_expert_skill_runtime_env_manifest_error_prefers_readable_expert_names(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    non_expert = profile_home / "skills" / "ordinary-skill"
+    non_expert.mkdir(parents=True)
+    (non_expert / "SKILL.md").write_text("---\nname: ordinary-skill\n---\n", encoding="utf-8")
+
+    managed = shared / ".hermes-plugin-managed"
+    (managed / "broken.json").write_text("{not-json", encoding="utf-8")
+
+    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
+    disabled = set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(","))
+
+    assert "using-resource-delivery" in disabled
+    assert "kep-trevi-delivery-orchestrate" in disabled
+    assert "ordinary-skill" not in disabled
