@@ -111,7 +111,7 @@ def test_core_aiagent_exposes_ephemeral_system_prompt_seam():
     )
 
 
-def test_expert_skill_runtime_env_disables_inactive_expert_skills(tmp_path, monkeypatch):
+def test_expert_disabled_skill_names_excludes_only_active_expert(tmp_path, monkeypatch):
     repo = _plugin_repo(tmp_path / "plug")
     other_skill = repo / "skills" / "other-private-skill"
     other_skill.mkdir(parents=True)
@@ -136,25 +136,25 @@ def test_expert_skill_runtime_env_disables_inactive_expert_skills(tmp_path, monk
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
     profile_home = shared / "profiles" / "feishu_test"
 
-    no_expert = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
-    assert set(no_expert["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {
+    # non-expert run hides ALL expert skills (byte-identical catalog)
+    assert agent_real._expert_disabled_skill_names_for_event(_event(), profile_home) == {
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+        "other-private-skill",
+    }
+    # active expert hides only OTHER experts' skills
+    assert agent_real._expert_disabled_skill_names_for_event(_event(EXPERT_ID), profile_home) == {
+        "other-private-skill",
+    }
+    # unknown expert → no active set → hide all (fail-closed)
+    assert agent_real._expert_disabled_skill_names_for_event(_event("missing-expert"), profile_home) == {
         "using-resource-delivery",
         "kep-trevi-delivery-orchestrate",
         "other-private-skill",
     }
 
-    active = agent_real._expert_skill_runtime_env_for_event(_event(EXPERT_ID), profile_home)
-    assert active == {"HERMES_DISABLED_SKILLS_EXTRA": "other-private-skill"}
 
-    unknown = agent_real._expert_skill_runtime_env_for_event(_event("missing-expert"), profile_home)
-    assert set(unknown["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {
-        "using-resource-delivery",
-        "kep-trevi-delivery-orchestrate",
-        "other-private-skill",
-    }
-
-
-def test_expert_skill_runtime_env_fail_closed_on_manifest_error(tmp_path, monkeypatch):
+def test_expert_disabled_skill_names_fail_closed_on_manifest_error(tmp_path, monkeypatch):
     shared = _shared_home(tmp_path)
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
     profile_home = shared / "profiles" / "feishu_test"
@@ -168,12 +168,13 @@ def test_expert_skill_runtime_env_fail_closed_on_manifest_error(tmp_path, monkey
     managed.mkdir(parents=True)
     (managed / "broken.json").write_text("{not-json", encoding="utf-8")
 
-    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
+    assert agent_real._expert_disabled_skill_names_for_event(_event(), profile_home) == {
+        "private-a",
+        "private-b",
+    }
 
-    assert set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {"private-a", "private-b"}
 
-
-def test_expert_skill_runtime_env_manifest_error_prefers_readable_expert_names(tmp_path, monkeypatch):
+def test_expert_disabled_skill_names_manifest_error_prefers_readable_expert_names(tmp_path, monkeypatch):
     repo = _plugin_repo(tmp_path / "plug")
     shared = _shared_home(tmp_path)
     _ingest(repo, shared)
@@ -187,15 +188,14 @@ def test_expert_skill_runtime_env_manifest_error_prefers_readable_expert_names(t
     managed = shared / ".hermes-plugin-managed"
     (managed / "broken.json").write_text("{not-json", encoding="utf-8")
 
-    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
-    disabled = set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(","))
+    disabled = agent_real._expert_disabled_skill_names_for_event(_event(), profile_home)
 
     assert "using-resource-delivery" in disabled
     assert "kep-trevi-delivery-orchestrate" in disabled
     assert "ordinary-skill" not in disabled
 
 
-def test_expert_skill_runtime_env_manifest_absent_does_not_disable_profile_skills(tmp_path, monkeypatch):
+def test_expert_disabled_skill_names_manifest_absent_returns_empty(tmp_path, monkeypatch):
     shared = _shared_home(tmp_path)
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
     profile_home = shared / "profiles" / "feishu_test"
@@ -209,6 +209,44 @@ def test_expert_skill_runtime_env_manifest_absent_does_not_disable_profile_skill
         encoding="utf-8",
     )
 
-    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
+    assert agent_real._expert_disabled_skill_names_for_event(_event(), profile_home) == set()
 
-    assert env == {}
+
+def test_core_get_disabled_skill_names_is_a_valid_monkeypatch_target():
+    """CI guard: 能力随专家私有 is enforced by monkeypatching get_disabled_skill_names
+    (upstream core ignores HERMES_DISABLED_SKILLS_EXTRA). If core renames/removes
+    this function the hiding would silently no-op → assert the seam exists on the
+    installed core so the build fails loudly instead of leaking."""
+    import agent.prompt_builder as prompt_builder
+    import agent.skill_utils as skill_utils
+
+    assert callable(getattr(skill_utils, "get_disabled_skill_names", None))
+    # prompt_builder binds it by name (from agent.skill_utils import get_disabled_skill_names)
+    assert callable(getattr(prompt_builder, "get_disabled_skill_names", None))
+
+
+def test_expert_skill_scope_hides_inactive_skills_end_to_end(tmp_path, monkeypatch):
+    """End-to-end against the REAL installed core: applying the scope makes
+    prompt_builder.get_disabled_skill_names() actually EXCLUDE non-active expert
+    skills (proves the fix works on upstream, not just the abandoned fork)."""
+    import agent.prompt_builder as prompt_builder
+
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    # before scope: expert skills are NOT disabled (would be visible to every run)
+    assert "using-resource-delivery" not in set(prompt_builder.get_disabled_skill_names())
+
+    cleanup = agent_real._apply_expert_skill_scope_for_aiagent(_event(), profile_home)  # non-expert run
+    try:
+        hidden = set(prompt_builder.get_disabled_skill_names())
+        assert "using-resource-delivery" in hidden
+        assert "kep-trevi-delivery-orchestrate" in hidden
+    finally:
+        cleanup()
+
+    # cleanup restores the original behavior (no leak of the patch)
+    assert "using-resource-delivery" not in set(prompt_builder.get_disabled_skill_names())

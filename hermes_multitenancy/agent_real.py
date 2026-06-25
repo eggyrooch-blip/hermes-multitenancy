@@ -559,16 +559,6 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
         return None
 
 
-def _parse_csv_env_names(value: str) -> set[str]:
-    names: set[str] = set()
-    for line in str(value or "").splitlines():
-        for item in line.split(","):
-            name = item.strip()
-            if name:
-                names.add(name)
-    return names
-
-
 def _installed_profile_skill_names(profile_home: Path) -> set[str]:
     """Best-effort fail-closed skill list for expert gating errors."""
     personal_manifest = Path(profile_home).expanduser() / "skills" / ".hermes-personal-installs.json"
@@ -597,33 +587,28 @@ def _installed_profile_skill_names(profile_home: Path) -> set[str]:
     return names
 
 
-def _disabled_skills_runtime_env(disabled: set[str]) -> dict[str, str]:
-    disabled = set(disabled) | _parse_csv_env_names(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA", ""))
-    if not disabled:
-        return {}
-    return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
+def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> set[str]:
+    """Names of expert skills to HIDE for this run (能力随专家私有).
 
+    Returns every expert-declared skill EXCEPT the ACTIVE expert's own — so a
+    non-expert run hides ALL expert skills (keeping its skill catalog
+    byte-identical) and an expert run hides only OTHER experts' skills.
 
-def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
-    """Return per-run env that hides inactive expert skills (能力随专家私有).
+    Applied by monkeypatching core's ``get_disabled_skill_names`` (see
+    ``_apply_expert_skill_scope_for_aiagent``), NOT via
+    ``HERMES_DISABLED_SKILLS_EXTRA``: upstream/prod core reads disabled skills
+    from ``config.yaml`` ONLY and ignores that env var (it is honored solely by
+    the abandoned fork core), so the env path is a silent no-op on prod.
 
-    Expert skills are installed into the profile ``skills/`` scan root by the
-    ingester (``plugin_ingest._install_skills_to_profile``; the governance check
-    ``assert_profile_governance`` REQUIRES the entry+orchestrate skills to be
-    present there). WorkBuddy-style scoping is session-level: only the ACTIVE
-    expert's private skills should be advertised/loadable in this run; every other
-    expert's skills (and ALL of them on a non-expert run) must be hidden so the
-    non-expert path stays byte-identical. Hermes core consumes
-    ``HERMES_DISABLED_SKILLS_EXTRA`` as a generic disabled-skill overlay; this is
-    subprocess-local (the run is a fresh ``asyncio.create_subprocess_exec`` child),
-    so it never leaks across the 1279 profiles.
+    Fail-closed: on any resolution error, hide a best-effort superset rather than
+    leak. Returns an empty set when there are no expert manifests at all.
     """
     try:
         from .expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
 
         all_expert_skills = all_expert_skill_names(profile_home)
         if not all_expert_skills:
-            return {}
+            return set()
 
         active_skills: set[str] = set()
         expert_id = _expert_id_for_event(event)
@@ -640,10 +625,10 @@ def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[
             if overlay is not None:
                 active_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
 
-        return _disabled_skills_runtime_env(all_expert_skills - active_skills)
+        return all_expert_skills - active_skills
     except Exception:
         logger.warning(
-            "[multitenancy] expert skill runtime scope failed for %s; using fail-closed skill fallback",
+            "[multitenancy] expert disabled-skill scope failed for %s; using fail-closed fallback",
             profile_home,
             exc_info=True,
         )
@@ -656,7 +641,7 @@ def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[
             logger.debug("[multitenancy] readable expert skill fallback failed", exc_info=True)
         if not fallback_names:
             fallback_names = _installed_profile_skill_names(profile_home)
-        return _disabled_skills_runtime_env(fallback_names)
+        return fallback_names
 
 
 def _expert_skill_dirs_for_event(event: Any, profile_home: Path) -> list[Path]:
@@ -699,85 +684,152 @@ def _expert_skill_dirs_for_event(event: Any, profile_home: Path) -> list[Path]:
 
 
 def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
-    """Temporarily add active expert skills to Hermes core's external skill dirs."""
+    """Scope skills for this run to 能力随专家私有, with ZERO hermes-agent change.
+
+    Two subprocess-local monkeypatches against Hermes core (the run is a fresh
+    ``asyncio.create_subprocess_exec`` child, so these module-global patches can
+    never leak across the 1279 profiles):
+
+      * ADD the active expert's private skill dirs to the external skill roots —
+        so an experts-only skill that is NOT in the profile scan root is still
+        loadable for the active expert.
+      * HIDE every NON-active expert skill via ``get_disabled_skill_names`` — this
+        is what actually enforces privacy on UPSTREAM/prod core, which reads
+        disabled skills from ``config.yaml`` only and IGNORES
+        ``HERMES_DISABLED_SKILLS_EXTRA`` (that env is honored solely by the
+        abandoned fork core; relying on it silently leaks on prod). On a
+        non-expert run every expert skill is hidden → byte-identical catalog.
+
+    Returns a cleanup that restores all patches. No-op only when there is nothing
+    to add AND nothing to hide (no expert manifests installed).
+    """
+    disabled = _expert_disabled_skill_names_for_event(event, profile_home)
     skill_dirs = _expert_skill_dirs_for_event(event, profile_home)
-    if not skill_dirs:
+    if not disabled and not skill_dirs:
         return lambda: None
 
-    tmp = tempfile.TemporaryDirectory(prefix=f"hermes-expert-skills-{profile_home.name}-")
-    tmp_root = Path(tmp.name)
-    copied = False
-    try:
-        for src in skill_dirs:
-            dst = tmp_root / src.name
-            if dst.exists():
-                continue
-            shutil.copytree(src, dst)
-            copied = True
-    except Exception:
-        logger.warning(
-            "[multitenancy] failed to prepare temporary expert skill root for %s",
-            profile_home,
-            exc_info=True,
-        )
-        tmp.cleanup()
-        return lambda: None
+    # Materialize the active expert's skill dirs into a temp external root (additive).
+    tmp = None
+    tmp_root: Optional[Path] = None
+    if skill_dirs:
+        tmp = tempfile.TemporaryDirectory(prefix=f"hermes-expert-skills-{profile_home.name}-")
+        candidate_root = Path(tmp.name)
+        copied = False
+        try:
+            for src in skill_dirs:
+                dst = candidate_root / src.name
+                if dst.exists():
+                    continue
+                shutil.copytree(src, dst)
+                copied = True
+        except Exception:
+            logger.warning(
+                "[multitenancy] failed to prepare temporary expert skill root for %s",
+                profile_home,
+                exc_info=True,
+            )
+            tmp.cleanup()
+            tmp = None
+        else:
+            if copied:
+                tmp_root = candidate_root
+            else:
+                tmp.cleanup()
+                tmp = None
 
-    if not copied:
-        tmp.cleanup()
+    if not disabled and tmp_root is None:
         return lambda: None
 
     _EXPERT_SKILL_SCOPE_LOCK.acquire()
     try:
         import agent.skill_utils as skill_utils
     except Exception:
-        logger.warning("[multitenancy] could not patch expert skill dirs into Hermes core", exc_info=True)
+        logger.warning("[multitenancy] could not patch expert skill scope into Hermes core", exc_info=True)
         _EXPERT_SKILL_SCOPE_LOCK.release()
-        tmp.cleanup()
+        if tmp is not None:
+            tmp.cleanup()
         return lambda: None
 
+    patched_module_attrs: list[tuple[Any, str, Any]] = []
+    original_external = None
+    original_all = None
+    original_disabled = None
     try:
-        original_external = getattr(skill_utils, "get_external_skills_dirs", None)
-        original_all = getattr(skill_utils, "get_all_skills_dirs", None)
+        # ── additive: expose the active expert's skill dirs ──
+        if tmp_root is not None:
+            original_external = getattr(skill_utils, "get_external_skills_dirs", None)
+            original_all = getattr(skill_utils, "get_all_skills_dirs", None)
+            _add_root = tmp_root
 
-        def _with_expert_external_dirs() -> list[Path]:
-            dirs = list(original_external() if callable(original_external) else [])
-            if tmp_root not in dirs:
-                dirs.append(tmp_root)
-            return dirs
+            def _with_expert_external_dirs(_orig=original_external, _root=_add_root) -> list[Path]:
+                dirs = list(_orig() if callable(_orig) else [])
+                if _root not in dirs:
+                    dirs.append(_root)
+                return dirs
 
-        def _with_expert_all_dirs() -> list[Path]:
-            dirs = list(original_all() if callable(original_all) else [])
-            if tmp_root not in dirs:
-                dirs.append(tmp_root)
-            return dirs
+            def _with_expert_all_dirs(_orig=original_all, _root=_add_root) -> list[Path]:
+                dirs = list(_orig() if callable(_orig) else [])
+                if _root not in dirs:
+                    dirs.append(_root)
+                return dirs
 
-        skill_utils.get_external_skills_dirs = _with_expert_external_dirs
-        skill_utils.get_all_skills_dirs = _with_expert_all_dirs
+            if callable(original_external):
+                skill_utils.get_external_skills_dirs = _with_expert_external_dirs
+            if callable(original_all):
+                skill_utils.get_all_skills_dirs = _with_expert_all_dirs
+            for module_name, attr, replacement in (
+                ("agent.prompt_builder", "get_external_skills_dirs", _with_expert_external_dirs),
+                ("agent.prompt_builder", "get_all_skills_dirs", _with_expert_all_dirs),
+                ("agent.skill_commands", "get_external_skills_dirs", _with_expert_external_dirs),
+                ("agent.skill_commands", "get_all_skills_dirs", _with_expert_all_dirs),
+            ):
+                module = sys.modules.get(module_name)
+                if module is None or not hasattr(module, attr):
+                    continue
+                patched_module_attrs.append((module, attr, getattr(module, attr)))
+                setattr(module, attr, replacement)
 
-        patched_module_attrs: list[tuple[Any, str, Any]] = []
-        for module_name, attr, replacement in (
-            ("agent.prompt_builder", "get_external_skills_dirs", _with_expert_external_dirs),
-            ("agent.prompt_builder", "get_all_skills_dirs", _with_expert_all_dirs),
-            ("agent.skill_commands", "get_external_skills_dirs", _with_expert_external_dirs),
-            ("agent.skill_commands", "get_all_skills_dirs", _with_expert_all_dirs),
-        ):
-            module = sys.modules.get(module_name)
-            if module is None or not hasattr(module, attr):
-                continue
-            patched_module_attrs.append((module, attr, getattr(module, attr)))
-            setattr(module, attr, replacement)
+        # ── subtractive: hide non-active expert skills (works on UPSTREAM core) ──
+        if disabled:
+            original_disabled = getattr(skill_utils, "get_disabled_skill_names", None)
+            _hide = frozenset(disabled)
+
+            def _with_expert_disabled(platform=None, *, _orig=original_disabled, _extra=_hide):
+                base = set(_orig(platform) if callable(_orig) else set())
+                return base | set(_extra)
+
+            if callable(original_disabled):
+                skill_utils.get_disabled_skill_names = _with_expert_disabled
+            for module_name in ("agent.prompt_builder", "agent.skill_commands"):
+                module = sys.modules.get(module_name)
+                if module is None or not hasattr(module, "get_disabled_skill_names"):
+                    continue
+                patched_module_attrs.append(
+                    (module, "get_disabled_skill_names", getattr(module, "get_disabled_skill_names"))
+                )
+                setattr(module, "get_disabled_skill_names", _with_expert_disabled)
     except Exception:
-        logger.warning("[multitenancy] failed to patch expert skill dirs into Hermes core", exc_info=True)
-        _EXPERT_SKILL_SCOPE_LOCK.release()
-        tmp.cleanup()
+        logger.warning("[multitenancy] failed to patch expert skill scope into Hermes core", exc_info=True)
+        try:
+            if callable(original_external):
+                skill_utils.get_external_skills_dirs = original_external
+            if callable(original_all):
+                skill_utils.get_all_skills_dirs = original_all
+            if callable(original_disabled):
+                skill_utils.get_disabled_skill_names = original_disabled
+            for module, attr, original in patched_module_attrs:
+                setattr(module, attr, original)
+        finally:
+            _EXPERT_SKILL_SCOPE_LOCK.release()
+            if tmp is not None:
+                tmp.cleanup()
         return lambda: None
 
     logger.info(
-        "[multitenancy] expert skill scope active profile=%s skills=%s temp_root=%s",
+        "[multitenancy] expert skill scope active profile=%s add=%s hide=%s",
         profile_home.name,
-        [p.name for p in skill_dirs],
-        tmp_root,
+        [p.name for p in skill_dirs] if skill_dirs else [],
+        sorted(disabled) if disabled else [],
     )
 
     def _cleanup() -> None:
@@ -786,9 +838,12 @@ def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
                 skill_utils.get_external_skills_dirs = original_external
             if callable(original_all):
                 skill_utils.get_all_skills_dirs = original_all
+            if callable(original_disabled):
+                skill_utils.get_disabled_skill_names = original_disabled
             for module, attr, original in patched_module_attrs:
                 setattr(module, attr, original)
-            tmp.cleanup()
+            if tmp is not None:
+                tmp.cleanup()
         finally:
             _EXPERT_SKILL_SCOPE_LOCK.release()
 
@@ -5086,18 +5141,13 @@ def _run_with_aiagent(
             event_sink,
             str(gateway_session_key),
         )
-        # Skill scope (能力随专家私有, sunke 2026-06-26): expert skills are
-        # installed into the profile skills/ scan root by the ingester (governance
-        # check requires it), so they would otherwise be visible to EVERY run.
-        # Subtractive hide of all NON-active expert skills (and ALL of them on a
-        # non-expert run) via HERMES_DISABLED_SKILLS_EXTRA keeps the non-expert
-        # path byte-identical; the active expert's dirs are additionally exposed by
-        # _apply_expert_skill_scope_for_aiagent below. Both are subprocess-local
-        # (fresh create_subprocess_exec child) → never leak across the 1279 profiles.
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
-            profile_home,
-            extra_env=_expert_skill_runtime_env_for_event(event, profile_home),
-        )
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        # Skill scope (能力随专家私有, sunke 2026-06-26): hide every NON-active
+        # expert skill (ALL of them on a non-expert run → byte-identical catalog)
+        # AND expose the active expert's private dirs. Hiding is a
+        # get_disabled_skill_names monkeypatch that works on UPSTREAM/prod core
+        # (which ignores HERMES_DISABLED_SKILLS_EXTRA); both patches are
+        # subprocess-local (fresh create_subprocess_exec child).
         expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
