@@ -173,3 +173,22 @@ def test_expert_skill_runtime_env_manifest_error_prefers_readable_expert_names(t
     assert "using-resource-delivery" in disabled
     assert "kep-trevi-delivery-orchestrate" in disabled
     assert "ordinary-skill" not in disabled
+
+
+def test_expert_skill_runtime_env_manifest_absent_uses_personal_install_manifest(tmp_path, monkeypatch):
+    shared = _shared_home(tmp_path)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+    skill_root = profile_home / "skills"
+    (skill_root / "private-a").mkdir(parents=True)
+    (skill_root / "private-a" / "SKILL.md").write_text("---\nname: private-a\n---\n", encoding="utf-8")
+    (skill_root / "ordinary-skill").mkdir(parents=True)
+    (skill_root / "ordinary-skill" / "SKILL.md").write_text("---\nname: ordinary-skill\n---\n", encoding="utf-8")
+    (skill_root / ".hermes-personal-installs.json").write_text(
+        json.dumps({"version": 1, "skills": {"private-a": {"source": "personal"}}}),
+        encoding="utf-8",
+    )
+
+    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
+
+    assert env == {"HERMES_DISABLED_SKILLS_EXTRA": "private-a"}

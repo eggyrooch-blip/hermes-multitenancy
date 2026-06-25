@@ -569,6 +569,15 @@ def _parse_csv_env_names(value: str) -> set[str]:
 
 def _installed_profile_skill_names(profile_home: Path) -> set[str]:
     """Best-effort fail-closed skill list for expert gating errors."""
+    personal_manifest = Path(profile_home).expanduser() / "skills" / ".hermes-personal-installs.json"
+    try:
+        data = json.loads(personal_manifest.read_text(encoding="utf-8"))
+        skills = data.get("skills") if isinstance(data, dict) else None
+        if isinstance(skills, dict):
+            return {str(name).strip() for name in skills if str(name).strip()}
+    except (OSError, json.JSONDecodeError):
+        pass
+
     names: set[str] = set()
     skills_root = Path(profile_home).expanduser() / "skills"
     try:
@@ -606,7 +615,7 @@ def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[
 
         all_expert_skills = all_expert_skill_names(profile_home)
         if not all_expert_skills:
-            return {}
+            return _disabled_skills_runtime_env(_installed_profile_skill_names(profile_home))
 
         active_skills: set[str] = set()
         expert_id = _expert_id_for_event(event)
@@ -5035,64 +5044,37 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
-        # Expert Role-Override overlay (ephemeral, this run only). Newer Hermes
-        # core accepts ``identity_override`` to replace the stable identity tier;
-        # ``ephemeral_system_prompt`` keeps the same block visible in the run-only
-        # prompt channel for older composition paths. SOUL.md / memory / USER on
-        # disk stay untouched. Do NOT route this through metadata.instructions:
-        # verdict B4 leaked the base Hermes identity from that user-message path.
+        # Expert Role-Override overlay (ephemeral, this run only). Keep
+        # hermes-agent core clean: use its existing run_conversation
+        # system_message seam and force the per-agent cached prompt to rebuild
+        # for this expert run. SOUL.md / memory / USER on disk stay untouched.
+        # Do NOT route this through metadata.instructions: verdict B4 leaked
+        # the base Hermes identity from that user-message path.
         _role_override = _role_override_block_for_event(event, profile_home)
-        if _role_override:
-            agent_kwargs["identity_override"] = _role_override
-            agent_kwargs["ephemeral_system_prompt"] = _role_override
 
         approval_cleanup = _configure_gateway_approval_bridge(
             event_sink,
             str(gateway_session_key),
         )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
-            profile_home,
-            _expert_skill_runtime_env_for_event(event, profile_home),
-        )
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
         try:
             _register_aiagent_process_image_gen_providers()
-            while True:
-                try:
-                    agent = AIAgent(**agent_kwargs)
-                    break
-                except TypeError as exc:
-                    # Graceful degrade only for optional run-only prompt plumbing.
-                    # ``identity_override`` is the load-bearing expert identity
-                    # seam; without it we would fall back to the known-bad
-                    # append-only behavior that leaks the default Hermes identity.
-                    unsupported_key = next(
-                        (
-                            key
-                            for key in ("identity_override", "ephemeral_system_prompt")
-                            if key in agent_kwargs and key in str(exc)
-                        ),
-                        None,
-                    )
-                    if unsupported_key is None:
-                        raise
-                    if unsupported_key == "identity_override":
-                        raise RuntimeError(
-                            "Hermes core does not support identity_override; "
-                            "expert Role Override cannot run safely"
-                        ) from exc
-                    logger.warning(
-                        "[multitenancy] AIAgent core has no %s; expert overlay "
-                        "degraded this run (profile=%s)",
-                        unsupported_key,
-                        profile_home.name,
-                    )
-                    agent_kwargs.pop(unsupported_key, None)
+            agent = AIAgent(**agent_kwargs)
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,
                 "task_id": str(session_id),
             }
+            if _role_override:
+                run_kwargs["system_message"] = _role_override
+                build_prompt = getattr(agent, "_build_system_prompt", None)
+                if callable(build_prompt):
+                    try:
+                        agent._cached_system_prompt = build_prompt(system_message=_role_override)
+                    except TypeError:
+                        agent._cached_system_prompt = build_prompt(_role_override)
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
@@ -5120,6 +5102,7 @@ def _run_with_aiagent(
             _retag_source_now("finally-pre-close")
             approval_cleanup()
             vod_image_override_cleanup()
+            expert_skill_scope_cleanup()
             runtime_env_cleanup()
             if clear_session_vars is not None and session_tokens is not None:
                 clear_session_vars(session_tokens)
