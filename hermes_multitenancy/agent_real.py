@@ -34,7 +34,7 @@ import uuid
 import re
 import secrets
 import importlib
-import inspect
+import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
@@ -56,6 +56,7 @@ from .security_audit import append_security_event
 from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
+_EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
 
 
 # Map a model provider prefix to the env-var name that holds its API key.
@@ -5074,7 +5075,10 @@ def _run_with_aiagent(
             event_sink,
             str(gateway_session_key),
         )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
+            profile_home,
+            extra_env=_expert_skill_runtime_env_for_event(event, profile_home),
+        )
         expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None

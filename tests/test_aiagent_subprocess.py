@@ -2314,6 +2314,47 @@ def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch
     assert "ephemeral_system_prompt" not in captured
 
 
+def test_run_with_aiagent_applies_expert_skill_disabled_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen_env: list[str | None] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen_env.append(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA"))
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.delenv("HERMES_DISABLED_SKILLS_EXTRA", raising=False)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    monkeypatch.setattr(
+        agent_real,
+        "_expert_skill_runtime_env_for_event",
+        lambda event, home: {"HERMES_DISABLED_SKILLS_EXTRA": "private-a"},
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen_env == ["private-a"]
+    assert os.environ.get("HERMES_DISABLED_SKILLS_EXTRA") is None
+
+
 def test_run_with_aiagent_fails_when_core_lacks_identity_override(monkeypatch, tmp_path: Path):
     """Old core cannot safely run expert identity sessions."""
     from hermes_multitenancy import agent_real
