@@ -250,3 +250,31 @@ def test_expert_skill_scope_hides_inactive_skills_end_to_end(tmp_path, monkeypat
 
     # cleanup restores the original behavior (no leak of the patch)
     assert "using-resource-delivery" not in set(prompt_builder.get_disabled_skill_names())
+
+
+def test_expert_skill_scope_blocks_invocation_gate_end_to_end(tmp_path, monkeypatch):
+    """End-to-end: applying the scope makes the skill_view INVOCATION gate
+    (tools.skills_tool._is_skill_disabled, which reads config.yaml directly and is
+    NOT covered by the catalog patch) report non-active expert skills as disabled —
+    so a hidden skill cannot be LOADED/EXECUTED, not merely un-advertised. Guards
+    round-3 HIGH #2 ('hidden skills still invocable')."""
+    import tools.skills_tool as skills_tool
+
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    # before scope: the invocation gate does NOT block the skill
+    assert skills_tool._is_skill_disabled("using-resource-delivery") is False
+
+    cleanup = agent_real._apply_expert_skill_scope_for_aiagent(_event(), profile_home)  # non-expert run
+    try:
+        assert skills_tool._is_skill_disabled("using-resource-delivery") is True
+        assert skills_tool._is_skill_disabled("kep-trevi-delivery-orchestrate") is True
+    finally:
+        cleanup()
+
+    # cleanup restores the original gate (no leak of the patch)
+    assert skills_tool._is_skill_disabled("using-resource-delivery") is False

@@ -644,100 +644,44 @@ def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> se
         return fallback_names
 
 
-def _expert_skill_dirs_for_event(event: Any, profile_home: Path) -> list[Path]:
-    """Return active expert skill dirs for this run.
-
-    Expert skills stay installed in the plugin repo, outside the profile's
-    default ``skills/`` scan root. Selecting an expert exposes only that
-    expert's declared skill dirs via a temporary external skill root for this
-    AIAgent subprocess.
-    """
-    expert_id = _expert_id_for_event(event)
-    if not expert_id:
-        return []
-    try:
-        from .expert_overlay import resolve_caller_departments, resolve_expert
-
-        try:
-            sender_open_id = _resolve_subprocess_sender_open_id(event) or None
-        except Exception:
-            sender_open_id = None
-        overlay = resolve_expert(
-            profile_home,
-            expert_id,
-            department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
-        )
-        if overlay is None:
-            return []
-        return [
-            Path(p)
-            for p in getattr(overlay, "skill_dirs", [])
-            if (Path(p) / "SKILL.md").is_file()
-        ]
-    except Exception:
-        logger.warning(
-            "[multitenancy] expert skill dir resolution failed for %s; running without expert skills",
-            profile_home,
-            exc_info=True,
-        )
-        return []
-
-
 def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
-    """Scope skills for this run to 能力随专家私有, with ZERO hermes-agent change.
+    """Scope skills for this run to 能力随专家私有 by HIDING every non-active expert
+    skill, with ZERO hermes-agent change.
 
-    Two subprocess-local monkeypatches against Hermes core (the run is a fresh
+    Expert skills are installed into the profile ``skills/`` scan root by the
+    ingester (``plugin_ingest._install_skills_to_profile``; ``assert_profile_governance``
+    REQUIRES the entry+orchestrate skills there). So the ACTIVE expert's own skills
+    are already resolvable — we only need to HIDE the others. Purely subtractive via
+    two subprocess-local monkeypatches (the run is a fresh
     ``asyncio.create_subprocess_exec`` child, so these module-global patches can
     never leak across the 1279 profiles):
 
-      * ADD the active expert's private skill dirs to the external skill roots —
-        so an experts-only skill that is NOT in the profile scan root is still
-        loadable for the active expert.
-      * HIDE every NON-active expert skill via ``get_disabled_skill_names`` — this
-        is what actually enforces privacy on UPSTREAM/prod core, which reads
-        disabled skills from ``config.yaml`` only and IGNORES
-        ``HERMES_DISABLED_SKILLS_EXTRA`` (that env is honored solely by the
-        abandoned fork core; relying on it silently leaks on prod). On a
-        non-expert run every expert skill is hidden → byte-identical catalog.
+      * ``get_disabled_skill_names`` (skill_utils source + the prompt_builder /
+        skill_commands bound imports) — hides them from the system-prompt CATALOG.
+        Works on UPSTREAM/prod core, which reads disabled skills from
+        ``config.yaml`` only and IGNORES ``HERMES_DISABLED_SKILLS_EXTRA`` (that env
+        is honored solely by the abandoned fork; relying on it silently leaks).
+      * ``tools.skills_tool._is_skill_disabled`` — the ``skill_view`` INVOCATION
+        gate (reads config.yaml directly, NOT get_disabled_skill_names), so a hidden
+        skill cannot be LOADED/EXECUTED, not merely un-advertised.
 
-    Returns a cleanup that restores all patches. No-op only when there is nothing
-    to add AND nothing to hide (no expert manifests installed).
+    On a non-expert run every expert skill is hidden → byte-identical catalog AND
+    not invocable. The active expert's own skills stay visible (in the scan root,
+    absent from the hidden set). NO additive temp-root is used: the skills are
+    already in the scan root, so adding a copy would make ``skill_view`` raise
+    "Ambiguous skill name" and break the active expert's own skill loading.
+
+    Returns a cleanup restoring all patches; a true no-op when there is nothing to
+    hide (no expert manifests installed → non-expert byte-identical path).
+
+    DOCUMENTED RESIDUAL: the raw ``Read`` tool can still read a hidden skill's
+    ``SKILL.md`` from ``<profile>/skills/``. True file-level isolation would require
+    not co-installing expert skills into non-audience profiles — out of this
+    0-core-change seam. Mitigated operationally by audience-scoped ingest (the plugin
+    lands only in its audience profiles).
     """
     disabled = _expert_disabled_skill_names_for_event(event, profile_home)
-    skill_dirs = _expert_skill_dirs_for_event(event, profile_home)
-    if not disabled and not skill_dirs:
-        return lambda: None
-
-    # Materialize the active expert's skill dirs into a temp external root (additive).
-    tmp = None
-    tmp_root: Optional[Path] = None
-    if skill_dirs:
-        tmp = tempfile.TemporaryDirectory(prefix=f"hermes-expert-skills-{profile_home.name}-")
-        candidate_root = Path(tmp.name)
-        copied = False
-        try:
-            for src in skill_dirs:
-                dst = candidate_root / src.name
-                if dst.exists():
-                    continue
-                shutil.copytree(src, dst)
-                copied = True
-        except Exception:
-            logger.warning(
-                "[multitenancy] failed to prepare temporary expert skill root for %s",
-                profile_home,
-                exc_info=True,
-            )
-            tmp.cleanup()
-            tmp = None
-        else:
-            if copied:
-                tmp_root = candidate_root
-            else:
-                tmp.cleanup()
-                tmp = None
-
-    if not disabled and tmp_root is None:
+    if not disabled:
         return lambda: None
 
     _EXPERT_SKILL_SCOPE_LOCK.acquire()
@@ -746,104 +690,72 @@ def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
     except Exception:
         logger.warning("[multitenancy] could not patch expert skill scope into Hermes core", exc_info=True)
         _EXPERT_SKILL_SCOPE_LOCK.release()
-        if tmp is not None:
-            tmp.cleanup()
         return lambda: None
 
+    _hide = frozenset(disabled)
     patched_module_attrs: list[tuple[Any, str, Any]] = []
-    original_external = None
-    original_all = None
     original_disabled = None
     try:
-        # ── additive: expose the active expert's skill dirs ──
-        if tmp_root is not None:
-            original_external = getattr(skill_utils, "get_external_skills_dirs", None)
-            original_all = getattr(skill_utils, "get_all_skills_dirs", None)
-            _add_root = tmp_root
+        # ── catalog: hide from the system-prompt skill catalog ──
+        original_disabled = getattr(skill_utils, "get_disabled_skill_names", None)
 
-            def _with_expert_external_dirs(_orig=original_external, _root=_add_root) -> list[Path]:
-                dirs = list(_orig() if callable(_orig) else [])
-                if _root not in dirs:
-                    dirs.append(_root)
-                return dirs
+        def _with_expert_disabled(platform=None, *, _orig=original_disabled, _extra=_hide):
+            base = set(_orig(platform) if callable(_orig) else set())
+            return base | set(_extra)
 
-            def _with_expert_all_dirs(_orig=original_all, _root=_add_root) -> list[Path]:
-                dirs = list(_orig() if callable(_orig) else [])
-                if _root not in dirs:
-                    dirs.append(_root)
-                return dirs
+        if callable(original_disabled):
+            skill_utils.get_disabled_skill_names = _with_expert_disabled
+        for module_name in ("agent.prompt_builder", "agent.skill_commands"):
+            module = sys.modules.get(module_name)
+            if module is None or not hasattr(module, "get_disabled_skill_names"):
+                continue
+            patched_module_attrs.append(
+                (module, "get_disabled_skill_names", getattr(module, "get_disabled_skill_names"))
+            )
+            setattr(module, "get_disabled_skill_names", _with_expert_disabled)
 
-            if callable(original_external):
-                skill_utils.get_external_skills_dirs = _with_expert_external_dirs
-            if callable(original_all):
-                skill_utils.get_all_skills_dirs = _with_expert_all_dirs
-            for module_name, attr, replacement in (
-                ("agent.prompt_builder", "get_external_skills_dirs", _with_expert_external_dirs),
-                ("agent.prompt_builder", "get_all_skills_dirs", _with_expert_all_dirs),
-                ("agent.skill_commands", "get_external_skills_dirs", _with_expert_external_dirs),
-                ("agent.skill_commands", "get_all_skills_dirs", _with_expert_all_dirs),
-            ):
-                module = sys.modules.get(module_name)
-                if module is None or not hasattr(module, attr):
-                    continue
-                patched_module_attrs.append((module, attr, getattr(module, attr)))
-                setattr(module, attr, replacement)
+        # ── invocation gate: skill_view → _is_skill_disabled (reads config.yaml directly,
+        #    NOT get_disabled_skill_names) — force-import so the patch lands before use.
+        try:
+            import tools.skills_tool as skills_tool
+        except Exception:
+            skills_tool = None
+        if skills_tool is not None and hasattr(skills_tool, "_is_skill_disabled"):
+            _orig_is_disabled = skills_tool._is_skill_disabled
 
-        # ── subtractive: hide non-active expert skills (works on UPSTREAM core) ──
-        if disabled:
-            original_disabled = getattr(skill_utils, "get_disabled_skill_names", None)
-            _hide = frozenset(disabled)
+            def _with_expert_is_disabled(name, platform=None, *, _orig=_orig_is_disabled, _extra=_hide):
+                if name in _extra:
+                    return True
+                try:
+                    return bool(_orig(name, platform))
+                except TypeError:
+                    return bool(_orig(name))
 
-            def _with_expert_disabled(platform=None, *, _orig=original_disabled, _extra=_hide):
-                base = set(_orig(platform) if callable(_orig) else set())
-                return base | set(_extra)
-
-            if callable(original_disabled):
-                skill_utils.get_disabled_skill_names = _with_expert_disabled
-            for module_name in ("agent.prompt_builder", "agent.skill_commands"):
-                module = sys.modules.get(module_name)
-                if module is None or not hasattr(module, "get_disabled_skill_names"):
-                    continue
-                patched_module_attrs.append(
-                    (module, "get_disabled_skill_names", getattr(module, "get_disabled_skill_names"))
-                )
-                setattr(module, "get_disabled_skill_names", _with_expert_disabled)
+            patched_module_attrs.append((skills_tool, "_is_skill_disabled", _orig_is_disabled))
+            skills_tool._is_skill_disabled = _with_expert_is_disabled
     except Exception:
         logger.warning("[multitenancy] failed to patch expert skill scope into Hermes core", exc_info=True)
         try:
-            if callable(original_external):
-                skill_utils.get_external_skills_dirs = original_external
-            if callable(original_all):
-                skill_utils.get_all_skills_dirs = original_all
             if callable(original_disabled):
                 skill_utils.get_disabled_skill_names = original_disabled
             for module, attr, original in patched_module_attrs:
                 setattr(module, attr, original)
         finally:
             _EXPERT_SKILL_SCOPE_LOCK.release()
-            if tmp is not None:
-                tmp.cleanup()
         return lambda: None
 
     logger.info(
-        "[multitenancy] expert skill scope active profile=%s add=%s hide=%s",
+        "[multitenancy] expert skill scope active profile=%s hide=%s",
         profile_home.name,
-        [p.name for p in skill_dirs] if skill_dirs else [],
-        sorted(disabled) if disabled else [],
+        sorted(disabled),
     )
 
     def _cleanup() -> None:
         try:
-            if callable(original_external):
-                skill_utils.get_external_skills_dirs = original_external
-            if callable(original_all):
-                skill_utils.get_all_skills_dirs = original_all
             if callable(original_disabled):
                 skill_utils.get_disabled_skill_names = original_disabled
             for module, attr, original in patched_module_attrs:
                 setattr(module, attr, original)
-            if tmp is not None:
-                tmp.cleanup()
         finally:
             _EXPERT_SKILL_SCOPE_LOCK.release()
 
