@@ -170,15 +170,39 @@ def _read_agent_md(manifest: dict[str, Any], expert: dict[str, Any]) -> Optional
 
 # ─────────────────────────── public API ──────────────────────────────────────
 
-def resolve_expert(profile_home: Path, expert_id: str) -> Optional[ExpertOverlay]:
+def _caller_profile_name(profile_home: Path) -> str:
+    """Derive the CALLER's profile_name from its on-disk home.
+
+    Convention (``router._profile_name_to_home``): a profile lives at
+    ``<root>/profiles/<profile_name>``, so the directory name IS the profile name.
+    Used to enforce a manifest's ``audience.profiles`` against the ACTIVATING
+    caller — without it, a known expert id is activatable by any profile.
+    """
+    return Path(profile_home).expanduser().name
+
+
+def resolve_expert(
+    profile_home: Path,
+    expert_id: str,
+    *,
+    department_ids: Optional[list[str]] = None,
+) -> Optional[ExpertOverlay]:
     """Resolve ``expert_id`` to a ready ``ExpertOverlay`` for ``profile_home``.
 
-    Returns ``None`` (never raises) when the id is empty / unknown, or its persona
-    markdown can't be loaded — the caller then runs with the normal SOUL persona.
+    Returns ``None`` (never raises) when the id is empty / unknown, its persona
+    markdown can't be loaded, OR the manifest audience does not admit the caller —
+    the caller then runs with the normal SOUL persona.
+
+    Authorization (fail-CLOSED): an expert is activatable ONLY when its manifest
+    audience admits this caller. ``profiles[]`` is matched against the caller's
+    profile_name (derived from ``profile_home``); ``department_ids`` is matched
+    against ``department_ids`` (resolved server-side by the caller). An expert
+    whose audience excludes the caller returns ``None`` even when its id is known.
     """
     eid = str(expert_id or "").strip()
     if not eid:
         return None
+    profile_name = _caller_profile_name(profile_home)
     try:
         for manifest, _path in _iter_managed_manifests(profile_home):
             experts = manifest.get("experts")
@@ -187,6 +211,15 @@ def resolve_expert(profile_home: Path, expert_id: str) -> Optional[ExpertOverlay
             for expert in experts:
                 if not isinstance(expert, dict) or str(expert.get("id") or "") != eid:
                     continue
+                if not _audience_allows(
+                    expert.get("audience"),
+                    profile_name=profile_name,
+                    department_ids=department_ids,
+                ):
+                    logger.info(
+                        "[multitenancy] expert %r denied for profile %r (audience)", eid, profile_name
+                    )
+                    return None
                 agent_md = _read_agent_md(manifest, expert)
                 if not agent_md:
                     logger.warning(
@@ -223,24 +256,42 @@ def build_role_override_block(overlay: ExpertOverlay) -> str:
     return "\n".join(parts).strip()
 
 
-def _audience_allows(audience: Any, *, department_ids: Optional[list[str]]) -> bool:
-    """Audience filter for the expert square.
+def _audience_allows(
+    audience: Any,
+    *,
+    profile_name: Optional[str] = None,
+    department_ids: Optional[list[str]] = None,
+) -> bool:
+    """Audience filter for the expert square — covers BOTH persisted modes.
 
-    No audience (or empty) → visible to everyone who has the plugin. A
-    ``department_ids`` audience matches when the caller's department set intersects
-    it; when the caller's departments are unknown (None), an explicit audience is
-    treated as NOT matched (fail-closed for scoped experts).
+    The ingester persists ``audience`` as
+    ``{"mode": "profile"|"department_ids", "profiles": [...], "department_ids": [...]}``
+    (plugin_ingest.py). Enforcement is fail-CLOSED for scoped experts:
+
+      * No audience / empty ``profiles`` AND empty ``department_ids`` → PUBLIC
+        (visible to everyone who has the plugin) — preserves prior behavior.
+      * ``profiles`` non-empty → allowed ONLY if the caller's ``profile_name`` is
+        in it. A None/unknown caller profile fails closed.
+      * ``department_ids`` non-empty → allowed ONLY if the caller's resolved
+        departments intersect it. Unknown caller departments (None) fail closed.
+
+    When BOTH scopes are present, EITHER admitting the caller is sufficient (a
+    union — the same OR semantics ``feishu_org._skill_audience_matches`` uses for
+    profiles/departments). Never raises.
     """
     if not isinstance(audience, dict):
         return True
-    dept_ids = audience.get("department_ids")
-    if not dept_ids:  # no/empty department scoping → public
+    want_profiles = {str(p) for p in (audience.get("profiles") or []) if str(p).strip()}
+    want_depts = {str(d) for d in (audience.get("department_ids") or []) if str(d).strip()}
+    if not want_profiles and not want_depts:  # no scoping → public
         return True
-    if not department_ids:
-        return False
-    want = {str(d) for d in dept_ids}
-    have = {str(d) for d in department_ids}
-    return bool(want & have)
+    if want_profiles and profile_name and str(profile_name) in want_profiles:
+        return True
+    if want_depts and department_ids:
+        have = {str(d) for d in department_ids}
+        if want_depts & have:
+            return True
+    return False
 
 
 def list_experts(
@@ -254,6 +305,7 @@ def list_experts(
     """
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    profile_name = _caller_profile_name(profile_home)
     try:
         for manifest, _path in _iter_managed_manifests(profile_home):
             experts = manifest.get("experts")
@@ -266,7 +318,11 @@ def list_experts(
                 eid = str(ex.get("id") or "").strip()
                 if not eid or eid in seen:
                     continue
-                if not _audience_allows(ex.get("audience"), department_ids=department_ids):
+                if not _audience_allows(
+                    ex.get("audience"),
+                    profile_name=profile_name,
+                    department_ids=department_ids,
+                ):
                     continue
                 seen.add(eid)
                 rows.append(
@@ -289,9 +345,113 @@ def list_experts(
     return sorted(rows, key=lambda r: (not r["featured"], r["category"], r["name"]))
 
 
-def role_override_block_for(profile_home: Path, expert_id: str) -> Optional[str]:
-    """Convenience: resolve + build in one call. ``None`` when no overlay applies."""
-    overlay = resolve_expert(profile_home, expert_id)
+# ─────────────────────────── caller department resolution ────────────────────
+# Department-scoped audiences must be enforced against the caller's REAL
+# departments, resolved server-side from the trusted tenant — never from a
+# caller-supplied value. The org snapshot (feishu_org.save_snapshot) is the only
+# place department membership is recorded; the routing DB does not carry it. We
+# read the newest persisted ``org-*.json`` and pull the matching employee's
+# departments. ANY failure (no snapshot, unreadable, employee not found) returns
+# None → department-scoped experts then fail CLOSED. This is intentionally a
+# single chokepoint so both the activation path (agent_real) and the catalog path
+# (webui_broker_server) resolve departments identically and are monkeypatchable.
+
+# Env override + conventional locations for the persisted org snapshot directory.
+_ORG_SNAPSHOT_DIR_ENV = "HERMES_ORG_SNAPSHOT_DIR"
+
+
+def _org_snapshot_dirs(profile_home: Path) -> list[Path]:
+    dirs: list[Path] = []
+    explicit = os.getenv(_ORG_SNAPSHOT_DIR_ENV)
+    if explicit:
+        dirs.append(Path(explicit).expanduser())
+    shared = _shared_home_for(Path(profile_home).expanduser())
+    for sub in ("org-snapshots", "snapshots", "."):
+        d = shared / sub
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _latest_org_snapshot(profile_home: Path) -> Optional[dict[str, Any]]:
+    newest: Optional[tuple[float, Path]] = None
+    for d in _org_snapshot_dirs(profile_home):
+        if not d.is_dir():
+            continue
+        for path in d.glob("org-*.json"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, path)
+    if newest is None:
+        return None
+    try:
+        data = json.loads(newest[1].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.debug("[multitenancy] unreadable org snapshot %s", newest[1], exc_info=True)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def resolve_caller_departments(
+    profile_home: Path,
+    *,
+    profile_name: Optional[str] = None,
+    open_id: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Resolve the CALLER's real departments from the trusted org snapshot.
+
+    Returns a list of department identifiers (``dept_id`` + ``dept_name``) for the
+    employee matching ``profile_name`` (preferred) or ``open_id``. Returns ``None``
+    when no snapshot exists or the caller can't be found — department-scoped
+    experts then fail CLOSED. Never raises.
+    """
+    pname = str(profile_name or _caller_profile_name(profile_home)).strip()
+    oid = str(open_id or "").strip()
+    try:
+        snap = _latest_org_snapshot(profile_home)
+        if not snap:
+            return None
+        employees = snap.get("employees")
+        if not isinstance(employees, dict):
+            return None
+        for emp in employees.values():
+            if not isinstance(emp, dict):
+                continue
+            if (pname and str(emp.get("profile_name") or "") == pname) or (
+                oid and str(emp.get("open_id") or "") == oid
+            ):
+                depts = [
+                    str(v).strip()
+                    for v in (emp.get("dept_id"), emp.get("dept_name"))
+                    if str(v or "").strip()
+                ]
+                return depts or None
+    except Exception:
+        logger.warning("[multitenancy] resolve_caller_departments failed", exc_info=True)
+    return None
+
+
+def role_override_block_for(
+    profile_home: Path,
+    expert_id: str,
+    *,
+    department_ids: Optional[list[str]] = None,
+    open_id: Optional[str] = None,
+) -> Optional[str]:
+    """Convenience: resolve + build in one call. ``None`` when no overlay applies.
+
+    Threads the caller's departments into the audience check (fail-closed). When
+    ``department_ids`` is not supplied, they are resolved server-side from the
+    trusted org snapshot so department-scoped experts can still activate for the
+    right caller without trusting any caller-supplied value.
+    """
+    depts = department_ids
+    if depts is None:
+        depts = resolve_caller_departments(profile_home, open_id=open_id)
+    overlay = resolve_expert(profile_home, expert_id, department_ids=depts)
     if overlay is None:
         return None
     try:

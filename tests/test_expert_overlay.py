@@ -279,7 +279,174 @@ def test_experts_endpoint(tmp_path, monkeypatch):
         finally:
             await client.close()
 
-    data = asyncio.get_event_loop().run_until_complete(runner())
+    data = asyncio.run(runner())
     assert data["profile_name"] == "feishu_test"
     assert len(data["experts"]) == 1
     assert data["experts"][0]["id"] == EXPERT_ID
+
+
+# ─────────────────────────── AUTHORIZATION (audience enforcement) ─────────────
+# These cover the CODEX REVIEW FAIL: manifest-level audience must be enforced on
+# BOTH the list (catalog) AND resolve (activation) paths, fail-CLOSED, and the
+# caller's departments must be resolved SERVER-SIDE (never from a query param).
+
+
+def _ingest_for(repo: Path, shared: Path, profile: str):
+    """Ingest the plugin so it's owned by ``profile`` (sets manifest repo/experts)."""
+    (shared / "profiles" / profile / "skills").mkdir(parents=True, exist_ok=True)
+    return pi.ingest(repo, audience=profile, shared_home=shared, profiles_root=shared / "profiles")
+
+
+def test_resolve_audience_profile_mode_cross_profile_denied(tmp_path, monkeypatch):
+    """mode=profile profiles=[A]: A activates+lists; B (known id) is denied both."""
+    repo = _plugin_repo(
+        tmp_path / "plug",
+        audience={"mode": "profile", "profiles": ["alice"], "department_ids": []},
+    )
+    shared = _shared_home(tmp_path, profile="alice")
+    (shared / "profiles" / "bob" / "skills").mkdir(parents=True, exist_ok=True)
+    _ingest_for(repo, shared, "alice")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    alice_home = shared / "profiles" / "alice"
+    bob_home = shared / "profiles" / "bob"
+
+    # caller A (in audience) — resolves AND lists
+    assert eo.resolve_expert(alice_home, EXPERT_ID) is not None
+    assert any(r["id"] == EXPERT_ID for r in eo.list_experts(alice_home))
+
+    # caller B (NOT in audience) — denied even though the id is known
+    assert eo.resolve_expert(bob_home, EXPERT_ID) is None
+    assert all(r["id"] != EXPERT_ID for r in eo.list_experts(bob_home))
+    assert eo.role_override_block_for(bob_home, EXPERT_ID) is None
+
+
+def test_resolve_audience_department_mode(tmp_path, monkeypatch):
+    """department_ids=[123]: dept-123 caller sees; dept-999 doesn't; query can't bypass."""
+    repo = _plugin_repo(
+        tmp_path / "plug",
+        audience={"mode": "department_ids", "profiles": [], "department_ids": ["123"]},
+    )
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    # caller whose resolved departments include 123 sees + activates
+    assert len(eo.list_experts(profile_home, department_ids=["123"])) == 1
+    assert eo.resolve_expert(profile_home, EXPERT_ID, department_ids=["123"]) is not None
+    # caller in a different department does not
+    assert eo.list_experts(profile_home, department_ids=["999"]) == []
+    assert eo.resolve_expert(profile_home, EXPERT_ID, department_ids=["999"]) is None
+    # unknown departments (None) → fail closed
+    assert eo.list_experts(profile_home, department_ids=None) == []
+    assert eo.resolve_expert(profile_home, EXPERT_ID, department_ids=None) is None
+
+
+def test_department_resolution_is_server_side_query_cannot_bypass(tmp_path, monkeypatch):
+    """A caller-supplied ?department_ids= must NOT expose a dept-scoped expert.
+
+    The broker resolves departments SERVER-SIDE from the org snapshot; the query
+    param is ignored. A snapshot placing feishu_test in dept 123 exposes the
+    expert; an attacker passing ?department_ids=123 with NO snapshot match gets
+    nothing.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy import webui_broker_server as broker
+
+    repo = _plugin_repo(
+        tmp_path / "plug",
+        audience={"mode": "department_ids", "profiles": [], "department_ids": ["123"]},
+    )
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_RUN_BROKER_KEY", raising=False)
+    profile_home = shared / "profiles" / "feishu_test"
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
+
+    def _query(profile_in_dept_123: bool):
+        # Server-side resolver returns the TRUSTED departments, ignoring any query.
+        monkeypatch.setattr(
+            eo,
+            "resolve_caller_departments",
+            lambda ph, **kw: (["123"] if profile_in_dept_123 else None),
+        )
+
+        async def runner():
+            app = broker.create_run_broker_app(
+                mark_seen=lambda _r: True, sandbox_available=lambda: True
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                # attacker always tries to spoof dept 123 via the query param
+                resp = await client.get(
+                    "/api/run-broker/experts?department_ids=123",
+                    headers={"X-Hermes-Profile": "feishu_test"},
+                )
+                assert resp.status == 200, await resp.text()
+                return await resp.json()
+            finally:
+                await client.close()
+
+        return asyncio.run(runner())
+
+    # caller actually in dept 123 (server-resolved) → expert visible
+    assert len(_query(True)["experts"]) == 1
+    # caller NOT in dept 123 (server resolves None) → query spoof cannot expose it
+    assert _query(False)["experts"] == []
+
+
+def test_resolve_caller_departments_from_snapshot(tmp_path, monkeypatch):
+    """The server-side resolver reads the newest org-*.json and matches the caller."""
+    shared = _shared_home(tmp_path)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    snap_dir = shared / "org-snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    (snap_dir / "org-2026-06-25.json").write_text(
+        json.dumps(
+            {
+                "employees": {
+                    "agent-1": {
+                        "profile_name": "feishu_test",
+                        "open_id": "ou_abc",
+                        "dept_id": "123",
+                        "dept_name": "增长部",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile_home = shared / "profiles" / "feishu_test"
+    depts = eo.resolve_caller_departments(profile_home, profile_name="feishu_test")
+    assert depts is not None and "123" in depts
+    # unknown caller → None (fail closed)
+    assert eo.resolve_caller_departments(profile_home, profile_name="nobody") is None
+    # no snapshot at all → None
+    other = _shared_home(tmp_path / "empty")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(other))
+    assert eo.resolve_caller_departments(other / "profiles" / "feishu_test") is None
+
+
+def test_resolve_audience_public_visible_to_any_profile(tmp_path, monkeypatch):
+    """Empty/absent audience stays public — visible to any caller (regression)."""
+    repo = _plugin_repo(tmp_path / "plug")  # no audience
+    shared = _shared_home(tmp_path)
+    (shared / "profiles" / "stranger" / "skills").mkdir(parents=True, exist_ok=True)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    stranger_home = shared / "profiles" / "stranger"
+    assert eo.resolve_expert(stranger_home, EXPERT_ID) is not None
+    assert len(eo.list_experts(stranger_home)) == 1
+    # explicitly-empty audience shape is also public
+    repo2 = _plugin_repo(
+        tmp_path / "plug2",
+        audience={"mode": "profile", "profiles": [], "department_ids": []},
+    )
+    shared2 = _shared_home(tmp_path / "s2")
+    _ingest(repo2, shared2)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared2))
+    any_home = shared2 / "profiles" / "feishu_test"
+    assert eo.resolve_expert(any_home, EXPERT_ID) is not None

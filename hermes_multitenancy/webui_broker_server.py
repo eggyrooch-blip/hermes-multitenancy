@@ -3855,10 +3855,19 @@ def create_run_broker_app(
         from . import expert_overlay
 
         try:
-            profile_name, _user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
-            dept_raw = str(request.query.get("department_ids") or "").strip()
-            department_ids = [d.strip() for d in dept_raw.split(",") if d.strip()] or None
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
             profile_home = _profile_home_for_name(profile_name)
+            # SERVER-SIDE department resolution from the TRUSTED tenant. The
+            # caller-supplied ?department_ids= query param is deliberately IGNORED:
+            # trusting it would let any caller expose a department-scoped expert by
+            # passing a matching id. Unresolved departments → department-scoped
+            # experts fail CLOSED inside list_experts.
+            department_ids = await asyncio.to_thread(
+                expert_overlay.resolve_caller_departments,
+                profile_home,
+                profile_name=profile_name,
+                open_id=user_key,
+            )
             experts = await asyncio.to_thread(
                 expert_overlay.list_experts,
                 profile_home,

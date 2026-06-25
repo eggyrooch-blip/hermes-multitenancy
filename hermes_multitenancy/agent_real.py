@@ -533,7 +533,15 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
     try:
         from .expert_overlay import role_override_block_for
 
-        block = role_override_block_for(profile_home, expert_id)
+        # Pass the TRUSTED sender open_id so department-scoped experts can be
+        # resolved against the caller's REAL departments (fail-closed when the
+        # caller can't be resolved). open_id is best-effort; profile_home already
+        # carries the profile_name for profile-scoped audiences.
+        try:
+            sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+        except Exception:
+            sender_open_id = None
+        block = role_override_block_for(profile_home, expert_id, open_id=sender_open_id)
         if block:
             logger.info(
                 "[multitenancy] expert overlay active expert_id=%s profile=%s",
