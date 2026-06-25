@@ -125,3 +125,29 @@ def test_expert_skill_runtime_env_disables_inactive_expert_skills(tmp_path, monk
 
     active = agent_real._expert_skill_runtime_env_for_event(_event(EXPERT_ID), profile_home)
     assert active == {"HERMES_DISABLED_SKILLS_EXTRA": "other-private-skill"}
+
+    unknown = agent_real._expert_skill_runtime_env_for_event(_event("missing-expert"), profile_home)
+    assert set(unknown["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+        "other-private-skill",
+    }
+
+
+def test_expert_skill_runtime_env_fail_closed_on_manifest_error(tmp_path, monkeypatch):
+    shared = _shared_home(tmp_path)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+    skill_root = profile_home / "skills"
+    (skill_root / "private-a").mkdir(parents=True)
+    (skill_root / "private-a" / "SKILL.md").write_text("---\nname: private-a\n---\n", encoding="utf-8")
+    (skill_root / "private-b").mkdir(parents=True)
+    (skill_root / "private-b" / "SKILL.md").write_text("---\nname: private-b\n---\n", encoding="utf-8")
+
+    managed = shared / ".hermes-plugin-managed"
+    managed.mkdir(parents=True)
+    (managed / "broken.json").write_text("{not-json", encoding="utf-8")
+
+    env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
+
+    assert set(env["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {"private-a", "private-b"}

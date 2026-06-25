@@ -2310,8 +2310,8 @@ def test_run_with_aiagent_omits_identity_override_without_expert(monkeypatch, tm
     assert "ephemeral_system_prompt" not in captured
 
 
-def test_run_with_aiagent_degrades_when_core_lacks_identity_override(monkeypatch, tmp_path: Path):
-    """Older Hermes core can still run with append-only expert context."""
+def test_run_with_aiagent_fails_when_core_lacks_identity_override(monkeypatch, tmp_path: Path):
+    """Expert runs must not silently degrade to append-only identity prompts."""
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
@@ -2322,7 +2322,6 @@ def test_run_with_aiagent_degrades_when_core_lacks_identity_override(monkeypatch
     )
     (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
 
-    captured: dict[str, object] = {}
     attempts: list[set[str]] = []
 
     class FakeAgent:
@@ -2330,7 +2329,7 @@ def test_run_with_aiagent_degrades_when_core_lacks_identity_override(monkeypatch
             attempts.append(set(kwargs))
             if "identity_override" in kwargs:
                 raise TypeError("__init__() got an unexpected keyword argument 'identity_override'")
-            captured.update(kwargs)
+            raise AssertionError("expert run must not retry without identity_override")
 
         def run_conversation(self, user_message, task_id):
             return {"final_response": "ok"}
@@ -2349,10 +2348,10 @@ def test_run_with_aiagent_degrades_when_core_lacks_identity_override(monkeypatch
     event = _event()
     event.source.platform = SimpleNamespace(value="webui")
 
-    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    with pytest.raises(RuntimeError, match="identity_override"):
+        agent_real._run_with_aiagent(event, profile_home)
     assert "identity_override" in attempts[0]
-    assert "identity_override" not in attempts[1]
-    assert captured["ephemeral_system_prompt"] == "ROLE OVERRIDE\n我是资源投放专家"
+    assert len(attempts) == 1
 
 
 def test_run_with_aiagent_applies_expert_skill_disabled_env(monkeypatch, tmp_path: Path):
@@ -2392,6 +2391,41 @@ def test_run_with_aiagent_applies_expert_skill_disabled_env(monkeypatch, tmp_pat
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert captured["disabled_skills"] == "inactive-expert-skill"
+    assert os.environ.get("HERMES_DISABLED_SKILLS_EXTRA") is None
+
+
+def test_run_with_aiagent_cleans_expert_skill_env_on_agent_init_error(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_DISABLED_SKILLS_EXTRA", raising=False)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            assert os.environ.get("HERMES_DISABLED_SKILLS_EXTRA") == "inactive-expert-skill"
+            raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    monkeypatch.setattr(
+        agent_real,
+        "_expert_skill_runtime_env_for_event",
+        lambda event, home: {"HERMES_DISABLED_SKILLS_EXTRA": "inactive-expert-skill"},
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        agent_real._run_with_aiagent(event, profile_home)
     assert os.environ.get("HERMES_DISABLED_SKILLS_EXTRA") is None
 
 

@@ -115,7 +115,7 @@ def _managed_manifest_dirs(profile_home: Path) -> list[Path]:
     return dirs
 
 
-def _iter_managed_manifests(profile_home: Path):
+def _iter_managed_manifests(profile_home: Path, *, strict: bool = False):
     """Yield ``(manifest_dict, manifest_path)`` for every readable managed manifest."""
     seen: set[Path] = set()
     for d in _managed_manifest_dirs(profile_home):
@@ -129,6 +129,8 @@ def _iter_managed_manifests(profile_home: Path):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
+                if strict:
+                    raise
                 logger.debug("[multitenancy] skip unreadable managed manifest %s", path, exc_info=True)
                 continue
             if isinstance(data, dict):
@@ -419,24 +421,17 @@ def all_expert_skill_names(profile_home: Path) -> set[str]:
     not be advertised unless that expert is the active run overlay.
     """
     names: set[str] = set()
-    try:
-        for manifest, _path in _iter_managed_manifests(profile_home):
-            experts = manifest.get("experts")
-            if not isinstance(experts, list):
+    for manifest, _path in _iter_managed_manifests(profile_home, strict=True):
+        experts = manifest.get("experts")
+        if not isinstance(experts, list):
+            continue
+        for ex in experts:
+            if not isinstance(ex, dict):
                 continue
-            for ex in experts:
-                if not isinstance(ex, dict):
-                    continue
-                for skill in ex.get("skills") or []:
-                    name = str(skill).strip()
-                    if name:
-                        names.add(name)
-    except Exception:
-        logger.warning(
-            "[multitenancy] all_expert_skill_names failed for %s",
-            profile_home,
-            exc_info=True,
-        )
+            for skill in ex.get("skills") or []:
+                name = str(skill).strip()
+                if name:
+                    names.add(name)
     return names
 
 

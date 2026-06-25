@@ -566,6 +566,32 @@ def _parse_csv_env_names(value: str) -> set[str]:
     return names
 
 
+def _installed_profile_skill_names(profile_home: Path) -> set[str]:
+    """Best-effort fail-closed skill list for expert gating errors."""
+    names: set[str] = set()
+    skills_root = Path(profile_home).expanduser() / "skills"
+    try:
+        for child in skills_root.iterdir():
+            if child.name.startswith("."):
+                continue
+            if child.is_dir() or child.is_symlink():
+                names.add(child.name)
+    except OSError:
+        logger.warning(
+            "[multitenancy] could not enumerate profile skills for fail-closed expert gating: %s",
+            skills_root,
+            exc_info=True,
+        )
+    return names
+
+
+def _disabled_skills_runtime_env(disabled: set[str]) -> dict[str, str]:
+    disabled = set(disabled) | _parse_csv_env_names(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA", ""))
+    if not disabled:
+        return {}
+    return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
+
+
 def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
     """Return per-run env that hides inactive expert skills.
 
@@ -596,18 +622,14 @@ def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[
             if overlay is not None:
                 active_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
 
-        disabled = all_expert_skills - active_skills
-        if not disabled:
-            return {}
-        disabled |= _parse_csv_env_names(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA", ""))
-        return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
+        return _disabled_skills_runtime_env(all_expert_skills - active_skills)
     except Exception:
         logger.warning(
-            "[multitenancy] expert skill runtime scope failed for %s; running without skill gating",
+            "[multitenancy] expert skill runtime scope failed for %s; disabling installed profile skills",
             profile_home,
             exc_info=True,
         )
-        return {}
+        return _disabled_skills_runtime_env(_installed_profile_skill_names(profile_home))
 
 
 def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
@@ -4906,9 +4928,10 @@ def _run_with_aiagent(
                     agent = AIAgent(**agent_kwargs)
                     break
                 except TypeError as exc:
-                    # Graceful degrade for older cores that do not accept the
-                    # overlay kwargs. Drop only the rejected kwarg and retry; any
-                    # unrelated TypeError still re-raises.
+                    # Graceful degrade only for optional run-only prompt plumbing.
+                    # ``identity_override`` is the load-bearing expert identity
+                    # seam; without it we would fall back to the known-bad
+                    # append-only behavior that leaks the default Hermes identity.
                     unsupported_key = next(
                         (
                             key
@@ -4919,6 +4942,11 @@ def _run_with_aiagent(
                     )
                     if unsupported_key is None:
                         raise
+                    if unsupported_key == "identity_override":
+                        raise RuntimeError(
+                            "Hermes core does not support identity_override; "
+                            "expert Role Override cannot run safely"
+                        ) from exc
                     logger.warning(
                         "[multitenancy] AIAgent core has no %s; expert overlay "
                         "degraded this run (profile=%s)",
