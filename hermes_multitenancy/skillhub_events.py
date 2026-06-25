@@ -40,6 +40,9 @@ DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
 KNOWN_EVENT_TYPES = frozenset(
     {
         "skill.install_approved",
+        "skill.status_changed",
+        "skill.auth_type_changed",
+        "skill.permission_approved",
         "skill.updated",
         "skill.revoked",
         "skill.permission_changed",
@@ -60,6 +63,7 @@ CREATE TABLE IF NOT EXISTS skillhub_events (
     auth_type          TEXT,
     audience_json      TEXT,
     raw_payload        TEXT,
+    results_json       TEXT,
     status             TEXT NOT NULL,
     signature_verified INTEGER NOT NULL DEFAULT 0,
     received_at        INTEGER NOT NULL,
@@ -208,12 +212,18 @@ class SkillhubEventStore:
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._conn.executescript("PRAGMA journal_mode=WAL;")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            try:
+                self._conn.execute("ALTER TABLE skillhub_events ADD COLUMN results_json TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+            self._conn.commit()
         # The connection is shared (check_same_thread=False) across the aiohttp
         # event loop and the cron worker thread; serialize writes.
-        self._lock = threading.Lock()
 
     def record(
         self,
@@ -281,6 +291,44 @@ class SkillhubEventStore:
             "SELECT * FROM skillhub_events ORDER BY received_at DESC LIMIT ?", (limit,)
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def list_queued(self, limit: int = 50) -> list[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM skillhub_events"
+            " WHERE status IN ('queued', 'queued_unknown_type')"
+            " ORDER BY received_at ASC, event_id ASC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def mark_installed(self, event_id: str, results: dict[str, Any]) -> bool:
+        now = int(time.time())
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE skillhub_events"
+                " SET status = ?, results_json = ?, updated_at = ?"
+                " WHERE event_id = ?",
+                ("installed", json.dumps(results, ensure_ascii=False), now, event_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def mark_failed(self, event_id: str, error_code: str, message: str) -> bool:
+        now = int(time.time())
+        payload = {
+            "error_code": str(error_code),
+            "message": str(message),
+            "failed_at": now,
+        }
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE skillhub_events"
+                " SET status = ?, results_json = ?, updated_at = ?"
+                " WHERE event_id = ?",
+                ("failed", json.dumps(payload, ensure_ascii=False), now, event_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def close(self) -> None:
         self._conn.close()
