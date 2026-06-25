@@ -3790,11 +3790,17 @@ def create_run_broker_app(
 
         try:
             profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            # Serve from the short-TTL cache by default so repeat panel loads are instant
+            # (the readers shell out to meegle/kep-auth — ~1.2s even parallelized). The
+            # WebUI passes ?fresh=1 for its post-auth poll and the manual refresh button,
+            # forcing a live read so a just-completed login shows without waiting for TTL.
+            fresh = str(request.query.get("fresh") or "").strip().lower() in ("1", "true", "yes", "on")
             # Offload to a thread: collection may shell out to meegle/kep-auth.
             statuses = await asyncio.to_thread(
                 registry.collect_connector_statuses,
                 profile_name=profile_name,
                 open_id=user_key,
+                use_cache=not fresh,
             )
             return web.json_response(
                 {

@@ -176,3 +176,44 @@ def test_to_dict_never_leaks_a_planted_secret_token(monkeypatch, tmp_path):
         assert secret not in blob, status.id
         assert ".keepai" not in blob, status.id
         assert str(home) not in blob, status.id
+
+def test_use_cache_true_serves_second_call_from_cache(monkeypatch, tmp_path):
+    """Repeat panel loads within the TTL skip the (subprocess-heavy) readers."""
+    from hermes_multitenancy import credential_hub
+    from hermes_multitenancy.connectors import registry
+
+    shared, _ = _mk_profile_home(tmp_path, "owner")
+    _patch_no_binaries(monkeypatch, lark_status={"status": "missing"})
+    registry._cache.clear()
+    calls = {"n": 0}
+    orig = credential_hub._collect_credential_rows
+    monkeypatch.setattr(
+        credential_hub, "_collect_credential_rows",
+        lambda **kw: (calls.__setitem__("n", calls["n"] + 1) or orig(**kw)),
+    )
+    for _ in range(2):
+        registry.collect_connector_statuses(
+            profile_name="owner", open_id="ou_owner", shared_home=shared, use_cache=True
+        )
+    assert calls["n"] == 1  # second call hit the cache
+
+
+def test_use_cache_false_bypasses_cache_every_call(monkeypatch, tmp_path):
+    """The post-auth poll / manual refresh path must read live every time."""
+    from hermes_multitenancy import credential_hub
+    from hermes_multitenancy.connectors import registry
+
+    shared, _ = _mk_profile_home(tmp_path, "owner")
+    _patch_no_binaries(monkeypatch, lark_status={"status": "missing"})
+    registry._cache.clear()
+    calls = {"n": 0}
+    orig = credential_hub._collect_credential_rows
+    monkeypatch.setattr(
+        credential_hub, "_collect_credential_rows",
+        lambda **kw: (calls.__setitem__("n", calls["n"] + 1) or orig(**kw)),
+    )
+    for _ in range(2):
+        registry.collect_connector_statuses(
+            profile_name="owner", open_id="ou_owner", shared_home=shared, use_cache=False
+        )
+    assert calls["n"] == 2  # fresh each time — no cache reuse

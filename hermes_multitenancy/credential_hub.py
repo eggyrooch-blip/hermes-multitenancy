@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -842,15 +843,24 @@ def _collect_credential_rows(
     )
     gitlab_installed = _has_skill(skills, name="kep-prd-analysis", needles=("gitlab_token",))
 
-    return [
-        lark_cli_status(profile_name=profile_name, open_id=open_id, shared_home=shared,
-                        profile_dir=p_dir, required_by=req.get(LARK_CLI)),
-        feishu_project_status(profile_dir=p_dir, profile_name=profile_name, required_by=req.get(FEISHU_PROJECT)),
-        keep_record_status(home_dir=home, installed=keep_installed),
-        kep_cli_status(profile_dir=p_dir, home_dir=home, profile_name=profile_name, shared_home=shared,
-                       installed=kep_installed, required_by=req.get(KEP_CLI)),
-        gitlab_status(profile_dir=p_dir, installed=gitlab_installed),
-    ]
+    # Each reader shells out to a CLI (kep-auth, meegle via npx, keep-record) and
+    # releases the GIL while waiting on the subprocess, so running them concurrently
+    # collapses the panel's wall-clock from sum-of-readers (~1.5-2s serial) to
+    # max-of-reader (~the slowest single CLI). Readers share no mutable state and each
+    # guards its own failure internally (returning a degraded CredentialRow), so a slow
+    # or failing one cannot corrupt the others. Order is preserved by ThreadPoolExecutor.map.
+    readers = (
+        lambda: lark_cli_status(profile_name=profile_name, open_id=open_id, shared_home=shared,
+                                profile_dir=p_dir, required_by=req.get(LARK_CLI)),
+        lambda: feishu_project_status(profile_dir=p_dir, profile_name=profile_name,
+                                      required_by=req.get(FEISHU_PROJECT)),
+        lambda: keep_record_status(home_dir=home, installed=keep_installed),
+        lambda: kep_cli_status(profile_dir=p_dir, home_dir=home, profile_name=profile_name,
+                               shared_home=shared, installed=kep_installed, required_by=req.get(KEP_CLI)),
+        lambda: gitlab_status(profile_dir=p_dir, installed=gitlab_installed),
+    )
+    with ThreadPoolExecutor(max_workers=len(readers)) as pool:
+        return list(pool.map(lambda fn: fn(), readers))
 
 
 def collect_credential_statuses(

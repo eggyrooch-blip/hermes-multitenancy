@@ -687,3 +687,28 @@ def test_qr_and_url_card_builders():
     assert '"tag": "img"' in qr and "img_v3_demo" in qr and "扫码" in qr
     url = json.dumps(build_url_card("kep-cli", "https://auth.example.com/x", label_zh="前往登录"), ensure_ascii=False)
     assert "https://auth.example.com/x" in url and "前往登录" in url
+
+
+def test_collect_credential_rows_preserves_order_under_parallelism(monkeypatch, tmp_path):
+    """The 5 readers run concurrently; output MUST stay in CREDENTIAL_ORDER even
+    when the first reader is the slowest to finish (else the UI columns reorder)."""
+    import time as _t
+    from hermes_multitenancy import credential_hub as ch
+
+    (tmp_path / "profiles" / "owner" / "home").mkdir(parents=True)
+    monkeypatch.setattr(ch, "scan_profile_skills", lambda *a, **k: [])
+    monkeypatch.setattr(ch, "_requirements_by_id", lambda *a, **k: {})
+    monkeypatch.setattr(ch, "_has_skill", lambda *a, **k: False)
+
+    def _row(cid):
+        return ch.CredentialRow(id=cid, title=cid, provider="x", installed=True, status="missing")
+
+    # lark (first) is slowest, gitlab (last) is instant — order must still hold.
+    monkeypatch.setattr(ch, "lark_cli_status", lambda **k: (_t.sleep(0.15), _row(ch.LARK_CLI))[1])
+    monkeypatch.setattr(ch, "feishu_project_status", lambda **k: _row(ch.FEISHU_PROJECT))
+    monkeypatch.setattr(ch, "keep_record_status", lambda **k: _row(ch.KEEP_RECORD))
+    monkeypatch.setattr(ch, "kep_cli_status", lambda **k: _row(ch.KEP_CLI))
+    monkeypatch.setattr(ch, "gitlab_status", lambda **k: _row(ch.GITLAB))
+
+    rows = ch._collect_credential_rows(profile_name="owner", open_id="o", shared_home=tmp_path)
+    assert [r.id for r in rows] == list(ch.CREDENTIAL_ORDER)

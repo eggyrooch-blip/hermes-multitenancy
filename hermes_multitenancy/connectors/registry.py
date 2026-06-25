@@ -166,7 +166,12 @@ def _require(connector_id: str) -> ConnectorDefinition:
 
 # --- optional short-TTL cache (profile/user/scope isolated) ------------------
 
-_CACHE_TTL_MS_DEFAULT = 3000
+# 15s: connector auth status changes rarely (login/logout/expiry), so a brief cache
+# makes repeat panel loads instant while staying fresh enough; the only freshness-
+# critical path (the post-auth poll) bypasses the cache with use_cache=False. Only the
+# /connectors endpoint opts into the cache, so this default affects nothing else.
+# Override with HERMES_CONNECTOR_STATUS_CACHE_TTL_MS.
+_CACHE_TTL_MS_DEFAULT = 15000
 _cache_lock = threading.Lock()
 _cache: dict[tuple[str, str, str], tuple[float, list[ConnectorStatus]]] = {}
 
