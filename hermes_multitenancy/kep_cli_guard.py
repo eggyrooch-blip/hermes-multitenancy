@@ -19,12 +19,10 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-# kep-cli family binaries that accept a ``--profile`` flag. NOTE: ``kep-cli`` itself (the
-# installer/doctor meta-CLI) is deliberately EXCLUDED — it has no ``--profile`` flag, so
-# shimming it would break ``kep-cli install`` ("unknown flag: --profile"). Only per-system
-# CLIs that are tenant-scoped belong here.
+# The kep-cli family binaries that take a ``--profile`` flag and live in the shared bin.
 KEP_CLI_SHIM_NAMES = (
     "kep-auth",
+    "kep-cli",
     "halo-cli",
     "hades-cli",
     "asgard-cli",
@@ -73,10 +71,6 @@ def install_kep_cli_shim(shim_dir: Path, *, real_bin_dir: Path) -> Path:
     primary = shim_dir / "kep-auth"
     for name in KEP_CLI_SHIM_NAMES:
         real = real_bin_dir / name
-        # Only shim a CLI the profile actually has — the shim set mirrors what was
-        # dispatched into the shared bin, so a profile without hades-cli gets no hades shim.
-        if not real.exists():
-            continue
         body = _shim_program(str(real))
         path = shim_dir / name
         path.write_text(body, encoding="utf-8")
