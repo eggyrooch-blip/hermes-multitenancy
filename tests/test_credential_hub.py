@@ -10,6 +10,7 @@ so no real binary is required.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
@@ -256,7 +257,7 @@ def test_feishu_project_missing_when_no_cli(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub
 
     monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
-    monkeypatch.setattr(credential_hub.shutil, "which", lambda n: None)  # no npx either
+    monkeypatch.setattr(credential_hub.shutil, "which", lambda n, path=None: None)  # no npx either
     row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
     assert row.id == "feishu-project"
     assert row.status == "missing"
@@ -268,7 +269,7 @@ def test_feishu_project_npx_only_not_run_for_status(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub
 
     monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
-    monkeypatch.setattr(credential_hub.shutil, "which", lambda n: "/usr/bin/npx" if n == "npx" else None)
+    monkeypatch.setattr(credential_hub.shutil, "which", lambda n, path=None: "/usr/bin/npx" if n == "npx" else None)
     called = {"ran": False}
     monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: called.__setitem__("ran", True) or None)
     row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
@@ -307,6 +308,35 @@ def test_feishu_project_needs_auth_when_not_authed(monkeypatch, tmp_path):
     row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
     assert row.status == "needs_auth"
     assert row.installed is True
+
+
+def test_meegle_search_path_augments_common_dirs_and_extra(monkeypatch):
+    """Parity with the WebUI reader: lookup PATH includes common node dirs +
+    HERMES_MEEGLE_EXTRA_PATHS so a narrow launchd/systemd PATH still finds npx."""
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_MEEGLE_EXTRA_PATHS", "/opt/custom-node/bin")
+    parts = credential_hub._meegle_search_path("/cmd/dir").split(os.pathsep)
+    assert "/opt/homebrew/bin" in parts          # common dir always added
+    assert "/usr/local/bin" in parts
+    assert "/opt/custom-node/bin" in parts        # HERMES_MEEGLE_EXTRA_PATHS honored
+    assert "/cmd/dir" in parts                    # caller-supplied command dir
+    assert parts.count("/usr/bin") == 1           # deduped
+
+
+def test_which_meegle_resolves_npx_via_extra_path(monkeypatch, tmp_path):
+    """_which_meegle finds npx outside the bare PATH via HERMES_MEEGLE_EXTRA_PATHS."""
+    from hermes_multitenancy import credential_hub
+
+    fake = tmp_path / "nodebin"
+    fake.mkdir()
+    npx = fake / "npx"
+    npx.write_text("#!/bin/sh\n")
+    npx.chmod(0o755)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_MEEGLE_EXTRA_PATHS", str(fake))
+    assert credential_hub._which_meegle("npx") == str(npx)
 
 
 # -- gitlab reader -----------------------------------------------------------
