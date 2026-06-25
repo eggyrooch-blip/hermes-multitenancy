@@ -4446,3 +4446,39 @@ def test_ensure_run_broker_server_started_is_noop_when_disabled(monkeypatch):
         assert broker_mod._site is None
 
     asyncio.run(runner())
+
+
+def test_connectors_handler_maps_fresh_query_to_use_cache(monkeypatch):
+    """The /connectors handler must map ?fresh=1 → use_cache=False (live read) and
+    its absence → use_cache=True (serve from the short-TTL cache)."""
+    import asyncio
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+    from hermes_multitenancy.connectors import registry
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)  # _authorized → open
+    captured: list[bool] = []
+
+    def fake_collect(*, profile_name, open_id, use_cache=False, **kw):
+        captured.append(use_cache)
+        return []
+
+    monkeypatch.setattr(registry, "collect_connector_statuses", fake_collect)
+
+    async def runner():
+        app = create_run_broker_app(mark_seen=lambda _r: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r1 = await client.get("/api/run-broker/connectors?profile_name=owner&user_key=ou_o")
+            await r1.text()
+            r2 = await client.get("/api/run-broker/connectors?profile_name=owner&user_key=ou_o&fresh=1")
+            await r2.text()
+            assert r1.status == 200 and r2.status == 200
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+    assert captured == [True, False]  # cached by default; fresh=1 bypasses
