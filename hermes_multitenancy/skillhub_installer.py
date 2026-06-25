@@ -19,6 +19,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+import yaml
+
 from .skill_registry import (
     MANAGED_SKILL_MANIFEST,
     _install_personal_skill,
@@ -30,6 +32,8 @@ from .skillhub_events import SkillhubEventStore, get_event_store
 
 _DOWNLOAD_TIMEOUT_SECONDS = 30
 _LOCK_FILENAME = Path(".keephub") / "lock.json"
+_SKILL_DISTRIBUTION_FILENAME = "skill-distribution.yaml"
+_SKILL_DISTRIBUTION_ORIGIN = "aidock-skillhub"
 
 
 class SkillhubInstallError(Exception):
@@ -142,7 +146,7 @@ def _resolve_skill_root(base_dir: Path) -> Path | None:
 def _canonical_release_dir(shared_home: Path, skill_code: str, version: str) -> Path:
     safe_skill = _safe_skill_relative_path(skill_code)
     safe_version = _safe_skill_relative_path(version)
-    return shared_home / "_managed" / "aidock-skillhub" / safe_skill / safe_version
+    return shared_home / "_managed" / _SKILL_DISTRIBUTION_ORIGIN / safe_skill / safe_version
 
 
 def _materialize_canonical_skill(
@@ -176,6 +180,137 @@ def _materialize_canonical_skill(
 
 def _routing_db_path(shared_home: Path) -> Path:
     return shared_home / "multitenancy.db"
+
+
+def _resolve_auth_type(event: dict[str, Any]) -> str:
+    audience = event.get("audience") if isinstance(event.get("audience"), dict) else None
+    nested = _first_str(audience.get("auth_type")) if isinstance(audience, dict) else None
+    return nested or _first_str(event.get("auth_type")) or "auth"
+
+
+def _distribution_config_path(shared_home: Path) -> Path:
+    return shared_home / _SKILL_DISTRIBUTION_FILENAME
+
+
+def _require_distribution_config(
+    shared_home: Path,
+    *,
+    allow_create_distribution: bool,
+) -> Path:
+    config_path = _distribution_config_path(shared_home)
+    if config_path.exists() or allow_create_distribution:
+        return config_path
+    raise SkillhubInstallError(
+        f"no {_SKILL_DISTRIBUTION_FILENAME} at {shared_home} — refusing to create it",
+        error_code="DISTRIBUTION_FILE_MISSING",
+    )
+
+
+def _symlink_target(path: Path) -> Path | None:
+    try:
+        raw_target = os.readlink(path)
+    except OSError:
+        return None
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = path.parent / target
+    return target.resolve(strict=False)
+
+
+def _is_owned_shared_skill_target(
+    target: Path,
+    *,
+    shared_home: Path,
+    skill_code: str,
+) -> bool:
+    owned_root = shared_home / "_managed" / _SKILL_DISTRIBUTION_ORIGIN / _safe_skill_relative_path(skill_code)
+    try:
+        target.relative_to(owned_root.resolve(strict=False))
+    except ValueError:
+        return False
+    return True
+
+
+def _register_shared_skill_symlink_source(
+    *,
+    shared_home: Path,
+    skill_code: str,
+    canonical_skill_root: Path,
+) -> dict[str, Any]:
+    rel_path = _safe_skill_relative_path(skill_code)
+    source_path = shared_home / "skills" / rel_path
+    canonical_root = canonical_skill_root.resolve(strict=True)
+    if source_path.is_symlink():
+        current_target = _symlink_target(source_path)
+        if current_target == canonical_root:
+            return {"path": str(rel_path), "source_path": str(source_path), "action": "present"}
+        if current_target is not None and _is_owned_shared_skill_target(
+            current_target,
+            shared_home=shared_home,
+            skill_code=skill_code,
+        ):
+            source_path.unlink()
+            source_path.symlink_to(canonical_skill_root)
+            return {"path": str(rel_path), "source_path": str(source_path), "action": "repointed"}
+        return {"path": str(rel_path), "source_path": str(source_path), "action": "skipped-foreign"}
+    if source_path.exists():
+        return {"path": str(rel_path), "source_path": str(source_path), "action": "skipped-foreign"}
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.symlink_to(canonical_skill_root)
+    return {"path": str(rel_path), "source_path": str(source_path), "action": "registered"}
+
+
+def _register_all_audience_distribution(
+    *,
+    shared_home: Path,
+    skill_code: str,
+    canonical_skill_root: Path,
+    allow_create_distribution: bool = False,
+) -> dict[str, Any]:
+    config_path = _require_distribution_config(
+        shared_home,
+        allow_create_distribution=allow_create_distribution,
+    )
+    source = _register_shared_skill_symlink_source(
+        shared_home=shared_home,
+        skill_code=skill_code,
+        canonical_skill_root=canonical_skill_root,
+    )
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    raw = loaded if isinstance(loaded, dict) else {}
+    skills_list = raw.get("skills")
+    if not isinstance(skills_list, list):
+        skills_list = []
+    path_text = str(_safe_skill_relative_path(skill_code))
+    entry = {
+        "path": path_text,
+        "audience": "all",
+        "install_mode": "symlink",
+        "origin": _SKILL_DISTRIBUTION_ORIGIN,
+    }
+    raw["skills"] = [
+        item
+        for item in skills_list
+        if not (
+            isinstance(item, dict)
+            and item.get("path") == path_text
+            and item.get("origin") == _SKILL_DISTRIBUTION_ORIGIN
+        )
+    ]
+    raw["skills"].append(entry)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return {
+        "path": path_text,
+        "audience": "all",
+        "install_mode": "symlink",
+        "config_path": str(config_path),
+        "source": str(source["action"]),
+        "entry_written": True,
+    }
 
 
 def _resolve_profile_name(shared_home: Path, ldap: str) -> str | None:
@@ -284,6 +419,7 @@ def process_event(
     shared_home: Path,
     profiles_root: Path | None = None,
     downloader: Callable[[str], bytes] | None = None,
+    allow_create_distribution: bool = False,
 ) -> dict[str, Any]:
     """Materialize one queued skillhub event.
 
@@ -304,6 +440,12 @@ def process_event(
     release_id = _first_str(event.get("release_id"))
     shared = Path(shared_home).expanduser()
     profiles = (profiles_root or shared / "profiles").expanduser()
+    auth_type = _resolve_auth_type(event)
+    if auth_type.strip().lower() == "all":
+        _require_distribution_config(
+            shared,
+            allow_create_distribution=allow_create_distribution,
+        )
     package_bytes = _download_package(download_url, downloader)
     _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
     canonical_skill_root = _materialize_canonical_skill(
@@ -312,6 +454,21 @@ def process_event(
         version=version,
         package_bytes=package_bytes,
     )
+    if auth_type.strip().lower() == "all":
+        distribution = _register_all_audience_distribution(
+            shared_home=shared,
+            skill_code=skill_code,
+            canonical_skill_root=canonical_skill_root,
+            allow_create_distribution=allow_create_distribution,
+        )
+        return {
+            "action": "install",
+            "mode": "all",
+            "skill_code": skill_code,
+            "version": version,
+            "release_id": release_id,
+            "distribution": distribution,
+        }
 
     audience = event.get("audience") if isinstance(event.get("audience"), dict) else {}
     users = audience.get("users") if isinstance(audience, dict) else []
