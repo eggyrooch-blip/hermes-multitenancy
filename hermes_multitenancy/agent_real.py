@@ -1629,23 +1629,6 @@ def _build_subprocess_env(
     path_parts = [part for part in existing_path.split(os.pathsep) if part]
     deduped = [part for part in path_parts if part != shared_bin]
     env["PATH"] = os.pathsep.join([shared_bin, *deduped])
-
-    # kep-cli family profile shim: inject --profile into kep-auth/kep-cli/halo/hades/
-    # asgard/phantasia so they stay tenant-correct even if a skill/LLM subprocess drops
-    # KEP_PROFILE (the shim recovers the profile from $HOME). Wraps by PATH-prepend; the
-    # real binaries in shared_bin are untouched. Fail-soft: a shim error never blocks the run.
-    try:
-        from .kep_cli_guard import install_kep_cli_shim
-
-        kep_shim_dir = profile_home / "tmp" / "kep-cli-shim"
-        install_kep_cli_shim(kep_shim_dir, real_bin_dir=Path(shared_bin))
-        kep_path_parts = [part for part in env["PATH"].split(os.pathsep) if part]
-        env["PATH"] = os.pathsep.join(
-            [str(kep_shim_dir), *[part for part in kep_path_parts if part != str(kep_shim_dir)]]
-        )
-    except Exception as exc:  # never let the shim break subprocess launch
-        logger.debug("multitenancy: kep-cli shim install skipped (%s)", exc)
-
     if strict_context_enabled():
         real_bin = _resolve_lark_cli_authsidecar_binary(profile_home)
         shim_dir = profile_home / "tmp" / "lark-cli-shim"
