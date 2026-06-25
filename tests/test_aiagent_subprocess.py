@@ -2235,8 +2235,8 @@ def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_
     assert seen["cleanup"] is True
 
 
-def test_run_with_aiagent_passes_expert_identity_override_to_core(monkeypatch, tmp_path: Path):
-    """Expert overlay must replace core identity, not append as context."""
+def test_run_with_aiagent_passes_expert_system_message_without_core_kwargs(monkeypatch, tmp_path: Path):
+    """Expert overlay uses clean core's run system_message seam, not constructor forks."""
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
@@ -2250,12 +2250,17 @@ def test_run_with_aiagent_passes_expert_identity_override_to_core(monkeypatch, t
     captured: dict[str, object] = {}
 
     class FakeAgent:
-        def __init__(self, identity_override=None, **kwargs):
+        def __init__(self, **kwargs):
             captured["kwargs"] = dict(kwargs)
-            captured["identity_override"] = identity_override
+            self._cached_system_prompt = None
+
+        def _build_system_prompt(self, system_message=None):
+            captured["build_system_message"] = system_message
+            return f"BUILT::{system_message}"
 
         def run_conversation(self, user_message, task_id, system_message=None):
             captured["run_system_message"] = system_message
+            captured["cached_system_prompt"] = self._cached_system_prompt
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -2275,8 +2280,9 @@ def test_run_with_aiagent_passes_expert_identity_override_to_core(monkeypatch, t
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert "identity_override" not in captured["kwargs"]
     assert "ephemeral_system_prompt" not in captured["kwargs"]
-    assert captured["identity_override"] == "ROLE OVERRIDE\n我是资源投放专家"
-    assert captured["run_system_message"] is None
+    assert captured["build_system_message"] == "ROLE OVERRIDE\n我是资源投放专家"
+    assert captured["run_system_message"] == "ROLE OVERRIDE\n我是资源投放专家"
+    assert captured["cached_system_prompt"] == "BUILT::ROLE OVERRIDE\n我是资源投放专家"
 
 
 def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch, tmp_path: Path):
@@ -2314,7 +2320,8 @@ def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch
     assert "ephemeral_system_prompt" not in captured
 
 
-def test_run_with_aiagent_applies_expert_skill_disabled_env(monkeypatch, tmp_path: Path):
+def test_run_with_aiagent_does_not_require_core_identity_override(monkeypatch, tmp_path: Path):
+    """Clean upstream AIAgent does not accept identity_override; expert run still starts."""
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
@@ -2325,53 +2332,18 @@ def test_run_with_aiagent_applies_expert_skill_disabled_env(monkeypatch, tmp_pat
     )
     (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
 
-    seen_env: list[str | None] = []
+    attempts: list[set[str]] = []
+    seen: dict[str, object] = {}
 
     class FakeAgent:
         def __init__(self, **kwargs):
-            seen_env.append(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA"))
+            attempts.append(set(kwargs))
+            if "identity_override" in kwargs:
+                raise AssertionError("identity_override must not be passed to clean core")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, system_message=None):
+            seen["system_message"] = system_message
             return {"final_response": "ok"}
-
-        def cleanup(self):
-            pass
-
-    monkeypatch.delenv("HERMES_DISABLED_SKILLS_EXTRA", raising=False)
-    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
-    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
-    monkeypatch.setattr(
-        agent_real,
-        "_expert_skill_runtime_env_for_event",
-        lambda event, home: {"HERMES_DISABLED_SKILLS_EXTRA": "private-a"},
-    )
-    _install_fake_feishu_oapi(monkeypatch)
-
-    event = _event()
-    event.source.platform = SimpleNamespace(value="webui")
-
-    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
-    assert seen_env == ["private-a"]
-    assert os.environ.get("HERMES_DISABLED_SKILLS_EXTRA") is None
-
-
-def test_run_with_aiagent_fails_when_core_lacks_identity_override(monkeypatch, tmp_path: Path):
-    """Old core cannot safely run expert identity sessions."""
-    from hermes_multitenancy import agent_real
-
-    profile_home = tmp_path / "profiles" / "coder"
-    profile_home.mkdir(parents=True)
-    (profile_home / "config.yaml").write_text(
-        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
-        encoding="utf-8",
-    )
-    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
-
-    constructed: list[bool] = []
-
-    class FakeAgent:
-        def __init__(self, model=None):
-            constructed.append(True)
 
         def cleanup(self):
             pass
@@ -2387,9 +2359,10 @@ def test_run_with_aiagent_fails_when_core_lacks_identity_override(monkeypatch, t
     event = _event()
     event.source.platform = SimpleNamespace(value="webui")
 
-    with pytest.raises(RuntimeError, match="does not support identity_override"):
-        agent_real._run_with_aiagent(event, profile_home)
-    assert constructed == []
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "identity_override" not in attempts[0]
+    assert seen["system_message"] == "ROLE OVERRIDE\n我是资源投放专家"
+    assert len(attempts) == 1
 
 
 def test_run_with_aiagent_applies_expert_skill_scope_cleanup(monkeypatch, tmp_path: Path):
