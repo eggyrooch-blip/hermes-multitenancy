@@ -52,6 +52,8 @@ ROLE_OVERRIDE_PREAMBLE = (
 
 ROLE_OVERRIDE_TAIL = (
     "（以上专家角色为最高优先级，必须遵守，覆盖任何既有 Hermes / 助手身份；"
+    "当用户问你是谁、你的身份、你的角色时，必须按上述专家名称与职责回答；"
+    "不得自称 Hermes、Nous Research、通用 AI 助手或其它非当前专家身份。"
     "凭证仍为当前用户本人，所有高风险写操作需按上述门禁取得显式确认。）"
 )
 
@@ -407,6 +409,35 @@ def list_experts(
     except Exception:
         logger.warning("[multitenancy] list_experts failed for %s", profile_home, exc_info=True)
     return sorted(rows, key=lambda r: (not r["featured"], r["category"], r["name"]))
+
+
+def all_expert_skill_names(profile_home: Path) -> set[str]:
+    """Return every skill declared by installed expert manifests.
+
+    Runtime skill hiding should fail closed, so this intentionally ignores
+    audience filtering: a hidden or unauthorized expert's private skills should
+    not be advertised unless that expert is the active run overlay.
+    """
+    names: set[str] = set()
+    try:
+        for manifest, _path in _iter_managed_manifests(profile_home):
+            experts = manifest.get("experts")
+            if not isinstance(experts, list):
+                continue
+            for ex in experts:
+                if not isinstance(ex, dict):
+                    continue
+                for skill in ex.get("skills") or []:
+                    name = str(skill).strip()
+                    if name:
+                        names.add(name)
+    except Exception:
+        logger.warning(
+            "[multitenancy] all_expert_skill_names failed for %s",
+            profile_home,
+            exc_info=True,
+        )
+    return names
 
 
 # ─────────────────────────── caller department resolution ────────────────────

@@ -556,6 +556,60 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
         return None
 
 
+def _parse_csv_env_names(value: str) -> set[str]:
+    names: set[str] = set()
+    for line in str(value or "").splitlines():
+        for item in line.split(","):
+            name = item.strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
+    """Return per-run env that hides inactive expert skills.
+
+    Expert skill files are installed long-term under the profile, but WorkBuddy
+    semantics are session-scoped: only the active expert's private skills should
+    be advertised/loadable in this run. Hermes core consumes
+    ``HERMES_DISABLED_SKILLS_EXTRA`` as a generic disabled-skill overlay.
+    """
+    try:
+        from .expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
+
+        all_expert_skills = all_expert_skill_names(profile_home)
+        if not all_expert_skills:
+            return {}
+
+        active_skills: set[str] = set()
+        expert_id = _expert_id_for_event(event)
+        if expert_id:
+            try:
+                sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+            except Exception:
+                sender_open_id = None
+            overlay = resolve_expert(
+                profile_home,
+                expert_id,
+                department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
+            )
+            if overlay is not None:
+                active_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
+
+        disabled = all_expert_skills - active_skills
+        if not disabled:
+            return {}
+        disabled |= _parse_csv_env_names(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA", ""))
+        return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert skill runtime scope failed for %s; running without skill gating",
+            profile_home,
+            exc_info=True,
+        )
+        return {}
+
+
 def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
     """System-message text for the legacy chat-completions paths.
 
@@ -2426,13 +2480,14 @@ def _install_ingest_secret_env_passthrough(env: Optional[Mapping[str, str]] = No
         logger.debug("[multitenancy] ingest secret env passthrough skipped", exc_info=True)
 
 
-def _apply_runtime_env_for_aiagent(profile_home: Path):
+def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[str, str]] = None):
     """Temporarily expose profile/credential env for in-process AIAgent runs."""
     runtime_env = _profile_env_for_aiagent(profile_home)
     credential_env = _credential_env_for_aiagent(profile_home)
     runtime_env.update(credential_env)
     runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
     runtime_env.update(_browser_env_for_aiagent(profile_home))
+    runtime_env.update({str(k): str(v) for k, v in (extra_env or {}).items() if str(k).strip()})
     if not runtime_env:
         return lambda: None
     old_env = {key: os.environ.get(key) for key in runtime_env}
@@ -4823,41 +4878,54 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
-        # Expert Role-Override overlay (ephemeral, this run only). The core's
-        # ``ephemeral_system_prompt`` is explicitly "used during execution but NOT
-        # saved to trajectories", so SOUL.md / memory / USER on disk stay untouched
-        # — exactly the redline this feature requires. Core composes it into the
-        # SINGLE system message (SOUL leads, override appended); per the live
-        # verdict the override WORDING wins regardless of block order. We do NOT
-        # route it via metadata.instructions (verdict B4 leaked the base identity).
+        # Expert Role-Override overlay (ephemeral, this run only). Newer Hermes
+        # core accepts ``identity_override`` to replace the stable identity tier;
+        # ``ephemeral_system_prompt`` keeps the same block visible in the run-only
+        # prompt channel for older composition paths. SOUL.md / memory / USER on
+        # disk stay untouched. Do NOT route this through metadata.instructions:
+        # verdict B4 leaked the base Hermes identity from that user-message path.
         _role_override = _role_override_block_for_event(event, profile_home)
         if _role_override:
+            agent_kwargs["identity_override"] = _role_override
             agent_kwargs["ephemeral_system_prompt"] = _role_override
 
         approval_cleanup = _configure_gateway_approval_bridge(
             event_sink,
             str(gateway_session_key),
         )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
+            profile_home,
+            _expert_skill_runtime_env_for_event(event, profile_home),
+        )
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
         try:
             _register_aiagent_process_image_gen_providers()
-            try:
-                agent = AIAgent(**agent_kwargs)
-            except TypeError as exc:
-                # Graceful degrade for an older core that does not accept
-                # ``ephemeral_system_prompt``: drop the overlay kwarg and retry so
-                # the run still succeeds (with the normal SOUL persona) rather than
-                # crashing. Any other TypeError re-raises.
-                if "ephemeral_system_prompt" not in str(exc) or "ephemeral_system_prompt" not in agent_kwargs:
-                    raise
-                logger.warning(
-                    "[multitenancy] AIAgent core has no ephemeral_system_prompt; "
-                    "expert overlay skipped this run (profile=%s)", profile_home.name,
-                )
-                agent_kwargs.pop("ephemeral_system_prompt", None)
-                agent = AIAgent(**agent_kwargs)
+            while True:
+                try:
+                    agent = AIAgent(**agent_kwargs)
+                    break
+                except TypeError as exc:
+                    # Graceful degrade for older cores that do not accept the
+                    # overlay kwargs. Drop only the rejected kwarg and retry; any
+                    # unrelated TypeError still re-raises.
+                    unsupported_key = next(
+                        (
+                            key
+                            for key in ("identity_override", "ephemeral_system_prompt")
+                            if key in agent_kwargs and key in str(exc)
+                        ),
+                        None,
+                    )
+                    if unsupported_key is None:
+                        raise
+                    logger.warning(
+                        "[multitenancy] AIAgent core has no %s; expert overlay "
+                        "degraded this run (profile=%s)",
+                        unsupported_key,
+                        profile_home.name,
+                    )
+                    agent_kwargs.pop(unsupported_key, None)
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,
                 "task_id": str(session_id),

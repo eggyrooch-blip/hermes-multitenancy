@@ -89,3 +89,39 @@ def test_apply_expert_id_rejects_unsafe_and_clears_blank():
     md2 = {"expert_id": "stale"}
     broker._apply_expert_id_to_metadata(req2, {}, md2)
     assert "expert_id" not in md2  # blank clears → no overlay
+
+
+def test_expert_skill_runtime_env_disables_inactive_expert_skills(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    other_skill = repo / "skills" / "other-private-skill"
+    other_skill.mkdir(parents=True)
+    (other_skill / "SKILL.md").write_text("---\nname: other-private-skill\n---\n# other\n", encoding="utf-8")
+    other_agent = repo / "agents" / "other-expert.md"
+    other_agent.write_text("# 其它专家\n", encoding="utf-8")
+    manifest_path = repo / ".hermes-plugin" / "plugin.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["skills"]["list"].append("other-private-skill")
+    data["experts"].append(
+        {
+            "id": "other-expert",
+            "name": "其它专家",
+            "agent_md": "./agents/other-expert.md",
+            "skills": ["other-private-skill"],
+        }
+    )
+    manifest_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    no_expert = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
+    assert set(no_expert["HERMES_DISABLED_SKILLS_EXTRA"].split(",")) == {
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+        "other-private-skill",
+    }
+
+    active = agent_real._expert_skill_runtime_env_for_event(_event(EXPERT_ID), profile_home)
+    assert active == {"HERMES_DISABLED_SKILLS_EXTRA": "other-private-skill"}

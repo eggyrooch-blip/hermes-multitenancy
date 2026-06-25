@@ -194,6 +194,9 @@ def test_resolve_expert_and_block(tmp_path, monkeypatch):
     assert "最高优先级，必须遵守" in block
     # the override wording must explicitly demote the Hermes identity
     assert "Hermes" in block
+    assert "当用户问你是谁" in block
+    assert "不得自称 Hermes" in block
+    assert "Nous Research" in block
 
 
 def test_resolve_unknown_expert_is_none(tmp_path, monkeypatch):
