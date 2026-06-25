@@ -34,6 +34,7 @@ import uuid
 import re
 import secrets
 import importlib
+import inspect
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
@@ -600,6 +601,18 @@ def _disabled_skills_runtime_env(disabled: set[str]) -> dict[str, str]:
     if not disabled:
         return {}
     return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
+
+
+def _aiagent_supports_identity_override(aiagent_cls: Any) -> bool:
+    try:
+        signature = inspect.signature(aiagent_cls)
+    except (TypeError, ValueError):
+        # Unknown callable shape: try the modern kwarg and let construction
+        # fail closed instead of silently downgrading expert identity injection.
+        return True
+    if "identity_override" in signature.parameters:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
 
 
 def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
@@ -5044,13 +5057,18 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
-        # Expert Role-Override overlay (ephemeral, this run only). Keep
-        # hermes-agent core clean: use its existing run_conversation
-        # system_message seam and force the per-agent cached prompt to rebuild
-        # for this expert run. SOUL.md / memory / USER on disk stay untouched.
-        # Do NOT route this through metadata.instructions: verdict B4 leaked
-        # the base Hermes identity from that user-message path.
+        # Expert Role-Override overlay (ephemeral, this run only). This must be
+        # a stable-tier identity override in hermes-agent core, not an appended
+        # system_message/context block; otherwise SOUL/default identity can still
+        # win "who are you" questions.
         _role_override = _role_override_block_for_event(event, profile_home)
+        if _role_override:
+            if not _aiagent_supports_identity_override(AIAgent):
+                raise RuntimeError(
+                    "Hermes core does not support identity_override; "
+                    "expert Role Override cannot run safely"
+                )
+            agent_kwargs["identity_override"] = _role_override
 
         approval_cleanup = _configure_gateway_approval_bridge(
             event_sink,
@@ -5067,14 +5085,6 @@ def _run_with_aiagent(
                 "user_message": user_text,
                 "task_id": str(session_id),
             }
-            if _role_override:
-                run_kwargs["system_message"] = _role_override
-                build_prompt = getattr(agent, "_build_system_prompt", None)
-                if callable(build_prompt):
-                    try:
-                        agent._cached_system_prompt = build_prompt(system_message=_role_override)
-                    except TypeError:
-                        agent._cached_system_prompt = build_prompt(_role_override)
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
             result = agent.run_conversation(**run_kwargs)
