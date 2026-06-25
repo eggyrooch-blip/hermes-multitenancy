@@ -398,6 +398,9 @@ def list_experts(
                         "featured": bool(ex.get("featured")),
                         "team": ex.get("team"),
                         "plugin_id": plugin_id,
+                        # experts live in managed manifests = ingested via the AiHub
+                        # plugin pipeline → drives the WebUI "来自 AiHub" badge.
+                        "source": "aihub",
                         "skills": [str(s) for s in ex.get("skills") or []],
                     }
                 )
