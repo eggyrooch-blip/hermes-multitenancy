@@ -79,7 +79,11 @@ def test_same_profile_open_id_within_ttl_uses_cache(monkeypatch):
     assert second[0].account_hint == "A"
 
 
-def test_use_cache_false_never_caches(monkeypatch):
+def test_use_cache_false_never_serves_from_cache(monkeypatch):
+    # use_cache=False always READS LIVE (never serves a cached value) — the reader
+    # runs on every call. It does still refresh the cache afterwards (so a later
+    # cached read isn't stale), but it never SERVES from it; that's the invariant the
+    # post-auth poll relies on.
     from hermes_multitenancy import credential_hub
     from hermes_multitenancy.connectors import registry
 
@@ -88,7 +92,7 @@ def test_use_cache_false_never_caches(monkeypatch):
 
     registry.collect_connector_statuses(profile_name="A", open_id="ua", use_cache=False)
     registry.collect_connector_statuses(profile_name="A", open_id="ua", use_cache=False)
-    assert calls["n"] == 2  # no caching when opted out → reader hit each time
+    assert calls["n"] == 2  # bypasses the cached read each time → reader hit every call
 
 
 def test_cache_key_includes_profile_open_id_and_scope():
