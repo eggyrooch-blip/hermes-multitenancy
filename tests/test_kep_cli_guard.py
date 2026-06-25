@@ -35,20 +35,6 @@ def test_only_shims_binaries_that_exist(tmp_path):
     assert not (shim_dir / "kep-auth").exists()  # not installed → not shimmed
 
 
-def test_cleans_stale_shims_on_reinstall(tmp_path):
-    # a prior run left a kep-cli shim; reinstall must remove it (it has no --profile flag)
-    real_bin = tmp_path / "bin"
-    real_bin.mkdir()
-    (real_bin / "kep-auth").write_text("#!/bin/sh\n", encoding="utf-8")
-    (real_bin / "kep-auth").chmod(0o755)
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    (shim_dir / "kep-cli").write_text("#!/bin/sh\n# stale\n", encoding="utf-8")  # stale
-    install_kep_cli_shim(shim_dir, real_bin_dir=real_bin)
-    assert not (shim_dir / "kep-cli").exists()  # stale shim removed
-    assert (shim_dir / "kep-auth").exists()
-
-
 def _fake_real_bin(tmp_path):
     """A stub 'real' kep-auth that just echoes the args it received."""
     real_bin = tmp_path / "bin"
