@@ -630,7 +630,7 @@ def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[
 
         all_expert_skills = all_expert_skill_names(profile_home)
         if not all_expert_skills:
-            return _disabled_skills_runtime_env(_installed_profile_skill_names(profile_home))
+            return {}
 
         active_skills: set[str] = set()
         expert_id = _expert_id_for_event(event)

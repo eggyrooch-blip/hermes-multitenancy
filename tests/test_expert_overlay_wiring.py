@@ -175,7 +175,7 @@ def test_expert_skill_runtime_env_manifest_error_prefers_readable_expert_names(t
     assert "ordinary-skill" not in disabled
 
 
-def test_expert_skill_runtime_env_manifest_absent_uses_personal_install_manifest(tmp_path, monkeypatch):
+def test_expert_skill_runtime_env_manifest_absent_does_not_disable_profile_skills(tmp_path, monkeypatch):
     shared = _shared_home(tmp_path)
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
     profile_home = shared / "profiles" / "feishu_test"
@@ -191,4 +191,4 @@ def test_expert_skill_runtime_env_manifest_absent_uses_personal_install_manifest
 
     env = agent_real._expert_skill_runtime_env_for_event(_event(), profile_home)
 
-    assert env == {"HERMES_DISABLED_SKILLS_EXTRA": "private-a"}
+    assert env == {}
