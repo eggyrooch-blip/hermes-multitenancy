@@ -464,6 +464,45 @@ def list_experts(
     return sorted(rows, key=lambda r: (not r["featured"], r["category"], r["name"]))
 
 
+def all_expert_skill_names(profile_home: Path) -> set[str]:
+    """Return every skill declared by installed expert manifests.
+
+    Runtime skill hiding should fail closed, so this intentionally ignores
+    audience filtering: a hidden or unauthorized expert's private skills should
+    not be advertised unless that expert is the active run overlay.
+    """
+    names: set[str] = set()
+    for manifest, _path in _iter_managed_manifests(profile_home, strict=True):
+        experts = manifest.get("experts")
+        if not isinstance(experts, list):
+            continue
+        for ex in experts:
+            if not isinstance(ex, dict):
+                continue
+            for skill in ex.get("skills") or []:
+                name = str(skill).strip()
+                if name:
+                    names.add(name)
+    return names
+
+
+def readable_expert_skill_names(profile_home: Path) -> set[str]:
+    """Best-effort expert skill names from readable manifests only."""
+    names: set[str] = set()
+    for manifest, _path in _iter_managed_manifests(profile_home):
+        experts = manifest.get("experts")
+        if not isinstance(experts, list):
+            continue
+        for ex in experts:
+            if not isinstance(ex, dict):
+                continue
+            for skill in ex.get("skills") or []:
+                name = str(skill).strip()
+                if name:
+                    names.add(name)
+    return names
+
+
 # ─────────────────────────── caller department resolution ────────────────────
 # Department-scoped audiences must be enforced against the caller's REAL
 # departments, resolved server-side from the trusted tenant — never from a

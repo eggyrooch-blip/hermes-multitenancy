@@ -2285,6 +2285,53 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
     assert captured.get("run_system_message") is None
 
 
+def test_run_with_aiagent_falls_back_when_core_lacks_ephemeral_seam(monkeypatch, tmp_path: Path):
+    """Narrow TypeError fallback (SPEC guard): a core WITHOUT ephemeral_system_prompt
+    drops the expert overlay and runs as a normal SOUL session — never hard-fails."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    attempts: list[dict] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if "ephemeral_system_prompt" in kwargs:
+                raise TypeError(
+                    "__init__() got an unexpected keyword argument 'ephemeral_system_prompt'"
+                )
+
+        def run_conversation(self, user_message, task_id, conversation_history=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(
+        agent_real,
+        "_role_override_block_for_event",
+        lambda event, home: "ROLE OVERRIDE\n我是资源投放专家",
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    # first attempt carried the overlay (raised TypeError), retry dropped it → SOUL run
+    assert len(attempts) == 2
+    assert "ephemeral_system_prompt" in attempts[0]
+    assert "ephemeral_system_prompt" not in attempts[1]
+
+
 def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -2318,6 +2365,47 @@ def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert "identity_override" not in captured
     assert "ephemeral_system_prompt" not in captured
+
+
+def test_run_with_aiagent_applies_expert_skill_disabled_env(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen_env: list[str | None] = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen_env.append(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA"))
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.delenv("HERMES_DISABLED_SKILLS_EXTRA", raising=False)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    monkeypatch.setattr(
+        agent_real,
+        "_expert_skill_runtime_env_for_event",
+        lambda event, home: {"HERMES_DISABLED_SKILLS_EXTRA": "private-a"},
+    )
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen_env == ["private-a"]
+    assert os.environ.get("HERMES_DISABLED_SKILLS_EXTRA") is None
 
 
 def test_run_with_aiagent_applies_expert_skill_scope_cleanup(monkeypatch, tmp_path: Path):

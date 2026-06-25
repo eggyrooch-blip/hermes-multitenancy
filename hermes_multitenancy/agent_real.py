@@ -559,6 +559,106 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
         return None
 
 
+def _parse_csv_env_names(value: str) -> set[str]:
+    names: set[str] = set()
+    for line in str(value or "").splitlines():
+        for item in line.split(","):
+            name = item.strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def _installed_profile_skill_names(profile_home: Path) -> set[str]:
+    """Best-effort fail-closed skill list for expert gating errors."""
+    personal_manifest = Path(profile_home).expanduser() / "skills" / ".hermes-personal-installs.json"
+    try:
+        data = json.loads(personal_manifest.read_text(encoding="utf-8"))
+        skills = data.get("skills") if isinstance(data, dict) else None
+        if isinstance(skills, dict):
+            return {str(name).strip() for name in skills if str(name).strip()}
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    names: set[str] = set()
+    skills_root = Path(profile_home).expanduser() / "skills"
+    try:
+        for child in skills_root.iterdir():
+            if child.name.startswith("."):
+                continue
+            if child.is_dir() or child.is_symlink():
+                names.add(child.name)
+    except OSError:
+        logger.warning(
+            "[multitenancy] could not enumerate profile skills for fail-closed expert gating: %s",
+            skills_root,
+            exc_info=True,
+        )
+    return names
+
+
+def _disabled_skills_runtime_env(disabled: set[str]) -> dict[str, str]:
+    disabled = set(disabled) | _parse_csv_env_names(os.environ.get("HERMES_DISABLED_SKILLS_EXTRA", ""))
+    if not disabled:
+        return {}
+    return {"HERMES_DISABLED_SKILLS_EXTRA": ",".join(sorted(disabled))}
+
+
+def _expert_skill_runtime_env_for_event(event: Any, profile_home: Path) -> dict[str, str]:
+    """Return per-run env that hides inactive expert skills (能力随专家私有).
+
+    Expert skills are installed into the profile ``skills/`` scan root by the
+    ingester (``plugin_ingest._install_skills_to_profile``; the governance check
+    ``assert_profile_governance`` REQUIRES the entry+orchestrate skills to be
+    present there). WorkBuddy-style scoping is session-level: only the ACTIVE
+    expert's private skills should be advertised/loadable in this run; every other
+    expert's skills (and ALL of them on a non-expert run) must be hidden so the
+    non-expert path stays byte-identical. Hermes core consumes
+    ``HERMES_DISABLED_SKILLS_EXTRA`` as a generic disabled-skill overlay; this is
+    subprocess-local (the run is a fresh ``asyncio.create_subprocess_exec`` child),
+    so it never leaks across the 1279 profiles.
+    """
+    try:
+        from .expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
+
+        all_expert_skills = all_expert_skill_names(profile_home)
+        if not all_expert_skills:
+            return {}
+
+        active_skills: set[str] = set()
+        expert_id = _expert_id_for_event(event)
+        if expert_id:
+            try:
+                sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+            except Exception:
+                sender_open_id = None
+            overlay = resolve_expert(
+                profile_home,
+                expert_id,
+                department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
+            )
+            if overlay is not None:
+                active_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
+
+        return _disabled_skills_runtime_env(all_expert_skills - active_skills)
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert skill runtime scope failed for %s; using fail-closed skill fallback",
+            profile_home,
+            exc_info=True,
+        )
+        fallback_names: set[str] = set()
+        try:
+            from .expert_overlay import readable_expert_skill_names
+
+            fallback_names = readable_expert_skill_names(profile_home)
+        except Exception:
+            logger.debug("[multitenancy] readable expert skill fallback failed", exc_info=True)
+        if not fallback_names:
+            fallback_names = _installed_profile_skill_names(profile_home)
+        return _disabled_skills_runtime_env(fallback_names)
+
+
 def _expert_skill_dirs_for_event(event: Any, profile_home: Path) -> list[Path]:
     """Return active expert skill dirs for this run.
 
@@ -4986,17 +5086,40 @@ def _run_with_aiagent(
             event_sink,
             str(gateway_session_key),
         )
-        # Skill scope is purely ADDITIVE (active expert's dirs via
-        # _apply_expert_skill_scope_for_aiagent below). No subtractive
-        # HERMES_DISABLED_SKILLS_EXTRA hiding — that altered NON-expert runs and
-        # has no WorkBuddy analogue (WorkBuddy registers skills additively).
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        # Skill scope (能力随专家私有, sunke 2026-06-26): expert skills are
+        # installed into the profile skills/ scan root by the ingester (governance
+        # check requires it), so they would otherwise be visible to EVERY run.
+        # Subtractive hide of all NON-active expert skills (and ALL of them on a
+        # non-expert run) via HERMES_DISABLED_SKILLS_EXTRA keeps the non-expert
+        # path byte-identical; the active expert's dirs are additionally exposed by
+        # _apply_expert_skill_scope_for_aiagent below. Both are subprocess-local
+        # (fresh create_subprocess_exec child) → never leak across the 1279 profiles.
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
+            profile_home,
+            extra_env=_expert_skill_runtime_env_for_event(event, profile_home),
+        )
         expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
         agent = None
         try:
             _register_aiagent_process_image_gen_providers()
-            agent = AIAgent(**agent_kwargs)
+            try:
+                agent = AIAgent(**agent_kwargs)
+            except TypeError as exc:
+                # Narrow fallback (SPEC regression guard): a core that lacks the
+                # upstream ``ephemeral_system_prompt`` kwarg must DROP the expert
+                # overlay and run as a normal SOUL session, never hard-fail. The
+                # CI signature guard (test_core_aiagent_exposes_ephemeral_system_prompt_seam)
+                # catches a seamless core at build time; this is the runtime net.
+                if "ephemeral_system_prompt" in agent_kwargs and "ephemeral_system_prompt" in str(exc):
+                    logger.warning(
+                        "[multitenancy] core lacks ephemeral_system_prompt kwarg; "
+                        "dropping expert overlay, running as normal SOUL session"
+                    )
+                    agent_kwargs.pop("ephemeral_system_prompt", None)
+                    agent = AIAgent(**agent_kwargs)
+                else:
+                    raise
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,
                 "task_id": str(session_id),
