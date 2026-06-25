@@ -217,3 +217,32 @@ def test_use_cache_false_bypasses_cache_every_call(monkeypatch, tmp_path):
             profile_name="owner", open_id="ou_owner", shared_home=shared, use_cache=False
         )
     assert calls["n"] == 2  # fresh each time — no cache reuse
+
+
+def test_fresh_read_refreshes_cache_so_next_cached_read_is_not_stale(monkeypatch, tmp_path):
+    """A use_cache=False (post-auth poll) read must OVERWRITE the cache, else a
+    pre-auth 'needs_auth' survives the TTL and the next cached load regresses."""
+    from hermes_multitenancy import credential_hub
+    from hermes_multitenancy.connectors import registry
+
+    shared, _ = _mk_profile_home(tmp_path, "owner")
+    _patch_no_binaries(monkeypatch, lark_status={"status": "missing"})
+    registry._cache.clear()
+    live = {"status": "needs_auth"}
+    monkeypatch.setattr(
+        credential_hub, "_collect_credential_rows",
+        lambda **kw: [credential_hub.CredentialRow(
+            id="kep-cli", title="kep-cli", provider="keep", installed=True, status=live["status"])],
+    )
+
+    # 1. prime cache with needs_auth
+    registry.collect_connector_statuses(profile_name="owner", open_id="o", shared_home=shared, use_cache=True)
+    # 2. user authenticates → reader now returns authenticated
+    live["status"] = "authenticated"
+    # 3. fresh poll read: live authenticated AND refreshes cache
+    fresh = registry.collect_connector_statuses(profile_name="owner", open_id="o", shared_home=shared, use_cache=False)
+    assert fresh[0].to_dict()["status"] == "authenticated"
+    # 4. a later CACHED read must reflect the refreshed value, not the stale needs_auth
+    live["status"] = "SHOULD_NOT_BE_READ_LIVE"
+    cached = registry.collect_connector_statuses(profile_name="owner", open_id="o", shared_home=shared, use_cache=True)
+    assert cached[0].to_dict()["status"] == "authenticated"

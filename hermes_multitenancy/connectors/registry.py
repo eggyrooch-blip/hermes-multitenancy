@@ -100,8 +100,13 @@ def collect_connector_statuses(
     )
     statuses = _enrich_rows(rows, profile=profile_name)
 
-    if use_cache:
-        _cache_put(profile_name, open_id, statuses)
+    # Always refresh the cache after a live compute — INCLUDING a use_cache=False
+    # (fresh) read. A fresh read bypasses the cache for its own result, but if it did
+    # not also overwrite the cached entry, a pre-auth "needs_auth" could survive the TTL
+    # and the next default /connectors call would regress the panel to stale data right
+    # after a successful login. Writing here keeps cached reads consistent with the last
+    # live read.
+    _cache_put(profile_name, open_id, statuses)
     return statuses
 
 
