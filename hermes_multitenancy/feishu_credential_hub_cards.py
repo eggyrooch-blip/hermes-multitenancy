@@ -204,9 +204,10 @@ def build_hub_card(
         elif row.id in auth_urls:
             # A minted URL is only present when the hub handler chose to offer
             # (re-)authorization for this row. Render it even when the row reads
-            # authenticated so lark always exposes a working 重新授权 entry
-            # (issue: auth-hub-lark-reauth-button). Non-lark connectors are only
-            # placed in auth_urls while unauthenticated, so they stay unaffected.
+            # authenticated so the user can re-verify on demand — lark always, and
+            # kep-cli when a public callback origin is set (issue:
+            # auth-hub-lark-reauth-button, broadened 2026-06-26). A row with no
+            # minted URL/QR shows only its status (no dead control).
             if row.authenticated:
                 elements.append(_auth_button(auth_urls[row.id], label_zh="重新授权", label_en="Re-authorize"))
             else:

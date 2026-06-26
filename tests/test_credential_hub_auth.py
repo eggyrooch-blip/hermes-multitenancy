@@ -329,3 +329,52 @@ async def test_auth_command_offers_keep_record_reauth_qr_when_authenticated(monk
     assert "img_reauth" in blob, "keep-record re-auth QR must be embedded even when authenticated"
     assert '"tag": "img"' in blob
     assert "重新认证" in blob
+
+
+@pytest.mark.asyncio
+async def test_auth_command_offers_kep_cli_reauth_when_authenticated_with_origin(monkeypatch, tmp_path):
+    """sunke 2026-06-26: with a public callback origin set, /auth must also mint a
+    re-auth entry for an already authenticated kep-cli row (prod has origin set)."""
+    import json
+    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
+    from hermes_multitenancy import feishu_auth_cards, feishu_uat_auth, webui_broker_server
+    from hermes_multitenancy import router as router_mod
+
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_PUBLIC_CALLBACK_ORIGIN", "https://hermes.example.com")
+
+    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(webui_broker_server, "ensure_run_broker_server_started", lambda: None)
+    monkeypatch.setattr(router_mod, "_track_kep_login_proc", lambda _proc: None)
+
+    def fake_collect(*, profile_name, open_id, home_dir):
+        return [
+            credential_hub.CredentialRow(
+                id=credential_hub.KEP_CLI, title="kep-cli", provider="keep",
+                installed=True, status="authenticated",
+            )
+        ]
+
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
+    monkeypatch.setattr(cha, "start_kep_cli_login",
+                        lambda _pdir, _profile, _shared, public_origin=None: {
+                            "verification_uri": "https://kep.example.com/reauth", "_proc": object()})
+
+    sent: dict = {}
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        sent["card"] = card
+        return {"message_id": "om_hub"}
+
+    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
+    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
+
+    await router_mod._handle_auth_command(
+        args="", sender="ou_owner", sender_alt=None, profile_name="owner",
+        profile_home=tmp_path, chat_id="oc_chat", gateway=object(), event=object(),
+    )
+
+    blob = json.dumps(sent.get("card", {}), ensure_ascii=False)
+    assert "https://kep.example.com/reauth" in blob, "kep-cli re-auth URL must be embedded when authenticated + origin set"
+    assert "重新授权" in blob
