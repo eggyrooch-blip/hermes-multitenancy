@@ -3701,8 +3701,10 @@ async def _handle_auth_command(
             except Exception as exc:
                 logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
             continue
-        if row.authenticated:
-            continue
+        # Mint a (re-)authorize entry for every connector, authenticated or not, so
+        # the hub always lets the user re-verify a tool on demand (sunke 2026-06-26).
+        # Non-lark rows only render a button/QR when an entry was actually minted
+        # here, so an unsupported/un-startable tool still shows no dead control.
         if row.id == credential_hub.KEEP_RECORD:
             try:
                 qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)

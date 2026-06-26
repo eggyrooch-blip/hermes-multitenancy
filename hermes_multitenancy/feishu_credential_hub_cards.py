@@ -193,8 +193,14 @@ def build_hub_card(
 
     for idx, row in enumerate(rows):
         elements.append(_row_markdown(row))
-        if (not row.authenticated) and row.id in qr_image_keys:
-            elements.extend(_qr_image(qr_image_keys[row.id]))
+        if row.id in qr_image_keys:
+            # Render the scannable QR whether or not the row is authenticated so the
+            # user can re-verify on demand (sunke 2026-06-26). The hub handler only
+            # mints a QR for a row it can actually (re-)start.
+            if row.authenticated:
+                elements.extend(_qr_image(qr_image_keys[row.id], label_zh="重新认证：请使用对应 App 扫码", label_en="Re-authenticate — scan with the app"))
+            else:
+                elements.extend(_qr_image(qr_image_keys[row.id]))
         elif row.id in auth_urls:
             # A minted URL is only present when the hub handler chose to offer
             # (re-)authorization for this row. Render it even when the row reads

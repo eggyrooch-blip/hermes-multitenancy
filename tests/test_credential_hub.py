@@ -645,20 +645,37 @@ def test_build_hub_card_renders_pregenerated_entries():
     assert blob.count('"tag": "img"') == 1
 
 
-def test_build_hub_card_authenticated_nonlark_row_has_no_entry():
-    """Non-lark connectors keep the 'authenticated → no entry' rule. The hub
-    handler never mints a URL for them while authenticated, so even if one slipped
-    into auth_urls it renders no button (qr/pending stay gated on not-authenticated)."""
+def test_build_hub_card_authenticated_row_without_minted_entry_has_no_control():
+    """A row with NO minted entry (not in auth_urls / qr_image_keys / pending_note)
+    renders only its status — no dead button/QR. This is the remaining invariant
+    after re-auth entries are offered for authenticated rows (sunke 2026-06-26)."""
     import json
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
 
     rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True,
                           status="authenticated", action={"kind": "qr", "label": "重新授权"})]
-    blob = json.dumps(build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_k"}), ensure_ascii=False)
+    blob = json.dumps(build_hub_card(rows=rows), ensure_ascii=False)  # nothing minted
     assert "已认证" in blob
     assert '"tag": "img"' not in blob
+    assert '"multi_url"' not in blob
     assert '"callback"' not in blob
+
+
+def test_build_hub_card_authenticated_keep_record_offers_reauth_qr():
+    """sunke 2026-06-26: an authenticated keep-record row WITH a minted QR renders
+    the scannable QR (re-authenticate) so the user can re-verify on demand."""
+    import json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True,
+                          status="authenticated", action={"kind": "qr", "label": "重新认证"})]
+    blob = json.dumps(build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_k"}), ensure_ascii=False)
+    assert "已认证" in blob
+    assert '"tag": "img"' in blob
+    assert "img_k" in blob
+    assert "重新认证" in blob
 
 
 def test_build_hub_card_authenticated_lark_offers_reauth_button():
