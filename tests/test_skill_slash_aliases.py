@@ -119,3 +119,36 @@ def test_list_profile_commands_includes_aliases(tmp_path):
     assert "/strategy" in slashes
     alias = next(c for c in cmds if c["slash"] == "/strategy")
     assert alias["skill"] == "kep-trevi-strategy-recommend" and alias["source"] == "skill-alias"
+
+
+def test_list_profile_commands_dedupes_duplicate_skill_names(tmp_path):
+    skills = tmp_path / "profiles" / "p" / "skills"
+    stale = skills / "kep-hades-cli"
+    managed = skills / "Keep" / "kep-hades-cli"
+    stale.mkdir(parents=True)
+    managed.mkdir(parents=True)
+    (stale / "SKILL.md").write_text(
+        "---\nname: kep-hades-cli\ndescription: hades API\n---\n# stale\n",
+        encoding="utf-8",
+    )
+    (managed / "SKILL.md").write_text(
+        "---\n"
+        "name: kep-hades-cli\n"
+        "description: Query Hades 投放管理系统 through kep-cli.\n"
+        "---\n"
+        "# managed\n",
+        encoding="utf-8",
+    )
+
+    cmds = list_profile_skill_slash_commands(profile_home=tmp_path / "profiles" / "p")
+    hades = [c for c in cmds if c["slash"] == "/kep-hades-cli"]
+
+    assert hades == [{
+        "name": "kep-hades-cli",
+        "slash": "/kep-hades-cli",
+        "title": "kep-hades-cli",
+        "description": "Query Hades 投放管理系统 through kep-cli.",
+        "source": "skill",
+        "type": "skill",
+        "category": "Keep",
+    }]

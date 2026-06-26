@@ -140,7 +140,7 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
     if not skills_root.is_dir():
         return []
 
-    commands: list[dict[str, Any]] = []
+    commands: dict[str, dict[str, Any]] = {}
     for skill_md in _iter_skill_files(skills_root):
         try:
             rel = skill_md.parent.relative_to(skills_root)
@@ -151,7 +151,7 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
         if not name:
             continue
         category = rel.parts[0] if len(rel.parts) > 1 else ""
-        commands.append({
+        _add_profile_slash_command(commands, {
             "name": name,
             "slash": f"/{name}",
             "title": meta.get("title") or name,
@@ -162,9 +162,9 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
         })
         # short-command aliases this skill self-declares (frontmatter `slash_aliases`)
         for alias in read_skill_slash_aliases(skill_md):
-            if alias == name or any(c["slash"] == f"/{alias}" for c in commands):
-                continue  # skip self + any already-claimed alias (deterministic, no dupes)
-            commands.append({
+            if alias == name:
+                continue  # skip self-aliases
+            _add_profile_slash_command(commands, {
                 "name": alias,
                 "slash": f"/{alias}",
                 "title": meta.get("title") or alias,
@@ -174,7 +174,31 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
                 "category": category,
                 "skill": name,
             })
-    return sorted(commands, key=lambda item: (str(item.get("category") or ""), str(item.get("name") or "")))
+    return sorted(commands.values(), key=lambda item: (str(item.get("category") or ""), str(item.get("name") or "")))
+
+
+def _profile_slash_command_score(command: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Prefer the most useful one-line picker row for duplicate slash names."""
+    source = str(command.get("source") or "")
+    category = str(command.get("category") or "")
+    title = str(command.get("title") or "")
+    name = str(command.get("name") or "")
+    description = str(command.get("description") or "")
+    return (
+        2 if source == "skill" else 1,
+        1 if category else 0,
+        1 if title and title != name else 0,
+        len(description),
+    )
+
+
+def _add_profile_slash_command(commands: dict[str, dict[str, Any]], command: dict[str, Any]) -> None:
+    slash = str(command.get("slash") or "")
+    if not slash:
+        return
+    current = commands.get(slash)
+    if current is None or _profile_slash_command_score(command) > _profile_slash_command_score(current):
+        commands[slash] = command
 
 
 def read_skill_slash_aliases(path: Path) -> list[str]:

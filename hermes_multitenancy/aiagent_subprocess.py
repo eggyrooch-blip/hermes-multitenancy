@@ -41,6 +41,8 @@ class _ReplayedEvent:
         self.sender_open_id = d.get("sender_open_id", "")
         self.source = _ReplayedSource(d.get("source") or {})
         self.raw_event = d.get("raw_event") if isinstance(d.get("raw_event"), dict) else {}
+        broker_role_override = d.get("broker_role_override")
+        self.broker_role_override = broker_role_override if isinstance(broker_role_override, dict) else {}
 
 
 def _load_run_with_aiagent():

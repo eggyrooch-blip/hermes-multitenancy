@@ -163,6 +163,19 @@ def _session_history_slash_commands() -> list[dict[str, str]]:
     ]
 
 
+def _dedupe_slash_commands(commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the first command for each slash string, preserving input order."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for command in commands:
+        slash = str(command.get("slash") or "").strip()
+        if not slash or slash in seen:
+            continue
+        seen.add(slash)
+        out.append(command)
+    return out
+
+
 def _shared_home_from_env() -> Path:
     configured = os.environ.get("HERMES_SHARED_HOME") or os.environ.get("HERMES_HOME")
     return Path(configured or (Path.home() / ".hermes")).expanduser()
@@ -3591,8 +3604,10 @@ def create_run_broker_app(
             from .skill_registry import list_profile_skill_slash_commands
 
             shared_home = _shared_home_from_env()
-            commands = _session_history_slash_commands() + list_profile_skill_slash_commands(
-                profile_home=shared_home / "profiles" / profile_name,
+            commands = _dedupe_slash_commands(
+                _session_history_slash_commands() + list_profile_skill_slash_commands(
+                    profile_home=shared_home / "profiles" / profile_name,
+                )
             )
             return web.json_response({
                 "ok": True,

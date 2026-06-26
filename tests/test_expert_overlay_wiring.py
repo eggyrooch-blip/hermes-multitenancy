@@ -111,6 +111,33 @@ def test_core_aiagent_exposes_ephemeral_system_prompt_seam():
     )
 
 
+def test_event_payload_carries_broker_resolved_overlay_for_sandboxed_child(tmp_path, monkeypatch):
+    """The parent broker resolves expert personas before the sandboxed child runs.
+
+    The AIAgent child can be sandboxed away from ``<shared>/.hermes-plugin-managed``.
+    It must consume the broker-resolved block from the subprocess payload instead
+    of trying to rediscover the plugin manifest inside the sandbox.
+    """
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    payload = agent_real._event_to_subprocess_payload(_event(EXPERT_ID), profile_home)
+    resolved = payload["event"]["broker_role_override"]
+
+    assert resolved["expert_id"] == EXPERT_ID
+    assert "资源投放领域的执行型专家" in resolved["block"]
+
+    from hermes_multitenancy import aiagent_subprocess
+
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(tmp_path / "empty-shared"))
+    replayed = aiagent_subprocess._ReplayedEvent(payload["event"])
+
+    assert agent_real._role_override_block_for_event(replayed, profile_home) == resolved["block"]
+
+
 def test_expert_disabled_skill_names_excludes_only_active_expert(tmp_path, monkeypatch):
     repo = _plugin_repo(tmp_path / "plug")
     other_skill = repo / "skills" / "other-private-skill"

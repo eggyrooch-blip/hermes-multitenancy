@@ -3148,6 +3148,68 @@ def test_webui_slash_registry_returns_empty_list_for_profile_without_skills(tmp_
     asyncio.run(runner())
 
 
+def test_webui_slash_registry_dedupes_builtin_and_skill_slashes(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    shared = tmp_path / ".hermes"
+    plan_skill = shared / "profiles" / "owner_sync_profile" / "skills" / "software-development" / "plan"
+    plan_skill.mkdir(parents=True)
+    (plan_skill / "SKILL.md").write_text(
+        "---\nname: plan\ndescription: local plan skill should not duplicate builtin /plan\n---\n# Plan\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    db_path = shared / "multitenancy.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                dispatch_agent=lambda request: f"echo:{request.content}",
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                response = await client.get(
+                    "/api/run-broker/slash/commands",
+                    headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                )
+                body = await response.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert response.status == 200
+        plan_rows = [command for command in body["commands"] if command["slash"] == "/plan"]
+        assert plan_rows == [{
+            "name": "plan",
+            "slash": "/plan",
+            "title": "Plan",
+            "description": "Expand the profile's plan skill for the current request",
+            "source": "builtin",
+            "type": "skill",
+            "category": "Session",
+        }]
+
+    asyncio.run(runner())
+
+
 def test_webui_slash_registry_requires_owner_header(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 

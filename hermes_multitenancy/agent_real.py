@@ -522,6 +522,57 @@ def _expert_id_for_event(event: Any) -> str:
     return str(_event_metadata(event).get("expert_id") or "").strip()
 
 
+_BROKER_ROLE_OVERRIDE_EVENT_KEY = "broker_role_override"
+_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY = "expert_id"
+_BROKER_ROLE_OVERRIDE_BLOCK_KEY = "block"
+
+
+def _broker_role_override_payload_for_event(
+    event: Any,
+    profile_home: Path,
+) -> Optional[dict[str, str]]:
+    """Resolve the expert override in the parent before sandboxing the child."""
+    expert_id = _expert_id_for_event(event)
+    if not expert_id:
+        return None
+    try:
+        from .expert_overlay import role_override_block_for
+
+        try:
+            sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+        except Exception:
+            sender_open_id = None
+        block = role_override_block_for(profile_home, expert_id, open_id=sender_open_id)
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert overlay parent resolution failed expert_id=%s; "
+            "child will fall back to local resolution",
+            expert_id,
+            exc_info=True,
+        )
+        return None
+    if not block:
+        return None
+    return {
+        _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
+        _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
+    }
+
+
+def _broker_role_override_block_for_event(event: Any, expert_id: str) -> Optional[str]:
+    """Return the broker-resolved override carried on the subprocess event."""
+    payload = getattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, None)
+    if not isinstance(payload, dict):
+        return None
+    payload_expert_id = str(payload.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or "").strip()
+    if payload_expert_id != expert_id:
+        return None
+    block = payload.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
+    if isinstance(block, str) and block.strip():
+        return block
+    return None
+
+
 def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[str]:
     """Resolve the ephemeral Role-Override system block for this run, or None.
 
@@ -532,6 +583,13 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
     expert_id = _expert_id_for_event(event)
     if not expert_id:
         return None
+    broker_block = _broker_role_override_block_for_event(event, expert_id)
+    if broker_block:
+        logger.info(
+            "[multitenancy] expert overlay active from broker payload expert_id=%s profile=%s",
+            expert_id, getattr(profile_home, "name", profile_home),
+        )
+        return broker_block
     try:
         from .expert_overlay import role_override_block_for
 
@@ -1511,6 +1569,9 @@ def _event_to_subprocess_payload(
     raw_event = getattr(event, "raw_event", None)
     if isinstance(raw_event, dict):
         payload["event"]["raw_event"] = _jsonable_deep(raw_event)
+    broker_role_override = _broker_role_override_payload_for_event(event, profile_home)
+    if broker_role_override is not None:
+        payload["event"][_BROKER_ROLE_OVERRIDE_EVENT_KEY] = broker_role_override
     payload_messages = _jsonable_messages(messages)
     if payload_messages is not None:
         payload["messages"] = payload_messages
