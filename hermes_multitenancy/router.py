@@ -3669,9 +3669,14 @@ async def _handle_auth_command(
     origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip() or None
 
     for row in rows:
-        if row.authenticated:
-            continue
         if row.id == credential_hub.LARK_CLI:
+            # Always offer a (re-)authorize entry for lark, even when the row reads
+            # `authenticated`. lark_cli_status marks authenticated on the weak
+            # default_identity == "user" signal, which can be true with no usable
+            # UAT (env HERMES_LARK_CLI_DEFAULT_AS=user, or a stale local cred file).
+            # /feishu_auth — which never checks status and always mints a session —
+            # is the proven-working reference; /auth must match it so the lark row is
+            # never a dead "已认证 but no button" card. (issue: auth-hub-lark-reauth-button)
             try:
                 session = await asyncio.to_thread(
                     feishu_uat_auth.find_active_session,
@@ -3695,7 +3700,10 @@ async def _handle_auth_command(
                 logger.debug("multitenancy: hub auth pregen %s unavailable (%s)", row.id, exc.message)
             except Exception as exc:
                 logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
-        elif row.id == credential_hub.KEEP_RECORD:
+            continue
+        if row.authenticated:
+            continue
+        if row.id == credential_hub.KEEP_RECORD:
             try:
                 qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
                 image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])

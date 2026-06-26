@@ -225,3 +225,60 @@ async def test_poll_hub_flows_rerenders_after_lark_success(monkeypatch, tmp_path
     success_blob = json.dumps(success_cards[0]["card"], ensure_ascii=False)
     assert "认证成功" in success_blob
     assert "Lark-cli" in success_blob
+
+
+@pytest.mark.asyncio
+async def test_auth_command_offers_lark_reauth_when_status_authenticated(monkeypatch, tmp_path):
+    """Regression for issue 2: /auth must offer a (re-)authorize button for the
+    lark row even when its status reads 'authenticated' via the weak
+    default_identity==user signal (which can be true with no usable UAT — env
+    HERMES_LARK_CLI_DEFAULT_AS=user or a stale local cred file). Previously
+    _handle_auth_command `continue`d on authenticated rows, so the lark row got
+    no minted URL and no button → '/auth 卡片不可用', while /feishu_auth (which
+    never checks status, always starts a session) worked. This test fails before
+    the fix and passes after.
+    """
+    import json
+    from hermes_multitenancy import credential_hub, feishu_auth_cards, feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+
+    def fake_collect(*, profile_name, open_id, home_dir):
+        return [
+            credential_hub.CredentialRow(
+                id=credential_hub.LARK_CLI, title="Lark-cli", provider="lark",
+                installed=True, status="authenticated", default_identity="user",
+                action={"kind": "feishu_device_flow", "label": "重新授权"},
+            )
+        ]
+
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
+    monkeypatch.setattr(feishu_uat_auth, "find_active_session", lambda **k: None)
+    monkeypatch.setattr(
+        feishu_uat_auth, "start_session",
+        lambda **k: {"session_id": "s1", "verification_uri": "https://accounts.feishu.cn/lark-verify"},
+    )
+
+    sent: dict = {}
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        sent["card"] = card
+        return {"message_id": "om_hub"}
+
+    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
+    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
+
+    await router_mod._handle_auth_command(
+        args="", sender="ou_owner", sender_alt=None, profile_name="owner",
+        profile_home=tmp_path, chat_id="oc_chat", gateway=object(), event=object(),
+    )
+
+    blob = json.dumps(sent.get("card", {}), ensure_ascii=False)
+    assert "https://accounts.feishu.cn/lark-verify" in blob, \
+        "lark authorize URL must be embedded in /auth even when status is authenticated"
+    assert '"multi_url"' in blob
+    assert "重新授权" in blob

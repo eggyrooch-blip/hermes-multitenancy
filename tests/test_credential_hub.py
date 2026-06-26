@@ -645,7 +645,26 @@ def test_build_hub_card_renders_pregenerated_entries():
     assert blob.count('"tag": "img"') == 1
 
 
-def test_build_hub_card_authenticated_row_has_no_entry():
+def test_build_hub_card_authenticated_nonlark_row_has_no_entry():
+    """Non-lark connectors keep the 'authenticated → no entry' rule. The hub
+    handler never mints a URL for them while authenticated, so even if one slipped
+    into auth_urls it renders no button (qr/pending stay gated on not-authenticated)."""
+    import json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+
+    rows = [CredentialRow(id="keep-record", title="Keep-record", provider="keep", installed=True,
+                          status="authenticated", action={"kind": "qr", "label": "重新授权"})]
+    blob = json.dumps(build_hub_card(rows=rows, qr_image_keys={"keep-record": "img_k"}), ensure_ascii=False)
+    assert "已认证" in blob
+    assert '"tag": "img"' not in blob
+    assert '"callback"' not in blob
+
+
+def test_build_hub_card_authenticated_lark_offers_reauth_button():
+    """issue auth-hub-lark-reauth-button: an authenticated lark row WITH a minted
+    URL must render a 重新授权 button (the hub handler always mints lark's URL so the
+    /auth card is never a dead '已认证 but no button' card for lark)."""
     import json
     from hermes_multitenancy.credential_hub import CredentialRow
     from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
@@ -654,8 +673,9 @@ def test_build_hub_card_authenticated_row_has_no_entry():
                           status="authenticated", action={"kind": "feishu_device_flow", "label": "重新授权"})]
     blob = json.dumps(build_hub_card(rows=rows, auth_urls={"lark-cli": "https://x"}), ensure_ascii=False)
     assert "已认证" in blob
-    assert '"multi_url"' not in blob
-    assert '"tag": "img"' not in blob
+    assert '"multi_url"' in blob
+    assert "https://x" in blob
+    assert "重新授权" in blob
     assert '"callback"' not in blob
 
 

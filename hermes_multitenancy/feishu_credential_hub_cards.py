@@ -195,8 +195,16 @@ def build_hub_card(
         elements.append(_row_markdown(row))
         if (not row.authenticated) and row.id in qr_image_keys:
             elements.extend(_qr_image(qr_image_keys[row.id]))
-        elif (not row.authenticated) and row.id in auth_urls:
-            elements.append(_auth_button(auth_urls[row.id]))
+        elif row.id in auth_urls:
+            # A minted URL is only present when the hub handler chose to offer
+            # (re-)authorization for this row. Render it even when the row reads
+            # authenticated so lark always exposes a working 重新授权 entry
+            # (issue: auth-hub-lark-reauth-button). Non-lark connectors are only
+            # placed in auth_urls while unauthenticated, so they stay unaffected.
+            if row.authenticated:
+                elements.append(_auth_button(auth_urls[row.id], label_zh="重新授权", label_en="Re-authorize"))
+            else:
+                elements.append(_auth_button(auth_urls[row.id]))
         elif not row.authenticated and pending_note.get(row.id):
             note = pending_note[row.id]
             elements.append({"tag": "markdown", "content": note,
