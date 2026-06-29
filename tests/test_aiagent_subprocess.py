@@ -2298,6 +2298,50 @@ def test_stream_aiagent_subprocess_warm_worker_holds_slot_until_env_scope_cleanu
     assert active_scopes == 0
 
 
+def test_stream_aiagent_subprocess_warm_worker_releases_slot_when_env_scope_enter_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    create_calls: list[tuple[object, ...]] = []
+
+    @contextmanager
+    def failing_env_scope(_event, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        raise RuntimeError("env enter failed")
+        yield {}
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        create_calls.append(args)
+        raise AssertionError("subprocess should not start when env scope fails")
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", failing_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        profile = tmp_path / "profiles" / "env-fail"
+        with pytest.raises(RuntimeError, match="env enter failed"):
+            async for _item in agent_real._stream_aiagent_subprocess(_event(), profile):
+                pass
+        worker = agent_real._get_aiagent_warm_worker(profile)
+        assert worker._lock.acquire(blocking=False) is True
+        worker._lock.release()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert create_calls == []
+
+
 def test_aiagent_warm_worker_slot_serializes_across_event_loops(tmp_path: Path):
     from hermes_multitenancy import agent_real
 

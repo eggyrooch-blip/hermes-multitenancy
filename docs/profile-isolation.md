@@ -424,7 +424,9 @@ If the worker cannot start, exits before `ready`, or dies before the first
 stream event, the parent discards it and falls back to the one-shot path. Once a
 warm run has emitted user-visible stream events, timeout, cancellation, or
 worker failure discards the worker and surfaces the failure rather than
-replaying a partially streamed request.
+replaying a partially streamed request. If strict-context env setup itself
+fails before the worker starts, the parent releases the profile slot and removes
+the per-run approval dir before surfacing the setup error.
 
 ### 8.3 Enabling SOP (recommended rollout)
 

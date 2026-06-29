@@ -4152,6 +4152,7 @@ async def _stream_aiagent_subprocess(
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
+    approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     warm_run = None
     warm_worker_requested = _aiagent_warm_worker_enabled()
     if warm_worker_requested:
@@ -4163,16 +4164,26 @@ async def _stream_aiagent_subprocess(
                 exc_info=True,
             )
             warm_worker_requested = False
-    approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    env_scope = _aiagent_subprocess_env_scope(
-        event,
-        profile_home,
-        approval_dir=approval_dir,
-        event_stream=True,
-    )
     env_scope_entered = False
-    env = env_scope.__enter__()
-    env_scope_entered = True
+    try:
+        env_scope = _aiagent_subprocess_env_scope(
+            event,
+            profile_home,
+            approval_dir=approval_dir,
+            event_stream=True,
+        )
+        env = env_scope.__enter__()
+        env_scope_entered = True
+    except Exception:
+        if warm_run is not None:
+            await warm_run.close()
+        try:
+            import shutil
+
+            shutil.rmtree(approval_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
     # Resolve symlinks so sandbox-exec's path-based allow rules match.
     # The plugin is typically loaded via a profile-local symlink
     # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
