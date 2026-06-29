@@ -22,19 +22,17 @@ PATH 上、且在 `_meegle_search_path()` 里），reader 自动改用它，**�
 
 ## 安装（hermes-1，hermes 用户）
 
+一条命令——幂等，**每次 provision/deploy 和机器重建后都跑它**（它是 host-provisioning
+固化入口，也被 `after-install.md` 引用）：
+
 ```bash
-REPO=/home/hermes/code/hermes-multitenancy            # 实际 checkout 路径
-chmod +x "$REPO/deploy/ensure-meegle.sh"
-# 1) 现在就装好二进制（首次；之后由 drop-in 自愈）
-"$REPO/deploy/ensure-meegle.sh"
-# 2) 装 drop-in（@REPO@ 占位替换为真实路径）
-mkdir -p ~/.config/systemd/user/hermes-gateway.service.d
-sed "s#@REPO@#$REPO#g" "$REPO/deploy/hermes-gateway-meegle.conf" \
-  > ~/.config/systemd/user/hermes-gateway.service.d/45-meegle-bin.conf
-systemctl --user daemon-reload
-# 不需要重启网关：二进制装好后 reader 下次调用即生效（call 时 shutil.which 解析）。
-# drop-in 只在“下次网关启动”生效，用于重建/被清理后的自愈。
+/home/hermes/code/hermes-multitenancy/deploy/install-gateway-dropins.sh
 ```
+
+它做三件事：装/更新 `~/.config/systemd/user/hermes-gateway.service.d/45-meegle-bin.conf`
+（自动用本仓路径替换 `@REPO@`）→ 跑 `ensure-meegle.sh` 装好二进制 → `daemon-reload`。
+**不重启网关**：二进制装好后 reader 下次调用即生效（`shutil.which` 解析）；drop-in 的
+Environment/ExecStartPre 在“下次网关启动”生效，用于重建/被清理后的自愈。
 
 ## 验证
 
