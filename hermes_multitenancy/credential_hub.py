@@ -745,7 +745,6 @@ def _kep_env_token_present(home_dir: Path, *, profile_name: str, env_name: str) 
     try:
         return keyring.is_dir() and any(
             f"token-key:{env_name}:{profile_name}" in p.name
-            or f"token-key:{env_name}:" in p.name
             for p in keyring.iterdir()
         )
     except OSError:

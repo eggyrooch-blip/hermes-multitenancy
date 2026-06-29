@@ -114,6 +114,25 @@ def test_kep_cli_unknown_when_token_present_no_live(monkeypatch, tmp_path):
     assert row.status == "unknown"
 
 
+def test_kep_cli_ignores_other_profile_token_when_no_live(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    home = tmp_path / "home"
+    keyring = home / ".kep-cli" / "keyring-fallback"
+    keyring.mkdir(parents=True)
+    (keyring / "token-key:online:other-profile").write_bytes(b"x")
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(tmp_path / "nope" / "kep-auth"))
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=home,
+        profile_name="p",
+        shared_home=tmp_path,
+        installed=True,
+    )
+    assert row.status == "needs_auth"
+    assert "凭证存在" not in (row.detail or "")
+
+
 def _make_jwt(exp: int) -> str:
     """Build an unsigned-payload JWT carrying ``exp`` (epoch seconds)."""
     import base64 as _b64
