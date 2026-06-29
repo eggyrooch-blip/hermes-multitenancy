@@ -44,16 +44,23 @@ def start_oauth(
     shared_home: Path,
     *,
     public_origin: Optional[str] = None,
+    env_name: str = "online",
 ) -> dict[str, Any]:
     from .. import credential_hub_auth as cha
 
-    return cha.start_kep_cli_login(profile_dir, profile_name, shared_home, public_origin=public_origin)
+    return cha.start_kep_cli_login(
+        profile_dir,
+        profile_name,
+        shared_home,
+        public_origin=public_origin,
+        env_name=env_name,
+    )
 
 
-def poll_oauth(profile_dir: Path, profile_name: str, shared_home: Path) -> bool:
+def poll_oauth(profile_dir: Path, profile_name: str, shared_home: Path, *, env_name: str = "online") -> bool:
     from .. import credential_hub_auth as cha
 
-    return cha.kep_cli_logged_in(profile_dir, profile_name, shared_home)
+    return cha.kep_cli_logged_in(profile_dir, profile_name, shared_home, env_name=env_name)
 
 
 def complete_oauth_callback(session_id: str, query: str) -> str:

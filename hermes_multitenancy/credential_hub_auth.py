@@ -324,20 +324,27 @@ def complete_kep_callback(session_id: str, query: str) -> str:
         raise HubAuthError(f"kep-auth local callback failed: {exc}", status=502) from exc
 
 
+def _normalize_kep_env_name(value: str) -> str:
+    env_name = str(value or "").strip().lower()
+    return env_name if env_name in {"online", "pre"} else "online"
+
+
 def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path,
-                        *, public_origin: Optional[str] = None) -> dict[str, Any]:
+                        *, public_origin: Optional[str] = None,
+                        env_name: str = "online") -> dict[str, Any]:
     """Spawn ``kep-auth login`` and capture the OAuth verification URL from output.
 
     The login process is left running (it waits for the OAuth callback); the
     caller stores the Popen handle so it survives until the user authorizes.
     Returns {verification_uri, _proc}.
     """
+    env_name = _normalize_kep_env_name(env_name)
     bin_path = kep_auth_bin(shared_home)
     if not Path(bin_path).exists():
         raise HubAuthError("kep-auth binary is not installed", status=404)
     try:
         proc = subprocess.Popen(
-            [bin_path, "--profile", profile_name, "--env", "online", "login"],
+            [bin_path, "--profile", profile_name, "--env", env_name, "login"],
             cwd=str(profile_dir), env=_kep_login_env(profile_dir, profile_name),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
@@ -377,18 +384,19 @@ def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path,
             except Exception:
                 pass
             raise
-    return {"verification_uri": url, "_proc": proc}
+    return {"verification_uri": url, "_proc": proc, "env": env_name}
 
 
-def kep_cli_logged_in(profile_dir: Path, profile_name: str, shared_home: Path) -> bool:
+def kep_cli_logged_in(profile_dir: Path, profile_name: str, shared_home: Path, *, env_name: str = "online") -> bool:
     """Poll: run ``kep-auth status`` → True iff logged in."""
+    env_name = _normalize_kep_env_name(env_name)
     bin_path = kep_auth_bin(shared_home)
     if not Path(bin_path).exists():
         return False
     env = {**_kep_env(profile_dir, profile_name), "KEP_NO_AUTO_LOGIN": "1"}
     try:
         proc = subprocess.run(
-            [bin_path, "--profile", profile_name, "--env", "online", "status"],
+            [bin_path, "--profile", profile_name, "--env", env_name, "status"],
             cwd=str(profile_dir), env=env, capture_output=True, text=True, timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):

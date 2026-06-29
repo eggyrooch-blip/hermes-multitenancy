@@ -3604,7 +3604,7 @@ def _filter_hub_rows_for_auth(rows: list) -> list:
     (other surfaces use them) but not surfaced in the Feishu hub."""
     from . import credential_hub as _ch
 
-    allowed = {_ch.LARK_CLI, _ch.KEEP_RECORD, _ch.KEP_CLI}
+    allowed = {_ch.LARK_CLI, _ch.KEEP_RECORD, *_ch.KEP_CLI_IDS}
     return [r for r in rows if r.id in allowed]
 
 
@@ -3718,9 +3718,10 @@ async def _handle_auth_command(
                 logger.debug("multitenancy: hub auth pregen %s unavailable (%s)", row.id, exc.message)
             except Exception as exc:
                 logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
-        elif row.id == credential_hub.KEP_CLI:
+        elif row.id in credential_hub.KEP_CLI_IDS:
             if origin:
                 try:
+                    env_name = str((row.action or {}).get("env") or "online")
                     try:
                         from . import webui_broker_server as _wb
 
@@ -3733,17 +3734,18 @@ async def _handle_auth_command(
                         profile_name,
                         shared,
                         public_origin=origin,
+                        env_name=env_name,
                     )
                     proc = login.get("_proc")
                     _track_kep_login_proc(proc)
-                    auth_urls[credential_hub.KEP_CLI] = login["verification_uri"]
-                    flows[credential_hub.KEP_CLI] = {"kind": "kep", "proc": proc}
+                    auth_urls[row.id] = login["verification_uri"]
+                    flows[row.id] = {"kind": "kep", "proc": proc, "env": env_name}
                 except cha.HubAuthError as exc:
                     logger.debug("multitenancy: hub auth pregen %s unavailable (%s)", row.id, exc.message)
                 except Exception as exc:
                     logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
             elif row.installed and not row.authenticated:
-                pending_note[credential_hub.KEP_CLI] = "kep-cli 飞书内认证需公网回调（已在 prod 支持），本机请用 WebUI。"
+                pending_note[row.id] = "kep-cli 飞书内认证需公网回调（已在 prod 支持），本机请用 WebUI。"
 
     card = build_hub_card(rows=rows, auth_urls=auth_urls, qr_image_keys=qr_image_keys, pending_note=pending_note)
     sent = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
@@ -3841,7 +3843,9 @@ async def _poll_hub_flows(
         return
 
     titles = {credential_hub.LARK_CLI: "Lark-cli", credential_hub.FEISHU_PROJECT: "飞书项目",
-              credential_hub.KEEP_RECORD: "Keep-record", credential_hub.KEP_CLI: "kep-cli"}
+              credential_hub.KEEP_RECORD: "Keep-record",
+              credential_hub.KEP_CLI_ONLINE: "kep-cli online",
+              credential_hub.KEP_CLI_PRE: "kep-cli pre"}
     # Entries still offered on re-render. A credential drops out only once it
     # SUCCEEDS — so re-rendering after one completion keeps the others' buttons/QRs.
     remaining_urls = dict(auth_urls or {})
@@ -3891,7 +3895,13 @@ async def _poll_hub_flows(
                     proc = desc.get("proc")
                     rc = proc.poll() if proc is not None else 0
                     if rc is not None:  # login proc exited
-                        ok = await asyncio.to_thread(cha.kep_cli_logged_in, profile_dir, profile_name, shared_home)
+                        ok = await asyncio.to_thread(
+                            cha.kep_cli_logged_in,
+                            profile_dir,
+                            profile_name,
+                            shared_home,
+                            env_name=str(desc.get("env") or "online"),
+                        )
                         if rc == 0 and ok:
                             succeeded.append(cid)
                         pending.pop(cid, None)  # proc finished either way; keep button if it failed

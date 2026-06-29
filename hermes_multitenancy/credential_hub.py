@@ -49,15 +49,21 @@ LARK_CLI = "lark-cli"
 FEISHU_PROJECT = "feishu-project"
 KEEP_RECORD = "keep-record"
 KEP_CLI = "kep-cli"
+KEP_CLI_ONLINE = "kep-cli-online"
+KEP_CLI_PRE = "kep-cli-pre"
 GITLAB = "gitlab"
 
-CREDENTIAL_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI, GITLAB)
+CREDENTIAL_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB)
+KEP_CLI_ENV_IDS = {"online": KEP_CLI_ONLINE, "pre": KEP_CLI_PRE}
+KEP_CLI_IDS = (KEP_CLI_ONLINE, KEP_CLI_PRE)
 
 _TITLES = {
     LARK_CLI: "Lark-cli",
     FEISHU_PROJECT: "飞书项目",
     KEEP_RECORD: "Keep-record",
     KEP_CLI: "kep-cli",
+    KEP_CLI_ONLINE: "kep-cli online",
+    KEP_CLI_PRE: "kep-cli pre",
     GITLAB: "GitLab",
 }
 
@@ -88,6 +94,7 @@ class CredentialRow:
     detail: Optional[str] = None
     required_by: list[str] = field(default_factory=list)
     action: dict[str, Any] = field(default_factory=dict)
+    environments: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def authenticated(self) -> bool:
@@ -111,6 +118,8 @@ class CredentialRow:
             out["detail"] = self.detail
         if self.required_by:
             out["required_by"] = self.required_by
+        if self.environments:
+            out["environments"] = self.environments
         return out
 
 
@@ -258,6 +267,34 @@ def _parse_skill_tags(text: str) -> list[str]:
     if not m:
         return []
     return [t.strip().strip("\"'").lower() for t in m.group(1).split(",") if t.strip()]
+
+
+def _kep_skill_env_policy(skills: list[_ProfileSkill]) -> tuple[str, tuple[str, ...]]:
+    """Return the primary kep-cli env plus envs worth reporting.
+
+    Resource-delivery skills default to ``--env pre`` for rehearsal. The
+    connector row should therefore gate on pre instead of showing a misleading
+    all-good online status, while still reporting online when present so the
+    user can see what is and is not logged in.
+    """
+    target_env = "online"
+    envs: set[str] = {"online"}
+    for skill in skills:
+        text = skill.text.lower()
+        is_kep = (
+            skill.name == "kep-hades-cli"
+            or "kep-cli" in skill.tags
+            or "kep-auth" in text
+        )
+        if not is_kep:
+            continue
+        if re.search(r"--env\s+pre\b", text) or "env_default: pre" in text:
+            target_env = "pre"
+            envs.add("pre")
+        if re.search(r"--env\s+online\b", text):
+            envs.add("online")
+    ordered = tuple(env for env in ("pre", "online") if env in envs)
+    return target_env, ordered
 
 
 def _configured_domain_patterns(env_var: str) -> tuple["re.Pattern[str]", ...]:
@@ -669,14 +706,14 @@ def _decode_jwt_exp_ms(token: str) -> Optional[int]:
 
 
 def _kep_token_exp_ms(
-    bin_path: str, *, profile_name: str, env: dict[str, str], cwd: Path
+    bin_path: str, *, profile_name: str, env: dict[str, str], cwd: Path, env_name: str = "online"
 ) -> Optional[int]:
     """Run ``kep-auth token`` and return the token's ``exp`` in epoch-ms.
 
     Returns None when the token cannot be fetched or decoded — callers treat
     None as "expiry unknown" (conservative: do NOT claim authenticated).
     """
-    proc = _run([bin_path, "--profile", profile_name, "--env", "online", "token"], cwd=cwd, env=env)
+    proc = _run([bin_path, "--profile", profile_name, "--env", env_name, "token"], cwd=cwd, env=env)
     if proc is None or proc.returncode != 0:
         return None
     # Scan for a JWT-shaped line rather than assuming line 0 is the token:
@@ -689,43 +726,54 @@ def _kep_token_exp_ms(
     return None
 
 
-def kep_cli_status(
+def _normalize_kep_env_name(value: str) -> str:
+    env_name = str(value or "").strip().lower()
+    return env_name if env_name in {"online", "pre"} else "online"
+
+
+def _ordered_kep_envs(target_env: str, report_envs: Optional[tuple[str, ...] | list[str]]) -> list[str]:
+    ordered: list[str] = []
+    for env_name in (_normalize_kep_env_name(target_env), *(report_envs or ())):
+        normalized = _normalize_kep_env_name(env_name)
+        if normalized not in ordered:
+            ordered.append(normalized)
+    return ordered or ["online"]
+
+
+def _kep_env_token_present(home_dir: Path, *, profile_name: str, env_name: str) -> bool:
+    keyring = Path(home_dir) / ".kep-cli" / "keyring-fallback"
+    try:
+        return keyring.is_dir() and any(
+            f"token-key:{env_name}:{profile_name}" in p.name
+            or f"token-key:{env_name}:" in p.name
+            for p in keyring.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _kep_env_status(
     *,
+    bin_path: str,
     profile_dir: Path,
     home_dir: Path,
     profile_name: str,
-    shared_home: Path,
-    installed: bool = False,
-    required_by: Optional[list[str]] = None,
-) -> CredentialRow:
-    """kep-cli — keyring presence + live ``kep-auth status`` (guarded)."""
-    row = CredentialRow(
-        id=KEP_CLI, title=_TITLES[KEP_CLI], provider="keep",
-        installed=installed, status=S_MISSING, required_by=required_by or [],
-        action={"kind": "oauth_url", "label": "认证"},
-    )
-    if not installed:
-        row.detail = "该 profile 没有安装依赖 kep-cli 的 skill。"
-        return row
-
-    keyring = Path(home_dir) / ".kep-cli" / "keyring-fallback"
-    try:
-        has_token = keyring.is_dir() and any("token-key:online:" in p.name for p in keyring.iterdir())
-    except OSError:
-        has_token = False
-
-    bin_path = _kep_auth_bin(shared_home)
+    env_name: str,
+) -> dict[str, Any]:
+    has_token = _kep_env_token_present(home_dir, profile_name=profile_name, env_name=env_name)
     live: Optional[str] = None
     account: Optional[str] = None
+    expires_at: Optional[int] = None
+
     if Path(bin_path).exists():
-        env = {
+        proc_env = {
             **os.environ,
             "HOME": str(home_dir),
             "HERMES_HOME": str(profile_dir),
             "KEP_PROFILE": str(profile_name),
             "KEP_NO_AUTO_LOGIN": "1",
         }
-        proc = _run([bin_path, "--profile", profile_name, "--env", "online", "status"], cwd=profile_dir, env=env)
+        proc = _run([bin_path, "--profile", profile_name, "--env", env_name, "status"], cwd=profile_dir, env=proc_env)
         if proc is not None:
             out = f"{proc.stdout}\n{proc.stderr}".lower()
             if re.search(r"not\s*logged\s*in", out):
@@ -734,50 +782,140 @@ def kep_cli_status(
                 live = "logged_in"
                 account = _parse_kep_account(f"{proc.stdout}\n{proc.stderr}")
             elif proc.returncode == 3 or re.search(r"unauthorized|401", out):
-                # WebUI maps exit-3 / 401 in the error path to not_logged_in.
                 live = "not_logged_in"
 
+        if live == "logged_in":
+            expires_at = _kep_token_exp_ms(
+                bin_path,
+                profile_name=profile_name,
+                env=proc_env,
+                cwd=profile_dir,
+                env_name=env_name,
+            )
+
     if live == "logged_in":
-        # kep-auth status only does a LOCAL check (expires:0) — blind to a
-        # server-side-expired token. Decode the token's own exp to tell live
-        # from stale, so a stale token correctly collapses to needs_auth and
-        # the /auth card re-surfaces the re-login button.
-        row.account_hint = account
-        exp_ms = _kep_token_exp_ms(bin_path, profile_name=profile_name, env=env, cwd=profile_dir)
-        if exp_ms is not None:
-            row.expires_at = exp_ms
-        if exp_ms is not None and exp_ms <= _now_ms():
-            row.status = S_NEEDS_AUTH
-            row.detail = "kep-cli 登录已过期，请重新认证。"
-            row.action["label"] = "重新认证"
-        elif exp_ms is None:
-            # Token unreadable/undecodable → cannot confirm validity. Do NOT
-            # claim authenticated (that's the false-positive that traps users).
-            # WARN (not debug): status said valid but the token won't decode —
-            # an anomaly. If this fires fleet-wide it signals a token-format
-            # change, not one stale profile; that distinction is worth a signal.
+        if expires_at is not None and expires_at <= _now_ms():
+            status = S_NEEDS_AUTH
+            detail = f"kep-cli {env_name} 登录已过期，请重新认证。"
+        elif expires_at is None:
             logger.warning(
-                "credential_hub: kep-cli status=valid but token undecodable for profile %r — "
-                "treating as needs re-auth (fleet-wide occurrence may indicate a token-format change)",
+                "credential_hub: kep-cli env=%s status=valid but token undecodable for profile %r — "
+                "treating as unknown (fleet-wide occurrence may indicate a token-format change)",
+                env_name,
                 profile_name,
             )
-            row.status = S_UNKNOWN
-            row.detail = "kep-cli 凭证存在，但无法确认有效期，建议重新认证。"
-            row.action["label"] = "重新认证"
+            status = S_UNKNOWN
+            detail = f"kep-cli {env_name} 凭证存在，但无法确认有效期，建议重新认证。"
         else:
-            row.status = S_AUTHENTICATED
-            row.detail = "kep-auth 已验证该 profile 登录。"
-            row.action["label"] = "重新认证"
+            status = S_AUTHENTICATED
+            detail = f"kep-auth 已验证该 profile 的 {env_name} 登录。"
     elif live == "not_logged_in":
-        row.status = S_NEEDS_AUTH
-        row.detail = "kep-auth 报告该 profile 未登录。"
+        status = S_NEEDS_AUTH
+        detail = f"kep-auth 报告该 profile 的 {env_name} 未登录。"
     elif has_token:
-        row.status = S_UNKNOWN
-        row.detail = "kep-cli 凭证存在，但无法在线校验有效性。"
+        status = S_UNKNOWN
+        detail = f"kep-cli {env_name} 凭证存在，但无法在线校验有效性。"
     else:
-        row.status = S_NEEDS_AUTH
-        row.detail = "kep-cli 需要登录。"
+        status = S_NEEDS_AUTH
+        detail = f"kep-cli 需要登录 {env_name}。"
+
+    out: dict[str, Any] = {
+        "status": status,
+        "detail": detail,
+    }
+    if account:
+        out["account_hint"] = account
+    if expires_at is not None:
+        out["expires_at"] = expires_at
+    return out
+
+
+def kep_cli_status(
+    *,
+    profile_dir: Path,
+    home_dir: Path,
+    profile_name: str,
+    shared_home: Path,
+    installed: bool = False,
+    required_by: Optional[list[str]] = None,
+    target_env: str = "online",
+    report_envs: Optional[tuple[str, ...] | list[str]] = None,
+) -> CredentialRow:
+    """kep-cli — keyring presence + live ``kep-auth status`` (guarded)."""
+    target_env = _normalize_kep_env_name(target_env)
+    row_id = KEP_CLI_ENV_IDS[target_env]
+    row = CredentialRow(
+        id=row_id, title=_TITLES[row_id], provider="keep",
+        installed=installed, status=S_MISSING, required_by=required_by or [],
+        action={"kind": "oauth_url", "label": "认证", "env": target_env},
+    )
+    if not installed:
+        row.detail = "该 profile 没有安装依赖 kep-cli 的 skill。"
+        return row
+
+    bin_path = _kep_auth_bin(shared_home)
+    envs = _ordered_kep_envs(target_env, report_envs)
+    row.environments = {
+        env_name: _kep_env_status(
+            bin_path=bin_path,
+            profile_dir=Path(profile_dir),
+            home_dir=Path(home_dir),
+            profile_name=profile_name,
+            env_name=env_name,
+        )
+        for env_name in envs
+    }
+
+    target = row.environments[target_env]
+    row.status = str(target["status"])
+    row.detail = str(target["detail"])
+    row.expires_at = target.get("expires_at")
+    row.account_hint = target.get("account_hint")
+    if not row.account_hint:
+        for env_data in row.environments.values():
+            if env_data.get("account_hint"):
+                row.account_hint = str(env_data["account_hint"])
+                break
+
+    if target_env != "online" and "online" in row.environments:
+        online = row.environments["online"]
+        online_status = online.get("status")
+        if row.status != S_AUTHENTICATED and online_status == S_AUTHENTICATED:
+            row.detail = f"{row.detail} online 已登录；当前专家默认需要 {target_env}。"
+
+    row.action["label"] = ("重新认证" if row.status == S_AUTHENTICATED else "认证")
+    if target_env != "online":
+        row.action["label"] = f"{row.action['label']} {target_env}"
     return row
+
+
+def kep_cli_statuses(
+    *,
+    profile_dir: Path,
+    home_dir: Path,
+    profile_name: str,
+    shared_home: Path,
+    installed: bool = False,
+    required_by: Optional[list[str]] = None,
+    target_env: str = "online",
+) -> list[CredentialRow]:
+    """Return separate kep-cli credential rows for online and pre."""
+    primary = _normalize_kep_env_name(target_env)
+    rows: list[CredentialRow] = []
+    for env_name in ("online", "pre"):
+        rows.append(
+            kep_cli_status(
+                profile_dir=profile_dir,
+                home_dir=home_dir,
+                profile_name=profile_name,
+                shared_home=shared_home,
+                installed=installed,
+                required_by=(required_by or []) if env_name == primary else [],
+                target_env=env_name,
+                report_envs=(env_name,),
+            )
+        )
+    return rows
 
 
 def _parse_kep_account(output: str) -> Optional[str]:
@@ -841,6 +979,7 @@ def _collect_credential_rows(
     kep_installed = bool(req.get(KEP_CLI)) or _has_skill(
         skills, name="kep-hades-cli", tags=("kep-cli",), needles=("kep-auth", "--env online")
     )
+    kep_target_env, kep_report_envs = _kep_skill_env_policy(skills)
     gitlab_installed = _has_skill(skills, name="kep-prd-analysis", needles=("gitlab_token",))
 
     # Each reader shells out to a CLI (kep-auth, meegle via npx, keep-record) and
@@ -855,12 +994,19 @@ def _collect_credential_rows(
         lambda: feishu_project_status(profile_dir=p_dir, profile_name=profile_name,
                                       required_by=req.get(FEISHU_PROJECT)),
         lambda: keep_record_status(home_dir=home, installed=keep_installed),
-        lambda: kep_cli_status(profile_dir=p_dir, home_dir=home, profile_name=profile_name,
-                               shared_home=shared, installed=kep_installed, required_by=req.get(KEP_CLI)),
+        lambda: kep_cli_statuses(profile_dir=p_dir, home_dir=home, profile_name=profile_name,
+                                 shared_home=shared, installed=kep_installed, required_by=req.get(KEP_CLI),
+                                 target_env=kep_target_env),
         lambda: gitlab_status(profile_dir=p_dir, installed=gitlab_installed),
     )
     with ThreadPoolExecutor(max_workers=len(readers)) as pool:
-        return list(pool.map(lambda fn: fn(), readers))
+        rows: list[CredentialRow] = []
+        for result in pool.map(lambda fn: fn(), readers):
+            if isinstance(result, list):
+                rows.extend(result)
+            else:
+                rows.append(result)
+        return rows
 
 
 def collect_credential_statuses(

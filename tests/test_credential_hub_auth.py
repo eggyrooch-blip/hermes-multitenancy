@@ -111,6 +111,66 @@ def test_kep_cli_logged_in_parses_status(monkeypatch, tmp_path):
     assert cha.kep_cli_logged_in(tmp_path, "p", tmp_path) is False
 
 
+def test_kep_cli_logged_in_checks_requested_env(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub_auth as cha
+
+    bin_path = tmp_path / "bin" / "kep-auth"
+    bin_path.parent.mkdir(parents=True)
+    bin_path.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(bin_path))
+
+    calls = []
+
+    class _Logged:
+        stdout = "state: valid\noperator: owner"
+        stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        calls.append(cmd)
+        return _Logged()
+
+    monkeypatch.setattr(cha.subprocess, "run", fake_run)
+    assert cha.kep_cli_logged_in(tmp_path, "p", tmp_path, env_name="pre") is True
+    assert calls[0] == [str(bin_path), "--profile", "p", "--env", "pre", "status"]
+
+
+def test_start_kep_cli_login_uses_requested_env(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub_auth as cha
+
+    bin_path = tmp_path / "bin" / "kep-auth"
+    bin_path.parent.mkdir(parents=True)
+    bin_path.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(bin_path))
+
+    calls = []
+
+    class _Stdout:
+        def __init__(self):
+            self._lines = iter(["https://auth.example.com/start?response_url=http%3A%2F%2Flocalhost%3A1234%2Fcb\n"])
+
+        def readline(self):
+            return next(self._lines, "")
+
+    class _Proc:
+        stdout = _Stdout()
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            return None
+
+    def fake_popen(cmd, *a, **k):
+        calls.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(cha.subprocess, "Popen", fake_popen)
+    out = cha.start_kep_cli_login(tmp_path, "p", tmp_path, env_name="pre")
+
+    assert out["verification_uri"].startswith("https://auth.example.com/start")
+    assert calls[0] == [str(bin_path), "--profile", "p", "--env", "pre", "login"]
+
+
 def test_kep_cli_logged_in_no_binary_false(tmp_path, monkeypatch):
     from hermes_multitenancy import credential_hub_auth as cha
 
@@ -351,14 +411,15 @@ async def test_auth_command_offers_kep_cli_reauth_when_authenticated_with_origin
     def fake_collect(*, profile_name, open_id, home_dir):
         return [
             credential_hub.CredentialRow(
-                id=credential_hub.KEP_CLI, title="kep-cli", provider="keep",
+                id=credential_hub.KEP_CLI_ONLINE, title="kep-cli online", provider="keep",
                 installed=True, status="authenticated",
+                action={"kind": "oauth_url", "label": "重新授权", "env": "online"},
             )
         ]
 
     monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
     monkeypatch.setattr(cha, "start_kep_cli_login",
-                        lambda _pdir, _profile, _shared, public_origin=None: {
+                        lambda _pdir, _profile, _shared, public_origin=None, env_name="online": {
                             "verification_uri": "https://kep.example.com/reauth", "_proc": object()})
 
     sent: dict = {}
@@ -378,3 +439,125 @@ async def test_auth_command_offers_kep_cli_reauth_when_authenticated_with_origin
     blob = json.dumps(sent.get("card", {}), ensure_ascii=False)
     assert "https://kep.example.com/reauth" in blob, "kep-cli re-auth URL must be embedded when authenticated + origin set"
     assert "重新授权" in blob
+
+
+def test_auth_command_starts_kep_cli_pre_when_row_action_targets_pre(monkeypatch, tmp_path):
+    """When the status row gates on pre, /auth must pre-generate a pre login URL."""
+    import asyncio
+    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
+    from hermes_multitenancy import feishu_auth_cards, feishu_uat_auth, webui_broker_server
+    from hermes_multitenancy import router as router_mod
+
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_PUBLIC_CALLBACK_ORIGIN", "https://hermes.example.com")
+    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(webui_broker_server, "ensure_run_broker_server_started", lambda: None)
+    monkeypatch.setattr(router_mod, "_track_kep_login_proc", lambda _proc: None)
+
+    def fake_collect(*, profile_name, open_id, home_dir):
+        return [
+            credential_hub.CredentialRow(
+                id=credential_hub.KEP_CLI_PRE,
+                title="kep-cli pre",
+                provider="keep",
+                installed=True,
+                status="needs_auth",
+                detail="pre 未登录；online 已登录。",
+                action={"kind": "oauth_url", "label": "认证 pre", "env": "pre"},
+            )
+        ]
+
+    calls = []
+
+    def fake_start(_pdir, _profile, _shared, public_origin=None, env_name="online"):
+        calls.append(env_name)
+        return {"verification_uri": "https://kep.example.com/pre", "_proc": object()}
+
+    sent: dict = {}
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        sent["card"] = card
+        return {"message_id": "om_hub"}
+
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
+    monkeypatch.setattr(cha, "start_kep_cli_login", fake_start)
+    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
+    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
+
+    asyncio.run(
+        router_mod._handle_auth_command(
+            args="",
+            sender="ou_owner",
+            sender_alt=None,
+            profile_name="owner",
+            profile_home=tmp_path,
+            chat_id="oc_chat",
+            gateway=object(),
+            event=object(),
+        )
+    )
+
+    assert calls == ["pre"]
+
+
+def test_poll_hub_flows_checks_kep_cli_pre_when_flow_targets_pre(monkeypatch, tmp_path):
+    """A pre login flow must be confirmed by polling pre, not online."""
+    import asyncio
+    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
+    from hermes_multitenancy import feishu_auth_cards
+    from hermes_multitenancy import feishu_credential_hub_cards as hub_cards
+    from hermes_multitenancy import router as router_mod
+
+    class DoneProc:
+        def poll(self):
+            return 0
+
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _gateway: object())
+
+    calls = []
+
+    def fake_logged_in(_profile_dir, _profile_name, _shared_home, env_name="online"):
+        calls.append(env_name)
+        return True
+
+    def fake_collect(*, profile_name, open_id, home_dir):
+        return [
+            credential_hub.CredentialRow(
+                id=credential_hub.KEP_CLI_PRE,
+                title="kep-cli pre",
+                provider="keep",
+                installed=True,
+                status="authenticated",
+            )
+        ]
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        return {"message_id": "om_success"}
+
+    async def fake_update_auth_card(*, adapter, auth_card, card):
+        return True
+
+    monkeypatch.setattr(cha, "kep_cli_logged_in", fake_logged_in)
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
+    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
+    monkeypatch.setattr(feishu_auth_cards, "update_auth_card", fake_update_auth_card)
+    monkeypatch.setattr(hub_cards, "build_hub_card", lambda **_kwargs: {"schema": "2.0"})
+
+    asyncio.run(
+        router_mod._poll_hub_flows(
+            profile_name="owner",
+            open_id="ou_owner",
+            profile_dir=Path(tmp_path),
+            shared_home=Path(tmp_path / "shared"),
+            chat_id="oc_chat",
+            gateway=object(),
+            hub_card={"message_id": "om_hub"},
+            flows={credential_hub.KEP_CLI_PRE: {"kind": "kep", "proc": DoneProc(), "env": "pre"}},
+            auth_urls={credential_hub.KEP_CLI_PRE: "https://kep.example.com/pre"},
+            qr_image_keys={},
+        )
+    )
+
+    assert calls == ["pre"]

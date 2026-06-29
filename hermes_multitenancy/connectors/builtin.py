@@ -1,8 +1,8 @@
-"""Built-in connector definitions — the five first-party connectors.
+"""Built-in connector definitions — the first-party connectors.
 
 These mirror exactly the ids / providers / display order that
 ``credential_hub`` already uses, so the new ``/connectors`` endpoint and the
-legacy ``/credentials/hub`` endpoint describe the same five capabilities.
+legacy ``/credentials/hub`` endpoint describe the same capabilities.
 
 Phase 1 adds NO new connectors and changes NO runtime behavior; this is purely
 the static metadata that enriches each existing credential row with scope and
@@ -18,14 +18,16 @@ from .models import (
     InvocationSpec,
 )
 
-# Ids — identical set + order to credential_hub.CREDENTIAL_ORDER.
+# Ids — identical display order to credential_hub.CREDENTIAL_ORDER.
 LARK_CLI = "lark-cli"
 FEISHU_PROJECT = "feishu-project"
 KEEP_RECORD = "keep-record"
 KEP_CLI = "kep-cli"
+KEP_CLI_ONLINE = "kep-cli-online"
+KEP_CLI_PRE = "kep-cli-pre"
 GITLAB = "gitlab"
 
-CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI, GITLAB)
+CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB)
 
 
 BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
@@ -97,9 +99,9 @@ BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
         ),
         ui=ConnectorUiSpec(group="internal-systems", action="qr_flow"),
     ),
-    KEP_CLI: ConnectorDefinition(
-        id=KEP_CLI,
-        title="kep-cli",
+    KEP_CLI_ONLINE: ConnectorDefinition(
+        id=KEP_CLI_ONLINE,
+        title="kep-cli online",
         provider="keep",
         kind="internal",
         scope="profile",
@@ -119,6 +121,47 @@ BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
             runtime_policy_owner="connector_driver",
         ),
         ui=ConnectorUiSpec(group="internal-systems", action="oauth_url"),
+    ),
+    KEP_CLI_PRE: ConnectorDefinition(
+        id=KEP_CLI_PRE,
+        title="kep-cli pre",
+        provider="keep",
+        kind="internal",
+        scope="profile",
+        invocation=InvocationSpec(type="cli_command", detail="kep-auth"),
+        auth_flow=AuthFlowSpec(
+            type="oauth_callback",
+            status_probe="credential_hub.kep_cli_status",
+            start="credential_hub_auth.start_kep_cli_login",
+            poll="credential_hub_auth.kep_cli_logged_in",
+            complete="credential_hub_auth.complete_kep_callback",
+        ),
+        policy=ConnectorPolicy(
+            supported_identities=("user",),
+            default_identity="user",
+            audit=True,
+            secrets_owner="profile_home",
+            runtime_policy_owner="connector_driver",
+        ),
+        ui=ConnectorUiSpec(group="internal-systems", action="oauth_url"),
+    ),
+    KEP_CLI: ConnectorDefinition(
+        id=KEP_CLI,
+        title="kep-cli",
+        provider="keep",
+        kind="internal",
+        scope="profile",
+        invocation=InvocationSpec(type="cli_command", detail="kep-auth"),
+        auth_flow=AuthFlowSpec(type="oauth_callback", status_probe="credential_hub.kep_cli_status"),
+        policy=ConnectorPolicy(
+            supported_identities=("user",),
+            default_identity="user",
+            audit=True,
+            secrets_owner="profile_home",
+            runtime_policy_owner="connector_driver",
+        ),
+        ui=ConnectorUiSpec(group="internal-systems", action="oauth_url"),
+        compat_ids=("keep-cli",),
     ),
     GITLAB: ConnectorDefinition(
         id=GITLAB,

@@ -1,6 +1,6 @@
 """Connector Registry — list / get / status surface + 防串号 redaction.
 
-Pins the registry's public read surface: the five built-in definitions and
+Pins the registry's public read surface: the built-in definitions and
 their order, the high-risk lark-cli runtime-policy marker, and the additive
 scope fields every ``ConnectorStatus`` carries. Subprocess-backed readers are
 monkeypatched (no real meegle/kep-auth binary) exactly like
@@ -31,13 +31,13 @@ def _patch_no_binaries(monkeypatch, *, lark_status):
     monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
 
 
-def test_list_definitions_returns_five_builtins_in_credential_order():
+def test_list_definitions_returns_builtins_in_credential_order():
     from hermes_multitenancy import credential_hub
     from hermes_multitenancy.connectors import registry
 
     defs = registry.list_definitions()
     assert [d.id for d in defs] == list(credential_hub.CREDENTIAL_ORDER)
-    assert len(defs) == 5
+    assert len(defs) == len(credential_hub.CREDENTIAL_ORDER)
 
 
 def test_lark_cli_is_high_risk_authsidecar_broker_owned():
@@ -48,16 +48,16 @@ def test_lark_cli_is_high_risk_authsidecar_broker_owned():
     assert lark.policy.runtime_policy_owner == "authsidecar_broker"
 
 
-def test_other_four_connectors_are_connector_driver_owned():
+def test_other_connectors_are_connector_driver_owned():
     from hermes_multitenancy.connectors import registry
 
-    for cid in ("feishu-project", "keep-record", "kep-cli", "gitlab"):
+    for cid in ("feishu-project", "keep-record", "kep-cli-online", "kep-cli-pre", "gitlab"):
         definition = registry.get_connector(cid)
         assert definition is not None
         assert definition.policy.runtime_policy_owner == "connector_driver", cid
 
 
-def test_collect_returns_five_statuses_with_scope_fields(monkeypatch, tmp_path):
+def test_collect_returns_statuses_with_scope_fields(monkeypatch, tmp_path):
     from hermes_multitenancy.connectors import registry
 
     shared, _ = _mk_profile_home(tmp_path, "owner")
@@ -69,7 +69,7 @@ def test_collect_returns_five_statuses_with_scope_fields(monkeypatch, tmp_path):
     statuses = registry.collect_connector_statuses(
         profile_name="owner", open_id="ou_owner", shared_home=shared
     )
-    assert len(statuses) == 5
+    assert len(statuses) == 6
     for status in statuses:
         assert status.profile == "owner"
         assert status.scope  # non-empty
@@ -129,7 +129,7 @@ def test_credential_owner_is_redacted_profile_name_not_a_path(monkeypatch, tmp_p
         profile_name="owner", open_id="ou_owner", shared_home=shared
     )
     for status in statuses:
-        # All five builtins are secrets_owner="profile_home" → owner == profile name.
+        # All builtins are secrets_owner="profile_home" → owner == profile name.
         assert status.credential_owner == "owner", status.id
         # A filesystem path would contain a separator; the redacted name must not.
         assert "/" not in (status.credential_owner or ""), status.id
@@ -232,7 +232,7 @@ def test_fresh_read_refreshes_cache_so_next_cached_read_is_not_stale(monkeypatch
     monkeypatch.setattr(
         credential_hub, "_collect_credential_rows",
         lambda **kw: [credential_hub.CredentialRow(
-            id="kep-cli", title="kep-cli", provider="keep", installed=True, status=live["status"])],
+            id="kep-cli-online", title="kep-cli online", provider="keep", installed=True, status=live["status"])],
     )
 
     # 1. prime cache with needs_auth

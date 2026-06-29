@@ -138,6 +138,7 @@ class ConnectorStatus:
     detail: Optional[str] = None
     required_by: list[str] = field(default_factory=list)
     action: Optional[AuthAction] = None
+    environments: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # --- additive control-plane fields (防串号 + policy) ---
     profile: Optional[str] = None
@@ -182,4 +183,6 @@ class ConnectorStatus:
             out["detail"] = self.detail
         if self.required_by:
             out["required_by"] = self.required_by
+        if self.environments:
+            out["environments"] = self.environments
         return out

@@ -1,8 +1,8 @@
-"""Credential hub (`/auth`) — the 归口 aggregation: 5 readers + card + reuse.
+"""Credential hub (`/auth`) — the 归口 aggregation: readers + card + reuse.
 
 `credential_hub` is the single credential-status aggregation in multitenancy.
 The Feishu /auth card and hermes-web-ui CredentialsView are two paths over it.
-These tests pin the read layer (all 5 credentials), card structure, expiry
+These tests pin the read layer (all credentials), card structure, expiry
 rendering, home-dir threading, and device-flow session reuse. Subprocess-backed
 readers (feishu-project/meegle, kep-cli/kep-auth) are exercised via monkeypatch
 so no real binary is required.
@@ -94,7 +94,7 @@ def test_kep_cli_missing_when_not_installed(tmp_path):
         profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
         shared_home=tmp_path, installed=False,
     )
-    assert row.id == "kep-cli"
+    assert row.id == credential_hub.KEP_CLI_ONLINE
     assert row.status == "missing"
 
 
@@ -180,6 +180,50 @@ def test_kep_cli_authenticated_when_token_live(monkeypatch, tmp_path):
     assert row.status == "authenticated"
     assert row.account_hint == "owner"
     assert row.expires_at == future * 1000
+
+
+def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env = cmd[cmd.index("--env") + 1]
+        if env == "online":
+            return _Proc("state: valid\noperator: dengwenhui <dengwenhui@keep.com>\n")
+        if env == "pre":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="dengwenhui",
+        shared_home=tmp_path,
+        installed=True,
+        target_env="pre",
+        report_envs=("pre", "online"),
+    )
+
+    assert row.status == "needs_auth"
+    assert row.account_hint == "dengwenhui"
+    assert row.action["env"] == "pre"
+    assert "pre" in row.detail
+    assert "online" in row.detail
+    data = row.to_dict()
+    assert data["environments"]["pre"]["status"] == "needs_auth"
+    assert data["environments"]["online"]["status"] == "authenticated"
+    assert data["environments"]["online"]["account_hint"] == "dengwenhui"
 
 
 def test_kep_cli_needs_auth_when_token_expired(monkeypatch, tmp_path):
@@ -529,7 +573,7 @@ def test_requirement_patterns_cover_proximity_and_oauth(tmp_path):
 # -- aggregation -------------------------------------------------------------
 
 
-def test_collect_returns_all_five_in_order(monkeypatch, tmp_path):
+def test_collect_returns_all_credentials_in_order(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub, feishu_uat_auth
 
     monkeypatch.setattr(feishu_uat_auth, "credential_status",
@@ -540,7 +584,14 @@ def test_collect_returns_all_five_in_order(monkeypatch, tmp_path):
     rows = credential_hub.collect_credential_statuses(
         profile_name="owner", open_id="ou_owner", shared_home=tmp_path
     )
-    assert [r.id for r in rows] == ["lark-cli", "feishu-project", "keep-record", "kep-cli", "gitlab"]
+    assert [r.id for r in rows] == [
+        "lark-cli",
+        "feishu-project",
+        "keep-record",
+        "kep-cli-online",
+        "kep-cli-pre",
+        "gitlab",
+    ]
     assert rows[0].status == "authenticated"
     # to_dict shape is SkillCredentialEntry-compatible
     d = rows[0].to_dict()
@@ -696,7 +747,7 @@ def test_build_hub_card_authenticated_lark_offers_reauth_button():
     assert '"callback"' not in blob
 
 
-def test_filter_hub_rows_for_auth_keeps_only_three_mvp_creds():
+def test_filter_hub_rows_for_auth_keeps_only_authable_mvp_creds():
     import json
     from hermes_multitenancy import router
     from hermes_multitenancy.credential_hub import CredentialRow, CREDENTIAL_ORDER
@@ -708,7 +759,7 @@ def test_filter_hub_rows_for_auth_keeps_only_three_mvp_creds():
     ]
     filtered = router._filter_hub_rows_for_auth(rows)
 
-    assert [row.id for row in filtered] == ["lark-cli", "keep-record", "kep-cli"]
+    assert [row.id for row in filtered] == ["lark-cli", "keep-record", "kep-cli-online", "kep-cli-pre"]
     assert "gitlab" not in [row.id for row in filtered]
     assert "feishu-project" not in [row.id for row in filtered]
 
@@ -727,7 +778,7 @@ def test_qr_and_url_card_builders():
 
 
 def test_collect_credential_rows_preserves_order_under_parallelism(monkeypatch, tmp_path):
-    """The 5 readers run concurrently; output MUST stay in CREDENTIAL_ORDER even
+    """The readers run concurrently; output MUST stay in CREDENTIAL_ORDER even
     when the first reader is the slowest to finish (else the UI columns reorder)."""
     import time as _t
     from hermes_multitenancy import credential_hub as ch
@@ -744,7 +795,7 @@ def test_collect_credential_rows_preserves_order_under_parallelism(monkeypatch, 
     monkeypatch.setattr(ch, "lark_cli_status", lambda **k: (_t.sleep(0.15), _row(ch.LARK_CLI))[1])
     monkeypatch.setattr(ch, "feishu_project_status", lambda **k: _row(ch.FEISHU_PROJECT))
     monkeypatch.setattr(ch, "keep_record_status", lambda **k: _row(ch.KEEP_RECORD))
-    monkeypatch.setattr(ch, "kep_cli_status", lambda **k: _row(ch.KEP_CLI))
+    monkeypatch.setattr(ch, "kep_cli_statuses", lambda **k: [_row(ch.KEP_CLI_ONLINE), _row(ch.KEP_CLI_PRE)])
     monkeypatch.setattr(ch, "gitlab_status", lambda **k: _row(ch.GITLAB))
 
     rows = ch._collect_credential_rows(profile_name="owner", open_id="o", shared_home=tmp_path)

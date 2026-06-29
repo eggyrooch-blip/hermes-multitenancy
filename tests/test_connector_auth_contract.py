@@ -109,7 +109,7 @@ def test_public_path_to_dict_equals_low_level_reader(monkeypatch, tmp_path):
     public_dicts = [r.to_dict() for r in public_rows]
     low_dicts = [r.to_dict() for r in low_rows]
     assert public_dicts == low_dicts
-    # And the order/ids are the canonical five.
+    # And the order/ids are the canonical connector set.
     assert [d["id"] for d in public_dicts] == list(credential_hub.CREDENTIAL_ORDER)
 
 
@@ -150,11 +150,14 @@ def test_action_dict_round_trip_is_lossless_per_kind(monkeypatch, tmp_path):
     assert public["keep-record"]["action"]["kind"] == "skill_flow"
     # The extra command key must survive (this is the lossless-extra assertion).
     assert public["keep-record"]["action"].get("command") == "/keep-record auth"
-    assert public["kep-cli"]["action"]["kind"] == "oauth_url"
+    assert public["kep-cli-online"]["action"]["kind"] == "oauth_url"
+    assert public["kep-cli-online"]["action"]["env"] == "online"
+    assert public["kep-cli-pre"]["action"]["kind"] == "oauth_url"
+    assert public["kep-cli-pre"]["action"]["env"] == "pre"
     assert public["feishu-project"]["action"]["kind"] == "oauth_url"
     assert public["gitlab"]["action"]["kind"] == "manual"
 
-    for cid in ("lark-cli", "feishu-project", "keep-record", "kep-cli", "gitlab"):
+    for cid in ("lark-cli", "feishu-project", "keep-record", "kep-cli-online", "kep-cli-pre", "gitlab"):
         assert public[cid]["action"] == low[cid]["action"], cid
 
 
@@ -186,6 +189,53 @@ def test_kep_cli_expired_jwt_collapses_to_needs_auth_through_registry(monkeypatc
     rows = credential_hub.collect_credential_statuses(
         profile_name="owner", open_id="ou_owner", shared_home=tmp_path
     )
-    kep = next(r for r in rows if r.id == "kep-cli")
+    kep = next(r for r in rows if r.id == "kep-cli-online")
     assert kep.status == "needs_auth"
     assert kep.expires_at == past * 1000
+
+
+def test_kep_cli_environment_statuses_round_trip_through_registry(monkeypatch, tmp_path):
+    """pre/online child statuses must survive registry enrichment and compat."""
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    home = tmp_path / "profiles" / "owner" / "home"
+    home.mkdir(parents=True)
+    skill = home.parent / "skills" / "kep-trevi-delivery-orchestrate"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "name: kep-trevi-delivery-orchestrate\ntags: [kep-cli]\n默认全程 `--env pre` 演练\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", lambda **kw: {"status": "missing"})
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env = cmd[cmd.index("--env") + 1]
+        if env == "online":
+            return _Proc("state: valid\noperator: owner <owner@keep.com>\n")
+        if env == "pre":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    rows = credential_hub.collect_credential_statuses(
+        profile_name="owner", open_id="ou_owner", shared_home=tmp_path
+    )
+    by_id = {r.id: r.to_dict() for r in rows}
+    kep = by_id["kep-cli-pre"]
+    online = by_id["kep-cli-online"]
+
+    assert kep["status"] == "needs_auth"
+    assert kep["action"]["env"] == "pre"
+    assert online["status"] == "authenticated"
+    assert online["action"]["env"] == "online"

@@ -29,6 +29,9 @@ class ConnectorDriver:
     def __init__(self, definition: ConnectorDefinition) -> None:
         self.definition = definition
 
+    def _kep_env_name(self) -> str:
+        return "pre" if self.definition.id.endswith("-pre") else "online"
+
     # --- auth lifecycle (delegates to auth_flows / credential_hub_auth) ---
 
     def start_auth(self, *, profile_dir: Path, profile_name: str, shared_home: Path,
@@ -38,7 +41,8 @@ class ConnectorDriver:
             return auth_flows.start_qr(profile_dir)
         if flow == "oauth_callback":
             return auth_flows.start_oauth(profile_dir, profile_name, shared_home,
-                                          public_origin=public_origin)
+                                          public_origin=public_origin,
+                                          env_name=self._kep_env_name())
         if flow in ("existing_profile_secret", "manual_token", "none"):
             # No interactive start in this control plane: existing-secret flows
             # (lark-cli/feishu-uat) start via feishu_uat_auth in the router;
@@ -56,7 +60,12 @@ class ConnectorDriver:
                 raise AuthFlowUnsupported("qr_poll requires a qrcode_id to poll")
             return auth_flows.poll_qr(profile_dir, qrcode_id, timeout_ms=timeout_ms)
         if flow == "oauth_callback":
-            return auth_flows.poll_oauth(profile_dir, profile_name, shared_home)
+            return auth_flows.poll_oauth(
+                profile_dir,
+                profile_name,
+                shared_home,
+                env_name=self._kep_env_name(),
+            )
         raise AuthFlowUnsupported(f"connector {self.definition.id!r} flow {flow!r} has no poll")
 
     def complete_auth(self, *, session_id: str, query: str) -> str:

@@ -61,6 +61,7 @@ def _enrich_rows(rows, *, profile: Optional[str]) -> list[ConnectorStatus]:
                     default_identity=row.default_identity, detail=row.detail,
                     required_by=list(row.required_by),
                     action=compat.AuthAction.from_dict(row.action),
+                    environments=dict(getattr(row, "environments", {}) or {}),
                     profile=profile, scope="profile",
                 )
             )

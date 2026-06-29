@@ -55,6 +55,7 @@ def enrich(row: "CredentialRow", definition: ConnectorDefinition, *, profile: Op
         detail=row.detail,
         required_by=list(row.required_by),
         action=AuthAction.from_dict(row.action),
+        environments=dict(row.environments),
         # additive control-plane
         profile=profile,
         scope=definition.scope,
@@ -82,6 +83,7 @@ def to_credential_row(status: ConnectorStatus) -> "CredentialRow":
         detail=status.detail,
         required_by=list(status.required_by),
         action=status.action.to_dict() if status.action else {},
+        environments=dict(status.environments),
     )
 
 
