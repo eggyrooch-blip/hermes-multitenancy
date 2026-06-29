@@ -1,0 +1,530 @@
+"""Multitenancy-owned update orchestration primitives.
+
+This module is intentionally deterministic and Linux-friendly: it records
+candidate/update state, runs host CLI updates through ``subprocess``-style
+runners, and only swaps active shared binaries after every command and copy
+step succeeds.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Optional
+
+from .lark_cli_canary import lark_cli_canary_preflight
+from . import plugin_ingest
+from .skill_registry import install_shared_skill_for_profile
+from .skill_registry import list_installed_skills, list_profile_skill_slash_commands
+
+
+UPDATE_CENTER_DIR = "update-center"
+DEFAULT_LEDGER_NAME = "ledger.jsonl"
+ENV_KEP_NO_AUTO_LOGIN = {"KEP_NO_AUTO_LOGIN": "1"}
+
+_LARK_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+)\b")
+_UPDATE_NOTICE_PATTERNS = [
+    re.compile(r"(?im)^.*(?:new version|newer version|update available|upgrade lark-cli).*(?:\n|$)"),
+    re.compile(r"(?im)^.*(?:有新版本|新版本可用|建议更新|可升级|升级 lark-cli|更新 lark-cli).*(?:\n|$)"),
+    re.compile(r"(?im)^.*(?:lark-cli|kep-cli)\s+update\b.*(?:\n|$)"),
+    re.compile(r"(?im)^.*(?:重新打开|重启|restart|reopen).*(?:AI Agent|agent|Skills|skills).*(?:\n|$)"),
+    re.compile(r"(?im)^(?:bash|copy)\s*$\n?"),
+]
+_SECRET_PATTERNS = [
+    re.compile(r"SECRET[_A-Z0-9-]*"),
+    re.compile(r"(?i)(token|secret|authorization|cookie)\s*[:=]\s*[^,\s\"']+"),
+    re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]+"),
+]
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _redact_text(value: str) -> str:
+    out = value
+    for pattern in _SECRET_PATTERNS:
+        out = pattern.sub("[REDACTED]", out)
+    return out
+
+
+def redact(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): redact(item) for key, item in value.items()}
+    return value
+
+
+def sanitize_user_visible_output(text: str) -> str:
+    """Remove host-maintenance update notices before text reaches an end user."""
+
+    cleaned = str(text or "")
+    for pattern in _UPDATE_NOTICE_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned.strip()
+
+
+def default_shared_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+
+
+def default_ledger_path(shared_home: Path | None = None) -> Path:
+    home = (shared_home or default_shared_home()).expanduser()
+    return home / UPDATE_CENTER_DIR / DEFAULT_LEDGER_NAME
+
+
+class UpdateLedger:
+    """Append-only JSONL event ledger for update-center decisions."""
+
+    def __init__(self, path: Path | str | None = None, *, shared_home: Path | None = None) -> None:
+        self.path = Path(path).expanduser() if path is not None else default_ledger_path(shared_home)
+
+    def append(self, event: str, **fields: Any) -> dict[str, Any]:
+        record = {
+            "ts": _now(),
+            "event": event,
+            **fields,
+        }
+        public = redact(record)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(public, ensure_ascii=False, sort_keys=True) + "\n")
+        return public
+
+    def read_events(self) -> list[dict[str, Any]]:
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        events: list[dict[str, Any]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
+
+
+@dataclass(frozen=True)
+class KepCliSystem:
+    system: str
+    binary: str
+    target_version: str = ""
+    installed_version: str | None = None
+
+    @property
+    def needs_install(self) -> bool:
+        return not self.installed_version
+
+    @property
+    def needs_update(self) -> bool:
+        return bool(self.installed_version and self.target_version and self.installed_version != self.target_version)
+
+
+Runner = Callable[[list[str]], Any]
+BinaryResolver = Callable[[str], Path | None]
+
+
+def scan_lark_cli_notice(text: str, *, ledger: UpdateLedger, current_version: str = "") -> dict[str, Any]:
+    target = _extract_lark_version(text)
+    candidate = {
+        "component": "lark-cli",
+        "current_version": current_version,
+        "target_version": target,
+        "risk": "manual-preflight-only",
+    }
+    record = ledger.append(
+        "candidate_detected",
+        component="lark-cli",
+        target_version=target,
+        current_version=current_version,
+        auto_apply=False,
+    )
+    return {
+        "candidate": candidate,
+        "auto_apply": False,
+        "user_visible_output": sanitize_user_visible_output(text),
+        "ledger_event": record,
+    }
+
+
+def _extract_lark_version(text: str) -> str:
+    matches = _LARK_VERSION_RE.findall(str(text or ""))
+    return f"v{matches[-1]}" if matches else ""
+
+
+def check_lark_cli_candidate(
+    *,
+    shared_home: Path,
+    profile_name: str,
+    open_id: str,
+    target_version: str,
+    ledger: UpdateLedger,
+    binary_path: Path | None = None,
+) -> dict[str, Any]:
+    """Run lark-cli readiness checks without replacing any binary."""
+
+    preflight = lark_cli_canary_preflight(
+        shared_home=shared_home,
+        profile_name=profile_name,
+        open_id=open_id,
+        binary_path=binary_path,
+    )
+    report = {
+        "component": "lark-cli",
+        "target_version": target_version,
+        "auto_apply": False,
+        "preflight": preflight,
+    }
+    ledger.append(
+        "preflight_completed",
+        component="lark-cli",
+        target_version=target_version,
+        auto_apply=False,
+        ready=bool(preflight.get("ready")),
+        missing=preflight.get("missing") or [],
+    )
+    return redact(report)
+
+
+def apply_additive_plugin_update(
+    repo: Path,
+    *,
+    audience: str,
+    shared_home: Path,
+    ledger: UpdateLedger,
+    profiles_root: Path | None = None,
+) -> dict[str, Any]:
+    """Auto-apply only non-destructive skill-only plugin updates."""
+
+    shared_home = shared_home.expanduser()
+    profiles_root = (profiles_root or shared_home / "profiles").expanduser()
+    plugin = plugin_ingest.load_plugin_manifest(repo)
+    risk = _classify_plugin_for_auto_apply(plugin, shared_home=shared_home)
+    if not risk["auto_apply"]:
+        ledger.append(
+            "candidate_quarantined",
+            component="plugin",
+            plugin_id=plugin["id"],
+            reason=risk["reason"],
+        )
+        return {
+            "component": "plugin",
+            "plugin_id": plugin["id"],
+            "auto_apply": False,
+            "applied": False,
+            "reason": risk["reason"],
+        }
+
+    report = plugin_ingest.ingest(
+        repo,
+        audience=audience,
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        dry_run=False,
+        force=False,
+    )
+    verification = _verify_plugin_skills(report, profiles_root=profiles_root)
+    missing = [
+        {"profile": profile, "missing": data["missing"]}
+        for profile, data in verification["profiles"].items()
+        if data["missing"]
+    ]
+    if missing:
+        ledger.append("candidate_quarantined", component="plugin", plugin_id=plugin["id"], reason="skill-verification-failed")
+        return {
+            "component": "plugin",
+            "plugin_id": plugin["id"],
+            "auto_apply": False,
+            "applied": False,
+            "reason": "skill-verification-failed",
+            "verification": verification,
+        }
+    ledger.append("plugin_applied", component="plugin", plugin_id=plugin["id"], verification=verification)
+    return {
+        "component": "plugin",
+        "plugin_id": plugin["id"],
+        "auto_apply": True,
+        "applied": True,
+        "report": report,
+        "verification": verification,
+    }
+
+
+def _classify_plugin_for_auto_apply(plugin: dict[str, Any], *, shared_home: Path) -> dict[str, Any]:
+    if plugin.get("clis"):
+        return {"auto_apply": False, "reason": "plugin-declares-cli"}
+    if plugin.get("connectors"):
+        return {"auto_apply": False, "reason": "plugin-declares-connector"}
+    managed_path = shared_home / plugin_ingest.MANAGED_DIR / f"{plugin['id']}.json"
+    if managed_path.exists():
+        try:
+            existing = json.loads(managed_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {"auto_apply": False, "reason": "managed-manifest-unreadable"}
+        before = {str(item) for item in existing.get("skills") or []}
+        after = {str(item) for item in (plugin.get("skills") or {}).get("list") or []}
+        if before - after:
+            return {"auto_apply": False, "reason": "skill-removal-or-rename"}
+    return {"auto_apply": True, "reason": "skill-additive"}
+
+
+def _verify_plugin_skills(report: dict[str, Any], *, profiles_root: Path) -> dict[str, Any]:
+    owned = (report.get("skills") or {}).get("owned") or {}
+    profiles: dict[str, Any] = {}
+    for profile, skills in owned.items():
+        profile_home = profiles_root / profile
+        installed = list_installed_skills(profile_home=profile_home)
+        slash = list_profile_skill_slash_commands(profile_home=profile_home)
+        missing = [skill for skill in skills if skill not in installed]
+        profiles[profile] = {
+            "expected": list(skills),
+            "missing": missing,
+            "slash_count": len(slash),
+        }
+    return {"profiles": profiles}
+
+
+def sync_kep_cli_systems(
+    *,
+    systems: Iterable[KepCliSystem | Mapping[str, Any]],
+    shared_home: Path,
+    ledger: UpdateLedger,
+    profiles: Iterable[str] | None = None,
+    resolve_binary: BinaryResolver | None = None,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """Install/update kep-cli systems and atomically sync binaries into shared bin."""
+
+    shared_home = shared_home.expanduser()
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True, exist_ok=True)
+    resolve = resolve_binary or resolve_kep_binary
+    run = runner or _run_kep_cli
+    rows: list[dict[str, Any]] = []
+    normalized_systems: list[KepCliSystem] = [
+        raw if isinstance(raw, KepCliSystem) else KepCliSystem(**dict(raw))
+        for raw in systems
+    ]
+    for system in normalized_systems:
+        rows.append(_sync_one_kep_system(system, shared_bin=shared_bin, resolve_binary=resolve, runner=run, ledger=ledger))
+    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or ())
+    report = {"component": "kep-cli", "systems": rows, "skills": skill_rows, "secret_free": True}
+    ledger.append("kep_cli_sync_completed", component="kep-cli", systems=rows)
+    return redact(report)
+
+
+def _sync_one_kep_system(
+    system: KepCliSystem,
+    *,
+    shared_bin: Path,
+    resolve_binary: BinaryResolver,
+    runner: Runner,
+    ledger: UpdateLedger,
+) -> dict[str, Any]:
+    if not system.needs_install and not system.needs_update:
+        src = resolve_binary(system.binary)
+        if src and src.is_file():
+            copied = _copy_binary_atomic(src, shared_bin / system.binary)
+            return {
+                **asdict(system),
+                "action": "synced",
+                "path": str(copied["path"]),
+                "sha256": copied["sha256"],
+            }
+        return {**asdict(system), "action": "up-to-date", "sha256": ""}
+
+    command = ["kep-cli", "install" if system.needs_install else "update", system.system]
+    result = _coerce_result(runner(command))
+    if result["returncode"] != 0:
+        row = {
+            **asdict(system),
+            "action": "quarantined",
+            "command": command[:2] + [system.system],
+            "reason": result["stderr"] or result["stdout"] or f"exit {result['returncode']}",
+        }
+        ledger.append("candidate_quarantined", component="kep-cli", system=system.system, reason=row["reason"])
+        return redact(row)
+
+    src = resolve_binary(system.binary)
+    if src is None or not src.is_file():
+        row = {
+            **asdict(system),
+            "action": "quarantined",
+            "command": command[:2] + [system.system],
+            "reason": f"binary {system.binary} not found after kep-cli {command[1]}",
+        }
+        ledger.append("candidate_quarantined", component="kep-cli", system=system.system, reason=row["reason"])
+        return redact(row)
+
+    copied = _copy_binary_atomic(src, shared_bin / system.binary)
+    action = "installed" if system.needs_install else "updated"
+    row = {
+        **asdict(system),
+        "action": action,
+        "command": command[:2] + [system.system],
+        "path": str(copied["path"]),
+        "sha256": copied["sha256"],
+    }
+    ledger.append("system_synced", component="kep-cli", system=system.system, action=action, sha256=copied["sha256"])
+    return row
+
+
+def ensure_kep_cli_skills(
+    systems: Iterable[KepCliSystem],
+    *,
+    shared_home: Path,
+    profiles: Iterable[str],
+    category: str = "Keep",
+) -> list[dict[str, Any]]:
+    """Ensure each kep-cli system has a shared wrapper skill and profile link.
+
+    Existing shared skill content is preserved; generated wrappers are only a
+    fallback for newly introduced kep-cli systems that have no curated skill yet.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for system in systems:
+        skill_path = f"{category}/kep-{system.system}-cli"
+        source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system)
+        for profile in profiles:
+            profile_home = shared_home / "profiles" / profile
+            if not profile_home.is_dir():
+                rows.append({"profile": profile, "skill_path": skill_path, "action": "quarantined", "reason": "profile missing"})
+                continue
+            guard = _profile_skill_install_guard(profile_home, skill_path, source)
+            if guard:
+                rows.append({"profile": profile, "skill_path": skill_path, "action": "quarantined", "reason": guard})
+                continue
+            installed = install_shared_skill_for_profile(
+                shared_home=shared_home,
+                profile_home=profile_home,
+                skill_path=skill_path,
+                source=source,
+                version=system.target_version or system.installed_version,
+            )
+            rows.append({"profile": profile, "skill_path": skill_path, "action": "ensured", "target": installed["target"]})
+    return rows
+
+
+def _profile_skill_install_guard(profile_home: Path, skill_path: str, source: Path) -> str:
+    managed = _read_profile_skill_manifest(profile_home / "skills" / ".hermes-managed.json")
+    if skill_path in managed:
+        return "profile skill already exists in managed manifest"
+    target = profile_home / "skills" / skill_path
+    if not target.exists() and not target.is_symlink():
+        return ""
+    try:
+        if target.is_symlink() and target.resolve() == source.resolve():
+            return ""
+    except OSError:
+        pass
+    return "profile skill already exists"
+
+
+def _read_profile_skill_manifest(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    skills = raw.get("skills") if isinstance(raw, dict) else None
+    return skills if isinstance(skills, dict) else {}
+
+
+def _ensure_kep_cli_skill_source(shared_home: Path, *, skill_path: str, system: KepCliSystem) -> Path:
+    source = shared_home / "skills" / skill_path
+    skill_md = source / "SKILL.md"
+    if skill_md.exists():
+        return source
+    source.mkdir(parents=True, exist_ok=True)
+    title = f"kep {system.system} CLI"
+    skill_md.write_text(
+        "\n".join(
+            [
+                "---",
+                f"name: kep-{system.system}-cli",
+                f"title: {title}",
+                f"description: Run {system.binary} from the Hermes managed kep-cli sandbox path.",
+                "---",
+                f"# {title}",
+                "",
+                "Use this skill when the current task needs this Keep/Kep business CLI.",
+                f"Run `{system.binary} --help` first when command arguments are unclear.",
+                "Do not ask the user to install or update host CLIs; Multitenancy manages updates.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return source
+
+
+def _run_kep_cli(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, **ENV_KEP_NO_AUTO_LOGIN}
+    return subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
+
+
+def _coerce_result(result: Any) -> dict[str, Any]:
+    if isinstance(result, Mapping):
+        return {
+            "returncode": int(result.get("returncode", 0)),
+            "stdout": str(result.get("stdout") or ""),
+            "stderr": str(result.get("stderr") or ""),
+        }
+    return {
+        "returncode": int(getattr(result, "returncode", 0)),
+        "stdout": str(getattr(result, "stdout", "") or ""),
+        "stderr": str(getattr(result, "stderr", "") or ""),
+    }
+
+
+def resolve_kep_binary(binary: str) -> Path | None:
+    found = shutil.which(binary)
+    if found:
+        return Path(found).resolve()
+    base = Path.home() / ".kep-cli" / "systems"
+    for pattern in (f"*/bin/{binary}", f"*/{binary}"):
+        for candidate in base.glob(pattern):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.resolve()
+    return None
+
+
+def _copy_binary_atomic(src: Path, dst: Path) -> dict[str, Any]:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    try:
+        shutil.copy2(src, tmp)
+        tmp.chmod(0o755)
+        digest = _sha256(tmp)
+        os.replace(tmp, dst)
+        return {"path": dst, "sha256": digest}
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()

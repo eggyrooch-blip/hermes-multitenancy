@@ -25,6 +25,7 @@ from .lark_cli_guard import (
     HERMES_LARK_CLI_RUN_TOKEN,
 )
 from .runtime import strict_context_enabled
+from .update_center import sanitize_user_visible_output
 
 try:
     from tools.registry import registry, tool_error, tool_result
@@ -105,7 +106,7 @@ def _strip_non_business_notices(text: str) -> str:
     cleaned = text or ""
     for pattern in _NON_BUSINESS_NOTICE_PATTERNS:
         cleaned = pattern.sub("", cleaned)
-    return cleaned.strip()
+    return sanitize_user_visible_output(cleaned).strip()
 
 
 def _load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
