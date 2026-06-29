@@ -79,6 +79,15 @@ _INGEST_SECRET_USAGE = {
     "basic": "HTTP Basic authorization",
     "opaque": "caller-defined opaque secret",
 }
+_PLUGIN_ASSET_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,180}$")
+_PLUGIN_ASSET_MANAGED_DIR = ".hermes-plugin-managed"
+_PLUGIN_ASSET_STORAGE_DIR = ".hermes-plugin-assets"
+_PLUGIN_ASSET_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
 
 _runner: Any = None
 _site: Any = None
@@ -179,6 +188,56 @@ def _dedupe_slash_commands(commands: list[dict[str, Any]]) -> list[dict[str, Any
 def _shared_home_from_env() -> Path:
     configured = os.environ.get("HERMES_SHARED_HOME") or os.environ.get("HERMES_HOME")
     return Path(configured or (Path.home() / ".hermes")).expanduser()
+
+
+def _safe_plugin_asset_component(raw: Any) -> str | None:
+    value = str(raw or "").strip()
+    if not value or "/" in value or "\\" in value or value.startswith("."):
+        return None
+    if not _PLUGIN_ASSET_COMPONENT_RE.fullmatch(value):
+        return None
+    return value
+
+
+def _resolve_registered_plugin_asset(
+    plugin_id_raw: Any,
+    asset_name_raw: Any,
+) -> tuple[Path, str, str, str] | None:
+    """Resolve a plugin asset only when the managed manifest explicitly registered it."""
+    plugin_id = _safe_plugin_asset_component(plugin_id_raw)
+    asset_name = _safe_plugin_asset_component(asset_name_raw)
+    if not plugin_id or not asset_name:
+        return None
+    shared_home = _shared_home_from_env()
+    manifest_path = shared_home / _PLUGIN_ASSET_MANAGED_DIR / f"{plugin_id}.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict):
+        return None
+    asset = assets.get(asset_name)
+    if not isinstance(asset, dict):
+        return None
+    path_raw = str(asset.get("path") or "").strip()
+    if not path_raw:
+        return None
+    try:
+        asset_path = Path(path_raw).expanduser().resolve()
+        allowed_root = (shared_home / _PLUGIN_ASSET_STORAGE_DIR / plugin_id).resolve()
+        asset_path.relative_to(allowed_root)
+    except Exception:
+        logger.warning("[multitenancy] plugin asset path rejected: plugin=%r asset=%r", plugin_id, asset_name)
+        return None
+    if not asset_path.is_file():
+        return None
+    mime = str(asset.get("mime") or "").strip()
+    if mime not in set(_PLUGIN_ASSET_MIME_BY_SUFFIX.values()):
+        mime = _PLUGIN_ASSET_MIME_BY_SUFFIX.get(asset_path.suffix.lower(), "application/octet-stream")
+    if mime == "application/octet-stream":
+        return None
+    return asset_path, mime, plugin_id, asset_name
 
 
 def _dotenv_values(path: Path) -> dict[str, str]:
@@ -3895,6 +3954,54 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI experts failed")
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def handle_plugin_asset(request):
+        """Serve one registered managed-plugin asset (currently expert avatars)."""
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import expert_overlay
+
+        resolved = _resolve_registered_plugin_asset(
+            request.match_info.get("plugin_id"),
+            request.match_info.get("asset_name"),
+        )
+        if resolved is None:
+            return web.json_response({"error": "not found"}, status=404)
+        asset_path, mime, plugin_id, asset_name = resolved
+        try:
+            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_home = _profile_home_for_name(profile_name)
+            department_ids = await asyncio.to_thread(
+                expert_overlay.resolve_caller_departments,
+                profile_home,
+                profile_name=profile_name,
+                open_id=user_key,
+            )
+            visible_experts = await asyncio.to_thread(
+                expert_overlay.list_experts,
+                profile_home,
+                department_ids=department_ids,
+            )
+        except cron_api.CronApiError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception:
+            logger.exception("[multitenancy] WebUI plugin asset visibility check failed")
+            return web.json_response({"error": "asset unavailable"}, status=500)
+        asset_url = f"/api/run-broker/plugin-assets/{plugin_id}/{asset_name}"
+        if not any(str(row.get("avatar") or "") == asset_url for row in visible_experts):
+            return web.json_response({"error": "not found"}, status=404)
+        try:
+            body = await asyncio.to_thread(asset_path.read_bytes)
+        except OSError:
+            return web.json_response({"error": "not found"}, status=404)
+        return web.Response(
+            body=body,
+            content_type=mime,
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     async def handle_credential_lease(request):
         header = request.headers.get("Authorization", "")
         prefix = "Bearer "
@@ -4527,6 +4634,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
     app.router.add_get("/api/run-broker/connectors", handle_connectors)
     app.router.add_get("/api/run-broker/experts", handle_experts)
+    app.router.add_get("/api/run-broker/plugin-assets/{plugin_id}/{asset_name}", handle_plugin_asset)
     app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)

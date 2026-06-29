@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -56,8 +57,16 @@ from .skill_registry import (
 PLUGIN_MANIFEST_REL = ".hermes-plugin/plugin.json"
 SUPPORTED_SCHEMA = "hermes-plugin/v1"
 MANAGED_DIR = ".hermes-plugin-managed"  # under shared_home; distinct from skill_registry's .hermes-managed.json
+MANAGED_ASSETS_DIR = ".hermes-plugin-assets"
+PLUGIN_ASSET_URL_PREFIX = "/api/run-broker/plugin-assets"
 SKILL_DISTRIBUTION_FILE = "skill-distribution.yaml"
 ENV_KEP_NO_AUTO_LOGIN = {"KEP_NO_AUTO_LOGIN": "1"}
+_ASSET_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
 
 
 class PluginIngestError(RuntimeError):
@@ -91,6 +100,17 @@ def _safe_component(value: Any, *, kind: str) -> str:
     return raw
 
 
+def _safe_url_path_component(value: Any, *, kind: str) -> str:
+    """Reject ids that would produce unusable `/api/run-broker/.../<id>/...` URLs."""
+    raw = _safe_component(value, kind=kind)
+    if len(raw) > 180 or not all(c.isascii() and (c.isalnum() or c in "-_.:") for c in raw):
+        raise PluginIngestError(
+            f"unsafe {kind} URL component in manifest: {value!r} "
+            "(ASCII alnum plus -_.: only)"
+        )
+    return raw
+
+
 def _normalize_skills_dir(value: Any) -> str:
     """Honor the manifest's `skills.dir` contract (default 'skills'); reject escapes."""
     raw = str(value or "skills").strip()
@@ -101,6 +121,55 @@ def _normalize_skills_dir(value: Any) -> str:
     if any(part in ("", "..") for part in p.parts):
         raise PluginIngestError(f"unsafe skills.dir in manifest: {value!r}")
     return str(p)
+
+
+def _safe_repo_relative_file(
+    repo: Path,
+    rel: Any,
+    *,
+    manifest_path: Path,
+    kind: str,
+    suffix_mimes: dict[str, str] | None = None,
+) -> Path:
+    """Resolve a repo-relative manifest file path and reject traversal/absolute paths."""
+    raw = str(rel or "").strip()
+    if not raw:
+        raise PluginIngestError(f"{manifest_path}: {kind} is required")
+    rel_clean = raw[2:] if raw.startswith("./") else raw
+    if raw.startswith("/") or PurePosixPath(rel_clean).is_absolute() or any(
+        part in ("", "..") for part in PurePosixPath(rel_clean).parts
+    ):
+        raise PluginIngestError(f"{manifest_path}: unsafe {kind} {raw!r}")
+    candidate = repo / rel_clean
+    if not candidate.is_file():
+        raise PluginIngestError(f"{manifest_path}: {kind} {raw!r} not found at {candidate}")
+    if suffix_mimes is not None and candidate.suffix.lower() not in suffix_mimes:
+        raise PluginIngestError(
+            f"{manifest_path}: {kind} {raw!r} must be one of {sorted(suffix_mimes)}"
+        )
+    return candidate
+
+
+def _external_or_web_asset_uri(raw: str) -> bool:
+    lowered = raw.strip().lower()
+    return (
+        lowered.startswith("http://")
+        or lowered.startswith("https://")
+        or lowered.startswith("data:")
+        or lowered.startswith("/api/")
+    )
+
+
+def _experts_have_local_assets(experts: Any) -> bool:
+    if not isinstance(experts, list):
+        return False
+    for ex in experts:
+        if not isinstance(ex, dict):
+            continue
+        avatar = str(ex.get("avatar") or "").strip()
+        if avatar and not _external_or_web_asset_uri(avatar):
+            return True
+    return False
 
 
 # ─────────────────────────── manifest loading ────────────────────────────
@@ -165,6 +234,8 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
         )
 
     _validate_experts(data.get("experts"), repo=repo, path=path)
+    if _experts_have_local_assets(data.get("experts")):
+        _safe_url_path_component(data["id"], kind="plugin id")
 
     data["_repo"] = str(repo)
     return data
@@ -199,14 +270,15 @@ def _validate_experts(experts: Any, *, repo: Path, path: Path) -> None:
         rel = str(ex.get("agent_md") or "").strip()
         if not rel:
             raise PluginIngestError(f"{path}: experts[{eid}] needs an agent_md (persona markdown path)")
-        rel_clean = rel[2:] if rel.startswith("./") else rel
-        if rel.startswith("/") or PurePosixPath(rel_clean).is_absolute() or any(
-            part in ("", "..") for part in PurePosixPath(rel_clean).parts
-        ):
-            raise PluginIngestError(f"{path}: unsafe experts[{eid}].agent_md {rel!r}")
-        if not (repo / rel_clean).is_file():
-            raise PluginIngestError(
-                f"{path}: experts[{eid}].agent_md {rel!r} not found at {repo / rel_clean}"
+        _safe_repo_relative_file(repo, rel, manifest_path=path, kind=f"experts[{eid}].agent_md")
+        avatar = str(ex.get("avatar") or "").strip()
+        if avatar and not _external_or_web_asset_uri(avatar):
+            _safe_repo_relative_file(
+                repo,
+                avatar,
+                manifest_path=path,
+                kind=f"experts[{eid}].avatar",
+                suffix_mimes=_ASSET_MIME_BY_SUFFIX,
             )
         skills = ex.get("skills")
         if skills is not None and not isinstance(skills, list):
@@ -583,6 +655,85 @@ def _write_managed_manifest(shared_home: Path, manifest: dict[str, Any], *, dry_
     return path
 
 
+def _asset_slug(value: Any) -> str:
+    raw = str(value or "").strip()
+    chars = [
+        c if c.isascii() and (c.isalnum() or c in "-_.") else "-"
+        for c in raw
+    ]
+    slug = "".join(chars).strip("-_.")
+    return slug or "asset"
+
+
+def _plugin_asset_url(plugin_id: str, asset_name: str) -> str:
+    plugin_id = _safe_url_path_component(plugin_id, kind="plugin id")
+    asset_name = _safe_url_path_component(asset_name, kind="asset name")
+    return f"{PLUGIN_ASSET_URL_PREFIX}/{plugin_id}/{asset_name}"
+
+
+def _materialize_expert_assets(
+    plugin: dict[str, Any],
+    *,
+    shared_home: Path,
+    dry_run: bool,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Copy declared local expert assets into shared-home and rewrite web-facing URLs.
+
+    Only repo-relative local avatar paths are copied. Remote/data/API URLs are left
+    untouched for forward compatibility; local files become broker asset URLs.
+    """
+    experts = plugin.get("experts") or []
+    if not isinstance(experts, list):
+        return [], {}, []
+    repo = Path(str(plugin.get("_repo") or "")).expanduser()
+    plugin_id = _safe_component(plugin["id"], kind="plugin id")
+    manifest_path = repo / PLUGIN_MANIFEST_REL
+    out_experts: list[dict[str, Any]] = []
+    assets: dict[str, dict[str, Any]] = {}
+    report: list[dict[str, Any]] = []
+
+    for ex in experts:
+        if not isinstance(ex, dict):
+            continue
+        copied = dict(ex)
+        avatar = str(copied.get("avatar") or "").strip()
+        if avatar and not _external_or_web_asset_uri(avatar):
+            src = _safe_repo_relative_file(
+                repo,
+                avatar,
+                manifest_path=manifest_path,
+                kind=f"experts[{copied.get('id')}].avatar",
+                suffix_mimes=_ASSET_MIME_BY_SUFFIX,
+            )
+            digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+            suffix = src.suffix.lower()
+            asset_name = f"{_asset_slug(copied.get('id'))}-{digest}{suffix}"
+            dest = shared_home / MANAGED_ASSETS_DIR / plugin_id / asset_name
+            mime = _ASSET_MIME_BY_SUFFIX[suffix]
+            if not dry_run:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+            copied["avatar"] = _plugin_asset_url(plugin_id, asset_name)
+            assets[asset_name] = {
+                "kind": "expert_avatar",
+                "expert_id": str(copied.get("id") or ""),
+                "mime": mime,
+                "path": str(dest),
+                "source": avatar,
+            }
+            report.append(
+                {
+                    "expert_id": str(copied.get("id") or ""),
+                    "source": avatar,
+                    "asset": asset_name,
+                    "url": copied["avatar"],
+                    "action": "would-copy" if dry_run else "copied",
+                }
+            )
+        out_experts.append(copied)
+    return out_experts, assets, report
+
+
 # ─────────────────────────── top-level ingest ────────────────────────────
 
 def _default_shared_home() -> Path:
@@ -624,6 +775,12 @@ def ingest(
             plugin, aud, shared_home=shared_home, dry_run=dry_run, allow_create=allow_create_distribution
         )
 
+    experts, assets, asset_report = _materialize_expert_assets(
+        plugin, shared_home=shared_home, dry_run=dry_run
+    )
+    if asset_report:
+        report["assets"] = asset_report
+
     manifest = {
         "plugin_id": plugin["id"],
         "version": plugin.get("version"),
@@ -642,7 +799,8 @@ def ingest(
         # by experts[].id. Persona is NEVER copied into SOUL.md (would pollute the
         # default agent); only the pointer + repo path live here.
         "repo": str(plugin.get("_repo") or ""),
-        "experts": list(plugin.get("experts") or []),
+        "experts": experts,
+        "assets": assets,
     }
     report["managed_manifest"] = str(_write_managed_manifest(shared_home, manifest, dry_run=dry_run))
 
@@ -806,6 +964,8 @@ def _print_human(report: dict[str, Any]) -> None:
     print(f"  governance: env={report['governance']['env_default']}, gates={len(report['governance']['approval_gates'])}")
     print(f"  connectors: {report['connectors']['connectors']}")
     print(f"  clis: {[c['action'] + ':' + c['id'] for c in report['clis']]}")
+    if report.get("assets"):
+        print(f"  assets: {[a['action'] + ':' + a['asset'] for a in report['assets']]}")
     skills = report["skills"]
     if "installed" in skills:
         print(f"  skills: {len(skills['installed'])} profile-installs; sources={skills['source_actions']}")

@@ -33,9 +33,21 @@ description: 资源投放专家
 """
 
 EXPERT_ID = "kep-trevi-resource-delivery-expert"
+PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+    b"\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01\x01\x00"
+    b"\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 
 
-def _plugin_repo(root: Path, *, experts="default", audience=None) -> Path:
+def _plugin_repo(
+    root: Path,
+    *,
+    experts="default",
+    audience=None,
+    plugin_id="keep-resource-delivery",
+) -> Path:
     """Build a plugin repo carrying skills + an agents/*.md persona + experts[]."""
     skills = ["using-resource-delivery", "kep-trevi-delivery-orchestrate"]
     for name in skills:
@@ -47,6 +59,8 @@ def _plugin_repo(root: Path, *, experts="default", audience=None) -> Path:
         (sk / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}", encoding="utf-8")
     (root / "agents").mkdir(parents=True, exist_ok=True)
     (root / "agents" / "kep-trevi-resource-delivery-expert.md").write_text(AGENT_MD, encoding="utf-8")
+    (root / "avatars").mkdir(parents=True, exist_ok=True)
+    (root / "avatars" / "expert.png").write_bytes(PNG_BYTES)
 
     if experts == "default":
         experts = [
@@ -55,6 +69,7 @@ def _plugin_repo(root: Path, *, experts="default", audience=None) -> Path:
                 "name": "资源投放专家",
                 "title": "资源投放专家",
                 "tagline": "一句话投放意图→选题到复盘全链路",
+                "avatar": "./avatars/expert.png",
                 "category": "营销增长",
                 "display_tags": ["资源投放", "圈人"],
                 "featured": True,
@@ -67,7 +82,7 @@ def _plugin_repo(root: Path, *, experts="default", audience=None) -> Path:
 
     manifest = {
         "schema": pi.SUPPORTED_SCHEMA,
-        "id": "keep-resource-delivery",
+        "id": plugin_id,
         "name": "资源投放专家",
         "version": "0.1.0",
         "entry_skill": "using-resource-delivery",
@@ -166,8 +181,37 @@ def test_ingest_persists_experts_and_repo(tmp_path):
     manifest = json.loads(mpath.read_text())
     assert manifest["repo"] == str(repo)
     assert manifest["experts"][0]["id"] == EXPERT_ID
+    assert manifest["experts"][0]["avatar"].startswith(
+        "/api/run-broker/plugin-assets/keep-resource-delivery/"
+    )
+    assert str(repo) not in manifest["experts"][0]["avatar"]
+    asset_name = manifest["experts"][0]["avatar"].rsplit("/", 1)[-1]
+    assert manifest["assets"][asset_name]["mime"] == "image/png"
+    assert Path(manifest["assets"][asset_name]["path"]).read_bytes() == PNG_BYTES
     # SOUL.md is NEVER created by ingest (persona must not pollute the default agent)
     assert not (shared / "profiles" / "feishu_test" / "SOUL.md").exists()
+
+
+def test_ingest_rejects_local_avatar_with_url_unsafe_plugin_id(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug", plugin_id="keep resource delivery")
+    shared = _shared_home(tmp_path)
+    with pytest.raises(pi.PluginIngestError, match="URL component"):
+        _ingest(repo, shared)
+
+
+def test_ingest_dry_run_does_not_copy_avatar_asset(tmp_path):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    report = pi.ingest(
+        repo,
+        audience="feishu_test",
+        shared_home=shared,
+        profiles_root=shared / "profiles",
+        dry_run=True,
+    )
+    assert report["assets"][0]["action"] == "would-copy"
+    assert not (shared / pi.MANAGED_ASSETS_DIR).exists()
+    assert not (shared / pi.MANAGED_DIR / "keep-resource-delivery.json").exists()
 
 
 # ─────────────────────────── resolve + block format ──────────────────────────
@@ -238,6 +282,8 @@ def test_list_experts_aggregation(tmp_path, monkeypatch):
     assert row["id"] == EXPERT_ID
     assert row["category"] == "营销增长"
     assert row["featured"] is True
+    assert row["avatar"].startswith("/api/run-broker/plugin-assets/keep-resource-delivery/")
+    assert str(repo) not in row["avatar"]
     # redacted: no persona body / repo path leaks into the catalog row
     assert "agent_md" not in row
     assert all("你是资源投放" not in str(v) for v in row.values())
@@ -290,6 +336,70 @@ def test_experts_endpoint(tmp_path, monkeypatch):
     assert data["profile_name"] == "feishu_test"
     assert len(data["experts"]) == 1
     assert data["experts"][0]["id"] == EXPERT_ID
+    assert data["experts"][0]["avatar"].startswith("/api/run-broker/plugin-assets/")
+
+
+def test_plugin_asset_endpoint_serves_registered_avatar(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy import webui_broker_server as broker
+
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "secret")
+    (shared / "profiles" / "bob" / "skills").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: shared / "profiles" / profile_name)
+
+    async def runner():
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True, sandbox_available=lambda: True
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            catalog = await client.get(
+                "/api/run-broker/experts",
+                headers={"Authorization": "Bearer secret", "X-Hermes-Profile": "feishu_test"},
+            )
+            assert catalog.status == 200, await catalog.text()
+            data = await catalog.json()
+            avatar_url = data["experts"][0]["avatar"]
+
+            unauthorized = await client.get(avatar_url)
+            assert unauthorized.status == 401
+
+            missing_profile = await client.get(avatar_url, headers={"Authorization": "Bearer secret"})
+            assert missing_profile.status == 400
+
+            hidden_profile = await client.get(
+                avatar_url,
+                headers={"Authorization": "Bearer secret", "X-Hermes-Profile": "bob"},
+            )
+            assert hidden_profile.status == 404
+
+            asset = await client.get(
+                avatar_url,
+                headers={"Authorization": "Bearer secret", "X-Hermes-Profile": "feishu_test"},
+            )
+            assert asset.status == 200, await asset.text()
+            assert asset.headers["Content-Type"].startswith("image/png")
+            assert await asset.read() == PNG_BYTES
+
+            missing = await client.get(
+                "/api/run-broker/plugin-assets/keep-resource-delivery/nope.png",
+                headers={"Authorization": "Bearer secret", "X-Hermes-Profile": "feishu_test"},
+            )
+            assert missing.status == 404
+            traversal = await client.get(
+                "/api/run-broker/plugin-assets/keep-resource-delivery/..%2Fsecret.png",
+                headers={"Authorization": "Bearer secret", "X-Hermes-Profile": "feishu_test"},
+            )
+            assert traversal.status in (400, 404)
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
 
 
 # ─────────────────────────── AUTHORIZATION (audience enforcement) ─────────────

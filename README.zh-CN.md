@@ -129,12 +129,13 @@ flowchart TB
 9. **CardKit 心跳在父 router。** router 先打底卡片、在子进程出 token 前发空闲心跳状态更新；一旦推理/工具/内容事件到来，心跳停止。
 10. **记忆按 `(profile, 规范化发送者)` 键。** `_history_key()` 不用 `sender_alt or sender`，故陈旧/共享 alt ID 不会把两个用户的记忆合并。
 11. **斜杠命令绝不泄进 LLM。** `/model`、`/reasoning`、`/reload-mcp` 等 registry 命令走 Hermes gateway 处理器；技能斜杠重写为原生技能调用；插件斜杠委托给 `hermes_cli.plugins.get_plugin_command_handler`；未知斜杠返回 Hermes 风格 unknown-command。
-12. **群 `@所有人` 绝不触发 Bot。** 准入（`_admit`）在*任何*回复模式都忽略 `@_all` —— 经结构化 mention 元数据**或**裸 `@_all` 检测 —— 故一条 `@所有人` 广播绝不会唤醒群里每个路由智能体。
-13. **Bot 发送在发送时复查路由。** 发送者刚建的自己的群当场解析，而非冻结在回合开头的快照；无 broker 代理的 Bot IM 发送无视声明 risk 一律拒绝，broker 延迟（defer）以代理在场为门控。
-14. **本地 exec 默认关。** `quick_commands` 别名仍可用；`type: exec` 除非 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 否则拒绝。生产环境在 profile 沙箱强制前保持关闭。
-15. **附件与文件回复留在 profile 域。** 入站附件委托给 Hermes 原生 `_prepare_inbound_message_text`，并对本地缓存的表格文件（`.csv`/`.xlsx`）加有界兜底。出站 `MEDIA:<path>` 回复被过滤，只投递解析到路由 `profile_home` 内的路径；`.env`、`auth.json`、`feishu_uat/`、`credentials/`、`tokens/` 被拦。
-16. **飞书 UAT 刷新镜像进凭证保险库。** 组织同步把刷新后的共享 `feishu_uat/<open_id>.json` 拷进每个路由 profile，并在配置了凭证 key 时把同一载荷写进 `multitenancy_credentials`。JSON 是迁移兜底；DB 才是运行时凭证源。
-17. **生产姿态。** 优先 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 和 `multitenancy.allow_quick_exec=false`。应用层隔离（路由/会话/斜杠/媒体边界）始终开。profile 执行环境隔离档 A（父 env 白名单、HOME/WORKSPACE/XDG/TMPDIR 切换、profile 树 `chmod 0700`、每 profile 的 `feishu_uat/` + `tokens/`）默认开 —— 用 `scripts/verify-isolation.sh` 验证。内核级容器化（`sandbox-exec`/Linux `bwrap`）是叠加的纵深防御，在每个 profile 都启用之前，档 A 当纵深防御而非授权边界看。完整细节：`docs/profile-isolation.md`。
+12. **托管插件资产由 Run Broker 复制、登记和服务。** 专家 manifest 可以声明本地图片头像，例如 `experts[].avatar: ./avatars/expert.png`。Ingest 会校验该路径必须是仓库相对路径、文件存在且扩展名为受支持图片格式，然后复制到 `<shared-home>/.hermes-plugin-assets/<plugin_id>/`，文件名带内容哈希。托管 manifest 只保存 broker URL 和 `assets` 登记表；WebUI 通过 `/api/run-broker/plugin-assets/<plugin_id>/<asset_name>`（通常经 BFF 代理）加载图片，所以浏览器 payload 不暴露原插件 checkout 路径。资产读取也会解析调用者 profile/部门，并且必须匹配该调用者可见 `/experts` 目录中的头像 URL；路径穿越、未登记文件和隐藏 profile 的资产都会被拒绝。
+13. **群 `@所有人` 绝不触发 Bot。** 准入（`_admit`）在*任何*回复模式都忽略 `@_all` —— 经结构化 mention 元数据**或**裸 `@_all` 检测 —— 故一条 `@所有人` 广播绝不会唤醒群里每个路由智能体。
+14. **Bot 发送在发送时复查路由。** 发送者刚建的自己的群当场解析，而非冻结在回合开头的快照；无 broker 代理的 Bot IM 发送无视声明 risk 一律拒绝，broker 延迟（defer）以代理在场为门控。
+15. **本地 exec 默认关。** `quick_commands` 别名仍可用；`type: exec` 除非 `multitenancy.allow_quick_exec: true` 或 `HERMES_MULTITENANCY_ALLOW_QUICK_EXEC=1` 否则拒绝。生产环境在 profile 沙箱强制前保持关闭。
+16. **附件与文件回复留在 profile 域。** 入站附件委托给 Hermes 原生 `_prepare_inbound_message_text`，并对本地缓存的表格文件（`.csv`/`.xlsx`）加有界兜底。出站 `MEDIA:<path>` 回复被过滤，只投递解析到路由 `profile_home` 内的路径；`.env`、`auth.json`、`feishu_uat/`、`credentials/`、`tokens/` 被拦。
+17. **飞书 UAT 刷新镜像进凭证保险库。** 组织同步把刷新后的共享 `feishu_uat/<open_id>.json` 拷进每个路由 profile，并在配置了凭证 key 时把同一载荷写进 `multitenancy_credentials`。JSON 是迁移兜底；DB 才是运行时凭证源。
+18. **生产姿态。** 优先 `HERMES_MULTITENANCY_AUTO_PROVISION=0` 和 `multitenancy.allow_quick_exec=false`。应用层隔离（路由/会话/斜杠/媒体边界）始终开。profile 执行环境隔离档 A（父 env 白名单、HOME/WORKSPACE/XDG/TMPDIR 切换、profile 树 `chmod 0700`、每 profile 的 `feishu_uat/` + `tokens/`）默认开 —— 用 `scripts/verify-isolation.sh` 验证。内核级容器化（`sandbox-exec`/Linux `bwrap`）是叠加的纵深防御，在每个 profile 都启用之前，档 A 当纵深防御而非授权边界看。完整细节：`docs/profile-isolation.md`。
 
 </details>
 
