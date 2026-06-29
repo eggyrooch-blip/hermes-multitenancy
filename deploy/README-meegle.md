@@ -13,8 +13,10 @@ PATH 上、且在 `_meegle_search_path()` 里），reader 自动改用它，**�
 
 1. **`ensure-meegle.sh`** — 幂等安装脚本：`~/.local/bin/meegle` 不存在才装，存在即秒退；
    安装失败也 `exit 0`（绝不阻塞网关启动）。
-2. **`hermes-gateway-meegle.conf`** — gateway drop-in，用 `ExecStartPre=-`（前导 `-` = 非致命）
-   在每次网关启动前跑该脚本自愈。
+2. **`hermes-gateway-meegle.conf`** — gateway drop-in，两件事：
+   - `Environment=HERMES_MEEGLE_BIN=%h/.local/bin/meegle` —— 让 `_meegle_invocation()` 最高优先级
+     直指该二进制，**不依赖 unit PATH 是否含 `~/.local/bin`**（否则重建改了 PATH 会静默回退 npx）。
+   - `ExecStartPre=-`（前导 `-` = 非致命）每次网关启动前跑脚本自愈那个二进制存在。
 
 ## 安装（hermes-1，hermes 用户）
 
@@ -47,7 +49,7 @@ curl -s -o /dev/null -w "%{time_total}s\n" -H "Authorization: Bearer $KEY" \
 
 - 这是 ops 二进制，不在 git 里——所以靠本 drop-in 的 `ExecStartPre` 自愈，并把本步骤
   写进每次 prod provisioning/重建流程。
-- 若 `~/.local` 路径变了，改 `HERMES_MEEGLE_PREFIX` 或在 gateway env 设
-  `HERMES_MEEGLE_BIN=<meegle 绝对路径>`（`_meegle_invocation` 最高优先级）。
+- 改安装路径：同时改脚本的 `HERMES_MEEGLE_PREFIX` 与 drop-in 的 `HERMES_MEEGLE_BIN`
+  （二者必须指向同一 `bin/meegle`）。
 - 与 [[meegle-node-resolve-robust]] 同源：meegle 修复必须是**提交代码/脚本**，不是
   脆弱的 plist/手改主机（codex review 定的规矩）。
