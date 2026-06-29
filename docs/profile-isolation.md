@@ -412,9 +412,14 @@ cache a run env. For every streamed request the parent still enters
 lark-cli auth broker env, session-search token, approval dir, and ingest-secret
 metadata, then sends that full env to the worker for that single request. Inside
 the worker, `os.environ` is temporarily replaced for the run and restored before
-the next request. If the worker cannot start, exits before `ready`, times out, or
-is cancelled mid-run, the parent discards it and falls back to the one-shot path
-where possible.
+the next request. The parent also holds the per-profile warm-worker slot from
+before `_aiagent_subprocess_env_scope()` is entered until after the env scope
+exits and the approval dir is removed, so two same-profile warm runs cannot
+overlap their strict-context state. In-worker `session_search` reads the
+session-search broker URL/token from the current run env on each call; it does
+not close over the first request's token. If the worker cannot start, exits
+before `ready`, times out, or is cancelled mid-run, the parent discards it and
+falls back to the one-shot path where possible.
 
 ### 8.3 Enabling SOP (recommended rollout)
 

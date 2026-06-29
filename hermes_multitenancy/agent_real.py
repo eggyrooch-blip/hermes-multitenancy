@@ -3371,9 +3371,6 @@ def _install_session_search_proxy_for_aiagent() -> None:
     current = getattr(session_search_tool, "session_search", None)
     tool_already_proxied = getattr(current, "_hermes_multitenancy_proxy", False)
 
-    endpoint = f"{base_url}/api/run-broker/internal/session-search"
-    proxy_db = object()
-
     if not tool_already_proxied:
         def _proxy_session_search(
             query: str = "",
@@ -3398,13 +3395,20 @@ def _install_session_search_proxy_for_aiagent() -> None:
                 "sort": sort,
                 "profile": profile,
             }
+            current_base_url = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "").strip().rstrip("/")
+            current_token = os.environ.get("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "").strip()
+            if not current_base_url or not current_token:
+                return json.dumps({
+                    "success": False,
+                    "error": "Session search proxy env unavailable",
+                }, ensure_ascii=False)
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(
-                endpoint,
+                f"{current_base_url}/api/run-broker/internal/session-search",
                 data=data,
                 method="POST",
                 headers={
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 },
             )
@@ -3550,8 +3554,14 @@ class _AiagentWarmRun:
                 continue
             if data.get("event") == "done":
                 self.done = True
-                await self.close()
             return line
+
+    async def start(self, payload: bytes, env: dict[str, str], timeout_s: float) -> None:
+        try:
+            await self.worker.start_locked_run(payload, env, timeout_s)
+        except Exception:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         if self.closed:
@@ -3575,6 +3585,11 @@ class _AiagentWarmWorker:
             self._lock = asyncio.Lock()
             self._lock_loop = loop
         return self._lock
+
+    async def acquire_run(self) -> _AiagentWarmRun:
+        lock = self._loop_lock()
+        await lock.acquire()
+        return _AiagentWarmRun(self, lock)
 
     async def _ensure_started(self, timeout_s: float) -> None:
         import asyncio
@@ -3634,25 +3649,23 @@ class _AiagentWarmWorker:
                 return
             logger.debug("[multitenancy] ignoring warm worker startup event: %s", data.get("event"))
 
+    async def start_locked_run(self, payload: bytes, env: dict[str, str], timeout_s: float) -> None:
+        await self._ensure_started(timeout_s)
+        proc = self.proc
+        assert proc is not None
+        assert proc.stdin is not None
+        request = {
+            "type": "run",
+            "payload": json.loads(payload.decode("utf-8")),
+            "env": env,
+        }
+        proc.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
+        await proc.stdin.drain()
+
     async def start_run(self, payload: bytes, env: dict[str, str], timeout_s: float) -> _AiagentWarmRun:
-        lock = self._loop_lock()
-        await lock.acquire()
-        try:
-            await self._ensure_started(timeout_s)
-            proc = self.proc
-            assert proc is not None
-            assert proc.stdin is not None
-            request = {
-                "type": "run",
-                "payload": json.loads(payload.decode("utf-8")),
-                "env": env,
-            }
-            proc.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
-            await proc.stdin.drain()
-            return _AiagentWarmRun(self, lock)
-        except Exception:
-            lock.release()
-            raise
+        run = await self.acquire_run()
+        await run.start(payload, env, timeout_s)
+        return run
 
     async def close(self) -> None:
         import asyncio
@@ -4124,6 +4137,17 @@ async def _stream_aiagent_subprocess(
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
+    warm_run = None
+    warm_worker_requested = _aiagent_warm_worker_enabled()
+    if warm_worker_requested:
+        try:
+            warm_run = await _get_aiagent_warm_worker(profile_home).acquire_run()
+        except Exception:
+            logger.warning(
+                "[multitenancy] AIAgent warm worker slot unavailable; falling back to one-shot subprocess",
+                exc_info=True,
+            )
+            warm_worker_requested = False
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     env_scope = _aiagent_subprocess_env_scope(
         event,
@@ -4146,7 +4170,6 @@ async def _stream_aiagent_subprocess(
     started_at = time.monotonic()
     proc = None
     stderr_task = None
-    warm_run = None
     using_warm_worker = False
     saw_done = False
     first_event_logged = False
@@ -4185,8 +4208,10 @@ async def _stream_aiagent_subprocess(
 
     async def _start_warm_reader():
         nonlocal warm_run, using_warm_worker
-        worker = _get_aiagent_warm_worker(profile_home)
-        warm_run = await worker.start_run(payload, env, timeout_s)
+        if warm_run is None:
+            warm_run = await _get_aiagent_warm_worker(profile_home).start_run(payload, env, timeout_s)
+        else:
+            await warm_run.start(payload, env, timeout_s)
         using_warm_worker = True
         logger.info(
             "[multitenancy] AIAgent warm worker dispatched profile_home=%s elapsed=%.3fs",
@@ -4196,7 +4221,7 @@ async def _stream_aiagent_subprocess(
         return warm_run.readline
 
     try:
-        if _aiagent_warm_worker_enabled():
+        if warm_worker_requested:
             try:
                 read_line = await _start_warm_reader()
             except Exception:
@@ -4205,6 +4230,8 @@ async def _stream_aiagent_subprocess(
                     exc_info=True,
                 )
                 await _discard_aiagent_warm_worker(profile_home)
+                if warm_run is not None:
+                    await warm_run.close()
                 using_warm_worker = False
                 warm_run = None
                 read_line = await _start_one_shot_reader()
@@ -4374,21 +4401,23 @@ async def _stream_aiagent_subprocess(
             await proc.wait()
         raise
     finally:
-        if warm_run is not None:
-            await warm_run.close()
-        if env_scope_entered:
-            env_scope.__exit__(*sys.exc_info())
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        if stderr_task is not None and not stderr_task.done():
-            stderr_task.cancel()
         try:
-            import shutil
+            if env_scope_entered:
+                env_scope.__exit__(*sys.exc_info())
+        finally:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
+            try:
+                import shutil
 
-            shutil.rmtree(approval_dir, ignore_errors=True)
-        except Exception:
-            pass
+                shutil.rmtree(approval_dir, ignore_errors=True)
+            except Exception:
+                pass
+            if warm_run is not None:
+                await warm_run.close()
 
 
 # ---------------------------------------------------------------------------

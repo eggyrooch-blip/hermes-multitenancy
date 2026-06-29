@@ -448,6 +448,65 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
     assert recall_db is not None
 
 
+def test_session_search_proxy_reads_current_run_env_after_reinstall(monkeypatch):
+    import urllib.request
+
+    from hermes_multitenancy import agent_real
+
+    fake_tools = types.ModuleType("tools")
+    fake_session_search_tool = types.ModuleType("tools.session_search_tool")
+    fake_session_search_tool.session_search = lambda **_kwargs: "{}"
+    fake_tools.session_search_tool = fake_session_search_tool
+    monkeypatch.setitem(sys.modules, "tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", fake_session_search_tool)
+
+    requests: list[dict[str, object]] = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "ok": True,
+                "result": json.dumps({"success": True}),
+            }).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        requests.append({
+            "url": req.full_url,
+            "timeout": timeout,
+            "authorization": req.headers.get("Authorization"),
+            "body": json.loads(req.data.decode("utf-8")),
+        })
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://broker-one")
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "token-one")
+    agent_real._install_session_search_proxy_for_aiagent()
+    fake_session_search_tool.session_search(query="first", current_session_id="s1")
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_URL", "http://broker-two")
+    monkeypatch.setenv("HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN", "token-two")
+    agent_real._install_session_search_proxy_for_aiagent()
+    fake_session_search_tool.session_search(query="second", current_session_id="s2")
+
+    assert [request["url"] for request in requests] == [
+        "http://broker-one/api/run-broker/internal/session-search",
+        "http://broker-two/api/run-broker/internal/session-search",
+    ]
+    assert [request["authorization"] for request in requests] == [
+        "Bearer token-one",
+        "Bearer token-two",
+    ]
+    assert [request["body"]["current_session_id"] for request in requests] == ["s1", "s2"]
+
+
 def test_session_search_proxy_covers_real_agent_tool_dispatch(tmp_path: Path):
     code = r'''
 import json
@@ -2108,6 +2167,134 @@ def test_stream_aiagent_subprocess_reuses_opt_in_warm_worker_and_rotates_run_env
         reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
         if reset is not None:
             asyncio.run(reset())
+
+
+def test_stream_aiagent_subprocess_warm_worker_holds_slot_until_env_scope_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    env_count = 0
+    active_scopes = 0
+    max_active_scopes = 0
+
+    @contextmanager
+    def fake_env_scope(_event, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        nonlocal env_count, active_scopes, max_active_scopes
+        env_count += 1
+        active_scopes += 1
+        max_active_scopes = max(max_active_scopes, active_scopes)
+        try:
+            yield {
+                "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+                "HERMES_MULTITENANCY_RUN_ID": f"run-{env_count}",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+                **(extra or {}),
+            }
+        finally:
+            active_scopes -= 1
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                request = json.loads(line)
+                run_id = request["env"]["HERMES_MULTITENANCY_RUN_ID"]
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": f"content-{run_id}"}).encode() + b"\n"
+                )
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "done", "result": f"done-{run_id}", "error": None}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = SimpleNamespace()
+            self.pid = 457
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        return FakeWorkerProc()
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        nonlocal max_active_scopes
+        profile = tmp_path / "profiles" / "warm-slot"
+        first = agent_real._stream_aiagent_subprocess(_event(), profile)
+        second_task = None
+        try:
+            assert await first.__anext__() == ("content", "content-run-1")
+            assert await first.__anext__() == ("done", "done-run-1")
+            assert active_scopes == 1
+
+            async def collect_second():
+                return [item async for item in agent_real._stream_aiagent_subprocess(_event(), profile)]
+
+            second_task = asyncio.create_task(collect_second())
+            await asyncio.sleep(0.02)
+            assert max_active_scopes == 1
+            assert second_task.done() is False
+
+            await first.aclose()
+            assert await asyncio.wait_for(second_task, timeout=1) == [
+                ("content", "content-run-2"),
+                ("done", "done-run-2"),
+            ]
+        finally:
+            await first.aclose()
+            if second_task is not None and not second_task.done():
+                second_task.cancel()
+                try:
+                    await second_task
+                except asyncio.CancelledError:
+                    pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert max_active_scopes == 1
+    assert active_scopes == 0
 
 
 def test_stream_aiagent_subprocess_warm_worker_disabled_uses_one_shot_command(
