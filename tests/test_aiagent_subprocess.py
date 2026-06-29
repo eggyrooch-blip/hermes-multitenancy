@@ -2350,6 +2350,45 @@ def test_aiagent_warm_worker_slot_serializes_across_event_loops(tmp_path: Path):
     assert order == ["first", "second"]
 
 
+def test_aiagent_warm_worker_process_is_loop_local_but_profile_slot_is_shared(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    workers = []
+    errors: list[BaseException] = []
+
+    async def collect_worker():
+        workers.append(agent_real._get_aiagent_warm_worker(tmp_path))
+
+    def run_in_loop():
+        try:
+            asyncio.run(collect_worker())
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run_in_loop)
+    second_thread = threading.Thread(target=run_in_loop)
+    first_thread.start()
+    first_thread.join(timeout=1)
+    second_thread.start()
+    second_thread.join(timeout=1)
+
+    try:
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert errors == []
+        assert len(workers) == 2
+        assert workers[0] is not workers[1]
+        assert workers[0]._lock is workers[1]._lock
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+
 def test_stream_aiagent_subprocess_warm_worker_disabled_uses_one_shot_command(
     monkeypatch,
     tmp_path: Path,

@@ -3494,7 +3494,8 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
         logger.debug("[multitenancy] token usage ledger (parent) skipped", exc_info=True)
 
 
-_AIAGENT_WARM_WORKERS: dict[str, "_AiagentWarmWorker"] = {}
+_AIAGENT_WARM_WORKERS: dict[tuple[str, Any], "_AiagentWarmWorker"] = {}
+_AIAGENT_WARM_PROFILE_LOCKS: dict[str, threading.Lock] = {}
 _AIAGENT_WARM_WORKERS_GUARD = threading.RLock()
 _AIAGENT_WARM_WORKER_BASE_ENV_DROP: frozenset[str] = frozenset({
     "HERMES_MULTITENANCY_APPROVAL_DIR",
@@ -3512,8 +3513,26 @@ def _aiagent_warm_worker_enabled() -> bool:
     return os.getenv("HERMES_AIAGENT_WARM_WORKER") == "1"
 
 
-def _aiagent_warm_worker_key(profile_home: Path) -> str:
+def _aiagent_warm_profile_key(profile_home: Path) -> str:
     return str(profile_home.expanduser().resolve())
+
+
+def _aiagent_warm_worker_key(profile_home: Path) -> tuple[str, Any]:
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    return (_aiagent_warm_profile_key(profile_home), loop)
+
+
+def _get_aiagent_warm_profile_lock(profile_key: str) -> threading.Lock:
+    lock = _AIAGENT_WARM_PROFILE_LOCKS.get(profile_key)
+    if lock is None:
+        lock = threading.Lock()
+        _AIAGENT_WARM_PROFILE_LOCKS[profile_key] = lock
+    return lock
 
 
 def _build_aiagent_warm_worker_base_env(profile_home: Path) -> dict[str, str]:
@@ -3571,10 +3590,10 @@ class _AiagentWarmRun:
 
 
 class _AiagentWarmWorker:
-    def __init__(self, profile_home: Path) -> None:
+    def __init__(self, profile_home: Path, profile_lock: threading.Lock | None = None) -> None:
         self.profile_home = profile_home
         self.proc: Any = None
-        self._lock = threading.Lock()
+        self._lock = profile_lock or threading.Lock()
 
     async def acquire_run(self) -> _AiagentWarmRun:
         import asyncio
@@ -3687,11 +3706,15 @@ class _AiagentWarmWorker:
 
 
 def _get_aiagent_warm_worker(profile_home: Path) -> "_AiagentWarmWorker":
+    profile_key = _aiagent_warm_profile_key(profile_home)
     key = _aiagent_warm_worker_key(profile_home)
     with _AIAGENT_WARM_WORKERS_GUARD:
         worker = _AIAGENT_WARM_WORKERS.get(key)
         if worker is None:
-            worker = _AiagentWarmWorker(profile_home)
+            worker = _AiagentWarmWorker(
+                profile_home,
+                profile_lock=_get_aiagent_warm_profile_lock(profile_key),
+            )
             _AIAGENT_WARM_WORKERS[key] = worker
         return worker
 
@@ -3708,6 +3731,7 @@ async def _reset_aiagent_warm_workers_for_tests() -> None:
     with _AIAGENT_WARM_WORKERS_GUARD:
         workers = list(_AIAGENT_WARM_WORKERS.values())
         _AIAGENT_WARM_WORKERS.clear()
+        _AIAGENT_WARM_PROFILE_LOCKS.clear()
     for worker in workers:
         await worker.close()
 

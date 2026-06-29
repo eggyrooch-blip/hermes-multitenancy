@@ -415,14 +415,16 @@ the worker, `os.environ` is temporarily replaced for the run and restored before
 the next request. The parent also holds the per-profile warm-worker slot from
 before `_aiagent_subprocess_env_scope()` is entered until after the env scope
 exits and the approval dir is removed, so two same-profile warm runs cannot
-overlap their strict-context state; the slot uses a process-wide thread lock,
-not an event-loop-local lock. In-worker `session_search` reads the session-search
-broker URL/token from the current run env on each call; it does not close over
-the first request's token. If the worker cannot start, exits before `ready`, or
-dies before the first stream event, the parent discards it and falls back to the
-one-shot path. Once a warm run has emitted user-visible stream events, timeout,
-cancellation, or worker failure discards the worker and surfaces the failure
-rather than replaying a partially streamed request.
+overlap their strict-context state. The worker process cache is event-loop-local
+because asyncio subprocess transports are loop-affine; the profile slot itself
+is a process-wide thread lock shared by all loop-local workers for that profile.
+In-worker `session_search` reads the session-search broker URL/token from the
+current run env on each call; it does not close over the first request's token.
+If the worker cannot start, exits before `ready`, or dies before the first
+stream event, the parent discards it and falls back to the one-shot path. Once a
+warm run has emitted user-visible stream events, timeout, cancellation, or
+worker failure discards the worker and surfaces the failure rather than
+replaying a partially streamed request.
 
 ### 8.3 Enabling SOP (recommended rollout)
 
