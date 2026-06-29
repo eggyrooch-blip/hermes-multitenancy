@@ -70,3 +70,14 @@ run-broker 的 `RuntimePool` 会按 profile 缓存已加载的 ProfileRuntime/co
 - 每个被改 config 改前备份(本次:`~/.hermes/_glm_to_tencent_bak_20260518-131945/`)。
 - 密钥只进 `.env` / plist EnvironmentVariables,**绝不进 docs/notes/log/commit 正文**。
 - 回退 = 从备份目录覆盖回原 config + 重启对应 agent。
+
+## 9. custom provider 的 `context_length` 只能当 fallback pin
+
+2026-06-30 生产排障证明：`custom:litellm-sre/tencent-sonnet-4-6` 在没有显式 context window 时会先探测 endpoint metadata，探测不到再 fallback 到 `256000`。给 `custom_providers[].models.tencent-sonnet-4-6.context_length=256000` 可以跳过这个失败探测和告警，但它不是 6s 级冷启动的主因。
+
+使用规则：
+
+- 如果 provider metadata 只列出 model id、没有 context 字段，`256000` 只能写成“保持现有 fallback 行为”的 pin，不要宣称是真实模型窗口。
+- 写入前先枚举所有受影响 profile config，备份后批量改；profile 子进程读的是 profile 自己的 `config.yaml`，只改 shared config 不够。
+- 验证必须包含真实 Run Broker SSE：header、first event、done、响应文本，以及 post-run 日志里 `Could not detect context length` 是否归零。
+- 如果目标是把 10-12s 降到几秒，真正方向是 streaming Run Broker 的隔离 AIAgent warm worker / persistent worker；不是增大并发，也不是这个 context pin。
