@@ -80,4 +80,4 @@ run-broker 的 `RuntimePool` 会按 profile 缓存已加载的 ProfileRuntime/co
 - 如果 provider metadata 只列出 model id、没有 context 字段，`256000` 只能写成“保持现有 fallback 行为”的 pin，不要宣称是真实模型窗口。
 - 写入前先枚举所有受影响 profile config，备份后批量改；profile 子进程读的是 profile 自己的 `config.yaml`，只改 shared config 不够。
 - 验证必须包含真实 Run Broker SSE：header、first event、done、响应文本，以及 post-run 日志里 `Could not detect context length` 是否归零。
-- 如果目标是把 10-12s 降到几秒，真正方向是 streaming Run Broker 的隔离 AIAgent warm worker / persistent worker；不是增大并发，也不是这个 context pin。
+- 如果目标是把 10-12s 降到几秒，真正方向是 streaming Run Broker 的隔离 AIAgent warm worker / persistent worker；不是增大并发，也不是这个 context pin。2026-06-30 本地实现方向是 `HERMES_AIAGENT_WARM_WORKER=1` opt-in、profile-scoped worker，只复用 Python/import 成本；每个 run 的 strict-context env/broker/token/approval_dir 仍由父进程逐次创建和清理。

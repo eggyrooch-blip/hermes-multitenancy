@@ -400,6 +400,22 @@ Both `_run_aiagent_subprocess` (one-shot path) and
 `_stream_aiagent_subprocess` (CardKit streaming path) use the same
 wrapper.
 
+### 8.2.1 Streaming warm worker opt-in
+
+`_stream_aiagent_subprocess` can use a profile-scoped warm worker when
+`HERMES_AIAGENT_WARM_WORKER=1` is set. This is intentionally opt-in: the
+default path remains the one-shot `aiagent_subprocess.py` process.
+
+The warm worker only reuses the Python process/imported runner. It does **not**
+cache a run env. For every streamed request the parent still enters
+`_aiagent_subprocess_env_scope()`, creates fresh strict-context leases/tokens,
+lark-cli auth broker env, session-search token, approval dir, and ingest-secret
+metadata, then sends that full env to the worker for that single request. Inside
+the worker, `os.environ` is temporarily replaced for the run and restored before
+the next request. If the worker cannot start, exits before `ready`, times out, or
+is cancelled mid-run, the parent discards it and falls back to the one-shot path
+where possible.
+
 ### 8.3 Enabling SOP (recommended rollout)
 
 #### 8.3.1 Pilot one profile (week 0)

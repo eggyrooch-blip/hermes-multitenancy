@@ -266,6 +266,97 @@ def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Pa
     ]
 
 
+def test_aiagent_worker_main_reuses_runner_and_rotates_run_env(monkeypatch, tmp_path: Path, capsys):
+    from hermes_multitenancy import aiagent_subprocess
+
+    env_snapshots: list[dict[str, str]] = []
+    load_count = 0
+
+    def fake_loader():
+        nonlocal load_count
+        load_count += 1
+
+        def fake_run(event, profile_home, *, event_sink=None, messages=None, usage_sink=None):
+            del event, profile_home, messages
+            snapshot = dict(os.environ)
+            env_snapshots.append(snapshot)
+            run_id = snapshot["HERMES_MULTITENANCY_RUN_ID"]
+            assert event_sink is not None
+            event_sink("content", text=f"content-{run_id}")
+            if usage_sink is not None:
+                usage_sink["input_tokens"] = len(run_id)
+            return f"done-{run_id}"
+
+        return fake_run
+
+    profile_home = tmp_path / "profiles" / "worker"
+    event_payload = {
+        "text": "hello",
+        "message_id": "om_worker",
+        "source": {
+            "platform": "webui",
+            "chat_id": "session-worker",
+            "user_id": "ou_worker",
+        },
+    }
+    requests = [
+        {
+            "type": "run",
+            "payload": {
+                "event": event_payload,
+                "profile_home": str(profile_home),
+                "messages": [{"role": "user", "content": "first"}],
+            },
+            "env": {
+                "HERMES_AIAGENT_EVENT_STREAM": "1",
+                "HERMES_MULTITENANCY_RUN_ID": "run-one",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(tmp_path / "approval-one"),
+                "ONLY_FIRST": "yes",
+            },
+        },
+        {
+            "type": "run",
+            "payload": {
+                "event": event_payload,
+                "profile_home": str(profile_home),
+            },
+            "env": {
+                "HERMES_AIAGENT_EVENT_STREAM": "1",
+                "HERMES_MULTITENANCY_RUN_ID": "run-two",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(tmp_path / "approval-two"),
+                "ONLY_SECOND": "yes",
+            },
+        },
+    ]
+
+    monkeypatch.setattr(aiagent_subprocess, "_load_run_with_aiagent", fake_loader)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(json.dumps(req) for req in requests) + "\n"))
+
+    aiagent_subprocess.worker_main()
+
+    out_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    assert out_lines[0] == {"event": "ready"}
+    assert out_lines[1]["event"] == "content"
+    assert out_lines[1]["text"] == "content-run-one"
+    assert out_lines[2] == {
+        "event": "done",
+        "result": "done-run-one",
+        "error": None,
+        "usage": {"input_tokens": len("run-one")},
+    }
+    assert out_lines[3]["text"] == "content-run-two"
+    assert out_lines[4]["result"] == "done-run-two"
+    assert load_count == 1
+    assert env_snapshots[0]["ONLY_FIRST"] == "yes"
+    assert "ONLY_FIRST" not in env_snapshots[1]
+    assert env_snapshots[1]["ONLY_SECOND"] == "yes"
+    assert env_snapshots[0]["HERMES_MULTITENANCY_APPROVAL_DIR"] != env_snapshots[1]["HERMES_MULTITENANCY_APPROVAL_DIR"]
+
+
 def test_aiagent_subprocess_script_loader_adds_repo_root_for_relative_imports():
     """The child script is executed by file path, so sys.path starts at package dir."""
     script = Path(__file__).resolve().parents[1] / "hermes_multitenancy" / "aiagent_subprocess.py"
@@ -1890,6 +1981,288 @@ async def test_stream_aiagent_subprocess_idle_timeout_is_runtime_error_not_cance
             pass
 
     assert created["proc"].killed is True
+
+
+def test_stream_aiagent_subprocess_reuses_opt_in_warm_worker_and_rotates_run_env(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    env_count = 0
+    seen_envs: list[dict[str, str]] = []
+    created: list[object] = []
+
+    @contextmanager
+    def fake_env_scope(_event, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        nonlocal env_count
+        env_count += 1
+        yield {
+            "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+            "HERMES_MULTITENANCY_RUN_ID": f"run-{env_count}",
+            "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+            "HERMES_MULTITENANCY_CRED_BROKER_TOKEN": f"cred-token-{env_count}",
+            "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN": f"search-token-{env_count}",
+            "LARKSUITE_CLI_PROXY_KEY": f"lark-key-{env_count}",
+            **(extra or {}),
+        }
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+            self.closed = False
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                request = json.loads(line)
+                env = dict(request["env"])
+                seen_envs.append(env)
+                run_id = env["HERMES_MULTITENANCY_RUN_ID"]
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": f"content-{run_id}"}).encode() + b"\n"
+                )
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "done", "result": f"done-{run_id}", "error": None}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerStderr:
+        async def read(self):
+            return b""
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = FakeWorkerStderr()
+            self.pid = 456
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        proc = FakeWorkerProc()
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    try:
+        profile = tmp_path / "profiles" / "warm"
+
+        async def collect_events():
+            return [
+                item
+                async for item in agent_real._stream_aiagent_subprocess(_event(), profile)
+            ]
+
+        async def collect_both():
+            first_events = await collect_events()
+            second_events = await collect_events()
+            return first_events, second_events
+
+        first, second = asyncio.run(collect_both())
+
+        assert first == [("content", "content-run-1"), ("done", "done-run-1")]
+        assert second == [("content", "content-run-2"), ("done", "done-run-2")]
+        assert len(created) == 1
+        assert seen_envs[0]["HERMES_MULTITENANCY_CRED_BROKER_TOKEN"] == "cred-token-1"
+        assert seen_envs[1]["HERMES_MULTITENANCY_CRED_BROKER_TOKEN"] == "cred-token-2"
+        assert seen_envs[0]["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] == "search-token-1"
+        assert seen_envs[1]["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] == "search-token-2"
+        assert seen_envs[0]["LARKSUITE_CLI_PROXY_KEY"] == "lark-key-1"
+        assert seen_envs[1]["LARKSUITE_CLI_PROXY_KEY"] == "lark-key-2"
+        assert seen_envs[0]["HERMES_MULTITENANCY_APPROVAL_DIR"] != seen_envs[1]["HERMES_MULTITENANCY_APPROVAL_DIR"]
+        assert created[0].stdin.closed is False
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+
+def test_stream_aiagent_subprocess_warm_worker_disabled_uses_one_shot_command(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.delenv("HERMES_AIAGENT_WARM_WORKER", raising=False)
+    calls: list[tuple[object, ...]] = []
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "one-shot-ok"}\n',
+                b'{"event": "done", "result": "one-shot-ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 654
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        calls.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [("content", "one-shot-ok"), ("done", "one-shot-ok")]
+    assert len(calls) == 1
+    assert "--worker" not in calls[0]
+    assert str(calls[0][1]).endswith("aiagent_subprocess.py")
+
+
+def test_stream_aiagent_subprocess_falls_back_to_one_shot_when_warm_worker_spawn_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    calls: list[tuple[object, ...]] = []
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "fallback-ok"}\n',
+                b'{"event": "done", "result": "fallback-ok", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 789
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("warm worker spawn failed")
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    events = asyncio.run(collect_events())
+
+    assert events == [("content", "fallback-ok"), ("done", "fallback-ok")]
+    assert "--worker" in calls[0]
+    assert "--worker" not in calls[1]
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
 
 
 def test_event_payload_carries_sender_open_id_from_raw_message(tmp_path: Path):

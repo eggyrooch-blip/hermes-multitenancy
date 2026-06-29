@@ -23,6 +23,7 @@ import os
 import sys
 import traceback
 import importlib.util
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -70,18 +71,31 @@ def _load_run_with_aiagent():
     return module._run_with_aiagent
 
 
-def main() -> None:
-    payload = json.loads(sys.stdin.read())
+@contextmanager
+def _temporary_environ(env: dict[str, str]):
+    previous = dict(os.environ)
+    os.environ.clear()
+    os.environ.update({str(key): str(value) for key, value in env.items()})
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+
+
+def _run_payload(
+    payload: dict,
+    _run_with_aiagent,
+    protocol_stdout,
+    *,
+    force_newline: bool = False,
+) -> None:
     event = _ReplayedEvent(payload["event"])
     profile_home = Path(payload["profile_home"])
     messages = payload.get("messages")
     if not isinstance(messages, list):
         messages = None
 
-    # Lazy import so import errors are reported as JSON, not crash
-    _run_with_aiagent = _load_run_with_aiagent()
-
-    protocol_stdout = sys.stdout
     event_stream = os.getenv("HERMES_AIAGENT_EVENT_STREAM") == "1"
 
     def emit(event: str, **payload) -> None:
@@ -89,12 +103,7 @@ def main() -> None:
         protocol_stdout.flush()
 
     try:
-        # stdout is the parent/child JSON protocol. Send any incidental prints
-        # from Hermes core, providers, or tools to stderr so the parent can
-        # parse stdout deterministically.
         sys.stdout = sys.stderr
-        # Per-turn token usage captured here (child has the agent), written to the
-        # ledger by the PARENT (sandbox blocks the child from writing /var/log/hermes).
         usage: dict = {}
         if event_stream:
             if messages is None:
@@ -132,10 +141,62 @@ def main() -> None:
         sys.stdout = protocol_stdout
 
     protocol_stdout.write(json.dumps(out, ensure_ascii=False))
-    if event_stream:
+    if event_stream or force_newline:
         protocol_stdout.write("\n")
     protocol_stdout.flush()
 
 
+def main() -> None:
+    payload = json.loads(sys.stdin.read())
+
+    # Lazy import so import errors are reported as JSON, not crash
+    _run_with_aiagent = _load_run_with_aiagent()
+
+    protocol_stdout = sys.stdout
+    _run_payload(payload, _run_with_aiagent, protocol_stdout)
+
+
+def worker_main() -> None:
+    protocol_stdout = sys.stdout
+    _run_with_aiagent = _load_run_with_aiagent()
+    protocol_stdout.write(json.dumps({"event": "ready"}, ensure_ascii=False) + "\n")
+    protocol_stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+            if request.get("type") == "shutdown":
+                break
+            if request.get("type") != "run":
+                raise ValueError("unknown worker request type")
+            payload = request.get("payload")
+            env = request.get("env")
+            if not isinstance(payload, dict):
+                raise ValueError("worker request missing payload")
+            if not isinstance(env, dict):
+                raise ValueError("worker request missing env")
+            with _temporary_environ(env):
+                _run_payload(payload, _run_with_aiagent, protocol_stdout, force_newline=True)
+        except Exception as exc:
+            protocol_stdout.write(
+                json.dumps(
+                    {
+                        "event": "done",
+                        "result": "",
+                        "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            protocol_stdout.flush()
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--worker"]:
+        worker_main()
+    else:
+        main()

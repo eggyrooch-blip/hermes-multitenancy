@@ -3490,6 +3490,224 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
         logger.debug("[multitenancy] token usage ledger (parent) skipped", exc_info=True)
 
 
+_AIAGENT_WARM_WORKERS: dict[str, "_AiagentWarmWorker"] = {}
+_AIAGENT_WARM_WORKERS_GUARD = threading.RLock()
+_AIAGENT_WARM_WORKER_BASE_ENV_DROP: frozenset[str] = frozenset({
+    "HERMES_MULTITENANCY_APPROVAL_DIR",
+    "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
+    "HERMES_MULTITENANCY_CRED_LEASE",
+    "HERMES_MULTITENANCY_RUN_ID",
+    "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN",
+    "HERMES_MULTITENANCY_SESSION_SEARCH_URL",
+    "LARKSUITE_CLI_AUTH_PROXY",
+    "LARKSUITE_CLI_PROXY_KEY",
+})
+
+
+def _aiagent_warm_worker_enabled() -> bool:
+    return os.getenv("HERMES_AIAGENT_WARM_WORKER") == "1"
+
+
+def _aiagent_warm_worker_key(profile_home: Path) -> str:
+    return str(profile_home.expanduser().resolve())
+
+
+def _build_aiagent_warm_worker_base_env(profile_home: Path) -> dict[str, str]:
+    approval_dir = profile_home / "tmp" / "aiagent-warm-worker-base-approval"
+    approval_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
+    for key in _AIAGENT_WARM_WORKER_BASE_ENV_DROP:
+        env.pop(key, None)
+    env["HERMES_AIAGENT_WARM_WORKER_CHILD"] = "1"
+    return env
+
+
+class _AiagentWarmRun:
+    def __init__(self, worker: "_AiagentWarmWorker", lock: Any) -> None:
+        self.worker = worker
+        self.lock = lock
+        self.closed = False
+        self.done = False
+
+    async def readline(self) -> bytes:
+        if self.done:
+            return b""
+        while True:
+            proc = self.worker.proc
+            if proc is None or proc.stdout is None:
+                await self.close()
+                raise RuntimeError("AIAgent warm worker is not running")
+            line = await proc.stdout.readline()
+            if not line:
+                await self.worker.close()
+                await self.close()
+                raise RuntimeError("AIAgent warm worker stream ended without done event")
+            try:
+                data = json.loads(line.decode("utf-8", errors="replace").strip())
+            except json.JSONDecodeError:
+                return line
+            if data.get("event") == "ready":
+                continue
+            if data.get("event") == "done":
+                self.done = True
+                await self.close()
+            return line
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.lock.release()
+
+
+class _AiagentWarmWorker:
+    def __init__(self, profile_home: Path) -> None:
+        self.profile_home = profile_home
+        self.proc: Any = None
+        self._lock: Any = None
+        self._lock_loop: Any = None
+
+    def _loop_lock(self):
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
+
+    async def _ensure_started(self, timeout_s: float) -> None:
+        import asyncio
+
+        if self.proc is not None and self.proc.returncode is None:
+            logger.info(
+                "[multitenancy] AIAgent warm worker hit profile_home=%s pid=%s",
+                self.profile_home,
+                self.proc.pid,
+            )
+            return
+        self.proc = None
+        child_script = Path(__file__).with_name("aiagent_subprocess.py").resolve()
+        cmd = _wrap_with_sandbox([sys.executable, str(child_script), "--worker"], self.profile_home)
+        env = _build_aiagent_warm_worker_base_env(self.profile_home)
+        logger.info("[multitenancy] AIAgent warm worker spawning profile_home=%s", self.profile_home)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+            cwd=_aiagent_subprocess_cwd(self.profile_home),
+        )
+        self.proc = proc
+        assert proc.stdout is not None
+        ready_timeout_s = min(
+            float(os.getenv("HERMES_AIAGENT_WARM_WORKER_READY_TIMEOUT", "30")),
+            max(timeout_s, 0.001),
+        )
+        deadline = time.monotonic() + ready_timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self.close()
+                raise RuntimeError(
+                    f"AIAgent warm worker did not become ready after {ready_timeout_s:g}s"
+                )
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            if not line:
+                await self.close()
+                raise RuntimeError("AIAgent warm worker exited before ready")
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                logger.debug("[multitenancy] ignoring non-json warm worker startup line len=%s", len(text))
+                continue
+            if data.get("event") == "ready":
+                logger.info(
+                    "[multitenancy] AIAgent warm worker ready profile_home=%s pid=%s",
+                    self.profile_home,
+                    proc.pid,
+                )
+                return
+            logger.debug("[multitenancy] ignoring warm worker startup event: %s", data.get("event"))
+
+    async def start_run(self, payload: bytes, env: dict[str, str], timeout_s: float) -> _AiagentWarmRun:
+        lock = self._loop_lock()
+        await lock.acquire()
+        try:
+            await self._ensure_started(timeout_s)
+            proc = self.proc
+            assert proc is not None
+            assert proc.stdin is not None
+            request = {
+                "type": "run",
+                "payload": json.loads(payload.decode("utf-8")),
+                "env": env,
+            }
+            proc.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
+            await proc.stdin.drain()
+            return _AiagentWarmRun(self, lock)
+        except Exception:
+            lock.release()
+            raise
+
+    async def close(self) -> None:
+        import asyncio
+
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        if proc.returncode is not None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(b'{"type":"shutdown"}\n')
+                await proc.stdin.drain()
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        except Exception:
+            logger.debug("[multitenancy] failed to kill AIAgent warm worker", exc_info=True)
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except Exception:
+            pass
+
+
+def _get_aiagent_warm_worker(profile_home: Path) -> "_AiagentWarmWorker":
+    key = _aiagent_warm_worker_key(profile_home)
+    with _AIAGENT_WARM_WORKERS_GUARD:
+        worker = _AIAGENT_WARM_WORKERS.get(key)
+        if worker is None:
+            worker = _AiagentWarmWorker(profile_home)
+            _AIAGENT_WARM_WORKERS[key] = worker
+        return worker
+
+
+async def _discard_aiagent_warm_worker(profile_home: Path) -> None:
+    key = _aiagent_warm_worker_key(profile_home)
+    with _AIAGENT_WARM_WORKERS_GUARD:
+        worker = _AIAGENT_WARM_WORKERS.pop(key, None)
+    if worker is not None:
+        await worker.close()
+
+
+async def _reset_aiagent_warm_workers_for_tests() -> None:
+    with _AIAGENT_WARM_WORKERS_GUARD:
+        workers = list(_AIAGENT_WARM_WORKERS.values())
+        _AIAGENT_WARM_WORKERS.clear()
+    for worker in workers:
+        await worker.close()
+
+
 async def _run_aiagent_subprocess(
     event: Any,
     profile_home: Path,
@@ -3928,9 +4146,13 @@ async def _stream_aiagent_subprocess(
     started_at = time.monotonic()
     proc = None
     stderr_task = None
+    warm_run = None
+    using_warm_worker = False
     saw_done = False
     first_event_logged = False
-    try:
+
+    async def _start_one_shot_reader():
+        nonlocal proc, stderr_task
         logger.info(
             "[multitenancy] AIAgent subprocess spawning profile_home=%s timeout=%.1fs",
             profile_home,
@@ -3958,14 +4180,43 @@ async def _stream_aiagent_subprocess(
             await proc.stdin.wait_closed()
         except Exception:
             pass
-
         assert proc.stdout is not None
+        return proc.stdout.readline
+
+    async def _start_warm_reader():
+        nonlocal warm_run, using_warm_worker
+        worker = _get_aiagent_warm_worker(profile_home)
+        warm_run = await worker.start_run(payload, env, timeout_s)
+        using_warm_worker = True
+        logger.info(
+            "[multitenancy] AIAgent warm worker dispatched profile_home=%s elapsed=%.3fs",
+            profile_home,
+            time.monotonic() - started_at,
+        )
+        return warm_run.readline
+
+    try:
+        if _aiagent_warm_worker_enabled():
+            try:
+                read_line = await _start_warm_reader()
+            except Exception:
+                logger.warning(
+                    "[multitenancy] AIAgent warm worker unavailable; falling back to one-shot subprocess",
+                    exc_info=True,
+                )
+                await _discard_aiagent_warm_worker(profile_home)
+                using_warm_worker = False
+                warm_run = None
+                read_line = await _start_one_shot_reader()
+        else:
+            read_line = await _start_one_shot_reader()
+
         first_heartbeat_s = float(os.getenv("HERMES_AIAGENT_FIRST_EVENT_HEARTBEAT_SECONDS", "1"))
         heartbeat_s = float(os.getenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "15"))
         heartbeat_count = 0
         while True:
             read_started = time.monotonic()
-            read_task = asyncio.create_task(proc.stdout.readline())
+            read_task = asyncio.create_task(read_line())
             try:
                 while not read_task.done():
                     elapsed = time.monotonic() - read_started
@@ -4082,23 +4333,26 @@ async def _stream_aiagent_subprocess(
             else:
                 logger.debug("[multitenancy] ignoring unknown child stream event: %s", event_name)
 
-        returncode = await asyncio.wait_for(proc.wait(), timeout=5)
-        stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
-        redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
-        if stderr_text:
-            logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
-        logger.info(
-            "[multitenancy] AIAgent subprocess exited returncode=%s elapsed=%.3fs",
-            returncode,
-            time.monotonic() - started_at,
-        )
-        if returncode != 0:
-            raise RuntimeError(
-                f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
+        if not using_warm_worker:
+            returncode = await asyncio.wait_for(proc.wait(), timeout=5)
+            stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
+            redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
+            if stderr_text:
+                logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
+            logger.info(
+                "[multitenancy] AIAgent subprocess exited returncode=%s elapsed=%.3fs",
+                returncode,
+                time.monotonic() - started_at,
             )
+            if returncode != 0:
+                raise RuntimeError(
+                    f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
+                )
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
     except asyncio.TimeoutError as exc:
+        if using_warm_worker:
+            await _discard_aiagent_warm_worker(profile_home)
         if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
@@ -4106,16 +4360,22 @@ async def _stream_aiagent_subprocess(
             f"AIAgent subprocess produced no stream events for {timeout_s:g}s"
         ) from exc
     except asyncio.CancelledError:
+        if using_warm_worker:
+            await _discard_aiagent_warm_worker(profile_home)
         if proc is not None:
             proc.kill()
             await proc.wait()
         raise
     except Exception:
+        if using_warm_worker and not saw_done:
+            await _discard_aiagent_warm_worker(profile_home)
         if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
         raise
     finally:
+        if warm_run is not None:
+            await warm_run.close()
         if env_scope_entered:
             env_scope.__exit__(*sys.exc_info())
         if proc is not None and proc.returncode is None:
