@@ -579,6 +579,56 @@ def test_skillhub_sourced_skill_requires_kep_cli(tmp_path):
     assert "kep-cli" in credential_hub.detect_skill_requirements(hub_skill)
 
 
+def test_resource_delivery_plain_skills_default_kep_cli_to_pre(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, feishu_uat_auth
+
+    profile = tmp_path / "profiles" / "owner"
+    for name, body in {
+        "using-resource-delivery": "# x\n",
+        "kep-trevi-delivery-orchestrate": "Gates: approve requires confirmation.\n",
+    }.items():
+        skill = profile / "skills" / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}", encoding="utf-8")
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(feishu_uat_auth, "credential_status", lambda **kw: {"status": "missing"})
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: None)
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env = cmd[cmd.index("--env") + 1]
+        if env == "online":
+            return _Proc("state: valid\noperator: owner <owner@keep.com>\n")
+        if env == "pre":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    rows = credential_hub.collect_credential_statuses(
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=tmp_path,
+    )
+    by_id = {row.id: row for row in rows}
+
+    assert by_id["kep-cli-online"].status == "authenticated"
+    assert by_id["kep-cli-online"].required_by == []
+    assert by_id["kep-cli-pre"].status == "needs_auth"
+    assert by_id["kep-cli-pre"].required_by == [
+        "kep-trevi-delivery-orchestrate",
+        "using-resource-delivery",
+    ]
+
+
 def test_requirement_patterns_cover_proximity_and_oauth(tmp_path):
     """M4: ported TS patterns — lark proximity + gitlab oauth2 inline form."""
     from hermes_multitenancy.credential_hub import _ProfileSkill, detect_skill_requirements

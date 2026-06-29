@@ -269,6 +269,11 @@ def _parse_skill_tags(text: str) -> list[str]:
     return [t.strip().strip("\"'").lower() for t in m.group(1).split(",") if t.strip()]
 
 
+def _is_resource_delivery_skill_name(name: str) -> bool:
+    normalized = str(name or "").strip().lower()
+    return normalized == "using-resource-delivery" or normalized.startswith("kep-trevi-")
+
+
 def _kep_skill_env_policy(skills: list[_ProfileSkill]) -> tuple[str, tuple[str, ...]]:
     """Return the primary kep-cli env plus envs worth reporting.
 
@@ -281,14 +286,16 @@ def _kep_skill_env_policy(skills: list[_ProfileSkill]) -> tuple[str, tuple[str, 
     envs: set[str] = {"online"}
     for skill in skills:
         text = skill.text.lower()
+        is_resource_delivery = _is_resource_delivery_skill_name(skill.name)
         is_kep = (
-            skill.name == "kep-hades-cli"
+            is_resource_delivery
+            or skill.name == "kep-hades-cli"
             or "kep-cli" in skill.tags
             or "kep-auth" in text
         )
         if not is_kep:
             continue
-        if re.search(r"--env\s+pre\b", text) or "env_default: pre" in text:
+        if is_resource_delivery or re.search(r"--env\s+pre\b", text) or "env_default: pre" in text:
             target_env = "pre"
             envs.add("pre")
         if re.search(r"--env\s+online\b", text):
@@ -340,7 +347,7 @@ def detect_skill_requirements(skill: _ProfileSkill) -> list[str]:
 
     # SkillHub-sourced skills always need kep-cli (parity with the TS hubSourced short-circuit).
     hub_sourced = source in ("hub", "aidock-skillhub")
-    if hub_sourced or any(p.search(text) for p in (
+    if hub_sourced or _is_resource_delivery_skill_name(skill.name) or any(p.search(text) for p in (
         re.compile(r"\bkep[-_ ]?cli\b"), re.compile(r"\bkep[-_ ]?auth\b"),
         re.compile(r"\baidock\b"), re.compile(r"\bskillhub\b"),
         re.compile(r"\bkeep[-_ ]?login\b"), re.compile(r"\bproxy[-_ ]?cms\b"),
@@ -744,7 +751,7 @@ def _kep_env_token_present(home_dir: Path, *, profile_name: str, env_name: str) 
     keyring = Path(home_dir) / ".kep-cli" / "keyring-fallback"
     try:
         return keyring.is_dir() and any(
-            f"token-key:{env_name}:{profile_name}" in p.name
+            p.name == f"token-key:{env_name}:{profile_name}"
             for p in keyring.iterdir()
         )
     except OSError:
