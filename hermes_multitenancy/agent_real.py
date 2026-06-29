@@ -1942,6 +1942,7 @@ def _build_subprocess_env(
     for path in pivot.values():
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     env.update({key: str(path) for key, path in pivot.items()})
+    _install_keep_login_compat(profile_home)
 
     env["HERMES_HOME"]                      = str(profile_home)
     env["HERMES_SHARED_HOME"]               = str(_resolve_shared_hermes_home(profile_home))
@@ -2628,6 +2629,104 @@ def _force_env_for_terminal_passthrough(env: dict[str, str]) -> dict[str, str]:
     return {f"_HERMES_FORCE_{key}": value for key, value in env.items()}
 
 
+_KEEP_LOGIN_COMPAT_AGENT_DIRS = (".claude", ".agents", ".codex", ".cursor", ".codeium")
+_KEEP_LOGIN_COMPAT_MARKER = "HERMES_KEEP_LOGIN_COMPAT_SHIM=v1"
+_KEEP_LOGIN_COMPAT_NOTE_MARKER = "Hermes Keep Auth Compatibility"
+_KEEP_LOGIN_COMPAT_NOTE = """## Hermes Keep Auth Compatibility
+
+This runtime is Hermes multitenancy. If this skill mentions keep-login-skill,
+get_bearer_token.py, or ~/.keep-login, treat those as legacy desktop hints.
+Use the current routed profile instead:
+
+```bash
+PROFILE_ARGS=()
+if [ -n "${KEP_PROFILE:-}" ]; then PROFILE_ARGS=(--profile "$KEP_PROFILE"); fi
+KEP_NO_AUTO_LOGIN=1 kep-auth "${PROFILE_ARGS[@]}" --env pre status
+KEP_NO_AUTO_LOGIN=1 kep-auth "${PROFILE_ARGS[@]}" --env online status
+```
+
+Do not judge Hermes login state by ~/.keep-login/token*.enc, do not remove
+--profile, do not copy another profile's token, and do not print token values.
+If a Bearer token is required for a subprocess, use kep-auth with the same
+profile and env, or the Hermes-managed legacy wrapper under HOME.
+"""
+
+
+def _keep_login_compat_wrapper_source() -> Path:
+    return Path(__file__).resolve().parent / "compat" / "keep_login_get_bearer_token.py"
+
+
+def _install_keep_login_compat(profile_home: Path) -> None:
+    """Expose legacy keep-login-skill probe paths inside the routed HOME.
+
+    Some upstream Keep skills/scripts search common agent homes for
+    ``keep-login-skill/scripts/get_bearer_token.py``.  Hermes owns the runtime
+    boundary, so we provide those legacy paths as symlinks to one canonical
+    compatibility wrapper instead of patching each upstream package.
+    """
+    try:
+        home = profile_home.expanduser() / "home"
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        wrapper = _keep_login_compat_wrapper_source()
+        if not wrapper.is_file():
+            logger.warning("[multitenancy] keep-login compat wrapper missing at %s", wrapper)
+            return
+
+        marker_dir = home / ".keep-login"
+        marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = marker_dir / "README-HERMES.txt"
+        marker_text = (
+            "Hermes compatibility note: this directory is not the credential source of truth.\n"
+            "Use kep-auth --profile \"$KEP_PROFILE\" --env <online|pre> status/token.\n"
+        )
+        if not marker.exists() or marker.read_text(encoding="utf-8", errors="ignore") != marker_text:
+            marker.write_text(marker_text, encoding="utf-8")
+            marker.chmod(0o600)
+
+        for agent_dir in _KEEP_LOGIN_COMPAT_AGENT_DIRS:
+            scripts_dir = home / agent_dir / "skills" / "keep-login-skill" / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target = scripts_dir / "get_bearer_token.py"
+            if target.is_symlink():
+                try:
+                    if target.resolve() == wrapper:
+                        continue
+                except OSError:
+                    pass
+                target.unlink()
+            elif target.exists():
+                try:
+                    existing = target.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    existing = ""
+                if _KEEP_LOGIN_COMPAT_MARKER not in existing:
+                    logger.warning(
+                        "[multitenancy] keep-login compat path exists and is not managed; leaving in place: %s",
+                        target,
+                    )
+                    continue
+                target.unlink()
+            target.symlink_to(wrapper)
+    except Exception:
+        logger.debug("[multitenancy] keep-login compatibility install skipped", exc_info=True)
+
+
+def _needs_keep_login_runtime_note(rendered: str, skill_dir: Any) -> bool:
+    haystack = f"{rendered}\n{skill_dir or ''}".lower()
+    return any(
+        needle in haystack
+        for needle in ("keep-login-skill", "get_bearer_token.py", ".keep-login")
+    )
+
+
+def _inject_keep_login_runtime_note(rendered: str, skill_dir: Any) -> str:
+    if _KEEP_LOGIN_COMPAT_NOTE_MARKER in rendered:
+        return rendered
+    if not _needs_keep_login_runtime_note(rendered, skill_dir):
+        return rendered
+    return f"{_KEEP_LOGIN_COMPAT_NOTE}\n\n{rendered}"
+
+
 def _install_credential_env_passthrough(profile_home: Path) -> None:
     """Allow configured credential env vars through terminal/code sandboxes."""
     env_names = sorted(_credential_env_for_aiagent(profile_home))
@@ -2778,9 +2877,11 @@ def _install_skill_runtime_compat(profile_home: Path) -> None:
 
     def _substitute_with_base_dir(content, skill_dir, session_id=None):
         rendered = original(content, skill_dir, session_id)
-        if not isinstance(rendered, str) or "{baseDir}" not in rendered or not skill_dir:
+        if not isinstance(rendered, str):
             return rendered
-        return rendered.replace("{baseDir}", str(Path(skill_dir).expanduser()))
+        if "{baseDir}" in rendered and skill_dir:
+            rendered = rendered.replace("{baseDir}", str(Path(skill_dir).expanduser()))
+        return _inject_keep_login_runtime_note(rendered, skill_dir)
 
     _substitute_with_base_dir._hermes_multitenancy_base_dir_compat = True
     skill_preprocessing.substitute_template_vars = _substitute_with_base_dir

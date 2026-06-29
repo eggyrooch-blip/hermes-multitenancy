@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -16,6 +17,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+def _jwt_with_exp(exp_seconds: int) -> str:
+    def _b64(payload: dict[str, object]) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    return f"{_b64({'alg': 'HS256', 'typ': 'JWT'})}.{_b64({'exp': exp_seconds})}.signature"
 
 
 def _event() -> SimpleNamespace:
@@ -493,6 +502,49 @@ def test_skill_runtime_compat_substitutes_base_dir_without_agent_patch(monkeypat
         (content, str(skill_dir)),
         (content, str(skill_dir)),
     ]
+
+
+def test_skill_runtime_compat_injects_keep_login_override(monkeypatch, tmp_path: Path):
+    """Legacy keep-login skill docs are adapted at render time, not patched upstream."""
+    from hermes_multitenancy import agent_real
+
+    def original_substitute(content, skill_dir, session_id):
+        return content
+
+    fake_skill_preprocessing = SimpleNamespace(
+        substitute_template_vars=original_substitute,
+    )
+    fake_skill_commands = SimpleNamespace(
+        _substitute_template_vars=original_substitute,
+    )
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    monkeypatch.setattr(agent_pkg, "skill_preprocessing", fake_skill_preprocessing, raising=False)
+    monkeypatch.setattr(agent_pkg, "skill_commands", fake_skill_commands, raising=False)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_preprocessing", fake_skill_preprocessing)
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", fake_skill_commands)
+
+    profile_home = tmp_path / "profile"
+    keep_skill_dir = profile_home / "skills" / "Keep" / "keep-login-skill"
+    other_skill_dir = profile_home / "skills" / "other"
+
+    agent_real._install_skill_runtime_compat(profile_home)
+
+    rendered = fake_skill_preprocessing.substitute_template_vars(
+        "Check ~/.keep-login/token.enc then run get_bearer_token.py",
+        keep_skill_dir,
+        "s1",
+    )
+    assert "Hermes Keep Auth Compatibility" in rendered
+    assert 'kep-auth "${PROFILE_ARGS[@]}" --env pre status' in rendered
+    assert "Do not judge Hermes login state by ~/.keep-login/token*.enc" in rendered
+
+    unrelated = fake_skill_preprocessing.substitute_template_vars(
+        "Run a normal command",
+        other_skill_dir,
+        "s1",
+    )
+    assert "Hermes Keep Auth Compatibility" not in unrelated
 
 
 def test_load_feishu_oapi_runtime_patches_legacy_uat_refresh_to_multitenancy(monkeypatch, tmp_path: Path):
@@ -4852,6 +4904,221 @@ def test_build_subprocess_env_pivots_home_workspace_and_token_compat_env(tmp_pat
         assert d.is_dir(), f"{sub} not created"
         mode = d.stat().st_mode & 0o777
         assert mode == 0o700, f"{sub} mode is {oct(mode)}, expected 0o700"
+
+    for agent_dir in (".claude", ".agents", ".codex", ".cursor", ".codeium"):
+        script = profile / "home" / agent_dir / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+        assert script.is_symlink()
+        assert script.resolve().name == "keep_login_get_bearer_token.py"
+    keep_login_marker = profile / "home" / ".keep-login" / "README-HERMES.txt"
+    assert keep_login_marker.exists()
+    assert not (profile / "home" / ".keep-login" / "token.enc").exists()
+    assert not (profile / "home" / ".keep-login" / "token-pre.enc").exists()
+
+
+def test_keep_login_compat_wrapper_uses_profile_scoped_kep_auth(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    bin_dir = shared / "bin"
+    bin_dir.mkdir(parents=True)
+    online_token = _jwt_with_exp(int(time.time()) + 3600)
+    pre_token = _jwt_with_exp(int(time.time()) + 7200)
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    fake_kep_auth = bin_dir / "kep-auth"
+    fake_kep_auth.write_text(
+        f"""#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+env_name = args[args.index("--env") + 1]
+profile = args[args.index("--profile") + 1] if "--profile" in args else os.environ.get("KEP_PROFILE", "")
+command = args[-1]
+if command == "status":
+    if (profile == "dengwenhui" and env_name == "pre") or env_name == "missing":
+        print("state: not logged in")
+        sys.exit(77)
+    print("state: valid")
+    sys.exit(0)
+if command == "token":
+    if (profile == "dengwenhui" and env_name == "pre") or env_name == "missing":
+        print("state: not logged in")
+        sys.exit(77)
+    if env_name == "expired":
+        print({expired_token!r})
+    elif env_name == "pre":
+        print({pre_token!r})
+    else:
+        print({online_token!r})
+    sys.exit(0)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    fake_kep_auth.chmod(0o755)
+
+    profile = shared / "profiles" / "sunke"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    script = profile / "home" / ".claude" / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+
+    online = subprocess.run(
+        [sys.executable, str(script), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    assert online.returncode == 0
+    assert online.stdout.strip() == online_token
+    assert ".keep-login" not in online.stdout + online.stderr
+
+    pre_from_url = subprocess.run(
+        [sys.executable, str(script), "--url", "https://proxy.cms.pre.gotokeep.com/api/x"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    assert pre_from_url.returncode == 0
+    assert pre_from_url.stdout.strip() == pre_token
+
+    dengwenhui_profile = shared / "profiles" / "dengwenhui"
+    dengwenhui_env = agent_real._build_subprocess_env(dengwenhui_profile, approval_dir=approval_dir)
+    dengwenhui_env["PATH"] = f"{bin_dir}{os.pathsep}{dengwenhui_env['PATH']}"
+    missing_script = dengwenhui_profile / "home" / ".claude" / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+    dengwenhui_online = subprocess.run(
+        [sys.executable, str(missing_script), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dengwenhui_env,
+        check=False,
+    )
+    assert dengwenhui_online.returncode == 0
+    assert dengwenhui_online.stdout.strip() == online_token
+
+    missing = subprocess.run(
+        [sys.executable, str(missing_script), "--env", "pre"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dengwenhui_env,
+        check=False,
+    )
+    assert missing.returncode == 77
+    assert "kep-auth --profile dengwenhui --env pre login" in missing.stderr
+    assert ".keep-login" not in missing.stdout + missing.stderr
+    assert "browser" not in (missing.stdout + missing.stderr).lower()
+
+
+def test_keep_login_compat_wrapper_fails_closed_without_profile(tmp_path: Path):
+    import hermes_multitenancy.compat.keep_login_get_bearer_token as wrapper
+
+    shared = tmp_path / ".hermes"
+    bin_dir = shared / "bin"
+    bin_dir.mkdir(parents=True)
+    marker = tmp_path / "kep-auth-ran"
+    token = _jwt_with_exp(int(time.time()) + 3600)
+    fake_kep_auth = bin_dir / "kep-auth"
+    fake_kep_auth.write_text(
+        f"""#!/usr/bin/env python3
+from pathlib import Path
+import sys
+Path({str(marker)!r}).write_text("ran", encoding="utf-8")
+command = sys.argv[-1]
+if command == "status":
+    print("state: valid")
+    sys.exit(0)
+if command == "token":
+    print({token!r})
+    sys.exit(0)
+sys.exit(2)
+""",
+        encoding="utf-8",
+    )
+    fake_kep_auth.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("KEP_PROFILE", None)
+    env.pop("HERMES_PROFILE", None)
+    env.pop("HERMES_KEP_AUTH_BIN", None)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["HERMES_SHARED_HOME"] = str(shared)
+
+    result = subprocess.run(
+        [sys.executable, str(Path(wrapper.__file__)), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 77
+    assert "KEP_PROFILE/HERMES_PROFILE" in result.stderr
+    assert not marker.exists()
+    assert token not in result.stdout + result.stderr
+
+
+def test_keep_login_compat_wrapper_rejects_expired_jwt(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    bin_dir = shared / "bin"
+    bin_dir.mkdir(parents=True)
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    fake_kep_auth = bin_dir / "kep-auth"
+    fake_kep_auth.write_text(
+        f"""#!/usr/bin/env python3
+import sys
+command = sys.argv[-1]
+if command == "status":
+    print("state: valid")
+    sys.exit(0)
+if command == "token":
+    print({expired_token!r})
+    sys.exit(0)
+sys.exit(2)
+""",
+        encoding="utf-8",
+    )
+    fake_kep_auth.chmod(0o755)
+
+    profile = shared / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    script = profile / "home" / ".claude" / "skills" / "keep-login-skill" / "scripts" / "get_bearer_token.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--env", "online"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 77
+    assert expired_token not in result.stdout + result.stderr
+
+
+def test_hermes_core_redacts_jwt_shaped_keep_tokens():
+    agent_repo = Path(os.environ.get("HERMES_AGENT_REPO", "")) if os.environ.get("HERMES_AGENT_REPO") else Path.home() / ".hermes" / "hermes-agent"
+    if agent_repo.exists() and str(agent_repo) not in sys.path:
+        sys.path.insert(0, str(agent_repo))
+    redact_mod = pytest.importorskip("agent.redact")
+    token = _jwt_with_exp(int(time.time()) + 3600)
+
+    redacted = redact_mod.redact_sensitive_text(f"token={token}", force=True)
+
+    assert token not in redacted
+    assert redacted.startswith("token=eyJ")
+    assert "..." in redacted
 
 
 def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
