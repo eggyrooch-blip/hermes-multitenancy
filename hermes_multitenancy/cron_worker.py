@@ -7,29 +7,33 @@ subprocess write reminders to its own profile-default cron path
 (``<target_profile>/cron/jobs.json``).
 
 This module starts a single background thread inside the gateway process that
-periodically scans every profile under ``<root>/profiles/*/cron/jobs.json``
-and reuses hermes-agent's native ``cron.scheduler.tick()`` to dispatch due
-jobs. The worker is started by a plugin-installed gateway watcher once the
-router has connected at least one adapter, with the pre-dispatch hook kept as
-a lazy fallback.
+periodically scans every profile under ``<root>/profiles/*/cron/jobs.json``.
+For each profile it briefly patches hermes-agent's native ``cron.jobs`` and
+``cron.scheduler`` globals, claims due jobs, and advances ``next_run_at`` under
+that profile's storage context. Expensive job execution then runs through a
+bounded cross-profile worker pool, so one slow profile cannot delay later
+profiles in the scan order.
 
-Race safety: the worker mutates module-level constants in ``cron.jobs`` to
-point at each profile in turn, holds an internal lock for the
-patch-then-tick window, and restores the originals in a ``finally`` block.
-``cron.scheduler.tick`` already uses a file lock keyed by jobs path, so even
-if the gateway's own ticker races on the patched constant the worst case is
-a duplicate-tick attempt that resolves into a no-op.
+The expensive agent run is isolated in a subprocess that only runs the cron job
+body (L4 defer / RunBroker / core ``run_job`` fallback). The router parent
+process still finalizes the job under the original profile context: output
+write, live-adapter delivery, status update, and multitenancy session mirroring.
+That keeps Feishu delivery in the process that owns the live gateway adapter.
 """
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 from concurrent.futures import TimeoutError as FuturesTimeout
 import functools
 import json
 import logging
 import os
 import re
+import subprocess
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -39,6 +43,15 @@ from urllib import request as urllib_request
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    msvcrt = None
 
 from .credential_renewal_common import (
     clear_needs_reauth_marker,
@@ -60,6 +73,7 @@ _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop: Optional[threading.Event] = None
 _cron_module_patch_lock = threading.Lock()
+_cron_in_flight_lock = threading.Lock()
 _runtime_patches_installed = False
 _gateway_watcher_installed = False
 _watcher_attr = "_hermes_multitenancy_cron_watch_scheduled"
@@ -1790,56 +1804,28 @@ def _active_cron_profiles(profiles_root: Path) -> Optional[set[str]]:
     return {str(row[0]) for row in rows if row and row[0]}
 
 
-def _multiprofile_cron_worker(
-    profiles_root: Path,
-    adapters: Any,
-    loop: asyncio.AbstractEventLoop,
-    stop_event: threading.Event,
-    interval: int = 60,
-) -> None:
+def _multitenancy_cron_worker_count() -> int:
+    raw = os.environ.get("HERMES_MULTITENANCY_CRON_WORKERS", "").strip()
+    if not raw:
+        return 4
     try:
-        import cron.jobs as cron_jobs
-        import cron.scheduler as cron_scheduler
-    except Exception:
-        logger.exception("[multitenancy] cron modules not importable; worker aborted")
-        return
-
-    while not stop_event.is_set():
-        try:
-            active_profiles = _active_cron_profiles(profiles_root)
-            for profile_dir in sorted(profiles_root.iterdir()):
-                if not profile_dir.is_dir():
-                    continue
-                if active_profiles is not None and profile_dir.name not in active_profiles:
-                    continue
-                jobs_file = profile_dir / "cron" / "jobs.json"
-                if not jobs_file.exists():
-                    continue
-                backfill_cron_owner_context_for_profile(profile_dir)
-                _tick_one_profile(
-                    cron_jobs,
-                    cron_scheduler,
-                    profile_dir,
-                    jobs_file,
-                    adapters,
-                    loop,
-                    _cron_module_patch_lock,
-                )
-        except Exception:
-            logger.exception("[multitenancy] cron worker scan error")
-        stop_event.wait(timeout=interval)
-    logger.info("[multitenancy] cron worker stopped")
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "[multitenancy] invalid HERMES_MULTITENANCY_CRON_WORKERS=%r; using 4",
+            raw,
+        )
+        return 4
 
 
-def _tick_one_profile(
+@contextlib.contextmanager
+def _cron_profile_context(
     cron_jobs: Any,
     cron_scheduler: Any,
     profile_dir: Path,
     jobs_file: Path,
-    adapters: Any,
-    loop: asyncio.AbstractEventLoop,
     patch_lock: threading.Lock,
-) -> None:
+) -> Any:
     with patch_lock:
         saved = (
             cron_jobs.HERMES_DIR,
@@ -1861,12 +1847,7 @@ def _tick_one_profile(
             cron_scheduler._hermes_home = profile_home
             cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
             cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
-            cron_scheduler.tick(verbose=False, adapters=adapters, loop=loop)
-        except Exception:
-            logger.exception(
-                "[multitenancy] cron tick failed for profile %s",
-                profile_dir.name,
-            )
+            yield profile_home
         finally:
             (
                 cron_jobs.HERMES_DIR,
@@ -1882,3 +1863,589 @@ def _tick_one_profile(
                 os.environ.pop("HERMES_HOME", None)
             else:
                 os.environ["HERMES_HOME"] = previous_home
+
+
+def _cron_scheduler_function(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    name: str,
+) -> Any:
+    func = getattr(cron_scheduler, name, None)
+    if callable(func):
+        return func
+    func = getattr(cron_jobs, name, None)
+    if callable(func):
+        return func
+    raise AttributeError(f"cron scheduler/jobs missing callable {name}")
+
+
+class _CronTickFileLock:
+    def __init__(self, lock_fd: Any) -> None:
+        self._lock_fd = lock_fd
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            if fcntl is not None:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows-only
+                msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except (OSError, IOError):
+            pass
+        self._lock_fd.close()
+
+
+class _ProfileTickClaim:
+    def __init__(self, tick_lock: Any) -> None:
+        self._tick_lock = tick_lock
+        self._lock = threading.Lock()
+        self._remaining = 0
+        self._submitting = True
+        self._released = False
+
+    def add_future(self) -> None:
+        with self._lock:
+            self._remaining += 1
+
+    def future_done(self) -> None:
+        with self._lock:
+            if self._remaining > 0:
+                self._remaining -= 1
+            self._release_if_ready_locked()
+
+    def close_submissions(self) -> None:
+        with self._lock:
+            self._submitting = False
+            self._release_if_ready_locked()
+
+    def _release_if_ready_locked(self) -> None:
+        if self._released or self._submitting or self._remaining > 0:
+            return
+        self._released = True
+        self._tick_lock.release()
+
+
+def _acquire_cron_tick_file_lock(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+) -> Optional[_CronTickFileLock]:
+    get_lock_paths = getattr(cron_scheduler, "_get_lock_paths", None)
+    if callable(get_lock_paths):
+        lock_dir, lock_file = get_lock_paths()
+    else:
+        lock_dir = Path(getattr(cron_scheduler, "_LOCK_DIR", None) or cron_jobs.CRON_DIR)
+        lock_file = Path(getattr(cron_scheduler, "_LOCK_FILE", None) or (lock_dir / ".tick.lock"))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_fd = None
+    try:
+        lock_fd = open(lock_file, "w", encoding="utf-8")
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:  # pragma: no cover - Windows-only
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+    except (OSError, IOError):
+        if lock_fd is not None:
+            lock_fd.close()
+        return None
+    return _CronTickFileLock(lock_fd)
+
+
+@contextlib.contextmanager
+def _cron_tick_file_lock(cron_jobs: Any, cron_scheduler: Any) -> Any:
+    tick_lock = _acquire_cron_tick_file_lock(cron_jobs, cron_scheduler)
+    try:
+        yield tick_lock is not None
+    finally:
+        if tick_lock is not None:
+            tick_lock.release()
+
+
+def _run_cron_job_body(job: dict, cron_scheduler: Any) -> tuple[bool, str, str, Optional[str]]:
+    deferred = _l4_check_needs_reauth_and_defer(job)
+    if deferred is not None:
+        return deferred
+    if _cron_run_broker_enabled():
+        return _run_job_through_broker(job, cron_scheduler)
+    return cron_scheduler.run_job(job)
+
+
+def _sweep_cron_mcp_orphans() -> None:
+    try:
+        from tools.mcp_tool import _kill_orphaned_mcp_children
+
+        _kill_orphaned_mcp_children()
+    except Exception as exc:
+        logger.debug("[multitenancy] cron MCP orphan cleanup failed: %s", exc)
+
+
+def _run_cron_job_body_with_cleanup(
+    job: dict,
+    cron_scheduler: Any,
+) -> tuple[bool, str, str, Optional[str]]:
+    try:
+        return _run_cron_job_body(job, cron_scheduler)
+    finally:
+        _sweep_cron_mcp_orphans()
+
+
+def _run_job_for_profile_subprocess(profile_home: Path, job: dict) -> dict[str, Any]:
+    profile_home = Path(profile_home).expanduser().resolve()
+    payload = {"profile_home": str(profile_home), "job": job}
+    child_code = r'''
+import json
+import os
+import sys
+from pathlib import Path
+
+payload = json.loads(sys.stdin.read())
+profile_home = Path(payload["profile_home"]).expanduser().resolve()
+os.environ["HERMES_HOME"] = str(profile_home)
+job = payload.get("job") or {}
+
+try:
+    from hermes_multitenancy.cron_worker import _run_cron_job_body_with_cleanup
+
+    import cron.jobs as cron_jobs
+    import cron.scheduler as cron_scheduler
+
+    cron_jobs.HERMES_DIR = profile_home
+    cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+    cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+    cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+    cron_scheduler._hermes_home = profile_home
+    cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
+    cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
+
+    success, output, final_response, error = _run_cron_job_body_with_cleanup(job, cron_scheduler)
+    result = {
+        "success": bool(success),
+        "output": "" if output is None else str(output),
+        "final_response": "" if final_response is None else str(final_response),
+        "error": None if error is None else str(error),
+    }
+except BaseException as exc:
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job_id or "scheduled task")
+    error = str(exc)
+    result = {
+        "success": False,
+        "output": (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Path:** isolated subprocess\n\n"
+            f"Error: {error}"
+        ),
+        "final_response": "",
+        "error": error,
+    }
+
+print(json.dumps(result, ensure_ascii=False))
+'''
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(profile_home)
+    proc = subprocess.run(
+        [sys.executable, "-c", child_code],
+        input=json.dumps(payload, ensure_ascii=False),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    parsed: Optional[dict[str, Any]] = None
+    for line in reversed([line.strip() for line in proc.stdout.splitlines() if line.strip()]):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            parsed = candidate
+            break
+    if parsed is not None:
+        if proc.returncode == 0:
+            return parsed
+        stderr = proc.stderr.strip()
+        parsed["success"] = False
+        parsed["error"] = parsed.get("error") or stderr or f"cron subprocess exited {proc.returncode}"
+        return parsed
+    stderr = proc.stderr.strip()
+    error = stderr or f"cron subprocess exited {proc.returncode} without JSON result"
+    return {
+        "success": False,
+        "output": (
+            f"# Cron Job: {job.get('name') or job.get('id') or 'scheduled task'}\n\n"
+            f"**Job ID:** {job.get('id') or ''}\n"
+            f"**Run Path:** isolated subprocess\n\n"
+            f"Error: {error}"
+        ),
+        "final_response": "",
+        "error": error,
+    }
+
+
+def _result_field(result: Any, name: str, default: Any = None) -> Any:
+    if isinstance(result, dict):
+        return result.get(name, default)
+    return getattr(result, name, default)
+
+
+def _finalize_claimed_cron_job_current_context(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    job: dict,
+    result: Any,
+    adapters: Any,
+    loop: asyncio.AbstractEventLoop,
+    *,
+    verbose: bool = False,
+) -> bool:
+    mark_job_run = _cron_scheduler_function(cron_jobs, cron_scheduler, "mark_job_run")
+    try:
+        save_job_output = _cron_scheduler_function(cron_jobs, cron_scheduler, "save_job_output")
+        deliver_result = getattr(cron_scheduler, "_deliver_result")
+        summarize_failure = getattr(
+            cron_scheduler,
+            "_summarize_cron_failure_for_delivery",
+            lambda _job, error: f"⚠️ Cron '{_job.get('name') or _job.get('id')}' failed: {error}",
+        )
+
+        success = bool(_result_field(result, "success", False))
+        output = str(_result_field(result, "output", "") or "")
+        final_response = str(_result_field(result, "final_response", "") or "")
+        raw_error = _result_field(result, "error", None)
+        error = None if raw_error is None else str(raw_error)
+
+        output_file = save_job_output(job["id"], output)
+        if verbose:
+            logger.info("[multitenancy] cron output saved to: %s", output_file)
+
+        deliver_content = final_response if success else summarize_failure(job, error)
+        should_deliver = bool(str(deliver_content or "").strip())
+        silent_marker = str(getattr(cron_scheduler, "SILENT_MARKER", "[SILENT]")).upper()
+        if should_deliver and success and silent_marker in str(deliver_content).strip().upper():
+            logger.info(
+                "[multitenancy] cron job '%s': agent returned %s — skipping delivery",
+                job["id"],
+                silent_marker,
+            )
+            should_deliver = False
+
+        delivery_error = None
+        if should_deliver:
+            try:
+                delivery_error = deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("[multitenancy] cron delivery failed for job %s: %s", job["id"], de)
+
+        if success and not final_response.strip():
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        return True
+    except Exception as exc:
+        logger.error("[multitenancy] error finalizing cron job %s: %s", job.get("id"), exc)
+        try:
+            mark_job_run(job["id"], False, str(exc))
+        except Exception:
+            logger.exception("[multitenancy] failed to mark cron job %s after finalize error", job.get("id"))
+        return False
+
+
+def _finalize_claimed_cron_job(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    profile_dir: Path,
+    jobs_file: Path,
+    job: dict,
+    result: Any,
+    adapters: Any,
+    loop: asyncio.AbstractEventLoop,
+    patch_lock: threading.Lock,
+    *,
+    verbose: bool = False,
+) -> bool:
+    with _cron_profile_context(cron_jobs, cron_scheduler, profile_dir, jobs_file, patch_lock):
+        return _finalize_claimed_cron_job_current_context(
+            cron_jobs,
+            cron_scheduler,
+            job,
+            result,
+            adapters,
+            loop,
+            verbose=verbose,
+        )
+
+
+def _complete_claimed_cron_job(
+    future: concurrent.futures.Future,
+    *,
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    profile_dir: Path,
+    jobs_file: Path,
+    job: dict,
+    adapters: Any,
+    loop: asyncio.AbstractEventLoop,
+    patch_lock: threading.Lock,
+    in_flight: set[tuple[str, str]],
+    key: tuple[str, str],
+    in_flight_lock: threading.Lock,
+    profile_claim: Optional[_ProfileTickClaim] = None,
+) -> None:
+    try:
+        try:
+            result = future.result()
+        except Exception as exc:
+            logger.exception(
+                "[multitenancy] cron isolated runner failed profile=%s job=%s",
+                profile_dir.name,
+                job.get("id", "?"),
+            )
+            result = {
+                "success": False,
+                "output": (
+                    f"# Cron Job: {job.get('name') or job.get('id') or 'scheduled task'}\n\n"
+                    f"**Job ID:** {job.get('id') or ''}\n"
+                    f"**Run Path:** isolated subprocess\n\n"
+                    f"Error: {exc}"
+                ),
+                "final_response": "",
+                "error": str(exc),
+            }
+        _finalize_claimed_cron_job(
+            cron_jobs,
+            cron_scheduler,
+            profile_dir,
+            jobs_file,
+            job,
+            result,
+            adapters,
+            loop,
+            patch_lock,
+        )
+    finally:
+        with in_flight_lock:
+            in_flight.discard(key)
+        if profile_claim is not None:
+            profile_claim.future_done()
+
+
+def _scan_and_submit_due_profile_jobs(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    profiles_root: Path,
+    active_profiles: Optional[set[str]],
+    *,
+    adapters: Any,
+    loop: asyncio.AbstractEventLoop,
+    patch_lock: threading.Lock,
+    executor: concurrent.futures.Executor,
+    in_flight: set[tuple[str, str]],
+    runner: Any = None,
+    in_flight_lock: Optional[threading.Lock] = None,
+) -> int:
+    runner = runner or _run_job_for_profile_subprocess
+    in_flight_lock = in_flight_lock or _cron_in_flight_lock
+    submitted = 0
+    get_due_jobs = _cron_scheduler_function(cron_jobs, cron_scheduler, "get_due_jobs")
+    advance_next_run = _cron_scheduler_function(cron_jobs, cron_scheduler, "advance_next_run")
+
+    for profile_dir in sorted(profiles_root.iterdir()):
+        if not profile_dir.is_dir():
+            continue
+        if active_profiles is not None and profile_dir.name not in active_profiles:
+            continue
+        jobs_file = profile_dir / "cron" / "jobs.json"
+        if not jobs_file.exists():
+            continue
+        profile_claim: Optional[_ProfileTickClaim] = None
+        callback_specs: list[
+            tuple[
+                concurrent.futures.Future,
+                Path,
+                Path,
+                dict,
+                tuple[str, str],
+                _ProfileTickClaim,
+            ]
+        ] = []
+        try:
+            backfill_cron_owner_context_for_profile(profile_dir)
+            with _cron_profile_context(cron_jobs, cron_scheduler, profile_dir, jobs_file, patch_lock):
+                tick_lock = _acquire_cron_tick_file_lock(cron_jobs, cron_scheduler)
+                if tick_lock is None:
+                    logger.debug(
+                        "[multitenancy] cron tick skipped for profile %s; lock held",
+                        profile_dir.name,
+                    )
+                    continue
+                profile_claim = _ProfileTickClaim(tick_lock)
+                due_jobs = list(get_due_jobs())
+                for job in due_jobs:
+                    job_id = str(job.get("id") or "").strip()
+                    if not job_id:
+                        logger.warning(
+                            "[multitenancy] cron due job without id skipped profile=%s",
+                            profile_dir.name,
+                        )
+                        continue
+                    key = (profile_dir.name, job_id)
+                    with in_flight_lock:
+                        if key in in_flight:
+                            logger.info(
+                                "[multitenancy] cron job already running — skipping profile=%s job=%s",
+                                profile_dir.name,
+                                job.get("name") or job_id,
+                            )
+                            continue
+                        in_flight.add(key)
+                    claimed_job = copy.deepcopy(job)
+                    try:
+                        advance_next_run(job_id)
+                        future = executor.submit(runner, profile_dir.resolve(), copy.deepcopy(claimed_job))
+                    except Exception:
+                        with in_flight_lock:
+                            in_flight.discard(key)
+                        error = "cron submit failed: executor down"
+                        exc = sys.exc_info()[1]
+                        if exc is not None:
+                            error = f"cron submit failed: {exc}"
+                        _finalize_claimed_cron_job_current_context(
+                            cron_jobs,
+                            cron_scheduler,
+                            claimed_job,
+                            {
+                                "success": False,
+                                "output": (
+                                    f"# Cron Job: {claimed_job.get('name') or job_id}\n\n"
+                                    f"**Job ID:** {job_id}\n"
+                                    f"**Run Path:** isolated subprocess\n\n"
+                                    f"Error: {error}"
+                                ),
+                                "final_response": "",
+                                "error": error,
+                            },
+                            adapters,
+                            loop,
+                        )
+                        logger.exception(
+                            "[multitenancy] cron submit failed profile=%s job=%s",
+                            profile_dir.name,
+                            job_id,
+                        )
+                        continue
+                    profile_claim.add_future()
+                    callback_specs.append(
+                        (
+                            future,
+                            profile_dir,
+                            jobs_file,
+                            claimed_job,
+                            key,
+                            profile_claim,
+                        )
+                    )
+                    submitted += 1
+        except Exception:
+            logger.exception(
+                "[multitenancy] cron claim failed for profile %s",
+                profile_dir.name,
+            )
+        finally:
+            try:
+                for future, callback_profile_dir, callback_jobs_file, callback_job, key, claim in callback_specs:
+                    future.add_done_callback(
+                        lambda fut,
+                        profile_dir=callback_profile_dir,
+                        jobs_file=callback_jobs_file,
+                        job=callback_job,
+                        key=key,
+                        profile_claim=claim: _complete_claimed_cron_job(
+                            fut,
+                            cron_jobs=cron_jobs,
+                            cron_scheduler=cron_scheduler,
+                            profile_dir=profile_dir,
+                            jobs_file=jobs_file,
+                            job=job,
+                            adapters=adapters,
+                            loop=loop,
+                            patch_lock=patch_lock,
+                            in_flight=in_flight,
+                            key=key,
+                            in_flight_lock=in_flight_lock,
+                            profile_claim=profile_claim,
+                        )
+                    )
+            finally:
+                if profile_claim is not None:
+                    profile_claim.close_submissions()
+    return submitted
+
+
+def _multiprofile_cron_worker(
+    profiles_root: Path,
+    adapters: Any,
+    loop: asyncio.AbstractEventLoop,
+    stop_event: threading.Event,
+    interval: int = 60,
+) -> None:
+    try:
+        import cron.jobs as cron_jobs
+        import cron.scheduler as cron_scheduler
+    except Exception:
+        logger.exception("[multitenancy] cron modules not importable; worker aborted")
+        return
+
+    worker_count = _multitenancy_cron_worker_count()
+    in_flight: set[tuple[str, str]] = set()
+    logger.info(
+        "[multitenancy] cron cross-profile dispatcher started workers=%d",
+        worker_count,
+    )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="multitenancy-cron",
+    ) as executor:
+        while not stop_event.is_set():
+            try:
+                active_profiles = _active_cron_profiles(profiles_root)
+                _scan_and_submit_due_profile_jobs(
+                    cron_jobs,
+                    cron_scheduler,
+                    profiles_root,
+                    active_profiles,
+                    adapters=adapters,
+                    loop=loop,
+                    patch_lock=_cron_module_patch_lock,
+                    executor=executor,
+                    in_flight=in_flight,
+                    in_flight_lock=_cron_in_flight_lock,
+                )
+            except Exception:
+                logger.exception("[multitenancy] cron worker scan error")
+            stop_event.wait(timeout=interval)
+    logger.info("[multitenancy] cron worker stopped")
+
+
+def _tick_one_profile(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    profile_dir: Path,
+    jobs_file: Path,
+    adapters: Any,
+    loop: asyncio.AbstractEventLoop,
+    patch_lock: threading.Lock,
+) -> None:
+    try:
+        with _cron_profile_context(cron_jobs, cron_scheduler, profile_dir, jobs_file, patch_lock):
+            cron_scheduler.tick(verbose=False, adapters=adapters, loop=loop)
+    except Exception:
+        logger.exception(
+            "[multitenancy] cron tick failed for profile %s",
+            profile_dir.name,
+        )

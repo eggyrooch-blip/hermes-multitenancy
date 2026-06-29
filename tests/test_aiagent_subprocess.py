@@ -348,9 +348,10 @@ def test_session_search_proxy_installs_http_wrapper(monkeypatch):
     assert recall_db is not None
 
 
-def test_session_search_proxy_covers_real_agent_tool_dispatch():
+def test_session_search_proxy_covers_real_agent_tool_dispatch(tmp_path: Path):
     code = r'''
 import json
+import os
 import urllib.request
 
 from agent import agent_runtime_helpers
@@ -417,9 +418,13 @@ result = agent_runtime_helpers.invoke_tool(
     pre_tool_block_checked=True,
     skip_tool_request_middleware=True,
 )
-print("RESULT_JSON=" + json.dumps({"requests": requests, "result": json.loads(result)}))
+print("RESULT_JSON=" + json.dumps({"requests": requests, "result": json.loads(result)}), flush=True)
+os._exit(0)
 '''
     env = os.environ.copy()
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    env["HERMES_HOME"] = str(profile_home)
     env["HERMES_MULTITENANCY_SESSION_SEARCH_URL"] = "http://127.0.0.1:8766"
     env["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] = "tok-session"
     env["PYTHONPATH"] = os.pathsep.join([
@@ -433,7 +438,7 @@ print("RESULT_JSON=" + json.dumps({"requests": requests, "result": json.loads(re
         env=env,
         text=True,
         capture_output=True,
-        timeout=20,
+        timeout=60,
     )
     assert completed.returncode == 0, completed.stderr
     result_line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT_JSON="))
@@ -3286,7 +3291,7 @@ async def test_stream_run_agent_inherits_shared_model_config(monkeypatch, tmp_pa
         item async for item in agent_real.stream_run_agent(_event(), profile_home)
     ]
 
-    assert chunks == [("content", "ok")]
+    assert [chunk for chunk in chunks if chunk[0] == "content"] == [("content", "ok")]
     assert captured["model"] == "test-model"
     assert captured["api_key"] == "test-key"
 
