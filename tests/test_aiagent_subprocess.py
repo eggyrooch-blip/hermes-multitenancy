@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import asyncio
 import contextvars
@@ -2297,6 +2298,58 @@ def test_stream_aiagent_subprocess_warm_worker_holds_slot_until_env_scope_cleanu
     assert active_scopes == 0
 
 
+def test_aiagent_warm_worker_slot_serializes_across_event_loops(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    worker = agent_real._AiagentWarmWorker(tmp_path)
+    first_acquired = threading.Event()
+    release_first = threading.Event()
+    second_acquired = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    async def first_runner():
+        run = await worker.acquire_run()
+        order.append("first")
+        first_acquired.set()
+        await asyncio.to_thread(release_first.wait)
+        await run.close()
+
+    async def second_runner():
+        await asyncio.to_thread(first_acquired.wait)
+        run = await worker.acquire_run()
+        try:
+            order.append("second")
+            second_acquired.set()
+        finally:
+            await run.close()
+
+    def run_coro(coro):
+        try:
+            asyncio.run(coro())
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run_coro, args=(first_runner,))
+    second_thread = threading.Thread(target=run_coro, args=(second_runner,))
+    first_thread.start()
+    assert first_acquired.wait(timeout=1)
+    second_thread.start()
+
+    time.sleep(0.05)
+    second_blocked_while_first_held = not second_acquired.is_set()
+
+    release_first.set()
+    first_thread.join(timeout=1)
+    second_thread.join(timeout=1)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert second_blocked_while_first_held is True
+    assert order == ["first", "second"]
+
+
 def test_stream_aiagent_subprocess_warm_worker_disabled_uses_one_shot_command(
     monkeypatch,
     tmp_path: Path,
@@ -2450,6 +2503,114 @@ def test_stream_aiagent_subprocess_falls_back_to_one_shot_when_warm_worker_spawn
     reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
     if reset is not None:
         asyncio.run(reset())
+
+
+def test_stream_aiagent_subprocess_falls_back_when_warm_worker_dies_before_first_event(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    calls: list[tuple[object, ...]] = []
+
+    class WarmStdin:
+        def __init__(self):
+            self.closed = False
+
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+    class WarmStdout:
+        def __init__(self):
+            self.lines = [b'{"event": "ready"}\n', b""]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class OneShotStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class OneShotStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event": "content", "text": "fallback-after-eof"}\n',
+                b'{"event": "done", "result": "fallback-after-eof", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            return b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self, *, warm: bool):
+            self.stdin = WarmStdin() if warm else OneShotStdin()
+            self.stdout = WarmStdout() if warm else OneShotStdout()
+            self.stderr = FakeStderr()
+            self.pid = 790 if warm else 791
+            self.returncode = None
+
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        calls.append(args)
+        return FakeProc(warm="--worker" in args)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect_events():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)
+        ]
+
+    try:
+        events = asyncio.run(collect_events())
+    finally:
+        reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert events == [("content", "fallback-after-eof"), ("done", "fallback-after-eof")]
+    assert len(calls) == 2
+    assert "--worker" in calls[0]
+    assert "--worker" not in calls[1]
 
 
 def test_event_payload_carries_sender_open_id_from_raw_message(tmp_path: Path):

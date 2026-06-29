@@ -3574,22 +3574,13 @@ class _AiagentWarmWorker:
     def __init__(self, profile_home: Path) -> None:
         self.profile_home = profile_home
         self.proc: Any = None
-        self._lock: Any = None
-        self._lock_loop: Any = None
-
-    def _loop_lock(self):
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        if self._lock is None or self._lock_loop is not loop:
-            self._lock = asyncio.Lock()
-            self._lock_loop = loop
-        return self._lock
+        self._lock = threading.Lock()
 
     async def acquire_run(self) -> _AiagentWarmRun:
-        lock = self._loop_lock()
-        await lock.acquire()
-        return _AiagentWarmRun(self, lock)
+        import asyncio
+
+        await asyncio.to_thread(self._lock.acquire)
+        return _AiagentWarmRun(self, self._lock)
 
     async def _ensure_started(self, timeout_s: float) -> None:
         import asyncio
@@ -4274,7 +4265,22 @@ async def _stream_aiagent_subprocess(
                         "status",
                         _animated_stream_status(phase, heartbeat_count),
                     )
-                line = read_task.result()
+                try:
+                    line = read_task.result()
+                except Exception:
+                    if using_warm_worker and not first_event_logged:
+                        logger.warning(
+                            "[multitenancy] AIAgent warm worker failed before first stream event; falling back to one-shot subprocess",
+                            exc_info=True,
+                        )
+                        await _discard_aiagent_warm_worker(profile_home)
+                        if warm_run is not None:
+                            await warm_run.close()
+                        warm_run = None
+                        using_warm_worker = False
+                        read_line = await _start_one_shot_reader()
+                        continue
+                    raise
             finally:
                 if not read_task.done():
                     read_task.cancel()
