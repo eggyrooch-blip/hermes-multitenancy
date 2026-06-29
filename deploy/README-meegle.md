@@ -14,8 +14,10 @@ PATH 上、且在 `_meegle_search_path()` 里），reader 自动改用它，**�
 1. **`ensure-meegle.sh`** — 幂等安装脚本：`~/.local/bin/meegle` 不存在才装，存在即秒退；
    安装失败也 `exit 0`（绝不阻塞网关启动）。
 2. **`hermes-gateway-meegle.conf`** — gateway drop-in，两件事：
-   - `Environment=HERMES_MEEGLE_BIN=%h/.local/bin/meegle` —— 让 `_meegle_invocation()` 最高优先级
-     直指该二进制，**不依赖 unit PATH 是否含 `~/.local/bin`**（否则重建改了 PATH 会静默回退 npx）。
+   - `Environment=HERMES_MEEGLE_EXTRA_PATHS=%h/.local/bin` —— 把 `~/.local/bin` 加进
+     `_meegle_search_path()`，`_which_meegle("meegle")` 用 `shutil.which` 找它，**不依赖 unit PATH
+     是否含 `~/.local/bin`**（重建改了 PATH 也不回退）。`shutil.which` 会校验存在+可执行，所以
+     二进制在 → 直跑(快)，二进制缺(如装失败) → 退回 `npx -y`(慢但状态正确)，不会指向死路径。
    - `ExecStartPre=-`（前导 `-` = 非致命）每次网关启动前跑脚本自愈那个二进制存在。
 
 ## 安装（hermes-1，hermes 用户）
