@@ -51,7 +51,7 @@ curl -s -o /dev/null -w "%{time_total}s\n" -H "Authorization: Bearer $KEY" \
 
 - 这是 ops 二进制，不在 git 里——所以靠本 drop-in 的 `ExecStartPre` 自愈，并把本步骤
   写进每次 prod provisioning/重建流程。
-- 改安装路径：同时改脚本的 `HERMES_MEEGLE_PREFIX` 与 drop-in 的 `HERMES_MEEGLE_BIN`
-  （二者必须指向同一 `bin/meegle`）。
+- 改安装路径：同时改脚本的 `HERMES_MEEGLE_PREFIX`（装到 `<prefix>/bin/meegle`）与
+  drop-in 的 `HERMES_MEEGLE_EXTRA_PATHS`（指向那个 `<prefix>/bin` 目录）。
 - 与 [[meegle-node-resolve-robust]] 同源：meegle 修复必须是**提交代码/脚本**，不是
   脆弱的 plist/手改主机（codex review 定的规矩）。
