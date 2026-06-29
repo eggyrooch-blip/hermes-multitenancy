@@ -23,6 +23,26 @@ hermes-multitenancy-update-center lark-preflight --profile alice --open-id ou_xx
 hermes-multitenancy-update-center kep-sync --systems-file kep-systems.json
 ```
 
+## Daily kep-cli Sync
+
+Production deployments should run `kep-sync` from an operator-owned scheduler
+such as a user-level systemd timer. The scheduler should not depend on an
+interactive shell profile; set `HERMES_HOME`, `HOME`, and `PATH` explicitly so
+both `kep-cli` and the Hermes virtualenv entry point resolve the same way they
+do for sandboxed agent runs.
+
+Prefer generating the `kep-sync` manifest immediately before each run from
+`kep-cli list` instead of hand-maintaining a static list. Include every active
+system row, set `installed_version` from the local system version file when it
+exists, and set `target_version` to a deployment-owned "latest" marker so
+installed systems use `kep-cli update <system>` while newly discovered systems
+use `kep-cli install <system>`.
+
+The timer should keep full JSON output in an internal report file and print
+only a short summary to the journal, for example system action counts, skill
+action counts, and quarantined system names. Do not print tokens, signed
+download URLs, or per-profile credential material.
+
 `kep-systems.json` accepts a list or `{ "systems": [...] }`:
 
 ```json
@@ -43,6 +63,11 @@ When it differs from `target_version`, it runs `kep-cli update <system>`. After 
 successful command it resolves the real binary and atomically copies it to
 `$HERMES_HOME/bin/<binary>` with mode `0755`. A failed command or missing binary
 quarantines the item and leaves the active binary untouched.
+
+For profile skill sync, the CLI defaults to all existing profiles under the
+shared home. Existing profile-local or organization-managed skills are not
+overwritten; they are reported as quarantined so an operator can inspect them
+without breaking a user's current skill surface.
 
 ## Skill Sync
 
