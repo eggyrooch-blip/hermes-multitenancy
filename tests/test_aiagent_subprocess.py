@@ -3656,6 +3656,54 @@ def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp
     }
 
 
+def test_run_with_aiagent_passes_disabled_toolsets_to_core(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: openai/test-model\n"
+        "agent:\n"
+        "  disabled_toolsets:\n"
+        "  - delegation\n"
+        "platform_toolsets:\n"
+        "  webui:\n"
+        "  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        captured["platform_key"] = platform_key
+        return ["delegation", "file", "terminal", "web"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
+            captured["disabled_toolsets"] = kwargs.get("disabled_toolsets")
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "platform_key": "webui",
+        "enabled_toolsets": ["delegation", "file", "terminal", "web"],
+        "disabled_toolsets": ["delegation"],
+    }
+
+
 def test_run_with_aiagent_removes_delegation_toolset_for_ingest_runs(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 

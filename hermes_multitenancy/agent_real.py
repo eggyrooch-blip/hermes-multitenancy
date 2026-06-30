@@ -5386,6 +5386,7 @@ def _run_with_aiagent(
             platform_key,
             platform_tools_resolver=_get_platform_tools,
         )
+    disabled_toolsets = _resolve_disabled_toolsets(config)
     if _is_ingest_run_event(event):
         before_ingest_toolsets = list(enabled_toolsets or [])
         enabled_toolsets = _ingest_enabled_toolsets(enabled_toolsets, platform_key)
@@ -5616,6 +5617,8 @@ def _run_with_aiagent(
         }
         if enabled_toolsets is not None:
             agent_kwargs["enabled_toolsets"] = enabled_toolsets
+        if disabled_toolsets:
+            agent_kwargs["disabled_toolsets"] = disabled_toolsets
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
@@ -5920,6 +5923,14 @@ def _normalize_toolset_list(value: Any) -> list[str]:
     else:
         return []
     return sorted({str(item).strip() for item in items if str(item).strip()})
+
+
+def _resolve_disabled_toolsets(config: dict[str, Any]) -> list[str]:
+    """Return profile/global toolsets that Hermes core should subtract."""
+    agent_cfg = config.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        return []
+    return _normalize_toolset_list(agent_cfg.get("disabled_toolsets"))
 
 
 def _toolsets_mode(config: dict[str, Any], platform_key: str | None = None) -> str:
