@@ -4184,6 +4184,45 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
     assert runtime_calls[-1] == ("clear", {})
 
 
+def test_aux_runtime_sync_fallback_cleanup_without_clear(monkeypatch):
+    from types import ModuleType
+
+    from hermes_multitenancy import agent_real
+
+    calls: list[tuple[str, str, dict]] = []
+
+    def set_runtime_main(provider, model, **kwargs):
+        calls.append((provider, model, kwargs))
+
+    fake_aux = ModuleType("agent.auxiliary_client")
+    fake_aux.set_runtime_main = set_runtime_main
+    fake_agent_pkg = ModuleType("agent")
+    fake_agent_pkg.auxiliary_client = fake_aux
+    monkeypatch.setitem(sys.modules, "agent", fake_agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+
+    cleanup = agent_real._sync_auxiliary_runtime_main_for_aiagent(
+        provider="custom:litellm-sre",
+        model="tencent-sonnet-4-6",
+        base_url="https://litellm.example/v1",
+        api_key="test-key",
+    )
+    cleanup()
+
+    assert calls == [
+        (
+            "custom:litellm-sre",
+            "tencent-sonnet-4-6",
+            {
+                "base_url": "https://litellm.example/v1",
+                "api_key": "test-key",
+                "api_mode": "",
+            },
+        ),
+        ("", "", {"base_url": "", "api_key": "", "api_mode": ""}),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_stream_run_agent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
