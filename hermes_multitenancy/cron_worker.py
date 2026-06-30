@@ -1992,6 +1992,91 @@ def _run_cron_job_body_with_cleanup(
         _sweep_cron_mcp_orphans()
 
 
+def _install_cron_subprocess_runtime_pool() -> None:
+    """Install the real agent runner without gateway-only plugin side effects."""
+    from . import _build_runtime_pool
+    from .agent_real import real_run_agent
+    from .router import override_pool
+    from .runtime import ProfileRuntime
+
+    def _real_factory(_profile_name: str, profile_home: Path) -> ProfileRuntime:
+        return ProfileRuntime(profile_home=profile_home, run_agent_fn=real_run_agent)
+
+    override_pool(_build_runtime_pool(_real_factory))
+
+
+def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[str, Any]:
+    profile_home = Path(profile_home).expanduser().resolve()
+    previous_home = os.environ.get("HERMES_HOME")
+    cron_jobs = None
+    cron_scheduler = None
+    saved_cron_state: Optional[tuple[Any, ...]] = None
+    os.environ["HERMES_HOME"] = str(profile_home)
+    try:
+        _install_cron_subprocess_runtime_pool()
+
+        import cron.jobs as cron_jobs_module
+        import cron.scheduler as cron_scheduler_module
+
+        cron_jobs = cron_jobs_module
+        cron_scheduler = cron_scheduler_module
+        saved_cron_state = (
+            getattr(cron_jobs, "HERMES_DIR", None),
+            getattr(cron_jobs, "CRON_DIR", None),
+            getattr(cron_jobs, "JOBS_FILE", None),
+            getattr(cron_jobs, "OUTPUT_DIR", None),
+            getattr(cron_scheduler, "_hermes_home", None),
+            getattr(cron_scheduler, "_LOCK_DIR", None),
+            getattr(cron_scheduler, "_LOCK_FILE", None),
+        )
+
+        cron_jobs.HERMES_DIR = profile_home
+        cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+        cron_scheduler._hermes_home = profile_home
+        cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
+        cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
+
+        success, output, final_response, error = _run_cron_job_body_with_cleanup(job, cron_scheduler)
+        return {
+            "success": bool(success),
+            "output": "" if output is None else str(output),
+            "final_response": "" if final_response is None else str(final_response),
+            "error": None if error is None else str(error),
+        }
+    except BaseException as exc:
+        job_id = str(job.get("id") or "")
+        job_name = str(job.get("name") or job_id or "scheduled task")
+        error = str(exc)
+        return {
+            "success": False,
+            "output": (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Path:** isolated subprocess\n\n"
+                f"Error: {error}"
+            ),
+            "final_response": "",
+            "error": error,
+        }
+    finally:
+        if cron_jobs is not None and cron_scheduler is not None and saved_cron_state is not None:
+            (
+                cron_jobs.HERMES_DIR,
+                cron_jobs.CRON_DIR,
+                cron_jobs.JOBS_FILE,
+                cron_jobs.OUTPUT_DIR,
+                cron_scheduler._hermes_home,
+                cron_scheduler._LOCK_DIR,
+                cron_scheduler._LOCK_FILE,
+            ) = saved_cron_state
+        if previous_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous_home
+
+
 def _run_job_for_profile_subprocess(profile_home: Path, job: dict) -> dict[str, Any]:
     profile_home = Path(profile_home).expanduser().resolve()
     payload = {"profile_home": str(profile_home), "job": job}
@@ -2007,26 +2092,9 @@ os.environ["HERMES_HOME"] = str(profile_home)
 job = payload.get("job") or {}
 
 try:
-    from hermes_multitenancy.cron_worker import _run_cron_job_body_with_cleanup
+    from hermes_multitenancy.cron_worker import _run_job_for_profile_current_process
 
-    import cron.jobs as cron_jobs
-    import cron.scheduler as cron_scheduler
-
-    cron_jobs.HERMES_DIR = profile_home
-    cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
-    cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
-    cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-    cron_scheduler._hermes_home = profile_home
-    cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
-    cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
-
-    success, output, final_response, error = _run_cron_job_body_with_cleanup(job, cron_scheduler)
-    result = {
-        "success": bool(success),
-        "output": "" if output is None else str(output),
-        "final_response": "" if final_response is None else str(final_response),
-        "error": None if error is None else str(error),
-    }
+    result = _run_job_for_profile_current_process(profile_home, job)
 except BaseException as exc:
     job_id = str(job.get("id") or "")
     job_name = str(job.get("name") or job_id or "scheduled task")

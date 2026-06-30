@@ -1,8 +1,9 @@
 import concurrent.futures
 import os
+import sys
 import threading
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -402,6 +403,116 @@ def test_cron_job_body_with_cleanup_sweeps_mcp_orphans_after_error(monkeypatch):
     with pytest.raises(RuntimeError, match="job exploded"):
         cron_worker._run_cron_job_body_with_cleanup({"id": "job1"}, object())
     assert calls == ["sweep"]
+
+
+def test_cron_subprocess_runtime_pool_uses_real_runner_for_visible_response(tmp_path, monkeypatch):
+    from hermes_multitenancy import agent_real, router
+
+    async def fake_real_run_agent(event, profile_home, **_kwargs):
+        assert profile_home == tmp_path / "profiles" / "sunke"
+        assert "Do not respond with [SILENT]" in event.text
+        return "REAL_VISIBLE_CRON_BODY"
+
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "sunke"))
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    router.override_pool(None)
+
+    try:
+        cron_worker._install_cron_subprocess_runtime_pool()
+        scheduler = SimpleNamespace(
+            _build_job_prompt=lambda job, prerun_script=None: job["prompt"],
+        )
+
+        success, output, final_response, error = cron_worker._run_job_through_broker(
+            {
+                "id": "job1",
+                "name": "Daily cron",
+                "prompt": "Return a detailed cron result.",
+                "deliver": "feishu",
+                "owner_profile": "sunke",
+                "owner_open_id": "ou_sunke",
+            },
+            scheduler,
+        )
+    finally:
+        router.override_pool(None)
+
+    assert (success, final_response, error) == (True, "REAL_VISIBLE_CRON_BODY", None)
+    assert "REAL_VISIBLE_CRON_BODY" in output
+    assert "本次没有发现需要提醒" not in final_response
+
+
+def test_run_job_for_profile_current_process_installs_runtime_pool_before_body(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_multitenancy import router
+    from hermes_multitenancy.pool import RuntimePool
+    from hermes_multitenancy.runtime import ProfileRuntime
+
+    profile = _profile(tmp_path / "profiles", "sunke")
+    cron_pkg = ModuleType("cron")
+    cron_jobs = ModuleType("cron.jobs")
+    cron_scheduler = ModuleType("cron.scheduler")
+    cron_jobs.HERMES_DIR = Path("/original/hermes")
+    cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+    cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+    cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+    cron_scheduler._hermes_home = Path("/original/hermes")
+    cron_scheduler._LOCK_DIR = cron_scheduler._hermes_home / "cron"
+    cron_scheduler._LOCK_FILE = cron_scheduler._LOCK_DIR / ".tick.lock"
+    cron_scheduler._build_job_prompt = lambda job, prerun_script=None: job["prompt"]
+    cron_pkg.jobs = cron_jobs
+    cron_pkg.scheduler = cron_scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", cron_scheduler)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", "/outer/home")
+    calls: list[tuple[str, str]] = []
+    router.override_pool(None)
+
+    async def fake_runner(_event, _profile_home, **_kwargs):
+        return "REAL_VISIBLE_FROM_CURRENT_PROCESS"
+
+    def install_runtime_pool():
+        calls.append(("install", os.environ["HERMES_HOME"]))
+        router.override_pool(
+            RuntimePool(
+                runtime_factory=lambda _profile_name, home: ProfileRuntime(
+                    profile_home=home,
+                    run_agent_fn=fake_runner,
+                )
+            )
+        )
+
+    monkeypatch.setattr(
+        cron_worker,
+        "_install_cron_subprocess_runtime_pool",
+        install_runtime_pool,
+    )
+
+    try:
+        result = cron_worker._run_job_for_profile_current_process(
+            profile,
+            {
+                "id": "job1",
+                "name": "Daily cron",
+                "prompt": "Return a detailed cron result.",
+                "deliver": "feishu",
+                "owner_profile": "sunke",
+                "owner_open_id": "ou_sunke",
+            },
+        )
+    finally:
+        router.override_pool(None)
+
+    assert calls == [("install", str(profile.resolve()))]
+    assert result["success"] is True
+    assert result["final_response"] == "REAL_VISIBLE_FROM_CURRENT_PROCESS"
+    assert "REAL_VISIBLE_FROM_CURRENT_PROCESS" in result["output"]
+    assert os.environ["HERMES_HOME"] == "/outer/home"
 
 
 class FinalizeScheduler:
