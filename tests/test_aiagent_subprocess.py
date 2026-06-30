@@ -4190,6 +4190,36 @@ def test_execute_code_child_env_patch_uses_each_source_env_not_lifo_stack(
         cleanup()
 
 
+def test_execute_code_child_env_patch_refcounts_overlapping_runs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return {"HOME": source_env.get("HOME", "")}
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    cleanup_a = agent_real._install_execute_code_profile_child_env_patch(tmp_path / "profiles" / "alice")
+    cleanup_b = agent_real._install_execute_code_profile_child_env_patch(tmp_path / "profiles" / "bob")
+    assert fake_code_execution_tool._scrub_child_env is not original_scrub_child_env
+
+    cleanup_b()
+    assert fake_code_execution_tool._scrub_child_env is not original_scrub_child_env
+    assert fake_code_execution_tool._scrub_child_env({
+        "HOME": "/home/hermes",
+        "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "alice" / "home"),
+    })["HOME"] == str(tmp_path / "profiles" / "alice" / "home")
+
+    cleanup_a()
+    assert fake_code_execution_tool._scrub_child_env is original_scrub_child_env
+
+
 def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
     monkeypatch,
     tmp_path: Path,

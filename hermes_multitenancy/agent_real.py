@@ -59,6 +59,7 @@ from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli
 logger = logging.getLogger(__name__)
 _EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
 _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK = threading.RLock()
+_EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 0
 _PROFILE_ANCHOR_ENV_KEYS = frozenset({
     "HOME",
     "WORKSPACE",
@@ -2714,12 +2715,19 @@ def _forced_profile_anchor_env_from(source_env: Mapping[str, str]) -> dict[str, 
 
 def _install_execute_code_profile_child_env_patch(profile_home: Path):
     """Force non-secret profile anchors into execute_code's sandbox child env."""
-    code_execution_tool = None
-    hermes_constants_mod = None
+    global _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS
 
     with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+        if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS > 0:
+            _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS += 1
+
+            def _cleanup_existing() -> None:
+                _release_execute_code_profile_child_env_patch()
+
+            return _cleanup_existing
+
         try:
-            from tools import code_execution_tool as code_execution_tool
+            from tools import code_execution_tool
 
             if not hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
                 original_scrub = code_execution_tool._scrub_child_env
@@ -2764,16 +2772,33 @@ def _install_execute_code_profile_child_env_patch(profile_home: Path):
         except Exception:
             logger.debug("[multitenancy] execute_code subprocess HOME patch skipped", exc_info=True)
 
+        _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 1
+
     def _cleanup() -> None:
-        with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
-            if code_execution_tool is not None and hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
-                code_execution_tool._scrub_child_env = code_execution_tool._hermes_mt_original_scrub_child_env
-                delattr(code_execution_tool, "_hermes_mt_original_scrub_child_env")
-            if hermes_constants_mod is not None and hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
-                hermes_constants_mod.get_subprocess_home = hermes_constants_mod._hermes_mt_original_get_subprocess_home
-                delattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home")
+        _release_execute_code_profile_child_env_patch()
 
     return _cleanup
+
+
+def _release_execute_code_profile_child_env_patch() -> None:
+    global _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS
+
+    with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+        if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS <= 0:
+            return
+        _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS -= 1
+        if _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS > 0:
+            return
+
+        code_execution_tool = sys.modules.get("tools.code_execution_tool")
+        if code_execution_tool is not None and hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
+            code_execution_tool._scrub_child_env = code_execution_tool._hermes_mt_original_scrub_child_env
+            delattr(code_execution_tool, "_hermes_mt_original_scrub_child_env")
+
+        hermes_constants_mod = sys.modules.get("hermes_constants")
+        if hermes_constants_mod is not None and hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
+            hermes_constants_mod.get_subprocess_home = hermes_constants_mod._hermes_mt_original_get_subprocess_home
+            delattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home")
 
 
 _KEEP_LOGIN_COMPAT_AGENT_DIRS = (".claude", ".agents", ".codex", ".cursor", ".codeium")
