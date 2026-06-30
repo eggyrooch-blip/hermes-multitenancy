@@ -245,6 +245,59 @@ def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkey
     assert data["environments"]["online"]["account_hint"] == "dengwenhui"
 
 
+def test_kep_auth_state_line_reports_pre_and_online(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            return _Proc(_make_jwt(future) + "\n")
+        env_name = cmd[cmd.index("--env") + 1]
+        if env_name == "pre":
+            return _Proc("state: valid\noperator: owner <owner@keep.com>\n")
+        if env_name == "online":
+            return _Proc("state: not logged in\n", returncode=3)
+        raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+
+    line = credential_hub.kep_auth_state_line(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+    )
+
+    assert line is not None
+    assert "勿再自行探活" in line
+    assert "pre=已登录: owner" in line
+    assert "online=未登录" in line
+
+
+def test_kep_auth_state_line_returns_none_on_failure(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    line = credential_hub.kep_auth_state_line(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+    )
+
+    assert line is None
+
+
 def test_kep_cli_needs_auth_when_token_expired(monkeypatch, tmp_path):
     """The core bug: kep-auth status says valid but the token is server-stale."""
     from hermes_multitenancy import credential_hub

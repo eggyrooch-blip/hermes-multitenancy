@@ -38,6 +38,8 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
+from . import credential_hub
+from . import kep_cli_guard
 from .credential_broker import lease_signing_secret, mint_lease
 from .lark_cli_guard import (
     HERMES_LARK_CLI_REAL_BIN,
@@ -830,6 +832,16 @@ def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
     block = _role_override_block_for_event(event, profile_home)
     if not block:
         return soul_text
+    policy_env, _ = credential_hub._kep_skill_env_policy(credential_hub.scan_profile_skills(profile_home))
+    if policy_env == "pre":
+        status_line = credential_hub.kep_auth_state_line(
+            profile_dir=profile_home,
+            home_dir=profile_home / "home",
+            profile_name=profile_home.name,
+            shared_home=_resolve_shared_hermes_home(profile_home),
+        )
+        if status_line:
+            return f"{status_line}\n\n{block}\n\n---\n\n{soul_text}"
     return f"{block}\n\n---\n\n{soul_text}"
 
 
@@ -1863,7 +1875,7 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_LARK_CLI_AUTHORIZED",
     "HERMES_LARK_CLI_REAL_BIN",
     "HERMES_MT_SECURITY_AUDIT_PATH",
-})
+}) | frozenset(kep_cli_guard.kep_cli_real_bin_env_keys())
 
 _FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
 _FEISHU_APP_CREDENTIAL_SUBJECT = "feishu_app"
@@ -1958,7 +1970,8 @@ def _build_subprocess_env(
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
 
-    shared_bin = str(_resolve_shared_hermes_home(profile_home) / "bin")
+    shared_bin_dir = _resolve_shared_hermes_home(profile_home) / "bin"
+    shared_bin = str(shared_bin_dir)
     existing_path = env.get("PATH", "")
     path_parts = [part for part in existing_path.split(os.pathsep) if part]
     deduped = [part for part in path_parts if part != shared_bin]
@@ -1973,6 +1986,15 @@ def _build_subprocess_env(
             "HERMES_MT_SECURITY_AUDIT_PATH",
             str(_default_security_audit_path_for_subprocess(profile_home)),
         )
+        real_bins = {
+            name: str(shared_bin_dir / name)
+            for name in kep_cli_guard.KEP_SHIM_NAMES
+            if (shared_bin_dir / name).exists()
+        }
+        if real_bins:
+            kep_cli_guard.install_kep_cli_shim(shim_dir, real_bins=real_bins)
+            for name, real_path in real_bins.items():
+                env[f"HERMES_KEP_CLI_REAL_BIN_{name.replace('-', '_').upper()}"] = real_path
         strict_path_parts = [part for part in env["PATH"].split(os.pathsep) if part]
         env["PATH"] = os.pathsep.join(
             [str(shim_dir), *[part for part in strict_path_parts if part != str(shim_dir)]]

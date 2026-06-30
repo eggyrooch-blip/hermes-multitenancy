@@ -895,6 +895,42 @@ def kep_cli_status(
     return row
 
 
+def kep_auth_state_line(
+    *,
+    profile_dir: Path,
+    home_dir: Path,
+    profile_name: str,
+    shared_home: Path,
+) -> Optional[str]:
+    try:
+        bin_path = _kep_auth_bin(shared_home)
+        statuses = {
+            env_name: _kep_env_status(
+                bin_path=bin_path,
+                profile_dir=Path(profile_dir),
+                home_dir=Path(home_dir),
+                profile_name=profile_name,
+                env_name=env_name,
+            )
+            for env_name in ("pre", "online")
+        }
+
+        def _segment(env_name: str) -> str:
+            env_status = statuses[env_name]
+            if env_status.get("status") == S_AUTHENTICATED:
+                account_hint = str(env_status.get("account_hint") or "").strip()
+                return f"已登录: {account_hint}" if account_hint else "已登录"
+            return "未登录"
+
+        return (
+            f"【系统已核实(勿再自行探活)】kep-cli pre={_segment('pre')}；online={_segment('online')}。"
+            "pre 已登录就直接用 ocean-cli --env pre 取数；pre 未登录就只引导用户在连接器认证 "
+            "kep-cli pre，不要声称 online 也失败、不要去掉 --profile。"
+        )
+    except Exception:
+        return None
+
+
 def kep_cli_statuses(
     *,
     profile_dir: Path,

@@ -47,6 +47,13 @@ def test_compose_system_text_with_overlay_leads_with_override(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
     profile_home = shared / "profiles" / "feishu_test"
 
+    # Isolate the override/SOUL composition contract from the Part A kep-status
+    # injection: feishu_test is a pre-default resource-delivery expert, so the
+    # authoritative kep line would otherwise lead. That prepend is covered by
+    # test_compose_system_text_prepends_kep_status_for_pre_overlay; here we
+    # neutralize it so this test stays focused on verdict-B (override leads SOUL).
+    monkeypatch.setattr(agent_real.credential_hub, "kep_auth_state_line", lambda **_kw: None)
+
     soul = "你是 Hermes Agent。"
     out = agent_real._compose_system_text(_event(EXPERT_ID), profile_home, soul)
     assert out != soul
@@ -57,6 +64,49 @@ def test_compose_system_text_with_overlay_leads_with_override(tmp_path, monkeypa
     assert out.index("**Role Override") < out.index(soul)
     # SOUL.md on disk is never written by composition
     assert not (profile_home / "SOUL.md").exists()
+
+
+def test_compose_system_text_prepends_kep_status_for_pre_overlay(tmp_path, monkeypatch):
+    status_line = "【系统已核实(勿再自行探活)】kep-cli pre=已登录: owner；online=未登录。"
+    calls = {"count": 0}
+
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda *_args, **_kwargs: "**Role Override**")
+    monkeypatch.setattr(agent_real.credential_hub, "scan_profile_skills", lambda _profile: [])
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_skill_env_policy", lambda _skills: ("pre", ("pre", "online")))
+
+    def fake_status_line(**_kwargs):
+        calls["count"] += 1
+        return status_line
+
+    monkeypatch.setattr(agent_real.credential_hub, "kep_auth_state_line", fake_status_line)
+
+    soul = "你是 Hermes Agent。"
+    out = agent_real._compose_system_text(_event("expert"), tmp_path, soul)
+
+    assert calls["count"] == 1
+    assert out.startswith(status_line)
+    assert "\n\n**Role Override**\n\n---\n\n" in out
+    assert out.endswith(soul)
+
+
+def test_compose_system_text_skips_kep_status_when_policy_not_pre(tmp_path, monkeypatch):
+    calls = {"count": 0}
+
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda *_args, **_kwargs: "**Role Override**")
+    monkeypatch.setattr(agent_real.credential_hub, "scan_profile_skills", lambda _profile: [])
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_skill_env_policy", lambda _skills: ("online", ("online",)))
+
+    def fake_status_line(**_kwargs):
+        calls["count"] += 1
+        return "should not be used"
+
+    monkeypatch.setattr(agent_real.credential_hub, "kep_auth_state_line", fake_status_line)
+
+    soul = "你是 Hermes Agent。"
+    out = agent_real._compose_system_text(_event("expert"), tmp_path, soul)
+
+    assert calls["count"] == 0
+    assert out == "**Role Override**\n\n---\n\n你是 Hermes Agent。"
 
 
 def test_apply_expert_id_to_metadata_precedence():

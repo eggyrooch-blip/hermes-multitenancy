@@ -6158,6 +6158,44 @@ def test_build_subprocess_env_force_passes_lark_cli_sidecar_to_terminal(monkeypa
     assert env["_HERMES_FORCE_LARKSUITE_CLI_STRICT_MODE"] == "off"
 
 
+def test_build_subprocess_env_installs_kep_shims_only_for_existing_bins(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real, kep_cli_guard
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    for name in ("lark-cli-authsidecar", "hades-cli", "kep-auth", "kep-dune-cli"):
+        path = shared_bin / name
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim_dir = profile / "tmp" / "lark-cli-shim"
+
+    assert env["PATH"].split(os.pathsep)[0] == str(shim_dir)
+    assert env["PATH"].split(os.pathsep)[1] == str(shared_bin)
+    assert (shim_dir / "lark-cli").is_file()
+    assert (shim_dir / "hades-cli").is_file()
+    assert (shim_dir / "kep-auth").is_file()
+    assert (shim_dir / "kep-dune-cli").is_file()
+    assert not (shim_dir / "ocean-cli").exists()
+
+    assert env["HERMES_LARK_CLI_REAL_BIN"] == str(shared_bin / "lark-cli-authsidecar")
+    assert env["HERMES_KEP_CLI_REAL_BIN_HADES_CLI"] == str(shared_bin / "hades-cli")
+    assert env["HERMES_KEP_CLI_REAL_BIN_KEP_AUTH"] == str(shared_bin / "kep-auth")
+    assert env["HERMES_KEP_CLI_REAL_BIN_KEP_DUNE_CLI"] == str(shared_bin / "kep-dune-cli")
+
+    allowlist = agent_real._SUBPROCESS_ENV_ALLOWLIST
+    assert "HERMES_KEP_CLI_REAL_BIN_HADES_CLI" in allowlist
+    assert "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH" in allowlist
+    assert set(kep_cli_guard.kep_cli_real_bin_env_keys()).issubset(allowlist)
+
+
 def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch, tmp_path: Path):
     """Each AIAgent run gets a short-lived sidecar key and localhost broker."""
     from hermes_multitenancy import agent_real
