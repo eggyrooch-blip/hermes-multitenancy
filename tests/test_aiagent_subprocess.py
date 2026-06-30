@@ -4126,6 +4126,8 @@ def test_execute_code_child_env_patch_forces_subprocess_home_override(
     monkeypatch.setitem(sys.modules, "hermes_constants", fake_hermes_constants)
     monkeypatch.setenv("HOME", str(profile_home / "home"))
     monkeypatch.setenv("TERMINAL_HOME_MODE", "auto")
+    monkeypatch.setenv("_HERMES_FORCE_HOME", str(profile_home / "home"))
+    monkeypatch.setenv("_HERMES_FORCE_TERMINAL_HOME_MODE", "profile")
 
     cleanup = agent_real._install_execute_code_profile_child_env_patch(profile_home)
     try:
@@ -4134,6 +4136,58 @@ def test_execute_code_child_env_patch_forces_subprocess_home_override(
         cleanup()
 
     assert fake_hermes_constants.get_subprocess_home is production_get_subprocess_home
+
+
+def test_execute_code_child_env_patch_uses_each_source_env_not_lifo_stack(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return {
+            "HOME": source_env.get("HOME", ""),
+            "KEP_PROFILE": source_env.get("KEP_PROFILE", ""),
+            "TERMINAL_HOME_MODE": source_env.get("TERMINAL_HOME_MODE", ""),
+        }
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    cleanup = agent_real._install_execute_code_profile_child_env_patch(tmp_path / "profiles" / "alice")
+    try:
+        alice_env = {
+            "HOME": "/home/hermes",
+            "KEP_PROFILE": "alice",
+            "TERMINAL_HOME_MODE": "auto",
+            "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "alice" / "home"),
+            "_HERMES_FORCE_KEP_PROFILE": "alice",
+            "_HERMES_FORCE_TERMINAL_HOME_MODE": "profile",
+        }
+        bob_env = {
+            "HOME": "/home/hermes",
+            "KEP_PROFILE": "bob",
+            "TERMINAL_HOME_MODE": "auto",
+            "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "bob" / "home"),
+            "_HERMES_FORCE_KEP_PROFILE": "bob",
+            "_HERMES_FORCE_TERMINAL_HOME_MODE": "profile",
+        }
+
+        assert fake_code_execution_tool._scrub_child_env(alice_env) == {
+            "HOME": str(tmp_path / "profiles" / "alice" / "home"),
+            "KEP_PROFILE": "alice",
+            "TERMINAL_HOME_MODE": "profile",
+        }
+        assert fake_code_execution_tool._scrub_child_env(bob_env) == {
+            "HOME": str(tmp_path / "profiles" / "bob" / "home"),
+            "KEP_PROFILE": "bob",
+            "TERMINAL_HOME_MODE": "profile",
+        }
+    finally:
+        cleanup()
 
 
 def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
