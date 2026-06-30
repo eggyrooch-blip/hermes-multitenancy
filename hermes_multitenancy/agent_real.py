@@ -1904,6 +1904,31 @@ _FEISHU_APP_CREDENTIAL_PROFILE = "__global__"
 _FEISHU_APP_CREDENTIAL_SUBJECT = "feishu_app"
 
 
+def _profile_anchor_env_for_aiagent(profile_home: Path) -> dict[str, str]:
+    """Return non-secret profile anchors shared by subprocess and in-process runs."""
+    profile_home = profile_home.expanduser()
+    pivot = {
+        "HOME":            profile_home / "home",
+        "WORKSPACE":       profile_home / "workspace",
+        "XDG_CACHE_HOME":  profile_home / "cache",
+        "XDG_CONFIG_HOME": profile_home / "config",
+        "XDG_STATE_HOME":  profile_home / "state",
+        "XDG_DATA_HOME":   profile_home / "data",
+        "TMPDIR":          profile_home / "tmp",
+    }
+    for path in pivot.values():
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _install_keep_login_compat(profile_home)
+    return {
+        **{key: str(path) for key, path in pivot.items()},
+        "HERMES_HOME":        str(profile_home),
+        "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
+        "HERMES_PROFILE":     profile_home.name,
+        "KEP_PROFILE":        profile_home.name,
+        "TERMINAL_HOME_MODE": "profile",
+    }
+
+
 def _build_subprocess_env(
     profile_home: Path,
     *,
@@ -1965,25 +1990,8 @@ def _build_subprocess_env(
     # OpenClaw-compatible token boundary: HOME and /workspace-style variables
     # point into the routed profile so unmodified token skills do not write to
     # the shared service user's home.
-    pivot = {
-        "HOME":            profile_home / "home",
-        "WORKSPACE":       profile_home / "workspace",
-        "XDG_CACHE_HOME":  profile_home / "cache",
-        "XDG_CONFIG_HOME": profile_home / "config",
-        "XDG_STATE_HOME":  profile_home / "state",
-        "XDG_DATA_HOME":   profile_home / "data",
-        "TMPDIR":          profile_home / "tmp",
-    }
-    for path in pivot.values():
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    env.update({key: str(path) for key, path in pivot.items()})
-    _install_keep_login_compat(profile_home)
-
-    env["HERMES_HOME"]                      = str(profile_home)
-    env["HERMES_SHARED_HOME"]               = str(_resolve_shared_hermes_home(profile_home))
-    env["HERMES_PROFILE"]                   = profile_home.name
-    env["KEP_PROFILE"]                      = profile_home.name
-    env["TERMINAL_HOME_MODE"]               = "profile"
+    profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
+    env.update(profile_anchor_env)
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
@@ -1991,24 +1999,7 @@ def _build_subprocess_env(
     # non-secret profile anchors through that boundary so profile-scoped CLIs
     # such as kep-auth/ocean-cli read the same HOME and KEP_PROFILE as the
     # routed AIAgent process.
-    env.update(
-        _force_env_for_terminal_passthrough(
-            {
-                "HOME": str(pivot["HOME"]),
-                "WORKSPACE": str(pivot["WORKSPACE"]),
-                "XDG_CACHE_HOME": str(pivot["XDG_CACHE_HOME"]),
-                "XDG_CONFIG_HOME": str(pivot["XDG_CONFIG_HOME"]),
-                "XDG_STATE_HOME": str(pivot["XDG_STATE_HOME"]),
-                "XDG_DATA_HOME": str(pivot["XDG_DATA_HOME"]),
-                "TMPDIR": str(pivot["TMPDIR"]),
-                "HERMES_HOME": str(profile_home),
-                "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
-                "HERMES_PROFILE": profile_home.name,
-                "KEP_PROFILE": profile_home.name,
-                "TERMINAL_HOME_MODE": "profile",
-            }
-        )
-    )
+    env.update(_force_env_for_terminal_passthrough(profile_anchor_env))
     lark_cli_env = _lark_cli_sidecar_env_for_aiagent(profile_home)
     env.update(lark_cli_env)
     env.update(_force_env_for_terminal_passthrough(lark_cli_env))
@@ -2862,6 +2853,9 @@ def _install_ingest_secret_env_passthrough(env: Optional[Mapping[str, str]] = No
 def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[str, str]] = None):
     """Temporarily expose profile/credential env for in-process AIAgent runs."""
     runtime_env = _profile_env_for_aiagent(profile_home)
+    profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
+    runtime_env.update(profile_anchor_env)
+    runtime_env.update(_force_env_for_terminal_passthrough(profile_anchor_env))
     credential_env = _credential_env_for_aiagent(profile_home)
     runtime_env.update(credential_env)
     runtime_env.update(_force_env_for_terminal_passthrough(credential_env))

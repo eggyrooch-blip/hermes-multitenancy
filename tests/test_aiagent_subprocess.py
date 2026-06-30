@@ -843,6 +843,55 @@ credentials:
     assert "_HERMES_FORCE_GITLAB_TOKEN" not in os.environ
 
 
+def test_apply_runtime_env_for_aiagent_forces_profile_boundary(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+
+    keys = [
+        "HOME",
+        "WORKSPACE",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "HERMES_HOME",
+        "HERMES_SHARED_HOME",
+        "HERMES_PROFILE",
+        "KEP_PROFILE",
+        "TERMINAL_HOME_MODE",
+    ]
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(f"_HERMES_FORCE_{key}", raising=False)
+
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        assert os.environ["HOME"] == str(profile_home / "home")
+        assert os.environ["WORKSPACE"] == str(profile_home / "workspace")
+        assert os.environ["HERMES_HOME"] == str(profile_home)
+        assert os.environ["HERMES_SHARED_HOME"] == str(shared)
+        assert os.environ["HERMES_PROFILE"] == "alice"
+        assert os.environ["KEP_PROFILE"] == "alice"
+        assert os.environ["TERMINAL_HOME_MODE"] == "profile"
+        assert os.environ["_HERMES_FORCE_HOME"] == str(profile_home / "home")
+        assert os.environ["_HERMES_FORCE_WORKSPACE"] == str(profile_home / "workspace")
+        assert os.environ["_HERMES_FORCE_HERMES_HOME"] == str(profile_home)
+        assert os.environ["_HERMES_FORCE_HERMES_SHARED_HOME"] == str(shared)
+        assert os.environ["_HERMES_FORCE_HERMES_PROFILE"] == "alice"
+        assert os.environ["_HERMES_FORCE_KEP_PROFILE"] == "alice"
+        assert os.environ["_HERMES_FORCE_TERMINAL_HOME_MODE"] == "profile"
+    finally:
+        cleanup()
+
+    for key in keys:
+        assert key not in os.environ
+        assert f"_HERMES_FORCE_{key}" not in os.environ
+
+
 def test_build_subprocess_env_forces_credential_env_through_terminal_scrub(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy.credentials import CredentialStore
