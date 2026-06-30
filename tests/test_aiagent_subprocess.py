@@ -3971,10 +3971,14 @@ def test_run_with_aiagent_ingest_secret_env_builds_authorization_header(
     assert captured["enabled_toolsets"] == ["lark-cli", "terminal"]
     assert captured["authorization_matches"] is True
     assert captured["manifest"] == manifest
-    assert registered_passthrough == {
+    expected_ingest_passthrough = {
         "HERMES_INGEST_SECRET_DIR",
         "HERMES_INGEST_SECRET_MANIFEST",
     }
+    assert expected_ingest_passthrough <= registered_passthrough
+    assert "KEP_PROFILE" in registered_passthrough
+    assert "TERMINAL_HOME_MODE" in registered_passthrough
+    assert "OPENAI_API_KEY" not in registered_passthrough
     assert set(fake_env_passthrough_mod._config_passthrough) == registered_passthrough
     assert secret_value not in json.dumps(captured, ensure_ascii=False)
     assert secret_value not in result
