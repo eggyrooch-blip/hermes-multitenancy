@@ -892,6 +892,49 @@ def test_apply_runtime_env_for_aiagent_forces_profile_boundary(monkeypatch, tmp_
         assert f"_HERMES_FORCE_{key}" not in os.environ
 
 
+def test_apply_runtime_env_for_aiagent_allows_execute_code_profile_boundary(
+    monkeypatch, tmp_path: Path
+):
+    from tools.code_execution_tool import _scrub_child_env
+
+    from hermes_multitenancy import agent_real
+
+    registered: set[str] = set()
+
+    def register_env_passthrough(names):
+        registered.update(str(name) for name in names)
+
+    fake_env_passthrough = SimpleNamespace(
+        register_env_passthrough=register_env_passthrough,
+        is_env_passthrough=lambda name: name in registered,
+        _config_passthrough=frozenset(),
+    )
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.env_passthrough = fake_env_passthrough
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough)
+
+    shared = tmp_path / ".hermes"
+    profile_home = shared / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-pass")
+    cleanup = agent_real._apply_runtime_env_for_aiagent(profile_home)
+    try:
+        child_env = _scrub_child_env(dict(os.environ))
+
+        assert child_env["HOME"] == str(profile_home / "home")
+        assert child_env["WORKSPACE"] == str(profile_home / "workspace")
+        assert child_env["HERMES_HOME"] == str(profile_home)
+        assert child_env["HERMES_SHARED_HOME"] == str(shared)
+        assert child_env["HERMES_PROFILE"] == "alice"
+        assert child_env["KEP_PROFILE"] == "alice"
+        assert child_env["TERMINAL_HOME_MODE"] == "profile"
+        assert "OPENAI_API_KEY" not in child_env
+    finally:
+        cleanup()
+
+
 def test_build_subprocess_env_forces_credential_env_through_terminal_scrub(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy.credentials import CredentialStore

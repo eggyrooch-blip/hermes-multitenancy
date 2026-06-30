@@ -2856,6 +2856,10 @@ def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[
     profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
     runtime_env.update(profile_anchor_env)
     runtime_env.update(_force_env_for_terminal_passthrough(profile_anchor_env))
+    try:
+        _register_env_passthrough_process_wide(sorted(profile_anchor_env))
+    except Exception:
+        logger.debug("[multitenancy] profile anchor env passthrough skipped", exc_info=True)
     credential_env = _credential_env_for_aiagent(profile_home)
     runtime_env.update(credential_env)
     runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
