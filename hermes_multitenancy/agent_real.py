@@ -58,6 +58,8 @@ from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli
 
 logger = logging.getLogger(__name__)
 _EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
+_EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK = threading.RLock()
+_EXECUTE_CODE_PROFILE_CHILD_ENV_STACK: list[dict[str, str]] = []
 
 
 # Map a model provider prefix to the env-var name that holds its API key.
@@ -2688,6 +2690,86 @@ def _force_env_for_terminal_passthrough(env: dict[str, str]) -> dict[str, str]:
     return {f"_HERMES_FORCE_{key}": value for key, value in env.items()}
 
 
+def _active_execute_code_profile_child_env() -> dict[str, str] | None:
+    with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+        if not _EXECUTE_CODE_PROFILE_CHILD_ENV_STACK:
+            return None
+        return dict(_EXECUTE_CODE_PROFILE_CHILD_ENV_STACK[-1])
+
+
+def _install_execute_code_profile_child_env_patch(profile_home: Path):
+    """Force non-secret profile anchors into execute_code's sandbox child env."""
+    profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
+    code_execution_tool = None
+    hermes_constants_mod = None
+
+    with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+        _EXECUTE_CODE_PROFILE_CHILD_ENV_STACK.append(profile_anchor_env)
+        try:
+            from tools import code_execution_tool as code_execution_tool
+
+            if not hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
+                original_scrub = code_execution_tool._scrub_child_env
+
+                def _hermes_mt_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+                    try:
+                        child_env = original_scrub(
+                            source_env,
+                            is_passthrough=is_passthrough,
+                            is_windows=is_windows,
+                        )
+                    except TypeError:
+                        child_env = original_scrub(source_env)
+                    active_env = _active_execute_code_profile_child_env()
+                    if active_env:
+                        child_env.update(active_env)
+                    return child_env
+
+                code_execution_tool._hermes_mt_original_scrub_child_env = original_scrub
+                code_execution_tool._scrub_child_env = _hermes_mt_scrub_child_env
+        except Exception:
+            logger.debug("[multitenancy] execute_code child env scrub patch skipped", exc_info=True)
+
+        try:
+            import hermes_constants as hermes_constants_mod
+
+            if not hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
+                original_get_home = hermes_constants_mod.get_subprocess_home
+
+                def _hermes_mt_get_subprocess_home(env=None):
+                    active_env = _active_execute_code_profile_child_env()
+                    if active_env:
+                        return active_env.get("HOME") or None
+                    if env is None:
+                        return original_get_home()
+                    try:
+                        return original_get_home(env)
+                    except TypeError:
+                        return original_get_home()
+
+                hermes_constants_mod._hermes_mt_original_get_subprocess_home = original_get_home
+                hermes_constants_mod.get_subprocess_home = _hermes_mt_get_subprocess_home
+        except Exception:
+            logger.debug("[multitenancy] execute_code subprocess HOME patch skipped", exc_info=True)
+
+    def _cleanup() -> None:
+        with _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK:
+            for idx in range(len(_EXECUTE_CODE_PROFILE_CHILD_ENV_STACK) - 1, -1, -1):
+                if _EXECUTE_CODE_PROFILE_CHILD_ENV_STACK[idx] is profile_anchor_env:
+                    del _EXECUTE_CODE_PROFILE_CHILD_ENV_STACK[idx]
+                    break
+            if _EXECUTE_CODE_PROFILE_CHILD_ENV_STACK:
+                return
+            if code_execution_tool is not None and hasattr(code_execution_tool, "_hermes_mt_original_scrub_child_env"):
+                code_execution_tool._scrub_child_env = code_execution_tool._hermes_mt_original_scrub_child_env
+                delattr(code_execution_tool, "_hermes_mt_original_scrub_child_env")
+            if hermes_constants_mod is not None and hasattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home"):
+                hermes_constants_mod.get_subprocess_home = hermes_constants_mod._hermes_mt_original_get_subprocess_home
+                delattr(hermes_constants_mod, "_hermes_mt_original_get_subprocess_home")
+
+    return _cleanup
+
+
 _KEEP_LOGIN_COMPAT_AGENT_DIRS = (".claude", ".agents", ".codex", ".cursor", ".codeium")
 _KEEP_LOGIN_COMPAT_MARKER = "HERMES_KEEP_LOGIN_COMPAT_SHIM=v1"
 _KEEP_LOGIN_COMPAT_NOTE_MARKER = "Hermes Keep Auth Compatibility"
@@ -2860,6 +2942,7 @@ def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[
         _register_env_passthrough_process_wide(sorted(profile_anchor_env))
     except Exception:
         logger.debug("[multitenancy] profile anchor env passthrough skipped", exc_info=True)
+    execute_code_child_env_cleanup = _install_execute_code_profile_child_env_patch(profile_home)
     credential_env = _credential_env_for_aiagent(profile_home)
     runtime_env.update(credential_env)
     runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
@@ -2871,6 +2954,7 @@ def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[
     os.environ.update(runtime_env)
 
     def _cleanup() -> None:
+        execute_code_child_env_cleanup()
         for key, old_value in old_env.items():
             if old_value is None:
                 os.environ.pop(key, None)

@@ -4030,6 +4030,112 @@ def test_run_with_aiagent_reapplies_profile_home_after_agent_init(
     }
 
 
+def test_execute_code_child_env_patch_survives_tool_time_env_reset(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - terminal\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        return ["terminal"]
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return {
+            "HOME": source_env.get("HOME", ""),
+            "HERMES_HOME": source_env.get("HERMES_HOME", ""),
+            "KEP_PROFILE": source_env.get("KEP_PROFILE", ""),
+            "TERMINAL_HOME_MODE": source_env.get("TERMINAL_HOME_MODE", ""),
+        }
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id):
+            os.environ["TERMINAL_HOME_MODE"] = "auto"
+            os.environ["HOME"] = "/home/hermes"
+            child_env = fake_code_execution_tool._scrub_child_env(os.environ)
+            captured.update({
+                "child_home": child_env.get("HOME"),
+                "child_mode": child_env.get("TERMINAL_HOME_MODE"),
+                "child_kep_profile": child_env.get("KEP_PROFILE"),
+            })
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "child_home": str(profile_home / "home"),
+        "child_mode": "profile",
+        "child_kep_profile": "sunke",
+    }
+    assert fake_code_execution_tool._scrub_child_env is original_scrub_child_env
+
+
+def test_execute_code_child_env_patch_forces_subprocess_home_override(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    profile_home.mkdir(parents=True)
+
+    def original_scrub_child_env(source_env, is_passthrough=None, is_windows=None):
+        return dict(source_env)
+
+    fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
+    tools_mod = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_mod.code_execution_tool = fake_code_execution_tool
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.code_execution_tool", fake_code_execution_tool)
+
+    def production_get_subprocess_home(env=None):
+        source = env or os.environ
+        mode = source.get("TERMINAL_HOME_MODE") or os.environ.get("TERMINAL_HOME_MODE", "auto")
+        if mode == "profile":
+            return str(profile_home / "home")
+        if source.get("HOME") == str(profile_home / "home"):
+            return "/home/hermes"
+        return None
+
+    fake_hermes_constants = SimpleNamespace(get_subprocess_home=production_get_subprocess_home)
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake_hermes_constants)
+    monkeypatch.setenv("HOME", str(profile_home / "home"))
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "auto")
+
+    cleanup = agent_real._install_execute_code_profile_child_env_patch(profile_home)
+    try:
+        assert fake_hermes_constants.get_subprocess_home() == str(profile_home / "home")
+    finally:
+        cleanup()
+
+    assert fake_hermes_constants.get_subprocess_home is production_get_subprocess_home
+
+
 def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
     monkeypatch,
     tmp_path: Path,
