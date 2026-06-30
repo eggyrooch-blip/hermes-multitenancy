@@ -1983,9 +1983,32 @@ def _build_subprocess_env(
     env["HERMES_SHARED_HOME"]               = str(_resolve_shared_hermes_home(profile_home))
     env["HERMES_PROFILE"]                   = profile_home.name
     env["KEP_PROFILE"]                      = profile_home.name
+    env["TERMINAL_HOME_MODE"]               = "profile"
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    # terminal/execute_code apply a second subprocess env scrub.  Force only
+    # non-secret profile anchors through that boundary so profile-scoped CLIs
+    # such as kep-auth/ocean-cli read the same HOME and KEP_PROFILE as the
+    # routed AIAgent process.
+    env.update(
+        _force_env_for_terminal_passthrough(
+            {
+                "HOME": str(pivot["HOME"]),
+                "WORKSPACE": str(pivot["WORKSPACE"]),
+                "XDG_CACHE_HOME": str(pivot["XDG_CACHE_HOME"]),
+                "XDG_CONFIG_HOME": str(pivot["XDG_CONFIG_HOME"]),
+                "XDG_STATE_HOME": str(pivot["XDG_STATE_HOME"]),
+                "XDG_DATA_HOME": str(pivot["XDG_DATA_HOME"]),
+                "TMPDIR": str(pivot["TMPDIR"]),
+                "HERMES_HOME": str(profile_home),
+                "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
+                "HERMES_PROFILE": profile_home.name,
+                "KEP_PROFILE": profile_home.name,
+                "TERMINAL_HOME_MODE": "profile",
+            }
+        )
+    )
     lark_cli_env = _lark_cli_sidecar_env_for_aiagent(profile_home)
     env.update(lark_cli_env)
     env.update(_force_env_for_terminal_passthrough(lark_cli_env))

@@ -5922,6 +5922,25 @@ def test_build_subprocess_env_pivots_home_workspace_and_token_compat_env(tmp_pat
     assert not (profile / "home" / ".keep-login" / "token-pre.enc").exists()
 
 
+def test_build_subprocess_env_forces_profile_boundary_into_tool_subprocesses(tmp_path: Path):
+    """terminal/execute_code apply a second env scrub, so profile anchors need force passthrough."""
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["_HERMES_FORCE_HOME"] == str(profile / "home")
+    assert env["_HERMES_FORCE_WORKSPACE"] == str(profile / "workspace")
+    assert env["_HERMES_FORCE_HERMES_HOME"] == str(profile)
+    assert env["_HERMES_FORCE_HERMES_SHARED_HOME"] == str(tmp_path)
+    assert env["_HERMES_FORCE_HERMES_PROFILE"] == "alice"
+    assert env["_HERMES_FORCE_KEP_PROFILE"] == "alice"
+    assert env["_HERMES_FORCE_TERMINAL_HOME_MODE"] == "profile"
+
+
 def test_keep_login_compat_wrapper_uses_profile_scoped_kep_auth(tmp_path: Path):
     from hermes_multitenancy import agent_real
 
