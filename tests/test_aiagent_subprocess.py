@@ -2915,6 +2915,25 @@ def test_configure_cron_home_patches_native_cronjob_run_to_broker(
             "owner_profile": "owner",
         }
 
+    def get_job(job_id):
+        return resolve_job_ref(job_id)
+
+    def execute_job_now(_job):
+        raise AssertionError("native cron _execute_job_now must not run locally")
+
+    def format_job(job):
+        return dict(job)
+
+    def cronjob(action, job_id=None, **_kwargs):
+        normalized = (action or "").strip().lower()
+        job = resolve_job_ref(job_id)
+        if normalized in {"run", "run_now", "trigger"}:
+            exec_result = cronjob_tools._execute_job_now(job)
+            result = cronjob_tools._format_job(cronjob_tools.get_job(job_id) or {"id": job_id})
+            result["executed"] = exec_result.get("claimed", False)
+            return json.dumps({"success": True, "job": result}, indent=2)
+        raise AssertionError(f"unexpected action {action!r}")
+
     def fake_forward(*, job_id, profile_home, owner_open_id):
         forwarded.append({
             "job_id": job_id,
@@ -2933,6 +2952,10 @@ def test_configure_cron_home_patches_native_cronjob_run_to_broker(
     cronjob_tools.update_job = update_job
     cronjob_tools.trigger_job = trigger_job
     cronjob_tools.resolve_job_ref = resolve_job_ref
+    cronjob_tools.get_job = get_job
+    cronjob_tools._execute_job_now = execute_job_now
+    cronjob_tools._format_job = format_job
+    cronjob_tools.cronjob = cronjob
     cron_pkg.jobs = cron_jobs
     tools_pkg.cronjob_tools = cronjob_tools
 
@@ -2942,17 +2965,28 @@ def test_configure_cron_home_patches_native_cronjob_run_to_broker(
     monkeypatch.setitem(sys.modules, "tools.cronjob_tools", cronjob_tools)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setattr(cron_worker, "trigger_profile_cron_job_via_run_broker", fake_forward)
+    cached_cronjob = cronjob_tools.cronjob
 
     agent_real._configure_cron_home(shared_home)
 
     job = cronjob_tools.trigger_job("job123")
+    payload = json.loads(cached_cronjob(action="run", job_id="job123"))
 
     assert job["owner_open_id"] == "ou_owner"
-    assert forwarded == [{
-        "job_id": "job123",
-        "profile_home": profile_home,
-        "owner_open_id": "ou_owner",
-    }]
+    assert payload["success"] is True
+    assert payload["job"]["owner_open_id"] == "ou_owner"
+    assert forwarded == [
+        {
+            "job_id": "job123",
+            "profile_home": profile_home,
+            "owner_open_id": "ou_owner",
+        },
+        {
+            "job_id": "job123",
+            "profile_home": profile_home,
+            "owner_open_id": "ou_owner",
+        },
+    ]
 
 
 def test_configure_cron_home_binds_shared_in_legacy_layout(monkeypatch, tmp_path: Path):

@@ -1348,6 +1348,8 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
     original_create_job = getattr(cronjob_tools, "create_job", None)
     original_update_job = getattr(cronjob_tools, "update_job", None)
     original_trigger_job = getattr(cronjob_tools, "trigger_job", None)
+    original_cronjob = getattr(cronjob_tools, "cronjob", None)
+    original_execute_job_now = getattr(cronjob_tools, "_execute_job_now", None)
     if original_create_job is None or original_update_job is None:
         return
 
@@ -1404,10 +1406,31 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
             owner_open_id=owner_open_id,
         )
 
+    def cronjob_with_runbroker(action: str, *args: Any, **kwargs: Any) -> Any:
+        normalized = (action or "").strip().lower()
+        if normalized not in {"run", "run_now", "trigger"}:
+            return original_cronjob(action, *args, **kwargs)
+
+        job_id = kwargs.get("job_id")
+        if job_id is None and args:
+            job_id = args[0]
+        job = trigger_job_via_run_broker(str(job_id or ""))
+        formatter = getattr(cronjob_tools, "_format_job", None)
+        formatted = formatter(job) if callable(formatter) else job
+        return json.dumps({"success": True, "job": formatted, "queued": True}, indent=2)
+
+    def execute_job_now_via_runbroker(job: dict[str, Any]) -> dict[str, Any]:
+        result = trigger_job_via_run_broker(str(job.get("id") or ""))
+        return {"claimed": True, "success": True, "job": result, "queued": True}
+
     cronjob_tools.create_job = create_job_with_owner
     cronjob_tools.update_job = update_job_with_owner
     if original_trigger_job is not None:
         cronjob_tools.trigger_job = trigger_job_via_run_broker
+    if original_cronjob is not None:
+        cronjob_tools.cronjob = cronjob_with_runbroker
+    if original_execute_job_now is not None:
+        cronjob_tools._execute_job_now = execute_job_now_via_runbroker
     cronjob_tools._hermes_multitenancy_owner_patch = True
     logger.info("[multitenancy] patched native cronjob tool owner context")
 
