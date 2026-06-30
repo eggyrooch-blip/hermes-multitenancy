@@ -3984,6 +3984,52 @@ def test_run_with_aiagent_ingest_secret_env_builds_authorization_header(
     assert secret_value not in result
 
 
+def test_run_with_aiagent_reapplies_profile_home_after_agent_init(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "sunke"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - lark-cli\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    captured: dict[str, object] = {}
+
+    def fake_resolve(config, platform_key, *, platform_tools_resolver):
+        return ["terminal"]
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            os.environ["TERMINAL_HOME_MODE"] = "auto"
+            os.environ["HOME"] = "/home/hermes"
+
+        def run_conversation(self, user_message, task_id):
+            captured["home"] = os.environ.get("HOME")
+            captured["mode"] = os.environ.get("TERMINAL_HOME_MODE")
+            captured["kep_profile"] = os.environ.get("KEP_PROFILE")
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(agent_real, "_resolve_enabled_toolsets", fake_resolve)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured == {
+        "home": str(profile_home / "home"),
+        "mode": "profile",
+        "kep_profile": "sunke",
+    }
+
+
 def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
     monkeypatch,
     tmp_path: Path,
