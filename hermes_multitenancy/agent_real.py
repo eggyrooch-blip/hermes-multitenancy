@@ -2836,6 +2836,59 @@ def _apply_vod_image_model_override_for_aiagent(user_text: str):
     return _cleanup
 
 
+def _sync_auxiliary_runtime_main_for_aiagent(
+    *,
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key: Any,
+    api_mode: str | None = None,
+):
+    """Tell Hermes core auxiliary calls which live main model this run uses."""
+    try:
+        from agent import auxiliary_client
+    except Exception:
+        return lambda: None
+
+    set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
+    if not callable(set_runtime_main):
+        return lambda: None
+    try:
+        set_runtime_main(
+            provider,
+            model,
+            base_url=base_url or "",
+            api_key=api_key if isinstance(api_key, str) else "",
+            api_mode=api_mode or "",
+        )
+    except TypeError:
+        try:
+            set_runtime_main(provider, model)
+        except Exception:
+            logger.debug("[multitenancy] auxiliary runtime main sync skipped", exc_info=True)
+            return lambda: None
+    except Exception:
+        logger.debug("[multitenancy] auxiliary runtime main sync skipped", exc_info=True)
+        return lambda: None
+
+    clear_runtime_main = getattr(auxiliary_client, "clear_runtime_main", None)
+    if callable(clear_runtime_main):
+        return clear_runtime_main
+
+    def _cleanup() -> None:
+        try:
+            set_runtime_main("", "", base_url="", api_key="", api_mode="")
+        except TypeError:
+            try:
+                set_runtime_main("", "")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    return _cleanup
+
+
 def _register_aiagent_process_image_gen_providers() -> None:
     """Register multitenancy image providers inside routed AIAgent children."""
 
@@ -5553,6 +5606,13 @@ def _run_with_aiagent(
         # subprocess-local (fresh create_subprocess_exec child).
         expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
+        aux_runtime_cleanup = _sync_auxiliary_runtime_main_for_aiagent(
+            provider=provider,
+            model=model_only,
+            base_url=base_url,
+            api_key=api_key,
+            api_mode=str(runtime_kwargs.get("api_mode") or ""),
+        )
         agent = None
         try:
             _register_aiagent_process_image_gen_providers()
@@ -5603,6 +5663,7 @@ def _run_with_aiagent(
             # parent process re-runs it post-done with full write access.
             _retag_source_now("finally-pre-close")
             approval_cleanup()
+            aux_runtime_cleanup()
             vod_image_override_cleanup()
             expert_skill_scope_cleanup()
             runtime_env_cleanup()

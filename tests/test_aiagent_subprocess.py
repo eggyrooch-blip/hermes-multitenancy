@@ -4102,6 +4102,88 @@ def test_run_with_aiagent_uses_webui_session_model_metadata(monkeypatch, tmp_pat
     assert captured["api_key"] == "session-key"
 
 
+def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, tmp_path: Path):
+    from types import ModuleType
+
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  default: custom:litellm-sre/tencent-sonnet-4-6",
+                "  provider: custom:litellm-sre",
+                "  base_url: https://litellm.example/v1",
+                "custom_providers:",
+                "  - name: litellm-sre",
+                "    base_url: https://litellm.example/v1",
+                "    api_key: test-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runtime_calls: list[tuple[str, dict]] = []
+
+    def set_runtime_main(provider, model, **kwargs):
+        runtime_calls.append(
+            (
+                "set",
+                {
+                    "provider": provider,
+                    "model": model,
+                    **kwargs,
+                },
+            )
+        )
+
+    def clear_runtime_main():
+        runtime_calls.append(("clear", {}))
+
+    fake_aux = ModuleType("agent.auxiliary_client")
+    fake_aux.set_runtime_main = set_runtime_main
+    fake_aux.clear_runtime_main = clear_runtime_main
+    fake_agent_pkg = ModuleType("agent")
+    fake_agent_pkg.auxiliary_client = fake_aux
+    monkeypatch.setitem(sys.modules, "agent", fake_agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id):
+            captured["runtime_at_run"] = list(runtime_calls)
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home) == "ok"
+
+    assert captured["model"] == "tencent-sonnet-4-6"
+    assert captured["provider"] == "custom:litellm-sre"
+    assert captured["base_url"] == "https://litellm.example/v1"
+    assert captured["runtime_at_run"] == [
+        (
+            "set",
+            {
+                "provider": "custom:litellm-sre",
+                "model": "tencent-sonnet-4-6",
+                "base_url": "https://litellm.example/v1",
+                "api_key": "test-key",
+                "api_mode": "",
+            },
+        )
+    ]
+    assert runtime_calls[-1] == ("clear", {})
+
+
 @pytest.mark.asyncio
 async def test_stream_run_agent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
