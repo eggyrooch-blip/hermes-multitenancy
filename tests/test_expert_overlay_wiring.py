@@ -89,6 +89,35 @@ def test_compose_system_text_prepends_kep_status_for_pre_overlay(tmp_path, monke
     assert out.endswith(soul)
 
 
+def test_compose_system_text_prepends_kep_403_receipt_guidance(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda *_args, **_kwargs: "**Role Override**")
+    monkeypatch.setattr(agent_real.credential_hub, "scan_profile_skills", lambda _profile: [])
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_skill_env_policy", lambda _skills: ("pre", ("pre", "online")))
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_auth_bin", lambda _shared_home: "/tmp/kep-auth")
+
+    def fake_kep_env_status(*, env_name, **_kwargs):
+        if env_name == "pre":
+            return {
+                "status": agent_real.credential_hub.S_AUTHENTICATED,
+                "account_hint": "owner",
+            }
+        if env_name == "online":
+            return {"status": agent_real.credential_hub.S_NEEDS_AUTH}
+        raise AssertionError(f"unexpected kep env {env_name!r}")
+
+    monkeypatch.setattr(agent_real.credential_hub, "_kep_env_status", fake_kep_env_status)
+
+    soul = "你是 Hermes Agent。"
+    out = agent_real._compose_system_text(_event("expert"), tmp_path, soul)
+
+    assert out.startswith("【系统已核实(勿再自行探活)】")
+    assert "pre=已登录: owner" in out
+    assert "HTTP 403" in out
+    assert "接口禁止访问" in out
+    assert "不要要求用户重新登录" in out
+    assert out.index("HTTP 403") < out.index("**Role Override**")
+
+
 def test_compose_system_text_skips_kep_status_when_policy_not_pre(tmp_path, monkeypatch):
     calls = {"count": 0}
 

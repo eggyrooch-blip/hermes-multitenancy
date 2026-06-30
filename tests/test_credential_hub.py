@@ -280,6 +280,9 @@ def test_kep_auth_state_line_reports_pre_and_online(monkeypatch, tmp_path):
     assert "勿再自行探活" in line
     assert "pre=已登录: owner" in line
     assert "online=未登录" in line
+    assert "HTTP 403" in line
+    assert "接口禁止访问" in line
+    assert "不要要求用户重新登录" in line
 
 
 def test_kep_auth_state_line_returns_none_on_failure(monkeypatch, tmp_path):

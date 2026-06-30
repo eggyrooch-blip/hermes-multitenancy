@@ -66,6 +66,11 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
             b"auth: not logged in",
             b"run kep-auth login",
         )
+        _PERMISSION_DENIED_MARKERS = (
+            "http 403",
+            "forbidden",
+            "接口禁止访问",
+        )
 
         def _timestamp_iso() -> str:
             return datetime.now(tz=_SHANGHAI_TZ).isoformat(timespec="seconds")
@@ -173,7 +178,11 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
             stderr_thread.join()
 
             combined_tail = bytes(stdout_tail + stderr_tail).lower()
+            combined_text = combined_tail.decode("utf-8", errors="ignore")
             auth_failure = returncode == 77 or any(marker in combined_tail for marker in _AUTH_FAILURE_MARKERS)
+            permission_denied = returncode != 0 and any(
+                marker in combined_text for marker in _PERMISSION_DENIED_MARKERS
+            )
             if auth_failure:
                 env_name = _parse_env_name(argv)
                 message = (
@@ -190,6 +199,25 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
                         event_type="kep_cli.auth_failure.relayed",
                         command_name=COMMAND_NAME,
                         reason="auth failure relayed to Hermes connector auth flow",
+                    )
+                except Exception:
+                    pass
+            elif permission_denied:
+                env_name = _parse_env_name(argv)
+                message = (
+                    f"\\n【Hermes】kep-cli {{env_name}} 接口禁止访问：当前账号已登录但没有该接口/数据权限；"
+                    "请直接告知用户无权限，不要要求重新登录或重新授权。"
+                )
+                try:
+                    sys.stderr.buffer.write(message.encode("utf-8"))
+                    sys.stderr.buffer.flush()
+                except Exception:
+                    pass
+                try:
+                    _append_security_event(
+                        event_type="kep_cli.permission_denied.relayed",
+                        command_name=COMMAND_NAME,
+                        reason="permission denied relayed as non-login failure",
                     )
                 except Exception:
                     pass

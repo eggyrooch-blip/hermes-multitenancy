@@ -25,6 +25,9 @@ if MODE == "exit77":
 if MODE == "phrase":
     sys.stdout.write("run kep-auth login\\n")
     raise SystemExit(3)
+if MODE == "forbidden403":
+    sys.stderr.write("Error: 认证失败: 接口禁止访问 (HTTP 403)\\n")
+    raise SystemExit(3)
 sys.stdout.buffer.write(b"payload\\x00ok\\n")
 raise SystemExit(0)
 """,
@@ -121,6 +124,30 @@ def test_install_kep_cli_shim_detects_auth_failure_from_output(tmp_path: Path):
     assert "【Hermes】kep-cli online 需要授权" in result.stderr
 
 
+def test_install_kep_cli_shim_relays_forbidden_as_permission_denied(tmp_path: Path):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
+    shim_dir = tmp_path / "shim"
+    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"ocean-cli": str(real_bin)})
+
+    env = os.environ.copy()
+    env["FAKE_KEP_MODE"] = "forbidden403"
+    result = subprocess.run(
+        [str(wrapper), "--env", "pre", "jd-adjust", "jd-adjust-list"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 3
+    assert "接口禁止访问 (HTTP 403)" in result.stderr
+    assert "【Hermes】kep-cli pre 接口禁止访问" in result.stderr
+    assert "当前账号已登录但没有该接口/数据权限" in result.stderr
+    assert "需要授权" not in result.stderr
+
+
 def test_install_kep_cli_shim_success_stdout_matches_real_binary(tmp_path: Path):
     from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
 
@@ -164,4 +191,3 @@ def test_install_kep_cli_shim_blocks_recursive_real_binary(tmp_path: Path):
     assert result.returncode == 127
     assert "shim" in result.stderr.lower()
     assert "real" in result.stderr.lower()
-

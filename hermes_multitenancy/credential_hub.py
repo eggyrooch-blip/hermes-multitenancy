@@ -926,6 +926,8 @@ def kep_auth_state_line(
             f"【系统已核实(勿再自行探活)】kep-cli pre={_segment('pre')}；online={_segment('online')}。"
             "pre 已登录就直接用 ocean-cli --env pre 取数；pre 未登录就只引导用户在连接器认证 "
             "kep-cli pre，不要声称 online 也失败、不要去掉 --profile。"
+            "如果 ocean-cli 返回 HTTP 403 或 接口禁止访问，这是已登录账号没有该接口/数据权限；"
+            "如实告知无权限，不要要求用户重新登录。只有 HTTP 401/not logged in 才按认证失效处理。"
         )
     except Exception:
         return None
