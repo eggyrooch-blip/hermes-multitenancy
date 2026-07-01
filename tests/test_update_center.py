@@ -550,6 +550,32 @@ def test_kep_sync_cli_from_registry_uses_live_manifest(monkeypatch, tmp_path: Pa
     assert [s.system for s in captured["systems"]] == ["asgard"]
 
 
+def test_kep_sync_cli_exit_code_reflects_skill_refresh_failure(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_cli
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice").mkdir(parents=True)
+
+    def fake_sync(**_kwargs):
+        return {"systems": [{"action": "updated"}], "skills": [
+            {"skill_path": "Keep/kep-hades-cli", "action": "quarantined", "reason": "skill-refresh-failed: read timeout"},
+        ]}
+
+    monkeypatch.setattr(update_center_cli, "build_kep_systems_from_registry", lambda **_k: [])
+    monkeypatch.setattr(update_center_cli, "sync_kep_cli_systems", fake_sync)
+    rc = update_center_cli.main(["--shared-home", str(shared), "kep-sync", "--from-registry"])
+    assert rc == 2  # real skill mirror failure fails the run
+
+    # benign profile-guard quarantine ("already exists") must NOT fail the run
+    def fake_sync_benign(**_kwargs):
+        return {"systems": [{"action": "updated"}], "skills": [
+            {"skill_path": "Keep/kep-hades-cli", "action": "quarantined", "reason": "profile skill already exists"},
+        ]}
+
+    monkeypatch.setattr(update_center_cli, "sync_kep_cli_systems", fake_sync_benign)
+    assert update_center_cli.main(["--shared-home", str(shared), "kep-sync", "--from-registry"]) == 0
+
+
 def test_kep_sync_cli_requires_a_manifest_source(tmp_path: Path) -> None:
     from hermes_multitenancy import update_center_cli
 

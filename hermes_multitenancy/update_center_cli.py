@@ -89,6 +89,12 @@ def _command_kep_sync(args: argparse.Namespace) -> int:
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     quarantined = [item for item in report["systems"] if item.get("action") == "quarantined"]
+    # A real embedded-skill mirror failure must also fail the run so ops automation
+    # notices; benign profile-guard quarantines ("already exists") are NOT failures.
+    quarantined += [
+        item for item in report.get("skills", [])
+        if item.get("action") == "quarantined" and str(item.get("reason", "")).startswith("skill-refresh-failed")
+    ]
     return 2 if quarantined else 0
 
 
