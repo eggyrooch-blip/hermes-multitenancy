@@ -221,6 +221,32 @@ def test_kep_cli_skill_refresh_preserves_curated_unmarked_source(tmp_path: Path)
     assert not (curated / ".kep-cli-managed").exists()
 
 
+def test_kep_cli_skill_refresh_prunes_stale_embedded_files(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice" / "skills").mkdir(parents=True)
+    sys = KepCliSystem(system="hades", binary="hades-cli", target_version="1.2.0")
+
+    # v1 embeds a references file...
+    ensure_kep_cli_skills(
+        [sys], shared_home=shared, profiles=["alice"],
+        runner=_kep_skill_runner({"hades": {"SKILL.md": "v1", "references/old.md": "gone soon"}}),
+    )
+    src = shared / "skills" / "Keep" / "kep-hades-cli"
+    assert (src / "references" / "old.md").exists()
+
+    # v2 drops it -> the managed source must mirror the embedded truth (prune stale).
+    ensure_kep_cli_skills(
+        [sys], shared_home=shared, profiles=["alice"],
+        runner=_kep_skill_runner({"hades": {"SKILL.md": "v2"}}),
+    )
+    assert (src / "SKILL.md").read_text(encoding="utf-8") == "v2"
+    assert not (src / "references" / "old.md").exists()
+    assert not (src / "references").exists()  # empty dir pruned
+    assert (src / ".kep-cli-managed").exists()
+
+
 def test_read_kep_cli_skill_files_rejects_path_traversal(tmp_path: Path) -> None:
     from hermes_multitenancy.update_center import read_kep_cli_skill_files
 

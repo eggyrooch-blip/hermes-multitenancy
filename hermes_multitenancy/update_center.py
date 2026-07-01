@@ -497,6 +497,8 @@ def _write_managed_skill_source(source: Path, files: list[dict[str, str]]) -> bo
     """
 
     source.mkdir(parents=True, exist_ok=True)
+    marker = source / KEP_CLI_MANAGED_MARKER
+    wanted = {source / item["path"] for item in files}
     changed = False
     for item in files:
         target = source / item["path"]
@@ -505,7 +507,17 @@ def _write_managed_skill_source(source: Path, files: list[dict[str, str]]) -> bo
         if not target.exists() or target.read_text(encoding="utf-8") != content:
             target.write_text(content, encoding="utf-8")
             changed = True
-    marker = source / KEP_CLI_MANAGED_MARKER
+    # Mirror the embedded set exactly: prune files that disappeared upstream.
+    # Safe because this source is fully kep-cli-managed (curated dirs never reach here).
+    for existing in list(source.rglob("*")):
+        if existing.is_file() and existing != marker and existing not in wanted:
+            existing.unlink()
+            changed = True
+    for stale_dir in sorted((p for p in source.rglob("*") if p.is_dir()), reverse=True):
+        try:
+            stale_dir.rmdir()  # only removes now-empty dirs
+        except OSError:
+            pass
     if not marker.exists():
         marker.write_text("", encoding="utf-8")
     return changed
