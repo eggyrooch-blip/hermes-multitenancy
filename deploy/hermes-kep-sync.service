@@ -15,7 +15,11 @@ Environment=HERMES_HOME=/home/hermes/.hermes
 Environment=HOME=/home/hermes
 Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin:/usr/bin:/bin
 # 从注册表现生成清单：aidock 新增系统次日自动纳管，无需改配置。
-ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_cli kep-sync --from-registry
+# --no-profile-sync：kep-sync 只维护"中央能力池"（共享二进制 + 共享 skill 源内容），
+# 绝不把 skill 铺给 profile。谁拿哪些 skill 由既有分发层决定（profile-skill-defaults /
+# skill-distribution → _sync_default_profile_skills）与专家 role-override（按角色精简）。
+# 这样能力池永远最新，而每个 profile/专家的上下文保持精简、不被全量 CLI skill 稀释。
+ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_cli kep-sync --from-registry --no-profile-sync
 Nice=10
 IOSchedulingClass=idle
 

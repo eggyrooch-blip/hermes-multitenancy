@@ -77,13 +77,31 @@ shared home. Existing profile-local or organization-managed skills are not
 overwritten; they are reported as quarantined so an operator can inspect them
 without breaking a user's current skill surface.
 
-## Skill Sync
+## Skill Sync — central pool, not fan-out
 
-For new `kep-cli` systems, Update Center can ensure wrapper skills named
-`Keep/kep-<system>-cli`. Existing shared skills are preserved; generated wrapper
-skills are only a fallback. Profile installs are symlinks managed through the
-existing skill registry, so personal/foreign skill ownership rules continue to
-apply.
+Update Center refreshes each system's skill CONTENT at the shared source
+`Keep/kep-<system>-cli` from the CLI's embedded `SKILL.md` (via
+`kep-cli skills list/read`), so the source is always a matched pair with the
+binary. Existing shared skills marked `.kep-cli-managed` are refreshed (new/
+changed files written, files dropped upstream pruned); curated (un-marked)
+skills are never overwritten. When a system CLI predates embedded skills it
+degrades gracefully (keeps existing / writes a stub); a real read error is
+surfaced as a quarantined skill row and fails the run's exit code.
+
+**Deployment runs pool-only (`--no-profile-sync`).** Update Center's job is to
+keep the central capability pool (shared binaries + shared skill sources) fresh
+— it does NOT decide which profile sees which skill. That fan-out stays owned by
+the existing distribution layer (`profile-skill-defaults.yaml` /
+`skill-distribution.yaml` → `_sync_default_profile_skills`) and by expert
+role-override (which scopes each expert to its curated subtractive skill set).
+Keeping fan-out out of `kep-sync` is deliberate: pushing every business-CLI
+skill into every profile would bloat agent context and dilute an expert's
+focused toolset. Profiles/experts pull selectively from the always-fresh pool
+via symlinks, so a source refresh propagates to exactly the profiles that
+already link it — no extra context, no expert-role conflict.
+
+The `--profile` / all-profiles fan-out path remains available for explicit,
+scoped use, but is off in the standardized timer deployment.
 
 ## Safety Boundaries
 
