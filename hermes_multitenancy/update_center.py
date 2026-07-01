@@ -323,7 +323,7 @@ def sync_kep_cli_systems(
     ]
     for system in normalized_systems:
         rows.append(_sync_one_kep_system(system, shared_bin=shared_bin, resolve_binary=resolve, runner=run, ledger=ledger))
-    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or ())
+    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or (), runner=run)
     report = {"component": "kep-cli", "systems": rows, "skills": skill_rows, "secret_free": True}
     ledger.append("kep_cli_sync_completed", component="kep-cli", systems=rows)
     return redact(report)
@@ -391,17 +391,20 @@ def ensure_kep_cli_skills(
     shared_home: Path,
     profiles: Iterable[str],
     category: str = "Keep",
+    runner: Runner | None = None,
 ) -> list[dict[str, Any]]:
-    """Ensure each kep-cli system has a shared wrapper skill and profile link.
+    """Ensure each kep-cli system has a shared skill (authoritative embedded content) and profile link.
 
-    Existing shared skill content is preserved; generated wrappers are only a
-    fallback for newly introduced kep-cli systems that have no curated skill yet.
+    Skill content is refreshed from the system CLI's embedded SKILL.md via
+    ``kep-cli skills read`` so it stays a matched pair with the binary. Curated
+    (human-authored, un-marked) shared skills are never overwritten; a generated
+    stub is only a fallback when the system CLI has no embedded skill yet.
     """
 
     rows: list[dict[str, Any]] = []
     for system in systems:
         skill_path = f"{category}/kep-{system.system}-cli"
-        source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system)
+        source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner)
         for profile in profiles:
             profile_home = shared_home / "profiles" / profile
             if not profile_home.is_dir():
@@ -446,14 +449,72 @@ def _read_profile_skill_manifest(path: Path) -> dict[str, Any]:
     return skills if isinstance(skills, dict) else {}
 
 
-def _ensure_kep_cli_skill_source(shared_home: Path, *, skill_path: str, system: KepCliSystem) -> Path:
-    source = shared_home / "skills" / skill_path
-    skill_md = source / "SKILL.md"
-    if skill_md.exists():
-        return source
+KEP_CLI_MANAGED_MARKER = ".kep-cli-managed"
+
+
+def read_kep_cli_skill_files(system: str, *, runner: Runner | None = None) -> list[dict[str, str]] | None:
+    """Read a system CLI's embedded skill files via ``kep-cli skills list/read``.
+
+    Returns ``[{"path", "content"}]`` for every embedded file, or ``None`` when
+    the system CLI predates embedded skills (``unknown command "skills"``) or any
+    read fails — the caller then leaves the existing skill untouched (graceful
+    degradation while the per-system CLI rollout is in progress).
+    """
+
+    run = runner or _run_kep_cli
+    listed = _coerce_result(run(["kep-cli", "skills", "list", system]))
+    if listed["returncode"] != 0:
+        return None
+    try:
+        entries = json.loads(listed["stdout"] or "null")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    files: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rel = str(entry.get("path") or "").strip()
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            continue  # never write outside the skill source dir
+        read = _coerce_result(run(["kep-cli", "skills", "read", system, rel]))
+        if read["returncode"] != 0:
+            return None
+        files.append({"path": rel, "content": read["stdout"]})
+    return files or None
+
+
+def _is_kep_cli_managed(source: Path) -> bool:
+    return (source / KEP_CLI_MANAGED_MARKER).exists()
+
+
+def _write_managed_skill_source(source: Path, files: list[dict[str, str]]) -> bool:
+    """Write authoritative embedded files byte-exact; mark the source kep-cli-managed.
+
+    Idempotent — only rewrites files whose content changed. Returns True if
+    anything changed.
+    """
+
+    source.mkdir(parents=True, exist_ok=True)
+    changed = False
+    for item in files:
+        target = source / item["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = item["content"]
+        if not target.exists() or target.read_text(encoding="utf-8") != content:
+            target.write_text(content, encoding="utf-8")
+            changed = True
+    marker = source / KEP_CLI_MANAGED_MARKER
+    if not marker.exists():
+        marker.write_text("", encoding="utf-8")
+    return changed
+
+
+def _write_stub_skill_source(source: Path, system: KepCliSystem) -> None:
     source.mkdir(parents=True, exist_ok=True)
     title = f"kep {system.system} CLI"
-    skill_md.write_text(
+    (source / "SKILL.md").write_text(
         "\n".join(
             [
                 "---",
@@ -471,6 +532,26 @@ def _ensure_kep_cli_skill_source(shared_home: Path, *, skill_path: str, system: 
         ),
         encoding="utf-8",
     )
+    (source / KEP_CLI_MANAGED_MARKER).write_text("", encoding="utf-8")
+
+
+def _ensure_kep_cli_skill_source(
+    shared_home: Path, *, skill_path: str, system: KepCliSystem, runner: Runner | None = None
+) -> Path:
+    source = shared_home / "skills" / skill_path
+    skill_md = source / "SKILL.md"
+    # Curated (human-authored, un-marked) skill present -> never touch it.
+    if skill_md.exists() and not _is_kep_cli_managed(source):
+        return source
+    # Authoritative path: refresh from the system CLI's embedded SKILL.md.
+    files = read_kep_cli_skill_files(system.system, runner=runner)
+    if files:
+        _write_managed_skill_source(source, files)
+        return source
+    # Embedded skill not available yet (older system CLI) -> keep or stub.
+    if skill_md.exists():
+        return source
+    _write_stub_skill_source(source, system)
     return source
 
 
@@ -503,6 +584,84 @@ def resolve_kep_binary(binary: str) -> Path | None:
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return candidate.resolve()
     return None
+
+
+DEFAULT_TARGET_MARKER = "latest"
+
+
+def _read_installed_kep_version(system: str) -> str | None:
+    """Best-effort read of the locally installed version from the kep-cli version file.
+
+    kep-cli writes ``~/.kep-cli/systems/<system>/version`` as small YAML whose
+    first ``version:`` line holds the installed version string.
+    """
+
+    version_file = Path.home() / ".kep-cli" / "systems" / system / "version"
+    try:
+        text = version_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value or None
+    return None
+
+
+def build_kep_systems_from_registry(
+    *,
+    runner: Runner | None = None,
+    version_reader: Callable[[str], str | None] | None = None,
+    include_developing: bool = False,
+    target_marker: str = DEFAULT_TARGET_MARKER,
+) -> list[KepCliSystem]:
+    """Derive the kep-cli sync manifest live from ``kep-cli list --json``.
+
+    Removes the hand-maintained systems-file: a system newly registered in the
+    aidock registry surfaces here on the next sync. ``installed=false`` rows
+    become install candidates (``installed_version=None``); installed rows
+    become update candidates by pinning ``target_version`` to a never-equal
+    marker so :class:`KepCliSystem` reports ``needs_update``.
+    """
+
+    run = runner or _run_kep_cli
+    read_version = version_reader or _read_installed_kep_version
+    argv = ["kep-cli", "list", "--json"]
+    if include_developing:
+        argv.append("--all")
+    result = _coerce_result(run(argv))
+    if result["returncode"] != 0:
+        detail = (result["stderr"] or result["stdout"] or "no output").strip()
+        raise ValueError(f"kep-cli list --json failed (exit {result['returncode']}): {detail}")
+    try:
+        rows = json.loads(result["stdout"] or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"kep-cli list --json returned non-JSON output: {exc}") from exc
+    if not isinstance(rows, list):
+        raise ValueError("kep-cli list --json must return a JSON array")
+
+    systems: list[KepCliSystem] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        binary = str(row.get("bin_name") or "").strip()
+        if not name or not binary:
+            continue
+        status = str(row.get("status") or "").strip()
+        if status != "active" and not include_developing:
+            continue
+        installed = bool(row.get("installed"))
+        systems.append(
+            KepCliSystem(
+                system=name,
+                binary=binary,
+                target_version=target_marker,
+                installed_version=read_version(name) if installed else None,
+            )
+        )
+    return systems
 
 
 def _copy_binary_atomic(src: Path, dst: Path) -> dict[str, Any]:

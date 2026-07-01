@@ -125,11 +125,113 @@ def test_kep_cli_skill_sync_preserves_existing_profile_skill(tmp_path: Path) -> 
         [KepCliSystem(system="hades", binary="hades-cli", target_version="1.2.0")],
         shared_home=shared,
         profiles=["alice"],
+        runner=lambda _argv: {"returncode": 1, "stdout": "", "stderr": "unknown command"},
     )
 
     assert rows[0]["action"] == "quarantined"
     assert "already exists" in rows[0]["reason"]
     assert (existing / "SKILL.md").read_text(encoding="utf-8") == "curated profile skill"
+
+
+def _kep_skill_runner(embedded: dict[str, dict[str, str]]):
+    """Fake runner: install/update -> ok; skills list/read served from `embedded`.
+
+    embedded maps system -> {relpath: content}; a system absent from `embedded`
+    behaves like an older CLI without the `skills` command (returncode 1).
+    """
+
+    def runner(argv: list[str]) -> object:
+        if len(argv) >= 3 and argv[1] == "skills":
+            sub, system = argv[2], argv[3]
+            files = embedded.get(system)
+            if files is None:
+                return {"returncode": 1, "stdout": "", "stderr": 'unknown command "skills"'}
+            if sub == "list":
+                return {"returncode": 0, "stdout": json.dumps(
+                    [{"path": p, "size": len(c)} for p, c in files.items()]), "stderr": ""}
+            if sub == "read":
+                rel = argv[4] if len(argv) > 4 else "SKILL.md"
+                if rel not in files:
+                    return {"returncode": 1, "stdout": "", "stderr": "not found"}
+                return {"returncode": 0, "stdout": files[rel], "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    return runner
+
+
+def test_kep_cli_skill_refresh_writes_embedded_content(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice" / "skills").mkdir(parents=True)
+
+    rows = ensure_kep_cli_skills(
+        [KepCliSystem(system="hades", binary="hades-cli", target_version="1.2.0")],
+        shared_home=shared,
+        profiles=["alice"],
+        runner=_kep_skill_runner({"hades": {
+            "SKILL.md": "---\nname: kep-hades-cli\n---\nREAL EMBEDDED BODY",
+            "references/api.md": "# api reference",
+        }}),
+    )
+
+    src = shared / "skills" / "Keep" / "kep-hades-cli"
+    assert (src / "SKILL.md").read_text(encoding="utf-8") == "---\nname: kep-hades-cli\n---\nREAL EMBEDDED BODY"
+    assert (src / "references" / "api.md").read_text(encoding="utf-8") == "# api reference"
+    assert (src / ".kep-cli-managed").exists()
+    assert rows[0]["action"] == "ensured"
+    assert (shared / "profiles" / "alice" / "skills" / "Keep" / "kep-hades-cli").is_symlink()
+
+
+def test_kep_cli_skill_refresh_graceful_when_embedded_absent(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice" / "skills").mkdir(parents=True)
+
+    # `embedded` empty -> system CLI has no `skills` command -> stub fallback, no crash.
+    ensure_kep_cli_skills(
+        [KepCliSystem(system="hades", binary="hades-cli", target_version="1.2.0")],
+        shared_home=shared,
+        profiles=["alice"],
+        runner=_kep_skill_runner({}),
+    )
+
+    stub = (shared / "skills" / "Keep" / "kep-hades-cli" / "SKILL.md").read_text(encoding="utf-8")
+    assert "hades-cli" in stub  # generated stub, not a crash
+
+
+def test_kep_cli_skill_refresh_preserves_curated_unmarked_source(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice" / "skills").mkdir(parents=True)
+    curated = shared / "skills" / "Keep" / "kep-hades-cli"
+    curated.mkdir(parents=True)
+    (curated / "SKILL.md").write_text("hand-curated content", encoding="utf-8")  # no marker
+
+    ensure_kep_cli_skills(
+        [KepCliSystem(system="hades", binary="hades-cli", target_version="1.2.0")],
+        shared_home=shared,
+        profiles=["alice"],
+        runner=_kep_skill_runner({"hades": {"SKILL.md": "EMBEDDED WOULD OVERWRITE"}}),
+    )
+
+    assert (curated / "SKILL.md").read_text(encoding="utf-8") == "hand-curated content"
+    assert not (curated / ".kep-cli-managed").exists()
+
+
+def test_read_kep_cli_skill_files_rejects_path_traversal(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import read_kep_cli_skill_files
+
+    def runner(argv: list[str]) -> object:
+        if argv[1:3] == ["skills", "list"]:
+            return {"returncode": 0, "stdout": json.dumps(
+                [{"path": "../evil.md", "size": 1}, {"path": "/etc/passwd", "size": 1}]), "stderr": ""}
+        return {"returncode": 0, "stdout": "pwned", "stderr": ""}
+
+    # both entries are unsafe and skipped -> nothing to read -> None
+    assert read_kep_cli_skill_files("hades", runner=runner) is None
 
 
 def test_lark_cli_preflight_does_not_replace_binary(monkeypatch, tmp_path: Path) -> None:
@@ -298,6 +400,89 @@ def test_systems_file_rejects_unknown_keys(tmp_path: Path) -> None:
         assert "unknown key" in str(exc)
     else:
         raise AssertionError("unknown keys should be rejected")
+
+
+def test_build_kep_systems_from_registry_maps_install_and_update() -> None:
+    from hermes_multitenancy.update_center import build_kep_systems_from_registry
+
+    registry = [
+        {"name": "hades", "bin_name": "hades-cli", "status": "active", "installed": True},
+        {"name": "dune", "bin_name": "dune-cli", "status": "active", "installed": False},
+        {"name": "wip", "bin_name": "wip-cli", "status": "developing", "installed": False},
+    ]
+
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> object:
+        calls.append(argv)
+        return {"returncode": 0, "stdout": json.dumps(registry), "stderr": ""}
+
+    systems = build_kep_systems_from_registry(
+        runner=runner,
+        version_reader=lambda name: "1.1.0" if name == "hades" else None,
+    )
+
+    assert ["kep-cli", "list", "--json"] in calls
+    by_name = {s.system: s for s in systems}
+    # developing filtered out by default
+    assert set(by_name) == {"hades", "dune"}
+    # installed system -> update candidate (target 'latest' never equals installed version)
+    assert by_name["hades"].binary == "hades-cli"
+    assert by_name["hades"].installed_version == "1.1.0"
+    assert by_name["hades"].target_version == "latest"
+    assert by_name["hades"].needs_update is True
+    # newly registered system -> install candidate
+    assert by_name["dune"].installed_version is None
+    assert by_name["dune"].needs_install is True
+
+
+def test_build_kep_systems_from_registry_raises_on_cli_failure() -> None:
+    from hermes_multitenancy.update_center import build_kep_systems_from_registry
+
+    def runner(_argv: list[str]) -> object:
+        return {"returncode": 1, "stdout": "", "stderr": "not logged in"}
+
+    try:
+        build_kep_systems_from_registry(runner=runner)
+    except ValueError as exc:
+        assert "kep-cli list --json failed" in str(exc)
+    else:
+        raise AssertionError("cli failure should raise")
+
+
+def test_kep_sync_cli_from_registry_uses_live_manifest(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_cli
+    from hermes_multitenancy.update_center import KepCliSystem
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice").mkdir(parents=True)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        update_center_cli,
+        "build_kep_systems_from_registry",
+        lambda **kwargs: [KepCliSystem(system="asgard", binary="asgard-cli", target_version="latest")],
+    )
+
+    def fake_sync(**kwargs):
+        captured.update(kwargs)
+        return {"systems": [], "skills": []}
+
+    monkeypatch.setattr(update_center_cli, "sync_kep_cli_systems", fake_sync)
+
+    rc = update_center_cli.main(["--shared-home", str(shared), "kep-sync", "--from-registry"])
+
+    assert rc == 0
+    assert [s.system for s in captured["systems"]] == ["asgard"]
+
+
+def test_kep_sync_cli_requires_a_manifest_source(tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_cli
+
+    shared = tmp_path / ".hermes"
+    rc = update_center_cli.main(["--shared-home", str(shared), "kep-sync"])
+
+    assert rc == 1
 
 
 def test_pyproject_exposes_update_center_cli() -> None:

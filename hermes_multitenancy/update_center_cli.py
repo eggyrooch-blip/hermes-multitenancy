@@ -10,6 +10,7 @@ from .update_center import (
     KepCliSystem,
     UpdateLedger,
     apply_additive_plugin_update,
+    build_kep_systems_from_registry,
     check_lark_cli_candidate,
     default_shared_home,
     scan_lark_cli_notice,
@@ -74,7 +75,12 @@ def _profile_targets(args: argparse.Namespace) -> list[str]:
 
 
 def _command_kep_sync(args: argparse.Namespace) -> int:
-    systems = _load_systems(args.systems_file)
+    if args.from_registry:
+        systems = build_kep_systems_from_registry(include_developing=args.include_developing)
+    elif args.systems_file:
+        systems = _load_systems(args.systems_file)
+    else:
+        raise ValueError("kep-sync requires --systems-file or --from-registry")
     report = sync_kep_cli_systems(
         systems=systems,
         shared_home=args.shared_home,
@@ -116,7 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_lark.set_defaults(func=_command_lark_preflight)
 
     p_kep = sub.add_parser("kep-sync", help="Install/update kep-cli systems and sync shared sandbox bin")
-    p_kep.add_argument("--systems-file", type=Path, required=True)
+    p_kep.add_argument("--systems-file", type=Path, default=None, help="Operator-provided manifest; omit when using --from-registry")
+    p_kep.add_argument("--from-registry", action="store_true", help="Build the manifest live from `kep-cli list --json` (auto-picks newly registered systems)")
+    p_kep.add_argument("--include-developing", action="store_true", help="With --from-registry, also include status=developing systems")
     p_kep.add_argument("--profile", action="append", default=[], help="Profile to sync skills for; defaults to all profiles")
     p_kep.add_argument("--no-profile-sync", action="store_true", help="Only sync shared binaries and shared skill sources")
     p_kep.set_defaults(func=_command_kep_sync)

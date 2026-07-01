@@ -1,0 +1,11 @@
+# 每日触发 hermes-kep-sync.service（凌晨低峰，随机错峰）。
+[Unit]
+Description=Run Hermes kep-cli registry sync daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

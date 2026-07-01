@@ -20,23 +20,31 @@ The package exposes:
 ```bash
 hermes-multitenancy-update-center scan-lark-notice --file notice.txt
 hermes-multitenancy-update-center lark-preflight --profile alice --open-id ou_xxx --target-version v1.0.59
-hermes-multitenancy-update-center kep-sync --systems-file kep-systems.json
+hermes-multitenancy-update-center kep-sync --from-registry            # recommended: live manifest
+hermes-multitenancy-update-center kep-sync --systems-file kep-systems.json   # pinned manifest
 ```
 
 ## Daily kep-cli Sync
 
 Production deployments should run `kep-sync` from an operator-owned scheduler
-such as a user-level systemd timer. The scheduler should not depend on an
-interactive shell profile; set `HERMES_HOME`, `HOME`, and `PATH` explicitly so
-both `kep-cli` and the Hermes virtualenv entry point resolve the same way they
-do for sandboxed agent runs.
+such as a user-level systemd timer (see `deploy/hermes-kep-sync.{service,timer}`).
+The scheduler should not depend on an interactive shell profile; set
+`HERMES_HOME`, `HOME`, and `PATH` explicitly so both `kep-cli` and the Hermes
+virtualenv entry point resolve the same way they do for sandboxed agent runs.
 
-Prefer generating the `kep-sync` manifest immediately before each run from
-`kep-cli list` instead of hand-maintaining a static list. Include every active
-system row, set `installed_version` from the local system version file when it
-exists, and set `target_version` to a deployment-owned "latest" marker so
-installed systems use `kep-cli update <system>` while newly discovered systems
-use `kep-cli install <system>`.
+Prefer `--from-registry`: it builds the manifest live from `kep-cli list --json`
+instead of a hand-maintained file, so a system newly registered in the aidock
+registry is picked up automatically on the next run — no code or config change.
+For each active row it sets `installed_version` from the local
+`~/.kep-cli/systems/<system>/version` file (empty when not installed) and pins
+`target_version` to a `latest` marker, so installed systems run
+`kep-cli update <system>` while newly registered systems run
+`kep-cli install <system>`. Pass `--include-developing` to also sync
+`status=developing` systems. A pinned `--systems-file` remains available when a
+deployment needs an explicit, reviewed system set.
+
+If `kep-cli list --json` fails (e.g. not logged in), `--from-registry` aborts
+with a non-zero exit and syncs nothing, leaving active binaries untouched.
 
 The timer should keep full JSON output in an internal report file and print
 only a short summary to the journal, for example system action counts, skill
