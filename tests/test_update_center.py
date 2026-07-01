@@ -462,6 +462,25 @@ def test_build_kep_systems_from_registry_maps_install_and_update() -> None:
     assert by_name["dune"].needs_install is True
 
 
+def test_build_kep_systems_from_registry_include_developing_excludes_other_statuses() -> None:
+    from hermes_multitenancy.update_center import build_kep_systems_from_registry
+
+    registry = [
+        {"name": "act", "bin_name": "act-cli", "status": "active", "installed": False},
+        {"name": "dev", "bin_name": "dev-cli", "status": "developing", "installed": False},
+        {"name": "dead", "bin_name": "dead-cli", "status": "deprecated", "installed": False},
+    ]
+
+    def runner(_argv: list[str]) -> object:
+        return {"returncode": 0, "stdout": json.dumps(registry), "stderr": ""}
+
+    # include_developing must add developing ONLY, never deprecated/disabled rows.
+    names = {s.system for s in build_kep_systems_from_registry(runner=runner, include_developing=True)}
+    assert names == {"act", "dev"}
+    default = {s.system for s in build_kep_systems_from_registry(runner=runner)}
+    assert default == {"act"}
+
+
 def test_build_kep_systems_from_registry_raises_on_cli_failure() -> None:
     from hermes_multitenancy.update_center import build_kep_systems_from_registry
 

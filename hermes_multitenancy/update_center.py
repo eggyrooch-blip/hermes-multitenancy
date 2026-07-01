@@ -653,6 +653,7 @@ def build_kep_systems_from_registry(
     if not isinstance(rows, list):
         raise ValueError("kep-cli list --json must return a JSON array")
 
+    allowed_statuses = {"active"} | ({"developing"} if include_developing else set())
     systems: list[KepCliSystem] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -662,7 +663,7 @@ def build_kep_systems_from_registry(
         if not name or not binary:
             continue
         status = str(row.get("status") or "").strip()
-        if status != "active" and not include_developing:
+        if status not in allowed_statuses:  # never touch deprecated/disabled rows
             continue
         installed = bool(row.get("installed"))
         systems.append(
