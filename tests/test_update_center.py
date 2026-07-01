@@ -247,6 +247,35 @@ def test_kep_cli_skill_refresh_prunes_stale_embedded_files(tmp_path: Path) -> No
     assert (src / ".kep-cli-managed").exists()
 
 
+def test_kep_cli_skill_refresh_surfaces_real_read_failure(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / "alice" / "skills").mkdir(parents=True)
+    # pre-existing kep-cli-managed source that must NOT be silently replaced by a stale stub
+    src = shared / "skills" / "Keep" / "kep-hades-cli"
+    src.mkdir(parents=True)
+    (src / "SKILL.md").write_text("prior embedded content", encoding="utf-8")
+    (src / ".kep-cli-managed").write_text("", encoding="utf-8")
+
+    def runner(argv: list[str]) -> object:
+        if argv[1:3] == ["skills", "list"]:  # CLI advertises skills (new build)
+            return {"returncode": 0, "stdout": json.dumps([{"path": "SKILL.md", "size": 9}]), "stderr": ""}
+        if argv[1:3] == ["skills", "read"]:  # ...but read fails (transient/runtime) -> real error
+            return {"returncode": 1, "stdout": "", "stderr": "runtime error: backend timeout"}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    rows = ensure_kep_cli_skills(
+        [KepCliSystem(system="hades", binary="hades-cli", target_version="1.2.0")],
+        shared_home=shared, profiles=["alice"], runner=runner,
+    )
+
+    assert rows[0]["action"] == "quarantined"
+    assert "skill-refresh-failed" in rows[0]["reason"]
+    # existing content preserved, NOT overwritten or blanked
+    assert (src / "SKILL.md").read_text(encoding="utf-8") == "prior embedded content"
+
+
 def test_read_kep_cli_skill_files_rejects_path_traversal(tmp_path: Path) -> None:
     from hermes_multitenancy.update_center import read_kep_cli_skill_files
 

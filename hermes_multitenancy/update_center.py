@@ -404,7 +404,13 @@ def ensure_kep_cli_skills(
     rows: list[dict[str, Any]] = []
     for system in systems:
         skill_path = f"{category}/kep-{system.system}-cli"
-        source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner)
+        try:
+            source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner)
+        except ValueError as exc:
+            # Real embedded-skill read error (not old-CLI): surface it, leave the
+            # existing skill untouched, and keep syncing other systems.
+            rows.append({"skill_path": skill_path, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})
+            continue
         for profile in profiles:
             profile_home = shared_home / "profiles" / profile
             if not profile_home.is_dir():
@@ -464,13 +470,19 @@ def read_kep_cli_skill_files(system: str, *, runner: Runner | None = None) -> li
     run = runner or _run_kep_cli
     listed = _coerce_result(run(["kep-cli", "skills", "list", system]))
     if listed["returncode"] != 0:
-        return None
+        blob = f"{listed['stderr']} {listed['stdout']}".lower()
+        if "unknown command" in blob:
+            return None  # older system CLI without embedded skills -> graceful skip
+        # skills command exists but failed (auth/runtime): a real error, not old-CLI.
+        raise ValueError(f"kep-cli skills list {system} failed: {(listed['stderr'] or listed['stdout']).strip()}")
     try:
         entries = json.loads(listed["stdout"] or "null")
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"kep-cli skills list {system} returned non-JSON: {exc}") from exc
+    if entries is None:
+        return None  # explicit no-skills
     if not isinstance(entries, list):
-        return None
+        raise ValueError(f"kep-cli skills list {system} must return a JSON array")
     files: list[dict[str, str]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -480,7 +492,8 @@ def read_kep_cli_skill_files(system: str, *, runner: Runner | None = None) -> li
             continue  # never write outside the skill source dir
         read = _coerce_result(run(["kep-cli", "skills", "read", system, rel]))
         if read["returncode"] != 0:
-            return None
+            # list succeeded, so the CLI advertises this file; a read failure is real, not old-CLI.
+            raise ValueError(f"kep-cli skills read {system} {rel} failed: {(read['stderr'] or read['stdout']).strip()}")
         files.append({"path": rel, "content": read["stdout"]})
     return files or None
 
