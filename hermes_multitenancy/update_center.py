@@ -324,7 +324,7 @@ def sync_kep_cli_systems(
     ]
     for system in normalized_systems:
         rows.append(_sync_one_kep_system(system, shared_bin=shared_bin, resolve_binary=resolve, runner=run, ledger=ledger))
-    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or (), runner=run, adopt=adopt)
+    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or (), runner=run, adopt=adopt, ledger=ledger)
     report = {"component": "kep-cli", "systems": rows, "skills": skill_rows, "secret_free": True}
     ledger.append("kep_cli_sync_completed", component="kep-cli", systems=rows)
     return redact(report)
@@ -394,6 +394,7 @@ def ensure_kep_cli_skills(
     category: str = "Keep",
     runner: Runner | None = None,
     adopt: bool = False,
+    ledger: UpdateLedger | None = None,
 ) -> list[dict[str, Any]]:
     """Ensure each kep-cli system has a shared skill (authoritative embedded content) and profile link.
 
@@ -407,7 +408,7 @@ def ensure_kep_cli_skills(
     for system in systems:
         skill_path = f"{category}/kep-{system.system}-cli"
         try:
-            source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner, adopt=adopt)
+            source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner, adopt=adopt, ledger=ledger)
         except ValueError as exc:
             # Real embedded-skill read error (not old-CLI): surface it, leave the
             # existing skill untouched, and keep syncing other systems.
@@ -595,10 +596,15 @@ def _write_stub_skill_source(source: Path, system: KepCliSystem) -> None:
 
 
 def _ensure_kep_cli_skill_source(
-    shared_home: Path, *, skill_path: str, system: KepCliSystem, runner: Runner | None = None, adopt: bool = False
+    shared_home: Path, *, skill_path: str, system: KepCliSystem, runner: Runner | None = None, adopt: bool = False,
+    ledger: UpdateLedger | None = None,
 ) -> Path:
     source = shared_home / "skills" / skill_path
     skill_md = source / "SKILL.md"
+    if source.is_symlink() and not adopt:
+        # Never silently coexist with a symlinked source: surface it so ops sees
+        # the anomaly (run adopt to materialize it into a real directory).
+        raise ValueError(f"shared skill source {source} is a symlink; run kep-sync --adopt to materialize it")
     # Un-marked existing skill: never touch it on normal runs; adopt takes it
     # over (pre-adoption tree archived for audit/rollback) and marks it managed.
     if skill_md.exists() and not _is_kep_cli_managed(source):
@@ -607,18 +613,21 @@ def _ensure_kep_cli_skill_source(
         files = read_kep_cli_skill_files(system.system, runner=runner)
         if not files:
             return source  # no embedded skill to adopt from; keep existing
-        _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
-        if source.is_symlink():
-            _materialize_symlink_source(source)
+        archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
+        target = _materialize_symlink_source(source) if source.is_symlink() else None
         _write_managed_skill_source(source, files)
+        if ledger is not None:
+            ledger.append("skill_adopted", component="kep-cli", skill=skill_path, archive=archive, symlink_target=target)
         return source
     if adopt and source.is_symlink():
         # Already-managed but symlinked (legacy layout): materialize on adopt.
         files = read_kep_cli_skill_files(system.system, runner=runner)
         if files:
-            _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
-            _materialize_symlink_source(source)
+            archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
+            target = _materialize_symlink_source(source)
             _write_managed_skill_source(source, files)
+            if ledger is not None:
+                ledger.append("skill_adopted", component="kep-cli", skill=skill_path, archive=archive, symlink_target=target)
             return source
     # Authoritative path: refresh from the system CLI's embedded SKILL.md.
     files = read_kep_cli_skill_files(system.system, runner=runner)
@@ -864,6 +873,10 @@ def sync_lark_cli_skills(
         source = shared_home / "skills" / name
         skill_md = source / "SKILL.md"
         managed = (source / LARK_CLI_MANAGED_MARKER).exists()
+        if source.is_symlink() and not adopt:
+            rows.append({"skill": name, "action": "quarantined",
+                         "reason": f"skill-refresh-failed: shared skill source {source} is a symlink; run lark-skill-sync --adopt to materialize it"})
+            continue
         if skill_md.exists() and not managed and not adopt:
             rows.append({"skill": name, "action": "skipped", "reason": "existing un-adopted source (run with --adopt to take over)"})
             continue
@@ -873,9 +886,9 @@ def sync_lark_cli_skills(
                 rows.append({"skill": name, "action": "skipped", "reason": "local lark-cli has no embedded skills verb"})
                 continue
             if adopt and (source.is_symlink() or (skill_md.exists() and not managed)):
-                _archive_skill_source_for_adopt(source, shared_home=shared_home, name=name)
-                if source.is_symlink():
-                    _materialize_symlink_source(source)
+                archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=name)
+                target = _materialize_symlink_source(source) if source.is_symlink() else None
+                ledger.append("skill_adopted", component="lark-cli-skills", skill=name, archive=archive, symlink_target=target)
             changed = _write_managed_skill_source(source, files, marker_name=LARK_CLI_MANAGED_MARKER)
         except ValueError as exc:
             rows.append({"skill": name, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})

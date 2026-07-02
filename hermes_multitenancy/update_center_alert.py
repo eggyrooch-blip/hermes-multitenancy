@@ -57,6 +57,14 @@ def send_failure_alert(unit: str, *, webhook: str | None = None, opener=None) ->
     except (OSError, ValueError) as exc:
         print(f"error: webhook post failed: {exc}", file=sys.stderr)
         return 1
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and parsed.get("code") not in (0, None):
+        # Feishu webhooks report failures as HTTP 200 + non-zero code.
+        print(f"error: feishu webhook rejected message: {body[:200]}", file=sys.stderr)
+        return 1
     print(body[:200])
     return 0
 

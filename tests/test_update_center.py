@@ -854,3 +854,90 @@ def test_refresh_refuses_symlinked_source_and_adopt_materializes(tmp_path: Path)
     assert (store / "SKILL.md").read_text(encoding="utf-8") == "legacy store content"  # untouched now
     archives = list((shared / "update-center" / "adopt-archive").glob("lark-im-*"))
     assert archives and (archives[0] / ".adopt-meta.json").exists()
+
+
+def test_unmarked_symlink_sources_quarantine_on_daily_refresh(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, UpdateLedger, ensure_kep_cli_skills, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    # lark: UNMARKED symlinked source (no .lark-cli-managed) -> quarantine, not silent skip
+    store = tmp_path / "store" / "lark-im"
+    store.mkdir(parents=True)
+    (store / "SKILL.md").write_text("legacy", encoding="utf-8")
+    (shared / "skills").mkdir(parents=True)
+    (shared / "skills" / "lark-im").symlink_to(store)
+    report = sync_lark_cli_skills(
+        shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"),
+        runner=_lark_skill_runner({"lark-im": {"SKILL.md": "embedded"}}),
+    )
+    assert report["skills"][0]["action"] == "quarantined"
+    assert "symlink" in report["skills"][0]["reason"]
+
+    # kep: symlinked source -> quarantine on normal run
+    kstore = tmp_path / "store" / "kep-hades-cli"
+    kstore.mkdir(parents=True)
+    (kstore / "SKILL.md").write_text("legacy kep", encoding="utf-8")
+    (shared / "skills" / "Keep").mkdir(parents=True)
+    (shared / "skills" / "Keep" / "kep-hades-cli").symlink_to(kstore)
+    rows = ensure_kep_cli_skills(
+        [KepCliSystem(system="hades", binary="hades-cli", target_version="latest")],
+        shared_home=shared, profiles=[], runner=_kep_skill_runner({"hades": {"SKILL.md": "embedded"}}),
+    )
+    assert rows[0]["action"] == "quarantined"
+    assert "symlink" in rows[0]["reason"]
+
+
+def test_adopt_records_ledger_event_with_symlink_target(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, UpdateLedger, sync_kep_cli_systems, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    store = tmp_path / "store" / "lark-im"
+    store.mkdir(parents=True)
+    (store / "SKILL.md").write_text("legacy", encoding="utf-8")
+    (shared / "skills").mkdir(parents=True)
+    (shared / "skills" / "lark-im").symlink_to(store)
+    ledger = UpdateLedger(tmp_path / "l.jsonl")
+
+    sync_lark_cli_skills(shared_home=shared, ledger=ledger, adopt=True,
+                         runner=_lark_skill_runner({"lark-im": {"SKILL.md": "embedded"}}))
+    events = [e for e in ledger.read_events() if e["event"] == "skill_adopted"]
+    assert events and events[0]["skill"] == "lark-im"
+    assert events[0]["symlink_target"] and "store" in events[0]["symlink_target"]
+    assert events[0]["archive"]
+
+    # kep adopt via top-level sync also ledgers the adoption
+    curated = shared / "skills" / "Keep" / "kep-hades-cli"
+    curated.mkdir(parents=True)
+    (curated / "SKILL.md").write_text("hand version", encoding="utf-8")
+    source_bin = tmp_path / "bins"
+    source_bin.mkdir()
+    (source_bin / "hades-cli").write_text("bin", encoding="utf-8")
+    (source_bin / "hades-cli").chmod(0o755)
+
+    def runner(argv: list[str]) -> object:
+        return _kep_skill_runner({"hades": {"SKILL.md": "embedded kep"}})(argv)
+
+    sync_kep_cli_systems(
+        systems=[KepCliSystem(system="hades", binary="hades-cli", target_version="latest", installed_version="1.0")],
+        shared_home=shared, ledger=ledger, profiles=[],
+        resolve_binary=lambda b: source_bin / b, runner=runner, adopt=True,
+    )
+    kevents = [e for e in ledger.read_events() if e["event"] == "skill_adopted" and e.get("component") == "kep-cli"]
+    assert kevents and kevents[0]["skill"] == "Keep/kep-hades-cli"
+    assert (curated / "SKILL.md").read_text(encoding="utf-8") == "embedded kep"
+
+
+def test_alert_rejects_feishu_error_code(monkeypatch) -> None:
+    from hermes_multitenancy import update_center_alert as ua
+
+    class _Resp:
+        def read(self):
+            return b'{"code":19001,"msg":"param invalid"}'
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setenv(ua.WEBHOOK_ENV, "https://open.feishu.cn/open-apis/bot/v2/hook/test-id")
+    monkeypatch.setattr(ua, "_journal_tail", lambda _u: "x")
+    assert ua.send_failure_alert("u.service", opener=lambda r, timeout=0: _Resp()) == 1
