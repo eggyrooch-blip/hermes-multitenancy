@@ -4,6 +4,8 @@
 Description=Hermes kep-cli registry sync (install/update systems from `kep-cli list --json`)
 After=network-online.target
 Wants=network-online.target
+# 失败即告警：模板单元读 prod 环境文件里的飞书群 webhook（URL 不入库）。
+OnFailure=hermes-update-center-alert@%n.service
 
 [Service]
 Type=oneshot

@@ -87,6 +87,7 @@ def _command_kep_sync(args: argparse.Namespace) -> int:
         shared_home=args.shared_home,
         ledger=_ledger(args),
         profiles=_profile_targets(args),
+        adopt=args.adopt,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     quarantined = [item for item in report["systems"] if item.get("action") == "quarantined"]
@@ -146,6 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_kep.add_argument("--include-developing", action="store_true", help="With --from-registry, also include status=developing systems")
     p_kep.add_argument("--profile", action="append", default=[], help="Profile to sync skills for; defaults to all profiles")
     p_kep.add_argument("--no-profile-sync", action="store_true", help="Only sync shared binaries and shared skill sources")
+    p_kep.add_argument("--adopt", action="store_true", help="Take over un-managed existing shared skill sources (archives the old tree, materializes symlinks, stamps .kep-cli-managed)")
     p_kep.set_defaults(func=_command_kep_sync)
 
     p_lark_skills = sub.add_parser("lark-skill-sync", help="Mirror lark-cli embedded skills into shared skill sources (pool-only; binaries untouched)")

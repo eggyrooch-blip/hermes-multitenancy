@@ -100,6 +100,15 @@ focused toolset. Profiles/experts pull selectively from the always-fresh pool
 via symlinks, so a source refresh propagates to exactly the profiles that
 already link it — no extra context, no expert-role conflict.
 
+**lark-\* exception (platform behavior, predates Update Center):** the org sync
+auto-distributes every shared source whose name starts with `lark-`
+(`_AUTO_DISTRIBUTE_SHARED_SKILL_PREFIXES` in `sync/feishu_org.py`) to every
+profile as a brokered-token symlink, regardless of the defaults/distribution
+files. Consequence: when `lark-skill-sync` creates a NEW `lark-*` source in the
+pool (a skill newly embedded in a lark-cli release), it will fan out to all
+profiles at the next org sync. Treat adding new lark skills to the pool as an
+org-wide distribution event, not a pool-only one.
+
 The `--profile` / all-profiles fan-out path remains available for explicit,
 scoped use, but is off in the standardized timer deployment.
 
@@ -122,6 +131,27 @@ clobbered silently. Run `lark-skill-sync --adopt` once (optionally scoped with
 `--skill <name>`) to take them over; from then on the daily timer
 (`deploy/hermes-lark-skill-sync.{service,timer}`) keeps them matched to the
 installed lark-cli version.
+
+## Failure Alerting
+
+Both sync services carry `OnFailure=hermes-update-center-alert@%n.service`. The
+alert unit posts the failed unit name plus a redacted journal tail to a Feishu
+group webhook. The webhook URL is secret material: it lives ONLY in the prod
+EnvironmentFile `~/.hermes/update-center/alert.env`
+(`HERMES_UPDATE_CENTER_WEBHOOK=...`), never in this repository. This is what
+surfaces silent rot such as an expired kep-auth token (the sync would otherwise
+fail red daily with nobody watching).
+
+## Adoption & Symlink Policy
+
+- Daily refresh REFUSES to write through a symlinked shared source (quarantine,
+  exit 2): writing through a symlink mutates whatever legacy store it points at.
+- `--adopt` (both `kep-sync --adopt` and `lark-skill-sync --adopt`) takes over
+  un-managed existing sources: the pre-adoption tree is archived to
+  `~/.hermes/update-center/adopt-archive/<name>-<ts>/` (audit + rollback), a
+  symlinked source is materialized into a real directory, content is mirrored
+  from the embedded truth, and the managed marker is stamped. Adoption is a
+  deliberate operator action, never something the daily timer does.
 
 ## Safety Boundaries
 

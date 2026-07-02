@@ -5,6 +5,8 @@
 Description=Hermes lark-cli embedded skill pool sync (content mirror only; binaries untouched)
 After=network-online.target
 Wants=network-online.target
+# 失败即告警：模板单元读 prod 环境文件里的飞书群 webhook（URL 不入库）。
+OnFailure=hermes-update-center-alert@%n.service
 
 [Service]
 Type=oneshot

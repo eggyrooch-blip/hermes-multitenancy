@@ -762,3 +762,95 @@ def test_lark_skill_sync_cli_passes_adopt_and_skill_filter(monkeypatch, tmp_path
     assert rc == 0
     assert captured["adopt"] is True
     assert list(captured["skills"]) == ["lark-im"]
+
+
+def test_alert_module_posts_redacted_feishu_text(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_alert as ua
+
+    captured: dict[str, object] = {}
+
+    class _Resp:
+        def read(self):
+            return b'{"code":0}'
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(request, timeout=0):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _Resp()
+
+    monkeypatch.setenv(ua.WEBHOOK_ENV, "https://open.feishu.cn/open-apis/bot/v2/hook/test-id")
+    monkeypatch.setattr(ua, "_journal_tail", lambda _u: "boom token=abc.def retry later")
+
+    rc = ua.send_failure_alert("hermes-kep-sync.service", opener=fake_open)
+
+    assert rc == 0
+    assert captured["url"].endswith("/hook/test-id")
+    body = captured["body"]
+    assert body["msg_type"] == "text"
+    text = body["content"]["text"]
+    assert "hermes-kep-sync.service" in text
+    assert "abc.def" not in text and "[REDACTED]" in text  # journal passed through redact()
+
+
+def test_alert_module_fails_without_webhook_env(monkeypatch) -> None:
+    from hermes_multitenancy import update_center_alert as ua
+
+    monkeypatch.delenv(ua.WEBHOOK_ENV, raising=False)
+    assert ua.send_failure_alert("x.service") == 1
+    assert ua.main([]) == 2
+
+
+def test_kep_adopt_takes_over_unmarked_source_with_archive(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    curated = shared / "skills" / "Keep" / "kep-hades-cli"
+    curated.mkdir(parents=True)
+    (curated / "SKILL.md").write_text("hand-delivered 2026-06-05 version", encoding="utf-8")
+    runner = _kep_skill_runner({"hades": {"SKILL.md": "EMBEDDED TRUTH"}})
+    sys_row = [KepCliSystem(system="hades", binary="hades-cli", target_version="latest")]
+
+    # without adopt: untouched (existing behavior)
+    ensure_kep_cli_skills(sys_row, shared_home=shared, profiles=[], runner=runner)
+    assert (curated / "SKILL.md").read_text(encoding="utf-8") == "hand-delivered 2026-06-05 version"
+
+    # with adopt: archived + taken over + marked
+    ensure_kep_cli_skills(sys_row, shared_home=shared, profiles=[], runner=runner, adopt=True)
+    assert (curated / "SKILL.md").read_text(encoding="utf-8") == "EMBEDDED TRUTH"
+    assert (curated / ".kep-cli-managed").exists()
+    archives = list((shared / "update-center" / "adopt-archive").glob("kep-hades-cli-*"))
+    assert archives and (archives[0] / "SKILL.md").read_text(encoding="utf-8") == "hand-delivered 2026-06-05 version"
+
+
+def test_refresh_refuses_symlinked_source_and_adopt_materializes(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    store = tmp_path / "legacy-store" / "lark-im"
+    store.mkdir(parents=True)
+    (store / "SKILL.md").write_text("legacy store content", encoding="utf-8")
+    (store / ".lark-cli-managed").write_text("", encoding="utf-8")  # marked, but symlinked
+    (shared / "skills").mkdir(parents=True)
+    (shared / "skills" / "lark-im").symlink_to(store)
+    runner = _lark_skill_runner({"lark-im": {"SKILL.md": "embedded truth"}})
+    ledger = UpdateLedger(tmp_path / "l.jsonl")
+
+    # daily refresh: guard fires, per-skill quarantine, store untouched
+    report = sync_lark_cli_skills(shared_home=shared, ledger=ledger, runner=runner)
+    assert report["skills"][0]["action"] == "quarantined"
+    assert "symlink" in report["skills"][0]["reason"]
+    assert (store / "SKILL.md").read_text(encoding="utf-8") == "legacy store content"
+
+    # adopt: archived, symlink replaced by real dir, mirrored; legacy store no longer written
+    report = sync_lark_cli_skills(shared_home=shared, ledger=ledger, runner=runner, adopt=True)
+    assert report["skills"][0]["action"] == "refreshed"
+    src = shared / "skills" / "lark-im"
+    assert not src.is_symlink() and src.is_dir()
+    assert (src / "SKILL.md").read_text(encoding="utf-8") == "embedded truth"
+    assert (store / "SKILL.md").read_text(encoding="utf-8") == "legacy store content"  # untouched now
+    archives = list((shared / "update-center" / "adopt-archive").glob("lark-im-*"))
+    assert archives and (archives[0] / ".adopt-meta.json").exists()

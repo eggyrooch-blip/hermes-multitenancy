@@ -308,6 +308,7 @@ def sync_kep_cli_systems(
     profiles: Iterable[str] | None = None,
     resolve_binary: BinaryResolver | None = None,
     runner: Runner | None = None,
+    adopt: bool = False,
 ) -> dict[str, Any]:
     """Install/update kep-cli systems and atomically sync binaries into shared bin."""
 
@@ -323,7 +324,7 @@ def sync_kep_cli_systems(
     ]
     for system in normalized_systems:
         rows.append(_sync_one_kep_system(system, shared_bin=shared_bin, resolve_binary=resolve, runner=run, ledger=ledger))
-    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or (), runner=run)
+    skill_rows = ensure_kep_cli_skills(normalized_systems, shared_home=shared_home, profiles=profiles or (), runner=run, adopt=adopt)
     report = {"component": "kep-cli", "systems": rows, "skills": skill_rows, "secret_free": True}
     ledger.append("kep_cli_sync_completed", component="kep-cli", systems=rows)
     return redact(report)
@@ -392,6 +393,7 @@ def ensure_kep_cli_skills(
     profiles: Iterable[str],
     category: str = "Keep",
     runner: Runner | None = None,
+    adopt: bool = False,
 ) -> list[dict[str, Any]]:
     """Ensure each kep-cli system has a shared skill (authoritative embedded content) and profile link.
 
@@ -405,7 +407,7 @@ def ensure_kep_cli_skills(
     for system in systems:
         skill_path = f"{category}/kep-{system.system}-cli"
         try:
-            source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner)
+            source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner, adopt=adopt)
         except ValueError as exc:
             # Real embedded-skill read error (not old-CLI): surface it, leave the
             # existing skill untouched, and keep syncing other systems.
@@ -502,15 +504,45 @@ def _is_kep_cli_managed(source: Path) -> bool:
     return (source / KEP_CLI_MANAGED_MARKER).exists()
 
 
+def _archive_skill_source_for_adopt(source: Path, *, shared_home: Path, name: str) -> str | None:
+    """Snapshot the pre-adoption source tree for audit/rollback; return archive path."""
+
+    if not source.exists():
+        return None
+    archive = shared_home / UPDATE_CENTER_DIR / "adopt-archive" / f"{name}-{_now()}"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, Any] = {"source": str(source), "adopted_at": _now()}
+    if source.is_symlink():
+        meta["symlink_target"] = str(source.resolve())
+    shutil.copytree(source.resolve(), archive, symlinks=False)
+    (archive / ".adopt-meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return str(archive)
+
+
+def _materialize_symlink_source(source: Path) -> str:
+    """Replace a symlinked shared source with an empty real directory (adopt-only)."""
+
+    target = str(source.resolve())
+    source.unlink()
+    source.mkdir(parents=True)
+    return target
+
+
 def _write_managed_skill_source(
     source: Path, files: list[dict[str, str]], *, marker_name: str = KEP_CLI_MANAGED_MARKER
 ) -> bool:
     """Write authoritative embedded files byte-exact; mark the source CLI-managed.
 
     Idempotent — only rewrites files whose content changed. Returns True if
-    anything changed.
+    anything changed. Refuses symlinked sources: writing through a symlink
+    mutates whatever legacy store it points at — adopt materializes it first.
     """
 
+    if source.is_symlink():
+        raise ValueError(
+            f"shared skill source {source} is a symlink; refusing to write through it "
+            f"(run adopt to materialize it into a real directory)"
+        )
     source.mkdir(parents=True, exist_ok=True)
     marker = source / marker_name
     wanted = {source / item["path"] for item in files}
@@ -563,13 +595,31 @@ def _write_stub_skill_source(source: Path, system: KepCliSystem) -> None:
 
 
 def _ensure_kep_cli_skill_source(
-    shared_home: Path, *, skill_path: str, system: KepCliSystem, runner: Runner | None = None
+    shared_home: Path, *, skill_path: str, system: KepCliSystem, runner: Runner | None = None, adopt: bool = False
 ) -> Path:
     source = shared_home / "skills" / skill_path
     skill_md = source / "SKILL.md"
-    # Curated (human-authored, un-marked) skill present -> never touch it.
+    # Un-marked existing skill: never touch it on normal runs; adopt takes it
+    # over (pre-adoption tree archived for audit/rollback) and marks it managed.
     if skill_md.exists() and not _is_kep_cli_managed(source):
+        if not adopt:
+            return source
+        files = read_kep_cli_skill_files(system.system, runner=runner)
+        if not files:
+            return source  # no embedded skill to adopt from; keep existing
+        _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
+        if source.is_symlink():
+            _materialize_symlink_source(source)
+        _write_managed_skill_source(source, files)
         return source
+    if adopt and source.is_symlink():
+        # Already-managed but symlinked (legacy layout): materialize on adopt.
+        files = read_kep_cli_skill_files(system.system, runner=runner)
+        if files:
+            _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
+            _materialize_symlink_source(source)
+            _write_managed_skill_source(source, files)
+            return source
     # Authoritative path: refresh from the system CLI's embedded SKILL.md.
     files = read_kep_cli_skill_files(system.system, runner=runner)
     if files:
@@ -819,13 +869,17 @@ def sync_lark_cli_skills(
             continue
         try:
             files = read_lark_cli_skill_files(name, runner=run)
+            if files is None:
+                rows.append({"skill": name, "action": "skipped", "reason": "local lark-cli has no embedded skills verb"})
+                continue
+            if adopt and (source.is_symlink() or (skill_md.exists() and not managed)):
+                _archive_skill_source_for_adopt(source, shared_home=shared_home, name=name)
+                if source.is_symlink():
+                    _materialize_symlink_source(source)
+            changed = _write_managed_skill_source(source, files, marker_name=LARK_CLI_MANAGED_MARKER)
         except ValueError as exc:
             rows.append({"skill": name, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})
             continue
-        if files is None:
-            rows.append({"skill": name, "action": "skipped", "reason": "local lark-cli has no embedded skills verb"})
-            continue
-        changed = _write_managed_skill_source(source, files, marker_name=LARK_CLI_MANAGED_MARKER)
         rows.append({"skill": name, "action": "refreshed" if changed else "up-to-date", "files": len(files)})
     report = {"component": "lark-cli-skills", "skills": rows, "secret_free": True}
     ledger.append("lark_skill_sync_completed", component="lark-cli-skills", skills=rows)
