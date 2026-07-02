@@ -598,3 +598,179 @@ def render_markdown(summary: dict[str, Any]) -> str:
 
 def dumps_json(summary: dict[str, Any]) -> str:
     return json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+# ─────────────────────────── SkillHub events audit ───────────────────────────
+# The writer persists status='installed' for benign no-ops too (mark_installed is
+# called for skipped_pending / plugin_no_audience / …), so a status='installed' row
+# whose results_json.action is one of these did NOT actually install/uninstall
+# anything — count it as skipped, not as processed.
+_SKILLHUB_SKIP_ACTIONS = frozenset({
+    "skipped_pending", "skipped_inactive", "plugin_deferred",
+    "plugin_no_audience", "plugin_noop_already_all", "plugin_no_package",
+})
+
+
+def _skillhub_json_field(blob: Any, key: str) -> Any:
+    try:
+        return json.loads(blob).get(key) if blob else None
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+
+
+def _skillhub_item_type(raw_payload: Any) -> str:
+    """item_type as the writer's normalize_event resolves it: top-level ``item_type``
+    OR nested ``skill.item_type`` (PRD shape), normalized to exactly "plugin" (only when
+    the value lower-cases to "plugin") else "skill". Mirrors normalize_event so the audit
+    reflects how the event was actually routed (not arbitrary raw casing)."""
+    try:
+        payload = json.loads(raw_payload) if raw_payload else {}
+    except (json.JSONDecodeError, TypeError):
+        return "skill"
+    if not isinstance(payload, dict):
+        return "skill"
+    skill_block = payload.get("skill") if isinstance(payload.get("skill"), dict) else {}
+    for candidate in (payload.get("item_type"), skill_block.get("item_type")):
+        text = str(candidate).strip() if candidate is not None else ""
+        if text:
+            return "plugin" if text.lower() == "plugin" else "skill"
+    return "skill"
+
+
+def _skillhub_bucket(status: str, action: str | None) -> str:
+    if status == "failed":
+        return "failed"
+    if status == "queued":
+        return "queued"
+    if status == "queued_unknown_type":
+        return "queued_unknown"
+    if status == "installed":
+        return "skipped" if (action or "") in _SKILLHUB_SKIP_ACTIONS else "processed"
+    return "skipped"
+
+
+def _md_cell(value: Any) -> str:
+    """Sanitize a value for a markdown table cell (no pipes / newlines break the table)."""
+    text = "" if value is None else str(value)
+    return text.replace("|", "/").replace("\n", " ").replace("\r", " ").strip()
+
+
+def build_skillhub_audit(
+    db_path: Path,
+    *,
+    days: int = 7,
+    all_time_only: bool = False,
+    sample_limit: int = 5,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Aggregate the skillhub_events ledger: received / processed / failed / queued
+    counts (all-time + last N days), failures grouped by error_code with newest-K
+    samples, and distribution by item_type and skill_code. Read-only.
+
+    '成功'(processed) = a status='installed' row that actually did work (install /
+    uninstall / shrink); benign no-ops (pending / no-audience …) are counted as
+    'skipped' even though the DB status is 'installed'."""
+    db_path = Path(db_path).expanduser()
+    if not db_path.exists():
+        raise FileNotFoundError(f"multitenancy.db not found at {db_path}")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='skillhub_events'"
+        ).fetchone()
+        if not exists:
+            raise ValueError("table skillhub_events does not exist in this DB")
+        cutoff = int(datetime.now().timestamp()) - max(1, days) * 86400
+        # newest first so failure samples are the most recent K
+        rows = conn.execute(
+            "SELECT skill_code, status, received_at, raw_payload, results_json"
+            " FROM skillhub_events ORDER BY received_at DESC, event_id DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    def _tally(subset: list[sqlite3.Row]) -> dict[str, int]:
+        c: Counter[str] = Counter()
+        for r in subset:
+            action = _skillhub_json_field(r["results_json"], "action")
+            c[_skillhub_bucket(r["status"] or "", action)] += 1
+        return {
+            "received": len(subset),
+            "processed": c.get("processed", 0),       # 成功：真装/卸/收缩
+            "failed": c.get("failed", 0),
+            "queued": c.get("queued", 0),
+            "queued_unknown": c.get("queued_unknown", 0),  # 未识别类型（另列）
+            "skipped": c.get("skipped", 0),           # 无操作：pending / no-audience 等
+        }
+
+    windowed = [r for r in rows if (r["received_at"] or 0) >= cutoff]
+
+    # failures grouped by error_code (all-time; rows already sorted newest-first)
+    err_counts: Counter[str] = Counter()
+    err_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if (r["status"] or "") != "failed":
+            continue
+        code = _skillhub_json_field(r["results_json"], "error_code") or "UNKNOWN"
+        err_counts[code] += 1
+        if len(err_samples[code]) < sample_limit:
+            err_samples[code].append({
+                "skill_code": r["skill_code"],
+                "message": _skillhub_json_field(r["results_json"], "message"),
+                "time": datetime.fromtimestamp(r["received_at"]).strftime("%Y-%m-%d %H:%M")
+                if r["received_at"] else None,
+            })
+
+    by_item_type: Counter[str] = Counter()
+    by_skill: Counter[str] = Counter()
+    for r in rows:
+        by_item_type[_skillhub_item_type(r["raw_payload"])] += 1
+        by_skill[r["skill_code"] or "(none)"] += 1
+
+    audit: dict[str, Any] = {
+        "db_path": str(db_path),
+        "generated_days_window": days,
+        "all_time": _tally(rows),
+        "failures": {
+            "by_error_code": dict(err_counts.most_common()),
+            "samples": {k: err_samples[k] for k in err_counts},
+        },
+        "by_item_type": dict(by_item_type.most_common()),
+        "by_skill_top": dict(by_skill.most_common(top_n)),
+    }
+    if not all_time_only:
+        audit["last_n_days"] = _tally(windowed)
+    return audit
+
+
+def _skillhub_line(label: str, t: dict[str, int]) -> str:
+    return (f"**{label}**：收到 {t['received']} · 成功 {t['processed']} · 失败 {t['failed']} · "
+            f"排队 {t['queued']} · 未识别 {t['queued_unknown']} · 无操作 {t['skipped']}")
+
+
+def render_skillhub_markdown(audit: dict[str, Any]) -> str:
+    out: list[str] = ["# SkillHub 事件审计", ""]
+    out.append(_skillhub_line("全量", audit["all_time"]))
+    if "last_n_days" in audit:
+        out.append(_skillhub_line(f"近 {audit['generated_days_window']} 天", audit["last_n_days"]))
+    out.append("")
+    errs = audit["failures"]["by_error_code"]
+    if errs:
+        out.append("## 失败原因（按 error_code）")
+        out.append("| error_code | 次数 | 近样本 (skill · message · 时间) |")
+        out.append("|---|---|---|")
+        for code, cnt in errs.items():
+            samples = audit["failures"]["samples"].get(code, [])
+            sample_txt = "; ".join(
+                f"{_md_cell(s['skill_code'])} · {_md_cell(s['message'])} · {_md_cell(s['time'])}"
+                for s in samples
+            ) or "-"
+            out.append(f"| {_md_cell(code)} | {cnt} | {sample_txt} |")
+    else:
+        out.append("## 失败原因\n无失败 ✓")
+    out.append("")
+    out.append("## 分布")
+    out.append("- 按类型: " + ", ".join(f"{k}={v}" for k, v in audit["by_item_type"].items()))
+    out.append("- Top skill/plugin: " + ", ".join(f"{k}={v}" for k, v in audit["by_skill_top"].items()))
+    return "\n".join(out) + "\n"
