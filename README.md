@@ -29,6 +29,10 @@
 - **vs vanilla [hermes-agent](https://github.com/NousResearch/hermes-agent):** hermes assumes *1 bot = 1 user* (one profile per gateway process). This plugin makes *1 bot = N users* — routing each user to their own `ProfileRuntime` — without forking the core.
 - **vs a single-tenant Lark/Feishu channel plugin (e.g. [OpenClaw Lark](https://github.com/larksuite/openclaw-lark)):** those bridge *one* agent identity to Feishu. This adds per-user routing, profile isolation, and a credential vault so a *single* deployment can safely serve a whole org — each person getting their own agent, memory, and tokens.
 
+### Companion X/Twitter tooling
+
+Teams that use Hermes for campaign launches, support mentions, or founder posts on X/Twitter can install [Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet) inside the routed profiles that need those social tools. That keeps each user's X/Twitter reads and optional actions scoped to the same profile, workspace, memory, and credential boundary that receives their Feishu messages.
+
 ---
 
 ## 🏛️ Architecture at a glance
