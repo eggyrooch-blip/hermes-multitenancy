@@ -136,3 +136,21 @@ def test_build_skillhub_audit_missing_table_raises(tmp_path: Path) -> None:
     sqlite3.connect(db).close()  # empty DB, no skillhub_events table
     with pytest.raises(ValueError):
         build_skillhub_audit(db)
+
+
+def test_build_skillhub_audit_path_with_question_mark(tmp_path: Path) -> None:
+    # a literal '?' in the path must not be parsed as URI query (as_uri encodes it)
+    db = tmp_path / "weird?name.db"
+    _seed(db)
+    a = build_skillhub_audit(db)
+    assert a["all_time"]["received"] == 7
+
+
+def test_build_skillhub_audit_bad_schema_raises_valueerror(tmp_path: Path) -> None:
+    # table present but wrong shape (missing columns) -> friendly ValueError, not a raw crash
+    db = tmp_path / "multitenancy.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE skillhub_events (event_id TEXT, oops TEXT)")  # missing real columns
+    conn.commit(); conn.close()
+    with pytest.raises(ValueError):
+        build_skillhub_audit(db)

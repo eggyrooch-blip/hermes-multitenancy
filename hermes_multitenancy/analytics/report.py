@@ -673,7 +673,9 @@ def build_skillhub_audit(
     db_path = Path(db_path).expanduser()
     if not db_path.exists():
         raise FileNotFoundError(f"multitenancy.db not found at {db_path}")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    # as_uri() percent-encodes the path (a literal '?' in it would otherwise be parsed
+    # as the URI query, yielding a false missing-table error).
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
         exists = conn.execute(
@@ -687,6 +689,10 @@ def build_skillhub_audit(
             "SELECT skill_code, status, received_at, raw_payload, results_json"
             " FROM skillhub_events ORDER BY received_at DESC, event_id DESC"
         ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # bad/incompatible skillhub_events schema (missing columns etc.) → same friendly
+        # nonzero failure path as a missing table, not an uncaught crash.
+        raise ValueError(f"cannot read skillhub_events (bad schema?): {exc}") from exc
     finally:
         conn.close()
 
