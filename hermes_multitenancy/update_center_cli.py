@@ -15,6 +15,7 @@ from .update_center import (
     default_shared_home,
     scan_lark_cli_notice,
     sync_kep_cli_systems,
+    sync_lark_cli_skills,
 )
 
 
@@ -98,6 +99,18 @@ def _command_kep_sync(args: argparse.Namespace) -> int:
     return 2 if quarantined else 0
 
 
+def _command_lark_skill_sync(args: argparse.Namespace) -> int:
+    report = sync_lark_cli_skills(
+        shared_home=args.shared_home,
+        ledger=_ledger(args),
+        skills=args.skill or None,
+        adopt=args.adopt,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    quarantined = [item for item in report["skills"] if item.get("action") == "quarantined"]
+    return 2 if quarantined else 0
+
+
 def _command_apply_plugin(args: argparse.Namespace) -> int:
     report = apply_additive_plugin_update(
         args.repo,
@@ -134,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_kep.add_argument("--profile", action="append", default=[], help="Profile to sync skills for; defaults to all profiles")
     p_kep.add_argument("--no-profile-sync", action="store_true", help="Only sync shared binaries and shared skill sources")
     p_kep.set_defaults(func=_command_kep_sync)
+
+    p_lark_skills = sub.add_parser("lark-skill-sync", help="Mirror lark-cli embedded skills into shared skill sources (pool-only; binaries untouched)")
+    p_lark_skills.add_argument("--skill", action="append", default=[], help="Sync only these skills; default = all embedded skills from `lark-cli skills list`")
+    p_lark_skills.add_argument("--adopt", action="store_true", help="Take over existing un-managed sources (e.g. legacy npx snapshots) and stamp them .lark-cli-managed")
+    p_lark_skills.set_defaults(func=_command_lark_skill_sync)
 
     p_plugin = sub.add_parser("apply-plugin", help="Auto-apply a skill-only additive plugin update")
     p_plugin.add_argument("repo", type=Path)

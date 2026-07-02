@@ -103,6 +103,26 @@ already link it — no extra context, no expert-role conflict.
 The `--profile` / all-profiles fan-out path remains available for explicit,
 scoped use, but is off in the standardized timer deployment.
 
+## lark-cli Skill Sync — same pool model, binaries untouched
+
+`lark-skill-sync` applies the identical pool-only mirror to the lark ecosystem:
+lark-cli embeds every skill's SKILL.md + references in its binary
+(`lark-cli skills list/read`), so the local binary is the authoritative,
+version-matched source. The command mirrors each embedded skill into the shared
+source `~/.hermes/skills/<name>` with the same semantics as kep
+(`.lark-cli-managed` marker, idempotent writes, stale-file pruning, real read
+errors quarantined with exit 2, old lark-cli without the `skills` verb degrades
+to a no-op). It NEVER updates or replaces the lark-cli/authsidecar binaries —
+that safety boundary is unchanged.
+
+**Adoption (one-time):** shared sources that already exist without the marker —
+notably the legacy `npx skills add larksuite/cli` snapshots, which have drifted
+from the embedded truth — are skipped by default so nothing hand-curated is
+clobbered silently. Run `lark-skill-sync --adopt` once (optionally scoped with
+`--skill <name>`) to take them over; from then on the daily timer
+(`deploy/hermes-lark-skill-sync.{service,timer}`) keeps them matched to the
+installed lark-cli version.
+
 ## Safety Boundaries
 
 The MVP does not auto-apply updates that:

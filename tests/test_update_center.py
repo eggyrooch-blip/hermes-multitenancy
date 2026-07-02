@@ -593,3 +593,160 @@ def test_pyproject_exposes_update_center_cli() -> None:
         data["project"]["scripts"]["hermes-multitenancy-update-center"]
         == "hermes_multitenancy.update_center_cli:main"
     )
+
+
+def _lark_skill_runner(embedded: dict[str, dict[str, str]], *, read_fails: set[str] | None = None):
+    """Fake lark-cli honoring the verified contract: top list -> {ok,skills:[{name}]};
+    per-path list -> {ok,path,entries:[{path,is_dir}]} (root-relative paths, dirs recursed);
+    read <root-relative-file> -> raw content; read errors -> exit 0 + {ok:false}."""
+
+    read_fails = read_fails or set()
+
+    def runner(argv: list[str]) -> object:
+        if argv[:2] != ["lark-cli", "skills"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if argv[2] == "list" and len(argv) == 3:
+            return {"returncode": 0, "stdout": json.dumps(
+                {"ok": True, "skills": [{"name": n, "version": "1.0.0"} for n in sorted(embedded)]}), "stderr": ""}
+        if argv[2] == "list":
+            path = argv[3]
+            skill = path.split("/")[0]
+            files = embedded.get(skill)
+            if files is None:
+                return {"returncode": 1, "stdout": "", "stderr": 'Error: unknown command "skills"'}
+            prefix = path[len(skill) + 1:] if "/" in path else ""
+            entries, seen_dirs = [], set()
+            for rel in sorted(files):
+                if prefix:
+                    if not rel.startswith(prefix + "/"):
+                        continue
+                    rest = rel[len(prefix) + 1:]
+                else:
+                    rest = rel
+                head = rest.split("/")[0]
+                child = f"{path}/{head}"
+                if "/" in rest:
+                    if child not in seen_dirs:
+                        seen_dirs.add(child)
+                        entries.append({"path": child, "is_dir": True})
+                else:
+                    entries.append({"path": child, "is_dir": False})
+            return {"returncode": 0, "stdout": json.dumps({"ok": True, "path": path, "entries": entries}), "stderr": ""}
+        if argv[2] == "read":
+            path = argv[3]
+            skill = path.split("/")[0]
+            rel = path[len(skill) + 1:]
+            if path in read_fails:
+                return {"returncode": 0, "stdout": json.dumps({"ok": False, "error": {"type": "runtime", "message": "boom"}}), "stderr": ""}
+            content = embedded.get(skill, {}).get(rel)
+            if content is None:
+                return {"returncode": 0, "stdout": json.dumps({"ok": False, "error": {"type": "validation"}}), "stderr": ""}
+            return {"returncode": 0, "stdout": content, "stderr": ""}
+        return {"returncode": 1, "stdout": "", "stderr": "?"}
+
+    return runner
+
+
+def test_lark_skill_sync_mirrors_embedded_multifile(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    runner = _lark_skill_runner({"lark-im": {
+        "SKILL.md": "---\nname: lark-im\n---\nEMBEDDED BODY",
+        "references/chat-create.md": "# chat create",
+    }})
+
+    report = sync_lark_cli_skills(shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=runner)
+
+    src = shared / "skills" / "lark-im"
+    assert (src / "SKILL.md").read_text(encoding="utf-8") == "---\nname: lark-im\n---\nEMBEDDED BODY"
+    assert (src / "references" / "chat-create.md").read_text(encoding="utf-8") == "# chat create"
+    assert (src / ".lark-cli-managed").exists()
+    assert report["skills"][0]["action"] == "refreshed"
+
+    report2 = sync_lark_cli_skills(shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=runner)
+    assert report2["skills"][0]["action"] == "up-to-date"
+
+
+def test_lark_skill_sync_skips_unadopted_then_adopts(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    legacy = shared / "skills" / "lark-im"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("legacy npx snapshot", encoding="utf-8")  # no marker
+    runner = _lark_skill_runner({"lark-im": {"SKILL.md": "embedded truth"}})
+
+    report = sync_lark_cli_skills(shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=runner)
+    assert report["skills"][0]["action"] == "skipped"
+    assert (legacy / "SKILL.md").read_text(encoding="utf-8") == "legacy npx snapshot"
+
+    report = sync_lark_cli_skills(shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=runner, adopt=True)
+    assert report["skills"][0]["action"] == "refreshed"
+    assert (legacy / "SKILL.md").read_text(encoding="utf-8") == "embedded truth"
+    assert (legacy / ".lark-cli-managed").exists()
+
+
+def test_lark_skill_sync_prunes_stale_files(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    ledger = UpdateLedger(tmp_path / "l.jsonl")
+    sync_lark_cli_skills(shared_home=shared, ledger=ledger,
+                         runner=_lark_skill_runner({"lark-im": {"SKILL.md": "v1", "references/old.md": "gone soon"}}))
+    src = shared / "skills" / "lark-im"
+    assert (src / "references" / "old.md").exists()
+
+    sync_lark_cli_skills(shared_home=shared, ledger=ledger,
+                         runner=_lark_skill_runner({"lark-im": {"SKILL.md": "v2"}}))
+    assert (src / "SKILL.md").read_text(encoding="utf-8") == "v2"
+    assert not (src / "references").exists()
+
+
+def test_lark_skill_sync_degrades_on_old_cli(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    def old_cli(_argv: list[str]) -> object:
+        return {"returncode": 1, "stdout": "", "stderr": 'Error: unknown command "skills" for "lark-cli"'}
+
+    report = sync_lark_cli_skills(shared_home=tmp_path / ".hermes", ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=old_cli)
+    assert report["skills"] == []  # top list degrades to empty; no crash
+
+    report = sync_lark_cli_skills(shared_home=tmp_path / ".hermes", ledger=UpdateLedger(tmp_path / "l.jsonl"),
+                                  skills=["lark-im"], runner=old_cli)
+    assert report["skills"][0]["action"] == "skipped"
+
+
+def test_lark_skill_sync_quarantines_okfalse_read_and_cli_exit(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_cli
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    runner = _lark_skill_runner({"lark-im": {"SKILL.md": "body"}}, read_fails={"lark-im/SKILL.md"})
+    report = sync_lark_cli_skills(shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=runner)
+    assert report["skills"][0]["action"] == "quarantined"
+    assert "skill-refresh-failed" in report["skills"][0]["reason"]
+    assert not (shared / "skills" / "lark-im" / "SKILL.md").exists()  # nothing half-written
+
+    monkeypatch.setattr(update_center_cli, "sync_lark_cli_skills",
+                        lambda **_k: {"skills": [{"action": "quarantined", "reason": "skill-refresh-failed: x"}]})
+    assert update_center_cli.main(["--shared-home", str(shared), "lark-skill-sync"]) == 2
+    monkeypatch.setattr(update_center_cli, "sync_lark_cli_skills",
+                        lambda **_k: {"skills": [{"action": "skipped", "reason": "existing un-adopted source"}]})
+    assert update_center_cli.main(["--shared-home", str(shared), "lark-skill-sync"]) == 0
+
+
+def test_lark_skill_sync_cli_passes_adopt_and_skill_filter(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_cli
+
+    captured: dict[str, object] = {}
+
+    def fake_sync(**kwargs):
+        captured.update(kwargs)
+        return {"skills": []}
+
+    monkeypatch.setattr(update_center_cli, "sync_lark_cli_skills", fake_sync)
+    rc = update_center_cli.main(["--shared-home", str(tmp_path), "lark-skill-sync", "--adopt", "--skill", "lark-im"])
+    assert rc == 0
+    assert captured["adopt"] is True
+    assert list(captured["skills"]) == ["lark-im"]

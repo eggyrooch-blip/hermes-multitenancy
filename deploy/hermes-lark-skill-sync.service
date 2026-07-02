@@ -1,0 +1,21 @@
+# 每日把 lark-cli 内嵌 skill 真身镜像进共享 skill 源（池-only，不碰任何 profile）。
+# 安全边界：绝不更新/替换 lark-cli / authsidecar 二进制（update-center MVP 既有边界）。
+# 首次接管既有 npx 快照需人工跑一次 `lark-skill-sync --adopt`（见 docs/update-center.md）。
+[Unit]
+Description=Hermes lark-cli embedded skill pool sync (content mirror only; binaries untouched)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 作为 hermes 用户的 user unit 安装（systemctl --user）；改 system-level 时加回 User=hermes。
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=HOME=/home/hermes
+# PATH 必须能解析到带 `skills` 子命令的 lark-cli；旧 lark-cli 会优雅降级为 no-op。
+Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_cli lark-skill-sync
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

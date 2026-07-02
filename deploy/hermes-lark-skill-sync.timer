@@ -1,0 +1,11 @@
+# 每日触发 hermes-lark-skill-sync.service（紧随 kep-sync 之后的低峰时段，随机错峰）。
+[Unit]
+Description=Run Hermes lark-cli skill pool sync daily
+
+[Timer]
+OnCalendar=*-*-* 04:50:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

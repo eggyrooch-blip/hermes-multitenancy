@@ -502,15 +502,17 @@ def _is_kep_cli_managed(source: Path) -> bool:
     return (source / KEP_CLI_MANAGED_MARKER).exists()
 
 
-def _write_managed_skill_source(source: Path, files: list[dict[str, str]]) -> bool:
-    """Write authoritative embedded files byte-exact; mark the source kep-cli-managed.
+def _write_managed_skill_source(
+    source: Path, files: list[dict[str, str]], *, marker_name: str = KEP_CLI_MANAGED_MARKER
+) -> bool:
+    """Write authoritative embedded files byte-exact; mark the source CLI-managed.
 
     Idempotent — only rewrites files whose content changed. Returns True if
     anything changed.
     """
 
     source.mkdir(parents=True, exist_ok=True)
-    marker = source / KEP_CLI_MANAGED_MARKER
+    marker = source / marker_name
     wanted = {source / item["path"] for item in files}
     changed = False
     for item in files:
@@ -688,6 +690,141 @@ def build_kep_systems_from_registry(
             )
         )
     return systems
+
+
+LARK_CLI_MANAGED_MARKER = ".lark-cli-managed"
+
+
+def _run_lark_cli(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
+def _lark_payload_or_error(result: Mapping[str, Any], *, context: str) -> dict[str, Any]:
+    """Parse a lark-cli skills JSON payload; lark-cli reports errors as exit 0 + {ok:false}."""
+
+    try:
+        payload = json.loads(result["stdout"] or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{context} returned non-JSON: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise ValueError(f"{context} returned not-ok payload: {str(payload)[:200]}")
+    return payload
+
+
+def list_lark_cli_skills(*, runner: Runner | None = None) -> list[str]:
+    """List embedded skill names from the local lark-cli binary.
+
+    Returns [] when the local lark-cli predates the `skills` verb.
+    """
+
+    run = runner or _run_lark_cli
+    result = _coerce_result(run(["lark-cli", "skills", "list"]))
+    if result["returncode"] != 0:
+        blob = f"{result['stderr']} {result['stdout']}".lower()
+        if "unknown command" in blob:
+            return []
+        raise ValueError(f"lark-cli skills list failed: {(result['stderr'] or result['stdout']).strip()}")
+    payload = _lark_payload_or_error(result, context="lark-cli skills list")
+    rows = payload.get("skills")
+    if not isinstance(rows, list):
+        raise ValueError("lark-cli skills list must return {'skills': [...]}")
+    names: list[str] = []
+    for row in rows:
+        if isinstance(row, dict):
+            name = str(row.get("name") or "").strip()
+            if name and "/" not in name and ".." not in name:
+                names.append(name)
+    return names
+
+
+def read_lark_cli_skill_files(skill: str, *, runner: Runner | None = None) -> list[dict[str, str]] | None:
+    """Read one skill's embedded files (SKILL.md + references/*) from lark-cli.
+
+    Returns ``[{"path", "content"}]`` with paths relative to the skill dir, or
+    ``None`` when the local lark-cli predates the ``skills`` verb. A failure on
+    a file the CLI itself advertised is a real error and raises ValueError.
+    """
+
+    run = runner or _run_lark_cli
+    files: list[dict[str, str]] = []
+    queue = [skill]
+    first = True
+    while queue:
+        path = queue.pop(0)
+        listed = _coerce_result(run(["lark-cli", "skills", "list", path]))
+        if listed["returncode"] != 0:
+            blob = f"{listed['stderr']} {listed['stdout']}".lower()
+            if first and "unknown command" in blob:
+                return None
+            raise ValueError(f"lark-cli skills list {path} failed: {(listed['stderr'] or listed['stdout']).strip()}")
+        first = False
+        payload = _lark_payload_or_error(listed, context=f"lark-cli skills list {path}")
+        for entry in payload.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            epath = str(entry.get("path") or "").strip()
+            if not epath or epath.startswith("/") or ".." in epath.split("/"):
+                continue  # never write outside the skill source dir
+            if entry.get("is_dir"):
+                queue.append(epath)
+                continue
+            read = _coerce_result(run(["lark-cli", "skills", "read", epath]))
+            if read["returncode"] != 0:
+                raise ValueError(f"lark-cli skills read {epath} failed: {(read['stderr'] or read['stdout']).strip()}")
+            body = read["stdout"]
+            if body.lstrip().startswith("{"):
+                # lark-cli reports read errors as exit 0 + {ok:false} JSON.
+                try:
+                    maybe = json.loads(body)
+                except json.JSONDecodeError:
+                    maybe = None
+                if isinstance(maybe, dict) and maybe.get("ok") is False:
+                    raise ValueError(f"lark-cli skills read {epath} failed: {str(maybe.get('error'))[:200]}")
+            rel = epath[len(skill) + 1:] if epath.startswith(f"{skill}/") else epath
+            files.append({"path": rel, "content": body})
+    return files or None
+
+
+def sync_lark_cli_skills(
+    *,
+    shared_home: Path,
+    ledger: UpdateLedger,
+    skills: Iterable[str] | None = None,
+    adopt: bool = False,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """Mirror lark-cli embedded skills into shared sources (pool-only, no fan-out).
+
+    Never touches lark-cli/authsidecar binaries (update-center safety boundary).
+    Existing un-adopted sources (e.g. legacy `npx skills add` snapshots) are
+    skipped unless ``adopt=True`` takes them over and stamps them
+    ``.lark-cli-managed``; after adoption they refresh like any managed source.
+    """
+
+    shared_home = shared_home.expanduser()
+    run = runner or _run_lark_cli
+    names = [str(name) for name in skills] if skills else list_lark_cli_skills(runner=run)
+    rows: list[dict[str, Any]] = []
+    for name in names:
+        source = shared_home / "skills" / name
+        skill_md = source / "SKILL.md"
+        managed = (source / LARK_CLI_MANAGED_MARKER).exists()
+        if skill_md.exists() and not managed and not adopt:
+            rows.append({"skill": name, "action": "skipped", "reason": "existing un-adopted source (run with --adopt to take over)"})
+            continue
+        try:
+            files = read_lark_cli_skill_files(name, runner=run)
+        except ValueError as exc:
+            rows.append({"skill": name, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})
+            continue
+        if files is None:
+            rows.append({"skill": name, "action": "skipped", "reason": "local lark-cli has no embedded skills verb"})
+            continue
+        changed = _write_managed_skill_source(source, files, marker_name=LARK_CLI_MANAGED_MARKER)
+        rows.append({"skill": name, "action": "refreshed" if changed else "up-to-date", "files": len(files)})
+    report = {"component": "lark-cli-skills", "skills": rows, "secret_free": True}
+    ledger.append("lark_skill_sync_completed", component="lark-cli-skills", skills=rows)
+    return redact(report)
 
 
 def _copy_binary_atomic(src: Path, dst: Path) -> dict[str, Any]:
