@@ -540,6 +540,10 @@ _SKILL_INJECTION_PATTERNS = [
     re.compile(r"不要(告诉|告知)用户"),
     re.compile(r"(?i)reveal (your )?(system prompt|hidden instructions)"),
     re.compile(r"(?i)(send|post|upload|exfiltrate) (all |your )?(credentials?|tokens?|secrets?)"),
+    # zh credential exfiltration: 把/将 + 凭证类名词 + 外发动词（紧窗口防误伤"上传文件需要 token"类正常文档）
+    re.compile(r"(?i)(把|将)\s*(所有|你的|全部)?的?\s*(凭证|密钥|令牌|密码|token|secret)[^\n]{0,12}(发送|发给|上传|提交|外传|泄露)"),
+    re.compile(r"(?i)(外传|泄露)\s*(所有|你的|全部)?的?\s*(凭证|密钥|令牌|密码|token|secret)"),
+    re.compile(r"(凭证|密钥|令牌|密码)\s*(外传|泄露)"),
 ]
 
 
