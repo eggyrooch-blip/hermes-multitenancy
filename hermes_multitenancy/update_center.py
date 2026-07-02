@@ -638,6 +638,7 @@ def _ensure_kep_cli_skill_source(
         files = read_kep_cli_skill_files(system.system, runner=runner)
         if not files:
             return source  # no embedded skill to adopt from; keep existing
+        _lint_skill_files_for_injection(files)  # BEFORE any side effect: a lint hit must leave the old source untouched
         archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
         target = _materialize_symlink_source(source) if source.is_symlink() else None
         _write_managed_skill_source(source, files)
@@ -648,6 +649,7 @@ def _ensure_kep_cli_skill_source(
         # Already-managed but symlinked (legacy layout): materialize on adopt.
         files = read_kep_cli_skill_files(system.system, runner=runner)
         if files:
+            _lint_skill_files_for_injection(files)
             archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
             target = _materialize_symlink_source(source)
             _write_managed_skill_source(source, files)
@@ -910,6 +912,7 @@ def sync_lark_cli_skills(
             if files is None:
                 rows.append({"skill": name, "action": "skipped", "reason": "local lark-cli has no embedded skills verb"})
                 continue
+            _lint_skill_files_for_injection(files)  # BEFORE materialize/archive side effects
             if adopt and (source.is_symlink() or (skill_md.exists() and not managed)):
                 archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=name)
                 target = _materialize_symlink_source(source) if source.is_symlink() else None
