@@ -559,13 +559,19 @@ def _auth_signal_stash(
     profile_name: str,
     subject: str,
 ) -> None:
-    """Park an inbound request for post-auth replay. Payload is user content
-    (never credentials/env); stored verbatim minus nothing secret-bearing."""
+    """Park an inbound request for post-auth replay. `metadata` is passed
+    through `_sanitize_ingest_metadata` (same allowlist handle_run applies to
+    the RunRequest) before storage, so no unexpected client-supplied keys sit
+    in memory for the TTL window; the rest is user content (channel/content/
+    messages), never credentials/env."""
+    stored = dict(payload or {})
+    if isinstance(stored.get("metadata"), dict):
+        stored["metadata"] = _sanitize_ingest_metadata(stored["metadata"])
     now = time.time()
     with _auth_signal_store_lock:
         _auth_signal_prune_locked(now)
         _auth_signal_store[signal_run_id] = {
-            "payload": dict(payload or {}),
+            "payload": stored,
             "profile_name": str(profile_name or ""),
             "subject": str(subject or ""),
             "stored_at": now,
@@ -2236,7 +2242,11 @@ def create_run_broker_app(
         """Admit + SSE-stream a run_request. Shared by handle_run and replay.
 
         Mints a fresh ``signal_run_id`` and parks ``stash_payload`` so any
-        ``auth_required`` frame this run emits can itself be replayed.
+        ``auth_required`` frame this run emits can itself be replayed. The
+        parked entry is retained ONLY if this run actually emits an
+        ``auth_required`` frame; runs that finish without one consume their own
+        speculative entry in the finally-block, so normal traffic never churns
+        the bounded store and can't evict a genuinely-pending re-auth request.
         """
         signal_run_id = secrets.token_urlsafe(24)
         _auth_signal_stash(
@@ -2245,6 +2255,7 @@ def create_run_broker_app(
             profile_name=run_request.profile_name,
             subject=run_request.user_key,
         )
+        auth_required_seen = False
 
         try:
             admission_broker = RunBroker(
@@ -2271,9 +2282,13 @@ def create_run_broker_app(
         emitter = _DisconnectTolerantEmitter(write_sse_event)
 
         async def emit_event(event: RunEvent) -> None:
+            nonlocal auth_required_seen
+            if event.kind == "auth_required":
+                auth_required_seen = True
             await emitter.emit(event)
 
         if admission.duplicate:
+            _auth_signal_consume(signal_run_id)  # dup run never re-auths; drop speculative entry
             await emit_event(RunEvent(kind="done"))
             if not emitter.disconnected:
                 try:
@@ -2302,6 +2317,11 @@ def create_run_broker_app(
             logger.exception("[multitenancy] WebUI run broker request failed")
             await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
         finally:
+            # Retain the parked request ONLY when this run signalled re-auth;
+            # otherwise drop it so the bounded store holds only pending-reauth
+            # entries and normal traffic can't evict a genuine one.
+            if not auth_required_seen:
+                _auth_signal_consume(signal_run_id)
             if not emitter.disconnected:
                 try:
                     await response.write_eof()
@@ -2373,7 +2393,21 @@ def create_run_broker_app(
 
         stashed_profile = str(entry.get("profile_name") or "")
         stashed_subject = str(entry.get("subject") or "")
-        if (caller_profile is not None and caller_profile != stashed_profile) or (
+        # Tenant isolation, made fail-closed at the endpoint (do not rely solely
+        # on the upstream resolution_error early-return). When owner enforcement
+        # is active — i.e. this broker is serving as the multi-user server
+        # (HERMES_MULTITENANCY_RUN_BROKER_SERVER, which start_run_broker_server
+        # refuses to run without a key) — the caller MUST positively prove the
+        # stashed entry's owner identity. Missing/mismatched identity is denied.
+        # Enforcement-off is the single-tenant/local path (no cross-tenant
+        # boundary exists), so the positive-match requirement is scoped to it.
+        if _owner_enforcement_enabled():
+            if (
+                caller_profile != stashed_profile
+                or (stashed_subject and caller_subject != stashed_subject)
+            ):
+                return web.json_response({"error": "signal_run_id does not belong to caller"}, status=403)
+        elif (caller_profile is not None and caller_profile != stashed_profile) or (
             caller_subject and caller_subject != stashed_subject
         ):
             return web.json_response({"error": "signal_run_id does not belong to caller"}, status=403)

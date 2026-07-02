@@ -198,11 +198,30 @@ def _app(dispatch=None):
     )
 
 
-def test_run_stashes_original_payload_keyed_by_signal_run_id() -> None:
+def test_auth_required_run_retains_stash_with_original_payload(monkeypatch, tmp_path) -> None:
+    """A run that emits auth_required retains its parked request (keyed by the
+    signal_run_id) with the original payload + tenant identity — so replay can
+    find it after the user re-auths. Uses the real _default_dispatch_agent path
+    with a stream that yields auth_required."""
     from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy import agent_real, router
+
+    async def fake_stream(event, profile_home, *, messages=None):
+        yield "content", "working…"
+        yield "auth_required", {"provider": "feishu", "connector_id": "lark-cli"}
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router, "_profile_name_to_home", lambda name: tmp_path)
+    monkeypatch.setattr(
+        broker, "_webui_streamable_media_text", lambda text, **kw: ("", [text] if text else [])
+    )
 
     async def _body() -> None:
-        client = TestClient(TestServer(_app()))
+        # dispatch_agent=None → real _default_dispatch_agent path (emits auth_required)
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True, sandbox_available=lambda: True
+        )
+        client = TestClient(TestServer(app))
         await client.start_server()
         try:
             resp = await client.post(
@@ -225,6 +244,28 @@ def test_run_stashes_original_payload_keyed_by_signal_run_id() -> None:
     assert entry["payload"]["content"] == "把上周销售额导出到飞书表格"
     assert entry["profile_name"] == "alice"
     assert entry["subject"] == "ou_alice"
+
+
+def test_normal_run_does_not_retain_stash() -> None:
+    """Churn guard (codex MEDIUM): a run that does NOT signal auth_required must
+    consume its own speculative stash entry, so normal traffic never fills the
+    bounded store and can't evict a genuinely-pending re-auth request."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def _body() -> None:
+        client = TestClient(TestServer(_app()))  # echo dispatch, no auth_required
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/run-broker/runs",
+                json={"channel": "webui", "profile_name": "alice", "user_key": "ou_alice", "content": "hi"},
+            )
+            await resp.text()
+        finally:
+            await client.close()
+
+    asyncio.run(_body())
+    assert len(broker._auth_signal_store) == 0
 
 
 def test_replay_redispatches_owned_stashed_request() -> None:
