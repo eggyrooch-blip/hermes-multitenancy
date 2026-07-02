@@ -736,6 +736,18 @@ def test_lark_skill_sync_quarantines_okfalse_read_and_cli_exit(monkeypatch, tmp_
     assert update_center_cli.main(["--shared-home", str(shared), "lark-skill-sync"]) == 0
 
 
+def test_lark_skill_sync_skips_non_lark_names(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, sync_lark_cli_skills
+
+    shared = tmp_path / ".hermes"
+    runner = _lark_skill_runner({"helper-tool": {"SKILL.md": "not a lark skill"}})
+    report = sync_lark_cli_skills(shared_home=shared, ledger=UpdateLedger(tmp_path / "l.jsonl"), runner=runner)
+
+    assert report["skills"][0]["action"] == "skipped"
+    assert "outside lark-* scope" in report["skills"][0]["reason"]
+    assert not (shared / "skills" / "helper-tool").exists()
+
+
 def test_lark_skill_sync_cli_passes_adopt_and_skill_filter(monkeypatch, tmp_path: Path) -> None:
     from hermes_multitenancy import update_center_cli
 

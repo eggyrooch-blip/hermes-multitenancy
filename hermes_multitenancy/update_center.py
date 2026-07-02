@@ -806,6 +806,11 @@ def sync_lark_cli_skills(
     names = [str(name) for name in skills] if skills else list_lark_cli_skills(runner=run)
     rows: list[dict[str, Any]] = []
     for name in names:
+        if not name.startswith("lark-"):
+            # SPEC scope: only top-level lark-* skills; never create unexpected
+            # shared-source dirs for helper/non-lark embedded names.
+            rows.append({"skill": name, "action": "skipped", "reason": "outside lark-* scope"})
+            continue
         source = shared_home / "skills" / name
         skill_md = source / "SKILL.md"
         managed = (source / LARK_CLI_MANAGED_MARKER).exists()
