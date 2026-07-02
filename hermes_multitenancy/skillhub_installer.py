@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -21,6 +22,7 @@ from typing import Any, Callable
 
 import yaml
 
+from . import plugin_ingest
 from .skill_registry import (
     MANAGED_SKILL_MANIFEST,
     _install_personal_skill,
@@ -34,6 +36,21 @@ _DOWNLOAD_TIMEOUT_SECONDS = 30
 _LOCK_FILENAME = Path(".keephub") / "lock.json"
 _SKILL_DISTRIBUTION_FILENAME = "skill-distribution.yaml"
 _SKILL_DISTRIBUTION_ORIGIN = "aidock-skillhub"
+_PLUGIN_DISTRIBUTION_ORIGIN = "aidock-skillhub-plugin"
+
+#: Event types that carry the FULL authorized-user snapshot (not an increment).
+#: For these, audience-shrink triggers a reconcile that uninstalls dropped users.
+#: v2 confirmed ``skill.auth_type_changed`` is a full snapshot too (previously
+#: mis-assumed incremental), so it joins install_approved / status_changed here.
+_FULL_SNAPSHOT_EVENT_TYPES = frozenset(
+    {
+        "skill.install_approved",
+        "skill.status_changed",
+        "skill.auth_type_changed",
+    }
+)
+
+logger = logging.getLogger(__name__)
 
 
 class SkillhubInstallError(Exception):
@@ -149,6 +166,12 @@ def _canonical_release_dir(shared_home: Path, skill_code: str, version: str) -> 
     return shared_home / "_managed" / _SKILL_DISTRIBUTION_ORIGIN / safe_skill / safe_version
 
 
+def _canonical_plugin_repo_dir(shared_home: Path, plugin_id: str, version: str) -> Path:
+    safe_plugin = _safe_skill_relative_path(plugin_id)
+    safe_version = _safe_skill_relative_path(version)
+    return shared_home / "_managed" / _PLUGIN_DISTRIBUTION_ORIGIN / safe_plugin / safe_version
+
+
 def _materialize_canonical_skill(
     *,
     shared_home: Path,
@@ -176,6 +199,132 @@ def _materialize_canonical_skill(
     if installed is None:
         raise SkillhubInstallError("package missing installed SKILL.md", error_code="PACKAGE_INVALID")
     return installed
+
+
+def _resolve_plugin_repo_root(base_dir: Path) -> Path | None:
+    if (base_dir / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
+        return base_dir
+    try:
+        children = sorted(path for path in base_dir.iterdir() if path.is_dir())
+    except FileNotFoundError:
+        return None
+    for child in children:
+        if child.name == "__MACOSX":
+            continue
+        if (child / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
+            return child
+    return None
+
+
+def _materialize_plugin_repo(shared_home: Path, plugin_id: str, package_bytes: bytes) -> Path:
+    try:
+        with tempfile.TemporaryDirectory(dir=shared_home, prefix=".plugin-staging-") as temp_dir:
+            staging = Path(temp_dir)
+            _extract_zip_safely(package_bytes, staging)
+            repo_root = _resolve_plugin_repo_root(staging)
+            if repo_root is None:
+                raise SkillhubInstallError("package missing plugin manifest", error_code="PACKAGE_INVALID")
+            try:
+                manifest = plugin_ingest.load_plugin_manifest(repo_root)
+            except plugin_ingest.PluginIngestError as exc:
+                raise SkillhubInstallError(str(exc), error_code="PACKAGE_INVALID") from exc
+            manifest_id = _first_str(manifest.get("id"))
+            if manifest_id != plugin_id:
+                raise SkillhubInstallError("plugin manifest id mismatch", error_code="PACKAGE_INVALID")
+            version = _first_str(manifest.get("version"))
+            if not version:
+                raise SkillhubInstallError("plugin manifest missing version", error_code="PACKAGE_INVALID")
+            release_dir = _canonical_plugin_repo_dir(shared_home, plugin_id, version)
+            if (release_dir / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
+                return release_dir
+            release_dir.parent.mkdir(parents=True, exist_ok=True)
+            if release_dir.exists():
+                shutil.rmtree(release_dir)
+            with tempfile.TemporaryDirectory(dir=release_dir.parent, prefix=f".{release_dir.name}-") as move_dir:
+                move_root = Path(move_dir)
+                payload_dir = move_root / "payload"
+                payload_dir.mkdir(parents=True, exist_ok=True)
+                _extract_zip_safely(package_bytes, payload_dir)
+                resolved = _resolve_plugin_repo_root(payload_dir)
+                if resolved is None:
+                    raise SkillhubInstallError("package missing plugin manifest", error_code="PACKAGE_INVALID")
+                shutil.move(str(resolved), str(release_dir))
+    except plugin_ingest.PluginIngestError as exc:
+        raise SkillhubInstallError(str(exc), error_code="PACKAGE_INVALID") from exc
+    if not (release_dir / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
+        raise SkillhubInstallError("package missing installed plugin manifest", error_code="PACKAGE_INVALID")
+    return release_dir
+
+
+def _plugin_managed_audience_profiles(shared_home: Path, plugin_id: str) -> set[str]:
+    path = plugin_ingest._managed_path(shared_home, plugin_id)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return set()
+    audience = manifest.get("audience") if isinstance(manifest, dict) else {}
+    profiles = audience.get("profiles") if isinstance(audience, dict) else []
+    if not isinstance(profiles, list):
+        return set()
+    return {
+        profile
+        for profile in (_first_str(value) for value in profiles)
+        if profile is not None
+    }
+
+
+def _plugin_managed_audience_mode(shared_home: Path, plugin_id: str) -> str | None:
+    path = plugin_ingest._managed_path(shared_home, plugin_id)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    audience = manifest.get("audience") if isinstance(manifest, dict) else {}
+    if not isinstance(audience, dict):
+        return None
+    return _first_str(audience.get("mode"))
+
+
+def _best_effort_plugin_uninstall(
+    plugin_id: str,
+    *,
+    shared: Path,
+    profiles: Path,
+    profile_subset: list[str] | None = None,
+) -> dict[str, Any] | None:
+    try:
+        return plugin_ingest.uninstall(
+            plugin_id,
+            shared_home=shared,
+            profiles_root=profiles,
+            profiles=profile_subset,
+        )
+    except plugin_ingest.PluginIngestError as exc:
+        if "no managed manifest" in str(exc):
+            return None
+        raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
+
+
+def _reconcile_plugin_full_snapshot(
+    plugin_id: str,
+    *,
+    shared: Path,
+    profiles: Path,
+    new_profiles: set[str],
+) -> None:
+    """Remove dropped profile installs; strip prior fan-out before re-scoping to profiles."""
+    prev_mode = _plugin_managed_audience_mode(shared, plugin_id)
+    if prev_mode in (None, "profile"):
+        dropped = _plugin_managed_audience_profiles(shared, plugin_id) - set(new_profiles)
+        if dropped:
+            _best_effort_plugin_uninstall(
+                plugin_id,
+                shared=shared,
+                profiles=profiles,
+                profile_subset=sorted(dropped),
+            )
+    else:
+        _best_effort_plugin_uninstall(plugin_id, shared=shared, profiles=profiles)
 
 
 def _routing_db_path(shared_home: Path) -> Path:
@@ -313,6 +462,84 @@ def _register_all_audience_distribution(
     }
 
 
+def _unregister_all_audience_distribution(
+    *,
+    shared_home: Path,
+    skill_code: str,
+) -> dict[str, Any]:
+    rel_path = _safe_skill_relative_path(skill_code)
+    path_text = str(rel_path)
+    config_path = _distribution_config_path(shared_home)
+    source_path = shared_home / "skills" / rel_path
+    if not config_path.exists():
+        return {"status": "absent", "entry_removed": False, "source": "absent"}
+
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw = loaded if isinstance(loaded, dict) else {}
+    skills_list = raw.get("skills")
+    if not isinstance(skills_list, list):
+        skills_list = []
+    kept = [
+        item
+        for item in skills_list
+        if not (
+            isinstance(item, dict)
+            and item.get("path") == path_text
+            and item.get("origin") == _SKILL_DISTRIBUTION_ORIGIN
+        )
+    ]
+    entry_removed = len(kept) != len(skills_list)
+    raw["skills"] = kept
+    config_path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    source = "absent"
+    if source_path.is_symlink():
+        target = _symlink_target(source_path)
+        if target is not None and _is_owned_shared_skill_target(
+            target,
+            shared_home=shared_home,
+            skill_code=skill_code,
+        ):
+            source_path.unlink()
+            source = "removed"
+        else:
+            source = "skipped-foreign"
+    elif source_path.exists():
+        source = "skipped-foreign"
+
+    return {
+        "status": "removed" if entry_removed or source == "removed" else "absent",
+        "entry_removed": entry_removed,
+        "source": source,
+    }
+
+
+def _has_all_audience_distribution(
+    *,
+    shared_home: Path,
+    skill_code: str,
+) -> bool:
+    config_path = _distribution_config_path(shared_home)
+    if not config_path.exists():
+        return False
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw = loaded if isinstance(loaded, dict) else {}
+    skills_list = raw.get("skills")
+    if not isinstance(skills_list, list):
+        return False
+    path_text = str(_safe_skill_relative_path(skill_code))
+    return any(
+        isinstance(item, dict)
+        and item.get("path") == path_text
+        and item.get("origin") == _SKILL_DISTRIBUTION_ORIGIN
+        and item.get("audience") == "all"
+        for item in skills_list
+    )
+
+
 def _resolve_profile_name(shared_home: Path, ldap: str) -> str | None:
     db_path = _routing_db_path(shared_home)
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
@@ -371,6 +598,75 @@ def _write_keephub_lock(
     )
 
 
+def _remove_keephub_lock_entry(
+    *,
+    profile_home: Path,
+    skill_code: str,
+) -> None:
+    rel_path = _safe_skill_relative_path(skill_code)
+    path = profile_home / "skills" / _LOCK_FILENAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    installed = raw.get("installed") if isinstance(raw, dict) else None
+    merged = dict(installed) if isinstance(installed, dict) else {}
+    merged.pop(str(rel_path), None)
+    path.write_text(
+        json.dumps({"installed": merged}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _uninstall_from_profile(
+    *,
+    profile_home: Path,
+    skill_code: str,
+) -> dict[str, Any]:
+    profile = Path(profile_home).expanduser()
+    rel_path = _safe_skill_relative_path(skill_code)
+    key = str(rel_path)
+    managed = _read_manifest(profile, MANAGED_SKILL_MANIFEST)
+    entry = managed.get(key) if isinstance(managed, dict) else None
+    if not isinstance(entry, dict):
+        return {"status": "absent", "profile": profile.name}
+    if entry.get("origin") != _SKILL_DISTRIBUTION_ORIGIN:
+        return {"status": "skipped-foreign", "profile": profile.name}
+
+    skill_dir = profile / "skills" / rel_path
+    if skill_dir.is_symlink():
+        skill_dir.unlink()
+    elif skill_dir.is_dir():
+        shutil.rmtree(skill_dir)
+    elif skill_dir.exists():
+        skill_dir.unlink()
+
+    managed.pop(key, None)
+    _write_manifest(profile, MANAGED_SKILL_MANIFEST, managed)
+    _remove_keephub_lock_entry(profile_home=profile, skill_code=skill_code)
+    return {"status": "removed", "profile": profile.name}
+
+
+def _profiles_with_skill(
+    *,
+    profiles_root: Path,
+    skill_code: str,
+) -> list[Path]:
+    # ponytail: O(profiles) manifest scan; build an index if throughput matters.
+    rel_path = _safe_skill_relative_path(skill_code)
+    key = str(rel_path)
+    try:
+        profiles = sorted(path for path in profiles_root.iterdir() if path.is_dir())
+    except FileNotFoundError:
+        return []
+    matches: list[Path] = []
+    for profile_home in profiles:
+        entry = _read_manifest(profile_home, MANAGED_SKILL_MANIFEST).get(key)
+        if isinstance(entry, dict) and entry.get("origin") == _SKILL_DISTRIBUTION_ORIGIN:
+            matches.append(profile_home)
+    return matches
+
+
 def _install_into_profile(
     *,
     profile_home: Path,
@@ -413,67 +709,65 @@ def _install_into_profile(
     return {"status": status, "profile": profile_home.name}
 
 
-def process_event(
-    event: dict[str, Any],
+def _resolve_installed_release(
     *,
-    shared_home: Path,
-    profiles_root: Path | None = None,
-    downloader: Callable[[str], bytes] | None = None,
-    allow_create_distribution: bool = False,
-) -> dict[str, Any]:
-    """Materialize one queued skillhub event.
+    profiles_root: Path,
+    skill_code: str,
+) -> dict[str, Any] | None:
+    """Recover an already-materialized canonical release for ``skill_code``.
 
-    Per-user resolution misses are reported in the results payload. Whole-event
-    failures raise ``SkillhubInstallError`` with a stable error code.
+    ``permission_approved`` (and similar add-only grants) frequently omit
+    release_id/version/download_url — the skill is already live and we only need
+    to grant it to new users. Read the managed-manifest entry of any profile that
+    already has it to recover the canonical skill root, version, and release_id.
+    Returns ``None`` when no profile has a usable installed copy.
     """
-    event_type = _first_str(event.get("event_type")) or ""
-    skill_status = _first_str(event.get("skill_status")) or "active"
-    if event_type == "skill.status_changed" and skill_status == "inactive":
-        return {"action": "skipped_inactive", "users": {}}
-
-    download_url = _first_str(event.get("download_url"))
-    skill_code = _first_str(event.get("skill_code"))
-    version = _first_str(event.get("version"))
-    if not download_url or not skill_code or not version:
-        raise SkillhubInstallError("event missing package fields", error_code="PACKAGE_INVALID")
-
-    release_id = _first_str(event.get("release_id"))
-    shared = Path(shared_home).expanduser()
-    profiles = (profiles_root or shared / "profiles").expanduser()
-    auth_type = _resolve_auth_type(event)
-    if auth_type.strip().lower() == "all":
-        _require_distribution_config(
-            shared,
-            allow_create_distribution=allow_create_distribution,
-        )
-    package_bytes = _download_package(download_url, downloader)
-    _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
-    canonical_skill_root = _materialize_canonical_skill(
-        shared_home=shared,
-        skill_code=skill_code,
-        version=version,
-        package_bytes=package_bytes,
-    )
-    if auth_type.strip().lower() == "all":
-        distribution = _register_all_audience_distribution(
-            shared_home=shared,
-            skill_code=skill_code,
-            canonical_skill_root=canonical_skill_root,
-            allow_create_distribution=allow_create_distribution,
-        )
+    rel_path = _safe_skill_relative_path(skill_code)
+    key = str(rel_path)
+    for profile_home in _profiles_with_skill(profiles_root=profiles_root, skill_code=skill_code):
+        entry = _read_manifest(profile_home, MANAGED_SKILL_MANIFEST).get(key)
+        if not isinstance(entry, dict):
+            continue
+        canonical_raw = _first_str(entry.get("target"), entry.get("source"))
+        version = _first_str(entry.get("version"))
+        if not canonical_raw or not version:
+            continue
+        canonical_root = Path(canonical_raw)
+        if _resolve_skill_root(canonical_root) is None:
+            continue
         return {
-            "action": "install",
-            "mode": "all",
-            "skill_code": skill_code,
+            "canonical_skill_root": canonical_root,
             "version": version,
-            "release_id": release_id,
-            "distribution": distribution,
+            "release_id": _first_str(entry.get("release_id")),
         }
+    return None
 
+
+def _install_from_existing_release(
+    *,
+    event: dict[str, Any],
+    skill_code: str,
+    shared: Path,
+    profiles: Path,
+) -> dict[str, Any]:
+    """Grant an already-installed skill to new users without a download.
+
+    Add-only (incremental): installs the canonical release into each new audience
+    profile; never reconciles/removes. Raises ``PACKAGE_INVALID`` only when the
+    skill is not installed anywhere (nothing to copy) — a genuinely-unknown skill
+    with no package.
+    """
+    resolved = _resolve_installed_release(profiles_root=profiles, skill_code=skill_code)
+    if resolved is None:
+        raise SkillhubInstallError("event missing package fields", error_code="PACKAGE_INVALID")
+    canonical_skill_root = resolved["canonical_skill_root"]
+    version = resolved["version"]
+    release_id = _first_str(event.get("release_id")) or resolved["release_id"]
     audience = event.get("audience") if isinstance(event.get("audience"), dict) else {}
     users = audience.get("users") if isinstance(audience, dict) else []
     results: dict[str, Any] = {
         "action": "install",
+        "mode": "from_existing",
         "skill_code": skill_code,
         "version": version,
         "release_id": release_id,
@@ -501,6 +795,447 @@ def process_event(
     return results
 
 
+def _process_plugin_event(
+    event: dict[str, Any],
+    *,
+    shared: Path,
+    profiles: Path,
+    downloader: Callable[[str], bytes] | None,
+) -> dict[str, Any]:
+    plugin_id = _first_str(event.get("skill_code"))
+    if not plugin_id:
+        raise SkillhubInstallError("plugin event missing skill_code", error_code="PACKAGE_INVALID")
+
+    skill_status = _first_str(event.get("skill_status")) or "active"
+    if skill_status == "pending":
+        return {"action": "skipped_pending", "plugin_id": plugin_id, "item_type": "plugin"}
+    if skill_status == "inactive":
+        uninstall_report = _best_effort_plugin_uninstall(
+            plugin_id,
+            shared=shared,
+            profiles=profiles,
+        )
+        if uninstall_report is None:
+            return {"action": "plugin_uninstall_inactive", "plugin_id": plugin_id, "status": "absent"}
+        return {
+            "action": "plugin_uninstall_inactive",
+            "plugin_id": plugin_id,
+            "uninstall": uninstall_report,
+        }
+
+    auth_type = _resolve_auth_type(event)
+    download_url = _first_str(event.get("download_url"))
+    if auth_type.strip().lower() == "all":
+        # Resolve the repo BEFORE any uninstall: the no-download path reads the cached repo
+        # pointer from the managed manifest, and uninstall unlinks that manifest. If we can't
+        # get a repo, bail with plugin_no_package WITHOUT having destroyed the existing install.
+        if download_url:
+            package_bytes = _download_package(download_url, downloader)
+            _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
+            repo_root = _materialize_plugin_repo(shared, plugin_id, package_bytes)
+        else:
+            managed_path = plugin_ingest._managed_path(shared, plugin_id)
+            try:
+                managed = json.loads(managed_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+                managed = None
+            repo_raw = _first_str(managed.get("repo")) if isinstance(managed, dict) else None
+            repo_root = Path(repo_raw).expanduser() if repo_raw else None
+            if repo_root is None or not repo_root.exists() or not (repo_root / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
+                return {
+                    "action": "plugin_no_package",
+                    "plugin_id": plugin_id,
+                    "reason": "no download_url and no cached plugin repo",
+                }
+        # Repo secured (dir survives uninstall — only the manifest json is unlinked). Now clear
+        # any prior install so the all-ingest doesn't orphan per-profile copies, then re-register.
+        _best_effort_plugin_uninstall(plugin_id, shared=shared, profiles=profiles)
+        try:
+            report = plugin_ingest.ingest(
+                repo_root,
+                audience="all",
+                shared_home=shared,
+                profiles_root=profiles,
+                allow_create_distribution=True,
+            )
+        except plugin_ingest.PluginIngestError as exc:
+            raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
+        return {"action": "plugin_install", "mode": "all", "plugin_id": plugin_id, "ingest": report}
+
+    audience = event.get("audience") if isinstance(event.get("audience"), dict) else {}
+    users = audience.get("users") if isinstance(audience, dict) else []
+    event_type = _first_str(event.get("event_type")) or ""
+    full_snapshot = event_type in _FULL_SNAPSHOT_EVENT_TYPES
+    incremental = event_type == "skill.permission_approved"
+    if not isinstance(users, list) or not users:
+        if full_snapshot:
+            # Empty authorized list on a full-snapshot event = de-authorize everyone.
+            # Uninstall from ALL currently-installed profiles (diff vs the empty set);
+            # a permission_approved (incremental) with no users stays a no-op.
+            _reconcile_plugin_full_snapshot(
+                plugin_id, shared=shared, profiles=profiles, new_profiles=set()
+            )
+            return {"action": "plugin_shrink", "plugin_id": plugin_id, "new_profiles": []}
+        return {"action": "plugin_no_audience", "plugin_id": plugin_id}
+
+    user_report: dict[str, dict[str, Any]] = {}
+    resolved_names: list[str] = []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        ldap = _first_str(entry.get("profile_id"), entry.get("employee_id"), entry.get("open_id"))
+        if not ldap:
+            continue
+        profile_name = _resolve_profile_name(shared, ldap)
+        if not profile_name:
+            user_report[ldap] = {"status": "PROFILE_NOT_FOUND", "profile": None}
+            continue
+        profiles.joinpath(profile_name).mkdir(parents=True, exist_ok=True)
+        user_report[ldap] = {"status": "resolved", "profile": profile_name}
+        if profile_name not in resolved_names:
+            resolved_names.append(profile_name)
+
+    if incremental and _plugin_managed_audience_mode(shared, plugin_id) == "all":
+        # Plugin is already all-audience (org-sync covers everyone) → an incremental grant
+        # is redundant. Keep the all-mode manifest intact; a per-profile install here would
+        # downgrade the manifest to profile-mode and orphan the all-distribution on a later
+        # inactive uninstall.
+        return {"action": "plugin_noop_already_all", "plugin_id": plugin_id, "users": user_report}
+
+    if download_url:
+        package_bytes = _download_package(download_url, downloader)
+        _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
+        repo_root = _materialize_plugin_repo(shared, plugin_id, package_bytes)
+        target = set(resolved_names)
+        if incremental:
+            target |= _plugin_managed_audience_profiles(shared, plugin_id)
+        if full_snapshot:
+            _reconcile_plugin_full_snapshot(
+                plugin_id,
+                shared=shared,
+                profiles=profiles,
+                new_profiles=set(resolved_names),
+            )
+        if not target:
+            return {
+                "action": "plugin_install",
+                "plugin_id": plugin_id,
+                "users": user_report,
+                "ingest": None,
+            }
+        try:
+            report = plugin_ingest.ingest(
+                repo_root,
+                audience=",".join(sorted(target)),
+                shared_home=shared,
+                profiles_root=profiles,
+            )
+        except plugin_ingest.PluginIngestError as exc:
+            raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
+        return {
+            "action": "plugin_install",
+            "plugin_id": plugin_id,
+            "users": user_report,
+            "ingest": report,
+        }
+
+    managed_path = plugin_ingest._managed_path(shared, plugin_id)
+    try:
+        managed = json.loads(managed_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        managed = None
+    repo_raw = _first_str(managed.get("repo")) if isinstance(managed, dict) else None
+    repo_root = Path(repo_raw).expanduser() if repo_raw else None
+    if repo_root is None or not repo_root.exists() or not (repo_root / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
+        return {
+            "action": "plugin_no_package",
+            "plugin_id": plugin_id,
+            "reason": "no download_url and no cached plugin repo",
+        }
+
+    target = set(resolved_names)
+    if incremental:
+        target |= _plugin_managed_audience_profiles(shared, plugin_id)
+    if full_snapshot:
+        _reconcile_plugin_full_snapshot(
+            plugin_id,
+            shared=shared,
+            profiles=profiles,
+            new_profiles=set(resolved_names),
+        )
+    if not target:
+        return {
+            "action": "plugin_install",
+            "plugin_id": plugin_id,
+            "mode": "from_existing",
+            "users": user_report,
+            "ingest": None,
+        }
+    try:
+        report = plugin_ingest.ingest(
+            repo_root,
+            audience=",".join(sorted(target)),
+            shared_home=shared,
+            profiles_root=profiles,
+        )
+    except plugin_ingest.PluginIngestError as exc:
+        raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
+    return {
+        "action": "plugin_install",
+        "mode": "from_existing",
+        "plugin_id": plugin_id,
+        "users": user_report,
+        "ingest": report,
+    }
+
+
+def process_event(
+    event: dict[str, Any],
+    *,
+    shared_home: Path,
+    profiles_root: Path | None = None,
+    downloader: Callable[[str], bytes] | None = None,
+    allow_create_distribution: bool = False,
+) -> dict[str, Any]:
+    """Materialize one queued skillhub event.
+
+    Per-user resolution misses are reported in the results payload. Whole-event
+    failures raise ``SkillhubInstallError`` with a stable error code.
+    """
+    event_type = _first_str(event.get("event_type")) or ""
+    skill_status = _first_str(event.get("skill_status")) or "active"
+    skill_code = _first_str(event.get("skill_code"))
+    item_type = (_first_str(event.get("item_type")) or "skill").strip().lower()
+    shared = Path(shared_home).expanduser()
+    profiles = (profiles_root or shared / "profiles").expanduser()
+    if item_type == "plugin":
+        return _process_plugin_event(
+            event,
+            shared=shared,
+            profiles=profiles,
+            downloader=downloader,
+        )
+    if skill_status == "pending":
+        # Skill not yet live — never download or install. Idempotent no-op.
+        return {"action": "skipped_pending", "skill_code": skill_code}
+    if event_type == "skill.status_changed" and skill_status == "inactive":
+        if not skill_code:
+            return {"action": "uninstall_inactive", "skill_code": None, "removed": []}
+        removed = [
+            _uninstall_from_profile(profile_home=profile_home, skill_code=skill_code)
+            for profile_home in _profiles_with_skill(
+                profiles_root=profiles,
+                skill_code=skill_code,
+            )
+        ]
+        distribution = _unregister_all_audience_distribution(
+            shared_home=shared,
+            skill_code=skill_code,
+        )
+        return {
+            "action": "uninstall_inactive",
+            "skill_code": skill_code,
+            "removed": removed,
+            "distribution": distribution,
+        }
+
+    download_url = _first_str(event.get("download_url"))
+    version = _first_str(event.get("version"))
+    if not skill_code:
+        raise SkillhubInstallError("event missing package fields", error_code="PACKAGE_INVALID")
+    if not download_url or not version:
+        # No package to fetch (common for permission_approved: grant an existing
+        # skill to new users). Install the already-materialized release if one
+        # exists; a never-installed skill with no package is PACKAGE_INVALID.
+        return _install_from_existing_release(
+            event=event,
+            skill_code=skill_code,
+            shared=shared,
+            profiles=profiles,
+        )
+
+    release_id = _first_str(event.get("release_id"))
+    auth_type = _resolve_auth_type(event)
+    auth_type_normalized = auth_type.strip().lower()
+    if auth_type.strip().lower() == "all":
+        _require_distribution_config(
+            shared,
+            allow_create_distribution=allow_create_distribution,
+        )
+    package_bytes = _download_package(download_url, downloader)
+    _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
+    canonical_skill_root = _materialize_canonical_skill(
+        shared_home=shared,
+        skill_code=skill_code,
+        version=version,
+        package_bytes=package_bytes,
+    )
+    if auth_type_normalized == "all":
+        distribution = _register_all_audience_distribution(
+            shared_home=shared,
+            skill_code=skill_code,
+            canonical_skill_root=canonical_skill_root,
+            allow_create_distribution=allow_create_distribution,
+        )
+        return {
+            "action": "install",
+            "mode": "all",
+            "skill_code": skill_code,
+            "version": version,
+            "release_id": release_id,
+            "distribution": distribution,
+        }
+
+    audience = event.get("audience") if isinstance(event.get("audience"), dict) else {}
+    users = audience.get("users") if isinstance(audience, dict) else []
+    results: dict[str, Any] = {
+        "action": "install",
+        "skill_code": skill_code,
+        "version": version,
+        "release_id": release_id,
+        "users": {},
+    }
+    full_snapshot = event_type in _FULL_SNAPSHOT_EVENT_TYPES
+    distribution = None
+    if full_snapshot and _has_all_audience_distribution(shared_home=shared, skill_code=skill_code):
+        distribution = _unregister_all_audience_distribution(
+            shared_home=shared,
+            skill_code=skill_code,
+        )
+
+    install_targets: list[tuple[str, Path]] = []
+    keep_profiles: set[Path] = set()
+    for entry in users if isinstance(users, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        ldap = _first_str(entry.get("profile_id"), entry.get("employee_id"), entry.get("open_id"))
+        if not ldap:
+            continue
+        profile_name = _resolve_profile_name(shared, ldap)
+        if not profile_name:
+            results["users"][ldap] = {"status": "PROFILE_NOT_FOUND", "profile": None}
+            continue
+        profile_home = profiles / profile_name
+        install_targets.append((ldap, profile_home))
+        if full_snapshot:
+            keep_profiles.add(profile_home)
+
+    if full_snapshot:
+        removed = [
+            _uninstall_from_profile(profile_home=profile_home, skill_code=skill_code)
+            for profile_home in _profiles_with_skill(
+                profiles_root=profiles,
+                skill_code=skill_code,
+            )
+            if profile_home not in keep_profiles
+        ]
+        if removed:
+            results["removed"] = removed
+    if distribution is not None:
+        results["distribution"] = distribution
+
+    for ldap, profile_home in install_targets:
+        profile_home.mkdir(parents=True, exist_ok=True)
+        results["users"][ldap] = _install_into_profile(
+            profile_home=profile_home,
+            skill_code=skill_code,
+            version=version,
+            release_id=release_id,
+            canonical_skill_root=canonical_skill_root,
+        )
+    return results
+
+
+def _item_type_from_raw_payload(raw_payload: Any) -> str | None:
+    """Recover item_type (skill|plugin) from the stored raw body.
+
+    item_type has no dedicated column; the raw_payload column already holds the
+    full inbound body, so parse it from there rather than migrating the schema.
+    """
+    if not raw_payload:
+        return None
+    try:
+        payload = json.loads(raw_payload)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    skill_block = payload.get("skill") if isinstance(payload.get("skill"), dict) else {}
+    return _first_str(payload.get("item_type"), skill_block.get("item_type"))
+
+
+def _event_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    audience = json.loads(row["audience_json"]) if row.get("audience_json") else {}
+    return {
+        "event_type": row.get("event_type"),
+        "skill_code": row.get("skill_code"),
+        "release_id": row.get("release_id"),
+        "version": row.get("version"),
+        "download_url": row.get("download_url"),
+        "checksum_sha256": row.get("checksum_sha256"),
+        "skill_status": row.get("skill_status"),
+        "item_type": _item_type_from_raw_payload(row.get("raw_payload")),
+        "audience": audience,
+    }
+
+
+def _process_row(
+    row: dict[str, Any],
+    *,
+    shared: Path,
+    profiles: Path,
+    event_store: SkillhubEventStore,
+    downloader: Callable[[str], bytes] | None,
+) -> dict[str, Any]:
+    try:
+        results = process_event(
+            _event_from_row(row),
+            shared_home=shared,
+            profiles_root=profiles,
+            downloader=downloader,
+        )
+        if event_store.mark_installed(str(row["event_id"]), results):
+            if results.get("action") in {
+                "skipped_pending",
+                "skipped_inactive",
+                "plugin_no_audience",
+                "plugin_no_package",
+            }:
+                return {"status": "skipped", "results": results}
+            return {"status": "installed", "results": results}
+    except SkillhubInstallError as exc:
+        if event_store.mark_failed(str(row["event_id"]), exc.error_code, str(exc)):
+            return {"status": "failed"}
+    except Exception as exc:
+        if event_store.mark_failed(str(row["event_id"]), "INTERNAL_ERROR", str(exc)):
+            return {"status": "failed"}
+    return {"status": "skipped"}
+
+
+def process_one(
+    *,
+    event_id: str,
+    shared_home: Path | None = None,
+    profiles_root: Path | None = None,
+    store: SkillhubEventStore | None = None,
+    downloader: Callable[[str], bytes] | None = None,
+) -> dict[str, Any]:
+    shared = (shared_home or _default_shared_home()).expanduser()
+    profiles = (profiles_root or shared / "profiles").expanduser()
+    event_store = store or get_event_store()
+    row = event_store.get(str(event_id))
+    if row is None or row.get("status") not in {"queued", "queued_unknown_type"}:
+        return {"processed": 0}
+    result = _process_row(
+        row,
+        shared=shared,
+        profiles=profiles,
+        event_store=event_store,
+        downloader=downloader,
+    )
+    return {"processed": 1, "status": result["status"]}
+
+
 def run_worker(
     *,
     store: SkillhubEventStore | None = None,
@@ -517,33 +1252,14 @@ def run_worker(
 
     for row in event_store.list_queued(limit=limit):
         summary["processed"] += 1
-        try:
-            audience = json.loads(row["audience_json"]) if row.get("audience_json") else {}
-            event = {
-                "event_type": row.get("event_type"),
-                "skill_code": row.get("skill_code"),
-                "release_id": row.get("release_id"),
-                "version": row.get("version"),
-                "download_url": row.get("download_url"),
-                "checksum_sha256": row.get("checksum_sha256"),
-                "skill_status": row.get("skill_status"),
-                "audience": audience,
-            }
-            results = process_event(
-                event,
-                shared_home=shared,
-                profiles_root=profiles,
-                downloader=downloader,
-            )
-            if event_store.mark_installed(str(row["event_id"]), results):
-                if results.get("action") == "skipped_inactive":
-                    summary["skipped"] += 1
-                else:
-                    summary["installed"] += 1
-        except SkillhubInstallError as exc:
-            if event_store.mark_failed(str(row["event_id"]), exc.error_code, str(exc)):
-                summary["failed"] += 1
-        except Exception as exc:
-            if event_store.mark_failed(str(row["event_id"]), "INTERNAL_ERROR", str(exc)):
-                summary["failed"] += 1
+        result = _process_row(
+            row,
+            shared=shared,
+            profiles=profiles,
+            event_store=event_store,
+            downloader=downloader,
+        )
+        status = result.get("status")
+        if status in {"installed", "failed", "skipped"}:
+            summary[status] += 1
     return summary

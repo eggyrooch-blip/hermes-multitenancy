@@ -1872,3 +1872,56 @@ def test_sync_profiles_auto_distributes_kep_cli_skills(tmp_path):
     assert target.is_symlink()  # instant propagation from the pool
     assert target.resolve() == ocean.resolve()
     assert not (profiles_root / "alice" / "skills" / "Keep" / "keep-record").exists()
+
+
+def test_default_profile_skill_specs_merges_distribution_over_defaults(tmp_path):
+    """选项2 regression: skill-distribution.yaml must NOT shadow profile-skill-defaults.yaml.
+
+    Before the fix, the mere presence of skill-distribution.yaml took an exclusive
+    branch that never read profile-skill-defaults.yaml, dropping every profile's
+    baseline default skills. With BOTH files present a profile must get the UNION,
+    with distribution entries overlaying defaults on path conflict.
+    """
+    from hermes_multitenancy.sync.feishu_org import Employee, _default_profile_skill_specs
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir(parents=True)
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        "skills:\n  - lark-docs\n  - daily-note\n",
+        encoding="utf-8",
+    )
+    (shared_home / "skill-distribution.yaml").write_text(
+        """
+skills:
+  - path: lark-docs
+    install_mode: symlink
+    audience: all
+    version: "9.9.9"
+  - path: Keep/keep-record
+    install_mode: symlink
+    audience: all
+""",
+        encoding="utf-8",
+    )
+
+    employee = Employee(
+        open_id="ou_alice",
+        user_id="alice",
+        agent_id="alice",
+        profile_name="alice",
+        name="Alice",
+        dept_id="od_x",
+        dept_name="X",
+        leader_user_id=None,
+    )
+
+    specs = _default_profile_skill_specs(shared_home, employee)
+    by_path = {str(spec["path"]): spec for spec in specs}
+
+    # Default-only skill is NOT dropped (the core bug).
+    assert "daily-note" in by_path
+    # Distribution-only skill is present.
+    assert "Keep/keep-record" in by_path
+    # Conflicting path: distribution entry overlays the default (defaults never
+    # carry a version; the distribution entry does).
+    assert by_path["lark-docs"].get("version") == "9.9.9"

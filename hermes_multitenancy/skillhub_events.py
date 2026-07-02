@@ -162,6 +162,11 @@ def normalize_event(payload: dict[str, Any], *, raw_body: str) -> dict[str, Any]
         payload.get("checksum_sha256"), package_block.get("checksum_sha256")
     )
     skill_status = _first_str(payload.get("skill_status"), skill_block.get("status")) or "active"
+    # v2 callback adds item_type (skill|plugin). Absent -> "skill" (backward compat
+    # with every legacy event). A value we don't recognize is treated as "skill" so a
+    # typo never silently routes to the plugin path.
+    item_type_raw = _first_str(payload.get("item_type"), skill_block.get("item_type"))
+    item_type = item_type_raw.lower() if item_type_raw and item_type_raw.lower() == "plugin" else "skill"
     # 王克杰 uses audience.auth_type (all|auth); PRD uses audience.type (users|...).
     auth_type = _first_str(audience.get("auth_type"), audience.get("type")) or "auth"
     users = _normalize_users(audience)
@@ -179,6 +184,7 @@ def normalize_event(payload: dict[str, Any], *, raw_body: str) -> dict[str, Any]
         "download_url": download_url,
         "checksum_sha256": checksum,
         "skill_status": skill_status,
+        "item_type": item_type,
         "auth_type": auth_type,
         "audience": {"auth_type": auth_type, "users": users},
         "known_type": event_type in KNOWN_EVENT_TYPES,

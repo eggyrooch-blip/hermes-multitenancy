@@ -966,6 +966,22 @@ def _desired_skill_metadata(
 
 def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
+    # Baseline defaults (profile-skill-defaults.yaml) are ALWAYS included. Previously
+    # the presence of skill-distribution.yaml took an exclusive `if` branch that never
+    # called _default_profile_skill_paths, silently dropping every profile's baseline
+    # default skills. MERGE instead of shadow: emit defaults first, then let
+    # skill-distribution.yaml entries overlay them on path conflict (distribution
+    # carries richer audience/metadata) via the last-wins dedup below. When only one
+    # file exists behavior is unchanged: no defaults file -> _default_profile_skill_paths
+    # returns []; no distribution file -> the overlay block is skipped.
+    specs.extend(
+        {
+            "path": rel_path,
+            "install_mode": "symlink" if _should_symlink_shared_skill(rel_path) else "copy",
+            "share_with_children": False,
+        }
+        for rel_path in _default_profile_skill_paths(shared_home)
+    )
     distribution = _skill_distribution_config_path(shared_home)
     if distribution is not None:
         raw = yaml.safe_load(distribution.read_text(encoding="utf-8")) or {}
@@ -976,15 +992,6 @@ def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[
             spec = _coerce_skill_distribution_entry(item, employee, shared_home=shared_home)
             if spec is not None:
                 specs.append(spec)
-    else:
-        specs.extend(
-            {
-                "path": rel_path,
-                "install_mode": "symlink" if _should_symlink_shared_skill(rel_path) else "copy",
-                "share_with_children": False,
-            }
-            for rel_path in _default_profile_skill_paths(shared_home)
-        )
     specs.extend(_skill_bundle_profile_specs(shared_home, employee))
     specs_by_path = {str(spec["path"]): spec for spec in specs}
     for rel_path in _shared_lark_skill_paths(shared_home):

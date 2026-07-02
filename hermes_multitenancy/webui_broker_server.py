@@ -190,6 +190,15 @@ def _shared_home_from_env() -> Path:
     return Path(configured or (Path.home() / ".hermes")).expanduser()
 
 
+def _run_skillhub_install_in_background(event_id: str, shared_home: Path) -> None:
+    try:
+        from . import skillhub_installer
+
+        skillhub_installer.process_one(event_id=event_id, shared_home=shared_home)
+    except Exception:
+        logger.exception("[multitenancy] SkillHub background install failed event_id=%s", event_id)
+
+
 def _safe_plugin_asset_component(raw: Any) -> str | None:
     value = str(raw or "").strip()
     if not value or "/" in value or "\\" in value or value.startswith("."):
@@ -4477,6 +4486,19 @@ def create_run_broker_app(
             status, duplicate = store.record(
                 event, raw_payload=raw_body, signature_verified=signature_verified
             )
+            if status == "queued" and not duplicate:
+                try:
+                    from . import skillhub_installer
+
+                    shared_home = _shared_home_from_env()
+                    event_id = event["event_id"]
+                    loop = asyncio.get_running_loop()
+                    loop.run_in_executor(
+                        None,
+                        lambda: _run_skillhub_install_in_background(event_id, shared_home),
+                    )
+                except Exception:
+                    logger.exception("[multitenancy] SkillHub background install schedule failed")
         except Exception:
             logger.exception("[multitenancy] SkillHub event persist failed")
             return web.json_response(

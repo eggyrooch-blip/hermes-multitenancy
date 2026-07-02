@@ -292,13 +292,15 @@ def _validate_experts(experts: Any, *, repo: Path, path: Path) -> None:
 
 @dataclass
 class Audience:
-    mode: str  # "profile" | "department_ids"
+    mode: str  # "profile" | "department_ids" | "all"
     profiles: list[str] = field(default_factory=list)
     department_ids: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         if self.mode == "profile":
             return f"profiles={self.profiles}"
+        if self.mode == "all":
+            return "audience=all"
         return f"department_ids={self.department_ids}"
 
 
@@ -312,6 +314,8 @@ def resolve_audience(value: str, *, profiles_root: Path) -> Audience:
     raw = (value or "").strip()
     if not raw:
         raise PluginIngestError("--audience is required (a profile id or numeric department_ids)")
+    if raw.lower() in {"all", "*", "everyone", "__all__"}:
+        return Audience(mode="all")
     tokens = [t.strip() for t in raw.split(",") if t.strip()]
     for t in tokens:  # a profile token becomes `profiles_root / t` — block traversal
         if "/" in t or "\\" in t or t in (".", "..") or "\x00" in t:
@@ -552,6 +556,53 @@ def _register_department_distribution(
     return {"config_path": str(config_path), "entries": entries, "written": not dry_run}
 
 
+def _register_global_distribution(
+    plugin: dict[str, Any],
+    *,
+    shared_home: Path,
+    dry_run: bool,
+    allow_create: bool = False,
+) -> dict[str, Any]:
+    """Add all-employee entries to shared `skill-distribution.yaml` for the org fan-out."""
+    config_path = shared_home / SKILL_DISTRIBUTION_FILE
+    if not config_path.exists() and not allow_create:
+        raise PluginIngestError(
+            f"no {SKILL_DISTRIBUTION_FILE} at {shared_home} — refusing to create it "
+            "(creating it would override every profile's default-skill source; this env "
+            "is likely curator-driven). Use --allow-create-distribution to override, or "
+            "target an explicit profile with --audience <profile-id>."
+        )
+    repo = Path(plugin["_repo"])
+    shared_skills = shared_home / "skills"
+    names = list(plugin["skills"]["list"])
+    install_mode = plugin.get("install_mode") or "copy"
+    for name in names:
+        _register_shared_skill_source(repo, shared_skills, name, skills_dir=plugin["_skills_dir"], dry_run=dry_run, force=False)
+
+    raw: dict[str, Any] = {}
+    if config_path.exists():
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    skills_list = raw.get("skills")
+    if not isinstance(skills_list, list):
+        skills_list = []
+    plugin_id = plugin["id"]
+    kept = [it for it in skills_list if not (isinstance(it, dict) and it.get("plugin") == plugin_id)]
+    entries = [
+        {
+            "path": name,
+            "install_mode": install_mode,
+            "audience": "all",
+            "plugin": plugin_id,
+        }
+        for name in names
+    ]
+    raw["skills"] = sorted(kept + entries, key=lambda it: (str(it.get("path")), str(it.get("plugin") or "")))
+
+    if not dry_run:
+        config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return {"config_path": str(config_path), "entries": entries, "written": not dry_run}
+
+
 # ─────────────────────────── connector validation ────────────────────────
 
 def validate_connectors(connectors: list[dict[str, Any]]) -> dict[str, Any]:
@@ -770,6 +821,10 @@ def ingest(
         report["skills"] = _install_skills_to_profile(
             plugin, aud, shared_home=shared_home, profiles_root=profiles_root, dry_run=dry_run, force=force
         )
+    elif aud.mode == "all":
+        report["skills"] = _register_global_distribution(
+            plugin, shared_home=shared_home, dry_run=dry_run, allow_create=allow_create_distribution
+        )
     else:
         report["skills"] = _register_department_distribution(
             plugin, aud, shared_home=shared_home, dry_run=dry_run, allow_create=allow_create_distribution
@@ -826,6 +881,7 @@ def uninstall(
     profiles_root: Optional[Path] = None,
     dry_run: bool = False,
     purge_clis: bool = False,
+    profiles: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     _safe_component(plugin_id, kind="plugin id")  # CLI arg → managed-manifest filename
     shared_home = (shared_home or _default_shared_home()).expanduser()
@@ -838,6 +894,7 @@ def uninstall(
     report: dict[str, Any] = {"plugin_id": plugin_id, "dry_run": dry_run, "removed": []}
     aud = manifest.get("audience") or {}
     skills = manifest.get("skills") or []
+    manifest_kept = False
 
     if aud.get("mode") == "profile":
         # remove ONLY skills we own; fall back to the flat list for manifests written
@@ -845,7 +902,10 @@ def uninstall(
         owned = manifest.get("owned_skills")
         if not isinstance(owned, dict) or not owned:
             owned = {p: list(skills) for p in (aud.get("profiles") or [])}
+        profile_filter = set(profiles) if profiles is not None else None
         for profile, names in owned.items():
+            if profile_filter is not None and profile not in profile_filter:
+                continue
             profile_home = profiles_root / profile
             for name in names:
                 # COEXISTENCE GUARD: if the personal install no longer points at our
@@ -860,6 +920,18 @@ def uninstall(
                     continue
                 res = uninstall_personal_skill_for_profile(profile_home=profile_home, skill_path=name)
                 report["removed"].append({"profile": profile, "skill": name, "action": "removed" if res.get("removed") else "absent"})
+        if profile_filter is not None:
+            remaining = {p: names for p, names in owned.items() if p not in profile_filter}
+            if remaining:
+                kept_manifest = dict(manifest)
+                kept_audience = dict(aud)
+                kept_audience["profiles"] = [p for p in (aud.get("profiles") or []) if p not in profile_filter]
+                kept_manifest["audience"] = kept_audience
+                kept_manifest["owned_skills"] = remaining
+                report["remaining_profiles"] = list(remaining)
+                if not dry_run:
+                    path.write_text(json.dumps(kept_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                manifest_kept = True
     else:
         # department mode → strip this plugin's entries from skill-distribution.yaml
         config_path = shared_home / SKILL_DISTRIBUTION_FILE
@@ -897,7 +969,7 @@ def uninstall(
             "is not sufficient to prove they belong only to this plugin"
         )
 
-    if not dry_run:
+    if not dry_run and not manifest_kept:
         path.unlink()
     report["managed_manifest"] = str(path)
     return report

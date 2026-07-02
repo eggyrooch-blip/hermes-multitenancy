@@ -59,7 +59,15 @@ def _fresh_event_store(monkeypatch):
     The endpoint is fail-closed, so a key MUST be configured for it to serve at
     all; tests send TEST_KEY by default via ``_post``.
     """
+    from hermes_multitenancy import webui_broker_server as broker_mod
+
     monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_KEY", TEST_KEY)
+    monkeypatch.setattr(
+        broker_mod,
+        "_run_skillhub_install_in_background",
+        lambda _event_id, _shared_home: None,
+        raising=False,
+    )
     skillhub_events.override_event_store(":memory:")
     yield
     skillhub_events.override_event_store(":memory:")
@@ -193,6 +201,26 @@ def test_endpoint_accepts_wangkejie_payload():
     assert body["skill_code"] == "daily-breaking"
     # persisted in the shared singleton store
     assert skillhub_events.get_event_store().count() == 1
+
+
+def test_endpoint_schedules_background_install_for_new_known_event(monkeypatch, tmp_path):
+    from hermes_multitenancy import webui_broker_server as broker_mod
+
+    scheduled = []
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(
+        broker_mod,
+        "_run_skillhub_install_in_background",
+        lambda event_id, shared_home: scheduled.append((event_id, shared_home)),
+    )
+
+    first_status, first = _post("/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD)
+    second_status, second = _post("/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD)
+
+    assert first_status == 200 and second_status == 200
+    assert first["status"] == "queued"
+    assert second["duplicate"] is True
+    assert scheduled == [(first["event_id"], tmp_path / ".hermes")]
 
 
 def test_endpoint_idempotent_on_repost():

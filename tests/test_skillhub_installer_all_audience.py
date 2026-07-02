@@ -322,6 +322,51 @@ def test_auth_event_regression_stays_per_profile_and_result_shape_is_unchanged(t
     assert managed["skills"]["daily-breaking"]["origin"] == "aidock-skillhub"
 
 
+def test_all_audience_to_auth_snapshot_removes_distribution_and_installs_subset(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    config_path = shared_home / "skill-distribution.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump({"skills": []}, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    package = _build_skill_zip("daily-breaking")
+
+    all_result = process_event(
+        _normalize_event(_event_payload(auth_type="all", users=[])),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: package,
+    )
+    subset_result = process_event(
+        _normalize_event(_event_payload(auth_type="auth", users=["alice-ldap"])),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: package,
+    )
+
+    assert all_result["mode"] == "all"
+    assert subset_result["users"]["alice-ldap"] == {"status": "installed", "profile": "alice"}
+    assert subset_result["distribution"]["entry_removed"] is True
+    assert subset_result["distribution"]["source"] == "removed"
+    merged = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert not [
+        item
+        for item in merged["skills"]
+        if isinstance(item, dict)
+        and item.get("path") == "daily-breaking"
+        and item.get("origin") == "aidock-skillhub"
+    ]
+    assert not (shared_home / "skills" / "daily-breaking").exists()
+    assert (profiles_root / "alice" / "skills" / "daily-breaking").resolve() == (
+        shared_home / "_managed" / "aidock-skillhub" / "daily-breaking" / "1.0.0"
+    ).resolve()
+
+
 def test_all_audience_skips_foreign_non_symlink_source_but_still_writes_distribution_entry(tmp_path: Path) -> None:
     from hermes_multitenancy.skillhub_installer import process_event
 

@@ -269,6 +269,13 @@ def test_resolve_audience_department_ids(tmp_path):
     assert aud.mode == "department_ids" and aud.department_ids == ["101", "202"]
 
 
+@pytest.mark.parametrize("value", ["all", "*", "everyone", "ALL"])
+def test_resolve_audience_all_variants(tmp_path, value):
+    home = _shared_home(tmp_path)
+    aud = pi.resolve_audience(value, profiles_root=home / "profiles")
+    assert aud.mode == "all"
+
+
 def test_resolve_audience_department_name_rejected(tmp_path):
     home = _shared_home(tmp_path)
     with pytest.raises(pi.PluginIngestError, match="department NAMES are rejected"):
@@ -347,6 +354,25 @@ def test_ingest_profile_mode_install_idempotent_uninstall(tmp_path):
     assert any(item.get("action") == "removed" for item in u["removed"])
 
 
+def test_uninstall_profiles_subset_keeps_other_profile(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path, profiles=("feishu_a", "feishu_b"))
+    managed_path = home / pi.MANAGED_DIR / "test-plugin.json"
+
+    pi.ingest(repo, audience="feishu_a,feishu_b", shared_home=home)
+    pi.uninstall("test-plugin", shared_home=home, profiles=["feishu_b"])
+
+    for name in ["using-resource-delivery", "kep-trevi-delivery-orchestrate", "kep-halo-cli"]:
+        assert (home / "profiles" / "feishu_a" / "skills" / name).exists()
+        assert not (home / "profiles" / "feishu_b" / "skills" / name).exists()
+    managed = json.loads(managed_path.read_text(encoding="utf-8"))
+    assert managed["audience"]["profiles"] == ["feishu_a"]
+    assert set(managed["owned_skills"]) == {"feishu_a"}
+
+    pi.uninstall("test-plugin", shared_home=home, profiles=["feishu_a"])
+    assert not managed_path.exists()
+
+
 # ─────────────────────────── ingest: department mode ────────────────────
 
 def test_ingest_profile_mode_asserts_profile_governance(tmp_path):
@@ -381,6 +407,37 @@ def test_ingest_department_mode_refuses_to_create_config(tmp_path):
     home = _shared_home(tmp_path)  # no skill-distribution.yaml
     with pytest.raises(pi.PluginIngestError, match="refusing to create"):
         pi.ingest(repo, audience="101,202", shared_home=home)
+
+
+def test_ingest_all_mode_refuses_create_without_flag(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)  # no skill-distribution.yaml
+    with pytest.raises(pi.PluginIngestError, match="refusing to create"):
+        pi.ingest(repo, audience="all", shared_home=home)
+
+
+def test_ingest_all_mode_writes_global_distribution_and_uninstall_strips(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+
+    pi.ingest(repo, audience="all", shared_home=home, allow_create_distribution=True)
+
+    dist = home / pi.SKILL_DISTRIBUTION_FILE
+    raw = yaml.safe_load(dist.read_text(encoding="utf-8")) or {}
+    entries = [it for it in raw.get("skills", []) if it.get("plugin") == "test-plugin"]
+    assert {it["path"] for it in entries} == {
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+        "kep-halo-cli",
+    }
+    assert all(it["audience"] == "all" for it in entries)
+    managed = json.loads((home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8"))
+    assert managed["audience"]["mode"] == "all"
+
+    pi.uninstall("test-plugin", shared_home=home)
+    raw2 = yaml.safe_load(dist.read_text(encoding="utf-8")) or {}
+    assert all(it.get("plugin") != "test-plugin" for it in raw2.get("skills", []))
+    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
 
 
 def test_ingest_department_mode_writes_distribution_and_strips(tmp_path):
