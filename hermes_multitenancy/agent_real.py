@@ -271,6 +271,13 @@ async def stream_run_agent(  # type: ignore[override]
             "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
             exc, exc_info=True,
         )
+        # A credential expiry may have been signalled before the stream raised
+        # (the sidecar returns a graceful 503, but a later step can still throw).
+        # Surface it here too so the re-auth card isn't silently dropped on the
+        # exception tail.
+        expiry = signal.get()
+        if expiry:
+            yield "auth_required", expiry
         # If we already streamed partial content into the card, re-running the
         # legacy stream below would DUPLICATE everything the user has seen. Stop
         # with an honest recovery hint instead of re-streaming. (Only fall through

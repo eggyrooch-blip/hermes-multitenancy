@@ -591,6 +591,21 @@ def _auth_signal_consume(signal_run_id: str) -> None:
         _auth_signal_store.pop(signal_run_id, None)
 
 
+def _auth_signal_touch(signal_run_id: str) -> None:
+    """Restart a retained entry's TTL/eviction clock at auth_required emission.
+
+    The entry is stashed at run START (before we know the run will re-auth), so
+    without this its 600s window and its cap-eviction age would count from run
+    start — a slow run could shrink the user's real re-auth window or make the
+    pending entry the oldest cap-eviction victim. Refreshing stored_at when the
+    signal actually fires gives the user the full window from that moment.
+    """
+    with _auth_signal_store_lock:
+        entry = _auth_signal_store.get(signal_run_id)
+        if entry is not None:
+            entry["stored_at"] = time.time()
+
+
 def _skillhub_authorized(request: Any) -> bool:
     """Auth for the SkillHub webhook ingress — **fail-closed**.
 
@@ -2285,6 +2300,7 @@ def create_run_broker_app(
             nonlocal auth_required_seen
             if event.kind == "auth_required":
                 auth_required_seen = True
+                _auth_signal_touch(signal_run_id)  # restart TTL/eviction clock at emission
             await emitter.emit(event)
 
         if admission.duplicate:
@@ -2422,7 +2438,12 @@ def create_run_broker_app(
                 chat_id=stashed_payload.get("chat_id"),
                 session_id=stashed_payload.get("session_id"),
                 message_id=stashed_payload.get("message_id"),
-                idempotency_key=stashed_payload.get("idempotency_key"),
+                # A replay is a DELIBERATE re-run of the original request. Reusing
+                # the original idempotency_key makes the broker's admit() dedup
+                # treat it as a duplicate (mark_seen within the 24h window) and
+                # return early WITHOUT dispatching — the whole re-auth loop would
+                # then produce no answer. Drop the key so the replay dispatches.
+                idempotency_key=None,
                 delivery_mode=stashed_payload.get("delivery_mode") or "socket",
                 credential_subject=stashed_subject or stashed_payload.get("credential_subject"),
                 requires_host_tools=bool(stashed_payload.get("requires_host_tools")),

@@ -284,6 +284,9 @@ def test_replay_redispatches_owned_stashed_request() -> None:
             "profile_name": "alice",
             "user_key": "ou_alice",
             "content": "原始请求",
+            # Original run's idempotency key — must NOT be reused on replay, or the
+            # broker dedup would swallow the deliberate re-run (the critical bug).
+            "idempotency_key": "webui:sess-1:resp_run_abc",
         },
         profile_name="alice",
         subject="ou_alice",
@@ -307,6 +310,9 @@ def test_replay_redispatches_owned_stashed_request() -> None:
     assert len(seen) == 1
     assert seen[0].content == "原始请求"
     assert seen[0].profile_name == "alice"
+    # CRITICAL: replay must drop the original idempotency_key so the broker's
+    # admit()-time dedup can't treat the deliberate re-run as a duplicate.
+    assert seen[0].idempotency_key is None
     assert '"kind": "done"' in status_body["body"]
     # one-shot: the consumed entry is gone (a fresh one for the replay run may exist)
     assert "sig-1" not in broker._auth_signal_store
