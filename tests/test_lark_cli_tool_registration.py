@@ -35,6 +35,7 @@ def test_lark_cli_tool_registers_with_hermes_registry_when_available(monkeypatch
     assert registrations[-1]["name"] == "lark_cli"
     assert registrations[-1]["toolset"] == "lark_cli"
     assert registrations[-1]["schema"]["name"] == "lark_cli"
+    assert registrations[-1]["max_result_size_chars"] == 30_000
     identity_description = registrations[-1]["schema"]["parameters"]["properties"]["identity"]["description"]
     assert "owner-mapped Feishu group message sends" in identity_description
     assert "non-message APIs are refused" in identity_description

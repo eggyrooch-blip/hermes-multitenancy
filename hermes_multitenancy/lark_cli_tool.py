@@ -769,6 +769,10 @@ if registry is not None:
         check_fn=_check_lark_cli,
         requires_env=[],
         is_async=False,
+        # 30K chars: force large payloads (e.g. 64KB sheets +csv-get) through the
+        # core hermes-results offload (preview + sandbox file path) instead of
+        # inline context — the model must never copy big data into write_file args.
+        max_result_size_chars=30_000,
         description="Official lark-cli bridge for Feishu/Lark OpenAPI",
         emoji="Lark",
     )
