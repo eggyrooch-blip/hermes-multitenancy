@@ -529,6 +529,62 @@ def _authorized(request: Any) -> bool:
     return hmac.compare_digest(header[len(prefix):].strip(), expected)
 
 
+# In-process TTL stash for webui credential-expiry replay. When a run emits an
+# `auth_required` frame, its original inbound request is parked here keyed by a
+# server-minted `signal_run_id`; after the user re-authenticates, the bearer-
+# protected replay endpoint re-dispatches it. Bounded (TTL + cap), single
+# process — never crosses restarts, mirroring the broker's own dedup posture.
+# NOTE: this is the WebUI seam only; the Feishu-path replay lives independently
+# in router._pending_auth_replay and must not be touched here.
+_AUTH_SIGNAL_TTL_SECONDS = 600.0
+_AUTH_SIGNAL_CAP = 512
+_auth_signal_store: dict[str, dict[str, Any]] = {}
+_auth_signal_store_lock = threading.Lock()
+
+
+def _auth_signal_prune_locked(now: float) -> None:
+    cutoff = now - _AUTH_SIGNAL_TTL_SECONDS
+    for key in [k for k, e in _auth_signal_store.items() if e["stored_at"] < cutoff]:
+        _auth_signal_store.pop(key, None)
+    if len(_auth_signal_store) > _AUTH_SIGNAL_CAP:
+        overflow = sorted(_auth_signal_store.items(), key=lambda kv: kv[1]["stored_at"])
+        for key, _ in overflow[: len(_auth_signal_store) - _AUTH_SIGNAL_CAP]:
+            _auth_signal_store.pop(key, None)
+
+
+def _auth_signal_stash(
+    signal_run_id: str,
+    *,
+    payload: dict[str, Any],
+    profile_name: str,
+    subject: str,
+) -> None:
+    """Park an inbound request for post-auth replay. Payload is user content
+    (never credentials/env); stored verbatim minus nothing secret-bearing."""
+    now = time.time()
+    with _auth_signal_store_lock:
+        _auth_signal_prune_locked(now)
+        _auth_signal_store[signal_run_id] = {
+            "payload": dict(payload or {}),
+            "profile_name": str(profile_name or ""),
+            "subject": str(subject or ""),
+            "stored_at": now,
+        }
+
+
+def _auth_signal_lookup(signal_run_id: str) -> Optional[dict[str, Any]]:
+    now = time.time()
+    with _auth_signal_store_lock:
+        _auth_signal_prune_locked(now)
+        entry = _auth_signal_store.get(signal_run_id)
+        return dict(entry) if entry is not None else None
+
+
+def _auth_signal_consume(signal_run_id: str) -> None:
+    with _auth_signal_store_lock:
+        _auth_signal_store.pop(signal_run_id, None)
+
+
 def _skillhub_authorized(request: Any) -> bool:
     """Auth for the SkillHub webhook ingress — **fail-closed**.
 
@@ -1975,6 +2031,7 @@ async def _default_dispatch_agent(
     request: RunRequest,
     *,
     emit_event: Optional[EmitRunEvent] = None,
+    auth_signal_run_id: Optional[str] = None,
 ) -> str:
     # Plan-A surgical fix (user-approved 2026-05-17). Keeps the streaming path
     # so tool_started/tool_completed/thinking frames reach the WebUI (the
@@ -2053,6 +2110,11 @@ async def _default_dispatch_agent(
             if kind in {"approval_required", "approval_resolved"}:
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
                 await emitter.emit(RunEvent(kind=kind, payload=event_payload))
+                continue
+            if kind == "auth_required":
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {}
+                event_payload["run_id"] = auth_signal_run_id
+                await emitter.emit(RunEvent(kind="auth_required", payload=event_payload))
                 continue
             if kind == "clarify_required":
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
@@ -2170,42 +2232,19 @@ def create_run_broker_app(
     except Exception as exc:  # pragma: no cover - production dependency guard
         raise RuntimeError("aiohttp is required for the WebUI run broker endpoint") from exc
 
-    async def handle_run(request):
-        if not _authorized(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
+    async def _stream_run_request(request, run_request, *, stash_payload):
+        """Admit + SSE-stream a run_request. Shared by handle_run and replay.
 
-        try:
-            payload = await request.json()
-            resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
-            if resolution_error is not None:
-                return web.json_response({"error": resolution_error}, status=403)
-            trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
-            metadata = _sanitize_ingest_metadata(payload.get("metadata") or {})
-            _apply_expert_id_to_metadata(request, payload, metadata)
-            share_context = _agent_share_context_for_request(
-                request,
-                payload,
-                resolved_profile_name=str(resolved_profile_name or payload.get("profile_name") or payload.get("profile") or ""),
-            )
-            if share_context:
-                metadata[_AGENT_SHARE_CONTEXT_METADATA_KEY] = share_context
-            run_request = RunRequest(
-                channel=payload.get("channel"),
-                profile_name=resolved_profile_name or payload.get("profile_name") or payload.get("profile"),
-                user_key=trusted_owner or payload.get("user_key") or payload.get("user"),
-                content=payload.get("content"),
-                chat_id=payload.get("chat_id"),
-                session_id=payload.get("session_id"),
-                message_id=payload.get("message_id"),
-                idempotency_key=payload.get("idempotency_key"),
-                delivery_mode=payload.get("delivery_mode") or "socket",
-                credential_subject=trusted_owner or payload.get("credential_subject"),
-                requires_host_tools=bool(payload.get("requires_host_tools")),
-                metadata=metadata,
-                messages=payload.get("messages") or [],
-            )
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=400)
+        Mints a fresh ``signal_run_id`` and parks ``stash_payload`` so any
+        ``auth_required`` frame this run emits can itself be replayed.
+        """
+        signal_run_id = secrets.token_urlsafe(24)
+        _auth_signal_stash(
+            signal_run_id,
+            payload=stash_payload,
+            profile_name=run_request.profile_name,
+            subject=run_request.user_key,
+        )
 
         try:
             admission_broker = RunBroker(
@@ -2245,7 +2284,9 @@ def create_run_broker_app(
             return response
 
         broker_dispatch = dispatch_agent or (
-            lambda req: _default_dispatch_agent(req, emit_event=emit_event)
+            lambda req: _default_dispatch_agent(
+                req, emit_event=emit_event, auth_signal_run_id=signal_run_id
+            )
         )
 
         broker = RunBroker(
@@ -2268,6 +2309,99 @@ def create_run_broker_app(
                     if not _is_client_transport_closed(exc):
                         raise
         return response
+
+    async def handle_run(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+            resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+            if resolution_error is not None:
+                return web.json_response({"error": resolution_error}, status=403)
+            trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+            metadata = _sanitize_ingest_metadata(payload.get("metadata") or {})
+            _apply_expert_id_to_metadata(request, payload, metadata)
+            share_context = _agent_share_context_for_request(
+                request,
+                payload,
+                resolved_profile_name=str(resolved_profile_name or payload.get("profile_name") or payload.get("profile") or ""),
+            )
+            if share_context:
+                metadata[_AGENT_SHARE_CONTEXT_METADATA_KEY] = share_context
+            run_request = RunRequest(
+                channel=payload.get("channel"),
+                profile_name=resolved_profile_name or payload.get("profile_name") or payload.get("profile"),
+                user_key=trusted_owner or payload.get("user_key") or payload.get("user"),
+                content=payload.get("content"),
+                chat_id=payload.get("chat_id"),
+                session_id=payload.get("session_id"),
+                message_id=payload.get("message_id"),
+                idempotency_key=payload.get("idempotency_key"),
+                delivery_mode=payload.get("delivery_mode") or "socket",
+                credential_subject=trusted_owner or payload.get("credential_subject"),
+                requires_host_tools=bool(payload.get("requires_host_tools")),
+                metadata=metadata,
+                messages=payload.get("messages") or [],
+            )
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        return await _stream_run_request(request, run_request, stash_payload=payload)
+
+    async def handle_credential_replay(request):
+        """Re-run a request that failed on expired lark-cli credentials.
+
+        Bearer-protected; the stashed entry is tenant-pinned, so only the owner
+        who created it (same resolved profile + owner subject) may replay it.
+        One-shot: a successfully re-dispatched entry is consumed.
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        signal_run_id = str(request.match_info.get("signal_run_id") or "").strip()
+        entry = _auth_signal_lookup(signal_run_id) if signal_run_id else None
+        if entry is None:
+            return web.json_response({"error": "unknown or expired signal_run_id"}, status=404)
+
+        # Re-derive the caller's owner boundary exactly as handle_run does; never
+        # trust a client-supplied profile that isn't owned.
+        caller_profile, resolution_error = _resolve_owner_scoped_profile(request, {})
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+        caller_subject = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+
+        stashed_profile = str(entry.get("profile_name") or "")
+        stashed_subject = str(entry.get("subject") or "")
+        if (caller_profile is not None and caller_profile != stashed_profile) or (
+            caller_subject and caller_subject != stashed_subject
+        ):
+            return web.json_response({"error": "signal_run_id does not belong to caller"}, status=403)
+
+        stashed_payload = dict(entry.get("payload") or {})
+        try:
+            run_request = RunRequest(
+                channel=stashed_payload.get("channel"),
+                profile_name=stashed_profile or stashed_payload.get("profile_name") or stashed_payload.get("profile"),
+                user_key=stashed_subject or stashed_payload.get("user_key") or stashed_payload.get("user"),
+                content=stashed_payload.get("content"),
+                chat_id=stashed_payload.get("chat_id"),
+                session_id=stashed_payload.get("session_id"),
+                message_id=stashed_payload.get("message_id"),
+                idempotency_key=stashed_payload.get("idempotency_key"),
+                delivery_mode=stashed_payload.get("delivery_mode") or "socket",
+                credential_subject=stashed_subject or stashed_payload.get("credential_subject"),
+                requires_host_tools=bool(stashed_payload.get("requires_host_tools")),
+                metadata=_sanitize_ingest_metadata(stashed_payload.get("metadata") or {}),
+                messages=stashed_payload.get("messages") or [],
+            )
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        # One-shot: consume before dispatch so a retry can't double-fire the
+        # same parked request; the new run parks its own fresh entry.
+        _auth_signal_consume(signal_run_id)
+        return await _stream_run_request(request, run_request, stash_payload=stashed_payload)
 
     # Result cache for ingest idempotency (gap D): a duplicate submission
     # returns the SAME result the first one produced, instead of an empty
@@ -4637,6 +4771,9 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post(
+        "/api/run-broker/credentials/replay/{signal_run_id}", handle_credential_replay
+    )
     app.router.add_post("/api/run-broker/ingest/async", handle_ingest_async)
     app.router.add_get("/api/run-broker/ingest/runs/{run_id}", handle_ingest_async_result)
     app.router.add_post("/api/run-broker/ingest", handle_ingest)

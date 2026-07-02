@@ -14,6 +14,7 @@ RunEventKind = Literal[
     "tool_completed",
     "approval_required",
     "approval_resolved",
+    "auth_required",
     "done",
     "error",
 ]

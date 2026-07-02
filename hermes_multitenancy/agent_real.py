@@ -35,6 +35,7 @@ import secrets
 import importlib
 import threading
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
@@ -58,6 +59,37 @@ from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli
 
 logger = logging.getLogger(__name__)
 _EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
+
+
+class _CredentialExpirySignal:
+    """Thread-safe one-shot holder for a lark-cli credential-expiry signal.
+
+    The lark auth sidecar records into this from its http.server handler
+    thread while the agent subprocess runs; the async run scope reads it
+    afterwards. Lives per ``stream_run_agent`` call via a ContextVar, so
+    there is no cross-run bleed.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value: Optional[dict] = None
+
+    def set(self, payload: dict) -> None:
+        with self._lock:
+            if self._value is None:
+                self._value = dict(payload or {})
+
+    def get(self) -> Optional[dict]:
+        with self._lock:
+            return dict(self._value) if self._value is not None else None
+
+
+# Set by ``stream_run_agent`` (the reader owns the lifecycle); read by
+# ``_lark_cli_auth_broker_scope`` to wire the sidecar's sink. Unset on paths
+# that don't stream (real_run_agent / Feishu), so the sink stays disabled there.
+_CREDENTIAL_EXPIRY_SIGNAL: ContextVar[Optional[_CredentialExpirySignal]] = ContextVar(
+    "hermes_lark_cli_credential_expiry_signal", default=None
+)
 _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK = threading.RLock()
 _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 0
 _PROFILE_ANCHOR_ENV_KEYS = frozenset({
@@ -188,6 +220,8 @@ async def stream_run_agent(  # type: ignore[override]
     as ``conversation_history`` and the current event text as the active user
     message.
     """
+    signal = _CredentialExpirySignal()
+    signal_token = _CREDENTIAL_EXPIRY_SIGNAL.set(signal)
     try:
         content_parts: list[str] = []
         final_text = ""
@@ -227,6 +261,9 @@ async def stream_run_agent(  # type: ignore[override]
         footer_tail = footer_text[len(content_text):]
         if footer_tail:
             yield "content", footer_tail
+        expiry = signal.get()
+        if expiry:
+            yield "auth_required", expiry
         if final_text or content_parts:
             return
     except Exception as exc:
@@ -242,6 +279,8 @@ async def stream_run_agent(  # type: ignore[override]
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
             return
+    finally:
+        _CREDENTIAL_EXPIRY_SIGNAL.reset(signal_token)
 
     async for kind, text in _stream_loop(event, profile_home, messages=messages):
         yield kind, text
@@ -2419,6 +2458,7 @@ def _lark_cli_auth_broker_scope(
     # broker identity gate before that policy check ever runs (freshness race).
     allowed_identities = frozenset({"user", "bot"})
     key = secrets.token_urlsafe(32)
+    expiry_signal = _CREDENTIAL_EXPIRY_SIGNAL.get(None)
     server = start_lark_cli_auth_broker_server(
         LarkCliAuthBrokerContext(
             shared_home=_resolve_shared_hermes_home(profile_home),
@@ -2429,6 +2469,7 @@ def _lark_cli_auth_broker_scope(
             profile_kind="group" if is_group_profile else "user",
             current_chat_id=_group_profile_chat_id(profile_home) if is_group_profile else "",
             allowed_bot_chat_ids=allowed_bot_chat_ids,
+            credential_expiry_sink=expiry_signal.set if expiry_signal is not None else None,
         )
     )
     try:

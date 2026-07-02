@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 
 PROTOCOL_VERSION = "v1"
@@ -74,6 +74,12 @@ class LarkCliAuthBrokerContext:
     profile_kind: str = "user"
     current_chat_id: str = ""
     allowed_bot_chat_ids: frozenset[str] = frozenset()
+    # Thread-safe callback invoked once when a stored UAT is present but expired
+    # (CredentialExpiredError). Runs on the http.server handler thread, so the
+    # sink must guard its own state. Left None on paths that don't need the
+    # signal (e.g. the non-streaming / Feishu path). Holds a callable, never
+    # mutated after construction — safe on this frozen dataclass.
+    credential_expiry_sink: Optional[Callable[[dict], None]] = None
 
 
 Forwarder = Callable[[str, str, Mapping[str, str], bytes, float], BrokerResponse]
@@ -189,6 +195,7 @@ class LarkCliAuthBroker:
                 token = self._resolve_token(identity)
                 break
             except CredentialExpiredError:
+                self._signal_credential_expiry()
                 return _error(503, "credential expired")
             except PermissionError:
                 last_transient = "credential unavailable"
@@ -301,6 +308,19 @@ class LarkCliAuthBroker:
         if _payload_is_expired(selected):
             raise CredentialExpiredError("credential expired")
         return selected
+
+    def _signal_credential_expiry(self) -> None:
+        """Notify the run scope that a stored UAT expired (re-auth needed).
+
+        Best-effort: a broken sink must never turn the 503 into a 500.
+        """
+        sink = self.context.credential_expiry_sink
+        if sink is None:
+            return
+        try:
+            sink({"provider": "feishu", "connector_id": "lark-cli"})
+        except Exception:
+            pass
 
 
 class RunningLarkCliAuthBrokerServer:
