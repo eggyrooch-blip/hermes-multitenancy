@@ -285,6 +285,26 @@ def _plugin_managed_audience_mode(shared_home: Path, plugin_id: str) -> str | No
     return _first_str(audience.get("mode"))
 
 
+def _plugin_sticky_profiles(shared_home: Path, plugin_id: str) -> set[str]:
+    """Operator-pinned profiles that must NEVER be auto-uninstalled by any event.
+
+    Read from ``.hermes-plugin-managed/<plugin_id>.sticky.json`` (``{"profiles": [...]}``).
+    These are manually-added whitelist entries that are NOT in AiDock's authoritative
+    audience, so a full-snapshot reconcile (or inactive) would otherwise remove them
+    (incident 2026-07-02). reconcile/inactive exempt them; they always stay in the
+    ingest target. Missing/broken file -> empty set (fail-safe, never raises).
+    """
+    path = plugin_ingest._managed_path(shared_home, plugin_id).parent / f"{plugin_id}.sticky.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return set()
+    raw = data.get("profiles") if isinstance(data, dict) else []
+    if not isinstance(raw, list):
+        return set()
+    return {p for p in (_first_str(v) for v in raw) if p is not None}
+
+
 def _best_effort_plugin_uninstall(
     plugin_id: str,
     *,
@@ -312,10 +332,16 @@ def _reconcile_plugin_full_snapshot(
     profiles: Path,
     new_profiles: set[str],
 ) -> None:
-    """Remove dropped profile installs; strip prior fan-out before re-scoping to profiles."""
+    """Remove dropped profile installs; strip prior fan-out before re-scoping to profiles.
+
+    STICKY (incident 2026-07-02): operator-pinned profiles are exempt from removal —
+    a full-snapshot event carrying AiDock's short list must never wipe the manually-added
+    whitelist. The caller also unions sticky into the ingest target so they stay installed.
+    """
+    sticky = _plugin_sticky_profiles(shared, plugin_id)
     prev_mode = _plugin_managed_audience_mode(shared, plugin_id)
     if prev_mode in (None, "profile"):
-        dropped = _plugin_managed_audience_profiles(shared, plugin_id) - set(new_profiles)
+        dropped = _plugin_managed_audience_profiles(shared, plugin_id) - set(new_profiles) - sticky
         if dropped:
             _best_effort_plugin_uninstall(
                 plugin_id,
@@ -324,6 +350,8 @@ def _reconcile_plugin_full_snapshot(
                 profile_subset=sorted(dropped),
             )
     else:
+        # all-mode -> subset: strip the global fan-out; sticky are re-pinned by the
+        # caller's ingest(target ∪ sticky), so no sticky loss across the transition.
         _best_effort_plugin_uninstall(plugin_id, shared=shared, profiles=profiles)
 
 
@@ -810,6 +838,26 @@ def _process_plugin_event(
     if skill_status == "pending":
         return {"action": "skipped_pending", "plugin_id": plugin_id, "item_type": "plugin"}
     if skill_status == "inactive":
+        # STICKY: operator-pinned whitelist survives inactive. Uninstall only the
+        # non-sticky profiles; keep sticky installed + in the manifest.
+        sticky = _plugin_sticky_profiles(shared, plugin_id)
+        current = _plugin_managed_audience_profiles(shared, plugin_id)
+        kept = sorted(current & sticky)
+        if kept:
+            to_remove = sorted(current - sticky)
+            report = (
+                _best_effort_plugin_uninstall(
+                    plugin_id, shared=shared, profiles=profiles, profile_subset=to_remove
+                )
+                if to_remove
+                else None
+            )
+            return {
+                "action": "plugin_uninstall_inactive",
+                "plugin_id": plugin_id,
+                "kept_sticky": kept,
+                "uninstall": report,
+            }
         uninstall_report = _best_effort_plugin_uninstall(
             plugin_id,
             shared=shared,
@@ -910,6 +958,9 @@ def _process_plugin_event(
         if incremental:
             target |= _plugin_managed_audience_profiles(shared, plugin_id)
         if full_snapshot:
+            # sticky whitelist always stays installed + in the manifest audience, so a
+            # short upstream list can never shrink it away (reconcile also exempts sticky).
+            target |= _plugin_sticky_profiles(shared, plugin_id)
             _reconcile_plugin_full_snapshot(
                 plugin_id,
                 shared=shared,
@@ -957,6 +1008,9 @@ def _process_plugin_event(
     if incremental:
         target |= _plugin_managed_audience_profiles(shared, plugin_id)
     if full_snapshot:
+        # sticky whitelist stays in the manifest audience on this cached-repo path too,
+        # else the ingest below would rewrite the manifest without sticky (codex 2026-07-02).
+        target |= _plugin_sticky_profiles(shared, plugin_id)
         _reconcile_plugin_full_snapshot(
             plugin_id,
             shared=shared,

@@ -638,3 +638,122 @@ def test_plugin_no_cached_repo_returns_plugin_no_package(tmp_path: Path) -> None
         "plugin_id": PLUGIN_ID,
         "reason": "no download_url and no cached plugin repo",
     }
+
+
+def _write_sticky(shared_home: Path, profiles: list[str], plugin_id: str = PLUGIN_ID) -> None:
+    (shared_home / pi.MANAGED_DIR / f"{plugin_id}.sticky.json").write_text(
+        json.dumps({"plugin_id": plugin_id, "profiles": profiles}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_sticky_survives_full_snapshot_shrink_but_nonsticky_dropped(tmp_path: Path) -> None:
+    # INCIDENT 2026-07-02 regression: a full-snapshot status_changed with a short upstream
+    # list must NOT remove the manually-pinned (sticky) whitelist; non-sticky still drop.
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "dave", "carol")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("dave-ldap", "dave"), ("carol-ldap", "carol")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text("skills: []\n", encoding="utf-8")
+
+    # install for alice + dave, then pin ONLY alice sticky
+    process_event(_plugin_event(users=["alice-ldap", "dave-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+    _write_sticky(shared_home, ["alice"])
+
+    # full-snapshot event authorizing only carol (neither alice nor dave)
+    process_event(_plugin_event(event_type="skill.status_changed", users=["carol-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+
+    assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()   # sticky KEPT
+    assert not (profiles_root / "dave" / "skills" / "using-resource-delivery").exists() # non-sticky DROPPED
+    assert (profiles_root / "carol" / "skills" / "using-resource-delivery").exists()    # new installed
+    assert "alice" in _managed_manifest(shared_home)["audience"]["profiles"]            # sticky stays in manifest
+
+
+def test_sticky_survives_inactive_but_nonsticky_removed(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "dave")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("dave-ldap", "dave")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text("skills: []\n", encoding="utf-8")
+
+    process_event(_plugin_event(users=["alice-ldap", "dave-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+    _write_sticky(shared_home, ["alice"])
+
+    result = process_event(_plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
+                           shared_home=shared_home, profiles_root=profiles_root,
+                           downloader=lambda _: pytest.fail("inactive must not download"))
+
+    assert result["kept_sticky"] == ["alice"]
+    assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()    # sticky KEPT
+    assert not (profiles_root / "dave" / "skills" / "using-resource-delivery").exists() # non-sticky removed
+    assert (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()                # manifest kept (sticky remains)
+
+
+def test_no_sticky_file_preserves_normal_shrink(tmp_path: Path) -> None:
+    # Regression: with NO sticky file, diff-shrink behaves exactly as before (drop the dropped).
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text("skills: []\n", encoding="utf-8")
+
+    process_event(_plugin_event(users=["alice-ldap", "bob-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+    process_event(_plugin_event(event_type="skill.status_changed", users=["alice-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+
+    assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()
+    assert not (profiles_root / "bob" / "skills" / "using-resource-delivery").exists()  # normal drop intact
+
+
+def test_sticky_kept_in_manifest_on_cached_repo_full_snapshot(tmp_path: Path) -> None:
+    # codex 2026-07-02: the NO-download (cached repo) full-snapshot path must also union sticky
+    # into the ingest target, else ingest rewrites the manifest audience WITHOUT sticky.
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "carol")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("carol-ldap", "carol")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text("skills: []\n", encoding="utf-8")
+
+    # first install (with download) so a cached repo + manifest exist
+    process_event(_plugin_event(users=["alice-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+    _write_sticky(shared_home, ["alice"])
+
+    # full-snapshot with NO download_url (cached-repo path), new list = carol only
+    process_event(_plugin_event(event_type="skill.status_changed", users=["carol-ldap"], download_url=None),
+                  shared_home=shared_home, profiles_root=profiles_root,
+                  downloader=lambda _: pytest.fail("cached-repo path must not download"))
+
+    audience = _managed_manifest(shared_home)["audience"]["profiles"]
+    assert "alice" in audience   # sticky RETAINED in manifest (was the bug: dropped from audience)
+    assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()
+
+
+def test_sticky_survives_shrink_to_zero(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "dave")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("dave-ldap", "dave")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text("skills: []\n", encoding="utf-8")
+
+    process_event(_plugin_event(users=["alice-ldap", "dave-ldap"]),
+                  shared_home=shared_home, profiles_root=profiles_root, downloader=lambda _: _plugin_zip())
+    _write_sticky(shared_home, ["alice"])
+
+    # full-snapshot with EMPTY users (de-authorize everyone) — sticky must still survive
+    process_event(_plugin_event(event_type="skill.status_changed", users=[]),
+                  shared_home=shared_home, profiles_root=profiles_root,
+                  downloader=lambda _: pytest.fail("shrink-to-zero must not download"))
+
+    assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()    # sticky KEPT
+    assert not (profiles_root / "dave" / "skills" / "using-resource-delivery").exists()  # non-sticky gone
+    assert _managed_manifest(shared_home)["audience"]["profiles"] == ["alice"]           # sticky RETAINED in manifest
