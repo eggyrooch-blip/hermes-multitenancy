@@ -529,6 +529,30 @@ def _materialize_symlink_source(source: Path) -> str:
     return target
 
 
+# High-precision deny patterns for skill content flowing from business repos
+# straight into every profile's agent instruction layer. Deliberately short:
+# false positives quarantine a whole skill (and page the Feishu group).
+_SKILL_INJECTION_PATTERNS = [
+    re.compile(r"(?i)ignore (all |any )?(previous|prior|above) (instructions|prompts)"),
+    re.compile(r"(?i)disregard (the |your )?(system|previous) (prompt|instructions)"),
+    re.compile(r"忽略(之前|以上|上面|先前)的?(所有)?(指令|提示|设定)"),
+    re.compile(r"(?i)do not (tell|inform|reveal to) the user"),
+    re.compile(r"不要(告诉|告知)用户"),
+    re.compile(r"(?i)reveal (your )?(system prompt|hidden instructions)"),
+    re.compile(r"(?i)(send|post|upload|exfiltrate) (all |your )?(credentials?|tokens?|secrets?)"),
+]
+
+
+def _lint_skill_files_for_injection(files: list[dict[str, str]]) -> None:
+    for item in files:
+        for pattern in _SKILL_INJECTION_PATTERNS:
+            match = pattern.search(item["content"])
+            if match:
+                raise ValueError(
+                    f"skill content failed injection lint: {item['path']!r} matches {match.group(0)!r}"
+                )
+
+
 def _write_managed_skill_source(
     source: Path, files: list[dict[str, str]], *, marker_name: str = KEP_CLI_MANAGED_MARKER
 ) -> bool:
@@ -544,6 +568,7 @@ def _write_managed_skill_source(
             f"shared skill source {source} is a symlink; refusing to write through it "
             f"(run adopt to materialize it into a real directory)"
         )
+    _lint_skill_files_for_injection(files)
     source.mkdir(parents=True, exist_ok=True)
     marker = source / marker_name
     wanted = {source / item["path"] for item in files}

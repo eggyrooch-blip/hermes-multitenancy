@@ -109,6 +109,18 @@ pool (a skill newly embedded in a lark-cli release), it will fan out to all
 profiles at the next org sync. Treat adding new lark skills to the pool as an
 org-wide distribution event, not a pool-only one.
 
+**Keep/kep-\*-cli is auto-distributed the same way (by decision, sunke
+2026-07-02):** org sync symlinks every pool source matching `Keep/kep-*-cli`
+into every profile, so a NEW business system registered in the kep hub reaches
+all profiles at the next org sync with zero manual distribution edits. The
+supply-chain guard for this fully-automatic lane is the injection lint below.
+
+**Injection lint (pool write gate):** every pool refresh/adoption runs the
+skill content through a short high-precision deny-pattern list (prompt-override
+phrases, credential-exfiltration instructions, zh+en) before writing. A hit
+quarantines that skill (exit 2 → OnFailure → Feishu alert) and leaves the
+existing content untouched.
+
 The `--profile` / all-profiles fan-out path remains available for explicit,
 scoped use, but is off in the standardized timer deployment.
 

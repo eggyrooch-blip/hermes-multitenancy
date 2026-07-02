@@ -1843,3 +1843,32 @@ def test_sync_profiles_reapplies_chmod_on_drift(tmp_path):
     # Second sync must restore 0700.
     sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
     assert stat_mod.S_IMODE(drifted.stat().st_mode) == 0o700
+
+
+def test_sync_profiles_auto_distributes_kep_cli_skills(tmp_path):
+    from hermes_multitenancy.sync import Department, DepartmentUser, build_org_snapshot, sync_profiles
+
+    shared_home = tmp_path / "shared"
+    # a kep business-CLI skill in the pool, NOT listed in any defaults/distribution
+    ocean = shared_home / "skills" / "Keep" / "kep-ocean-cli"
+    ocean.mkdir(parents=True)
+    (ocean / "SKILL.md").write_text("# ocean\n", encoding="utf-8")
+    # a non-CLI Keep skill must NOT be auto-distributed
+    record = shared_home / "skills" / "Keep" / "keep-record"
+    record.mkdir(parents=True)
+    (record / "SKILL.md").write_text("# record\n", encoding="utf-8")
+    (shared_home / "config.yaml").write_text("model:\n  default: zai/glm-5.1\n", encoding="utf-8")
+    (shared_home / "profile-skill-defaults.yaml").write_text("skills: []\n", encoding="utf-8")
+
+    profiles_root = tmp_path / "profiles"
+    snapshot = build_org_snapshot(
+        [Department(dept_id="od_sales", name="Sales", leader_user_id="alice")],
+        {"od_sales": [DepartmentUser(open_id="ou_alice", user_id="alice")]},
+    )
+
+    sync_profiles(snapshot, profiles_root=profiles_root, source_home=shared_home)
+
+    target = profiles_root / "alice" / "skills" / "Keep" / "kep-ocean-cli"
+    assert target.is_symlink()  # instant propagation from the pool
+    assert target.resolve() == ocean.resolve()
+    assert not (profiles_root / "alice" / "skills" / "Keep" / "keep-record").exists()

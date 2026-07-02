@@ -998,6 +998,17 @@ def _default_profile_skill_specs(shared_home: Path, employee: Employee) -> list[
                 "requires_token": False,
             },
         )
+    for rel_path in _shared_kep_cli_skill_paths(shared_home):
+        # symlink -> pool refresh propagates instantly; credentials stay
+        # per-profile via kep-auth (no brokered token semantics here).
+        specs_by_path.setdefault(
+            str(rel_path),
+            {
+                "path": rel_path,
+                "install_mode": "symlink",
+                "share_with_children": False,
+            },
+        )
     specs = list(specs_by_path.values())
     return sorted(specs, key=lambda item: str(item["path"]))
 
@@ -1246,6 +1257,25 @@ def _default_profile_skill_paths(shared_home: Path) -> list[Path]:
         if path is not None:
             result.append(path)
     return sorted(set(result), key=lambda p: str(p))
+
+
+def _shared_kep_cli_skill_paths(shared_home: Path) -> list[Path]:
+    """Auto-distribute candidates for kep business-CLI skills: Keep/kep-*-cli.
+
+    Mirrors the lark-* prefix auto-distribution (sunke 2026-07-02: kep skills
+    are org-wide by decision) so a NEW system registered in the kep hub reaches
+    every profile at the next org sync without a manual distribution edit.
+    """
+    keep_root = shared_home / "skills" / "Keep"
+    if not keep_root.is_dir():
+        return []
+    result: list[Path] = []
+    for item in keep_root.iterdir():
+        if not (item.name.startswith("kep-") and item.name.endswith("-cli")):
+            continue
+        if (item.is_dir() or item.is_symlink()) and (item / "SKILL.md").is_file():
+            result.append(Path("Keep") / item.name)
+    return sorted(result, key=lambda p: str(p))
 
 
 def _shared_lark_skill_paths(shared_home: Path) -> list[Path]:
