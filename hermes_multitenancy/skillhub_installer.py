@@ -322,6 +322,51 @@ def _canonical_plugin_repo_dir(shared_home: Path, plugin_id: str, version: str) 
     return shared_home / "_managed" / _PLUGIN_DISTRIBUTION_ORIGIN / safe_plugin / safe_version
 
 
+def _lint_downloaded_skill_advisory(skill_root: Path, *, skill_code: str) -> None:
+    """Run the shared prompt-injection lint over a DOWNLOADED skill's text and log
+    an advisory on hits — closing the asymmetry where CLI-embedded skills were
+    linted (update_center) but SkillHub downloads were not.
+
+    Advisory by DEFAULT (content is already checksum-verified; blocking would
+    false-positive on legit skill docs, per the update-center first-party
+    decision). Set HERMES_SKILLHUB_QUARANTINE_ON_LINT=1 to hard-reject on a hit.
+    Never breaks an install on its own error path. MED-5, audit 2026-07-03.
+    """
+    try:
+        from .update_center import _lint_skill_files_for_injection
+    except Exception:
+        return
+    files: list[dict[str, str]] = []
+    for path in sorted(skill_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".md", ".mdx", ".txt"}:
+            continue
+        try:
+            files.append(
+                {"path": str(path.relative_to(skill_root)),
+                 "content": path.read_text(encoding="utf-8", errors="replace")}
+            )
+        except OSError:
+            continue
+    try:
+        hits = _lint_skill_files_for_injection(files)
+    except Exception:
+        return
+    if not hits:
+        return
+    logger.warning(
+        "[skillhub] downloaded skill %s tripped injection-lint (advisory): %s",
+        skill_code, hits[:5],
+    )
+    if os.environ.get("HERMES_SKILLHUB_QUARANTINE_ON_LINT", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        raise SkillhubInstallError(
+            f"downloaded skill {skill_code} tripped injection-lint and "
+            "HERMES_SKILLHUB_QUARANTINE_ON_LINT is on",
+            error_code="PACKAGE_INVALID",
+        )
+
+
 def _materialize_canonical_skill(
     *,
     shared_home: Path,
@@ -332,6 +377,10 @@ def _materialize_canonical_skill(
     release_dir = _canonical_release_dir(shared_home, skill_code, version)
     existing = _resolve_skill_root(release_dir)
     if existing is not None:
+        # Lint on the cache hit too — a package cached once under advisory mode
+        # must still be re-checked (and rejected under strict mode) on every
+        # serve, else the cache is a lint bypass. MED-5.
+        _lint_downloaded_skill_advisory(existing, skill_code=skill_code)
         return existing
 
     release_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -342,6 +391,11 @@ def _materialize_canonical_skill(
         resolved = _resolve_skill_root(staging)
         if resolved is None:
             raise SkillhubInstallError("package missing top-level SKILL.md", error_code="PACKAGE_INVALID")
+        # Lint BEFORE moving into the canonical cache: a strict-mode reject must
+        # leave NO residue on disk. Raising here unwinds the TemporaryDirectory,
+        # so the poisoned payload is discarded and cannot be served from the
+        # cache-hit early-return on a later call. MED-5.
+        _lint_downloaded_skill_advisory(resolved, skill_code=skill_code)
         if release_dir.exists():
             shutil.rmtree(release_dir)
         shutil.move(str(staging), str(release_dir))
@@ -964,6 +1018,8 @@ def _install_from_existing_release(
     if resolved is None:
         raise SkillhubInstallError("event missing package fields", error_code="PACKAGE_INVALID")
     canonical_skill_root = resolved["canonical_skill_root"]
+    # Grant-to-new-profile from cache must also lint (see cache-hit note). MED-5.
+    _lint_downloaded_skill_advisory(Path(canonical_skill_root), skill_code=skill_code)
     version = resolved["version"]
     release_id = _first_str(event.get("release_id")) or resolved["release_id"]
     audience = event.get("audience") if isinstance(event.get("audience"), dict) else {}
