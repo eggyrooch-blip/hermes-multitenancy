@@ -63,7 +63,7 @@ hermes-multitenancy-update-center = "hermes_multitenancy.update_center_cli:main"
 multitenancy = "hermes_multitenancy"
 
 [tool.setuptools]
-packages = ["hermes_multitenancy", "hermes_multitenancy.agent_real", "hermes_multitenancy.analytics", "hermes_multitenancy.card", "hermes_multitenancy.compat", "hermes_multitenancy.connectors", "hermes_multitenancy.cron", "hermes_multitenancy.credential_hub", "hermes_multitenancy.credential_hub.readers", "hermes_multitenancy.router", "hermes_multitenancy.sync"]
+packages = ["hermes_multitenancy", "hermes_multitenancy.agent_real", "hermes_multitenancy.analytics", "hermes_multitenancy.card", "hermes_multitenancy.compat", "hermes_multitenancy.connectors", "hermes_multitenancy.cron", "hermes_multitenancy.credential_hub", "hermes_multitenancy.credential_hub.readers", "hermes_multitenancy.router", "hermes_multitenancy.sync", "hermes_multitenancy.webui_broker"]
 
 [tool.setuptools.package-data]
 hermes_multitenancy = ["plugin.yaml"]
