@@ -29,6 +29,42 @@ SCOPE_STRIPPED_REASONS = frozenset({REASON_SCOPE_STRIPPED_BY_FEISHU})
 FIXTURE_DIRNAMES = frozenset({"feishu_uat.fixtures.bak"})
 
 
+# Benign, non-secret env vars a third-party credential-status/login CLI
+# (npx @lark-project/meegle, kep-auth, node keep-record) legitimately needs.
+# The vault master decryption key (HERMES_MULTITENANCY_CREDENTIAL_KEY /
+# HERMES_CREDENTIAL_KEY), FEISHU_APP_SECRET, and any other secret promoted into
+# os.environ are deliberately absent — a positive allowlist keeps them out of
+# third-party subprocess environments (CWE-200). Everything a CLI needs beyond
+# these benign vars is passed explicitly by the caller via ``overrides``.
+_STATUS_SUBPROCESS_ENV_ALLOWLIST = frozenset({
+    # process basics / locale
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TZ", "TMPDIR",
+    "LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE",
+    # outbound network — proxies + TLS trust (CLIs reach IdP / npm registry)
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # node / npm package resolution + cache (npx resolves under HOME)
+    "NODE_PATH", "NPM_CONFIG_CACHE", "npm_config_cache", "NPM_CONFIG_PREFIX",
+})
+
+
+def build_status_subprocess_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Minimal env for third-party credential-status/login subprocesses.
+
+    Starts from an allowlisted subset of ``os.environ`` (benign vars only) and
+    layers the caller's explicit ``overrides`` on top. Replaces the historical
+    ``{**os.environ, ...}`` pattern so secrets promoted into the parent process
+    env (vault master key, FEISHU_APP_SECRET) can never leak into npx / node /
+    kep-auth child environments. See CRIT-1, audit 2026-07-03.
+    """
+    env = {k: v for k, v in os.environ.items() if k in _STATUS_SUBPROCESS_ENV_ALLOWLIST}
+    if overrides:
+        env.update({k: str(v) for k, v in overrides.items()})
+    return env
+
+
 @dataclass(frozen=True)
 class UatLocation:
     """One UAT file on disk plus the profile_name it's bound to (legacy → '')."""

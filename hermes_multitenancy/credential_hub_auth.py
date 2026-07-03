@@ -27,6 +27,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
+from .credential_renewal_common import build_status_subprocess_env
+
 logger = logging.getLogger(__name__)
 
 _KEEP_TIMEOUT = 30
@@ -66,7 +68,7 @@ def _keep_node_path(profile_dir: Path, skill_dir: Path) -> str:
 
 def _run_keep_node(profile_dir: Path, args: list[str], *, timeout: int = _KEEP_TIMEOUT) -> dict[str, Any]:
     skill = keep_record_skill_dir(profile_dir)
-    env = {**os.environ, "HOME": str(_profile_home(profile_dir))}
+    env = build_status_subprocess_env({"HOME": str(_profile_home(profile_dir))})
     node_path = _keep_node_path(profile_dir, skill)
     if node_path:
         env["NODE_PATH"] = node_path
@@ -199,12 +201,11 @@ def kep_auth_bin(shared_home: Path) -> str:
 
 
 def _kep_env(profile_dir: Path, profile_name: str) -> dict[str, str]:
-    return {
-        **os.environ,
+    return build_status_subprocess_env({
         "HOME": str(_profile_home(profile_dir)),
         "HERMES_HOME": str(profile_dir),
         "KEP_PROFILE": str(profile_name),
-    }
+    })
 
 
 def _ensure_no_browser_dir() -> Path:

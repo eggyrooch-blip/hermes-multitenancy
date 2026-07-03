@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from .credential_renewal_common import build_status_subprocess_env
+
 logger = logging.getLogger(__name__)
 
 # Credential ids in display order (identical set + order to the WebUI).
@@ -593,7 +595,7 @@ def feishu_project_status(
     host = os.environ.get("HERMES_MEEGLE_HOST", _MEEGLE_DEFAULT_HOST).strip() or _MEEGLE_DEFAULT_HOST
     # Child PATH includes the resolved command's own dir so a found npx can locate
     # the sibling node binary (parity with the TS meegleEnv child PATH).
-    env = {**os.environ, "MEEGLE_HOST": host, "PATH": _meegle_search_path(os.path.dirname(inv[0]))}
+    env = build_status_subprocess_env({"MEEGLE_HOST": host, "PATH": _meegle_search_path(os.path.dirname(inv[0]))})
     cmd = [*inv, "--profile", _meegle_profile(profile_name), "auth", "status", "--format", "json"]
     proc = _run(cmd, cwd=profile_dir, env=env)
     if proc is None or proc.returncode not in (0, None):
@@ -772,13 +774,12 @@ def _kep_env_status(
     expires_at: Optional[int] = None
 
     if Path(bin_path).exists():
-        proc_env = {
-            **os.environ,
+        proc_env = build_status_subprocess_env({
             "HOME": str(home_dir),
             "HERMES_HOME": str(profile_dir),
             "KEP_PROFILE": str(profile_name),
             "KEP_NO_AUTO_LOGIN": "1",
-        }
+        })
         proc = _run([bin_path, "--profile", profile_name, "--env", env_name, "status"], cwd=profile_dir, env=proc_env)
         if proc is not None:
             out = f"{proc.stdout}\n{proc.stderr}".lower()
