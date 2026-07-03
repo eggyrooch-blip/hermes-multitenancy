@@ -521,7 +521,14 @@ def _owner_enforcement_enabled() -> bool:
 def _authorized(request: Any) -> bool:
     expected = _run_broker_key()
     if not expected:
-        return True
+        # No key configured. Keep the dev-friendly "open" behavior ONLY for a
+        # loopback bind; if the broker is somehow bound to a non-loopback host
+        # with no key, fail CLOSED — a keyless broker must never be reachable
+        # off-box. Defense-in-depth: the prod startup path already refuses a
+        # keyless bind, but the auth decision no longer trusts that alone.
+        # audit 2026-07-03 §4 fail-open hardening.
+        host = _run_broker_host()
+        return host in {"127.0.0.1", "::1", "localhost", ""}
     header = request.headers.get("Authorization", "")
     prefix = "Bearer "
     if not header.startswith(prefix):
