@@ -67,6 +67,7 @@ def _plugin_zip(
     *,
     plugin_id: str = PLUGIN_ID,
     version: str = PLUGIN_VERSION,
+    content_tag: str = "",
 ) -> bytes:
     manifest = {
         "schema": pi.SUPPORTED_SCHEMA,
@@ -98,6 +99,8 @@ def _plugin_zip(
             body = f"---\nname: {name}\n---\n# {name}\n"
             if "orchestrat" in name:
                 body += "Gates: `x approve` requires explicit confirmation.\n"
+            if content_tag:
+                body += f"{content_tag}\n"
             archive.writestr(f"keep-rd-plugin/skills/{name}/SKILL.md", body)
     return buffer.getvalue()
 
@@ -119,6 +122,8 @@ def _plugin_event(
     users: list[str] | None = None,
     download_url: str | None = "https://example.invalid/keep-rd-plugin.zip",
     skill_code: str = PLUGIN_ID,
+    version: str | None = None,
+    release_id: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "event_type": event_type,
@@ -132,6 +137,10 @@ def _plugin_event(
     }
     if download_url is not None:
         payload["download_url"] = download_url
+    if version is not None:
+        payload["version"] = version
+    if release_id is not None:
+        payload["release_id"] = release_id
     return payload
 
 
@@ -174,6 +183,52 @@ def test_plugin_install_approved_installs_for_authorized_profiles_only(tmp_path:
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
     assert not (profiles_root / "charlie" / "skills" / "kep-halo-cli").exists()
+
+
+def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path) -> None:
+    # 2026-07-03 incident: upstream published release 168 (v1.0.1) whose zip carried NEW
+    # content but an unbumped inner plugin.json version ("0.1.0"); the inner-version cache
+    # key matched the stale r165 dir and the new content was silently dropped. The cache
+    # must key on the upstream release identity, not the zip's self-declared version.
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+
+    result_a = process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="165"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    assert result_a["action"] == "plugin_install"
+    repo_a = Path(str(_managed_manifest(shared_home)["repo"]))
+    assert repo_a.name == "1.0.0-r165"
+
+    result_b = process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.1", release_id="168"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(content_tag="RELEASE-168-CONTENT"),
+    )
+    assert result_b["action"] == "plugin_install"
+    repo_b = Path(str(_managed_manifest(shared_home)["repo"]))
+    assert repo_b.name == "1.0.1-r168"
+    skill_md = repo_b / "skills" / "kep-halo-cli" / "SKILL.md"
+    assert "RELEASE-168-CONTENT" in skill_md.read_text(encoding="utf-8")
+    installed = profiles_root / "alice" / "skills" / "kep-halo-cli" / "SKILL.md"
+    assert "RELEASE-168-CONTENT" in installed.read_text(encoding="utf-8")
+
+    # Same release re-delivered → idempotent reuse, no error, pointer unchanged.
+    result_dup = process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.1", release_id="168"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(content_tag="RELEASE-168-CONTENT"),
+    )
+    assert result_dup["action"] == "plugin_install"
+    assert Path(str(_managed_manifest(shared_home)["repo"])).name == "1.0.1-r168"
 
 
 def test_plugin_pending_skips_without_download(tmp_path: Path) -> None:

@@ -316,7 +316,32 @@ def _resolve_plugin_repo_root(base_dir: Path) -> Path | None:
     return None
 
 
-def _materialize_plugin_repo(shared_home: Path, plugin_id: str, package_bytes: bytes) -> Path:
+def _plugin_release_key(event: dict[str, Any]) -> str | None:
+    """Upstream release identity used as the plugin repo cache key.
+
+    The zip's inner plugin.json version is self-declared: upstream has shipped a
+    new release whose payload changed but whose inner version stayed "0.1.0"
+    (release 168, 2026-07-03), which poisoned the version-keyed cache and served
+    stale content. The SkillHub release row (version + release_id) is the only
+    trustworthy identity, so key on it; the inner version is a fallback for
+    events that predate these fields.
+    """
+    version = _first_str(event.get("version"))
+    release_id = _first_str(event.get("release_id"))
+    if version and release_id:
+        return f"{version}-r{release_id}"
+    return version or release_id or None
+
+
+def _materialize_plugin_repo(
+    shared_home: Path, plugin_id: str, package_bytes: bytes, *, release_key: str | None = None
+) -> tuple[Path, bool]:
+    """Return ``(release_dir, fresh)``; ``fresh`` is False on a cache hit.
+
+    Callers thread ``fresh`` into ``plugin_ingest.ingest(force=...)`` — a newly
+    extracted release must overwrite the name-keyed shared-skill copies, else the
+    repo pointer moves but every profile keeps serving the previous release's files.
+    """
     try:
         with tempfile.TemporaryDirectory(dir=shared_home, prefix=".plugin-staging-") as temp_dir:
             staging = Path(temp_dir)
@@ -334,9 +359,9 @@ def _materialize_plugin_repo(shared_home: Path, plugin_id: str, package_bytes: b
             version = _first_str(manifest.get("version"))
             if not version:
                 raise SkillhubInstallError("plugin manifest missing version", error_code="PACKAGE_INVALID")
-            release_dir = _canonical_plugin_repo_dir(shared_home, plugin_id, version)
+            release_dir = _canonical_plugin_repo_dir(shared_home, plugin_id, release_key or version)
             if (release_dir / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
-                return release_dir
+                return release_dir, False
             release_dir.parent.mkdir(parents=True, exist_ok=True)
             if release_dir.exists():
                 shutil.rmtree(release_dir)
@@ -353,7 +378,7 @@ def _materialize_plugin_repo(shared_home: Path, plugin_id: str, package_bytes: b
         raise SkillhubInstallError(str(exc), error_code="PACKAGE_INVALID") from exc
     if not (release_dir / plugin_ingest.PLUGIN_MANIFEST_REL).is_file():
         raise SkillhubInstallError("package missing installed plugin manifest", error_code="PACKAGE_INVALID")
-    return release_dir
+    return release_dir, True
 
 
 def _plugin_managed_audience_profiles(shared_home: Path, plugin_id: str) -> set[str]:
@@ -980,8 +1005,11 @@ def _process_plugin_event(
         if download_url:
             package_bytes = _download_package(download_url, downloader)
             _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
-            repo_root = _materialize_plugin_repo(shared, plugin_id, package_bytes)
+            repo_root, fresh_repo = _materialize_plugin_repo(
+                shared, plugin_id, package_bytes, release_key=_plugin_release_key(event)
+            )
         else:
+            fresh_repo = False
             managed_path = plugin_ingest._managed_path(shared, plugin_id)
             try:
                 managed = json.loads(managed_path.read_text(encoding="utf-8"))
@@ -1005,6 +1033,7 @@ def _process_plugin_event(
                 shared_home=shared,
                 profiles_root=profiles,
                 allow_create_distribution=True,
+                force=fresh_repo,
             )
         except plugin_ingest.PluginIngestError as exc:
             raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
@@ -1053,7 +1082,9 @@ def _process_plugin_event(
     if download_url:
         package_bytes = _download_package(download_url, downloader)
         _verify_checksum(package_bytes, _first_str(event.get("checksum_sha256")))
-        repo_root = _materialize_plugin_repo(shared, plugin_id, package_bytes)
+        repo_root, fresh_repo = _materialize_plugin_repo(
+            shared, plugin_id, package_bytes, release_key=_plugin_release_key(event)
+        )
         target = set(resolved_names)
         if incremental:
             target |= _plugin_managed_audience_profiles(shared, plugin_id)
@@ -1080,6 +1111,7 @@ def _process_plugin_event(
                 audience=",".join(sorted(target)),
                 shared_home=shared,
                 profiles_root=profiles,
+                force=fresh_repo,
             )
         except plugin_ingest.PluginIngestError as exc:
             raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
