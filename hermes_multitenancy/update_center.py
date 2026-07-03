@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -408,12 +409,19 @@ def ensure_kep_cli_skills(
     for system in systems:
         skill_path = f"{category}/kep-{system.system}-cli"
         try:
-            source = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner, adopt=adopt, ledger=ledger)
+            source, lint_flags = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner, adopt=adopt, ledger=ledger)
         except ValueError as exc:
             # Real embedded-skill read error (not old-CLI): surface it, leave the
             # existing skill untouched, and keep syncing other systems.
             rows.append({"skill_path": skill_path, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})
             continue
+        # First-party lint hit is advisory: content is already written byte-exact
+        # above; here we only record + notify (never quarantine, never exit 2).
+        if lint_flags:
+            if ledger is not None:
+                ledger.append("skill_lint_flagged", component="kep-cli", skill=skill_path, flags=lint_flags)
+            _emit_lint_advisory("kep-cli", skill_path, lint_flags)
+        flagged_on_row = False
         for profile in profiles:
             profile_home = shared_home / "profiles" / profile
             if not profile_home.is_dir():
@@ -430,7 +438,14 @@ def ensure_kep_cli_skills(
                 source=source,
                 version=system.target_version or system.installed_version,
             )
-            rows.append({"profile": profile, "skill_path": skill_path, "action": "ensured", "target": installed["target"]})
+            row = {"profile": profile, "skill_path": skill_path, "action": "ensured", "target": installed["target"]}
+            if lint_flags:
+                row["lint_flags"] = lint_flags
+                flagged_on_row = True
+            rows.append(row)
+        # Ensure the flag is visible even with no (or only-quarantined) profile rows.
+        if lint_flags and not flagged_on_row:
+            rows.append({"skill_path": skill_path, "action": "flagged", "lint_flags": lint_flags})
     return rows
 
 
@@ -530,14 +545,28 @@ def _materialize_symlink_source(source: Path) -> str:
 
 
 # High-precision deny patterns for skill content flowing from business repos
-# straight into every profile's agent instruction layer. Deliberately short:
-# false positives quarantine a whole skill (and page the Feishu group).
+# straight into every profile's agent instruction layer. Deliberately short.
+#
+# For FIRST-PARTY embedded content (lark-cli / kep-cli go:embed, byte-exact from
+# team-built signed binaries) a hit is ADVISORY: the detector records it, the
+# caller still writes the content byte-exact, flags the row, and fires one
+# best-effort alert. (sunke 2026-07-03: first-party byte-exact mirror is trusted;
+# the lint only flags, it no longer quarantines. Third-party supply-chain review
+# gate is a separate roadmap item.)
+_IGNORE_INSTRUCTIONS_RE = re.compile(r"(?i)ignore (all |any )?(previous|prior|above) (instructions|prompts)")
+_DISREGARD_RE = re.compile(r"(?i)disregard (the |your )?(system|previous) (prompt|instructions)")
+_DO_NOT_TELL_EN_RE = re.compile(r"(?i)do not (tell|inform|reveal to) the user")
+# zh "不要告知用户 …" only fires with an adjacent concealment object in a tight
+# window, so benign UX guidance like `不要告知用户你等待了` does NOT match.
+_DO_NOT_TELL_ZH_RE = re.compile(
+    r"(?i)不要(告诉|告知)用户[^\n]{0,20}(密码|凭证|令牌|token|secret|密钥|系统提示|指令|命令|隐藏)"
+)
 _SKILL_INJECTION_PATTERNS = [
-    re.compile(r"(?i)ignore (all |any )?(previous|prior|above) (instructions|prompts)"),
-    re.compile(r"(?i)disregard (the |your )?(system|previous) (prompt|instructions)"),
+    _IGNORE_INSTRUCTIONS_RE,
+    _DISREGARD_RE,
     re.compile(r"忽略(之前|以上|上面|先前)的?(所有)?(指令|提示|设定)"),
-    re.compile(r"(?i)do not (tell|inform|reveal to) the user"),
-    re.compile(r"不要(告诉|告知)用户"),
+    _DO_NOT_TELL_EN_RE,
+    _DO_NOT_TELL_ZH_RE,
     re.compile(r"(?i)reveal (your )?(system prompt|hidden instructions)"),
     re.compile(r"(?i)(send|post|upload|exfiltrate) (all |your )?(credentials?|tokens?|secrets?)"),
     # zh credential exfiltration: 把/将 + 凭证类名词 + 外发动词（紧窗口防误伤"上传文件需要 token"类正常文档）
@@ -546,15 +575,74 @@ _SKILL_INJECTION_PATTERNS = [
     re.compile(r"(凭证|密钥|令牌|密码)\s*(外传|泄露)"),
 ]
 
+# English instruction-override phrases quoted as an EXAMPLE inside defensive prose
+# (e.g. a mail skill teaching injection defense) are benign; a match is ignored
+# when a quote / 如 / 例如 / such as / e.g. sits in the small window just before it.
+_QUOTE_GUARDED_PATTERNS = frozenset({_IGNORE_INSTRUCTIONS_RE, _DISREGARD_RE, _DO_NOT_TELL_EN_RE})
+_BENIGN_QUOTE_CHARS = "\"'“”„‟「『《«‹"
+_BENIGN_QUOTE_MARKERS_ZH = ("例如", "比如", "譬如", "如", "例")
+_BENIGN_QUOTE_MARKERS_EN = ("such as", "e.g.", "for example", "like ")
 
-def _lint_skill_files_for_injection(files: list[dict[str, str]]) -> None:
+
+def _is_benign_quoted_match(content: str, start: int) -> bool:
+    """A quote-guarded pattern hit is benign when a quote or an example marker
+    (如 / 例如 / such as / e.g.) sits in the ~8 chars just before it."""
+
+    window = content[max(0, start - 8):start]
+    if any(ch in window for ch in _BENIGN_QUOTE_CHARS):
+        return True
+    if any(marker in window for marker in _BENIGN_QUOTE_MARKERS_ZH):
+        return True
+    low = window.lower()
+    return any(marker in low for marker in _BENIGN_QUOTE_MARKERS_EN)
+
+
+def _lint_skill_files_for_injection(files: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Detect injection-style phrases in skill content.
+
+    Pure DETECTOR: returns a list of ``{"path", "match"}`` hits (empty = clean)
+    and NEVER raises. For first-party embedded content a hit is advisory — the
+    caller writes the content anyway and flags/alerts on the returned hits.
+    Quote-guarded English patterns skip phrases cited as examples.
+    """
+
+    hits: list[dict[str, str]] = []
     for item in files:
+        content = item["content"]
         for pattern in _SKILL_INJECTION_PATTERNS:
-            match = pattern.search(item["content"])
-            if match:
-                raise ValueError(
-                    f"skill content failed injection lint: {item['path']!r} matches {match.group(0)!r}"
-                )
+            guarded = pattern in _QUOTE_GUARDED_PATTERNS
+            hit: str | None = None
+            for match in pattern.finditer(content):
+                if guarded and _is_benign_quoted_match(content, match.start()):
+                    continue
+                hit = match.group(0)
+                break
+            if hit is not None:
+                hits.append({"path": item["path"], "match": hit})
+                break  # one representative hit per file is enough for an advisory
+    return hits
+
+
+def _emit_lint_advisory(component: str, skill: str, hits: list[dict[str, str]]) -> None:
+    """Best-effort advisory that a first-party embedded skill tripped the lint.
+
+    The content was written anyway (first-party byte-exact is trusted); this only
+    notifies ops. NEVER raises — a webhook failure must not fail the sync.
+    """
+
+    if not hits:
+        return
+    match = hits[0].get("match", "")
+    text = (
+        "ℹ️ update-center: 一方内嵌 skill 触发注入-lint(仅提醒,已写盘) "
+        f"component={component} skill={skill} match={match}"
+    )
+    try:
+        from .update_center_alert import send_advisory_alert
+
+        send_advisory_alert(text)
+    except Exception as exc:  # noqa: BLE001 - advisory is strictly best-effort
+        print(f"notice: advisory alert skipped: {exc}", file=sys.stderr)
 
 
 def _write_managed_skill_source(
@@ -572,7 +660,8 @@ def _write_managed_skill_source(
             f"shared skill source {source} is a symlink; refusing to write through it "
             f"(run adopt to materialize it into a real directory)"
         )
-    _lint_skill_files_for_injection(files)
+    # NB: injection lint is run ONCE per skill at the caller (loop) level now — a
+    # single advisory scan, not a second scan through this shared writer.
     source.mkdir(parents=True, exist_ok=True)
     marker = source / marker_name
     wanted = {source / item["path"] for item in files}
@@ -627,7 +716,14 @@ def _write_stub_skill_source(source: Path, system: KepCliSystem) -> None:
 def _ensure_kep_cli_skill_source(
     shared_home: Path, *, skill_path: str, system: KepCliSystem, runner: Runner | None = None, adopt: bool = False,
     ledger: UpdateLedger | None = None,
-) -> Path:
+) -> tuple[Path, list[dict[str, str]]]:
+    """Refresh the shared skill source; return ``(source, lint_hits)``.
+
+    ``lint_hits`` is the advisory injection-lint result for whatever content was
+    written this run (empty when nothing was written or content was clean). The
+    lint never blocks the write for first-party embedded content.
+    """
+
     source = shared_home / "skills" / skill_path
     skill_md = source / "SKILL.md"
     if source.is_symlink() and not adopt:
@@ -638,38 +734,39 @@ def _ensure_kep_cli_skill_source(
     # over (pre-adoption tree archived for audit/rollback) and marks it managed.
     if skill_md.exists() and not _is_kep_cli_managed(source):
         if not adopt:
-            return source
+            return source, []
         files = read_kep_cli_skill_files(system.system, runner=runner)
         if not files:
-            return source  # no embedded skill to adopt from; keep existing
-        _lint_skill_files_for_injection(files)  # BEFORE any side effect: a lint hit must leave the old source untouched
+            return source, []  # no embedded skill to adopt from; keep existing
+        hits = _lint_skill_files_for_injection(files)
         archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
         target = _materialize_symlink_source(source) if source.is_symlink() else None
         _write_managed_skill_source(source, files)
         if ledger is not None:
             ledger.append("skill_adopted", component="kep-cli", skill=skill_path, archive=archive, symlink_target=target)
-        return source
+        return source, hits
     if adopt and source.is_symlink():
         # Already-managed but symlinked (legacy layout): materialize on adopt.
         files = read_kep_cli_skill_files(system.system, runner=runner)
         if files:
-            _lint_skill_files_for_injection(files)
+            hits = _lint_skill_files_for_injection(files)
             archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=f"kep-{system.system}-cli")
             target = _materialize_symlink_source(source)
             _write_managed_skill_source(source, files)
             if ledger is not None:
                 ledger.append("skill_adopted", component="kep-cli", skill=skill_path, archive=archive, symlink_target=target)
-            return source
+            return source, hits
     # Authoritative path: refresh from the system CLI's embedded SKILL.md.
     files = read_kep_cli_skill_files(system.system, runner=runner)
     if files:
+        hits = _lint_skill_files_for_injection(files)
         _write_managed_skill_source(source, files)
-        return source
+        return source, hits
     # Embedded skill not available yet (older system CLI) -> keep or stub.
     if skill_md.exists():
-        return source
+        return source, []
     _write_stub_skill_source(source, system)
-    return source
+    return source, []
 
 
 def _run_kep_cli(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -916,7 +1013,7 @@ def sync_lark_cli_skills(
             if files is None:
                 rows.append({"skill": name, "action": "skipped", "reason": "local lark-cli has no embedded skills verb"})
                 continue
-            _lint_skill_files_for_injection(files)  # BEFORE materialize/archive side effects
+            lint_flags = _lint_skill_files_for_injection(files)  # advisory only for first-party embedded content
             if adopt and (source.is_symlink() or (skill_md.exists() and not managed)):
                 archive = _archive_skill_source_for_adopt(source, shared_home=shared_home, name=name)
                 target = _materialize_symlink_source(source) if source.is_symlink() else None
@@ -925,7 +1022,14 @@ def sync_lark_cli_skills(
         except ValueError as exc:
             rows.append({"skill": name, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})
             continue
-        rows.append({"skill": name, "action": "refreshed" if changed else "up-to-date", "files": len(files)})
+        row = {"skill": name, "action": "refreshed" if changed else "up-to-date", "files": len(files)}
+        # First-party lint hit is advisory: content is already written byte-exact;
+        # flag the row, ledger it, and alert once — never quarantine, never exit 2.
+        if lint_flags:
+            row["lint_flags"] = lint_flags
+            ledger.append("skill_lint_flagged", component="lark-cli-skills", skill=name, flags=lint_flags)
+            _emit_lint_advisory("lark-cli-skills", name, lint_flags)
+        rows.append(row)
     report = {"component": "lark-cli-skills", "skills": rows, "secret_free": True}
     ledger.append("lark_skill_sync_completed", component="lark-cli-skills", skills=rows)
     return redact(report)

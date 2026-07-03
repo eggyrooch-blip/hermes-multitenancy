@@ -41,13 +41,11 @@ def build_alert_text(unit: str, *, journal: str | None = None) -> str:
     )
 
 
-def send_failure_alert(unit: str, *, webhook: str | None = None, opener=None) -> int:
-    url = (webhook or os.environ.get(WEBHOOK_ENV, "")).strip()
-    if not url:
-        print(f"error: {WEBHOOK_ENV} not set (expected via EnvironmentFile)", file=sys.stderr)
-        return 1
+def _post_feishu_text(url: str, text: str, *, opener=None) -> int:
+    """POST a plain-text Feishu group message; 0 on success, 1 on any failure."""
+
     payload = json.dumps(
-        {"msg_type": "text", "content": {"text": build_alert_text(unit)}}, ensure_ascii=False
+        {"msg_type": "text", "content": {"text": text}}, ensure_ascii=False
     ).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     open_fn = opener or urllib.request.urlopen
@@ -67,6 +65,30 @@ def send_failure_alert(unit: str, *, webhook: str | None = None, opener=None) ->
         return 1
     print(body[:200])
     return 0
+
+
+def send_failure_alert(unit: str, *, webhook: str | None = None, opener=None) -> int:
+    url = (webhook or os.environ.get(WEBHOOK_ENV, "")).strip()
+    if not url:
+        print(f"error: {WEBHOOK_ENV} not set (expected via EnvironmentFile)", file=sys.stderr)
+        return 1
+    return _post_feishu_text(url, build_alert_text(unit), opener=opener)
+
+
+def send_advisory_alert(text: str, *, webhook: str | None = None, opener=None) -> int:
+    """Best-effort advisory (non-failure) alert to the same Feishu group.
+
+    Unlike ``send_failure_alert``, a missing webhook is NOT an error: the sync
+    unit may not have the webhook wired, so we print a notice and return 0
+    (graceful degradation). Text is routed through ``redact()``.
+    """
+
+    url = (webhook or os.environ.get(WEBHOOK_ENV, "")).strip()
+    safe = redact(str(text))[:_TEXT_CAP]
+    if not url:
+        print(f"notice: {WEBHOOK_ENV} not set; advisory not sent: {safe}", file=sys.stderr)
+        return 0
+    return _post_feishu_text(url, safe, opener=opener)
 
 
 def main(argv: list[str] | None = None) -> int:
