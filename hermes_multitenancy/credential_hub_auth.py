@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -208,6 +209,9 @@ def _kep_env(profile_dir: Path, profile_name: str) -> dict[str, str]:
     })
 
 
+_nobrowser_dir: Optional[Path] = None
+
+
 def _ensure_no_browser_dir() -> Path:
     """A dir holding no-op `open`/`xdg-open`/`www-browser` shims.
 
@@ -217,14 +221,24 @@ def _ensure_no_browser_dir() -> Path:
     to PATH (+ BROWSER) makes the "open" a no-op: the URL is still printed (we
     capture it for the card button) and the localhost callback server still runs,
     so the page only opens when the user clicks the button.
+
+    Security: created via ``mkdtemp`` (random name, 0700, owned by this process)
+    and the shims are written UNCONDITIONALLY. The old fixed path
+    (``$TMPDIR/hermes-credhub-nobrowser``) with ``mkdir(exist_ok=True)`` +
+    ``if not shim.exists()`` let any local user pre-create the dir and plant a
+    malicious ``open``, which kep-auth would then execute as the hermes service
+    account — a CWE-377 local RCE on the box holding every profile's credentials.
+    Cached per process so login doesn't leak a new temp dir each time.
     """
-    d = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-credhub-nobrowser"
-    d.mkdir(parents=True, exist_ok=True)
+    global _nobrowser_dir
+    if _nobrowser_dir is not None and _nobrowser_dir.is_dir():
+        return _nobrowser_dir
+    d = Path(tempfile.mkdtemp(prefix="hermes-credhub-nobrowser-"))
     for name in ("open", "xdg-open", "www-browser", "x-www-browser"):
         shim = d / name
-        if not shim.exists():
-            shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            shim.chmod(0o755)
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+    _nobrowser_dir = d
     return d
 
 
