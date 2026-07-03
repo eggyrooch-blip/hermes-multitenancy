@@ -28,6 +28,8 @@ import contextlib
 from concurrent.futures import TimeoutError as FuturesTimeout
 import functools
 import json
+import math
+import signal
 import logging
 import os
 import re
@@ -2077,6 +2079,45 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
             os.environ["HERMES_HOME"] = previous_home
 
 
+_CRON_JOB_TIMEOUT_DEFAULT_SECONDS = 1800  # 30min — bounds a hung job; long agent runs still fit
+_CRON_JOB_TIMEOUT_MAX_SECONDS = 7200       # 2h hard ceiling — a fat-fingered/huge env can't disable the watchdog
+
+
+def _cron_job_timeout_seconds() -> float:
+    """Wall-clock bound for one isolated cron-job subprocess.
+
+    Without it a single hung job (LLM/network stall, MCP tool deadlock, an
+    infinite loop) blocks its worker thread and holds the profile tick-lock
+    forever; a handful of such hangs exhaust the ThreadPoolExecutor and halt
+    cron delivery for every profile (CRIT-2, audit 2026-07-03). Override via
+    HERMES_CRON_JOB_TIMEOUT (seconds).
+    """
+    raw = os.environ.get("HERMES_CRON_JOB_TIMEOUT", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+        except ValueError:
+            val = 0.0
+        if val > 0 and math.isfinite(val):
+            return min(val, float(_CRON_JOB_TIMEOUT_MAX_SECONDS))
+    return float(_CRON_JOB_TIMEOUT_DEFAULT_SECONDS)
+
+
+def _kill_cron_job_process_group(proc: "subprocess.Popen") -> None:
+    """Kill the whole job tree (wrapper + any tool/agent grandchildren), not just
+    the direct child. On timeout, a hung descendant that inherited the captured
+    stdout/stderr pipes would otherwise keep them open and block the worker even
+    after the wrapper dies. Falls back to killing the direct process if the group
+    is already gone. CRIT-2."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _run_job_for_profile_subprocess(profile_home: Path, job: dict) -> dict[str, Any]:
     profile_home = Path(profile_home).expanduser().resolve()
     payload = {"profile_home": str(profile_home), "job": job}
@@ -2115,16 +2156,53 @@ print(json.dumps(result, ensure_ascii=False))
 '''
     env = os.environ.copy()
     env["HERMES_HOME"] = str(profile_home)
-    proc = subprocess.run(
+    timeout_s = _cron_job_timeout_seconds()
+    # start_new_session=True → the child leads its own process group so a timeout
+    # can kill the ENTIRE job tree. A cron job runs an agent that may spawn
+    # CLI/tool subprocesses; bounding only the direct wrapper (subprocess.run's
+    # default) leaves runaway grandchildren that hold the captured pipes open and
+    # keep the worker — then the pool, then all cron delivery — blocked. CRIT-2.
+    proc = subprocess.Popen(
         [sys.executable, "-c", child_code],
-        input=json.dumps(payload, ensure_ascii=False),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        capture_output=True,
         env=env,
-        check=False,
+        start_new_session=True,
     )
+    try:
+        out_text, err_text = proc.communicate(
+            input=json.dumps(payload, ensure_ascii=False), timeout=timeout_s
+        )
+    except subprocess.TimeoutExpired:
+        # Kill the whole group, then reap. Return a failure result so the future
+        # completes → the done-callback finalizes → the profile tick-lock
+        # releases, instead of hanging the worker. CRIT-2.
+        _kill_cron_job_process_group(proc)
+        try:
+            out_text, err_text = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_cron_job_process_group(proc)
+            out_text, err_text = "", ""
+        error = f"cron subprocess exceeded {timeout_s:.0f}s timeout — job tree killed"
+        logger.warning(
+            "[multitenancy] cron job timed out after %ss profile=%s job=%s",
+            timeout_s, profile_home.name, job.get("id", "?"),
+        )
+        return {
+            "success": False,
+            "output": (
+                f"# Cron Job: {job.get('name') or job.get('id') or 'scheduled task'}\n\n"
+                f"**Job ID:** {job.get('id') or ''}\n"
+                f"**Run Path:** isolated subprocess\n\n"
+                f"Error: {error}"
+            ),
+            "final_response": "",
+            "error": error,
+        }
     parsed: Optional[dict[str, Any]] = None
-    for line in reversed([line.strip() for line in proc.stdout.splitlines() if line.strip()]):
+    for line in reversed([line.strip() for line in (out_text or "").splitlines() if line.strip()]):
         try:
             candidate = json.loads(line)
         except json.JSONDecodeError:
@@ -2135,11 +2213,11 @@ print(json.dumps(result, ensure_ascii=False))
     if parsed is not None:
         if proc.returncode == 0:
             return parsed
-        stderr = proc.stderr.strip()
+        stderr = (err_text or "").strip()
         parsed["success"] = False
         parsed["error"] = parsed.get("error") or stderr or f"cron subprocess exited {proc.returncode}"
         return parsed
-    stderr = proc.stderr.strip()
+    stderr = (err_text or "").strip()
     error = stderr or f"cron subprocess exited {proc.returncode} without JSON result"
     return {
         "success": False,
