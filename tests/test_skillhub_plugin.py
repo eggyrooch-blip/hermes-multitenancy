@@ -625,6 +625,7 @@ def test_plugin_all_audience_installs_global_distribution(tmp_path: Path) -> Non
         shared_home=shared_home,
         profiles_root=profiles_root,
         downloader=lambda _: _plugin_zip(),
+        allow_create_distribution=True,  # plugin-all now requires opt-in (MED-4)
     )
 
     assert result["action"] == "plugin_install"
@@ -663,11 +664,35 @@ def test_plugin_all_audience_installs_with_download(tmp_path: Path) -> None:
         shared_home=shared_home,
         profiles_root=profiles_root,
         downloader=lambda _: _plugin_zip(),
+        allow_create_distribution=True,  # plugin-all now requires opt-in (MED-4)
     )
 
     assert result["action"] == "plugin_install"
     assert result["mode"] == "all"
     assert _managed_manifest(shared_home)["audience"]["mode"] == "all"
+
+
+def test_plugin_all_without_opt_in_refuses_to_create_distribution(tmp_path: Path) -> None:
+    """MED-4 regression: plugin auth_type='all' must NOT auto-create
+    skill-distribution.yaml without allow_create_distribution, matching the skill
+    path. Pre-fix it hardcoded True and silently created it — overriding every
+    profile's default-skill source. FAILS on pre-fix code (no raise)."""
+    from hermes_multitenancy.skillhub_installer import process_event, SkillhubInstallError
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+
+    with pytest.raises(SkillhubInstallError):
+        process_event(
+            _plugin_event(auth_type="all", users=[]),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(),
+            # no allow_create_distribution → default False → must refuse
+        )
+    # the guard refused: skill-distribution.yaml was NOT created
+    assert not (shared_home / "skill-distribution.yaml").exists()
 
 
 def test_plugin_no_cached_repo_returns_plugin_no_package(tmp_path: Path) -> None:

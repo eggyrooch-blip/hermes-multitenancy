@@ -954,6 +954,7 @@ def _process_plugin_event(
     shared: Path,
     profiles: Path,
     downloader: Callable[[str], bytes] | None,
+    allow_create_distribution: bool = False,
 ) -> dict[str, Any]:
     plugin_id = _first_str(event.get("skill_code"))
     if not plugin_id:
@@ -1032,7 +1033,12 @@ def _process_plugin_event(
                 audience="all",
                 shared_home=shared,
                 profiles_root=profiles,
-                allow_create_distribution=True,
+                # Thread the caller's opt-in instead of hardcoding True. Creating
+                # skill-distribution.yaml where none exists overrides every
+                # profile's default-skill source; the skill path already gates
+                # this behind allow_create_distribution (default False), and the
+                # plugin path must match. MED-4, audit 2026-07-03.
+                allow_create_distribution=allow_create_distribution,
                 force=fresh_repo,
             )
         except plugin_ingest.PluginIngestError as exc:
@@ -1200,6 +1206,7 @@ def process_event(
             shared=shared,
             profiles=profiles,
             downloader=downloader,
+            allow_create_distribution=allow_create_distribution,
         )
     if skill_status == "pending":
         # Skill not yet live — never download or install. Idempotent no-op.
