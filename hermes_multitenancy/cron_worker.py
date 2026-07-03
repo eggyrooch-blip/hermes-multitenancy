@@ -534,8 +534,11 @@ def _l4_check_needs_reauth_and_defer(
                     body,
                     source="cron_worker_l4",
                 )
-                clear_needs_reauth_marker(non_actionable_marker)
-                cleared = True
+                # Only count progress if the marker was ACTUALLY removed — a
+                # silently-failed unlink (root-owned marker / read-only FS) must
+                # NOT keep the while-loop alive re-finding the same marker. HIGH-2.
+                if clear_needs_reauth_marker(non_actionable_marker):
+                    cleared = True
         logger.warning(
             "[multitenancy] L4 ignored non-authoritative reauth marker owner=%s reason=%s",
             owner_open_id,

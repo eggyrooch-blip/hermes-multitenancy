@@ -10,12 +10,15 @@ Single source of truth for:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 REASON_EMPTY_REFRESH_TOKEN = "empty_refresh_token"
 REASON_SCOPE_STRIPPED_BY_FEISHU = "scope_stripped_by_feishu"
@@ -258,14 +261,22 @@ def read_refresh_diagnostic_marker(marker_path: Path) -> Optional[dict[str, Any]
     return data if isinstance(data, dict) else None
 
 
-def clear_needs_reauth_marker(marker_path: Path) -> None:
-    """Remove a marker if present; quiet on failure (caller decides reaction)."""
+def clear_needs_reauth_marker(marker_path: Path) -> bool:
+    """Remove a marker if present. Returns True when the marker is now gone
+    (removed, or already absent), False when removal FAILED (root-owned marker,
+    read-only FS, …).
+
+    Callers that loop until markers are cleared MUST check this: treating a
+    failed unlink as "cleared" gives no forward progress and spins the loop
+    forever at 100% CPU (HIGH-2, audit 2026-07-03)."""
     try:
         marker_path.unlink()
+        return True
     except FileNotFoundError:
-        return
+        return True
     except OSError:
-        return
+        logger.warning("[credential] failed to remove reauth marker %s", marker_path)
+        return False
 
 
 def iter_uat_locations(shared_home: Path) -> Iterator[UatLocation]:
