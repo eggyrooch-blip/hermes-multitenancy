@@ -22,6 +22,9 @@ architect estimate). For end-to-end demo today, this thin runner is enough.
 """
 from __future__ import annotations
 
+import sys as _sys
+_pkg = _sys.modules["hermes_multitenancy.agent_real"]
+
 import json
 import logging
 import os
@@ -39,26 +42,25 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
-from . import credential_hub
-from . import kep_cli_guard
-from .credential_broker import lease_signing_secret, mint_lease
-from .lark_cli_guard import (
+from .. import credential_hub
+from .. import kep_cli_guard
+from ..credential_broker import lease_signing_secret, mint_lease
+from ..lark_cli_guard import (
     HERMES_LARK_CLI_REAL_BIN,
     HERMES_LARK_CLI_RUN_TOKEN,
     generate_lark_cli_run_token,
     install_lark_cli_shim,
 )
-from .lark_cli_auth_broker import (
+from ..lark_cli_auth_broker import (
     LarkCliAuthBrokerContext,
     start_lark_cli_auth_broker_server,
 )
-from .runtime import require_sandbox_enabled, strict_context_enabled
-from .security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
-from .security_audit import append_security_event
-from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
+from ..runtime import require_sandbox_enabled, strict_context_enabled
+from ..security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
+from ..security_audit import append_security_event
+from .. import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
-_EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
 
 # StreamReader line-buffer cap for the AIAgent subprocess NDJSON protocol. The
 # child writes one JSON event per line; asyncio's default 64 KiB limit makes a
@@ -79,27 +81,6 @@ def _resolve_aiagent_stream_limit() -> int:
 _AIAGENT_STREAM_LIMIT = _resolve_aiagent_stream_limit()
 
 
-class _CredentialExpirySignal:
-    """Thread-safe one-shot holder for a lark-cli credential-expiry signal.
-
-    The lark auth sidecar records into this from its http.server handler
-    thread while the agent subprocess runs; the async run scope reads it
-    afterwards. Lives per ``stream_run_agent`` call via a ContextVar, so
-    there is no cross-run bleed.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._value: Optional[dict] = None
-
-    def set(self, payload: dict) -> None:
-        with self._lock:
-            if self._value is None:
-                self._value = dict(payload or {})
-
-    def get(self) -> Optional[dict]:
-        with self._lock:
-            return dict(self._value) if self._value is not None else None
 
 
 # Set by ``stream_run_agent`` (the reader owns the lifecycle); read by
@@ -245,9 +226,9 @@ async def stream_run_agent(  # type: ignore[override]
         final_text = ""
         tool_started_count = 0
         stream = (
-            _stream_aiagent_subprocess(event, profile_home, messages=messages)
+            _pkg._stream_aiagent_subprocess(event, profile_home, messages=messages)
             if messages is not None
-            else _stream_aiagent_subprocess(event, profile_home)
+            else _pkg._stream_aiagent_subprocess(event, profile_home)
         )
         async for kind, payload in stream:
             if kind == "done":
@@ -307,7 +288,7 @@ async def stream_run_agent(  # type: ignore[override]
     finally:
         _CREDENTIAL_EXPIRY_SIGNAL.reset(signal_token)
 
-    async for kind, text in _stream_loop(event, profile_home, messages=messages):
+    async for kind, text in _pkg._stream_loop(event, profile_home, messages=messages):
         yield kind, text
 
 
@@ -332,115 +313,6 @@ def _reasoning_for_state_db(
     return reasoning_text
 
 
-async def _stream_loop(
-    event: Any,
-    profile_home: Path,
-    *,
-    messages: Optional[list[dict]] = None,
-):
-    """Streaming counterpart to ``real_run_agent`` — yields content chunks.
-
-    Used by the multitenancy router to stream LLM tokens into a Feishu
-    ``edit_message`` loop, restoring the typewriter UX that hermes' main
-    flow provides natively. Falls through provider candidates the same way
-    as ``real_run_agent`` — first one whose first chunk is non-empty wins.
-
-    Yields
-    ------
-    str
-        Each non-empty content chunk from the live model.
-
-    Raises
-    ------
-    RuntimeError
-        If every candidate model+credential combination fails or yields
-        nothing. Caller should fall back to ``real_run_agent`` for a final
-        non-streamed attempt before giving up.
-    """
-    import yaml
-    from openai import AsyncOpenAI
-    from dotenv import dotenv_values
-
-    config = _load_profile_config(profile_home)
-    auth = _load_json(profile_home / "auth.json")
-    env_overrides = (
-        dotenv_values(profile_home / ".env") if (profile_home / ".env").exists() else {}
-    )
-
-    primary = config.get("model", {}).get("default")
-    fallback_models = config.get("fallback") or []
-    candidates: list[str] = [primary] if primary else []
-    candidates.extend(fallback_models)
-
-    soul_text = _load_soul(profile_home)
-    # Expert Role-Override overlay (ephemeral, this run only): override block leads
-    # the single system message, SOUL demoted below it (verdict B). SOUL.md unchanged.
-    system_text = _compose_system_text(event, profile_home, soul_text)
-    user_text = getattr(event, "text", "") or ""
-
-    # Caller can override the message list (used for multi-turn history).
-    # Default: system prompt + single user message.
-    if messages is None:
-        effective_messages: list[dict] = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
-        ]
-    else:
-        # Caller supplies the conversation. We still inject SOUL (+ any expert
-        # overlay) as system to guarantee the active persona stays in force.
-        effective_messages = [
-            {"role": "system", "content": system_text},
-            *messages,
-        ]
-
-    last_error: Optional[BaseException] = None
-
-    for model_spec in candidates:
-        if not model_spec:
-            continue
-        try:
-            provider, model_name = _split_model_spec(model_spec)
-        except ValueError:
-            continue
-        api_key = _resolve_api_key(provider, env_overrides, auth)
-        if not api_key:
-            continue
-        base_url = _resolve_base_url(provider, model_spec == primary, config, env_overrides)
-
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        try:
-            stream = await client.chat.completions.create(
-                model=model_name,
-                messages=effective_messages,
-                max_tokens=512,
-                stream=True,
-            )
-            got_content = False
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if not delta:
-                    continue
-                # Reasoning models (e.g. GLM 5.1) stream reasoning_content
-                # BEFORE content; surfacing it gives the user real-time feedback
-                # instead of a 5-15s placeholder freeze.
-                reasoning = getattr(delta, "reasoning_content", None)
-                if reasoning:
-                    yield "thinking", reasoning
-                if delta.content:
-                    got_content = True
-                    yield "content", delta.content
-            if got_content:
-                return
-            logger.info("stream_run_agent: %s yielded no content, falling back", model_spec)
-        except Exception as exc:
-            last_error = exc
-            logger.info("stream_run_agent: %s failed (%s), falling back", model_spec, exc)
-
-    if last_error is not None:
-        raise RuntimeError(f"streaming failed; last error: {last_error}") from last_error
-    raise RuntimeError("streaming exhausted (no usable provider returned content)")
 
 
 async def real_run_agent(
@@ -487,7 +359,7 @@ async def _legacy_real_run_agent(
     # in strict mode we fail closed rather than silently degrade to it.
     if strict_context_enabled():
         try:
-            from .security_audit import append_security_event
+            from ..security_audit import append_security_event
 
             append_security_event(
                 event_type="route.denied",
@@ -618,7 +490,7 @@ def _broker_role_override_payload_for_event(
     if not expert_id:
         return None
     try:
-        from .expert_overlay import role_override_block_for
+        from ..expert_overlay import role_override_block_for
 
         try:
             sender_open_id = _resolve_subprocess_sender_open_id(event) or None
@@ -673,7 +545,7 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
         )
         return broker_block
     try:
-        from .expert_overlay import role_override_block_for
+        from ..expert_overlay import role_override_block_for
 
         # Pass the TRUSTED sender open_id so department-scoped experts can be
         # resolved against the caller's REAL departments (fail-closed when the
@@ -743,7 +615,7 @@ def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> se
     leak. Returns an empty set when there are no expert manifests at all.
     """
     try:
-        from .expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
+        from ..expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
 
         all_expert_skills = all_expert_skill_names(profile_home)
         if not all_expert_skills:
@@ -773,7 +645,7 @@ def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> se
         )
         fallback_names: set[str] = set()
         try:
-            from .expert_overlay import readable_expert_skill_names
+            from ..expert_overlay import readable_expert_skill_names
 
             fallback_names = readable_expert_skill_names(profile_home)
         except Exception:
@@ -783,122 +655,6 @@ def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> se
         return fallback_names
 
 
-def _apply_expert_skill_scope_for_aiagent(event: Any, profile_home: Path):
-    """Scope skills for this run to 能力随专家私有 by HIDING every non-active expert
-    skill, with ZERO hermes-agent change.
-
-    Expert skills are installed into the profile ``skills/`` scan root by the
-    ingester (``plugin_ingest._install_skills_to_profile``; ``assert_profile_governance``
-    REQUIRES the entry+orchestrate skills there). So the ACTIVE expert's own skills
-    are already resolvable — we only need to HIDE the others. Purely subtractive via
-    two subprocess-local monkeypatches (the run is a fresh
-    ``asyncio.create_subprocess_exec`` child, so these module-global patches can
-    never leak across the 1279 profiles):
-
-      * ``get_disabled_skill_names`` (skill_utils source + the prompt_builder /
-        skill_commands bound imports) — hides them from the system-prompt CATALOG.
-        Works on UPSTREAM/prod core, which reads disabled skills from
-        ``config.yaml`` only and IGNORES ``HERMES_DISABLED_SKILLS_EXTRA`` (that env
-        is honored solely by the abandoned fork; relying on it silently leaks).
-      * ``tools.skills_tool._is_skill_disabled`` — the ``skill_view`` INVOCATION
-        gate (reads config.yaml directly, NOT get_disabled_skill_names), so a hidden
-        skill cannot be LOADED/EXECUTED, not merely un-advertised.
-
-    On a non-expert run every expert skill is hidden → byte-identical catalog AND
-    not invocable. The active expert's own skills stay visible (in the scan root,
-    absent from the hidden set). NO additive temp-root is used: the skills are
-    already in the scan root, so adding a copy would make ``skill_view`` raise
-    "Ambiguous skill name" and break the active expert's own skill loading.
-
-    Returns a cleanup restoring all patches; a true no-op when there is nothing to
-    hide (no expert manifests installed → non-expert byte-identical path).
-
-    DOCUMENTED RESIDUAL: the raw ``Read`` tool can still read a hidden skill's
-    ``SKILL.md`` from ``<profile>/skills/``. True file-level isolation would require
-    not co-installing expert skills into non-audience profiles — out of this
-    0-core-change seam. Mitigated operationally by audience-scoped ingest (the plugin
-    lands only in its audience profiles).
-    """
-    disabled = _expert_disabled_skill_names_for_event(event, profile_home)
-    if not disabled:
-        return lambda: None
-
-    _EXPERT_SKILL_SCOPE_LOCK.acquire()
-    try:
-        import agent.skill_utils as skill_utils
-    except Exception:
-        logger.warning("[multitenancy] could not patch expert skill scope into Hermes core", exc_info=True)
-        _EXPERT_SKILL_SCOPE_LOCK.release()
-        return lambda: None
-
-    _hide = frozenset(disabled)
-    patched_module_attrs: list[tuple[Any, str, Any]] = []
-    original_disabled = None
-    try:
-        # ── catalog: hide from the system-prompt skill catalog ──
-        original_disabled = getattr(skill_utils, "get_disabled_skill_names", None)
-
-        def _with_expert_disabled(platform=None, *, _orig=original_disabled, _extra=_hide):
-            base = set(_orig(platform) if callable(_orig) else set())
-            return base | set(_extra)
-
-        if callable(original_disabled):
-            skill_utils.get_disabled_skill_names = _with_expert_disabled
-        for module_name in ("agent.prompt_builder", "agent.skill_commands"):
-            module = sys.modules.get(module_name)
-            if module is None or not hasattr(module, "get_disabled_skill_names"):
-                continue
-            patched_module_attrs.append(
-                (module, "get_disabled_skill_names", getattr(module, "get_disabled_skill_names"))
-            )
-            setattr(module, "get_disabled_skill_names", _with_expert_disabled)
-
-        # ── invocation gate: skill_view → _is_skill_disabled (reads config.yaml directly,
-        #    NOT get_disabled_skill_names) — force-import so the patch lands before use.
-        try:
-            import tools.skills_tool as skills_tool
-        except Exception:
-            skills_tool = None
-        if skills_tool is not None and hasattr(skills_tool, "_is_skill_disabled"):
-            _orig_is_disabled = skills_tool._is_skill_disabled
-
-            def _with_expert_is_disabled(name, platform=None, *, _orig=_orig_is_disabled, _extra=_hide):
-                if name in _extra:
-                    return True
-                try:
-                    return bool(_orig(name, platform))
-                except TypeError:
-                    return bool(_orig(name))
-
-            patched_module_attrs.append((skills_tool, "_is_skill_disabled", _orig_is_disabled))
-            skills_tool._is_skill_disabled = _with_expert_is_disabled
-    except Exception:
-        logger.warning("[multitenancy] failed to patch expert skill scope into Hermes core", exc_info=True)
-        try:
-            if callable(original_disabled):
-                skill_utils.get_disabled_skill_names = original_disabled
-            for module, attr, original in patched_module_attrs:
-                setattr(module, attr, original)
-        finally:
-            _EXPERT_SKILL_SCOPE_LOCK.release()
-        return lambda: None
-
-    logger.info(
-        "[multitenancy] expert skill scope active profile=%s hide=%s",
-        profile_home.name,
-        sorted(disabled),
-    )
-
-    def _cleanup() -> None:
-        try:
-            if callable(original_disabled):
-                skill_utils.get_disabled_skill_names = original_disabled
-            for module, attr, original in patched_module_attrs:
-                setattr(module, attr, original)
-        finally:
-            _EXPERT_SKILL_SCOPE_LOCK.release()
-
-    return _cleanup
 
 
 def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
@@ -1226,7 +982,7 @@ def _install_feishu_app_db_broker(feishu_oapi_module: Any, shared_home: Path) ->
         setattr(feishu_oapi_module, "_hermes_mt_original_resolve_feishu_credentials", original)
 
     def _resolve_feishu_credentials_with_broker() -> tuple[str, str, str]:
-        from .credentials import CredentialStore
+        from ..credentials import CredentialStore
 
         store = None
         try:
@@ -1277,7 +1033,7 @@ def _install_feishu_uat_db_broker(feishu_oapi_module: Any, profile_home: Path, s
 
     def _load_uat_with_broker(open_id: Optional[str] = None) -> dict:
         if open_id:
-            from .credentials import CredentialStore
+            from ..credentials import CredentialStore
 
             try:
                 store = CredentialStore(shared_home / "multitenancy.db")
@@ -1320,7 +1076,7 @@ def _install_feishu_uat_db_broker(feishu_oapi_module: Any, profile_home: Path, s
 
 def _store_feishu_uat_payload(shared_home: Path, profile_name: str, open_id: str, data: dict[str, Any]) -> None:
     try:
-        from .credentials import CredentialStore
+        from ..credentials import CredentialStore
 
         scopes = data.get("scopes") or data.get("scope") or []
         if isinstance(scopes, str):
@@ -1438,7 +1194,7 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
         return Path(raw).expanduser() if raw else Path(default_profile_home).expanduser()
 
     def _owner_updates(job: dict) -> dict[str, str]:
-        from .cron_worker import infer_cron_owner_context
+        from ..cron_worker import infer_cron_owner_context
 
         return infer_cron_owner_context(job, profile_home=_profile_home())
 
@@ -1468,7 +1224,7 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
         return refreshed or {**job, **owner_updates}
 
     def trigger_job_via_run_broker(job_id: str) -> Any:
-        from . import cron_worker
+        from .. import cron_worker
 
         resolver = getattr(cronjob_tools, "resolve_job_ref", None)
         job = resolver(job_id) if callable(resolver) else None
@@ -2009,157 +1765,12 @@ def _profile_anchor_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     }
 
 
-def _build_subprocess_env(
-    profile_home: Path,
-    *,
-    approval_dir: Path,
-    event_stream: bool = False,
-    extra: Optional[dict[str, str]] = None,
-) -> dict[str, str]:
-    """Build a sanitized env for the AIAgent subprocess (档 A isolation).
-
-    Two guarantees enforced here:
-
-      1. **Env whitelist** — the parent gateway's full env is NOT inherited.
-         Only keys in :data:`_SUBPROCESS_ENV_ALLOWLIST` carry over. This stops
-         API keys / OAuth tokens / shell secrets exported into the gateway
-         process from leaking into a profile's tool execution.
-
-      2. **Profile compatibility pivots** — HOME, WORKSPACE, XDG
-         cache/config/state/data and TMPDIR redirect into the profile's own
-         directory tree. Token-oriented skills and CLIs that were written for
-         OpenClaw-style ``$HOME`` or ``/workspace`` semantics can therefore run
-         unchanged: ``Path.home() / ".keepai"`` lands in the current profile,
-         ``/workspace/credentials/gitlab.token`` maps to the profile workspace,
-         and CLIs/MCP servers see stable profile identity via ``HERMES_PROFILE``
-         plus ``KEP_PROFILE`` for existing Keep tooling.
-
-    Skills that already use :mod:`hermes_multitenancy.skill_storage` continue
-    to work, but it is no longer the only safe path. The multitenancy runtime
-    itself provides the compatibility boundary for unmodified upstream skills.
-
-    The directories ``home/``, ``workspace/``, ``cache/``, ``config/``,
-    ``state/``, ``data/`` and ``tmp/`` are created on first use (mode 0700).
-
-    Profile-local secrets are loaded inside the child by
-    :func:`_run_with_aiagent` from ``<profile_home>/.env`` and ``auth.json``;
-    they are intentionally NOT injected here so the child never sees a parent
-    env-derived key as an "ambient" credential.
-    """
-    parent = os.environ
-    env: dict[str, str] = {
-        key: parent[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in parent
-    }
-    if strict_context_enabled():
-        env.pop("HERMES_MULTITENANCY_CREDENTIAL_KEY", None)
-        env.pop("HERMES_CREDENTIAL_KEY", None)
-
-    profile_home = profile_home.expanduser()
-    share_role = str((extra or {}).get("HERMES_AGENT_SHARE_ROLE") or "").strip()
-    shared_agent_run = share_role in _AGENT_SHARED_ROLES
-    env.update(
-        _profile_env_for_aiagent(
-            profile_home,
-            include_profile_secrets=not shared_agent_run,
-        )
-    )
-    credential_env = {} if shared_agent_run else _credential_env_for_aiagent(profile_home)
-    env.update(credential_env)
-    env.update(_force_env_for_terminal_passthrough(credential_env))
-
-    # OpenClaw-compatible token boundary: HOME and /workspace-style variables
-    # point into the routed profile so unmodified token skills do not write to
-    # the shared service user's home.
-    profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
-    env.update(profile_anchor_env)
-    env["HERMES_GATEWAY_SESSION"]           = "1"
-    env["HERMES_EXEC_ASK"]                  = "1"
-    env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
-    # terminal/execute_code apply a second subprocess env scrub.  Force only
-    # non-secret profile anchors through that boundary so profile-scoped CLIs
-    # such as kep-auth/ocean-cli read the same HOME and KEP_PROFILE as the
-    # routed AIAgent process.
-    env.update(_force_env_for_terminal_passthrough(profile_anchor_env))
-    lark_cli_env = _lark_cli_sidecar_env_for_aiagent(profile_home)
-    env.update(lark_cli_env)
-    env.update(_force_env_for_terminal_passthrough(lark_cli_env))
-    env.update(_browser_env_for_aiagent(profile_home))
-    if event_stream:
-        env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
-
-    shared_bin_dir = _resolve_shared_hermes_home(profile_home) / "bin"
-    shared_bin = str(shared_bin_dir)
-    existing_path = env.get("PATH", "")
-    path_parts = [part for part in existing_path.split(os.pathsep) if part]
-    deduped = [part for part in path_parts if part != shared_bin]
-    env["PATH"] = os.pathsep.join([shared_bin, *deduped])
-    if strict_context_enabled():
-        real_bin = _resolve_lark_cli_authsidecar_binary(profile_home)
-        shim_dir = profile_home / "tmp" / "lark-cli-shim"
-        install_lark_cli_shim(shim_dir, real_binary=real_bin)
-        env[HERMES_LARK_CLI_REAL_BIN] = str(real_bin)
-        env[HERMES_LARK_CLI_RUN_TOKEN] = generate_lark_cli_run_token()
-        env.setdefault(
-            "HERMES_MT_SECURITY_AUDIT_PATH",
-            str(_default_security_audit_path_for_subprocess(profile_home)),
-        )
-        real_bins = {
-            name: str(shared_bin_dir / name)
-            for name in kep_cli_guard.KEP_SHIM_NAMES
-            if (shared_bin_dir / name).exists()
-        }
-        if real_bins:
-            kep_cli_guard.install_kep_cli_shim(shim_dir, real_bins=real_bins)
-            for name, real_path in real_bins.items():
-                env[f"HERMES_KEP_CLI_REAL_BIN_{name.replace('-', '_').upper()}"] = real_path
-        strict_path_parts = [part for part in env["PATH"].split(os.pathsep) if part]
-        env["PATH"] = os.pathsep.join(
-            [str(shim_dir), *[part for part in strict_path_parts if part != str(shim_dir)]]
-        )
-
-    # Mirror _wrap_with_sandbox's toggle + per-profile gate so the subprocess
-    # knows it's running inside a sandbox host. tools/approval.py reads
-    # HERMES_SANDBOX_HOST to bypass dangerous-command approval: the sandbox
-    # already enforces filesystem/network isolation at the kernel layer, so
-    # asking the user about `python -c ...` inside it is duplicate friction.
-    # The hardline blocklist (rm -rf /, mkfs, dd /dev/sd, shutdown, fork bomb)
-    # is checked BEFORE the bypass in approval.py and remains in effect.
-    if os.environ.get("HERMES_USE_SANDBOX") == "1":
-        allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
-        if not allowlist_raw or profile_home.name in {
-            p.strip() for p in allowlist_raw.split(",") if p.strip()
-        }:
-            env["HERMES_SANDBOX_HOST"] = "1"
-            env.setdefault("HERMES_YOLO_MODE", "1")
-
-    if extra:
-        env.update(extra)
-
-    # Feishu per-user UAT identity: forward sender open_id so that AIAgent
-    # tool-worker threads (which lose ContextVar across ThreadPoolExecutor
-    # workers per run_agent.py:1104 / 8479) can recover identity via
-    # os.environ. The contextvar is set by sender_open_id_scope in the
-    # feishu adapter; asyncio.create_task copies context so it is still
-    # alive here even when called from a batched / deferred flush task.
-    # Note: MessageEvent dataclass (gateway/platforms/base.py:785) has no
-    # sender_open_id field, so a caller-driven getattr would always return
-    # empty. ContextVar is the reliable source.
-    # Must come AFTER extra so an explicit caller-supplied value wins.
-    if "HERMES_FEISHU_USER_OPEN_ID" not in env:
-        try:
-            from tools import feishu_oapi_client as _foc
-            _sender = _foc.current_sender_open_id.get()
-            if _sender:
-                env["HERMES_FEISHU_USER_OPEN_ID"] = str(_sender)
-        except Exception:
-            pass
-    return env
 
 
 def _browser_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     """Expose profile-scoped env for Hermes native browser tools."""
     try:
-        from .browser_policy import browser_decision, browser_env
+        from ..browser_policy import browser_decision, browser_env
 
         config = _load_yaml(profile_home / "config.yaml")
         return browser_env(browser_decision(config, profile_home))
@@ -2219,7 +1830,7 @@ def _resolve_lark_cli_app_id(profile_home: Path) -> str:
     if app_id:
         return app_id
     try:
-        from .credentials import CredentialStore
+        from ..credentials import CredentialStore
 
         store = CredentialStore(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
         try:
@@ -2341,7 +1952,7 @@ def _profile_has_lark_cli_user_credential(profile_home: Path, open_id: str) -> b
 
     shared_home = _resolve_shared_hermes_home(profile_home)
     try:
-        from .feishu_uat_auth import refresh_uat_if_needed
+        from ..feishu_uat_auth import refresh_uat_if_needed
 
         refreshed = refresh_uat_if_needed(
             profile_name=Path(profile_home).name,
@@ -2362,7 +1973,7 @@ def _profile_has_lark_cli_user_credential(profile_home: Path, open_id: str) -> b
         pass
 
     try:
-        from .credentials import CredentialStore
+        from ..credentials import CredentialStore
 
         store = CredentialStore(shared_home / "multitenancy.db")
         try:
@@ -2422,7 +2033,7 @@ def _owner_mapped_bot_chat_ids(profile_home: Path, sender_open_id: str) -> froze
         return frozenset()
     table = None
     try:
-        from .routing import KIND_GROUP, RoutingTable
+        from ..routing import KIND_GROUP, RoutingTable
 
         table = RoutingTable(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
         rows = table.list_by_owner(sender_open_id, kind=KIND_GROUP)
@@ -2442,7 +2053,7 @@ def _profile_owner_open_id(profile_home: Path) -> str:
     profile_name = Path(profile_home).name
     table = None
     try:
-        from .routing import RoutingTable
+        from ..routing import RoutingTable
 
         table = RoutingTable(_resolve_shared_hermes_home(profile_home) / "multitenancy.db")
         row = table.lookup_by_profile_name(profile_name)
@@ -2525,7 +2136,7 @@ def _aiagent_subprocess_env_scope(
     extra: Optional[dict[str, str]] = None,
 ) -> Iterator[dict[str, str]]:
     """Build child env while keeping per-run broker lifetime scoped to spawn."""
-    from .webui_broker_server import (
+    from ..webui_broker_server import (
         credential_broker_url,
         register_credential_broker_token,
         register_session_search_broker_token,
@@ -2660,7 +2271,7 @@ def _profile_env_for_aiagent(
         logger.debug("[multitenancy] failed to load profile .env for subprocess", exc_info=True)
 
     try:
-        from .provider_adapter import provider_env_for_aiagent
+        from ..provider_adapter import provider_env_for_aiagent
 
         for key, value in provider_env_for_aiagent(profile_home, existing_env=loaded).items():
             if key not in loaded:
@@ -2707,13 +2318,13 @@ def _credential_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     """
     loaded: dict[str, str] = {}
     try:
-        from .credential_materializer import (
+        from ..credential_materializer import (
             DEFAULT_SHARED_PROFILE,
             _payload_content,
             _resolve_config_path,
             _target_profiles,
         )
-        from .credentials import CredentialStore
+        from ..credentials import CredentialStore
 
         shared_home = _resolve_shared_hermes_home(profile_home)
         config = _resolve_config_path(shared_home, None)
@@ -2891,7 +2502,7 @@ profile and env, or the Hermes-managed legacy wrapper under HOME.
 
 
 def _keep_login_compat_wrapper_source() -> Path:
-    return Path(__file__).resolve().parent / "compat" / "keep_login_get_bearer_token.py"
+    return Path(__file__).resolve().parent.parent / "compat" / "keep_login_get_bearer_token.py"
 
 
 def _install_keep_login_compat(profile_home: Path) -> None:
@@ -3064,7 +2675,7 @@ def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[
 def _apply_vod_image_model_override_for_aiagent(user_text: str):
     """Expose a one-run VOD image model override parsed from natural language."""
     try:
-        from .tencent_vod_image_gen import VOD_MODEL_OVERRIDE_ENV, detect_vod_model_override
+        from ..tencent_vod_image_gen import VOD_MODEL_OVERRIDE_ENV, detect_vod_model_override
     except Exception:
         return lambda: None
 
@@ -3146,7 +2757,7 @@ def _register_aiagent_process_image_gen_providers() -> None:
             register_provider(provider)
 
     try:
-        from .tencent_vod_image_gen import register_vod_image_gen_provider
+        from ..tencent_vod_image_gen import register_vod_image_gen_provider
 
         registered = register_vod_image_gen_provider(_ImageGenRegistryContext())
         if registered:
@@ -3223,7 +2834,7 @@ def _dotenv_values_for_aiagent(
 # 档 B — sandbox-exec wrapper (kernel-level filesystem + network deny)
 # ─────────────────────────────────────────────────────────────────────────
 
-_SANDBOX_POLICY_FILE = Path(__file__).parent / "sandbox" / "profile-default.sb"
+_SANDBOX_POLICY_FILE = Path(__file__).parent.parent / "sandbox" / "profile-default.sb"
 _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
 # Linux backend — bubblewrap. Policy is a sibling file written one bwrap arg
@@ -3231,7 +2842,7 @@ _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # the macOS .sb file rather than compiled from a shared DSL (see
 # sandbox-cross-platform-design.md §6 for the trade-off).
 _BWRAP_EXEC = "/usr/bin/bwrap"
-_BWRAP_ARGS_FILE = Path(__file__).parent / "sandbox" / "bwrap-default.args"
+_BWRAP_ARGS_FILE = Path(__file__).parent.parent / "sandbox" / "bwrap-default.args"
 _SANDBOX_SKILL_IGNORED_DIRS = {".git", ".github", ".hub", ".archive", "__pycache__"}
 _SANDBOX_SKILL_SECRET_FILE_NAMES = {".env", ".env.local", ".npmrc", ".netrc", "auth.json", "feishu_uat.json"}
 _SANDBOX_SKILL_SECRET_NAME_PARTS = ("token", "secret", "credential", "password", "passwd", "apikey", "api_key")
@@ -3402,7 +3013,7 @@ def _wrap_macos_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     agent_install = venv.parent
     shared_home = _resolve_shared_hermes_home(profile_home).resolve()
     agent_repo = _resolve_hermes_agent_repo().resolve()
-    mt_repo = Path(__file__).resolve().parent.parent
+    mt_repo = Path(__file__).resolve().parent.parent.parent
     user_home = Path.home().resolve()
     profile_home_resolved = profile_home.expanduser().resolve()
 
@@ -3623,7 +3234,7 @@ def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
     agent_install = venv.parent
     shared_home = _resolve_shared_hermes_home(profile_home).resolve()
     agent_repo = _resolve_hermes_agent_repo().resolve()
-    mt_repo = Path(__file__).resolve().parent.parent
+    mt_repo = Path(__file__).resolve().parent.parent.parent
     user_home = Path.home().resolve()
     profile_home_resolved = profile_home.expanduser().resolve()
 
@@ -3767,7 +3378,7 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
     if not isinstance(usage, dict):
         return
     try:
-        from .token_usage_ledger import append_token_usage, token_usage_ledger_enabled
+        from ..token_usage_ledger import append_token_usage, token_usage_ledger_enabled
 
         if not token_usage_ledger_enabled():
             return
@@ -3777,7 +3388,7 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
         # routing.lookup_by_chat_id expects — covers 'topic' groups and the
         # parent_chat_id / chat_id_alt / event.message.chat_id variants that a
         # bare source.chat_id read would miss (would mis-bill group turns).
-        from .router import _extract_chat_id, _extract_chat_type
+        from ..router import _extract_chat_id, _extract_chat_type
 
         append_token_usage(
             sender_open_id=_resolve_subprocess_sender_open_id(event),
@@ -3794,247 +3405,6 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
         logger.debug("[multitenancy] token usage ledger (parent) skipped", exc_info=True)
 
 
-_AIAGENT_WARM_WORKERS: dict[tuple[str, Any], "_AiagentWarmWorker"] = {}
-_AIAGENT_WARM_PROFILE_LOCKS: dict[str, threading.Lock] = {}
-_AIAGENT_WARM_WORKERS_GUARD = threading.RLock()
-_AIAGENT_WARM_WORKER_BASE_ENV_DROP: frozenset[str] = frozenset({
-    "HERMES_MULTITENANCY_APPROVAL_DIR",
-    "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
-    "HERMES_MULTITENANCY_CRED_LEASE",
-    "HERMES_MULTITENANCY_RUN_ID",
-    "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN",
-    "HERMES_MULTITENANCY_SESSION_SEARCH_URL",
-    "LARKSUITE_CLI_AUTH_PROXY",
-    "LARKSUITE_CLI_PROXY_KEY",
-})
-
-
-def _aiagent_warm_worker_enabled() -> bool:
-    return os.getenv("HERMES_AIAGENT_WARM_WORKER") == "1"
-
-
-def _aiagent_warm_profile_key(profile_home: Path) -> str:
-    return str(profile_home.expanduser().resolve())
-
-
-def _aiagent_warm_worker_key(profile_home: Path) -> tuple[str, Any]:
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    return (_aiagent_warm_profile_key(profile_home), loop)
-
-
-def _get_aiagent_warm_profile_lock(profile_key: str) -> threading.Lock:
-    lock = _AIAGENT_WARM_PROFILE_LOCKS.get(profile_key)
-    if lock is None:
-        lock = threading.Lock()
-        _AIAGENT_WARM_PROFILE_LOCKS[profile_key] = lock
-    return lock
-
-
-def _build_aiagent_warm_worker_base_env(profile_home: Path) -> dict[str, str]:
-    approval_dir = profile_home / "tmp" / "aiagent-warm-worker-base-approval"
-    approval_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
-    for key in _AIAGENT_WARM_WORKER_BASE_ENV_DROP:
-        env.pop(key, None)
-    env["HERMES_AIAGENT_WARM_WORKER_CHILD"] = "1"
-    return env
-
-
-class _AiagentWarmRun:
-    def __init__(self, worker: "_AiagentWarmWorker", lock: Any) -> None:
-        self.worker = worker
-        self.lock = lock
-        self.closed = False
-        self.done = False
-
-    async def readline(self) -> bytes:
-        if self.done:
-            return b""
-        while True:
-            proc = self.worker.proc
-            if proc is None or proc.stdout is None:
-                await self.close()
-                raise RuntimeError("AIAgent warm worker is not running")
-            line = await proc.stdout.readline()
-            if not line:
-                await self.worker.close()
-                await self.close()
-                raise RuntimeError("AIAgent warm worker stream ended without done event")
-            try:
-                data = json.loads(line.decode("utf-8", errors="replace").strip())
-            except json.JSONDecodeError:
-                return line
-            if data.get("event") == "ready":
-                continue
-            if data.get("event") == "done":
-                self.done = True
-            return line
-
-    async def start(self, payload: bytes, env: dict[str, str], timeout_s: float) -> None:
-        try:
-            await self.worker.start_locked_run(payload, env, timeout_s)
-        except Exception:
-            await self.close()
-            raise
-
-    async def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        self.lock.release()
-
-
-class _AiagentWarmWorker:
-    def __init__(self, profile_home: Path, profile_lock: threading.Lock | None = None) -> None:
-        self.profile_home = profile_home
-        self.proc: Any = None
-        self._lock = profile_lock or threading.Lock()
-
-    async def acquire_run(self) -> _AiagentWarmRun:
-        import asyncio
-
-        await asyncio.to_thread(self._lock.acquire)
-        return _AiagentWarmRun(self, self._lock)
-
-    async def _ensure_started(self, timeout_s: float) -> None:
-        import asyncio
-
-        if self.proc is not None and self.proc.returncode is None:
-            logger.info(
-                "[multitenancy] AIAgent warm worker hit profile_home=%s pid=%s",
-                self.profile_home,
-                self.proc.pid,
-            )
-            return
-        self.proc = None
-        child_script = Path(__file__).with_name("aiagent_subprocess.py").resolve()
-        cmd = _wrap_with_sandbox([sys.executable, str(child_script), "--worker"], self.profile_home)
-        env = _build_aiagent_warm_worker_base_env(self.profile_home)
-        logger.info("[multitenancy] AIAgent warm worker spawning profile_home=%s", self.profile_home)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=env,
-            cwd=_aiagent_subprocess_cwd(self.profile_home),
-            limit=_AIAGENT_STREAM_LIMIT,
-        )
-        self.proc = proc
-        assert proc.stdout is not None
-        ready_timeout_s = min(
-            float(os.getenv("HERMES_AIAGENT_WARM_WORKER_READY_TIMEOUT", "30")),
-            max(timeout_s, 0.001),
-        )
-        deadline = time.monotonic() + ready_timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                await self.close()
-                raise RuntimeError(
-                    f"AIAgent warm worker did not become ready after {ready_timeout_s:g}s"
-                )
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-            if not line:
-                await self.close()
-                raise RuntimeError("AIAgent warm worker exited before ready")
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                logger.debug("[multitenancy] ignoring non-json warm worker startup line len=%s", len(text))
-                continue
-            if data.get("event") == "ready":
-                logger.info(
-                    "[multitenancy] AIAgent warm worker ready profile_home=%s pid=%s",
-                    self.profile_home,
-                    proc.pid,
-                )
-                return
-            logger.debug("[multitenancy] ignoring warm worker startup event: %s", data.get("event"))
-
-    async def start_locked_run(self, payload: bytes, env: dict[str, str], timeout_s: float) -> None:
-        await self._ensure_started(timeout_s)
-        proc = self.proc
-        assert proc is not None
-        assert proc.stdin is not None
-        request = {
-            "type": "run",
-            "payload": json.loads(payload.decode("utf-8")),
-            "env": env,
-        }
-        proc.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
-        await proc.stdin.drain()
-
-    async def start_run(self, payload: bytes, env: dict[str, str], timeout_s: float) -> _AiagentWarmRun:
-        run = await self.acquire_run()
-        await run.start(payload, env, timeout_s)
-        return run
-
-    async def close(self) -> None:
-        import asyncio
-
-        proc = self.proc
-        self.proc = None
-        if proc is None:
-            return
-        if proc.returncode is not None:
-            return
-        try:
-            if proc.stdin is not None:
-                proc.stdin.write(b'{"type":"shutdown"}\n')
-                await proc.stdin.drain()
-        except Exception:
-            pass
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-        except Exception:
-            logger.debug("[multitenancy] failed to kill AIAgent warm worker", exc_info=True)
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2)
-        except Exception:
-            pass
-
-
-def _get_aiagent_warm_worker(profile_home: Path) -> "_AiagentWarmWorker":
-    profile_key = _aiagent_warm_profile_key(profile_home)
-    key = _aiagent_warm_worker_key(profile_home)
-    with _AIAGENT_WARM_WORKERS_GUARD:
-        worker = _AIAGENT_WARM_WORKERS.get(key)
-        if worker is None:
-            worker = _AiagentWarmWorker(
-                profile_home,
-                profile_lock=_get_aiagent_warm_profile_lock(profile_key),
-            )
-            _AIAGENT_WARM_WORKERS[key] = worker
-        return worker
-
-
-async def _discard_aiagent_warm_worker(profile_home: Path) -> None:
-    key = _aiagent_warm_worker_key(profile_home)
-    with _AIAGENT_WARM_WORKERS_GUARD:
-        worker = _AIAGENT_WARM_WORKERS.pop(key, None)
-    if worker is not None:
-        await worker.close()
-
-
-async def _reset_aiagent_warm_workers_for_tests() -> None:
-    with _AIAGENT_WARM_WORKERS_GUARD:
-        workers = list(_AIAGENT_WARM_WORKERS.values())
-        _AIAGENT_WARM_WORKERS.clear()
-        _AIAGENT_WARM_PROFILE_LOCKS.clear()
-    for worker in workers:
-        await worker.close()
 
 
 async def _run_aiagent_subprocess(
@@ -4067,7 +3437,7 @@ async def _run_aiagent_subprocess(
     # but the sandbox policy only whitelists the resolved repo path.
     # Without .resolve() the child python sees an [Errno 1] Operation not
     # permitted when trying to open aiagent_subprocess.py through the symlink.
-    child_script = Path(__file__).with_name("aiagent_subprocess.py").resolve()
+    child_script = Path(__file__).parent.with_name("aiagent_subprocess.py").resolve()
     cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     proc = None
@@ -4132,636 +3502,6 @@ async def _run_aiagent_subprocess(
     return str(data.get("result") or "")
 
 
-async def _stream_aiagent_subprocess(
-    event: Any,
-    profile_home: Path,
-    *,
-    messages: Optional[list[dict]] = None,
-):
-    """Run AIAgent in a child process and yield its NDJSON progress events.
-
-    State.db mirroring (user/assistant/tool rows + source retag) is done here
-    in the parent process — the subprocess sandbox blocks sqlite WAL opens on
-    PROFILE_HOME/state.db, so any write logic running inside the sandbox fails
-    silently with ``sqlite3.OperationalError: unable to open database file``.
-    The parent has no sandbox and can write freely.
-    """
-    import asyncio
-    import sqlite3 as _sqlite3
-    import time as _time
-
-    # Resolve identifiers the mirror needs. All derivable from ``event`` and
-    # ``profile_home`` so we don't have to push them across the NDJSON pipe.
-    # current_sender_open_id contextvar is set by the feishu adapter on the
-    # gateway loop; lazy-import it so this module still imports if
-    # tools.feishu_oapi_client is unavailable in tests / non-feishu
-    # deployments.
-    sender_open_id = ""
-    try:
-        from tools.feishu_oapi_client import current_sender_open_id as _cv
-        sender_open_id = _cv.get() or ""
-    except Exception:
-        pass
-    if not sender_open_id:
-        sender_open_id = _resolve_subprocess_sender_open_id(event)
-    _canonical_session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
-    user_text = getattr(event, "text", "") or ""
-    _state_db_path = profile_home / "state.db"
-    _source_for_display = getattr(event, "source", None)
-    _preserve_reasoning_in_state = _resolve_platform_value(_source_for_display) != "webui"
-    try:
-        from .conversation_audit import (
-            append_conversation_audit_event as _append_conversation_audit_event,
-            build_conversation_audit_context as _build_conversation_audit_context,
-        )
-        _audit_context = _build_conversation_audit_context(event, profile_home)
-    except Exception:
-        logger.exception("[multitenancy] conversation audit context init failed")
-        _append_conversation_audit_event = None
-        _audit_context = {
-            "profile_name": Path(profile_home).name,
-            "platform": _resolve_platform_value(_source_for_display),
-            "chat_type": "",
-        }
-
-    # ── Session-boundary epoch ────────────────────────────────────────────
-    # The canonical session_id is keyed only by (chat_id, user_id), so it
-    # stays the same forever — including across ``/new`` resets. That
-    # collapses every turn from the same DM into a single web-ui sidebar
-    # entry, which is wrong UX after the user explicitly asked for a fresh
-    # session.
-    #
-    # The router (``router.py:_clear_history``) wipes its in-process history
-    # dict on ``/new``, so the next turn arrives with ``messages`` either
-    # None or containing only the current user message. We use that signal
-    # as the session boundary: on a fresh-start turn we rotate the epoch
-    # (written to a per-(chat,user) text file in ``profile_home``), on a
-    # continuation turn we reuse it. Appending ``:epoch:<ts>`` to the
-    # canonical id yields a new session row in state.db after each ``/new``
-    # while preserving session continuity within a chat-history run.
-    _is_session_start = messages is None or len(messages) <= 1
-    _chat_id_for_epoch = ""
-    _source_for_epoch = getattr(event, "source", None)
-    if _source_for_epoch is not None:
-        _chat_id_for_epoch = str(
-            getattr(_source_for_epoch, "chat_id", "")
-            or getattr(_source_for_epoch, "parent_chat_id", "")
-            or getattr(_source_for_epoch, "chat_id_alt", "")
-            or ""
-        )
-
-    def _epoch_path() -> Optional[Path]:
-        if not _chat_id_for_epoch:
-            return None
-        def _safe(s: str) -> str:
-            return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in s)[:80]
-        return (
-            profile_home
-            / "mirror_epochs"
-            / f"{_safe(_chat_id_for_epoch)}__{_safe(sender_open_id or 'unknown')}.txt"
-        )
-
-    def _resolve_epoch() -> str:
-        ep = _epoch_path()
-        if ep is None:
-            return str(int(_time.time()))
-        try:
-            if _is_session_start or not ep.exists():
-                try:
-                    ep.parent.mkdir(parents=True, exist_ok=True)
-                except Exception:
-                    pass
-                value = str(int(_time.time()))
-                try:
-                    ep.write_text(value, encoding="utf-8")
-                except Exception:
-                    pass
-                return value
-            current = ep.read_text(encoding="utf-8").strip()
-            return current or str(int(_time.time()))
-        except Exception:
-            return str(int(_time.time()))
-
-    session_id = f"{_canonical_session_id}:epoch:{_resolve_epoch()}"
-
-    class _StateDbMirror:
-        """Parent-side write-through to ``profile_home/state.db`` for web-ui visibility.
-
-        Holds the in-flight assistant row id so streaming deltas update the
-        same row instead of creating a new one per chunk. Tool calls seal the
-        active assistant row so the next assistant text starts a new bubble.
-        """
-
-        def __init__(self) -> None:
-            self.active_assistant_id: Optional[int] = None
-            self.active_assistant_timestamp: Optional[float] = None
-            self.assistant_content: str = ""
-            self.assistant_reasoning: str = ""
-            self.session_ensured: bool = False
-            self.user_inserted: bool = False
-            self.retagged: bool = False
-
-        def _audit(
-            self,
-            *,
-            message_id: int | str | None,
-            role: str,
-            content: str | None,
-            timestamp: float,
-            tool_name: str | None = None,
-            tool_calls: str | None = None,
-            finish_reason: str | None = None,
-        ) -> None:
-            if _append_conversation_audit_event is None:
-                return
-            _append_conversation_audit_event(
-                profile_name=str(_audit_context.get("profile_name") or ""),
-                platform=str(_audit_context.get("platform") or ""),
-                chat_type=str(_audit_context.get("chat_type") or ""),
-                session_id=str(session_id),
-                message_id=message_id,
-                role=role,
-                content=content,
-                timestamp=timestamp,
-                tool_name=tool_name,
-                tool_calls=tool_calls,
-                finish_reason=finish_reason,
-            )
-
-        def _conn(self):
-            return _sqlite3.connect(str(_state_db_path), timeout=2.0)
-
-        def ensure_session(self) -> None:
-            if self.session_ensured:
-                return
-            try:
-                from hermes_state import SessionDB
-                SessionDB(_state_db_path).close()
-            except Exception:
-                logger.exception("[multitenancy] mirror schema init failed")
-            try:
-                with closing(self._conn()) as conn, conn:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO sessions (id, source, started_at) "
-                        "VALUES (?, 'feishu', ?)",
-                        (str(session_id), _time.time()),
-                    )
-                self.session_ensured = True
-            except Exception:
-                logger.exception("[multitenancy] mirror ensure_session failed")
-
-        def insert_user(self, text: str) -> None:
-            if self.user_inserted:
-                return
-            self.ensure_session()
-            try:
-                with closing(self._conn()) as conn, conn:
-                    ts = _time.time()
-                    cur = conn.execute(
-                        "INSERT INTO messages (session_id, role, content, timestamp) "
-                        "VALUES (?, 'user', ?, ?)",
-                        (str(session_id), text or "", ts),
-                    )
-                    message_id = cur.lastrowid
-                self.user_inserted = True
-                self._audit(
-                    message_id=message_id,
-                    role="user",
-                    content=text or "",
-                    timestamp=ts,
-                )
-            except Exception:
-                logger.exception("[multitenancy] mirror insert_user failed")
-
-        def upsert_assistant(self, text_delta: str, reasoning_delta: str) -> None:
-            if text_delta:
-                self.assistant_content += text_delta
-            if reasoning_delta:
-                self.assistant_reasoning += reasoning_delta
-            if not self.assistant_content and not self.assistant_reasoning:
-                return
-            self.ensure_session()
-            try:
-                with closing(self._conn()) as conn, conn:
-                    if self.active_assistant_id is None:
-                        ts = _time.time()
-                        cur = conn.execute(
-                            "INSERT INTO messages (session_id, role, content, reasoning, timestamp) "
-                            "VALUES (?, 'assistant', ?, ?, ?)",
-                            (
-                                str(session_id),
-                                self.assistant_content,
-                                _reasoning_for_state_db(
-                                    self.assistant_content,
-                                    self.assistant_reasoning,
-                                    preserve_reasoning=_preserve_reasoning_in_state,
-                                ),
-                                ts,
-                            ),
-                        )
-                        self.active_assistant_id = cur.lastrowid
-                        self.active_assistant_timestamp = ts
-                    else:
-                        conn.execute(
-                            "UPDATE messages SET content=?, reasoning=? WHERE id=?",
-                            (
-                                self.assistant_content,
-                                _reasoning_for_state_db(
-                                    self.assistant_content,
-                                    self.assistant_reasoning,
-                                    preserve_reasoning=_preserve_reasoning_in_state,
-                                ),
-                                self.active_assistant_id,
-                            ),
-                        )
-            except Exception:
-                logger.exception("[multitenancy] mirror upsert_assistant failed")
-
-        def seal_assistant(self, finish_reason: str | None = None) -> None:
-            if self.active_assistant_id is not None:
-                self._audit(
-                    message_id=self.active_assistant_id,
-                    role="assistant",
-                    content=self.assistant_content,
-                    timestamp=self.active_assistant_timestamp or _time.time(),
-                    finish_reason=finish_reason,
-                )
-            self.active_assistant_id = None
-            self.active_assistant_timestamp = None
-            self.assistant_content = ""
-            self.assistant_reasoning = ""
-
-        def insert_tool_call(self, tool_name: str, preview: Any, args: Any) -> None:
-            if not tool_name:
-                return
-            self.ensure_session()
-            try:
-                payload = json.dumps(
-                    {"name": str(tool_name), "args": args, "preview": preview},
-                    ensure_ascii=False,
-                    default=str,
-                )
-            except Exception:
-                payload = None
-            try:
-                with closing(self._conn()) as conn, conn:
-                    ts = _time.time()
-                    cur = conn.execute(
-                        "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
-                        "VALUES (?, 'assistant', '', ?, ?, ?)",
-                        (str(session_id), str(tool_name), payload, ts),
-                    )
-                    message_id = cur.lastrowid
-                self._audit(
-                    message_id=message_id,
-                    role="assistant",
-                    content="",
-                    timestamp=ts,
-                    tool_name=str(tool_name),
-                    tool_calls=payload,
-                )
-            except Exception:
-                logger.exception("[multitenancy] mirror insert_tool_call failed")
-
-        def retag_source(self) -> None:
-            if self.retagged:
-                return
-            try:
-                _mark_session_source_feishu(profile_home, str(session_id))
-                self.retagged = True
-            except Exception:
-                logger.exception("[multitenancy] mirror retag_source failed")
-
-        def dedupe(self) -> None:
-            try:
-                with closing(self._conn()) as conn, conn:
-                    conn.execute(
-                        "DELETE FROM messages WHERE session_id = ? AND id NOT IN ("
-                        "SELECT MIN(id) FROM messages WHERE session_id = ? "
-                        "GROUP BY role, IFNULL(content,''), IFNULL(tool_name,''))",
-                        (str(session_id), str(session_id)),
-                    )
-            except Exception:
-                logger.exception("[multitenancy] mirror dedupe failed")
-
-    _mirror = _StateDbMirror()
-    # Pre-write the user message so the web-ui shows the question instantly,
-    # even if the run later times out / aborts before any reply.
-    _mirror.insert_user(user_text)
-
-    payload = json.dumps(
-        _event_to_subprocess_payload(event, profile_home, messages=messages),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
-    approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
-    warm_run = None
-    warm_worker_requested = _aiagent_warm_worker_enabled()
-    if warm_worker_requested:
-        try:
-            warm_run = await _get_aiagent_warm_worker(profile_home).acquire_run()
-        except Exception:
-            logger.warning(
-                "[multitenancy] AIAgent warm worker slot unavailable; falling back to one-shot subprocess",
-                exc_info=True,
-            )
-            warm_worker_requested = False
-    env_scope_entered = False
-    try:
-        env_scope = _aiagent_subprocess_env_scope(
-            event,
-            profile_home,
-            approval_dir=approval_dir,
-            event_stream=True,
-        )
-        env = env_scope.__enter__()
-        env_scope_entered = True
-    except Exception:
-        if warm_run is not None:
-            await warm_run.close()
-        try:
-            import shutil
-
-            shutil.rmtree(approval_dir, ignore_errors=True)
-        except Exception:
-            pass
-        raise
-    # Resolve symlinks so sandbox-exec's path-based allow rules match.
-    # The plugin is typically loaded via a profile-local symlink
-    # (~/.hermes/profiles/<p>/plugins/multitenancy → ~/code/hermes-multitenancy/),
-    # but the sandbox policy only whitelists the resolved repo path.
-    # Without .resolve() the child python sees an [Errno 1] Operation not
-    # permitted when trying to open aiagent_subprocess.py through the symlink.
-    child_script = Path(__file__).with_name("aiagent_subprocess.py").resolve()
-    cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
-
-    started_at = time.monotonic()
-    proc = None
-    stderr_task = None
-    using_warm_worker = False
-    saw_done = False
-    first_event_logged = False
-
-    async def _start_one_shot_reader():
-        nonlocal proc, stderr_task
-        logger.info(
-            "[multitenancy] AIAgent subprocess spawning profile_home=%s timeout=%.1fs",
-            profile_home,
-            timeout_s,
-        )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=_aiagent_subprocess_cwd(profile_home),
-            limit=_AIAGENT_STREAM_LIMIT,
-        )
-        logger.info(
-            "[multitenancy] AIAgent subprocess spawned pid=%s elapsed=%.3fs",
-            proc.pid,
-            time.monotonic() - started_at,
-        )
-        stderr_task = asyncio.create_task(proc.stderr.read())
-        assert proc.stdin is not None
-        proc.stdin.write(payload)
-        await proc.stdin.drain()
-        proc.stdin.close()
-        try:
-            await proc.stdin.wait_closed()
-        except Exception:
-            pass
-        assert proc.stdout is not None
-        return proc.stdout.readline
-
-    async def _start_warm_reader():
-        nonlocal warm_run, using_warm_worker
-        if warm_run is None:
-            warm_run = await _get_aiagent_warm_worker(profile_home).start_run(payload, env, timeout_s)
-        else:
-            await warm_run.start(payload, env, timeout_s)
-        using_warm_worker = True
-        logger.info(
-            "[multitenancy] AIAgent warm worker dispatched profile_home=%s elapsed=%.3fs",
-            profile_home,
-            time.monotonic() - started_at,
-        )
-        return warm_run.readline
-
-    try:
-        if warm_worker_requested:
-            try:
-                read_line = await _start_warm_reader()
-            except Exception:
-                logger.warning(
-                    "[multitenancy] AIAgent warm worker unavailable; falling back to one-shot subprocess",
-                    exc_info=True,
-                )
-                await _discard_aiagent_warm_worker(profile_home)
-                if warm_run is not None:
-                    await warm_run.close()
-                using_warm_worker = False
-                warm_run = None
-                read_line = await _start_one_shot_reader()
-        else:
-            read_line = await _start_one_shot_reader()
-
-        first_heartbeat_s = float(os.getenv("HERMES_AIAGENT_FIRST_EVENT_HEARTBEAT_SECONDS", "1"))
-        heartbeat_s = float(os.getenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "15"))
-        heartbeat_count = 0
-        while True:
-            read_started = time.monotonic()
-            read_task = asyncio.create_task(read_line())
-            try:
-                while not read_task.done():
-                    elapsed = time.monotonic() - read_started
-                    remaining = timeout_s - elapsed
-                    if remaining <= 0:
-                        read_task.cancel()
-                        try:
-                            await read_task
-                        except asyncio.CancelledError:
-                            pass
-                        except Exception:
-                            pass
-                        raise asyncio.TimeoutError()
-                    next_heartbeat_s = first_heartbeat_s if heartbeat_count == 0 and not first_event_logged else heartbeat_s
-                    wait_seconds = min(next_heartbeat_s, remaining) if next_heartbeat_s > 0 else remaining
-                    done, _pending = await asyncio.wait({read_task}, timeout=wait_seconds)
-                    if done:
-                        break
-                    heartbeat_count += 1
-                    total_elapsed = time.monotonic() - started_at
-                    logger.info(
-                        "[multitenancy] waiting for AIAgent subprocess stream event elapsed=%.3fs heartbeat=%s",
-                        total_elapsed,
-                        heartbeat_count,
-                    )
-                    phase = "等待当前工具或子任务输出" if first_event_logged else "准备响应"
-                    yield (
-                        "status",
-                        _animated_stream_status(phase, heartbeat_count),
-                    )
-                try:
-                    line = read_task.result()
-                except Exception:
-                    if using_warm_worker and not first_event_logged:
-                        logger.warning(
-                            "[multitenancy] AIAgent warm worker failed before first stream event; falling back to one-shot subprocess",
-                            exc_info=True,
-                        )
-                        await _discard_aiagent_warm_worker(profile_home)
-                        if warm_run is not None:
-                            await warm_run.close()
-                        warm_run = None
-                        using_warm_worker = False
-                        read_line = await _start_one_shot_reader()
-                        continue
-                    raise
-            finally:
-                if not read_task.done():
-                    read_task.cancel()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                logger.debug(
-                    "[multitenancy] ignoring non-json child stream line: %r",
-                    _redact_ingest_runtime_text(text, event)[-500:],
-                )
-                continue
-            event_name = data.get("event")
-            if not first_event_logged:
-                first_event_logged = True
-                logger.info(
-                    "[multitenancy] AIAgent subprocess first event kind=%s elapsed=%.3fs",
-                    event_name,
-                    time.monotonic() - started_at,
-                )
-            if event_name == "done":
-                saw_done = True
-                if data.get("error"):
-                    raise RuntimeError(
-                        "AIAgent subprocess failed: "
-                        f"{_redact_ingest_runtime_text(data['error'], event)}"
-                    )
-                logger.info(
-                    "[multitenancy] AIAgent subprocess done elapsed=%.3fs result_len=%s",
-                    time.monotonic() - started_at,
-                    len(str(data.get("result") or "")),
-                )
-                # Seal any trailing assistant chunk, retag source to feishu,
-                # and dedupe against whatever Hermes core's own end-of-run
-                # write inserted.
-                _mirror.seal_assistant(finish_reason="stop")
-                _mirror.retag_source()
-                _mirror.dedupe()
-                _write_token_ledger_from_child(event, profile_home, data.get("usage"))
-                yield "done", _redact_ingest_runtime_text(data.get("result"), event)
-                continue
-            if event_name == "content":
-                content_text = _redact_ingest_runtime_text(data.get("text"), event)
-                _mirror.upsert_assistant(content_text, "")
-                yield "content", content_text
-            elif event_name == "thinking":
-                thinking_text = _redact_ingest_runtime_text(data.get("text"), event)
-                _mirror.upsert_assistant("", thinking_text)
-                yield "thinking", thinking_text
-            elif event_name in {
-                "tool_started",
-                "tool_completed",
-                "approval_required",
-                "approval_resolved",
-                "clarify_required",
-                "clarify_resolved",
-            }:
-                payload_data = _redact_ingest_runtime_value(
-                    {k: v for k, v in data.items() if k != "event"},
-                    event,
-                )
-                if event_name == "tool_started":
-                    # Seal any pre-tool assistant text into its own row, then
-                    # mirror the tool invocation. First tool-start is also
-                    # the safest moment to retag — Hermes core has had time
-                    # to insert the sessions row by now.
-                    _mirror.seal_assistant(finish_reason="tool_calls")
-                    _mirror.insert_tool_call(
-                        str(payload_data.get("name") or ""),
-                        payload_data.get("preview"),
-                        payload_data.get("args"),
-                    )
-                    _mirror.retag_source()
-                elif event_name == "tool_completed":
-                    # Tool finished — subsequent assistant text is a new
-                    # bubble. Seal so upsert starts a fresh row.
-                    _mirror.seal_assistant()
-                yield str(event_name), payload_data
-            else:
-                logger.debug("[multitenancy] ignoring unknown child stream event: %s", event_name)
-
-        if not using_warm_worker:
-            returncode = await asyncio.wait_for(proc.wait(), timeout=5)
-            stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
-            redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
-            if stderr_text:
-                logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
-            logger.info(
-                "[multitenancy] AIAgent subprocess exited returncode=%s elapsed=%.3fs",
-                returncode,
-                time.monotonic() - started_at,
-            )
-            if returncode != 0:
-                raise RuntimeError(
-                    f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
-                )
-        if not saw_done:
-            raise RuntimeError("AIAgent subprocess stream ended without done event")
-    except asyncio.TimeoutError as exc:
-        if using_warm_worker:
-            await _discard_aiagent_warm_worker(profile_home)
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        raise RuntimeError(
-            f"AIAgent subprocess produced no stream events for {timeout_s:g}s"
-        ) from exc
-    except asyncio.CancelledError:
-        if using_warm_worker:
-            await _discard_aiagent_warm_worker(profile_home)
-        if proc is not None:
-            proc.kill()
-            await proc.wait()
-        raise
-    except Exception:
-        if using_warm_worker and not saw_done:
-            await _discard_aiagent_warm_worker(profile_home)
-        if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        raise
-    finally:
-        try:
-            if env_scope_entered:
-                env_scope.__exit__(*sys.exc_info())
-        finally:
-            if proc is not None and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            if stderr_task is not None and not stderr_task.done():
-                stderr_task.cancel()
-            try:
-                import shutil
-
-                shutil.rmtree(approval_dir, ignore_errors=True)
-            except Exception:
-                pass
-            if warm_run is not None:
-                await warm_run.close()
 
 
 # ---------------------------------------------------------------------------
@@ -5501,463 +4241,6 @@ def _enrich_webui_image_attachments_for_aiagent(
     return "\n\n".join(analysis_blocks + [user_text])
 
 
-def _run_with_aiagent(
-    event: Any,
-    profile_home: Path,
-    *,
-    messages: Optional[list[dict]] = None,
-    event_sink=None,
-    usage_sink: Optional[dict] = None,
-) -> str:
-    """Synchronous body — runs hermes' real AIAgent against the profile config.
-
-    Constructs an AIAgent with the profile's enabled toolsets + LLM
-    credentials, sets the per-user open_id contextvar so UAT tools load the
-    right token file, and runs a full tool-loop conversation.
-
-    Designed to run inside ``aiagent_subprocess.py`` so the parent gateway
-    keeps its async event loop isolated from the synchronous AIAgent/tool loop.
-    """
-    # 1) Anchor HERMES_HOME so any module that reads it sees the profile.
-    os.environ["HERMES_HOME"] = str(profile_home)
-
-    # 2) Read profile LLM config + credentials (mirrors the spike loader).
-    config = _load_profile_config(profile_home)
-    auth = _load_json(profile_home / "auth.json")
-    from dotenv import dotenv_values
-    env_overrides = dict(
-        dotenv_values(profile_home / ".env")
-        if (profile_home / ".env").exists()
-        else {}
-    )
-
-    primary = (config.get("model") or {}).get("default")
-    if not primary:
-        raise RuntimeError("profile config missing model.default")
-    primary = _model_spec_for_event(str(primary), event)
-    fallback_models = config.get("fallback") or []
-
-    provider, model_only = _split_model_spec(primary)
-    api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
-    if not api_key:
-        raise RuntimeError(f"no API key for primary provider {provider!r}")
-
-    base_url = _resolve_base_url(provider, True, config, env_overrides)
-
-    # 3) Lazy-import hermes core (only when this code path is hit).
-    _install_credential_env_passthrough(profile_home)
-    _install_ingest_secret_env_passthrough()
-    _install_skill_runtime_compat(profile_home)
-    _install_session_search_proxy_for_aiagent()
-    try:
-        from .browser_policy import install_browser_guard
-
-        install_browser_guard(config, profile_home)
-    except Exception:
-        logger.debug("[multitenancy] browser guard install skipped", exc_info=True)
-    from run_agent import AIAgent
-    _install_session_search_recall_db_proxy(AIAgent)
-    sender_open_id_scope, current_sender_open_id, shared_hermes_home = _load_feishu_oapi_runtime(profile_home)
-    try:
-        from hermes_cli.tools_config import _get_platform_tools
-    except Exception:
-        _get_platform_tools = None  # graceful: fall back to None toolsets
-
-    # 4) Resolve platform and sender identity for toolset policy.
-    platform_key = _resolve_platform_value(getattr(event, "source", None))
-    # 5) Sender's real Feishu open_id (ou_*) for per-user UAT routing.
-    # The feishu adapter already set this contextvar in
-    # _process_inbound_message before dispatching us — prefer that value
-    # because it comes straight from sender_id.open_id (the SDK gives the
-    # ou_* form). Only fall back to event.source on weird code paths
-    # (e.g., synthetic events constructed without going through the adapter).
-    sender_open_id = (current_sender_open_id.get() or "") or _resolve_sender_open_id(event)
-
-    try:
-        enabled_toolsets = _resolve_enabled_toolsets(
-            config,
-            platform_key,
-            platform_tools_resolver=_get_platform_tools,
-            profile_home=profile_home,
-            shared_home=shared_hermes_home,
-            user_key=sender_open_id or None,
-            xai_credentials={"available": True, "source": "upstream_toolset"},
-        )
-    except TypeError as exc:
-        if "unexpected keyword" not in str(exc):
-            raise
-        enabled_toolsets = _resolve_enabled_toolsets(
-            config,
-            platform_key,
-            platform_tools_resolver=_get_platform_tools,
-        )
-    disabled_toolsets = _resolve_disabled_toolsets(config)
-    if _is_ingest_run_event(event):
-        before_ingest_toolsets = list(enabled_toolsets or [])
-        enabled_toolsets = _ingest_enabled_toolsets(enabled_toolsets, platform_key)
-        if before_ingest_toolsets != list(enabled_toolsets or []):
-            logger.info(
-                "[multitenancy] ingest run filtered toolsets profile=%s before=%s after=%s",
-                profile_home.name,
-                before_ingest_toolsets or "<default>",
-                enabled_toolsets if enabled_toolsets is not None else "<default>",
-            )
-
-    # 6) Pull source / session metadata for AIAgent kwargs.
-    source = getattr(event, "source", None)
-    event_metadata = _event_metadata(event)
-    user_text = getattr(event, "text", "") or ""
-    original_user_text = user_text
-    user_text = _enrich_webui_image_attachments_for_aiagent(
-        user_text,
-        platform_key=platform_key,
-        profile_home=profile_home,
-        config=config,
-        fallback_api_key=api_key,
-        fallback_base_url=base_url,
-        fallback_model=model_only,
-        metadata_source=str(event_metadata.get("source") or ""),
-    )
-    session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
-    gateway_session_key = _resolve_multitenant_gateway_session_key(
-        event,
-        profile_home,
-        sender_open_id,
-    )
-    conversation_history = _conversation_history_for_aiagent(messages, original_user_text)
-
-    runtime_kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        runtime_kwargs["base_url"] = base_url
-    if provider:
-        # Forward provider name so AIAgent.__init__ selects the correct
-        # transport (anthropic_messages for anthropic, codex_responses for
-        # openai-codex / xai, etc.). Without this, AIAgent falls back to
-        # chat_completions and ignores ANTHROPIC_BASE_URL, breaking
-        # Anthropic-compatible providers like Tencent TokenHub.
-        runtime_kwargs["provider"] = provider
-
-    fallback_model = fallback_models[0] if fallback_models else None
-
-    # 7) Wrap the agent run in sender_open_id_scope so legacy Feishu tools
-    #    pick up the right token from the profile-local UAT directory.
-    logger.info(
-        "[multitenancy] running AIAgent for sender=%s profile=%s toolsets=%s",
-        sender_open_id, profile_home.name,
-        enabled_toolsets if enabled_toolsets is not None else "<default>",
-    )
-    _log_feishu_identity_context(
-        profile_home=profile_home,
-        shared_home=shared_hermes_home,
-        sender_open_id=sender_open_id,
-    )
-    with sender_open_id_scope(sender_open_id or None):
-        try:
-            from gateway.session_context import clear_session_vars, set_session_vars
-        except Exception:
-            clear_session_vars = None
-            set_session_vars = None
-
-        platform_value = str(
-            getattr(getattr(source, "platform", ""), "value", None)
-            or getattr(source, "platform", "")
-            or platform_key
-        )
-        session_tokens = None
-        if set_session_vars is not None:
-            session_var_kwargs = {
-                "platform": platform_value,
-                "chat_id": str(getattr(source, "chat_id", "") or "") if source else "",
-                "chat_name": str(getattr(source, "chat_name", "") or "") if source else "",
-                "thread_id": str(getattr(source, "thread_id", "") or "") if source else "",
-                "user_id": str(getattr(source, "user_id", "") or "") if source else "",
-                "user_name": str(getattr(source, "user_name", "") or "") if source else "",
-                "session_key": str(gateway_session_key),
-                "async_delivery": (platform_key != "webui"),
-            }
-            try:
-                session_tokens = set_session_vars(**session_var_kwargs)
-            except TypeError as exc:
-                if "async_delivery" not in str(exc):
-                    raise
-                logger.warning(
-                    "[multitenancy] Hermes gateway.session_context.set_session_vars "
-                    "does not accept async_delivery; falling back to legacy "
-                    "session context behavior on this runtime "
-                    "(platform=%s profile=%s)",
-                    platform_key,
-                    profile_home.name,
-                )
-                session_var_kwargs.pop("async_delivery", None)
-                session_tokens = set_session_vars(**session_var_kwargs)
-        def _emit(event_name: str, **payload: Any) -> None:
-            if event_sink is None:
-                return
-            try:
-                event_sink(event_name, **payload)
-            except Exception:
-                logger.debug("[multitenancy] event_sink failed", exc_info=True)
-
-        # In-flight workaround — see _mark_session_source_feishu docstring for
-        # why we need to opportunistically retag. Called at multiple lifecycle
-        # points (tool.started during run, finally pre-close, finally
-        # post-close) because Hermes core may insert the sessions row at any
-        # of those phases. UPDATE is idempotent so multiple calls are cheap.
-        def _retag_source_now(reason: str) -> None:
-            try:
-                _mark_session_source_feishu(profile_home, str(session_id))
-            except Exception as exc:
-                # In sandboxed subprocesses PROFILE_HOME/state.db may be visible
-                # but sqlite cannot open the WAL files. The parent streaming
-                # mirror has the authoritative retag path; keep this best-effort
-                # child-side attempt from polluting user-visible error logs.
-                if exc.__class__.__name__ == "OperationalError" and "unable to open database file" in str(exc):
-                    logger.debug(
-                        "[multitenancy] skipped child-side session.source retag (reason=%s): %s",
-                        reason,
-                        exc,
-                    )
-                    return
-                logger.exception(
-                    "[multitenancy] failed to rewrite session.source -> feishu (reason=%s)",
-                    reason,
-                )
-
-        # NOTE: state.db.messages live mirror lives in the parent process
-        # (_stream_aiagent_subprocess), NOT here. The subprocess sandbox
-        # blocks sqlite WAL opens on PROFILE_HOME/state.db, so every write
-        # attempt failed with sqlite3.OperationalError: unable to open
-        # database file. Moving the mirror to the parent — which has no
-        # sandbox — sidesteps that. _retag_source_now below remains as a
-        # best-effort second writer; it fails silently in sandboxed runs.
-
-        def _tool_progress_event_callback(
-            event_type: str,
-            tool_name: str,
-            preview: Any = None,
-            args: Any = None,
-            **kwargs: Any,
-        ) -> None:
-            _log_aiagent_tool_progress(event_type, tool_name, preview, args, **kwargs)
-            if event_type == "tool.started":
-                # First tool-start is the earliest deterministic signal that
-                # Hermes core has inserted the session row into state.db with
-                # source='api_server'. Flip it now so a long-running tool
-                # (especially one blocked on user approval) doesn't strand the
-                # row in the wrong source bucket while we wait.
-                _retag_source_now("tool.started")
-                _emit(
-                    "tool_started",
-                    name=str(tool_name or ""),
-                    preview=str(preview or "") if preview is not None else None,
-                    args=args,
-                )
-            elif event_type == "tool.completed":
-                _emit(
-                    "tool_completed",
-                    name=str(tool_name or ""),
-                    duration=float(kwargs.get("duration") or 0.0),
-                    is_error=bool(kwargs.get("is_error")),
-                )
-            elif event_type == "_thinking":
-                text = str(preview or tool_name or "")
-                if text:
-                    _emit("thinking", text=text)
-            elif event_type == "reasoning.available":
-                # Hermes upstream uses reasoning.available as a coarse preview
-                # signal and often passes visible answer text in `preview`.
-                # WebUI already treats this event as "thinking ended", not as
-                # reasoning content. Do not turn it into a thinking delta here,
-                # otherwise the UI shows duplicated/extra reasoning bubbles.
-                return
-
-        def _stream_delta_event_callback(text: Any) -> None:
-            if text is None:
-                return
-            text = str(text)
-            if text:
-                _emit("content", text=text)
-
-        def _reasoning_event_callback(text: Any) -> None:
-            if text is None:
-                return
-            text = str(text)
-            if text:
-                _emit("thinking", text=text)
-
-        def _tool_gen_event_callback(tool_name: str) -> None:
-            if tool_name:
-                _emit("tool_started", name=str(tool_name), preview="generating arguments")
-
-        clarify_callback = (
-            _configure_webui_clarify_bridge(event_sink, str(gateway_session_key))
-            if platform_key == "webui"
-            else None
-        )
-
-        agent_kwargs: dict[str, Any] = {
-            # AIAgent expects the bare model name (e.g. "glm-5.1"), not the
-            # provider-prefixed form. Provider was already used above to
-            # resolve api_key + base_url; the prefix would otherwise be
-            # forwarded verbatim to the OpenAI client and rejected with
-            # `1211 Unknown Model`.
-            "model": model_only,
-            **runtime_kwargs,
-            "max_iterations": int(os.getenv("HERMES_MAX_ITERATIONS", "30")),
-            "quiet_mode": True,
-            "verbose_logging": False,
-            "session_id": str(session_id),
-            "platform": platform_key,
-            "user_id": str(getattr(source, "user_id", "") or "") if source else "",
-            "user_name": str(getattr(source, "user_name", "") or "") if source else "",
-            "chat_id": str(getattr(source, "chat_id", "") or "") if source else "",
-            "chat_name": str(getattr(source, "chat_name", "") or "") if source else "",
-            "chat_type": str(getattr(source, "chat_type", "") or "") if source else "",
-            "gateway_session_key": str(gateway_session_key),
-            "tool_progress_callback": _tool_progress_event_callback,
-            "stream_delta_callback": _stream_delta_event_callback if event_sink is not None else None,
-            "reasoning_callback": _reasoning_event_callback if event_sink is not None else None,
-            "clarify_callback": clarify_callback,
-            "tool_gen_callback": _tool_gen_event_callback if event_sink is not None else None,
-        }
-        if enabled_toolsets is not None:
-            agent_kwargs["enabled_toolsets"] = enabled_toolsets
-        if disabled_toolsets:
-            agent_kwargs["disabled_toolsets"] = disabled_toolsets
-        if fallback_model:
-            agent_kwargs["fallback_model"] = fallback_model
-
-        # Expert Role-Override overlay (ephemeral, this run only). Rides the
-        # UPSTREAM ``ephemeral_system_prompt`` constructor kwarg: core re-appends
-        # it to the system message every turn at API-call time and NEVER writes it
-        # to the cached/DB-stored prompt or trajectories (run_agent.py:6208,12746).
-        # That makes the overlay switch per-run/per-expert, survive the gateway's
-        # fresh-AIAgent-per-message model, and support mid-conversation switching —
-        # all with ZERO hermes-agent change (``ephemeral_system_prompt`` is in
-        # NousResearch origin/main, so prod honors it without any core fork).
-        #
-        # The block lands BELOW the SOUL/base identity tier (core builds SOUL
-        # first), so precedence is carried by the bookended Role-Override WORDING
-        # (ROLE_OVERRIDE_PREAMBLE/TAIL — explicit disavowal of Hermes/Nous
-        # Research), not by position. The previously-wired ``identity_override``
-        # kwarg required FORKING core and would RAISE on upstream (see SPEC dead
-        # ends); it is gone.
-        _role_override = _role_override_block_for_event(event, profile_home)
-        if _role_override:
-            agent_kwargs["ephemeral_system_prompt"] = _role_override
-
-        approval_cleanup = _configure_gateway_approval_bridge(
-            event_sink,
-            str(gateway_session_key),
-        )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
-        # Skill scope (能力随专家私有, sunke 2026-06-26): hide every NON-active
-        # expert skill (ALL of them on a non-expert run → byte-identical catalog)
-        # AND expose the active expert's private dirs. Hiding is a
-        # get_disabled_skill_names monkeypatch that works on UPSTREAM/prod core
-        # (which ignores HERMES_DISABLED_SKILLS_EXTRA); both patches are
-        # subprocess-local (fresh create_subprocess_exec child).
-        expert_skill_scope_cleanup = _apply_expert_skill_scope_for_aiagent(event, profile_home)
-        vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
-        aux_runtime_cleanup = _sync_auxiliary_runtime_main_for_aiagent(
-            provider=provider,
-            model=model_only,
-            base_url=base_url,
-            api_key=api_key,
-            api_mode=str(runtime_kwargs.get("api_mode") or ""),
-        )
-        agent = None
-        try:
-            _register_aiagent_process_image_gen_providers()
-            try:
-                agent = AIAgent(**agent_kwargs)
-            except TypeError as exc:
-                # Narrow fallback (SPEC regression guard): a core that lacks the
-                # upstream ``ephemeral_system_prompt`` kwarg must DROP the expert
-                # overlay and run as a normal SOUL session, never hard-fail. The
-                # CI signature guard (test_core_aiagent_exposes_ephemeral_system_prompt_seam)
-                # catches a seamless core at build time; this is the runtime net.
-                if "ephemeral_system_prompt" in agent_kwargs and "ephemeral_system_prompt" in str(exc):
-                    logger.warning(
-                        "[multitenancy] core lacks ephemeral_system_prompt kwarg; "
-                        "dropping expert overlay, running as normal SOUL session"
-                    )
-                    agent_kwargs.pop("ephemeral_system_prompt", None)
-                    agent = AIAgent(**agent_kwargs)
-                else:
-                    raise
-            run_kwargs: dict[str, Any] = {
-                "user_message": user_text,
-                "task_id": str(session_id),
-            }
-            if conversation_history is not None:
-                run_kwargs["conversation_history"] = conversation_history
-            profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
-            os.environ.update(profile_anchor_env)
-            os.environ.update(_force_env_for_terminal_passthrough(profile_anchor_env))
-            result = agent.run_conversation(**run_kwargs)
-            # 工件1a：捕获本回合 token 用量到 usage_sink，由父进程（非沙箱）写台账。
-            # 不能在这里(子进程)直接写 /var/log/hermes —— 沙箱策略不允许该路径，
-            # 写会静默失败。token 计数器只在子进程的 agent 上，故在此读出、透传出去；
-            # 真正的台账落盘在 _run_aiagent_subprocess / _stream_aiagent_subprocess 的
-            # 父进程侧完成（与 conversation_audit 同样的「父进程写」规避沙箱）。
-            if usage_sink is not None:
-                try:
-                    from .token_usage_ledger import read_agent_session_tokens
-
-                    _ut = read_agent_session_tokens(agent)
-                    usage_sink.update({
-                        "model": model_only,
-                        "input_tokens": _ut["input_tokens"],
-                        "output_tokens": _ut["output_tokens"],
-                        "total_tokens": _ut["total_tokens"],
-                    })
-                except Exception:
-                    logger.debug("[multitenancy] token usage capture skipped", exc_info=True)
-        finally:
-            # Best-effort retag from inside the sandbox; if it fails the
-            # parent process re-runs it post-done with full write access.
-            _retag_source_now("finally-pre-close")
-            approval_cleanup()
-            aux_runtime_cleanup()
-            vod_image_override_cleanup()
-            expert_skill_scope_cleanup()
-            runtime_env_cleanup()
-            if clear_session_vars is not None and session_tokens is not None:
-                clear_session_vars(session_tokens)
-            if agent is not None:
-                try:
-                    close_agent = getattr(agent, "close", None)
-                    cleanup_agent = getattr(agent, "cleanup", None)
-                    if callable(close_agent):
-                        close_agent()
-                    elif callable(cleanup_agent):
-                        cleanup_agent()
-                except Exception:
-                    pass
-            _retag_source_now("finally-post-close")
-
-    # Raw subprocess diagnostic (child-side, BEFORE finalize collapses the dict to
-    # a string): one line of the core's raw result for any non-clean turn so prod
-    # can confirm the dominant failure class (#1 invalid tool name vs #2 truncated
-    # tool-call args vs textless truncation). finish_reason is not part of the core
-    # result dict; the error string is the discriminator.
-    _r = result or {}
-    if _r.get("failed") or _r.get("partial") or not (
-        (_r.get("final_response") or "").strip() if isinstance(_r.get("final_response"), str) else _r.get("final_response")
-    ):
-        redact_runtime_text = lambda value: _redact_ingest_runtime_text(value, event)
-        logger.warning(
-            "[multitenancy][finalize-diag] raw child result: partial=%s failed=%s "
-            "completed=%s has_text=%s error=%r",
-            _r.get("partial"), _r.get("failed"), _r.get("completed"),
-            bool(isinstance(_r.get("final_response"), str) and _r["final_response"].strip()),
-            redact_runtime_text(_r.get("error")),
-        )
-    return _finalize_aiagent_result(
-        result,
-        redact=lambda value: _redact_ingest_runtime_text(value, event),
-    )
 
 
 def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
@@ -5994,123 +4277,6 @@ def _mark_session_source_feishu(profile_home: Path, session_id: str) -> None:
         conn.commit()
 
 
-def _resolve_enabled_toolsets(
-    config: dict[str, Any],
-    platform_key: str,
-    *,
-    platform_tools_resolver: Any,
-    profile_home: Path | None = None,
-    shared_home: Path | None = None,
-    user_key: str | None = None,
-    departments: list[str] | tuple[str, ...] | None = None,
-    xai_credentials: dict[str, Any] | None = None,
-) -> Optional[list[str]]:
-    """Resolve profile toolsets without dropping core non-Feishu abilities.
-
-    A plain Hermes Feishu gateway defaults to the composite ``hermes-feishu``
-    toolset, which includes web/search/browser/file/etc. During multitenant
-    UAT it is common to add ``platform_toolsets.feishu`` only for Feishu user
-    token helpers; treating that list as a hard replacement makes the agent
-    look competent inside Feishu but unable to search the web.
-
-    Default mode therefore merges explicit profile entries with the platform
-    default. Set ``multitenancy.toolsets_mode: explicit`` or
-    ``HERMES_MULTITENANCY_TOOLSETS_MODE=explicit`` to preserve the old strict
-    replacement behavior for providers that need a smaller schema.
-    """
-    explicit = (config.get("platform_toolsets") or {}).get(platform_key)
-    explicit_toolsets = _normalize_toolset_list(explicit)
-    mode = _toolsets_mode(config, platform_key)
-
-    def apply_discovery_policy(toolsets: list[str] | None) -> list[str] | None:
-        if not toolsets or not (profile_home or shared_home):
-            return toolsets
-        try:
-            from .discovery_policy import apply_toolset_policy
-
-            profile_name = profile_home.name if profile_home is not None else str(config.get("profile_name") or "")
-            if not profile_name:
-                return [item for item in toolsets if item != "x_search"]
-            root = shared_home
-            if root is None and profile_home is not None:
-                root = profile_home.parent.parent if profile_home.parent.name == "profiles" else profile_home
-            if root is None:
-                return [item for item in toolsets if item != "x_search"]
-            return apply_toolset_policy(
-                toolsets,
-                shared_home=root,
-                profile_name=profile_name,
-                user_key=user_key,
-                departments=departments,
-                xai_credentials=xai_credentials,
-            )
-        except Exception as exc:
-            logger.warning("[multitenancy] discovery policy filter failed: %s", exc)
-            return [item for item in toolsets if item != "x_search"]
-
-    def apply_profile_tool_policies(toolsets: list[str] | None) -> list[str] | None:
-        filtered = apply_discovery_policy(toolsets)
-        if profile_home is None:
-            return filtered
-        try:
-            from .browser_policy import browser_decision, browser_toolsets_for_policy
-
-            return browser_toolsets_for_policy(
-                filtered,
-                browser_decision(config, profile_home),
-            )
-        except Exception as exc:
-            logger.warning("[multitenancy] browser toolset policy failed: %s", exc)
-            return [item for item in filtered or [] if item != "browser"] or None
-
-    if explicit_toolsets and mode in {"explicit", "strict", "replace"}:
-        logger.info(
-            "[multitenancy] platform_toolsets explicit mode for %s: %s",
-            platform_key, explicit_toolsets,
-        )
-        return apply_profile_tool_policies(explicit_toolsets)
-
-    default_toolsets: list[str] = []
-    resolver_platform_key = "api_server" if platform_key == "webui" else platform_key
-    if platform_tools_resolver is not None:
-        resolver_config = config
-        if explicit_toolsets:
-            import copy
-
-            resolver_config = copy.deepcopy(config)
-            platform_toolsets = resolver_config.get("platform_toolsets")
-            if isinstance(platform_toolsets, dict):
-                platform_toolsets.pop(platform_key, None)
-                if resolver_platform_key != platform_key:
-                    platform_toolsets.pop(resolver_platform_key, None)
-        try:
-            try:
-                resolved = platform_tools_resolver(
-                    resolver_config,
-                    resolver_platform_key,
-                    include_default_mcp_servers=("no_mcp" not in explicit_toolsets),
-                )
-            except TypeError:
-                resolved = platform_tools_resolver(resolver_config, resolver_platform_key)
-            default_toolsets = _normalize_toolset_list(resolved)
-        except Exception as exc:
-            logger.warning(
-                "[multitenancy] _get_platform_tools failed for %s: %s",
-                platform_key, exc,
-            )
-
-    if explicit_toolsets and not default_toolsets:
-        default_toolsets = _fallback_default_toolsets(platform_key)
-
-    if explicit_toolsets:
-        merged = sorted(set(default_toolsets) | set(explicit_toolsets))
-        logger.info(
-            "[multitenancy] platform_toolsets merged for %s: explicit=%s default=%s merged=%s",
-            platform_key, explicit_toolsets, default_toolsets, merged,
-        )
-        return apply_profile_tool_policies(merged)
-
-    return apply_profile_tool_policies(default_toolsets) or None
 
 
 def _fallback_default_toolsets(platform_key: str) -> list[str]:

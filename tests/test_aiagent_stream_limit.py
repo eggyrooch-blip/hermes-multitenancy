@@ -59,7 +59,16 @@ def test_default_reader_overflows_on_same_line():
 
 
 def test_every_subprocess_exec_call_passes_the_limit():
-    src = inspect.getsource(agent_real)
+    # agent_real is now a package (god-node split); its create_subprocess_exec
+    # calls live in submodules, so scan every submodule's source — the same
+    # invariant, spread across the package instead of one file.
+    import importlib
+    import pkgutil
+
+    src = "".join(
+        inspect.getsource(importlib.import_module(f"{agent_real.__name__}.{m.name}"))
+        for m in pkgutil.iter_modules(agent_real.__path__)
+    )
     calls = src.count("asyncio.create_subprocess_exec(")
     limited = src.count("limit=_AIAGENT_STREAM_LIMIT")
     assert calls > 0
