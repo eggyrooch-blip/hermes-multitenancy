@@ -5086,6 +5086,19 @@ def is_group_profile_name(name: Optional[str]) -> bool:
     return bool(name) and str(name).startswith(_GROUP_PROFILE_PREFIX)
 
 
+def _sanitize_soul_field(text: Any, *, max_len: int = 80) -> str:
+    """Make an untrusted Feishu value safe to embed inside a SOUL.md system-prompt
+    line. Feishu display names / group names are attacker-controllable; embedded
+    raw they could carry newlines + backticks to break out of the markdown code
+    span and inject instructions into the group agent's persona (stored prompt
+    injection). Collapse to a single line, drop backticks/backslashes/control
+    chars, and length-cap. MED-1, audit 2026-07-03."""
+    s = str(text or "").replace("`", "").replace("\\", "")
+    s = "".join(ch for ch in s if ch >= " " and ch != "\x7f")  # drop \n\r\t + control/DEL
+    s = " ".join(s.split())  # collapse remaining whitespace runs
+    return s[:max_len]
+
+
 def _group_display_label(
     *,
     owner_open_id: str,
@@ -5452,9 +5465,9 @@ def _ensure_group_profile(
                 [
                     f"# Hermes Group Profile {profile_name}",
                     "",
-                    f"You are a Feishu group-chat agent for chat `{chat_id}`.",
-                    f"This profile is owned by Feishu user `{owner_open_id}` "
-                    f"(display label: `{display_label}`).",
+                    f"You are a Feishu group-chat agent for chat `{_sanitize_soul_field(chat_id)}`.",
+                    f"This profile is owned by Feishu user `{_sanitize_soul_field(owner_open_id)}` "
+                    f"(display label: `{_sanitize_soul_field(display_label)}`).",
                     "Identity rules (strict):",
                     "- 你不能以群成员任何一个个人的身份操作飞书数据。",
                     "- /feishu_auth 在群聊模式下被禁用，任何用户的 UAT 不会被加载。",
@@ -5544,8 +5557,8 @@ def _ensure_webui_agent_profile(
                 [
                     f"# Hermes WebUI Group Agent Profile {profile_name}",
                     "",
-                    f"You are a WebUI group-chat agent named `{display_label}`.",
-                    f"This profile is owned by Feishu user `{owner_open_id}`.",
+                    f"You are a WebUI group-chat agent named `{_sanitize_soul_field(display_label)}`.",
+                    f"This profile is owned by Feishu user `{_sanitize_soul_field(owner_open_id)}`.",
                     "Identity rules (strict):",
                     "- 你不能以 WebUI 群成员任何一个个人的身份操作飞书数据。",
                     "- /feishu_auth 在 WebUI 群聊 agent 模式下被禁用，任何用户的 UAT 不会被加载。",
@@ -5725,8 +5738,8 @@ def _ensure_auto_profile(
                 [
                     f"# Hermes Profile {profile_name}",
                     "",
-                    f"You are the dedicated Hermes tenant profile for Feishu route `{route_key}`.",
-                    f"The current Feishu sender open_id is `{sender}`.",
+                    f"You are the dedicated Hermes tenant profile for Feishu route `{_sanitize_soul_field(route_key)}`.",
+                    f"The current Feishu sender open_id is `{_sanitize_soul_field(sender)}`.",
                     "Keep tools, files, memory, and responses isolated to this profile.",
                     "Do not claim to be another Hermes profile.",
                     "",
