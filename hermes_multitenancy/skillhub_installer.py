@@ -36,6 +36,14 @@ from .skill_registry import (
 from .skillhub_events import SkillhubEventStore, get_event_store
 
 _DOWNLOAD_TIMEOUT_SECONDS = 30
+# Size caps for skill/plugin package download + extraction. The broker serving
+# ~1259 employees buffers the download in memory and extracts to shared disk, so
+# an unbounded response.read()/zip is an OOM / disk-fill DoS. MED-3, audit
+# 2026-07-03.
+_MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024        # 64 MiB compressed download cap
+_MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024   # 256 MiB total extracted cap
+_MAX_ZIP_ENTRIES = 5000                        # entry-count cap
+_ZIP_COPY_CHUNK = 1024 * 1024
 _LOCK_FILENAME = Path(".keephub") / "lock.json"
 _SKILL_DISTRIBUTION_FILENAME = "skill-distribution.yaml"
 _SKILL_DISTRIBUTION_ORIGIN = "aidock-skillhub"
@@ -150,7 +158,15 @@ def _assert_download_url_allowed(url: str) -> None:
 def _default_downloader(url: str) -> bytes:
     _assert_download_url_allowed(url)
     with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:  # noqa: S310 — scheme asserted https above
-        return response.read()
+        # Read at most cap+1 so an over-large body is detected without buffering
+        # the whole thing (a compromised artifact host could return multi-GB).
+        data = response.read(_MAX_DOWNLOAD_BYTES + 1)
+    if len(data) > _MAX_DOWNLOAD_BYTES:
+        raise SkillhubInstallError(
+            f"skill package exceeds the {_MAX_DOWNLOAD_BYTES}-byte download cap",
+            error_code="PACKAGE_INVALID",
+        )
+    return data
 
 
 def _first_str(*values: Any) -> str | None:
@@ -229,13 +245,47 @@ def _validated_zip_relpath(name: str) -> Path:
     return Path(*rel.parts)
 
 
+def _copy_capped(source: Any, sink: Any, *, max_bytes: int) -> int:
+    """Copy ``source`` → ``sink`` streaming, raising if more than ``max_bytes``
+    are written. Guards against a zip entry whose declared ``file_size``
+    under-reports the real uncompressed size (a lying header that beats the
+    up-front declared-total check). Returns the number of bytes written."""
+    written = 0
+    while True:
+        chunk = source.read(_ZIP_COPY_CHUNK)
+        if not chunk:
+            return written
+        written += len(chunk)
+        if written > max_bytes:
+            raise SkillhubInstallError(
+                f"package extraction exceeds the {_MAX_UNCOMPRESSED_BYTES}-byte cap",
+                error_code="PACKAGE_INVALID",
+            )
+        sink.write(chunk)
+
+
 def _extract_zip_safely(package_bytes: bytes, destination: Path) -> None:
     try:
         archive = zipfile.ZipFile(io.BytesIO(package_bytes))
     except zipfile.BadZipFile as exc:
         raise SkillhubInstallError("package is not a valid zip archive", error_code="PACKAGE_INVALID") from exc
     with archive:
-        for info in archive.infolist():
+        infos = archive.infolist()
+        if len(infos) > _MAX_ZIP_ENTRIES:
+            raise SkillhubInstallError(
+                f"package has too many entries (> {_MAX_ZIP_ENTRIES})",
+                error_code="PACKAGE_INVALID",
+            )
+        # Reject on the declared uncompressed total up front (cheap zip-bomb check)...
+        if sum(int(i.file_size) for i in infos) > _MAX_UNCOMPRESSED_BYTES:
+            raise SkillhubInstallError(
+                f"package uncompressed size exceeds the {_MAX_UNCOMPRESSED_BYTES}-byte cap",
+                error_code="PACKAGE_INVALID",
+            )
+        # ...and enforce the same cap DURING copy (cumulative across files) so a
+        # lying file_size header can't beat the up-front declared-total check.
+        remaining = _MAX_UNCOMPRESSED_BYTES
+        for info in infos:
             rel_path = _validated_zip_relpath(info.filename)
             target = destination / rel_path
             if info.is_dir():
@@ -243,7 +293,7 @@ def _extract_zip_safely(package_bytes: bytes, destination: Path) -> None:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(info, "r") as source, target.open("wb") as sink:
-                shutil.copyfileobj(source, sink)
+                remaining -= _copy_capped(source, sink, max_bytes=remaining)
 
 
 def _resolve_skill_root(base_dir: Path) -> Path | None:
