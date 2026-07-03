@@ -7,6 +7,8 @@ profiles.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import socket
 import io
 import json
 import logging
@@ -15,6 +17,7 @@ import shutil
 import sqlite3
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -70,8 +73,83 @@ def _default_shared_home() -> Path:
     ).expanduser()
 
 
+def _skillhub_allowed_hosts() -> frozenset[str]:
+    """Optional host allowlist for skill/plugin download URLs (comma-separated
+    in ``HERMES_SKILLHUB_ALLOWED_HOSTS``). Empty → host is not restricted, but
+    https is still enforced."""
+    raw = os.environ.get("HERMES_SKILLHUB_ALLOWED_HOSTS", "")
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+
+def _ip_is_blocked(ip: Any) -> bool:
+    return bool(
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def _host_literal_blocked_ip(host: str) -> bool:
+    """True if ``host`` is an IP literal in a private/reserved range — INCLUDING
+    the decimal/hex/octal/short IPv4 forms the C resolver (``inet_aton``) accepts
+    but ``ipaddress`` rejects. e.g. decimal / hex / octal / short forms like
+    ``2130706433`` / ``0x7f000001`` / ``127.1`` all resolve to loopback, and a
+    short ``10.1`` resolves to a private 10.x host. Canonical IPv4/IPv6 literals
+    go through ``ipaddress``."""
+    candidates: list[Any] = []
+    try:
+        candidates.append(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    try:  # permissive IPv4 forms the real connect() would accept
+        candidates.append(ipaddress.ip_address(socket.inet_aton(host)))
+    except (OSError, ValueError):
+        pass
+    return any(_ip_is_blocked(ip) for ip in candidates)
+
+
+def _assert_download_url_allowed(url: str) -> None:
+    """Reject non-https and non-allowlisted download hosts BEFORE fetching.
+
+    The bytes fetched here are extracted and land in every profile's agent
+    instruction layer, so an ``http://`` MITM, a ``file://`` local read, or an
+    SSRF to an internal host must never be fetched. HIGH-3, audit 2026-07-03.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as exc:  # e.g. malformed IPv6 literal
+        raise SkillhubInstallError(
+            f"malformed skill download URL: {exc}", error_code="PACKAGE_INVALID"
+        ) from exc
+    if parsed.scheme != "https":
+        raise SkillhubInstallError(
+            f"refusing non-https skill download URL (scheme={parsed.scheme or 'none'!r})",
+            error_code="PACKAGE_INVALID",
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise SkillhubInstallError(
+            "skill download URL has no host", error_code="PACKAGE_INVALID"
+        )
+    # Block private/reserved IP hosts by default (SSRF to internal services +
+    # cloud metadata e.g. 169.254.169.254), including obfuscated numeric IPv4
+    # forms. A public hostname that RESOLVES to a private IP (DNS-rebinding) is
+    # only caught by HERMES_SKILLHUB_ALLOWED_HOSTS — set it for strict pinning.
+    if _host_literal_blocked_ip(host):
+        raise SkillhubInstallError(
+            f"refusing skill download from non-public IP host {host!r}",
+            error_code="PACKAGE_INVALID",
+        )
+    allowed = _skillhub_allowed_hosts()
+    if allowed and host not in allowed:
+        raise SkillhubInstallError(
+            f"skill download host {host!r} not in HERMES_SKILLHUB_ALLOWED_HOSTS",
+            error_code="PACKAGE_INVALID",
+        )
+
+
 def _default_downloader(url: str) -> bytes:
-    with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
+    _assert_download_url_allowed(url)
+    with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:  # noqa: S310 — scheme asserted https above
         return response.read()
 
 
@@ -113,8 +191,30 @@ def _download_package(url: str, downloader: Callable[[str], bytes] | None) -> by
     return payload
 
 
+def _skillhub_require_checksum() -> bool:
+    """Whether a downloaded package MUST carry a checksum_sha256.
+
+    Default OFF keeps behavior byte-identical (AiDock does not always send a
+    checksum today — enabling this unconditionally would reject real installs).
+    Flip ``HERMES_SKILLHUB_REQUIRE_CHECKSUM=1`` once the sender is confirmed to
+    include checksums; then an unverified package is refused. HIGH-3."""
+    return os.environ.get("HERMES_SKILLHUB_REQUIRE_CHECKSUM", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _verify_checksum(package_bytes: bytes, expected: str | None) -> None:
+    # A provided checksum is ALWAYS verified. A MISSING checksum is refused only
+    # when HERMES_SKILLHUB_REQUIRE_CHECKSUM is on — the integrity check is the
+    # only thing between a compromised/MITM'd artifact host and arbitrary skill
+    # code landing in every profile's agent instruction layer. HIGH-3.
     if not expected:
+        if _skillhub_require_checksum():
+            raise SkillhubInstallError(
+                "downloaded package has no checksum_sha256 and "
+                "HERMES_SKILLHUB_REQUIRE_CHECKSUM is on — refusing unverified bytes",
+                error_code="PACKAGE_INVALID",
+            )
         return
     actual = hashlib.sha256(package_bytes).hexdigest()
     if actual.lower() != str(expected).strip().lower():
