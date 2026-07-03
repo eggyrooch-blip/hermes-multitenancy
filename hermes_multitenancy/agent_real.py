@@ -60,6 +60,24 @@ from . import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli
 logger = logging.getLogger(__name__)
 _EXPERT_SKILL_SCOPE_LOCK = threading.RLock()
 
+# StreamReader line-buffer cap for the AIAgent subprocess NDJSON protocol. The
+# child writes one JSON event per line; asyncio's default 64 KiB limit makes a
+# single large event line (a big final answer, a large tool arg / thinking block)
+# raise LimitOverrun from readline(), which fails the whole run and can poison a
+# warm worker. Bound it generously instead of at 64 KiB. MED-2, audit 2026-07-03.
+# Override via HERMES_AIAGENT_STREAM_LIMIT_BYTES.
+def _resolve_aiagent_stream_limit() -> int:
+    # Parse defensively: a non-numeric env value must NOT crash module import.
+    raw = os.environ.get("HERMES_AIAGENT_STREAM_LIMIT_BYTES", "").strip()
+    try:
+        val = int(raw)
+    except ValueError:
+        val = 0
+    return max(64 * 1024, val if val > 0 else 16 * 1024 * 1024)
+
+
+_AIAGENT_STREAM_LIMIT = _resolve_aiagent_stream_limit()
+
 
 class _CredentialExpirySignal:
     """Thread-safe one-shot holder for a lark-cli credential-expiry signal.
@@ -3905,6 +3923,7 @@ class _AiagentWarmWorker:
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
             cwd=_aiagent_subprocess_cwd(self.profile_home),
+            limit=_AIAGENT_STREAM_LIMIT,
         )
         self.proc = proc
         assert proc.stdout is not None
@@ -4060,6 +4079,7 @@ async def _run_aiagent_subprocess(
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=_aiagent_subprocess_cwd(profile_home),
+            limit=_AIAGENT_STREAM_LIMIT,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout_s)
     except asyncio.TimeoutError as exc:
@@ -4496,6 +4516,7 @@ async def _stream_aiagent_subprocess(
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=_aiagent_subprocess_cwd(profile_home),
+            limit=_AIAGENT_STREAM_LIMIT,
         )
         logger.info(
             "[multitenancy] AIAgent subprocess spawned pid=%s elapsed=%.3fs",
