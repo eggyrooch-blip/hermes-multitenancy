@@ -195,6 +195,72 @@ def test_install_hook_idempotent():
         group_inviter_hook._HOOK_INSTALLED = False
 
 
+def test_init_rebind_survives_sdk_capture_race():
+    """Regression for the always-0%-success race: the Lark SDK captures
+    ``self._on_bot_added_to_chat`` INSIDE the adapter's own ``__init__``
+    (mirroring ``_build_event_handler``'s ``.register_...(self._on_bot_added_to_chat)``
+    called shortly after construction). If ``__init__`` binds that reference
+    BEFORE our class patch's effect is visible to *this* call, the SDK ends up
+    with the unwrapped original — even though the class attribute is patched.
+    ``_patch_init_rebind`` must force every new instance to rebind onto the
+    (already-patched) class attribute right after construction, so whatever
+    the SDK captured resolves to our wrapped handler."""
+    from hermes_multitenancy import group_inviter_hook
+    import sys, types
+
+    captured = []
+
+    class FakeFeishuAdapter:
+        def __init__(self):
+            # Simulate the SDK grabbing a bound-method reference to
+            # self._on_bot_added_to_chat at construction time.
+            self._sdk_captured_ref = self._on_bot_added_to_chat
+
+        def _on_bot_added_to_chat(self, data):
+            return "original_return"
+
+    fake_module = types.ModuleType("gateway.platforms.feishu")
+    fake_module.FeishuAdapter = FakeFeishuAdapter  # type: ignore[attr-defined]
+    parents = ("gateway", "gateway.platforms")
+    saved_parents = {name: sys.modules.get(name) for name in parents}
+    saved_module = sys.modules.get("gateway.platforms.feishu")
+    for name in parents:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules["gateway.platforms.feishu"] = fake_module
+
+    group_inviter_hook._HOOK_INSTALLED = False
+    original_capture = group_inviter_hook._capture_inviter_from_event
+    group_inviter_hook._capture_inviter_from_event = lambda data: captured.append(data)
+    try:
+        group_inviter_hook.install_feishu_bot_added_hook()
+
+        # First instance (mirrors gateway boot) and a second instance (mirrors
+        # a reconnect creating a brand-new adapter) must BOTH route through
+        # the wrapped handler via whatever the SDK "captured" at __init__ time.
+        inst1 = FakeFeishuAdapter()
+        inst1._sdk_captured_ref(data="event1")
+        inst2 = FakeFeishuAdapter()
+        inst2._sdk_captured_ref(data="event2")
+
+        assert len(captured) == 2, (
+            "SDK-captured reference must invoke the wrapped handler "
+            f"(inviter capture ran {len(captured)}/2 times)"
+        )
+    finally:
+        group_inviter_hook._capture_inviter_from_event = original_capture
+        if saved_module is None:
+            sys.modules.pop("gateway.platforms.feishu", None)
+        else:
+            sys.modules["gateway.platforms.feishu"] = saved_module
+        for name, mod in saved_parents.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        group_inviter_hook._HOOK_INSTALLED = False
+
+
 def test_install_hook_patches_chat_added_welcome_for_groups():
     """The class-level patch must replace _send_chat_added_onboarding with a
     group-aware wrapper that sends the welcome card when chat_type is 'group'.

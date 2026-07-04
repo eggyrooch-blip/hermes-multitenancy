@@ -36,6 +36,7 @@ from collections import OrderedDict as _OrderedDict
 _HOOK_INSTALLED = False
 _CLASS_PATCH_FLAG = "_hermes_multitenancy_bot_added_class_patched"
 _WELCOME_PATCH_FLAG = "_hermes_multitenancy_welcome_class_patched"
+_INIT_PATCH_FLAG = "_hermes_multitenancy_init_rebind_patched"
 
 # Feishu delivers im.chat.member.bot.added_v1 at-least-once, so the same
 # chat can fire the welcome path several times. Track recently-welcomed
@@ -94,6 +95,7 @@ def install_feishu_bot_added_hook() -> None:
     has_onboarding = getattr(FeishuAdapter, "_send_chat_added_onboarding", None) is not None
     _patch_bot_added(FeishuAdapter, send_welcome=not has_onboarding)
     _patch_chat_added_welcome(FeishuAdapter)
+    _patch_init_rebind(FeishuAdapter)
     _HOOK_INSTALLED = True
 
 
@@ -136,6 +138,33 @@ def _patch_bot_added(FeishuAdapter: Any, *, send_welcome: bool = False) -> None:
         "(welcome_card_here=%s)",
         send_welcome,
     )
+
+
+def _patch_init_rebind(FeishuAdapter: Any) -> None:
+    """Force every new instance to (re-)bind ``_on_bot_added_to_chat`` on
+    itself right after construction, closing a class-vs-instance monkeypatch
+    race: the Lark SDK callback registry captures ``self._on_bot_added_to_chat``
+    when the adapter builds its event handler (on connect/reconnect), and
+    whether that resolves to our wrapped method depends on exactly when the
+    class-level patch above ran relative to construction. Every reconnect
+    constructs a brand-new adapter instance (``Gateway._create_adapter``), so
+    explicitly rebinding here — after the class patch has already run —
+    guarantees the wrapped handler is what the SDK sees, regardless of the
+    original race. This was 0/49 successful in production logs before this fix."""
+    original_init = FeishuAdapter.__init__
+    if getattr(original_init, _INIT_PATCH_FLAG, False):
+        return
+
+    @functools.wraps(original_init)
+    def wrapped_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        current = getattr(type(self), "_on_bot_added_to_chat", None)
+        if current is not None:
+            self._on_bot_added_to_chat = current.__get__(self, type(self))
+
+    setattr(wrapped_init, _INIT_PATCH_FLAG, True)
+    FeishuAdapter.__init__ = wrapped_init
+    logger.info("[multitenancy] installed __init__ rebind guard on FeishuAdapter class")
 
 
 def _schedule_group_welcome_card(adapter: Any, data: Any) -> None:

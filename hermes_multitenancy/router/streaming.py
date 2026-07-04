@@ -136,9 +136,11 @@ async def _poll_hub_flows(
 
     pending = dict(flows)
     # Each flow keys off THIS attempt so re-auth of an already-authed credential
-    # reports real completion, not a stale "already logged in". ~40 iterations;
-    # keep's login-wait blocks ~15s/iter (QR window is minutes).
-    for _ in range(40):
+    # reports real completion, not a stale "already logged in". ~200 iterations
+    # (10 min) — lark's device-flow OAuth needs the user to switch to a
+    # browser and approve, which routinely takes well over the old 120s
+    # window; keep's login-wait blocks ~15s/iter (QR window is minutes).
+    for _ in range(200):
         if not pending:
             break
         succeeded: list[str] = []
