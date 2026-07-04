@@ -2034,7 +2034,7 @@ async def _default_dispatch_agent(
         messages = request.messages or None
         async for kind, payload in stream_run_agent(event, profile_home, messages=messages):
             if kind == "content":
-                pending_media_text, text_items = _webui_streamable_media_text(
+                pending_media_text, text_items = _m._webui_streamable_media_text(
                     pending_media_text + str(payload or ""),
                     router_mod=router_mod,
                     profile_home=profile_home,
