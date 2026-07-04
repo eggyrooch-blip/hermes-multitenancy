@@ -15,6 +15,7 @@ from .._io import _safe_account
 from ..model import (
     FEISHU_PROJECT,
     S_AUTHENTICATED,
+    S_ERROR,
     S_MISSING,
     S_NEEDS_AUTH,
     CredentialRow,
@@ -113,10 +114,26 @@ def feishu_project_status(
     cmd = [*inv, "--profile", _hub._meegle_profile(profile_name), "auth", "status", "--format", "json"]
     proc = _hub._run(cmd, cwd=profile_dir, env=env)
     if proc is None or proc.returncode not in (0, None):
-        # Binary present but status errored → treat as installed-but-needs-auth
+        # Binary present but status errored. Classify instead of collapsing EVERY
+        # non-zero to needs_auth: a transient npx/node/network error must NOT tell
+        # the user to re-authorize. Terminal (token expired / 401) → needs_auth;
+        # transient → error (retry). exit_code is passed but not trusted; the
+        # decision rides on stderr markers.
+        from ...connector_failure_classifier import classify_connector_failure, is_needs_reauth
+
+        rc = None if proc is None else proc.returncode
+        stderr_tail = (getattr(proc, "stderr", "") or "")[-500:] if proc is not None else ""
+        verdict = classify_connector_failure(
+            "feishu-project", exit_code=rc, stderr=stderr_tail
+        )
         row.installed = True
-        row.status = S_NEEDS_AUTH
-        row.detail = "飞书项目需要授权后才能查询和更新工作项。"
+        row.diagnostic = {"returncode": rc, "class": verdict["class"], "reason": verdict["reason"]}
+        if is_needs_reauth(verdict):
+            row.status = S_NEEDS_AUTH
+            row.detail = "飞书项目需要授权后才能查询和更新工作项。"
+        else:
+            row.status = S_ERROR
+            row.detail = "飞书项目状态暂时不可用（临时错误，可稍后重试）。"
         return row
     try:
         parsed = json.loads(proc.stdout or "{}")

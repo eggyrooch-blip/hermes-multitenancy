@@ -37,7 +37,7 @@ from .credential_renewal_common import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SECONDS = 60
-DEFAULT_HEADROOM_SECONDS = 30 * 60  # refresh anything entering its last 30 minutes
+DEFAULT_HEADROOM_SECONDS = 5 * 60  # refresh anything entering its last 5 minutes (WorkBuddy parity)
 
 _worker_lock = threading.Lock()
 _worker_thread: Optional[threading.Thread] = None
@@ -198,8 +198,21 @@ def _record_failure(
     if len(detail) > 240:
         detail = detail[:237] + "..."
     from .feishu_uat_auth import FeishuUatAuthError
+    from .connector_failure_classifier import classify_connector_failure, is_needs_reauth
 
-    if not (isinstance(exc, FeishuUatAuthError) and exc.refresh_class == "invalid"):
+    # Route the terminal-vs-transient decision through the ONE unified classifier
+    # (same function the reactive card + non-Feishu detect use). For Feishu the
+    # curated refresh_class is the authoritative signal; http status is a fallback.
+    _refresh_class = exc.refresh_class if isinstance(exc, FeishuUatAuthError) else None
+    _http = exc.status if isinstance(exc, FeishuUatAuthError) else None
+    verdict = classify_connector_failure(
+        "lark-cli", http_status=_http, stderr=detail, refresh_class=_refresh_class
+    )
+    # User-facing needs_reauth marker only when the classifier says terminal AND it is
+    # Feishu-authoritative-invalid (marker_requires_reauth stays the surfacing gate,
+    # unchanged — this preserves the "silent unless authoritative" discipline).
+    authoritative_invalid = isinstance(exc, FeishuUatAuthError) and exc.refresh_class == "invalid"
+    if not (is_needs_reauth(verdict) and authoritative_invalid):
         write_refresh_diagnostic_marker(
             refresh_diagnostic_path_for_open_id(
                 shared_home / "profiles" / profile_name / "feishu_uat", open_id

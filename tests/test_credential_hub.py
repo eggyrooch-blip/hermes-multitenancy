@@ -429,6 +429,39 @@ def test_feishu_project_needs_auth_when_not_authed(monkeypatch, tmp_path):
     assert row.installed is True
 
 
+def test_feishu_project_transient_error_is_not_needs_auth(monkeypatch, tmp_path):
+    # A transient npx/network failure must NOT be collapsed to needs_auth (finding [5]).
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "npx: network error ETIMEDOUT"
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "error"          # transient → error, not a false re-auth prompt
+    assert row.diagnostic["class"] == "transient"
+
+
+def test_feishu_project_terminal_error_is_needs_auth(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "token expired, please re-login (401)"
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "needs_auth"
+    assert row.diagnostic["class"] == "needs_reauth"
+
+
 def test_meegle_search_path_augments_common_dirs_and_extra(monkeypatch):
     """Parity with the WebUI reader: lookup PATH includes common node dirs +
     HERMES_MEEGLE_EXTRA_PATHS so a narrow launchd/systemd PATH still finds npx."""
