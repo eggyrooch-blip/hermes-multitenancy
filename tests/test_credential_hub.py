@@ -443,7 +443,7 @@ def test_feishu_project_transient_error_is_not_needs_auth(monkeypatch, tmp_path)
     monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
     row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
     assert row.status == "error"          # transient → error, not a false re-auth prompt
-    assert row.diagnostic["class"] == "transient"
+    assert row.status != "needs_auth"
 
 
 def test_feishu_project_terminal_error_is_needs_auth(monkeypatch, tmp_path):
@@ -459,7 +459,6 @@ def test_feishu_project_terminal_error_is_needs_auth(monkeypatch, tmp_path):
     monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
     row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
     assert row.status == "needs_auth"
-    assert row.diagnostic["class"] == "needs_reauth"
 
 
 def test_meegle_search_path_augments_common_dirs_and_extra(monkeypatch):

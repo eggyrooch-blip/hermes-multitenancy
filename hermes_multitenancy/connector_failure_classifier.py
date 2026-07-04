@@ -27,10 +27,21 @@ from .credential_renewal_common import payload_access_expired, payload_refresh_e
 TERMINAL_HTTP_STATUSES = frozenset({401, 403, 422})
 
 # stderr/body substrings that terminally indicate an expired/rejected credential.
-# Kept deliberately narrow so ordinary business errors don't false-positive.
+# Deliberately narrow: bare "401"/"403"/"forbidden" are NOT enough (a business
+# error like "工作项 401 不存在" or "forbidden by policy" is not a credential
+# failure). A numeric status only counts when it sits in an auth/http context
+# (HTTP 401 / status: 403 / 401 unauthorized), and the word phrases are unambiguous.
 _TERMINAL_STDERR_RE = re.compile(
-    r"\b(401|403|unauthorized|forbidden|token[ _-]?expired|invalid[ _-]?token|"
-    r"credential[ _-]?expired|needs?[ _-]?re-?auth|please[ _-]?re-?login|登录已过期|重新登录|重新授权)\b",
+    r"(?:\b(?:http|status|statuscode|code|错误码|状态码)\b\W{0,4}(?:401|403)\b)"
+    r"|(?:\b(?:401|403)\b[ _-]?(?:unauthorized|forbidden))"
+    r"|\bunauthorized\b"
+    r"|token[ _-]?(?:expired|invalid|无效|过期)"
+    r"|invalid[ _-]?(?:grant|token)"
+    r"|credential[ _-]?expired"
+    r"|needs?[ _-]?re-?auth"
+    r"|please[ _-]?re-?login"
+    r"|(?:登录|凭证|授权)(?:已)?(?:过期|失效)"
+    r"|重新(?:登录|授权)",
     re.IGNORECASE,
 )
 
@@ -60,7 +71,9 @@ def _extract_body_code(stderr: str) -> Optional[int]:
     (e.g. ``{"code":99991668,...}`` or ``code: 10101``). Returns None if absent."""
     if not stderr:
         return None
-    m = re.search(r'["\']?code["\']?\s*[:=]\s*(\d{3,})', stderr)
+    # Require the key to be exactly "code" (quoted or word-bounded) — NOT a suffix
+    # of status_code/retcode/error_code, whose value would otherwise be grabbed.
+    m = re.search(r'(?:"code"|\'code\'|(?<![a-zA-Z_])code)\s*[:=]\s*(\d{3,})', stderr)
     if m:
         try:
             return int(m.group(1))

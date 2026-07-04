@@ -59,10 +59,6 @@ class CredentialRow:
     required_by: list[str] = field(default_factory=list)
     action: dict[str, Any] = field(default_factory=dict)
     environments: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Raw failure signal threaded from a reader (redacted): {returncode, http_status,
-    # stderr_tail, class}. Additive — lets the unified classifier distinguish
-    # terminal (needs_auth) from transient (error) instead of collapsing both.
-    diagnostic: Optional[dict[str, Any]] = None
 
     @property
     def authenticated(self) -> bool:
@@ -88,8 +84,6 @@ class CredentialRow:
             out["required_by"] = self.required_by
         if self.environments:
             out["environments"] = self.environments
-        if self.diagnostic:
-            out["diagnostic"] = self.diagnostic
         return out
 
 

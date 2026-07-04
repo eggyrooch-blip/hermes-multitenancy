@@ -67,6 +67,25 @@ def test_payload_access_expired_but_refresh_alive_is_transient_refreshable():
 
 
 # --- negatives: no false-positive needs_reauth -------------------------------
+def test_stderr_bare_number_not_false_positive():
+    # review [4]: bare "401"/"403"/"forbidden" in benign business text must NOT trip re-auth
+    assert cls("feishu-project", exit_code=1, stderr="工作项 401 不存在") == TRANSIENT
+    assert cls("feishu-project", exit_code=1, stderr="work item 403 archived") == TRANSIENT
+    assert cls("feishu-project", exit_code=1, stderr="This action is forbidden by policy") == TRANSIENT
+    assert cls("gitlab", exit_code=1, stderr="record 1403 not found") == TRANSIENT
+    # ...but an auth-context status IS still terminal
+    assert cls("feishu-project", exit_code=1, stderr="HTTP 401 unauthorized") == NEEDS_REAUTH
+    assert cls("feishu-project", exit_code=1, stderr="status: 403") == NEEDS_REAUTH
+
+
+def test_body_code_word_boundary():
+    # review [1]: must read the real "code", not the value of status_code/retcode
+    assert cls("kep-cli", stderr='{"status_code":200,"code":10101}') == NEEDS_REAUTH
+    assert cls("kep-cli", stderr='{"retcode":200,"code":10101}') == NEEDS_REAUTH
+    # a benign status_code alone (no terminal business code) stays transient
+    assert cls("kep-cli", stderr='{"status_code":200,"code":40004}') == TRANSIENT
+
+
 def test_negatives_zero_false_positive():
     now = int(time.time() * 1000)
     negatives = [

@@ -123,11 +123,8 @@ def feishu_project_status(
 
         rc = None if proc is None else proc.returncode
         stderr_tail = (getattr(proc, "stderr", "") or "")[-500:] if proc is not None else ""
-        verdict = classify_connector_failure(
-            "feishu-project", exit_code=rc, stderr=stderr_tail
-        )
+        verdict = classify_connector_failure("feishu-project", exit_code=rc, stderr=stderr_tail)
         row.installed = True
-        row.diagnostic = {"returncode": rc, "class": verdict["class"], "reason": verdict["reason"]}
         if is_needs_reauth(verdict):
             row.status = S_NEEDS_AUTH
             row.detail = "飞书项目需要授权后才能查询和更新工作项。"
