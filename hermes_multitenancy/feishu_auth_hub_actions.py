@@ -96,13 +96,12 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     # cross-user / cross-profile write path. Deriving both from the signed
     # operator means a clicker can only ever authenticate their OWN resolved
     # profile, and profile_home fidelity comes from the authoritative routing.
-    open_id = _event_operator_open_id(event)
-    if not open_id:
-        return _toast_response("无法确认操作者身份，请私聊我后重新发送 /auth")
+    # Resolves from the operator's FULL id set (open_id / union_id / user_id) so
+    # a Schema-2 callback that omits open_id still matches (mirrors group_valve).
     shared = feishu_uat_auth.resolve_shared_home()
-    profile_name, pdir = _resolve_profile_for_open_id(open_id, shared)
-    if not profile_name or pdir is None:
-        return _toast_response("你还没有绑定 Hermes profile，请先私聊我")
+    profile_name, open_id, pdir = _resolve_operator_profile(event, shared)
+    if not profile_name or not open_id or pdir is None:
+        return _toast_response("无法确认你的 Hermes profile，请先私聊我发送 /auth")
     ctx = {"chat_id": chat_id}
 
     # Mint ONLY this credential's entry (blocking network — Feishu shows the
@@ -238,40 +237,60 @@ def _ctx_message_id(event: Any) -> str:
     return str(_read_value(event, "open_message_id") or "").strip()
 
 
-def _event_operator_open_id(event: Any) -> str:
-    """The ``ou_``-prefixed open_id of whoever clicked, from the SIGNED event
-    operator. This is the trust anchor for the whole flow — never the payload."""
+def _operator_typed_ids(event: Any) -> dict[str, str]:
+    """The SIGNED operator's typed ids. Under Feishu card-callback Schema 2 the
+    operator may omit ``open_id`` and carry only ``union_id`` / ``user_id``, so
+    all three are extracted and resolved (mirrors feishu_group_valve)."""
     operator = _read_value(event, "operator") or _read_value(event, "operator_id")
-    for name in ("open_id", "operator_open_id", "union_id", "operator_union_id", "user_id"):
-        value = _read_value(operator, name)
-        if value:
-            text = str(value).strip()
-            if text.startswith("ou_"):
-                return text
-    return ""
+
+    def pick(*names: str) -> str:
+        for name in names:
+            value = _read_value(operator, name)
+            if value:
+                return str(value).strip()
+        return ""
+
+    return {
+        "open_id": pick("open_id", "operator_open_id"),
+        "union_id": pick("union_id", "operator_union_id"),
+        "user_id": pick("user_id", "operator_user_id"),
+    }
 
 
-def _resolve_profile_for_open_id(open_id: str, shared: Path) -> tuple[str, Optional[Path]]:
-    """Authoritatively map a signed operator open_id → (profile_name, profile_dir)
-    via the multitenancy routing table. Returns ("", None) when the operator has
-    no bound profile, so an unrecognized clicker gets a clean rejection rather
-    than a mis-targeted auth."""
+def _resolve_operator_profile(event: Any, shared: Path) -> tuple[str, str, Optional[Path]]:
+    """Authoritatively map the SIGNED operator → (profile_name, open_id, profile_dir)
+    via the routing table, trying every typed id (open_id → resolve_owner_root /
+    lookup_by_open_id, union_id → lookup_by_union_id, user_id → lookup_by_user_id).
+    Returns ("", "", None) when the clicker has no bound profile, so an
+    unrecognized operator gets a clean rejection rather than a mis-targeted auth.
+    The resolved ``open_id`` is the routing row's authoritative open_id (needed by
+    the auth flow) even when the Schema-2 event only carried a union_id/user_id."""
+    ids = _operator_typed_ids(event)
     try:
         from .router import _get_routing_table
         table = _get_routing_table()
         if table is None:
-            return "", None
-        owner = table.resolve_owner_root(open_id) or table.lookup_by_open_id(open_id)
+            return "", "", None
+        owner = None
+        if ids["open_id"]:
+            owner = table.resolve_owner_root(ids["open_id"]) or table.lookup_by_open_id(ids["open_id"])
+        if owner is None and ids["union_id"]:
+            owner = table.lookup_by_union_id(ids["union_id"])
+        if owner is None and ids["user_id"]:
+            owner = table.lookup_by_user_id(ids["user_id"])
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("[multitenancy] cred_auth profile resolve failed for %s (%s)", open_id, exc)
-        return "", None
-    profile_name = str(getattr(owner, "profile_name", "") or "").strip() if owner is not None else ""
-    if not profile_name:
-        return "", None
+        logger.debug("[multitenancy] cred_auth operator resolve failed (%s)", exc)
+        return "", "", None
+    if owner is None:
+        return "", "", None
+    profile_name = str(getattr(owner, "profile_name", "") or "").strip()
+    open_id = str(getattr(owner, "open_id", "") or "").strip() or ids["open_id"]
+    if not profile_name or not open_id:
+        return "", "", None
     pdir = shared / "profiles" / profile_name
     if not pdir.exists():
-        return "", None
-    return profile_name, pdir
+        return "", "", None
+    return profile_name, open_id, pdir
 
 
 def _toast_response(content: str, *, level: str = "info") -> Any:

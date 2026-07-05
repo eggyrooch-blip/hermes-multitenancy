@@ -493,6 +493,54 @@ def test_cred_auth_action_rejects_unbound_operator(monkeypatch, tmp_path):
     assert minted["n"] == 0, "unbound operator must not trigger any mint"
 
 
+def test_cred_auth_action_resolves_schema2_union_id_operator(monkeypatch, tmp_path):
+    """Feishu card-callback Schema 2 may deliver an operator with only union_id /
+    user_id and NO open_id. The handler must still resolve the clicker's profile
+    (via lookup_by_union_id) and use the routing row's authoritative open_id,
+    else a legitimate click is wrongly denied — the exact bug fixed earlier for
+    group card actions."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    class _Row:
+        profile_name = "profile_B"
+        open_id = "ou_B_synced"
+
+    class _Table:
+        def resolve_owner_root(self, oid):
+            return None
+        def lookup_by_open_id(self, oid):
+            return None
+        def lookup_by_union_id(self, uid):
+            return _Row() if uid == "on_UNION" else None
+        def lookup_by_user_id(self, u):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    (tmp_path / "profiles" / "profile_B").mkdir(parents=True)
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+
+    used = {}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda cred, *, profile_name, open_id, pdir, shared: (
+                            used.update(profile_name=profile_name, open_id=open_id) or ({cred: "u"}, {}, {}, {})))
+    monkeypatch.setattr(actions, "_collect_rows", lambda **k: [])
+
+    # Operator carries ONLY union_id (Schema 2) — no open_id.
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(union_id="on_UNION"),
+        context=types.SimpleNamespace(open_chat_id="oc", open_message_id="om"),
+        action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+    )
+    resp = actions._handle_cred_auth_action(
+        types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    assert resp is not None
+    assert used == {"profile_name": "profile_B", "open_id": "ou_B_synced"}, \
+        "Schema 2 union_id operator must resolve via lookup_by_union_id + routing open_id"
+
+
 def test_poll_hub_flows_checks_kep_cli_pre_when_flow_targets_pre(monkeypatch, tmp_path):
     """A pre login flow must be confirmed by polling pre, not online."""
     import asyncio
