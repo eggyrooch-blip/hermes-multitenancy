@@ -62,6 +62,7 @@ def _start_hub_flow_poll(
     flows: dict[str, dict[str, Any]],
     auth_urls: dict[str, str],
     qr_image_keys: dict[str, str],
+    ctx: Optional[dict[str, Any]] = None,
 ) -> None:
     if not flows:
         return
@@ -77,6 +78,7 @@ def _start_hub_flow_poll(
             flows=flows,
             auth_urls=auth_urls,
             qr_image_keys=qr_image_keys,
+            ctx=ctx,
         ),
         name=f"auth-hub:{profile_name}:{open_id}:{','.join(sorted(flows))}",
     )
@@ -95,6 +97,8 @@ async def _poll_hub_flows(
     flows: dict[str, dict[str, Any]],
     auth_urls: dict[str, str],
     qr_image_keys: dict[str, str],
+    ctx: Optional[dict[str, Any]] = None,
+    adapter: Optional[Any] = None,
 ) -> None:
     """Poll the started auth flows. ONLY a credential the user actually completes
     produces feedback: its row flips to ✅已认证 via an in-place card update, and
@@ -105,7 +109,10 @@ async def _poll_hub_flows(
     from ..feishu_auth_cards import send_auth_card, update_auth_card
     from ..feishu_credential_hub_cards import build_hub_card, build_success_card
 
-    adapter = _m._get_feishu_adapter(gateway)
+    # The card-action hub already holds the adapter (SDK callback thread, no
+    # gateway handle); the /auth-command path passes gateway and resolves it.
+    if adapter is None:
+        adapter = _m._get_feishu_adapter(gateway)
     if adapter is None:
         return
 
@@ -130,9 +137,14 @@ async def _poll_hub_flows(
             return []
 
     async def _rerender(rows: list) -> None:
+        # When ``ctx`` is set (unified card-action hub), rows without a still-open
+        # inline entry render their collapsed 认证/重新认证 callback button; the
+        # completed row flips to ✅ and offers 重新认证. Legacy callers pass no
+        # ctx and keep the original inline-only re-render.
         await update_auth_card(adapter=adapter, auth_card=hub_card,
                                card=build_hub_card(rows=rows, auth_urls=remaining_urls,
-                                                   pending_note={}, qr_image_keys=remaining_qr))
+                                                   pending_note={}, qr_image_keys=remaining_qr,
+                                                   ctx=ctx))
 
     pending = dict(flows)
     # Each flow keys off THIS attempt so re-auth of an already-authed credential

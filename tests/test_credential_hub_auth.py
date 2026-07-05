@@ -237,7 +237,7 @@ async def test_poll_hub_flows_rerenders_after_lark_success(monkeypatch, tmp_path
             )
         ]
 
-    def fake_build_hub_card(*, rows, auth_urls=None, pending_note=None, qr_image_keys=None):
+    def fake_build_hub_card(*, rows, auth_urls=None, pending_note=None, qr_image_keys=None, ctx=None):
         rerenders.append(
             {
                 "rows": rows,
@@ -288,41 +288,20 @@ async def test_poll_hub_flows_rerenders_after_lark_success(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_auth_command_offers_lark_reauth_when_status_authenticated(monkeypatch, tmp_path):
-    """Regression for issue 2: /auth must offer a (re-)authorize button for the
-    lark row even when its status reads 'authenticated' via the weak
-    default_identity==user signal (which can be true with no usable UAT — env
-    HERMES_LARK_CLI_DEFAULT_AS=user or a stale local cred file). Previously
-    _handle_auth_command `continue`d on authenticated rows, so the lark row got
-    no minted URL and no button → '/auth 卡片不可用', while /feishu_auth (which
-    never checks status, always starts a session) worked. This test fails before
-    the fix and passes after.
-    """
+async def _auth_command_card(monkeypatch, tmp_path, rows):
+    """Run /auth with a mocked adapter/send and return the sent card JSON blob.
+
+    The unified hub sends INSTANTLY with per-credential callback buttons and no
+    eager minting, so this only needs the status rows + a send capture."""
     import json
     from hermes_multitenancy import credential_hub, feishu_auth_cards, feishu_uat_auth
     from hermes_multitenancy import router as router_mod
 
     (tmp_path / "home").mkdir(parents=True, exist_ok=True)
-
     monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
     monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
-
-    def fake_collect(*, profile_name, open_id, home_dir):
-        return [
-            credential_hub.CredentialRow(
-                id=credential_hub.LARK_CLI, title="Lark-cli", provider="lark",
-                installed=True, status="authenticated", default_identity="user",
-                action={"kind": "feishu_device_flow", "label": "重新授权"},
-            )
-        ]
-
-    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
-    monkeypatch.setattr(feishu_uat_auth, "find_active_session", lambda **k: None)
-    monkeypatch.setattr(
-        feishu_uat_auth, "start_session",
-        lambda **k: {"session_id": "s1", "verification_uri": "https://accounts.feishu.cn/lark-verify"},
-    )
-
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses",
+                        lambda *, profile_name, open_id, home_dir: rows)
     sent: dict = {}
 
     async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
@@ -330,175 +309,110 @@ async def test_auth_command_offers_lark_reauth_when_status_authenticated(monkeyp
         return {"message_id": "om_hub"}
 
     monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
-    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
-
     await router_mod._handle_auth_command(
         args="", sender="ou_owner", sender_alt=None, profile_name="owner",
         profile_home=tmp_path, chat_id="oc_chat", gateway=object(), event=object(),
     )
-
-    blob = json.dumps(sent.get("card", {}), ensure_ascii=False)
-    assert "https://accounts.feishu.cn/lark-verify" in blob, \
-        "lark authorize URL must be embedded in /auth even when status is authenticated"
-    assert '"multi_url"' in blob
-    assert "重新授权" in blob
+    return json.dumps(sent.get("card", {}), ensure_ascii=False)
 
 
-@pytest.mark.asyncio
-async def test_auth_command_offers_keep_record_reauth_qr_when_authenticated(monkeypatch, tmp_path):
-    """sunke 2026-06-26: /auth must also mint a re-auth QR for an already
-    authenticated keep-record row so the user can re-verify on demand."""
-    import json
-    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
-    from hermes_multitenancy import feishu_auth_cards, feishu_uat_auth
-    from hermes_multitenancy import router as router_mod
-
-    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
-    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
-
-    def fake_collect(*, profile_name, open_id, home_dir):
-        return [
-            credential_hub.CredentialRow(
-                id=credential_hub.KEEP_RECORD, title="Keep-record", provider="keep",
-                installed=True, status="authenticated",
-            )
-        ]
-
-    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
-    monkeypatch.setattr(cha, "start_keep_record_qr",
-                        lambda _pdir: {"qrcode_id": "q1", "qrcode_url": "https://x/img", "redirect_url": "https://x/r"})
-    monkeypatch.setattr(cha, "fetch_qr_image_key", lambda _shared, _url: "img_reauth")
-
-    sent: dict = {}
-
-    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
-        sent["card"] = card
-        return {"message_id": "om_hub"}
-
-    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
-    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
-
-    await router_mod._handle_auth_command(
-        args="", sender="ou_owner", sender_alt=None, profile_name="owner",
-        profile_home=tmp_path, chat_id="oc_chat", gateway=object(), event=object(),
-    )
-
-    blob = json.dumps(sent.get("card", {}), ensure_ascii=False)
-    assert "img_reauth" in blob, "keep-record re-auth QR must be embedded even when authenticated"
-    assert '"tag": "img"' in blob
+async def test_auth_command_offers_lark_reauth_when_status_authenticated(monkeypatch, tmp_path):
+    """/auth must offer a re-auth control for the lark row even when its status
+    reads 'authenticated' (weak default_identity==user signal). In the unified
+    hub that control is a cred_auth callback button labelled 重新认证; the actual
+    device-flow session is minted lazily on click (see _mint_one_cred test)."""
+    from hermes_multitenancy import credential_hub
+    blob = await _auth_command_card(monkeypatch, tmp_path, [
+        credential_hub.CredentialRow(
+            id=credential_hub.LARK_CLI, title="Lark-cli", provider="lark",
+            installed=True, status="authenticated", default_identity="user",
+        )
+    ])
+    assert '"hermes_action": "cred_auth"' in blob and '"cred": "lark-cli"' in blob, \
+        "lark row must offer a cred_auth callback button even when authenticated"
     assert "重新认证" in blob
 
 
 @pytest.mark.asyncio
-async def test_auth_command_offers_kep_cli_reauth_when_authenticated_with_origin(monkeypatch, tmp_path):
-    """sunke 2026-06-26: with a public callback origin set, /auth must also mint a
-    re-auth entry for an already authenticated kep-cli row (prod has origin set)."""
-    import json
+async def test_auth_command_offers_keep_record_callback_button(monkeypatch, tmp_path):
+    """Every credential (incl. an authenticated keep-record) gets a unified
+    callback button; nothing is pre-minted at /auth time."""
     from hermes_multitenancy import credential_hub, credential_hub_auth as cha
-    from hermes_multitenancy import feishu_auth_cards, feishu_uat_auth, webui_broker_server
-    from hermes_multitenancy import router as router_mod
+    calls = {"n": 0}
+    monkeypatch.setattr(cha, "start_keep_record_qr", lambda _p: calls.__setitem__("n", calls["n"] + 1) or {})
+    blob = await _auth_command_card(monkeypatch, tmp_path, [
+        credential_hub.CredentialRow(id=credential_hub.KEEP_RECORD, title="Keep-record",
+                                     provider="keep", installed=True, status="authenticated")
+    ])
+    assert '"cred": "keep-record"' in blob and '"hermes_action": "cred_auth"' in blob
+    assert calls["n"] == 0, "/auth must NOT eagerly mint the keep QR (lazy on click)"
 
-    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+
+@pytest.mark.asyncio
+async def test_mint_one_cred_lark_returns_verify_url(monkeypatch, tmp_path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    monkeypatch.setattr(feishu_uat_auth, "find_active_session", lambda **k: None)
+    monkeypatch.setattr(feishu_uat_auth, "start_session",
+                        lambda **k: {"session_id": "s1", "verification_uri": "https://accounts.feishu.cn/lark-verify"})
+    auth_urls, qr, note, flows = actions._mint_one_cred(
+        "lark-cli", profile_name="owner", open_id="ou", pdir=tmp_path, shared=tmp_path)
+    assert auth_urls["lark-cli"] == "https://accounts.feishu.cn/lark-verify"
+    assert flows["lark-cli"]["kind"] == "lark" and flows["lark-cli"]["session_id"] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_mint_one_cred_keep_returns_qr(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub_auth as cha
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    monkeypatch.setattr(cha, "start_keep_record_qr",
+                        lambda _p: {"qrcode_id": "q1", "qrcode_url": "https://x/img"})
+    monkeypatch.setattr(cha, "fetch_qr_image_key", lambda _s, _u: "img_reauth")
+    auth_urls, qr, note, flows = actions._mint_one_cred(
+        "keep-record", profile_name="owner", open_id="ou", pdir=tmp_path, shared=tmp_path)
+    assert qr["keep-record"] == "img_reauth"
+    assert flows["keep-record"]["kind"] == "keep" and flows["keep-record"]["qrcode_id"] == "q1"
+
+
+@pytest.mark.asyncio
+async def test_mint_one_cred_kep_online_with_origin(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub_auth as cha, webui_broker_server
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
     monkeypatch.setenv("HERMES_PUBLIC_CALLBACK_ORIGIN", "https://hermes.example.com")
-
-    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
-    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
     monkeypatch.setattr(webui_broker_server, "ensure_run_broker_server_started", lambda: None)
-    monkeypatch.setattr(router_mod, "_track_kep_login_proc", lambda _proc: None)
-
-    def fake_collect(*, profile_name, open_id, home_dir):
-        return [
-            credential_hub.CredentialRow(
-                id=credential_hub.KEP_CLI_ONLINE, title="kep-cli online", provider="keep",
-                installed=True, status="authenticated",
-                action={"kind": "oauth_url", "label": "重新授权", "env": "online"},
-            )
-        ]
-
-    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
     monkeypatch.setattr(cha, "start_kep_cli_login",
-                        lambda _pdir, _profile, _shared, public_origin=None, env_name="online": {
+                        lambda _p, _prof, _sh, public_origin=None, env_name="online": {
                             "verification_uri": "https://kep.example.com/reauth", "_proc": object()})
-
-    sent: dict = {}
-
-    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
-        sent["card"] = card
-        return {"message_id": "om_hub"}
-
-    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
-    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
-
-    await router_mod._handle_auth_command(
-        args="", sender="ou_owner", sender_alt=None, profile_name="owner",
-        profile_home=tmp_path, chat_id="oc_chat", gateway=object(), event=object(),
-    )
-
-    blob = json.dumps(sent.get("card", {}), ensure_ascii=False)
-    assert "https://kep.example.com/reauth" in blob, "kep-cli re-auth URL must be embedded when authenticated + origin set"
-    assert "重新授权" in blob
+    auth_urls, qr, note, flows = actions._mint_one_cred(
+        "kep-cli-online", profile_name="owner", open_id="ou", pdir=tmp_path, shared=tmp_path)
+    assert auth_urls["kep-cli-online"] == "https://kep.example.com/reauth"
+    assert flows["kep-cli-online"]["env"] == "online"
 
 
-def test_auth_command_starts_kep_cli_pre_when_row_action_targets_pre(monkeypatch, tmp_path):
-    """When the status row gates on pre, /auth must pre-generate a pre login URL."""
-    import asyncio
-    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
-    from hermes_multitenancy import feishu_auth_cards, feishu_uat_auth, webui_broker_server
-    from hermes_multitenancy import router as router_mod
-
-    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+@pytest.mark.asyncio
+async def test_mint_one_cred_kep_pre_targets_pre_env(monkeypatch, tmp_path):
+    """kep-cli-pre must start login with env_name='pre', not online."""
+    from hermes_multitenancy import credential_hub_auth as cha, webui_broker_server
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
     monkeypatch.setenv("HERMES_PUBLIC_CALLBACK_ORIGIN", "https://hermes.example.com")
-    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
-    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
     monkeypatch.setattr(webui_broker_server, "ensure_run_broker_server_started", lambda: None)
-    monkeypatch.setattr(router_mod, "_track_kep_login_proc", lambda _proc: None)
-
-    def fake_collect(*, profile_name, open_id, home_dir):
-        return [
-            credential_hub.CredentialRow(
-                id=credential_hub.KEP_CLI_PRE,
-                title="kep-cli pre",
-                provider="keep",
-                installed=True,
-                status="needs_auth",
-                detail="pre 未登录；online 已登录。",
-                action={"kind": "oauth_url", "label": "认证 pre", "env": "pre"},
-            )
-        ]
-
     calls = []
-
-    def fake_start(_pdir, _profile, _shared, public_origin=None, env_name="online"):
-        calls.append(env_name)
-        return {"verification_uri": "https://kep.example.com/pre", "_proc": object()}
-
-    sent: dict = {}
-
-    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
-        sent["card"] = card
-        return {"message_id": "om_hub"}
-
-    monkeypatch.setattr(credential_hub, "collect_credential_statuses", fake_collect)
-    monkeypatch.setattr(cha, "start_kep_cli_login", fake_start)
-    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
-    monkeypatch.setattr(router_mod, "_start_hub_flow_poll", lambda **k: None)
-
-    asyncio.run(
-        router_mod._handle_auth_command(
-            args="",
-            sender="ou_owner",
-            sender_alt=None,
-            profile_name="owner",
-            profile_home=tmp_path,
-            chat_id="oc_chat",
-            gateway=object(),
-            event=object(),
-        )
-    )
-
+    monkeypatch.setattr(cha, "start_kep_cli_login",
+                        lambda _p, _prof, _sh, public_origin=None, env_name="online": (
+                            calls.append(env_name) or {"verification_uri": "https://kep.example.com/pre", "_proc": object()}))
+    actions._mint_one_cred("kep-cli-pre", profile_name="owner", open_id="ou", pdir=tmp_path, shared=tmp_path)
     assert calls == ["pre"]
+
+
+@pytest.mark.asyncio
+async def test_mint_one_cred_kep_no_origin_shows_webui_note(monkeypatch, tmp_path):
+    """kep-cli locally (no public callback) offers a WebUI note, not a dead click."""
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    monkeypatch.delenv("HERMES_PUBLIC_CALLBACK_ORIGIN", raising=False)
+    auth_urls, qr, note, flows = actions._mint_one_cred(
+        "kep-cli-online", profile_name="owner", open_id="ou", pdir=tmp_path, shared=tmp_path)
+    assert not auth_urls and not flows
+    assert "WebUI" in note["kep-cli-online"]
 
 
 def test_poll_hub_flows_checks_kep_cli_pre_when_flow_targets_pre(monkeypatch, tmp_path):

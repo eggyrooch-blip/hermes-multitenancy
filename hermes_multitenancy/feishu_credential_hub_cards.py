@@ -90,6 +90,38 @@ def _auth_button(url: str, *, label_zh: str = "前往授权", label_en: str = "A
     }
 
 
+def _auth_callback_button(
+    cred_id: str,
+    ctx: dict[str, Any],
+    *,
+    label_zh: str,
+    label_en: str,
+    disabled: bool = False,
+) -> dict[str, Any]:
+    """A right-aligned callback button. Clicking fires ``_on_card_action_trigger``
+    with ``value = {hermes_action: 'cred_auth', cred: <id>, **ctx}`` so the hub
+    mints THIS credential's auth entry lazily (no eager pre-generation), then
+    expands the card in place. Unified across every credential — the single
+    interaction the user asked for, replacing the scattered inline-QR / URL mix."""
+    value: dict[str, Any] = {"hermes_action": "cred_auth", "cred": cred_id}
+    value.update(ctx)
+    button: dict[str, Any] = {
+        "tag": "button",
+        "text": _plain_i18n(label_zh, label_en),
+        "type": "primary",
+        "size": "small",
+        "value": value,
+    }
+    if disabled:
+        button["disabled"] = True
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_align": "right",
+        "columns": [{"tag": "column", "width": "auto", "elements": [button]}],
+    }
+
+
 def _qr_image(img_key: str, *, label_zh: str = "请使用对应 App 扫码认证", label_en: str = "Scan to authenticate") -> list[dict[str, Any]]:
     return [
         {"tag": "img", "img_key": img_key, "alt": _plain_i18n(label_zh, label_en), "mode": "fit_horizontal", "preview": True},
@@ -166,14 +198,23 @@ def build_hub_card(
     auth_urls: Optional[dict[str, str]] = None,
     pending_note: Optional[dict[str, str]] = None,
     qr_image_keys: Optional[dict[str, str]] = None,
+    ctx: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build the credential-hub card.
 
-    ``auth_urls`` maps credential id → a verification/authorize URL → renders a
-    button (lark-cli, kep-cli). ``qr_image_keys`` maps credential id → a Feishu
-    image_key → renders an inline QR image to scan (keep-record).
-    ``pending_note`` maps credential id → a short zh note for a not-yet-startable
-    tool. Entry points are embedded at render time; there is no callback button.
+    Two rendering modes, mixable per row:
+
+    * **Collapsed (default, fast)** — when ``ctx`` is provided, every credential
+      renders a unified *认证 / 重新认证* CALLBACK button carrying
+      ``{hermes_action: 'cred_auth', cred: <id>, **ctx}``. Nothing is
+      pre-generated, so the card sends instantly and every credential (incl.
+      expired ones) gets a re-auth control.
+    * **Expanded (after a click / on poll re-render)** — ``auth_urls`` maps
+      credential id → a verification URL (renders a 前往认证 button) and
+      ``qr_image_keys`` maps credential id → a Feishu image_key (renders an
+      inline scannable QR). A row present in either shows its entry inline
+      instead of the collapsed button. ``pending_note`` maps id → a short note
+      (e.g. kep-cli needs a public callback → use WebUI locally).
     """
     auth_urls = auth_urls or {}
     pending_note = pending_note or {}
@@ -212,10 +253,20 @@ def build_hub_card(
                 elements.append(_auth_button(auth_urls[row.id], label_zh="重新授权", label_en="Re-authorize"))
             else:
                 elements.append(_auth_button(auth_urls[row.id]))
-        elif not row.authenticated and pending_note.get(row.id):
+        elif pending_note.get(row.id):
+            # Expanded-state note for a credential that can't mint an inline
+            # entry here (e.g. kep-cli locally needs a public callback → WebUI).
             note = pending_note[row.id]
             elements.append({"tag": "markdown", "content": note,
                              "i18n_content": _i18n(note, note), "text_size": "notation"})
+        elif ctx is not None:
+            # Collapsed default: one unified callback button per credential. The
+            # click handler mints this row's entry lazily and re-renders it into
+            # the expanded state above. Authenticated rows still offer re-auth.
+            if row.authenticated:
+                elements.append(_auth_callback_button(row.id, ctx, label_zh="重新认证", label_en="Re-authenticate"))
+            else:
+                elements.append(_auth_callback_button(row.id, ctx, label_zh="认证", label_en="Authenticate"))
         if idx != len(rows) - 1:
             elements.append({"tag": "hr"})
 

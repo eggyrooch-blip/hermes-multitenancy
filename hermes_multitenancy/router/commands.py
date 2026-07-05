@@ -921,7 +921,7 @@ async def _handle_auth_command(
     here too, so the card renders static auth URLs / inline QR directly.
     """
     del args, event
-    from .. import credential_hub, credential_hub_auth as cha, feishu_uat_auth
+    from .. import credential_hub
     from ..feishu_auth_cards import send_auth_card
     from ..feishu_credential_hub_cards import build_hub_card
 
@@ -954,114 +954,24 @@ async def _handle_auth_command(
         return
     rows = _m._filter_hub_rows_for_auth(rows)
 
-    shared = feishu_uat_auth.resolve_shared_home()
-    pdir = Path(profile_home) if profile_home else (shared / "profiles" / profile_name)
-    auth_urls: dict[str, str] = {}
-    qr_image_keys: dict[str, str] = {}
-    pending_note: dict[str, str] = {}
-    flows: dict[str, dict[str, Any]] = {}
-    origin = os.environ.get("HERMES_PUBLIC_CALLBACK_ORIGIN", "").strip() or None
-
-    for row in rows:
-        if row.id == credential_hub.LARK_CLI:
-            # Always offer a (re-)authorize entry for lark, even when the row reads
-            # `authenticated`. lark_cli_status marks authenticated on the weak
-            # default_identity == "user" signal, which can be true with no usable
-            # UAT (env HERMES_LARK_CLI_DEFAULT_AS=user, or a stale local cred file).
-            # /feishu_auth — which never checks status and always mints a session —
-            # is the proven-working reference; /auth must match it so the lark row is
-            # never a dead "已认证 but no button" card. (issue: auth-hub-lark-reauth-button)
-            try:
-                session = await asyncio.to_thread(
-                    feishu_uat_auth.find_active_session,
-                    profile_name=profile_name,
-                    open_id=open_id,
-                )
-                if not session:
-                    session = await asyncio.to_thread(
-                        feishu_uat_auth.start_session,
-                        profile_name=profile_name,
-                        open_id=open_id,
-                    )
-                uri = str(session.get("verification_uri") or "")
-                if uri:
-                    auth_urls[credential_hub.LARK_CLI] = uri
-                    flows[credential_hub.LARK_CLI] = {
-                        "kind": "lark",
-                        "session_id": str(session.get("session_id") or ""),
-                    }
-            except cha.HubAuthError as exc:
-                _m.logger.debug("multitenancy: hub auth pregen %s unavailable (%s)", row.id, exc.message)
-            except Exception as exc:
-                _m.logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
-            continue
-        # Mint a (re-)authorize entry for every connector, authenticated or not, so
-        # the hub always lets the user re-verify a tool on demand (sunke 2026-06-26).
-        # Non-lark rows only render a button/QR when an entry was actually minted
-        # here, so an unsupported/un-startable tool still shows no dead control.
-        if row.id == credential_hub.KEEP_RECORD:
-            try:
-                qr = await asyncio.to_thread(cha.start_keep_record_qr, pdir)
-                image_key = await asyncio.to_thread(cha.fetch_qr_image_key, shared, qr["qrcode_url"])
-                qr_image_keys[credential_hub.KEEP_RECORD] = image_key
-                flows[credential_hub.KEEP_RECORD] = {
-                    "kind": "keep",
-                    "qrcode_id": qr["qrcode_id"],
-                }
-            except cha.HubAuthError as exc:
-                _m.logger.debug("multitenancy: hub auth pregen %s unavailable (%s)", row.id, exc.message)
-            except Exception as exc:
-                _m.logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
-        elif row.id in credential_hub.KEP_CLI_IDS:
-            if origin:
-                try:
-                    env_name = str((row.action or {}).get("env") or "online")
-                    try:
-                        from .. import webui_broker_server as _wb
-
-                        _wb.ensure_run_broker_server_started()
-                    except Exception as exc:  # pragma: no cover - defensive
-                        _m.logger.debug("multitenancy: run-broker lazy start failed (%s)", exc)
-                    login = await asyncio.to_thread(
-                        cha.start_kep_cli_login,
-                        pdir,
-                        profile_name,
-                        shared,
-                        public_origin=origin,
-                        env_name=env_name,
-                    )
-                    proc = login.get("_proc")
-                    _m._track_kep_login_proc(proc)
-                    auth_urls[row.id] = login["verification_uri"]
-                    flows[row.id] = {"kind": "kep", "proc": proc, "env": env_name}
-                except cha.HubAuthError as exc:
-                    _m.logger.debug("multitenancy: hub auth pregen %s unavailable (%s)", row.id, exc.message)
-                except Exception as exc:
-                    _m.logger.debug("multitenancy: hub auth pregen %s failed (%s)", row.id, exc)
-            elif row.installed and not row.authenticated:
-                pending_note[row.id] = "kep-cli 飞书内认证需公网回调（已在 prod 支持），本机请用 WebUI。"
-
-    card = build_hub_card(rows=rows, auth_urls=auth_urls, qr_image_keys=qr_image_keys, pending_note=pending_note)
+    # Send the hub FAST: one unified 认证/重新认证 callback button per credential,
+    # nothing pre-generated. Each credential's auth entry (device-flow session /
+    # QR / kep login) is minted lazily only when the user clicks its button (see
+    # feishu_auth_hub_actions._handle_cred_auth_action), which keeps /auth
+    # instant and gives every credential — expired ones included — a re-auth
+    # control in one unified interaction.
+    ctx = {
+        "profile_name": profile_name,
+        "open_id": open_id,
+        "chat_id": chat_id,
+    }
+    card = build_hub_card(rows=rows, ctx=ctx)
     sent = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
     if sent is None:
         lines = ["凭证中心："] + [
             f"- {row.title}: {'✅ 已认证' if row.authenticated else '⚠️ 未认证'}" for row in rows
         ]
         await _m._safe_call(adapter.send, chat_id, "\n".join(lines))
-        return
-
-    _m._start_hub_flow_poll(
-        profile_name=profile_name,
-        open_id=open_id,
-        profile_dir=pdir,
-        shared_home=shared,
-        chat_id=chat_id,
-        gateway=gateway,
-        hub_card=sent,
-        flows=flows,
-        auth_urls=auth_urls,
-        qr_image_keys=qr_image_keys,
-    )
 
 
 def _track_kep_login_proc(proc: Any) -> None:

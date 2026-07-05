@@ -195,4 +195,6 @@ def install_cron_runtime_patches() -> None:
     install_feishu_reaction_lifecycle_patch()
     from .feishu_group_valve import install_feishu_group_valve_patch
     install_feishu_group_valve_patch()
+    from .feishu_auth_hub_actions import install_feishu_auth_hub_actions
+    install_feishu_auth_hub_actions()
     _runtime_patches_installed = True
