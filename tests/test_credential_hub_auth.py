@@ -587,6 +587,52 @@ def test_auth_command_is_group_blocked():
     assert router_mod._is_blocked_group_command("auth@bot")
 
 
+def test_cred_auth_group_check_uses_signed_context_not_payload(monkeypatch, tmp_path):
+    """The group-scope guard must read the chat from the SIGNED event context,
+    never the unsigned button payload. A forwarded/stale card carrying a spoofed
+    (original DM) chat_id in its value, clicked inside a provisioned group, must
+    still be rejected — the signed context (group) wins."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import router as router_mod
+
+    class _Table:
+        def lookup_by_chat_id(self, cid):
+            return object() if cid == "oc_GROUP" else None
+        def resolve_owner_root(self, o):
+            return None
+        def lookup_by_open_id(self, o):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
+
+    # Signed context says GROUP; payload spoofs a DM chat_id.
+    forged = {"cred": "lark-cli", "chat_id": "oc_DM_forged"}
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id="ou_B"),
+        context=types.SimpleNamespace(open_chat_id="oc_GROUP", open_message_id="om"),
+        action=types.SimpleNamespace(value=forged),
+    )
+    resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, forged)
+    assert resp is not None
+    assert minted["n"] == 0, "spoofed payload chat_id must not bypass the signed-context group guard"
+
+
+def test_hub_card_button_payload_carries_only_cred():
+    """The callback button value must contain no identity/chat — only cred +
+    hermes_action — so nothing sensitive rides in the unsigned payload."""
+    import json as _json
+    from hermes_multitenancy.credential_hub import CredentialRow
+    from hermes_multitenancy.feishu_credential_hub_cards import build_hub_card
+    rows = [CredentialRow(id="lark-cli", title="L", provider="l", installed=True, status="needs_auth")]
+    blob = _json.dumps(build_hub_card(rows=rows, ctx={}), ensure_ascii=False)
+    assert '"cred": "lark-cli"' in blob and '"hermes_action": "cred_auth"' in blob
+    assert '"chat_id"' not in blob and '"profile_name"' not in blob and '"open_id"' not in blob
+
+
 def test_poll_hub_flows_checks_kep_cli_pre_when_flow_targets_pre(monkeypatch, tmp_path):
     """A pre login flow must be confirmed by polling pre, not online."""
     import asyncio

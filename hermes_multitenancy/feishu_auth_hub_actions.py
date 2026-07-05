@@ -84,7 +84,7 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     from .feishu_credential_hub_cards import build_hub_card
 
     cred = str(action_value.get("cred") or "").strip()
-    chat_id = _ctx_chat_id(event, action_value)
+    chat_id = _signed_chat_id(event)
     message_id = _ctx_message_id(event)
     if not cred:
         return _toast_response("认证信息不完整，请重新发送 /auth")
@@ -227,10 +227,12 @@ def _read_value(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-def _ctx_chat_id(event: Any, action_value: dict[str, Any]) -> str:
-    chat_id = str(action_value.get("chat_id") or "").strip()
-    if chat_id:
-        return chat_id
+def _signed_chat_id(event: Any) -> str:
+    """The chat where the card actually lives, from the Feishu-SIGNED event
+    context ONLY. Never the button payload: a forwarded/stale card could carry a
+    spoofed (e.g. original DM) chat_id and slip a personal hub past the
+    group-scope guard. This is the authoritative chat for both the group check
+    and delivery."""
     context = _read_value(event, "context")
     return str(_read_value(context, "open_chat_id") or "").strip()
 
