@@ -133,9 +133,14 @@ def _patch_bot_added(FeishuAdapter: Any, *, send_welcome: bool = False) -> None:
 
     setattr(wrapped, _CLASS_PATCH_FLAG, True)
     FeishuAdapter._on_bot_added_to_chat = wrapped
+    # The module name here is the deploy-time observable for the double-import
+    # trap: it must match the adapter logger seen in gateway logs (e.g.
+    # ``hermes_plugins.feishu_platform.adapter``), else the patch landed on an
+    # unused clone class and inviter capture will silently never fire.
     logger.info(
-        "[multitenancy] installed bot-added inviter hook on FeishuAdapter class "
+        "[multitenancy] installed bot-added inviter hook on %s.FeishuAdapter "
         "(welcome_card_here=%s)",
+        FeishuAdapter.__module__,
         send_welcome,
     )
 

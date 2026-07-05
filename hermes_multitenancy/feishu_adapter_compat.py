@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import sys
 from importlib import import_module
 from types import ModuleType
 from typing import Any
+
+# Newer cores load the bundled feishu platform plugin through
+# ``hermes_cli/plugins.py``, which imports the plugin directory under this
+# SYNTHETIC package name via ``spec_from_file_location`` — producing a module
+# object DISTINCT from ``plugins.platforms.feishu.adapter`` even though both
+# come from the same source file. The synthetic module exists only in
+# ``sys.modules`` (it cannot be imported by name), and it is the one the
+# gateway actually instantiates — class patches must land on it, else they
+# silently no-op (root cause of bot-added inviter capture never firing).
+_PLUGIN_LOADER_MODULE_NAME = "hermes_plugins.feishu_platform.adapter"
 
 _FEISHU_MODULE_NAMES = (
     "gateway.platforms.feishu",
@@ -42,6 +53,14 @@ def log_feishu_adapter_load_error(logger: Any, message: str, exc: BaseException)
 
 
 def load_feishu_module() -> ModuleType:
+    # The plugin-loader's synthetic module wins when present: it is the
+    # adapter the gateway actually runs. (For the legacy names below a plain
+    # ``import_module`` already returns the cached ``sys.modules`` entry, so
+    # only the synthetic name needs an explicit lookup.) Guarded on the
+    # ``FeishuAdapter`` attr so a half-initialized module never wins.
+    module = sys.modules.get(_PLUGIN_LOADER_MODULE_NAME)
+    if module is not None and getattr(module, "FeishuAdapter", None) is not None:
+        return module
     last_error: Exception | None = None
     for module_name in _FEISHU_MODULE_NAMES:
         try:

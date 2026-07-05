@@ -164,6 +164,52 @@ def test_feishu_module_falls_back_on_bare_candidate_module_errors(monkeypatch) -
     assert seen == ["gateway.platforms.feishu", "plugins.platforms.feishu.adapter"]
 
 
+def test_feishu_module_prefers_already_loaded_synthetic_plugin_module(monkeypatch) -> None:
+    """Regression for the double-import trap behind 0/49 inviter captures.
+
+    ``hermes_cli/plugins.py`` loads the bundled feishu platform plugin under
+    the synthetic ``hermes_plugins.feishu_platform.adapter`` name via
+    ``spec_from_file_location`` — a module object DISTINCT from what a fresh
+    ``import plugins.platforms.feishu.adapter`` would create from the same
+    source file. Class patches (group_inviter_hook, cron delivery patches,
+    reply-quote, …) must land on the module the gateway actually runs, so an
+    already-loaded candidate must win over a fresh import."""
+    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    synthetic.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
+    clone = types.ModuleType("plugins.platforms.feishu.adapter")
+    clone.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+
+    def import_module(name: str) -> types.ModuleType:
+        if name == "plugins.platforms.feishu.adapter":
+            return clone
+        raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+
+    monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+
+    assert feishu_adapter_compat.load_feishu_module() is synthetic
+    assert feishu_adapter_compat.load_feishu_adapter() is synthetic.FeishuAdapter
+
+
+def test_feishu_module_skips_loaded_module_without_adapter_class(monkeypatch) -> None:
+    """A half-initialized (or unrelated) module under a candidate name must
+    not win the sys.modules preference; resolution falls through to import."""
+    partial = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", partial)
+    legacy = types.ModuleType("gateway.platforms.feishu")
+    legacy.FeishuAdapter = type("FeishuAdapter", (), {})  # type: ignore[attr-defined]
+
+    def import_module(name: str) -> types.ModuleType:
+        if name == "gateway.platforms.feishu":
+            return legacy
+        raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+
+    monkeypatch.setattr(feishu_adapter_compat, "import_module", import_module)
+
+    assert feishu_adapter_compat.load_feishu_module() is legacy
+
+
 def test_feishu_adapter_load_error_logger_distinguishes_expected_missing_modules() -> None:
     class FakeLogger:
         def __init__(self) -> None:
