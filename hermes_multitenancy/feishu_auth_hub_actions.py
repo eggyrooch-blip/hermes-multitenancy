@@ -89,6 +89,13 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     if not cred:
         return _toast_response("认证信息不完整，请重新发送 /auth")
 
+    # SCOPING: the credential hub is strictly personal. /auth is hard-rejected in
+    # group chats at the command gate, but guard the card action too (defense in
+    # depth for a forwarded/stale card) — never render or mutate a member's
+    # personal credential hub inside a shared group chat.
+    if _chat_is_group(chat_id):
+        return _toast_response("认证只能在私聊里进行，请私聊我发送 /auth")
+
     # SECURITY: identity and profile are resolved from the Feishu-SIGNED event
     # operator (who actually clicked), NEVER from the unsigned callback payload.
     # The card can be clicked by anyone who sees it (e.g. any group member), so
@@ -235,6 +242,24 @@ def _ctx_message_id(event: Any) -> str:
         if value:
             return str(value)
     return str(_read_value(event, "open_message_id") or "").strip()
+
+
+def _chat_is_group(chat_id: str) -> bool:
+    """True when ``chat_id`` is a provisioned group chat. Group rows are keyed by
+    chat_id in the routing table (kind='group'); a personal DM never is. Fails
+    CLOSED (treats an unresolvable chat as group) so a lookup error can't leak a
+    personal hub into a group."""
+    if not chat_id:
+        return False
+    try:
+        from .router import _get_routing_table
+        table = _get_routing_table()
+        if table is None:
+            return False
+        return table.lookup_by_chat_id(chat_id) is not None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("[multitenancy] cred_auth group check failed for %s (%s)", chat_id, exc)
+        return True
 
 
 def _operator_typed_ids(event: Any) -> dict[str, str]:

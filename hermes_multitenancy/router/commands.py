@@ -89,8 +89,8 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     await _m._safe_call(
                         adapter.send,
                         chat_id,
-                        "群聊模式下不支持 /feishu_auth。"
-                        "如需以你本人的身份调用飞书数据，请在与我私聊时执行。",
+                        "群聊模式下不支持认证类命令（/auth、/feishu_auth 等）。"
+                        "如需查看或认证你本人的凭证，请在与我私聊时执行。",
                     )
                 return
 

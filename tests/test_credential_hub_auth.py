@@ -442,6 +442,8 @@ def test_cred_auth_action_uses_signed_operator_ignores_payload_identity(monkeypa
             return _Row() if oid == "ou_B" else None
         def lookup_by_open_id(self, oid):
             return None
+        def lookup_by_chat_id(self, cid):
+            return None
 
     monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
     (tmp_path / "profiles" / "profile_B").mkdir(parents=True)
@@ -517,6 +519,8 @@ def test_cred_auth_action_resolves_schema2_union_id_operator(monkeypatch, tmp_pa
             return _Row() if uid == "on_UNION" else None
         def lookup_by_user_id(self, u):
             return None
+        def lookup_by_chat_id(self, cid):
+            return None
 
     monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
     (tmp_path / "profiles" / "profile_B").mkdir(parents=True)
@@ -539,6 +543,48 @@ def test_cred_auth_action_resolves_schema2_union_id_operator(monkeypatch, tmp_pa
     assert resp is not None
     assert used == {"profile_name": "profile_B", "open_id": "ou_B_synced"}, \
         "Schema 2 union_id operator must resolve via lookup_by_union_id + routing open_id"
+
+
+def test_cred_auth_action_rejected_in_group_chat(monkeypatch, tmp_path):
+    """SCOPING: the personal credential hub must never render/mutate inside a
+    group chat. A cred_auth click whose chat_id is a provisioned group is
+    rejected before any mint (defense in depth behind the /auth group command
+    gate)."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import router as router_mod
+
+    class _Table:
+        def lookup_by_chat_id(self, cid):
+            return object() if cid == "oc_GROUP" else None
+        def resolve_owner_root(self, o):
+            return None
+        def lookup_by_open_id(self, o):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
+
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id="ou_B"),
+        context=types.SimpleNamespace(open_chat_id="oc_GROUP", open_message_id="om"),
+        action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+    )
+    resp = actions._handle_cred_auth_action(
+        types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    assert resp is not None
+    assert minted["n"] == 0, "cred_auth in a group chat must not mint a personal credential"
+
+
+def test_auth_command_is_group_blocked():
+    """/auth (the credential hub) must be in the group-blocked auth family so it
+    is hard-rejected in group chats — its cards carry group-clickable buttons."""
+    from hermes_multitenancy import router as router_mod
+    assert "auth" in router_mod._GROUP_BLOCKED_COMMANDS
+    assert router_mod._is_blocked_group_command("auth")
+    assert router_mod._is_blocked_group_command("auth@bot")
 
 
 def test_poll_hub_flows_checks_kep_cli_pre_when_flow_targets_pre(monkeypatch, tmp_path):

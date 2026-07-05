@@ -1636,10 +1636,14 @@ def _extract_chat_id(event: Any) -> str:
     return ""
 
 
-# Commands that bind/replace a per-user Feishu identity. None of them make
-# sense in a group profile (it owns no UAT), so all are hard-rejected.
+# Commands that read or bind/replace a per-user Feishu identity. None of them
+# make sense in a group profile (it owns no UAT), and rendering a member's
+# PERSONAL credential hub into a shared group chat would leak/mutate their
+# credentials, so all are hard-rejected in groups. ``auth`` (the credential
+# hub) is included: its cards now carry group-clickable re-auth buttons, so it
+# must never be openable in a group.
 _GROUP_BLOCKED_COMMANDS: frozenset[str] = frozenset(
-    {"feishu_auth", "feishu-auth", "feishu_logout", "feishu-logout", "feishu_reauth", "feishu-reauth"}
+    {"auth", "feishu_auth", "feishu-auth", "feishu_logout", "feishu-logout", "feishu_reauth", "feishu-reauth"}
 )
 # Zero-width / bidi chars Feishu clients occasionally inject; stripped before
 # the command-name membership check so they can't smuggle a blocked command
