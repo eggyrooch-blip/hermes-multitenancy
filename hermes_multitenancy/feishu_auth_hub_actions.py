@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,6 +30,52 @@ logger = logging.getLogger(__name__)
 
 _HOOK_INSTALLED = False
 _CARD_ACTION_FLAG = "_hermes_multitenancy_cred_auth_card_action_patched"
+
+# --- DM-provenance allowlist ---------------------------------------------------
+# Card-action callbacks carry NO chat_type, and user routing rows store no p2p
+# chat_id, so a click alone can't prove it happened in a 1:1 DM. But we know one
+# thing for certain: /auth is hard-blocked in groups at the command gate (message
+# events DO carry a reliable chat_type), so every hub card we actually SEND lands
+# in a private chat. We remember those cards' signed message ids here; a card
+# FORWARDED into a group becomes a NEW message with a different id, so its clicks
+# miss the allowlist and are rejected. This is the positive DM signal — without
+# it an unprovisioned-group forward would fall open (codex round-6 CRITICAL).
+#
+# ponytail: process-local bounded LRU. On gateway restart the set is empty, so a
+# stale card's click fails CLOSED ("re-send /auth") — safe and self-healing.
+# Make it durable only if restart-mid-auth becomes a real complaint.
+_DM_AUTH_CARD_IDS_MAX = 4096
+_dm_auth_card_ids: "OrderedDict[str, None]" = OrderedDict()
+_dm_auth_card_lock = threading.Lock()
+
+
+def record_dm_auth_card(*ids: Optional[str]) -> None:
+    """Remember the message/card ids of an /auth hub card sent into a DM.
+
+    Called from the (group-blocked) /auth command send site, so every id here
+    provably belongs to a 1:1 chat. Accepts several ids (message_id + card_id)
+    because a click callback may report either.
+    """
+    with _dm_auth_card_lock:
+        for raw in ids:
+            mid = str(raw or "").strip()
+            if not mid:
+                continue
+            _dm_auth_card_ids.pop(mid, None)
+            _dm_auth_card_ids[mid] = None
+            while len(_dm_auth_card_ids) > _DM_AUTH_CARD_IDS_MAX:
+                _dm_auth_card_ids.popitem(last=False)
+
+
+def _is_known_dm_auth_card(*ids: Optional[str]) -> bool:
+    """True iff any id matches a hub card we sent into a DM (see above)."""
+    with _dm_auth_card_lock:
+        for raw in ids:
+            mid = str(raw or "").strip()
+            if mid and mid in _dm_auth_card_ids:
+                _dm_auth_card_ids.move_to_end(mid)
+                return True
+    return False
 
 
 def install_feishu_auth_hub_actions() -> None:
@@ -86,15 +134,22 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     cred = str(action_value.get("cred") or "").strip()
     chat_id = _signed_chat_id(event)
     message_id = _ctx_message_id(event)
+    card_id = _ctx_card_id(event)
     if not cred:
         return _toast_response("认证信息不完整，请重新发送 /auth")
 
-    # SCOPING: the credential hub is strictly personal. /auth is hard-rejected in
-    # group chats at the command gate, but guard the card action too (defense in
-    # depth for a forwarded/stale card) — never render or mutate a member's
-    # personal credential hub inside a shared group chat.
+    # SCOPING (fail-closed): the credential hub is strictly personal. Two guards,
+    # both must pass, so a member can never render/mutate their personal hub in a
+    # shared chat:
+    #  1) cheap reject if the signed event/routing says this is a group chat;
+    #  2) AUTHORITATIVE positive gate — proceed only if this click lands on a hub
+    #     card WE sent into a DM (allowlist by signed message/card id). A card
+    #     forwarded into a group is a NEW message with an id we never recorded, so
+    #     it is rejected even though callbacks carry no chat_type (round-6 fix).
     if _chat_is_group(event, chat_id):
         return _toast_response("认证只能在私聊里进行，请私聊我发送 /auth")
+    if not _is_known_dm_auth_card(message_id, card_id):
+        return _toast_response("认证卡片已过期或不在私聊里，请重新私聊我发送 /auth")
 
     # SECURITY: identity and profile are resolved from the Feishu-SIGNED event
     # operator (who actually clicked), NEVER from the unsigned callback payload.
@@ -248,6 +303,17 @@ def _ctx_message_id(event: Any) -> str:
         if value:
             return str(value)
     return str(_read_value(event, "open_message_id") or "").strip()
+
+
+def _ctx_card_id(event: Any) -> str:
+    """Best-effort card-entity id from the signed callback (CardKit cards may be
+    addressed by card_id rather than message_id). Empty when absent."""
+    context = _read_value(event, "context")
+    for name in ("card_id", "open_card_id"):
+        value = _read_value(context, name)
+        if value:
+            return str(value)
+    return ""
 
 
 def _chat_is_group(event: Any, chat_id: str) -> bool:

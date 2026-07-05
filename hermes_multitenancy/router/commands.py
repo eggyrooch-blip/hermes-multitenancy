@@ -972,6 +972,13 @@ async def _handle_auth_command(
             f"- {row.title}: {'✅ 已认证' if row.authenticated else '⚠️ 未认证'}" for row in rows
         ]
         await _m._safe_call(adapter.send, chat_id, "\n".join(lines))
+    else:
+        # Record this card's signed ids as DM-originated: the click handler only
+        # mints for a card it can prove was sent into a private chat (this send
+        # site is group-blocked). A copy forwarded into a group gets a new id and
+        # is rejected. See feishu_auth_hub_actions.record_dm_auth_card.
+        from ..feishu_auth_hub_actions import record_dm_auth_card
+        record_dm_auth_card(sent.get("message_id"), sent.get("card_id"))
 
 
 def _track_kep_login_proc(proc: Any) -> None:

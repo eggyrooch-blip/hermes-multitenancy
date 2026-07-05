@@ -410,6 +410,35 @@ def test_mint_one_cred_kep_no_origin_shows_webui_note(monkeypatch, tmp_path):
     assert "WebUI" in note["kep-cli-online"]
 
 
+@pytest.fixture(autouse=True)
+def _clear_dm_auth_card_allowlist():
+    """The DM-provenance allowlist is module-global; reset it around every test so
+    a recorded id can't leak into a negative (forwarded-card) test."""
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    with actions._dm_auth_card_lock:
+        actions._dm_auth_card_ids.clear()
+    yield
+    with actions._dm_auth_card_lock:
+        actions._dm_auth_card_ids.clear()
+
+
+def _card_data(resp):
+    """Extract the raw card dict from a card-action response regardless of whether
+    the lark SDK is installed (P2CardActionTriggerResponse with .card.data) or not
+    (dict fallback {"card": {"data": ...}}). Serializing the SDK response object
+    directly hides the card, so assertions must go through this."""
+    if isinstance(resp, dict):
+        return ((resp.get("card") or {}).get("data")) or {}
+    card = getattr(resp, "card", None)
+    return getattr(card, "data", None) or {}
+
+
+def _toast_text(resp):
+    """Extract a toast's content string across the same SDK/dict split."""
+    toast = resp.get("toast") if isinstance(resp, dict) else getattr(resp, "toast", None)
+    return (toast or {}).get("content", "") if isinstance(toast, dict) else ""
+
+
 def _cred_auth_event(operator_open_id, payload):
     import types
     return types.SimpleNamespace(
@@ -453,6 +482,7 @@ def test_cred_auth_action_uses_signed_operator_ignores_payload_identity(monkeypa
     monkeypatch.setattr(actions, "_mint_one_cred", fake_mint)
     monkeypatch.setattr(actions, "_collect_rows", lambda **k: [])
 
+    actions.record_dm_auth_card("om")  # card was sent into this DM
     forged = {"hermes_action": "cred_auth", "cred": "lark-cli",
               "profile_name": "profile_A", "open_id": "ou_ATTACKER"}
     resp = actions._handle_cred_auth_action(
@@ -482,6 +512,7 @@ def test_cred_auth_action_rejects_unbound_operator(monkeypatch, tmp_path):
     monkeypatch.setattr(actions, "_mint_one_cred",
                         lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
 
+    actions.record_dm_auth_card("om")  # DM provenance ok; rejection must be the operator gate
     resp = actions._handle_cred_auth_action(
         types.SimpleNamespace(_loop=None),
         _cred_auth_event("ou_unbound", {"cred": "lark-cli"}),
@@ -527,6 +558,7 @@ def test_cred_auth_action_resolves_schema2_union_id_operator(monkeypatch, tmp_pa
                             used.update(profile_name=profile_name, open_id=open_id) or ({cred: "u"}, {}, {}, {})))
     monkeypatch.setattr(actions, "_collect_rows", lambda **k: [])
 
+    actions.record_dm_auth_card("om")  # card was sent into this DM
     # Operator carries ONLY union_id (Schema 2) — no open_id.
     event = types.SimpleNamespace(
         operator=types.SimpleNamespace(union_id="on_UNION"),
@@ -562,6 +594,7 @@ def test_cred_auth_action_rejected_in_group_chat(monkeypatch, tmp_path):
     monkeypatch.setattr(actions, "_mint_one_cred",
                         lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
 
+    actions.record_dm_auth_card("om")  # provenance ok; rejection must be the group-scope guard
     event = types.SimpleNamespace(
         operator=types.SimpleNamespace(open_id="ou_B"),
         context=types.SimpleNamespace(open_chat_id="oc_GROUP", open_message_id="om"),
@@ -604,6 +637,7 @@ def test_cred_auth_group_check_uses_signed_context_not_payload(monkeypatch, tmp_
     monkeypatch.setattr(actions, "_mint_one_cred",
                         lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
 
+    actions.record_dm_auth_card("om")  # provenance ok; only the signed-context guard should reject
     # Signed context says GROUP; payload spoofs a DM chat_id.
     forged = {"cred": "lark-cli", "chat_id": "oc_DM_forged"}
     event = types.SimpleNamespace(
@@ -636,6 +670,7 @@ def test_cred_auth_rejected_in_unprovisioned_group_via_chat_type(monkeypatch, tm
     monkeypatch.setattr(actions, "_mint_one_cred",
                         lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
 
+    actions.record_dm_auth_card("om")  # provenance ok; the chat_type branch must still reject
     for chat_type_carrier in (
         {"chat_type": "group"},                       # event-level
         {"context_chat_type": "topic"},               # context-level
@@ -687,16 +722,133 @@ def test_cred_auth_updated_card_payload_has_no_chat_id(monkeypatch, tmp_path):
                         lambda **k: [CredentialRow(id="lark-cli", title="L", provider="l", installed=True, status="needs_auth"),
                                      CredentialRow(id="keep-record", title="K", provider="k", installed=True, status="needs_auth")])
 
+    actions.record_dm_auth_card("om")  # card was sent into this DM
     event = types.SimpleNamespace(
         operator=types.SimpleNamespace(open_id="ou_B"),
         context=types.SimpleNamespace(open_chat_id="oc_dm", open_message_id="om"),
         action=types.SimpleNamespace(value={"cred": "lark-cli"}),
     )
     resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
-    blob = _json.dumps(resp, ensure_ascii=False, default=str)
+    # Inspect the ACTUAL card dict, not str(SDK response) — see _card_data.
+    blob = _json.dumps(_card_data(resp), ensure_ascii=False)
     assert "https://v" in blob, "clicked credential should expand (lark URL shown)"
     assert '"chat_id"' not in blob and '"open_id"' not in blob and '"profile_name"' not in blob, \
         "updated card button payloads must carry no chat_id/identity"
+
+
+def test_cred_auth_rejected_when_card_not_from_dm_send(monkeypatch, tmp_path):
+    """CRITICAL (codex round-6): a real card-action callback carries NO chat_type,
+    and an unprovisioned group has no routing row — so the chat_type/routing group
+    checks alone fall OPEN. A card forwarded into such a group is a NEW message
+    whose id we never recorded, so the DM-provenance gate must reject it: no mint,
+    no personal auth URL/QR ever rendered in the group."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    class _Row:
+        profile_name = "pB"
+        open_id = "ou_B"
+
+    class _Table:  # operator IS bound, and the group is NOT a provisioned row
+        def resolve_owner_root(self, o):
+            return _Row() if o == "ou_B" else None
+        def lookup_by_open_id(self, o):
+            return None
+        def lookup_by_chat_id(self, c):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    (tmp_path / "profiles" / "pB").mkdir(parents=True)
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
+
+    # Forwarded copy: message_id 'om_forwarded' was NEVER recorded by an /auth send.
+    # No chat_type anywhere (mirrors the real Lark CallBackContext), unprovisioned
+    # group chat — the pre-round-6 fall-open path.
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id="ou_B"),
+        context=types.SimpleNamespace(open_chat_id="oc_UNPROVISIONED_GROUP", open_message_id="om_forwarded"),
+        action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+    )
+    resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    assert resp is not None
+    assert minted["n"] == 0, "a forwarded (unrecorded) card must never mint — fail closed"
+    assert "私聊" in _toast_text(resp), "should tell the user to re-auth in a private chat"
+
+
+def test_cred_auth_allowed_only_for_recorded_dm_card(monkeypatch, tmp_path):
+    """The DM-provenance gate is a positive allowlist: the SAME event mints once
+    its card id is recorded, and is rejected once it is not — proving the gate,
+    not some unrelated guard, is what admits the click."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    class _Row:
+        profile_name = "pB"
+        open_id = "ou_B"
+
+    class _Table:
+        def resolve_owner_root(self, o):
+            return _Row() if o == "ou_B" else None
+        def lookup_by_open_id(self, o):
+            return None
+        def lookup_by_chat_id(self, c):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    (tmp_path / "profiles" / "pB").mkdir(parents=True)
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: (minted.__setitem__("n", minted["n"] + 1) or ({"lark-cli": "https://v"}, {}, {}, {})))
+    monkeypatch.setattr(actions, "_collect_rows", lambda **k: [])
+
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id="ou_B"),
+        context=types.SimpleNamespace(open_chat_id="oc_dm", open_message_id="om_dm"),
+        action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+    )
+    # Not recorded → rejected.
+    actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    assert minted["n"] == 0
+    # Recorded (as the /auth send would) → minted.
+    actions.record_dm_auth_card("om_dm")
+    actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    assert minted["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_command_records_dm_card_provenance(monkeypatch, tmp_path):
+    """/auth's send site must register the card it sent so its own buttons are
+    later clickable (the provenance gate would reject an unrecorded id)."""
+    from hermes_multitenancy import credential_hub, feishu_auth_cards, feishu_uat_auth
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import router as router_mod
+
+    rows = [credential_hub.CredentialRow(id=credential_hub.LARK_CLI, title="L",
+                                         provider="lark", installed=True, status="needs_auth")]
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda _g: object())
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(credential_hub, "collect_credential_statuses",
+                        lambda *, profile_name, open_id, home_dir: rows)
+
+    async def fake_send_auth_card(*, adapter, chat_id, card, metadata=None):
+        return {"message_id": "om_sent", "card_id": "card_sent"}
+
+    monkeypatch.setattr(feishu_auth_cards, "send_auth_card", fake_send_auth_card)
+    await router_mod._handle_auth_command(
+        args="", sender="ou_owner", sender_alt=None, profile_name="owner",
+        profile_home=tmp_path, chat_id="oc_dm", gateway=object(), event=object(),
+    )
+    assert actions._is_known_dm_auth_card("om_sent"), "message_id must be recorded as DM provenance"
+    assert actions._is_known_dm_auth_card("card_sent"), "card_id must be recorded too"
 
 
 def test_hub_card_button_payload_carries_only_cred():
