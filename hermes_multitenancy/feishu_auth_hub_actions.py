@@ -93,7 +93,7 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     # group chats at the command gate, but guard the card action too (defense in
     # depth for a forwarded/stale card) — never render or mutate a member's
     # personal credential hub inside a shared group chat.
-    if _chat_is_group(chat_id):
+    if _chat_is_group(event, chat_id):
         return _toast_response("认证只能在私聊里进行，请私聊我发送 /auth")
 
     # SECURITY: identity and profile are resolved from the Feishu-SIGNED event
@@ -246,22 +246,32 @@ def _ctx_message_id(event: Any) -> str:
     return str(_read_value(event, "open_message_id") or "").strip()
 
 
-def _chat_is_group(chat_id: str) -> bool:
-    """True when ``chat_id`` is a provisioned group chat. Group rows are keyed by
-    chat_id in the routing table (kind='group'); a personal DM never is. Fails
-    CLOSED (treats an unresolvable chat as group) so a lookup error can't leak a
-    personal hub into a group."""
-    if not chat_id:
-        return False
+def _chat_is_group(event: Any, chat_id: str) -> bool:
+    """True when the click happened in a group/topic chat. Checks the SIGNED
+    event chat_type first (catches an UNPROVISIONED group not yet in the routing
+    table) and the routing table's group row (catches provisioned groups). Fails
+    CLOSED on any error so a personal hub can never leak into a group."""
     try:
-        from .router import _get_routing_table
-        table = _get_routing_table()
-        if table is None:
-            return False
-        return table.lookup_by_chat_id(chat_id) is not None
+        from .router import _extract_chat_type, _is_group_chat_type
+        chat_type = _extract_chat_type(event)
+        if not chat_type:
+            context = _read_value(event, "context")
+            chat_type = str(_read_value(context, "chat_type") or "").strip().lower()
+        if chat_type and _is_group_chat_type(chat_type):
+            return True
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("[multitenancy] cred_auth group check failed for %s (%s)", chat_id, exc)
+        logger.debug("[multitenancy] cred_auth chat_type check failed (%s)", exc)
         return True
+    if chat_id:
+        try:
+            from .router import _get_routing_table
+            table = _get_routing_table()
+            if table is not None and table.lookup_by_chat_id(chat_id) is not None:
+                return True
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("[multitenancy] cred_auth group-row check failed for %s (%s)", chat_id, exc)
+            return True
+    return False
 
 
 def _operator_typed_ids(event: Any) -> dict[str, str]:

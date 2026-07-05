@@ -348,8 +348,7 @@ async def test_auth_command_offers_keep_record_callback_button(monkeypatch, tmp_
     assert calls["n"] == 0, "/auth must NOT eagerly mint the keep QR (lazy on click)"
 
 
-@pytest.mark.asyncio
-async def test_mint_one_cred_lark_returns_verify_url(monkeypatch, tmp_path):
+def test_mint_one_cred_lark_returns_verify_url(monkeypatch, tmp_path):
     from hermes_multitenancy import feishu_uat_auth
     from hermes_multitenancy import feishu_auth_hub_actions as actions
     monkeypatch.setattr(feishu_uat_auth, "find_active_session", lambda **k: None)
@@ -361,8 +360,7 @@ async def test_mint_one_cred_lark_returns_verify_url(monkeypatch, tmp_path):
     assert flows["lark-cli"]["kind"] == "lark" and flows["lark-cli"]["session_id"] == "s1"
 
 
-@pytest.mark.asyncio
-async def test_mint_one_cred_keep_returns_qr(monkeypatch, tmp_path):
+def test_mint_one_cred_keep_returns_qr(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub_auth as cha
     from hermes_multitenancy import feishu_auth_hub_actions as actions
     monkeypatch.setattr(cha, "start_keep_record_qr",
@@ -374,8 +372,7 @@ async def test_mint_one_cred_keep_returns_qr(monkeypatch, tmp_path):
     assert flows["keep-record"]["kind"] == "keep" and flows["keep-record"]["qrcode_id"] == "q1"
 
 
-@pytest.mark.asyncio
-async def test_mint_one_cred_kep_online_with_origin(monkeypatch, tmp_path):
+def test_mint_one_cred_kep_online_with_origin(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub_auth as cha, webui_broker_server
     from hermes_multitenancy import feishu_auth_hub_actions as actions
     monkeypatch.setenv("HERMES_PUBLIC_CALLBACK_ORIGIN", "https://hermes.example.com")
@@ -389,8 +386,7 @@ async def test_mint_one_cred_kep_online_with_origin(monkeypatch, tmp_path):
     assert flows["kep-cli-online"]["env"] == "online"
 
 
-@pytest.mark.asyncio
-async def test_mint_one_cred_kep_pre_targets_pre_env(monkeypatch, tmp_path):
+def test_mint_one_cred_kep_pre_targets_pre_env(monkeypatch, tmp_path):
     """kep-cli-pre must start login with env_name='pre', not online."""
     from hermes_multitenancy import credential_hub_auth as cha, webui_broker_server
     from hermes_multitenancy import feishu_auth_hub_actions as actions
@@ -404,8 +400,7 @@ async def test_mint_one_cred_kep_pre_targets_pre_env(monkeypatch, tmp_path):
     assert calls == ["pre"]
 
 
-@pytest.mark.asyncio
-async def test_mint_one_cred_kep_no_origin_shows_webui_note(monkeypatch, tmp_path):
+def test_mint_one_cred_kep_no_origin_shows_webui_note(monkeypatch, tmp_path):
     """kep-cli locally (no public callback) offers a WebUI note, not a dead click."""
     from hermes_multitenancy import feishu_auth_hub_actions as actions
     monkeypatch.delenv("HERMES_PUBLIC_CALLBACK_ORIGIN", raising=False)
@@ -619,6 +614,45 @@ def test_cred_auth_group_check_uses_signed_context_not_payload(monkeypatch, tmp_
     resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, forged)
     assert resp is not None
     assert minted["n"] == 0, "spoofed payload chat_id must not bypass the signed-context group guard"
+
+
+def test_cred_auth_rejected_in_unprovisioned_group_via_chat_type(monkeypatch, tmp_path):
+    """A group not yet in the routing table (unprovisioned) must still be rejected
+    from the SIGNED event chat_type — routing-row lookup alone would miss it."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import router as router_mod
+
+    class _Table:  # nothing is a provisioned group row
+        def lookup_by_chat_id(self, cid):
+            return None
+        def resolve_owner_root(self, o):
+            return None
+        def lookup_by_open_id(self, o):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
+
+    for chat_type_carrier in (
+        {"chat_type": "group"},                       # event-level
+        {"context_chat_type": "topic"},               # context-level
+    ):
+        minted["n"] = 0
+        ctx_kwargs = {"open_chat_id": "oc_new", "open_message_id": "om"}
+        if "context_chat_type" in chat_type_carrier:
+            ctx_kwargs["chat_type"] = chat_type_carrier["context_chat_type"]
+        event = types.SimpleNamespace(
+            operator=types.SimpleNamespace(open_id="ou_B"),
+            context=types.SimpleNamespace(**ctx_kwargs),
+            action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+            **({"chat_type": chat_type_carrier["chat_type"]} if "chat_type" in chat_type_carrier else {}),
+        )
+        resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+        assert resp is not None
+        assert minted["n"] == 0, f"unprovisioned group ({chat_type_carrier}) must be rejected via signed chat_type"
 
 
 def test_hub_card_button_payload_carries_only_cred():
