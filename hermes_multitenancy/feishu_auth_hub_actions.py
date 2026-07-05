@@ -49,32 +49,33 @@ _dm_auth_card_ids: "OrderedDict[str, None]" = OrderedDict()
 _dm_auth_card_lock = threading.Lock()
 
 
-def record_dm_auth_card(*ids: Optional[str]) -> None:
-    """Remember the message/card ids of an /auth hub card sent into a DM.
+def record_dm_auth_card(message_id: Optional[str]) -> None:
+    """Remember the MESSAGE id of an /auth hub card sent into a DM.
 
     Called from the (group-blocked) /auth command send site, so every id here
-    provably belongs to a 1:1 chat. Accepts several ids (message_id + card_id)
-    because a click callback may report either.
+    provably belongs to a 1:1 chat. Message id ONLY — never a CardKit card_id,
+    which is the card entity id and survives a forward (see the round-7 note in
+    _handle_cred_auth_action).
     """
+    mid = str(message_id or "").strip()
+    if not mid:
+        return
     with _dm_auth_card_lock:
-        for raw in ids:
-            mid = str(raw or "").strip()
-            if not mid:
-                continue
-            _dm_auth_card_ids.pop(mid, None)
-            _dm_auth_card_ids[mid] = None
-            while len(_dm_auth_card_ids) > _DM_AUTH_CARD_IDS_MAX:
-                _dm_auth_card_ids.popitem(last=False)
+        _dm_auth_card_ids.pop(mid, None)
+        _dm_auth_card_ids[mid] = None
+        while len(_dm_auth_card_ids) > _DM_AUTH_CARD_IDS_MAX:
+            _dm_auth_card_ids.popitem(last=False)
 
 
-def _is_known_dm_auth_card(*ids: Optional[str]) -> bool:
-    """True iff any id matches a hub card we sent into a DM (see above)."""
+def _is_known_dm_auth_card(message_id: Optional[str]) -> bool:
+    """True iff the message id matches a hub card we sent into a DM (see above)."""
+    mid = str(message_id or "").strip()
+    if not mid:
+        return False
     with _dm_auth_card_lock:
-        for raw in ids:
-            mid = str(raw or "").strip()
-            if mid and mid in _dm_auth_card_ids:
-                _dm_auth_card_ids.move_to_end(mid)
-                return True
+        if mid in _dm_auth_card_ids:
+            _dm_auth_card_ids.move_to_end(mid)
+            return True
     return False
 
 
@@ -134,7 +135,6 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     cred = str(action_value.get("cred") or "").strip()
     chat_id = _signed_chat_id(event)
     message_id = _ctx_message_id(event)
-    card_id = _ctx_card_id(event)
     if not cred:
         return _toast_response("认证信息不完整，请重新发送 /auth")
 
@@ -143,12 +143,15 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     # shared chat:
     #  1) cheap reject if the signed event/routing says this is a group chat;
     #  2) AUTHORITATIVE positive gate — proceed only if this click lands on a hub
-    #     card WE sent into a DM (allowlist by signed message/card id). A card
-    #     forwarded into a group is a NEW message with an id we never recorded, so
-    #     it is rejected even though callbacks carry no chat_type (round-6 fix).
+    #     card WE sent into a DM (allowlist by signed MESSAGE id). Forwarding a card
+    #     into a group produces a NEW message with a message_id we never recorded,
+    #     so it is rejected even though callbacks carry no chat_type (round-6 fix).
+    # NOTE: match on message_id ONLY, never the card_id — a CardKit card_id is the
+    # card ENTITY id and is STABLE across a forward, so trusting it would re-open
+    # the exact fall-open this gate closes (codex round-7).
     if _chat_is_group(event, chat_id):
         return _toast_response("认证只能在私聊里进行，请私聊我发送 /auth")
-    if not _is_known_dm_auth_card(message_id, card_id):
+    if not _is_known_dm_auth_card(message_id):
         return _toast_response("认证卡片已过期或不在私聊里，请重新私聊我发送 /auth")
 
     # SECURITY: identity and profile are resolved from the Feishu-SIGNED event
@@ -303,17 +306,6 @@ def _ctx_message_id(event: Any) -> str:
         if value:
             return str(value)
     return str(_read_value(event, "open_message_id") or "").strip()
-
-
-def _ctx_card_id(event: Any) -> str:
-    """Best-effort card-entity id from the signed callback (CardKit cards may be
-    addressed by card_id rather than message_id). Empty when absent."""
-    context = _read_value(event, "context")
-    for name in ("card_id", "open_card_id"):
-        value = _read_value(context, name)
-        if value:
-            return str(value)
-    return ""
 
 
 def _chat_is_group(event: Any, chat_id: str) -> bool:

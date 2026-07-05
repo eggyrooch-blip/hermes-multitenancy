@@ -973,12 +973,14 @@ async def _handle_auth_command(
         ]
         await _m._safe_call(adapter.send, chat_id, "\n".join(lines))
     else:
-        # Record this card's signed ids as DM-originated: the click handler only
-        # mints for a card it can prove was sent into a private chat (this send
-        # site is group-blocked). A copy forwarded into a group gets a new id and
-        # is rejected. See feishu_auth_hub_actions.record_dm_auth_card.
+        # Record this card's signed MESSAGE id as DM-originated: the click handler
+        # only mints for a card it can prove was sent into a private chat (this
+        # send site is group-blocked). A copy forwarded into a group gets a new
+        # message_id and is rejected. Message id ONLY — a CardKit card_id survives
+        # forwarding, so recording it would re-open the leak (codex round-7). See
+        # feishu_auth_hub_actions.record_dm_auth_card.
         from ..feishu_auth_hub_actions import record_dm_auth_card
-        record_dm_auth_card(sent.get("message_id"), sent.get("card_id"))
+        record_dm_auth_card(sent.get("message_id"))
 
 
 def _track_kep_login_proc(proc: Any) -> None:

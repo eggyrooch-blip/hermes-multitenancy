@@ -848,7 +848,56 @@ async def test_auth_command_records_dm_card_provenance(monkeypatch, tmp_path):
         profile_home=tmp_path, chat_id="oc_dm", gateway=object(), event=object(),
     )
     assert actions._is_known_dm_auth_card("om_sent"), "message_id must be recorded as DM provenance"
-    assert actions._is_known_dm_auth_card("card_sent"), "card_id must be recorded too"
+    # card_id must NOT be recorded — it is stable across a forward (round-7).
+    assert not actions._is_known_dm_auth_card("card_sent"), \
+        "card_id must NOT be a provenance token — it survives forwarding"
+
+
+def test_cred_auth_card_id_does_not_bypass_provenance(monkeypatch, tmp_path):
+    """CRITICAL (codex round-7): a CardKit card_id is the card ENTITY id and is
+    STABLE across a forward. A card forwarded into a group keeps the original
+    card_id but gets a NEW message_id, so provenance must key on message_id ALONE
+    — a matching (recorded-era) card_id must never admit a forwarded click."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    class _Row:
+        profile_name = "pB"
+        open_id = "ou_B"
+
+    class _Table:  # operator bound; group NOT provisioned
+        def resolve_owner_root(self, o):
+            return _Row() if o == "ou_B" else None
+        def lookup_by_open_id(self, o):
+            return None
+        def lookup_by_chat_id(self, c):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    (tmp_path / "profiles" / "pB").mkdir(parents=True)
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
+
+    # The original DM card's message_id was recorded (as /auth would).
+    actions.record_dm_auth_card("om_dm_original")
+    # Forwarded copy in an unprovisioned group: NEW message_id, no chat_type, but
+    # it still carries the original (stable) card_id in context.
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id="ou_B"),
+        context=types.SimpleNamespace(
+            open_chat_id="oc_UNPROVISIONED_GROUP",
+            open_message_id="om_forwarded_group",
+            card_id="card_dm_original",
+        ),
+        action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+    )
+    resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    assert resp is not None
+    assert minted["n"] == 0, "a stable card_id must NOT admit a forwarded (new message_id) click"
 
 
 def test_hub_card_button_payload_carries_only_cred():
