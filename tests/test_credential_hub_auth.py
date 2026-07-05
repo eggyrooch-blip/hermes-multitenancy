@@ -655,6 +655,50 @@ def test_cred_auth_rejected_in_unprovisioned_group_via_chat_type(monkeypatch, tm
         assert minted["n"] == 0, f"unprovisioned group ({chat_type_carrier}) must be rejected via signed chat_type"
 
 
+def test_cred_auth_updated_card_payload_has_no_chat_id(monkeypatch, tmp_path):
+    """The post-click updated card's remaining callback buttons must carry no
+    chat_id/identity in their payload — identical to the initial /auth card, so
+    nothing sensitive ever rides in an unsigned, forwardable button value."""
+    import json as _json
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.credential_hub import CredentialRow
+
+    class _Row:
+        profile_name = "pB"
+        open_id = "ou_B"
+
+    class _Table:
+        def resolve_owner_root(self, o):
+            return _Row() if o == "ou_B" else None
+        def lookup_by_open_id(self, o):
+            return None
+        def lookup_by_chat_id(self, c):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    (tmp_path / "profiles" / "pB").mkdir(parents=True)
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda cred, **k: ({cred: "https://v"}, {}, {}, {cred: {"kind": "lark", "session_id": "s"}}))
+    monkeypatch.setattr(actions, "_collect_rows",
+                        lambda **k: [CredentialRow(id="lark-cli", title="L", provider="l", installed=True, status="needs_auth"),
+                                     CredentialRow(id="keep-record", title="K", provider="k", installed=True, status="needs_auth")])
+
+    event = types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id="ou_B"),
+        context=types.SimpleNamespace(open_chat_id="oc_dm", open_message_id="om"),
+        action=types.SimpleNamespace(value={"cred": "lark-cli"}),
+    )
+    resp = actions._handle_cred_auth_action(types.SimpleNamespace(_loop=None), event, {"cred": "lark-cli"})
+    blob = _json.dumps(resp, ensure_ascii=False, default=str)
+    assert "https://v" in blob, "clicked credential should expand (lark URL shown)"
+    assert '"chat_id"' not in blob and '"open_id"' not in blob and '"profile_name"' not in blob, \
+        "updated card button payloads must carry no chat_id/identity"
+
+
 def test_hub_card_button_payload_carries_only_cred():
     """The callback button value must contain no identity/chat — only cred +
     hermes_action — so nothing sensitive rides in the unsigned payload."""

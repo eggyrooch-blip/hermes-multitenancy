@@ -109,7 +109,11 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     profile_name, open_id, pdir = _resolve_operator_profile(event, shared)
     if not profile_name or not open_id or pdir is None:
         return _toast_response("无法确认你的 Hermes profile，请先私聊我发送 /auth")
-    ctx = {"chat_id": chat_id}
+    # Empty ctx: the re-rendered card's remaining callback buttons carry ONLY
+    # the credential id (never chat_id/identity), identical to the initial /auth
+    # card. chat_id flows to the poll separately (below), taken from the signed
+    # event — nothing sensitive ever rides in the button payload.
+    ctx: dict[str, Any] = {}
 
     # Mint ONLY this credential's entry (blocking network — Feishu shows the
     # button's native loading spinner meanwhile).
