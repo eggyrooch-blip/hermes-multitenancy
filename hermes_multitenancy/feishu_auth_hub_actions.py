@@ -80,20 +80,30 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     """Mint the clicked credential's auth entry, expand its row in place, and
     background-poll it to ✅. Runs on the SDK callback thread (blocking network
     calls are fine here); the poll is scheduled on the adapter loop."""
-    from . import credential_hub, feishu_uat_auth
+    from . import feishu_uat_auth
     from .feishu_credential_hub_cards import build_hub_card
 
     cred = str(action_value.get("cred") or "").strip()
-    profile_name = str(action_value.get("profile_name") or "").strip()
-    open_id = str(action_value.get("open_id") or "").strip()
     chat_id = _ctx_chat_id(event, action_value)
     message_id = _ctx_message_id(event)
-    if not cred or not profile_name or not open_id:
+    if not cred:
         return _toast_response("认证信息不完整，请重新发送 /auth")
 
+    # SECURITY: identity and profile are resolved from the Feishu-SIGNED event
+    # operator (who actually clicked), NEVER from the unsigned callback payload.
+    # The card can be clicked by anyone who sees it (e.g. any group member), so
+    # trusting a profile/open_id baked into the button value would be a
+    # cross-user / cross-profile write path. Deriving both from the signed
+    # operator means a clicker can only ever authenticate their OWN resolved
+    # profile, and profile_home fidelity comes from the authoritative routing.
+    open_id = _event_operator_open_id(event)
+    if not open_id:
+        return _toast_response("无法确认操作者身份，请私聊我后重新发送 /auth")
     shared = feishu_uat_auth.resolve_shared_home()
-    pdir = shared / "profiles" / profile_name
-    ctx = {"profile_name": profile_name, "open_id": open_id, "chat_id": chat_id}
+    profile_name, pdir = _resolve_profile_for_open_id(open_id, shared)
+    if not profile_name or pdir is None:
+        return _toast_response("你还没有绑定 Hermes profile，请先私聊我")
+    ctx = {"chat_id": chat_id}
 
     # Mint ONLY this credential's entry (blocking network — Feishu shows the
     # button's native loading spinner meanwhile).
@@ -226,6 +236,42 @@ def _ctx_message_id(event: Any) -> str:
         if value:
             return str(value)
     return str(_read_value(event, "open_message_id") or "").strip()
+
+
+def _event_operator_open_id(event: Any) -> str:
+    """The ``ou_``-prefixed open_id of whoever clicked, from the SIGNED event
+    operator. This is the trust anchor for the whole flow — never the payload."""
+    operator = _read_value(event, "operator") or _read_value(event, "operator_id")
+    for name in ("open_id", "operator_open_id", "union_id", "operator_union_id", "user_id"):
+        value = _read_value(operator, name)
+        if value:
+            text = str(value).strip()
+            if text.startswith("ou_"):
+                return text
+    return ""
+
+
+def _resolve_profile_for_open_id(open_id: str, shared: Path) -> tuple[str, Optional[Path]]:
+    """Authoritatively map a signed operator open_id → (profile_name, profile_dir)
+    via the multitenancy routing table. Returns ("", None) when the operator has
+    no bound profile, so an unrecognized clicker gets a clean rejection rather
+    than a mis-targeted auth."""
+    try:
+        from .router import _get_routing_table
+        table = _get_routing_table()
+        if table is None:
+            return "", None
+        owner = table.resolve_owner_root(open_id) or table.lookup_by_open_id(open_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("[multitenancy] cred_auth profile resolve failed for %s (%s)", open_id, exc)
+        return "", None
+    profile_name = str(getattr(owner, "profile_name", "") or "").strip() if owner is not None else ""
+    if not profile_name:
+        return "", None
+    pdir = shared / "profiles" / profile_name
+    if not pdir.exists():
+        return "", None
+    return profile_name, pdir
 
 
 def _toast_response(content: str, *, level: str = "info") -> Any:

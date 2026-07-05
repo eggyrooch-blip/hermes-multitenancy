@@ -415,6 +415,84 @@ async def test_mint_one_cred_kep_no_origin_shows_webui_note(monkeypatch, tmp_pat
     assert "WebUI" in note["kep-cli-online"]
 
 
+def _cred_auth_event(operator_open_id, payload):
+    import types
+    return types.SimpleNamespace(
+        operator=types.SimpleNamespace(open_id=operator_open_id),
+        context=types.SimpleNamespace(open_chat_id="oc", open_message_id="om"),
+        action=types.SimpleNamespace(value=payload),
+    )
+
+
+def test_cred_auth_action_uses_signed_operator_ignores_payload_identity(monkeypatch, tmp_path):
+    """SECURITY: identity + profile come from the Feishu-signed event operator,
+    never the (group-clickable, unsigned) callback payload. A forged
+    profile_name/open_id in the value must be ignored — a clicker only ever
+    authenticates their OWN resolved profile."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    class _Row:
+        profile_name = "profile_B"
+
+    class _Table:
+        def resolve_owner_root(self, oid):
+            return _Row() if oid == "ou_B" else None
+        def lookup_by_open_id(self, oid):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    (tmp_path / "profiles" / "profile_B").mkdir(parents=True)
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+
+    used = {}
+
+    def fake_mint(cred, *, profile_name, open_id, pdir, shared):
+        used.update(profile_name=profile_name, open_id=open_id)
+        return ({cred: "https://v"}, {}, {}, {})
+
+    monkeypatch.setattr(actions, "_mint_one_cred", fake_mint)
+    monkeypatch.setattr(actions, "_collect_rows", lambda **k: [])
+
+    forged = {"hermes_action": "cred_auth", "cred": "lark-cli",
+              "profile_name": "profile_A", "open_id": "ou_ATTACKER"}
+    resp = actions._handle_cred_auth_action(
+        types.SimpleNamespace(_loop=None), _cred_auth_event("ou_B", forged), forged)
+    assert resp is not None
+    assert used == {"profile_name": "profile_B", "open_id": "ou_B"}, \
+        "must mint for the signed operator's profile, not the forged payload"
+
+
+def test_cred_auth_action_rejects_unbound_operator(monkeypatch, tmp_path):
+    """An operator with no bound profile is rejected cleanly — no mis-targeted mint."""
+    import types
+    from hermes_multitenancy import feishu_auth_hub_actions as actions
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy import router as router_mod
+
+    class _Table:
+        def resolve_owner_root(self, oid):
+            return None
+        def lookup_by_open_id(self, oid):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: _Table())
+    monkeypatch.setattr(feishu_uat_auth, "resolve_shared_home", lambda: tmp_path)
+
+    minted = {"n": 0}
+    monkeypatch.setattr(actions, "_mint_one_cred",
+                        lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or ({}, {}, {}, {}))
+
+    resp = actions._handle_cred_auth_action(
+        types.SimpleNamespace(_loop=None),
+        _cred_auth_event("ou_unbound", {"cred": "lark-cli"}),
+        {"hermes_action": "cred_auth", "cred": "lark-cli"})
+    assert resp is not None
+    assert minted["n"] == 0, "unbound operator must not trigger any mint"
+
+
 def test_poll_hub_flows_checks_kep_cli_pre_when_flow_targets_pre(monkeypatch, tmp_path):
     """A pre login flow must be confirmed by polling pre, not online."""
     import asyncio

@@ -960,11 +960,11 @@ async def _handle_auth_command(
     # feishu_auth_hub_actions._handle_cred_auth_action), which keeps /auth
     # instant and gives every credential — expired ones included — a re-auth
     # control in one unified interaction.
-    ctx = {
-        "profile_name": profile_name,
-        "open_id": open_id,
-        "chat_id": chat_id,
-    }
+    # The callback payload carries NO identity — on click the handler re-derives
+    # open_id + profile from the signed event operator (see
+    # feishu_auth_hub_actions._handle_cred_auth_action), so the button can't be
+    # used to auth into someone else's profile. chat_id is non-sensitive.
+    ctx = {"chat_id": chat_id}
     card = build_hub_card(rows=rows, ctx=ctx)
     sent = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
     if sent is None:
