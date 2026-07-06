@@ -505,6 +505,16 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    def lookup_users_by_union_id(self, union_id: str) -> list[RoutingRow]:
+        """Return every active sync-owned user row for union_id."""
+        cur = self._conn.execute(
+            "SELECT * FROM multitenancy_routing "
+            "WHERE union_id = ? AND active = 1 AND kind = 'user' "
+            "AND provenance = 'sync'",
+            (union_id,),
+        )
+        return [_row_to_dataclass(row) for row in cur.fetchall()]
+
     def lookup_by_user_id(self, user_id: str) -> Optional[RoutingRow]:
         """Return the active row by tenant user_id (PRIMARY KEY).
 

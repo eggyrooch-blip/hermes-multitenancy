@@ -168,6 +168,27 @@ def _build_subprocess_env(
     return env
 
 
+def _readonly_enabled_toolsets(toolsets: Optional[list[str]]) -> Optional[list[str]]:
+    try:
+        from ..expert_bot_route import READONLY_DISABLED_TOOLSETS, feishu_expert_readonly_enabled
+
+        readonly = feishu_expert_readonly_enabled()
+        readonly_disabled_toolsets = READONLY_DISABLED_TOOLSETS
+    except Exception:
+        readonly = False
+        readonly_disabled_toolsets = frozenset()
+    if not readonly:
+        return toolsets
+    # terminal is removed structurally here, so terminal-run lark-cli/kep writes
+    # cannot bypass the registered lark_cli and kep/hades guards below.
+    filtered = [
+        item
+        for item in list(toolsets or [])
+        if str(item or "").strip() not in readonly_disabled_toolsets
+    ]
+    return filtered or None
+
+
 def _resolve_enabled_toolsets(
     config: dict[str, Any],
     platform_key: str,
@@ -242,7 +263,7 @@ def _resolve_enabled_toolsets(
             "[multitenancy] platform_toolsets explicit mode for %s: %s",
             platform_key, explicit_toolsets,
         )
-        return apply_profile_tool_policies(explicit_toolsets)
+        return _readonly_enabled_toolsets(apply_profile_tool_policies(explicit_toolsets))
 
     default_toolsets: list[str] = []
     resolver_platform_key = "api_server" if platform_key == "webui" else platform_key
@@ -282,6 +303,6 @@ def _resolve_enabled_toolsets(
             "[multitenancy] platform_toolsets merged for %s: explicit=%s default=%s merged=%s",
             platform_key, explicit_toolsets, default_toolsets, merged,
         )
-        return apply_profile_tool_policies(merged)
+        return _readonly_enabled_toolsets(apply_profile_tool_policies(merged))
 
-    return apply_profile_tool_policies(default_toolsets) or None
+    return _readonly_enabled_toolsets(apply_profile_tool_policies(default_toolsets) or None)

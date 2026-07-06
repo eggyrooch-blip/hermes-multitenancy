@@ -19,6 +19,7 @@ from .. import router as _m
 
 async def handle_async(*, event: Any, gateway: Any) -> None:
     """Async dispatch — orchestrates routing + pool + adapter calls + commands."""
+    from .. import expert_bot_route
     from ..commands import parse_command
 
     try:
@@ -29,6 +30,33 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         if _m._is_feishu_open_id(sender):
             setattr(event, "sender_open_id", sender)
         text = getattr(event, "text", "") or ""
+        chat_type = _m._extract_chat_type(event)
+        fixed_context: expert_bot_route.FixedExpertContext | None = None
+        fixed_expert_id = expert_bot_route.fixed_expert_id_from_env()
+        if fixed_expert_id:
+            adapter = _m._get_feishu_adapter(gateway)
+            if _m._is_group_chat_type(chat_type):
+                if adapter is not None:
+                    await _m._safe_call(adapter.send, chat_id, "只读专家入口仅支持与专家 bot 私聊。")
+                return
+            fixed_result = expert_bot_route.resolve_fixed_expert_context(
+                event,
+                routing_table=_m._get_routing_table(),
+                profile_home_resolver=_m._profile_name_to_home,
+                expert_id=fixed_expert_id,
+            )
+            if isinstance(fixed_result, expert_bot_route.FixedExpertRejection):
+                _m.logger.info(
+                    "multitenancy: fixed expert route rejected reason=%s chat_id=%s",
+                    fixed_result.reason,
+                    chat_id,
+                )
+                if adapter is not None:
+                    await _m._safe_call(adapter.send, chat_id, fixed_result.message)
+                return
+            fixed_context = fixed_result
+            expert_bot_route.apply_fixed_expert_context(event, fixed_context)
+            sender = fixed_context.canonical_open_id
 
         if _m._is_reaction_synthetic_event(event, text):
             _m.logger.info(
@@ -40,7 +68,11 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             )
             return
 
-        sender_alt = getattr(source, "user_id_alt", None) if source else None
+        sender_alt = (
+            fixed_context.union_id
+            if fixed_context is not None
+            else (getattr(source, "user_id_alt", None) if source else None)
+        )
         if getattr(event, "media_urls", None):
             _m.logger.info(
                 "multitenancy: handle_async media event message_id=%s text_len=%s media_urls=%s media_types=%s message_type=%s",
@@ -55,11 +87,10 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # chat, the route is keyed by chat_id (not the @-er's open_id). This
         # branch runs before slash-command short-circuit so /status & friends
         # see the group profile instead of the @-er's private profile.
-        chat_type = _m._extract_chat_type(event)
         is_group_chat = _m._is_group_chat_type(chat_type)
         group_profile_name: Optional[str] = None
         group_profile_home: Optional[Path] = None
-        if is_group_chat and chat_id and chat_id != "unknown":
+        if fixed_context is None and is_group_chat and chat_id and chat_id != "unknown":
             group_profile_name, group_profile_home = (
                 await _m.resolve_or_auto_provision_group_route(
                     chat_id=chat_id, gateway=gateway,
@@ -76,6 +107,16 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         command_source_text = _m._strip_leading_at_mentions(text) if is_group_chat else text
         cmd_pair = parse_command(command_source_text)
         if cmd_pair is not None:
+            if fixed_context is not None and not expert_bot_route.is_fixed_expert_slash_allowed(cmd_pair[0]):
+                adapter = _m._get_feishu_adapter(gateway)
+                if adapter is not None:
+                    await _m._safe_call(
+                        adapter.send,
+                        chat_id,
+                        expert_bot_route.fixed_expert_slash_deny_message(cmd_pair[0]),
+                    )
+                return
+
             # Group profiles do not own any UAT — the whole auth command
             # family is hard-rejected so a curious member can't trigger an
             # OAuth dance that would store a per-user token under the
@@ -97,6 +138,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             if is_group_chat:
                 cmd_profile_name = group_profile_name
                 cmd_profile_home = group_profile_home
+            elif fixed_context is not None:
+                cmd_profile_name = fixed_context.profile_name
+                cmd_profile_home = fixed_context.profile_home
             else:
                 cmd_profile_name, cmd_profile_home = _m._resolve_route(sender, alt_id=sender_alt)
             cmd_profile = cmd_profile_name if cmd_profile_home is not None else None
@@ -143,7 +187,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 return
 
         # Routing: group already resolved above; sender-based path for p2p.
-        if is_group_chat:
+        if fixed_context is not None:
+            profile_name, profile_home = fixed_context.profile_name, fixed_context.profile_home
+        elif is_group_chat:
             profile_name, profile_home = group_profile_name, group_profile_home
             if profile_home is None:
                 _m.logger.info(

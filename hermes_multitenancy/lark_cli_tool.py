@@ -82,6 +82,7 @@ _SAFE_ENV_NAMES = {
     "HERMES_LARK_CLI_AUTHORIZED",
     "HERMES_LARK_CLI_RUN_TOKEN",
     "HERMES_LARK_CLI_REAL_BIN",
+    "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY",
     "HERMES_MT_SECURITY_AUDIT_PATH",
     "LARKSUITE_CLI_AUTH_PROXY",
     "LARKSUITE_CLI_PROXY_KEY",
@@ -305,6 +306,29 @@ _IM_READ_API_PREFIXES = (
 _IM_READ_API_EXACT_METHODS = {
     ("POST", "/open-apis/im/v1/messages/search"),
 }
+# ponytail: fail-closed — actual keep-resource-delivery endpoints await sunke/plugin confirmation to narrow; anything not listed is intentionally denied.
+_READONLY_API_READ_PREFIXES: tuple[str, ...] = (
+    *_IM_READ_API_PREFIXES,
+    "/open-apis/contact/v3/users",
+    "/open-apis/contact/v3/departments",
+    "/open-apis/contact/v3/scopes",
+    "/open-apis/bitable/v1/apps",
+    "/open-apis/sheets/v3/spreadsheets",
+    "/open-apis/sheets/v2/spreadsheets",
+    "/open-apis/drive/v1/files",
+    "/open-apis/drive/v1/metas",
+    "/open-apis/wiki/v2/spaces",
+    "/open-apis/docx/v1/documents",
+)
+_READONLY_READ_SHORTCUTS = frozenset(
+    {
+        *_PERSONAL_IM_READ_SHORTCUTS,
+        ("contact", "+users-get"),
+        ("contact", "+users-batch"),
+        ("contact", "+departments-get"),
+        ("contact", "+search-user"),
+    }
+)
 
 
 def _shortcut_prefix(argv: list[str]) -> tuple[str, str] | None:
@@ -428,6 +452,32 @@ def _is_im_read_request(mode: str, argv: list[str]) -> bool:
         method, path = request
         return (method, path) in _IM_READ_API_EXACT_METHODS or (method == "GET" and path.startswith(_IM_READ_API_PREFIXES))
     return False
+
+
+def _feishu_expert_readonly_enabled() -> bool:
+    return str(os.getenv("HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY") or "").strip() == "1"
+
+
+def _readonly_lark_cli_error(mode: str, argv: list[str], risk: str) -> str | None:
+    if not _feishu_expert_readonly_enabled():
+        return None
+    if risk != "read":
+        return "read-only lark-cli denied non-read risk"
+    if mode == "api":
+        request = _api_request_from_argv(argv)
+        if not request:
+            return "read-only lark-cli denied malformed api command"
+        method, path = request
+        if method != "GET":
+            return "read-only lark-cli denied mutating OpenAPI method"
+        if "/admin/" in path or "export" in path.strip("/").split("/"):
+            return "read-only lark-cli denied OpenAPI path outside the read allowlist"
+        if path.startswith(_READONLY_API_READ_PREFIXES):
+            return None
+        return "read-only lark-cli denied OpenAPI path outside the read allowlist"
+    if _is_im_read_request(mode, argv) or _shortcut_prefix(argv) in _READONLY_READ_SHORTCUTS:
+        return None
+    return "read-only lark-cli denied command outside the read allowlist"
 
 
 def _group_current_chat_im_read_allowed(mode: str, argv: list[str], current_chat_id: str) -> bool:
@@ -668,6 +718,10 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         )
     elif argv and argv[0] == "api":
         return tool_error("api command must use mode=api")
+
+    readonly_error = _readonly_lark_cli_error(mode, argv, risk)
+    if readonly_error:
+        return tool_error(readonly_error, mode=mode, command=argv, risk=risk)
 
     decision = _policy_decision(mode, argv, risk)
     if not decision.get("allowed"):

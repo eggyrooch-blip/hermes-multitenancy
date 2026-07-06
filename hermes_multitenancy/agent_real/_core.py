@@ -489,6 +489,15 @@ def _broker_role_override_payload_for_event(
     expert_id = _expert_id_for_event(event)
     if not expert_id:
         return None
+    existing = getattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, None)
+    if isinstance(existing, dict):
+        payload_expert_id = str(existing.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or "").strip()
+        block = existing.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
+        if payload_expert_id == expert_id and isinstance(block, str) and block.strip():
+            return {
+                _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
+                _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
+            }
     try:
         from ..expert_overlay import role_override_block_for
 
@@ -1713,6 +1722,7 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MAX_ITERATIONS",
     "HERMES_MULTITENANCY_APPROVAL_TIMEOUT",
     "HERMES_MULTITENANCY_TOOLSETS_MODE",
+    "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY",
     "HERMES_MULTITENANCY_CREDENTIAL_KEY",
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
@@ -4303,8 +4313,20 @@ def _resolve_disabled_toolsets(config: dict[str, Any]) -> list[str]:
     """Return profile/global toolsets that Hermes core should subtract."""
     agent_cfg = config.get("agent") or {}
     if not isinstance(agent_cfg, dict):
-        return []
-    return _normalize_toolset_list(agent_cfg.get("disabled_toolsets"))
+        disabled: list[str] = []
+    else:
+        disabled = _normalize_toolset_list(agent_cfg.get("disabled_toolsets"))
+    try:
+        from ..expert_bot_route import READONLY_DISABLED_TOOLSETS, feishu_expert_readonly_enabled
+
+        readonly = feishu_expert_readonly_enabled()
+        readonly_disabled_toolsets = READONLY_DISABLED_TOOLSETS
+    except Exception:
+        readonly = False
+        readonly_disabled_toolsets = frozenset()
+    if readonly:
+        return sorted(set(disabled) | set(readonly_disabled_toolsets))
+    return disabled
 
 
 def _toolsets_mode(config: dict[str, Any], platform_key: str | None = None) -> str:

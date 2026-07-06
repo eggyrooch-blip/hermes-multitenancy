@@ -105,6 +105,83 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
         def _has_explicit_profile(argv) -> bool:
             return "--profile" in argv or any(arg.startswith("--profile=") for arg in argv)
 
+        _READONLY_WRITE_WORDS = (
+            "add",
+            "approve",
+            "auth",
+            "bind",
+            "create",
+            "delete",
+            "deny",
+            "edit",
+            "grant",
+            "import",
+            "login",
+            "logout",
+            "patch",
+            "post",
+            "put",
+            "remove",
+            "revoke",
+            "save",
+            "send",
+            "set",
+            "submit",
+            "unbind",
+            "update",
+            "upload",
+            "write",
+        )
+        _READONLY_READ_WORDS = (
+            "describe",
+            "detail",
+            "fetch",
+            "find",
+            "get",
+            "info",
+            "list",
+            "query",
+            "read",
+            "search",
+            "show",
+            "status",
+        )
+
+        def _readonly_enabled() -> bool:
+            return str(os.environ.get("HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY") or "").strip() == "1"
+
+        def _readonly_words(argv):
+            words = set()
+            skip_next = False
+            for arg in argv:
+                if skip_next:
+                    skip_next = False
+                    continue
+                item = str(arg or "").strip().lower()
+                if item in ("--profile", "--env"):
+                    skip_next = True
+                    continue
+                if item.startswith("--"):
+                    continue
+                for part in re.split(r"[^a-z0-9]+", item):
+                    if part:
+                        words.add(part)
+            return words
+
+        def _readonly_write_reason(argv) -> str:
+            if not _readonly_enabled():
+                return ""
+            if any(str(arg or "").strip().lower() in ("--help", "-h", "help") for arg in argv):
+                return ""
+            words = _readonly_words(argv)
+            if not words:
+                return "read-only kep/hades command denied: missing read subcommand"
+            if words.intersection(_READONLY_WRITE_WORDS):
+                return "read-only kep/hades command denied: write subcommand"
+            if words.intersection(_READONLY_READ_WORDS):
+                return ""
+            return "read-only kep/hades command denied: command is not in the read allowlist"
+
         def _parse_env_name(argv) -> str:
             for idx, arg in enumerate(argv):
                 if arg == "--env" and idx + 1 < len(argv):
@@ -152,6 +229,18 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
             kep_profile = str(os.environ.get("KEP_PROFILE") or "").strip()
             if kep_profile and not _has_explicit_profile(argv):
                 argv = ["--profile", kep_profile, *argv]
+            readonly_reason = _readonly_write_reason(argv)
+            if readonly_reason:
+                print(readonly_reason, file=sys.stderr)
+                try:
+                    _append_security_event(
+                        event_type="kep_cli.readonly.denied",
+                        command_name=COMMAND_NAME,
+                        reason=readonly_reason,
+                    )
+                except Exception:
+                    pass
+                return 126
 
             proc = subprocess.Popen(
                 [real_binary, *argv],
