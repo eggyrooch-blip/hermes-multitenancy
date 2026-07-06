@@ -162,13 +162,12 @@ def with_cron_owner_context(job: dict, *, profile_home: Path) -> dict:
         updated["owner_open_id"] = context["owner_open_id"]
     if not str(updated.get("owner_profile") or "").strip():
         updated["owner_profile"] = context["owner_profile"]
-    # Carry the expert routing labels too, so backfill / update / legacy-job paths
-    # tag consistently on an expert gateway (setdefault: never clobber an existing
-    # source_app, and only added when infer produced one = expert gateway).
-    if context.get("source_app"):
-        updated.setdefault("source_app", context["source_app"])
-    if context.get("writable_authorized"):
-        updated.setdefault("writable_authorized", context["writable_authorized"])
+    # OWNER-ONLY on purpose. Do NOT stamp source_app / writable_authorized here:
+    # this runs during backfill/scan across ALL profiles, so stamping the expert
+    # gateway's labels onto a legacy/user job would silently convert ordinary cron
+    # into expert writable cron and steal it from the router. Source labels are
+    # created ONLY in the create hook (infer_cron_owner_context via create_job) —
+    # i.e. by the user's act of creating the job in the expert bot.
     return updated
 
 

@@ -382,6 +382,26 @@ def test_partition_is_env_only_and_fails_closed_without_app_id_env(tmp_path, mon
     assert cron_worker._job_belongs_to_this_gateway({"source_app": "cli_from_profile"}) is False
 
 
+def test_with_cron_owner_context_never_stamps_source_labels_during_backfill(tmp_path, monkeypatch):
+    # On an expert gateway (app-id env set), backfilling/scanning a legacy/user job
+    # must NOT stamp source_app / writable_authorized — else ordinary cron silently
+    # becomes expert writable cron and the router stops owning it. Source labels are
+    # created ONLY by the create hook (the user's act of creating in the expert bot).
+    profile = _profile(tmp_path / "profiles", "alice")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", "cli_expert")
+
+    legacy = {"id": "legacy", "owner_open_id": "ou_owner", "owner_profile": "alice"}
+    result = cron_worker.with_cron_owner_context(legacy, profile_home=profile)
+    assert "source_app" not in result
+    assert "writable_authorized" not in result
+    # ... but the create hook itself DOES stamp (source labels come from create only).
+    tagged = cron_worker.infer_cron_owner_context(legacy, profile_home=profile)
+    assert tagged.get("source_app") == "cli_expert"
+    assert tagged.get("writable_authorized") is True
+
+
 def test_router_regression_without_fixed_expert_keeps_untagged_jobs_unchanged(tmp_path, monkeypatch):
     profile = _profile(tmp_path / "profiles", "alice")
     monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)
