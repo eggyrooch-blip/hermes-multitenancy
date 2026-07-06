@@ -272,7 +272,10 @@ def test_scheduled_execution_appends_security_audit_with_hashed_owner(tmp_path, 
     profile = _profile(tmp_path / "profiles", "alice")
     audit_path = tmp_path / "audit.jsonl"
     _install_fake_cron_modules(monkeypatch, profile)
-    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
+    # Gate explicitly OFF — the expert (source_app) writable audit is a required
+    # compensating control and must still land via force= (SPEC guardrail: 每次
+    # scheduled 执行落审计; operator cannot silence the control that authorizes it).
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "0")
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit_path))
     # Trusted expert_id is derived from the owning gateway env, gated on source_app.
     monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")

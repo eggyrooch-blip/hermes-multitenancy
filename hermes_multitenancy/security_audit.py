@@ -114,8 +114,12 @@ def _redact_embedded_ids(value: str) -> str:
     return _EMBEDDED_ID_RE.sub(_sub, value)
 
 
-def append_security_event(*, event_type: str, **fields: Any) -> None:
-    if not security_audit_enabled():
+def append_security_event(*, event_type: str, force: bool = False, **fields: Any) -> None:
+    # ``force`` bypasses the default-off gate for events that are themselves a
+    # required security control (e.g. the expert-bot writable scheduled-cron audit,
+    # the compensating control that replaces per-execution approval). Normal
+    # callers leave force=False and stay byte-identical under a default-off deploy.
+    if not (force or security_audit_enabled()):
         return
 
     event: dict[str, str] = {

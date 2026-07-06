@@ -212,9 +212,14 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
         cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
         cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
 
+        source_app = str(job.get("source_app") or "").strip()
         try:
             from ..security_audit import append_security_event
 
+            # An expert-routed scheduled run is the no-approval writable path; its
+            # audit IS the compensating control (SPEC guardrail), so force it to
+            # land even under a default-off audit gate. Non-expert user cron keeps
+            # the existing gate (byte-identical).
             append_security_event(
                 event_type="cron_scheduled_execution",
                 point="cron.scheduled",
@@ -223,9 +228,18 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
                 run_id=job.get("id"),
                 expert_id=_cw._expert_id_for_cron_job(job),
                 decision="writable" if job.get("writable_authorized") else "readonly",
+                force=bool(source_app),
             )
         except Exception:
-            logger.debug("[multitenancy] cron scheduled execution audit skipped", exc_info=True)
+            if source_app:
+                logger.warning(
+                    "[multitenancy] cron scheduled execution audit FAILED for expert job=%s "
+                    "(compensating control for writable no-approval path)",
+                    job.get("id"),
+                    exc_info=True,
+                )
+            else:
+                logger.debug("[multitenancy] cron scheduled execution audit skipped", exc_info=True)
         success, output, final_response, error = _cw._run_cron_job_body_with_cleanup(job, cron_scheduler)
         return {
             "success": bool(success),
