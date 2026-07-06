@@ -103,6 +103,19 @@ def test_existing_non_router_runner_cannot_create_feishu_adapter(monkeypatch, tm
     assert runner._create_adapter(_PlatformKey("api_server"), _PlatformConfig(enabled=True)) is not None
 
 
+def test_fixed_expert_env_must_not_leak_to_subprocess_allowlist():
+    """Security invariant (codex review): HERMES_MULTITENANCY_FIXED_EXPERT must
+    NOT be in the AIAgent subprocess env allowlist — otherwise a per-user
+    subprocess would inherit it and _may_own_feishu_runtime() would treat that
+    per-user gateway as a fixed-expert Feishu owner. Only READONLY is allowlisted.
+    """
+    from hermes_multitenancy.agent_real._core import _SUBPROCESS_ENV_ALLOWLIST
+
+    assert "HERMES_MULTITENANCY_FIXED_EXPERT" not in _SUBPROCESS_ENV_ALLOWLIST
+    # ROUTER_PROFILE (the old masquerade env) must also not leak.
+    assert "HERMES_MULTITENANCY_ROUTER_PROFILE" not in _SUBPROCESS_ENV_ALLOWLIST
+
+
 def test_fixed_expert_profile_keeps_feishu_without_masquerade(monkeypatch, tmp_path):
     """Expert bot (own app, FIXED_EXPERT set) owns Feishu — one method, no
     ROUTER_PROFILE masquerade needed."""
