@@ -1036,8 +1036,61 @@ def _is_missing_legacy_feishu_auth(exc: ModuleNotFoundError) -> bool:
     return exc.name in {"hermes_cli", "hermes_cli.feishu_auth"}
 
 
-def _scope_with_offline_access(scope: str | None) -> str:
+def _app_granted_scope_names(client_id: str, client_secret: str, *, timeout: int = 10) -> set[str] | None:
+    """Return scope names the APP is actually granted (grant_status == 1), or
+    None on any failure so callers fall back to the full requested set.
+
+    Feishu rejects the WHOLE device-auth with error 20027 if it requests any
+    scope the app lacks. Each expert bot is a separate app with its own granted
+    scope set, so requesting a fixed superset (FEISHU_DEFAULT_SCOPE, built for
+    the main bot) breaks /auth on any bot missing a single scope. Intersecting
+    the request with what the app actually has is the fix (fail-open: if this
+    query fails we request the full set, i.e. current behavior).
+    """
+    try:
+        token = _mint_tenant_access_token(client_id, client_secret, timeout=timeout)
+        request = urllib.request.Request(
+            f"{FEISHU_OPEN_BASE_URL}/open-apis/application/v6/scopes",
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed Feishu host.
+            raw = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        logger.warning("[feishu-auth] app-scope query failed; requesting full scope set", exc_info=True)
+        return None
+    if int(raw.get("code") or 0) != 0:
+        return None
+    scopes = (raw.get("data") or {}).get("scopes")
+    if not isinstance(scopes, list):
+        return None
+    granted = {
+        str(s.get("scope_name")).strip()
+        for s in scopes
+        if isinstance(s, dict) and s.get("grant_status") == 1 and str(s.get("scope_name") or "").strip()
+    }
+    # Empty set = misconfigured/unexpected — fall back to full set rather than
+    # request an empty (offline_access-only) scope.
+    return granted or None
+
+
+def _scope_with_offline_access(scope: str | None, granted: set[str] | None = None) -> str:
     parts = parse_scopes(scope or os.environ.get("HERMES_FEISHU_UAT_DEFAULT_SCOPE") or FEISHU_DEFAULT_SCOPE)
+    if granted is not None:
+        kept: list[str] = []
+        dropped: list[str] = []
+        for part in parts:
+            # offline_access is an OAuth grant type, not an app scope — always keep.
+            if part == "offline_access" or part in granted:
+                kept.append(part)
+            else:
+                dropped.append(part)
+        if dropped:
+            logger.info(
+                "[feishu-auth] app lacks %d requested scope(s); dropping from device-auth: %s",
+                len(dropped), " ".join(sorted(dropped)),
+            )
+        parts = kept
     if "offline_access" not in parts:
         parts.append("offline_access")
     return " ".join(dict.fromkeys(parts))
@@ -1062,12 +1115,13 @@ def _begin_device_authorization_local(
     scope: str | None,
     client_secret: str,
 ) -> dict[str, Any]:
+    granted = _app_granted_scope_names(client_id, client_secret)
     data = _api_post(
         f"{FEISHU_ACCOUNTS_BASE_URL}/oauth/v1/device_authorization",
         {
             "client_id": client_id,
             "client_secret": client_secret,
-            "scope": _scope_with_offline_access(scope),
+            "scope": _scope_with_offline_access(scope, granted),
         },
     )
     required = {"device_code", "user_code", "verification_uri_complete"}
