@@ -194,7 +194,7 @@ def test_fixed_context_hard_rejects_audience_miss_and_accepts_audience_hit(
 
 
 @pytest.mark.asyncio
-async def test_fixed_expert_slash_gate_denies_auth_and_approve_but_allows_status(
+async def test_fixed_expert_slash_gate_allows_auth_via_canonical_but_denies_approve(
     table, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from hermes_multitenancy import expert_bot_route, router as router_mod
@@ -215,11 +215,16 @@ async def test_fixed_expert_slash_gate_denies_auth_and_approve_but_allows_status
     monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", FIXED_EXPERT)
     monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda name: profile_home)
     monkeypatch.setattr(expert_bot_route, "role_override_block_for", lambda *_a, **_kw: "**Role Override**")
-    monkeypatch.setattr(
-        router_mod,
-        "_handle_auth_command",
-        lambda **_kw: (_ for _ in ()).throw(AssertionError("/auth must be denied before auth handler")),
-    )
+
+    # /auth must REACH the auth handler (not be denied) AND arrive with the
+    # CANONICAL mapped identity (union_id on_delivery_user -> profile alice,
+    # open_id ou_main_bot_alice), NOT the expert-app-domain sender ou_expert_app.
+    auth_calls: list[dict] = []
+
+    async def _capture_auth(**kwargs):
+        auth_calls.append(kwargs)
+
+    monkeypatch.setattr(router_mod, "_handle_auth_command", _capture_auth)
 
     sends: list[str] = []
 
@@ -232,8 +237,16 @@ async def test_fixed_expert_slash_gate_denies_auth_and_approve_but_allows_status
     await router_mod.handle_async(event=_event("/approve"), gateway=gateway)
     await router_mod.handle_async(event=_event("/status"), gateway=gateway)
 
-    assert any("只读专家入口" in message and "/auth" in message for message in sends)
-    assert any("只读专家入口" in message and "/approve" in message for message in sends)
+    # /auth reached the handler exactly once, bound to the canonical profile/open_id.
+    assert len(auth_calls) == 1
+    assert auth_calls[0]["profile_name"] == "alice"
+    assert auth_calls[0]["sender"] == "ou_main_bot_alice"
+    assert auth_calls[0]["sender"] != "ou_expert_app"
+    # /auth was NOT denied (no "不支持 /auth" message; /auth only appears in the
+    # available-commands list of OTHER deny messages).
+    assert not any("不支持 /auth" in message for message in sends)
+    # /approve is still denied; /status still allowed.
+    assert any("不支持 /approve" in message for message in sends)
     assert any("profile: alice" in message for message in sends)
     router_mod.override_routing_table(None)
 

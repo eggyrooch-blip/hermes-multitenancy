@@ -13,7 +13,21 @@ logger = logging.getLogger(__name__)
 
 FIXED_EXPERT_ENV = "HERMES_MULTITENANCY_FIXED_EXPERT"
 READONLY_ENV = "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"
+# Session-control slash commands — always safe in the fixed-expert bot.
 SAFE_FIXED_EXPERT_SLASH_COMMANDS = frozenset({"new", "reset", "status", "stop"})
+# Credential-authorization slash commands (normalized names from
+# ``commands.py``: ``auth`` covers auth/creds/credentials, ``feishu-auth``
+# covers feishu_auth/feishu_reauth). Allowed because command dispatch in the
+# fixed-expert bot already routes through ``fixed_context`` — the OAuth flow
+# binds the token to the CANONICAL mapped profile + open_id (the user's own
+# main-bot-domain identity via union_id), NOT the expert-bot-domain shadow
+# open_id. So authorizing here stores creds in the right profile, shared with
+# the main bot / WebUI — no credential-domain split. Destructive-write
+# ``approve`` and quick-exec / plugin commands stay denied (M2 / readonly).
+AUTH_FIXED_EXPERT_SLASH_COMMANDS = frozenset({"auth", "feishu-auth"})
+ALLOWED_FIXED_EXPERT_SLASH_COMMANDS = (
+    SAFE_FIXED_EXPERT_SLASH_COMMANDS | AUTH_FIXED_EXPERT_SLASH_COMMANDS
+)
 READONLY_DISABLED_TOOLSETS = frozenset({"delegation", "execute_code", "terminal"})
 
 
@@ -43,12 +57,12 @@ def feishu_expert_readonly_enabled() -> bool:
 
 
 def is_fixed_expert_slash_allowed(command: str) -> bool:
-    return str(command or "").strip().lower() in SAFE_FIXED_EXPERT_SLASH_COMMANDS
+    return str(command or "").strip().lower() in ALLOWED_FIXED_EXPERT_SLASH_COMMANDS
 
 
 def fixed_expert_slash_deny_message(command: str) -> str:
     cmd = str(command or "").strip().lower() or "unknown"
-    return f"只读专家入口不支持 /{cmd}。可用命令：/status、/stop、/new。"
+    return f"只读专家入口不支持 /{cmd}。可用命令：/auth、/status、/stop、/new。"
 
 
 def _reject(reason: str) -> FixedExpertRejection:
