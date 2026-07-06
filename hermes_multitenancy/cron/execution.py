@@ -194,8 +194,13 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
     cron_jobs = None
     cron_scheduler = None
     saved_cron_state: Optional[tuple[Any, ...]] = None
+    source_app = str(job.get("source_app") or "").strip()
     os.environ["HERMES_HOME"] = str(profile_home)
-    if _writable_authorized(job):
+    # Writable scheduling is an EXPERT-only privilege: drop the readonly gate only
+    # for a job that is BOTH expert-routed (source_app — set only by the create
+    # hook, never by backfill) AND create-time authorized. A dirty/untagged job can
+    # never opt into writable execution, independent of the upstream partition.
+    if source_app and _writable_authorized(job):
         os.environ.pop(READONLY_ENV, None)
     try:
         _cw._install_cron_subprocess_runtime_pool()
@@ -223,7 +228,6 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
         cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
         cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
 
-        source_app = str(job.get("source_app") or "").strip()
         audit_ok = True
         try:
             from ..security_audit import append_security_event

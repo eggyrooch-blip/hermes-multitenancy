@@ -200,6 +200,8 @@ def test_run_job_for_profile_current_process_temporarily_disables_readonly_for_a
     profile = _profile(tmp_path / "profiles", "alice")
     _install_fake_cron_modules(monkeypatch, profile)
     monkeypatch.setenv("HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY", "1")
+    # A source_app job force-audits; give it a writable path so it isn't fail-closed.
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     monkeypatch.setattr(cron_worker, "_install_cron_subprocess_runtime_pool", lambda: None)
 
     states: list[bool] = []
@@ -210,12 +212,23 @@ def test_run_job_for_profile_current_process_temporarily_disables_readonly_for_a
 
     monkeypatch.setattr(cron_worker, "_run_cron_job_body_with_cleanup", fake_run)
 
+    # Expert-routed (source_app) AND create-time authorized → readonly dropped.
     writable = cron_worker._run_job_for_profile_current_process(
         profile,
-        {"id": "job1", "name": "Daily", "writable_authorized": True},
+        {"id": "job1", "name": "Daily", "source_app": "cli_expert", "writable_authorized": True},
     )
     assert writable["success"] is True
     assert states == [False]
+    assert os.environ["HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"] == "1"
+
+    # writable_authorized WITHOUT source_app (dirty/untagged) must NOT drop readonly.
+    states.clear()
+    untagged = cron_worker._run_job_for_profile_current_process(
+        profile,
+        {"id": "jobU", "name": "Daily", "writable_authorized": True},
+    )
+    assert untagged["success"] is True
+    assert states == [True]
     assert os.environ["HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"] == "1"
 
     states.clear()
