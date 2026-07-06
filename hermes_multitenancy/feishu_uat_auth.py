@@ -1059,11 +1059,27 @@ def _app_granted_scope_names(client_id: str, client_secret: str, *, timeout: int
     except Exception:
         logger.warning("[feishu-auth] app-scope query failed; requesting full scope set", exc_info=True)
         return None
-    if int(raw.get("code") or 0) != 0:
+    # Robust parse: any malformed/error response fails OPEN (return None → full
+    # set requested), and logs code/msg so a persistent failure is diagnosable
+    # rather than silently re-hitting 20027.
+    if not isinstance(raw, dict):
+        logger.warning("[feishu-auth] app-scope response not a JSON object; requesting full scope set")
         return None
-    scopes = (raw.get("data") or {}).get("scopes")
+    try:
+        code_ok = int(raw.get("code") or 0) == 0
+    except (TypeError, ValueError):
+        code_ok = False
+    if not code_ok:
+        logger.warning(
+            "[feishu-auth] app-scope query code=%s msg=%s; requesting full scope set",
+            raw.get("code"), raw.get("msg"),
+        )
+        return None
+    data = raw.get("data")
+    scopes = data.get("scopes") if isinstance(data, dict) else None
     if not isinstance(scopes, list):
         return None
+    # grant_status per Feishu /application/v6/scopes enum: 1 = granted, 2 = not granted.
     granted = {
         str(s.get("scope_name")).strip()
         for s in scopes
@@ -1086,8 +1102,9 @@ def _scope_with_offline_access(scope: str | None, granted: set[str] | None = Non
             else:
                 dropped.append(part)
         if dropped:
-            logger.info(
-                "[feishu-auth] app lacks %d requested scope(s); dropping from device-auth: %s",
+            logger.warning(
+                "[feishu-auth] app lacks %d requested scope(s); dropping from device-auth "
+                "(user token will NOT carry these): %s",
                 len(dropped), " ".join(sorted(dropped)),
             )
         parts = kept

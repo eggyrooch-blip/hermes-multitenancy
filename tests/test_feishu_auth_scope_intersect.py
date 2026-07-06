@@ -52,8 +52,8 @@ def test_app_granted_scope_names_parses_granted_only(monkeypatch):
         "code": 0,
         "data": {
             "scopes": [
-                {"scope_name": "im:message", "grant_status": 1},
-                {"scope_name": "search:search", "grant_status": 0},  # 未授权
+                {"scope_name": "im:message", "grant_status": 1},  # 官方枚举 1=已授权
+                {"scope_name": "search:search", "grant_status": 2},  # 2=未授权
                 {"scope_name": "contact:user.base:readonly", "grant_status": 1},
             ]
         },
@@ -72,6 +72,30 @@ def test_app_granted_scope_names_fail_open_returns_none(monkeypatch):
 
     monkeypatch.setattr(fa, "_mint_tenant_access_token", _boom)
     assert fa._app_granted_scope_names("cli_x", "sec") is None  # fail-open
+
+
+def _patch_scopes_response(monkeypatch, body: bytes):
+    monkeypatch.setattr(fa, "_mint_tenant_access_token", lambda *a, **k: "t-fake")
+    monkeypatch.setattr(
+        fa.urllib.request, "urlopen", lambda *a, **k: _FakeResp(body)
+    )
+
+
+def test_app_granted_scope_names_malformed_non_dict_fail_open(monkeypatch):
+    # 飞书返回 JSON 数组/非 object → raw.get 会 AttributeError,必须 fail-open 不抛。
+    _patch_scopes_response(monkeypatch, json.dumps([1, 2, 3]).encode("utf-8"))
+    assert fa._app_granted_scope_names("cli_x", "sec") is None
+
+
+def test_app_granted_scope_names_error_code_fail_open(monkeypatch):
+    _patch_scopes_response(monkeypatch, json.dumps({"code": 99991663, "msg": "denied"}).encode("utf-8"))
+    assert fa._app_granted_scope_names("cli_x", "sec") is None
+
+
+def test_app_granted_scope_names_empty_scopes_fail_open(monkeypatch):
+    # code=0 但 scopes 空/缺 → None(回退全集,不请求空 scope)。
+    _patch_scopes_response(monkeypatch, json.dumps({"code": 0, "data": {"scopes": []}}).encode("utf-8"))
+    assert fa._app_granted_scope_names("cli_x", "sec") is None
 
 
 def test_device_auth_requests_only_granted_scopes(monkeypatch):
