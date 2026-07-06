@@ -2621,6 +2621,7 @@ from .media import (  # noqa: E402,F401
     _profile_main_runtime_for_image_prep,
     _install_auxiliary_main_runtime_patch,
     _install_vision_model_override,
+    _install_vision_task_endpoint_override,
     _restore_auxiliary_main_runtime_patch,
     _profile_image_prep_runtime,
     _materialize_inbound_media_for_profile,

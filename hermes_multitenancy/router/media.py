@@ -1063,6 +1063,64 @@ def _install_vision_model_override(provider: str) -> tuple[Optional[Any], dict[s
     return auxiliary_client, saved
 
 
+def _install_vision_task_endpoint_override(runtime: Optional[dict[str, str]]) -> tuple[Optional[Any], dict[str, tuple[bool, Any]]]:
+    """Force the vision auxiliary task at this profile's custom endpoint,
+    regardless of what ``provider`` the caller passes in.
+
+    ``auxiliary_client._resolve_task_provider_model("vision", ...)`` only
+    reads ``auxiliary.vision.*`` from config, which is unset for a plain
+    custom-provider profile — and once a caller passes an explicit
+    ``provider`` (even the literal string ``"auto"``, which
+    ``resolve_vision_provider_client``'s own aggregator-fallback and
+    ``vision_tools.check_vision_requirements()`` both do), that resolver's
+    ``if provider: return provider, ...`` short-circuit skips the
+    per-task config branch entirely — so patching config alone can't reach
+    every caller. The vision auto-detect chain then calls
+    ``resolve_provider_client("custom:litellm-sre", ..., is_vision=True)``
+    *by name*, which doesn't match any registered ``custom_providers`` entry,
+    logs "unknown provider", and falls through to the (unavailable)
+    openrouter/nous aggregators.
+
+    Instead, wrap ``resolve_vision_provider_client`` itself: whenever a
+    caller doesn't already supply its own ``base_url``, inject this
+    runtime's base_url/api_key/model before delegating. That forces
+    ``_resolve_task_provider_model``'s ``if base_url:`` branch (checked
+    *before* the ``if provider:`` branch), which returns provider="custom"
+    unconditionally — routing into the explicit-base_url branch proven to
+    build a working client end-to-end. Restored after the prep call, same
+    as ``_install_vision_model_override``.
+    """
+    if not runtime:
+        return None, {}
+    provider = str(runtime.get("provider", "")).strip().lower()
+    if not (provider == "custom" or provider.startswith("custom:")):
+        return None, {}
+    try:
+        auxiliary_client = importlib.import_module("agent.auxiliary_client")
+    except Exception as exc:
+        _m.logger.debug("multitenancy: agent.auxiliary_client unavailable for vision endpoint override (%s)", exc)
+        return None, {}
+    original = getattr(auxiliary_client, "resolve_vision_provider_client", None)
+    if original is None:
+        return None, {}
+    saved = {"resolve_vision_provider_client": (True, original)}
+    rt_base_url = runtime.get("base_url", "")
+    rt_api_key = runtime.get("api_key", "")
+    rt_model = runtime.get("model", "")
+
+    def _patched(provider=None, model=None, *, base_url=None, api_key=None, async_mode=False):
+        return original(
+            provider,
+            model or rt_model,
+            base_url=base_url or rt_base_url,
+            api_key=api_key or rt_api_key,
+            async_mode=async_mode,
+        )
+
+    setattr(auxiliary_client, "resolve_vision_provider_client", _patched)
+    return auxiliary_client, saved
+
+
 def _restore_auxiliary_main_runtime_patch(auxiliary_client: Optional[Any], saved: dict[str, tuple[bool, Any]]) -> None:
     if auxiliary_client is None:
         return
@@ -1096,9 +1154,16 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
             saved_aux: dict[str, tuple[bool, Any]] = {}
             vis_client = None
             saved_vis: dict[str, tuple[bool, Any]] = {}
+            vte_client = None
+            saved_vte: dict[str, tuple[bool, Any]] = {}
             try:
                 os.environ[HERMES_HOME_ENV] = str(profile_home)
                 auxiliary_client, saved_aux = _m._install_auxiliary_main_runtime_patch(runtime)
+                # Scope the vision auxiliary task at this profile's custom
+                # endpoint directly — the auto-detect-by-name chain 404s for
+                # custom providers with no matching custom_providers entry
+                # name (see _install_vision_task_endpoint_override docstring).
+                vte_client, saved_vte = _m._install_vision_task_endpoint_override(runtime)
                 # Apply the vision-model override independently of the main-runtime
                 # patch (which no-ops for plain provider profiles like zai). Read
                 # the profile's provider from its merged config.
@@ -1128,6 +1193,7 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
                     vis_client, saved_vis = _m._install_vision_model_override(_prof_provider)
                 yield
             finally:
+                _m._restore_auxiliary_main_runtime_patch(vte_client, saved_vte)
                 _m._restore_auxiliary_main_runtime_patch(vis_client, saved_vis)
                 _m._restore_auxiliary_main_runtime_patch(auxiliary_client, saved_aux)
                 if had_home:
