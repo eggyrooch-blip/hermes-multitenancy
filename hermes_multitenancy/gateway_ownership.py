@@ -43,6 +43,30 @@ def is_router_profile_runtime() -> bool:
     return profile is None or profile == router_profile_name()
 
 
+def _may_own_feishu_runtime() -> bool:
+    """Whether this gateway process may own the Feishu websocket.
+
+    ONE rule for BOTH the main router AND expert bots — no masquerade. A gateway
+    owns Feishu when it is EITHER the router profile OR a dedicated fixed-expert
+    bot instance (its own Feishu app, bound via HERMES_MULTITENANCY_FIXED_EXPERT).
+    Per-user profiles are neither, so they stay fail-closed (Feishu stripped).
+
+    This lets an expert bot own its app's websocket WITHOUT setting
+    HERMES_MULTITENANCY_ROUTER_PROFILE to masquerade as the router — the
+    masquerade also wrongly flipped ``is_router_profile_runtime()`` True on the
+    expert bot, enabling router-only cron/broker/credential-renewal subsystems
+    that a second instance must not run. Feishu ownership and router-only
+    behavior are now decided by two separate predicates.
+    """
+    if is_router_profile_runtime():
+        return True
+    try:
+        from .expert_bot_route import fixed_expert_id_from_env
+    except Exception:
+        return False
+    return bool(fixed_expert_id_from_env())
+
+
 def install_gateway_ownership_guard() -> None:
     """Patch GatewayRunner so non-router profile gateways never create Feishu."""
     try:
@@ -93,24 +117,21 @@ def _patch_gateway_runner_create_adapter(GatewayRunner: Any) -> None:
 
 
 def _enforce_feishu_ownership(config: Any) -> bool:
-    profile = current_profile_name()
-    if profile is None or profile == router_profile_name():
+    if _may_own_feishu_runtime():
         return False
 
     removed = _remove_platform(config, "feishu")
     if removed:
         logger.warning(
-            "[multitenancy] stripped Feishu platform from non-router profile %s; "
-            "only %s may own the Feishu websocket",
-            profile,
-            router_profile_name(),
+            "[multitenancy] stripped Feishu platform from profile %s; only the router "
+            "or a fixed-expert bot may own the Feishu websocket",
+            current_profile_name(),
         )
     return removed
 
 
 def _should_block_feishu_platform(platform: Any) -> bool:
-    profile = current_profile_name()
-    return profile is not None and profile != router_profile_name() and _platform_name(platform) == "feishu"
+    return not _may_own_feishu_runtime() and _platform_name(platform) == "feishu"
 
 
 def _remove_platform(config: Any, platform_name: str) -> bool:
