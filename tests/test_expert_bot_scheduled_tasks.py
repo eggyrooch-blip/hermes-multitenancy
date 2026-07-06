@@ -345,6 +345,43 @@ def test_expert_scheduled_execution_fails_closed_when_audit_cannot_be_recorded(t
     assert ran == []
 
 
+def test_writable_authorized_strict_bool_rejects_dirty_data():
+    from hermes_multitenancy.cron.execution import _writable_authorized
+
+    assert _writable_authorized({"writable_authorized": True}) is True
+    assert _writable_authorized({"writable_authorized": "1"}) is True
+    assert _writable_authorized({"writable_authorized": "true"}) is True
+    # Dirty / hand-edited persisted data must NOT authorize writes — Python
+    # truthiness would wrongly treat the strings "0"/"false" as authorized.
+    assert _writable_authorized({"writable_authorized": "0"}) is False
+    assert _writable_authorized({"writable_authorized": "false"}) is False
+    assert _writable_authorized({"writable_authorized": 0}) is False
+    assert _writable_authorized({"writable_authorized": ""}) is False
+    assert _writable_authorized({}) is False
+
+
+def test_partition_is_env_only_and_fails_closed_without_app_id_env(tmp_path, monkeypatch):
+    # The expert gateway partition matches ONLY the process env app-id (deploy
+    # contract) — never a profile file, because the scan rebinds HERMES_HOME to
+    # each scanned USER profile. A missing app-id env means "own nothing"
+    # (fail-closed misconfig), never a profile-file lookup of the wrong app.
+    profile = _profile(tmp_path / "profiles", "alice")
+    uat = profile / "feishu_uat"
+    uat.mkdir(parents=True, exist_ok=True)
+    (uat / "app.json").write_text(json.dumps({"app_id": "cli_from_profile"}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", raising=False)
+
+    # No app-id env → owns nothing, even a job tagged with the profile file's app.
+    assert cron_worker._job_belongs_to_this_gateway({"source_app": "cli_from_profile"}) is False
+
+    # With the env set, it matches by env (not the profile file).
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", "cli_env")
+    assert cron_worker._job_belongs_to_this_gateway({"source_app": "cli_env"}) is True
+    assert cron_worker._job_belongs_to_this_gateway({"source_app": "cli_from_profile"}) is False
+
+
 def test_router_regression_without_fixed_expert_keeps_untagged_jobs_unchanged(tmp_path, monkeypatch):
     profile = _profile(tmp_path / "profiles", "alice")
     monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)

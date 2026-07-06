@@ -176,6 +176,17 @@ def _install_cron_subprocess_runtime_pool() -> None:
     override_pool(_build_runtime_pool(_real_factory))
 
 
+def _writable_authorized(job: dict) -> bool:
+    """Strict read of the create-time write-authorization flag from (possibly
+    dirty / hand-edited) persisted job data. Only a real bool True or a canonical
+    truthy string authorizes writes — "0"/"false"/""/0/None do NOT (Python
+    truthiness would wrongly treat the strings "0"/"false" as authorized)."""
+    value = job.get("writable_authorized")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[str, Any]:
     profile_home = Path(profile_home).expanduser().resolve()
     previous_home = os.environ.get("HERMES_HOME")
@@ -184,7 +195,7 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
     cron_scheduler = None
     saved_cron_state: Optional[tuple[Any, ...]] = None
     os.environ["HERMES_HOME"] = str(profile_home)
-    if job.get("writable_authorized"):
+    if _writable_authorized(job):
         os.environ.pop(READONLY_ENV, None)
     try:
         _cw._install_cron_subprocess_runtime_pool()
@@ -228,7 +239,7 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
                 profile=job.get("owner_profile"),
                 run_id=job.get("id"),
                 expert_id=_cw._expert_id_for_cron_job(job),
-                decision="writable" if job.get("writable_authorized") else "readonly",
+                decision="writable" if _writable_authorized(job) else "readonly",
                 force=bool(source_app),
             )
         except Exception:

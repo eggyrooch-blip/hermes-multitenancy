@@ -56,11 +56,17 @@ _cron_in_flight_lock = threading.Lock()
 def _job_belongs_to_this_gateway(job: dict) -> bool:
     source_app = str(job.get("source_app") or "").strip()
 
-    from ..expert_bot_route import fixed_expert_id_from_env
+    from ..expert_bot_route import fixed_expert_id_from_env, fixed_expert_app_id_from_env
 
     if not fixed_expert_id_from_env():
+        # Router / per-user gateway: owns only untagged jobs.
         return not source_app
-    return bool(source_app) and source_app == _cw._owned_expert_app_id(_cw._current_profile_home())
+    # Expert gateway: match the app id from the PROCESS env (deploy contract).
+    # Never from a profile file — the scan rebinds HERMES_HOME to each scanned
+    # USER profile, so a profile-file lookup would read the wrong app. Missing
+    # app-id env → matches nothing (fail-closed misconfig, not misroute).
+    owned_app = fixed_expert_app_id_from_env()
+    return bool(source_app) and bool(owned_app) and source_app == owned_app
 
 
 def _resolve_profiles_root() -> Optional[Path]:

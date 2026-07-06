@@ -117,41 +117,6 @@ def _session_owner_open_id() -> str:
     return ""
 
 
-def _owned_expert_app_id(profile_home: Path) -> str:
-    """The Feishu app id THIS expert gateway owns, or "" when it owns none.
-
-    Env is the deploy contract (the expert bot sets HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID
-    on its gateway launch); best-effort fallback to the gateway's OWN feishu_uat
-    app id. Used only by the source_app ownership filter in the gateway process,
-    where ``_current_profile_home()`` is the expert profile — never against a
-    scanned per-user profile.
-    """
-    from .. import expert_bot_route
-
-    app_id = expert_bot_route.fixed_expert_app_id_from_env()
-    if app_id:
-        return app_id
-
-    uat_dir = Path(profile_home).expanduser() / "feishu_uat"
-    try:
-        candidates = sorted(
-            (path for path in uat_dir.glob("*.json") if path.is_file()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-    except Exception:
-        return ""
-    for path in candidates:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        app_id = str(payload.get("app_id") or payload.get("client_id") or "").strip()
-        if app_id:
-            return app_id
-    return ""
-
-
 def infer_cron_owner_context(job: dict, *, profile_home: Path) -> dict[str, Any]:
     """Return inferred owner context for a cron job without mutating it."""
     owner = str(job.get("owner_open_id") or "").strip()
