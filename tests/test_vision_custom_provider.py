@@ -142,6 +142,45 @@ def test_vision_endpoint_override_respects_caller_supplied_base_url(monkeypatch)
         router._restore_auxiliary_main_runtime_patch(client, saved)
 
 
+def test_vision_endpoint_override_does_not_clobber_explicit_different_provider(monkeypatch):
+    """A profile that explicitly configured `auxiliary.vision.provider:
+    openrouter` (a different, real provider choice, no base_url of its own)
+    must keep routing there — the override must not force this profile's
+    litellm endpoint onto an unrelated explicit choice (codex review
+    finding: this SPEC's own 'auxiliary.vision.* overrides still win'
+    Out-of-scope guarantee)."""
+    fake = _install_fake_aux(monkeypatch)
+    client, saved = router._install_vision_task_endpoint_override(_RUNTIME)
+    try:
+        requested, client_after, _ = fake.resolve_vision_provider_client(
+            provider="openrouter", async_mode=True
+        )
+        assert requested == "openrouter"
+        # Not clobbered: the fake's openrouter path has no base_url of its
+        # own, so a correctly-untouched call still resolves to no client —
+        # proving the runtime's base_url was NOT force-injected.
+        assert client_after is None
+    finally:
+        router._restore_auxiliary_main_runtime_patch(client, saved)
+
+
+def test_vision_endpoint_override_fills_gap_for_own_named_provider(monkeypatch):
+    """Edge case: `auxiliary.vision.provider` explicitly names this SAME
+    custom provider (e.g. `custom:litellm-sre`) but without repeating
+    base_url/api_key — the exact "named custom provider unreachable" bug,
+    just reached via a different config knob. Still fixed."""
+    fake = _install_fake_aux(monkeypatch)
+    client, saved = router._install_vision_task_endpoint_override(_RUNTIME)
+    try:
+        _, client_after, _ = fake.resolve_vision_provider_client(
+            provider=_RUNTIME["provider"], async_mode=True
+        )
+        assert client_after is not None
+        assert client_after.base_url == _RUNTIME["base_url"]
+    finally:
+        router._restore_auxiliary_main_runtime_patch(client, saved)
+
+
 def test_vision_endpoint_override_noop_for_non_custom_provider(monkeypatch):
     _install_fake_aux(monkeypatch)
     client, saved = router._install_vision_task_endpoint_override(

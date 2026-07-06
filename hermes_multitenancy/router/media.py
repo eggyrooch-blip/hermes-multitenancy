@@ -1081,19 +1081,24 @@ def _install_vision_task_endpoint_override(runtime: Optional[dict[str, str]]) ->
     logs "unknown provider", and falls through to the (unavailable)
     openrouter/nous aggregators.
 
-    Instead, wrap ``resolve_vision_provider_client`` itself: whenever a
-    caller doesn't already supply its own ``base_url``, inject this
-    runtime's base_url/api_key/model before delegating. That forces
-    ``_resolve_task_provider_model``'s ``if base_url:`` branch (checked
-    *before* the ``if provider:`` branch), which returns provider="custom"
-    unconditionally — routing into the explicit-base_url branch proven to
-    build a working client end-to-end. Restored after the prep call, same
-    as ``_install_vision_model_override``.
+    Instead, wrap ``resolve_vision_provider_client`` itself: only when the
+    caller has no explicit endpoint of its own — no ``base_url``, and its
+    ``provider`` is empty, ``"auto"``, or literally this runtime's own
+    provider name (the exact "named custom provider unreachable" case) —
+    inject this runtime's base_url/api_key/model before delegating. That
+    forces ``_resolve_task_provider_model``'s ``if base_url:`` branch
+    (checked *before* the ``if provider:`` branch), which returns
+    provider="custom" unconditionally — routing into the explicit-base_url
+    branch proven to build a working client end-to-end. A caller that
+    already resolved a *different* explicit ``auxiliary.vision.provider``
+    (e.g. ``openrouter``) is passed through untouched, so that config knob
+    still wins. Restored after the prep call, same as
+    ``_install_vision_model_override``.
     """
     if not runtime:
         return None, {}
-    provider = str(runtime.get("provider", "")).strip().lower()
-    if not (provider == "custom" or provider.startswith("custom:")):
+    runtime_provider = str(runtime.get("provider", "")).strip().lower()
+    if not (runtime_provider == "custom" or runtime_provider.startswith("custom:")):
         return None, {}
     try:
         auxiliary_client = importlib.import_module("agent.auxiliary_client")
@@ -1109,11 +1114,17 @@ def _install_vision_task_endpoint_override(runtime: Optional[dict[str, str]]) ->
     rt_model = runtime.get("model", "")
 
     def _patched(provider=None, model=None, *, base_url=None, api_key=None, async_mode=False):
+        caller_provider = str(provider or "").strip().lower()
+        if base_url or caller_provider not in {"", "auto", runtime_provider}:
+            # Caller already has its own endpoint, or explicitly resolved a
+            # DIFFERENT provider (e.g. auxiliary.vision.provider: openrouter)
+            # — respect it, don't clobber with this profile's runtime.
+            return original(provider, model, base_url=base_url, api_key=api_key, async_mode=async_mode)
         return original(
             provider,
             model or rt_model,
-            base_url=base_url or rt_base_url,
-            api_key=api_key or rt_api_key,
+            base_url=rt_base_url,
+            api_key=rt_api_key,
             async_mode=async_mode,
         )
 
