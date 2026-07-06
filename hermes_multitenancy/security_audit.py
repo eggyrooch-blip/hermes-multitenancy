@@ -27,6 +27,7 @@ _SAFE_FIELD_NAMES = frozenset(
         "lease_kind",
         "decision",
         "run_id",
+        "expert_id",
         "ttl_seconds",
         "point",
     }

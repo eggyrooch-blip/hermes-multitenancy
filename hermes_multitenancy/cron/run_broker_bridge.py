@@ -64,6 +64,23 @@ def _cron_user_key(job: dict, profile_name: str) -> str:
     return owner_open_id
 
 
+def _expert_id_for_cron_job(job: dict) -> str:
+    """Expert-overlay id for a scheduled run — derived from the OWNING gateway.
+
+    An expert job carries a ``source_app`` routing label and is only ever executed
+    on the expert bot that owns that app (orchestrator._job_belongs_to_this_gateway),
+    so the trusted expert id is THIS gateway's own fixed-expert env — available in
+    the cron execute subprocess via os.environ.copy, not the (deliberately
+    FIXED_EXPERT-free) AIAgent env allowlist. Empty on the router / for untagged
+    jobs. Never trusted from a spoofable job field.
+    """
+    if not str(job.get("source_app") or "").strip():
+        return ""
+    from ..expert_bot_route import fixed_expert_id_from_env
+
+    return fixed_expert_id_from_env()
+
+
 def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> RunRequest:
     job = _cw.with_cron_owner_context(job, profile_home=profile_home)
     profile_name = str(job.get("owner_profile") or "").strip() or profile_home.name
@@ -74,6 +91,7 @@ def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> Ru
     metadata = {
         "job_id": job_id,
         "job_name": str(job.get("name") or job_id or "scheduled task"),
+        "expert_id": _cw._expert_id_for_cron_job(job),
         "deliver": job.get("deliver"),
         "profile_home": str(profile_home),
         "model": job.get("model"),

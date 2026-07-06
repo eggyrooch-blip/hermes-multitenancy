@@ -117,7 +117,42 @@ def _session_owner_open_id() -> str:
     return ""
 
 
-def infer_cron_owner_context(job: dict, *, profile_home: Path) -> dict[str, str]:
+def _owned_expert_app_id(profile_home: Path) -> str:
+    """The Feishu app id THIS expert gateway owns, or "" when it owns none.
+
+    Env is the deploy contract (the expert bot sets HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID
+    on its gateway launch); best-effort fallback to the gateway's OWN feishu_uat
+    app id. Used only by the source_app ownership filter in the gateway process,
+    where ``_current_profile_home()`` is the expert profile — never against a
+    scanned per-user profile.
+    """
+    from .. import expert_bot_route
+
+    app_id = expert_bot_route.fixed_expert_app_id_from_env()
+    if app_id:
+        return app_id
+
+    uat_dir = Path(profile_home).expanduser() / "feishu_uat"
+    try:
+        candidates = sorted(
+            (path for path in uat_dir.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return ""
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        app_id = str(payload.get("app_id") or payload.get("client_id") or "").strip()
+        if app_id:
+            return app_id
+    return ""
+
+
+def infer_cron_owner_context(job: dict, *, profile_home: Path) -> dict[str, Any]:
     """Return inferred owner context for a cron job without mutating it."""
     owner = str(job.get("owner_open_id") or "").strip()
     owner_profile = str(job.get("owner_profile") or "").strip()
@@ -131,7 +166,23 @@ def infer_cron_owner_context(job: dict, *, profile_home: Path) -> dict[str, str]
         return {}
     if not owner_profile:
         owner_profile = Path(profile_home).expanduser().name
-    return {"owner_open_id": owner, "owner_profile": owner_profile}
+    context: dict[str, Any] = {"owner_open_id": owner, "owner_profile": owner_profile}
+
+    # Expert cron routing label. Set ONLY from the dedicated app-id env, which the
+    # expert bot forwards to its create subprocess. We deliberately do NOT read
+    # HERMES_MULTITENANCY_FIXED_EXPERT here: it is banned from the subprocess
+    # allowlist (it would flip _may_own_feishu_runtime() in a per-user subprocess),
+    # and the app-id env alone is a routing label — never an ownership grant, and
+    # only the expert gateway ever sets it (so per-user/router create subprocesses
+    # stay untagged = regression-safe). The expert_id itself is derived at execute
+    # time from the OWNING gateway's trusted identity, not persisted here.
+    from ..expert_bot_route import fixed_expert_app_id_from_env
+
+    source_app = fixed_expert_app_id_from_env()
+    if not source_app:
+        return context
+    context.update({"source_app": source_app, "writable_authorized": True})
+    return context
 
 
 def with_cron_owner_context(job: dict, *, profile_home: Path) -> dict:

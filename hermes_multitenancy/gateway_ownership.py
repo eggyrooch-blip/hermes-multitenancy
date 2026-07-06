@@ -67,6 +67,10 @@ def _may_own_feishu_runtime() -> bool:
     return bool(fixed_expert_id_from_env())
 
 
+def may_own_cron_runtime() -> bool:
+    return _may_own_feishu_runtime()
+
+
 def install_gateway_ownership_guard() -> None:
     """Patch GatewayRunner so non-router profile gateways never create Feishu."""
     try:
@@ -156,5 +160,6 @@ __all__ = [
     "current_profile_name",
     "install_gateway_ownership_guard",
     "is_router_profile_runtime",
+    "may_own_cron_runtime",
     "router_profile_name",
 ]

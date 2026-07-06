@@ -44,6 +44,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from .. import cron_worker as _cw
 from ..feishu_inbound_richtext import install_feishu_inbound_richtext_patch
 from ..feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
+from .. import gateway_ownership
 
 # Keep the historical logger name so log records are attributed to
 # ``hermes_multitenancy.cron_worker`` exactly as before the split.
@@ -181,12 +182,13 @@ def install_gateway_startup_watcher() -> None:
 
 
 def _schedule_startup_watch(gateway: Any) -> None:
-    try:
-        from ..webui_broker_server import ensure_run_broker_server_started
+    if gateway_ownership.is_router_profile_runtime():
+        try:
+            from ..webui_broker_server import ensure_run_broker_server_started
 
-        ensure_run_broker_server_started()
-    except Exception:
-        logger.exception("[multitenancy] failed to schedule WebUI run broker sidecar")
+            ensure_run_broker_server_started()
+        except Exception:
+            logger.exception("[multitenancy] failed to schedule WebUI run broker sidecar")
     if getattr(gateway, _watcher_attr, False):
         return
     try:

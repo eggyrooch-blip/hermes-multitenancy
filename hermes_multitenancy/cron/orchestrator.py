@@ -53,6 +53,16 @@ _cron_module_patch_lock = threading.Lock()
 _cron_in_flight_lock = threading.Lock()
 
 
+def _job_belongs_to_this_gateway(job: dict) -> bool:
+    source_app = str(job.get("source_app") or "").strip()
+
+    from ..expert_bot_route import fixed_expert_id_from_env
+
+    if not fixed_expert_id_from_env():
+        return not source_app
+    return bool(source_app) and source_app == _cw._owned_expert_app_id(_cw._current_profile_home())
+
+
 def _resolve_profiles_root() -> Optional[Path]:
     hermes_home = os.environ.get("HERMES_HOME")
     if not hermes_home:
@@ -366,6 +376,20 @@ def _scan_and_submit_due_profile_jobs(
                         logger.warning(
                             "[multitenancy] cron due job without id skipped profile=%s",
                             profile_dir.name,
+                        )
+                        continue
+                    # Owning gateway both executes and later finalizes/delivers
+                    # through its live Feishu adapter, so non-owners must skip
+                    # before advance_next_run/in_flight to avoid double-run.
+                    # ponytail: shared profile tick locks are enough today; add
+                    # per-app sub-locks only if mixed router/expert scans ever
+                    # show starvation under real load.
+                    if not _cw._job_belongs_to_this_gateway(job):
+                        logger.debug(
+                            "[multitenancy] cron due job owned by another gateway profile=%s job=%s source_app=%s",
+                            profile_dir.name,
+                            job_id,
+                            str(job.get("source_app") or "").strip(),
                         )
                         continue
                     key = (profile_dir.name, job_id)

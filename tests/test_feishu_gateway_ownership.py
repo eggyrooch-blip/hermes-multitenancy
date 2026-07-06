@@ -114,6 +114,10 @@ def test_fixed_expert_env_must_not_leak_to_subprocess_allowlist():
     assert "HERMES_MULTITENANCY_FIXED_EXPERT" not in _SUBPROCESS_ENV_ALLOWLIST
     # ROUTER_PROFILE (the old masquerade env) must also not leak.
     assert "HERMES_MULTITENANCY_ROUTER_PROFILE" not in _SUBPROCESS_ENV_ALLOWLIST
+    # The app-id LABEL is safe to forward — it is not an ownership grant
+    # (_may_own_feishu_runtime reads only FIXED_EXPERT) — and it lets the expert
+    # bot's create subprocess tag a cron job's source_app.
+    assert "HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID" in _SUBPROCESS_ENV_ALLOWLIST
 
 
 def test_fixed_expert_profile_keeps_feishu_without_masquerade(monkeypatch, tmp_path):
@@ -153,8 +157,10 @@ def test_may_own_feishu_predicate_router_expert_and_per_user(monkeypatch, tmp_pa
 
 
 def test_fixed_expert_owns_feishu_but_does_NOT_run_router_sidecars(monkeypatch, tmp_path):
-    """The masquerade side-effect fix: owning Feishu (FIXED_EXPERT) must NOT flip
-    is_router_profile_runtime True — expert bot still skips cron/broker/renewal."""
+    """FIXED_EXPERT owns Feishu AND now runs the cron worker (源进源出:
+    source_app-partitioned self-execution), but must STILL NOT run router-only
+    sidecars (run-broker / credential renewal / bot-added) — owning Feishu +
+    running cron does not flip is_router_profile_runtime True."""
     import hermes_multitenancy
     import hermes_multitenancy.group_inviter_hook as group_inviter_hook
 
@@ -182,10 +188,11 @@ def test_fixed_expert_owns_feishu_but_does_NOT_run_router_sidecars(monkeypatch, 
 
     hermes_multitenancy.register(FakeCtx())
 
-    # FIXED_EXPERT grants Feishu ownership but NOT router-only subsystems.
+    # FIXED_EXPERT runs the cron worker (owns its app's jobs), but NOT the
+    # router-only sidecars.
+    assert ("cron_patches", None) in calls
+    assert ("cron_watcher", None) in calls
     assert ("run_broker_server", None) not in calls
-    assert ("cron_watcher", None) not in calls
-    assert ("cron_patches", None) not in calls
     assert ("bot_added_hook", None) not in calls
 
 

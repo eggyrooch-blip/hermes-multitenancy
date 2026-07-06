@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+from hermes_multitenancy import cron_worker
+
+
+class FakeCronJobs:
+    def __init__(self) -> None:
+        self.HERMES_DIR = Path("/original/hermes")
+        self.CRON_DIR = self.HERMES_DIR / "cron"
+        self.JOBS_FILE = self.CRON_DIR / "jobs.json"
+        self.OUTPUT_DIR = self.CRON_DIR / "output"
+
+
+class DueScheduler:
+    def __init__(self, due_by_profile: dict[str, list[dict]]) -> None:
+        self.due_by_profile = due_by_profile
+        self._hermes_home = Path("/original/hermes")
+        self._LOCK_DIR = self._hermes_home / "cron"
+        self._LOCK_FILE = self._LOCK_DIR / ".tick.lock"
+        self.advanced: list[tuple[str, str]] = []
+
+    def get_due_jobs(self) -> list[dict]:
+        profile = Path(os.environ["HERMES_HOME"]).name
+        return [dict(job) for job in self.due_by_profile.get(profile, [])]
+
+    def advance_next_run(self, job_id: str) -> bool:
+        self.advanced.append((Path(os.environ["HERMES_HOME"]).name, job_id))
+        return True
+
+
+class RecordingExecutor:
+    def __init__(self) -> None:
+        self.submissions: list[tuple[object, tuple, dict]] = []
+
+    def submit(self, fn, *args, **kwargs):
+        import concurrent.futures
+
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self.submissions.append((fn, args, kwargs))
+        return future
+
+
+def _profile(root: Path, name: str) -> Path:
+    profile = root / name
+    (profile / "cron").mkdir(parents=True)
+    (profile / "cron" / "jobs.json").write_text("[]", encoding="utf-8")
+    return profile
+
+
+def _install_fake_cron_modules(monkeypatch, profile: Path) -> None:
+    cron_pkg = ModuleType("cron")
+    cron_jobs = ModuleType("cron.jobs")
+    cron_scheduler = ModuleType("cron.scheduler")
+    cron_jobs.HERMES_DIR = Path("/original/hermes")
+    cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+    cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+    cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+    cron_scheduler._hermes_home = Path("/original/hermes")
+    cron_scheduler._LOCK_DIR = cron_scheduler._hermes_home / "cron"
+    cron_scheduler._LOCK_FILE = cron_scheduler._LOCK_DIR / ".tick.lock"
+    cron_pkg.jobs = cron_jobs
+    cron_pkg.scheduler = cron_scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.jobs", cron_jobs)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", cron_scheduler)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+
+def test_infer_cron_owner_context_tags_expert_jobs_and_regresses_without_fixed_expert(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path / "profiles", "alice")
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", "cli_a123")
+
+    tagged = cron_worker.infer_cron_owner_context({}, profile_home=profile)
+
+    # expert_id is NOT persisted at create time: the create subprocess is
+    # deliberately FIXED_EXPERT-free (subprocess allowlist), so it can only tag
+    # the source_app LABEL + writable authorization. The trusted expert_id is
+    # derived at execute time from the owning gateway env (see
+    # _expert_id_for_cron_job), never from a spoofable job field.
+    assert tagged == {
+        "owner_open_id": "ou_owner",
+        "owner_profile": "alice",
+        "source_app": "cli_a123",
+        "writable_authorized": True,
+    }
+
+    # Tagging is gated on the app-id label (what the create subprocess actually
+    # sees), so the non-expert regression case must clear APP_ID, not FIXED_EXPERT.
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", raising=False)
+    plain = cron_worker.infer_cron_owner_context({}, profile_home=profile)
+
+    assert plain == {
+        "owner_open_id": "ou_owner",
+        "owner_profile": "alice",
+    }
+
+
+def test_job_partition_and_scan_submit_only_the_owning_gateway(tmp_path, monkeypatch):
+    profile = _profile(tmp_path / "profiles", "alice")
+    monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    untagged = {"id": "plain"}
+    tagged = {"id": "expert", "source_app": "cli_expert"}
+    other = {"id": "other", "source_app": "cli_other"}
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", raising=False)
+    assert cron_worker._job_belongs_to_this_gateway(untagged) is True
+    assert cron_worker._job_belongs_to_this_gateway(tagged) is False
+
+    router_scheduler = DueScheduler({"alice": [tagged]})
+    router_executor = RecordingExecutor()
+    router_submitted = cron_worker._scan_and_submit_due_profile_jobs(
+        FakeCronJobs(),
+        router_scheduler,
+        profile.parent,
+        {"alice"},
+        adapters=None,
+        loop=SimpleNamespace(is_running=lambda: False),
+        patch_lock=threading.Lock(),
+        executor=router_executor,
+        in_flight=set(),
+        runner=lambda _profile_home, _job: None,
+    )
+    assert router_submitted == 0
+    assert router_scheduler.advanced == []
+    assert router_executor.submissions == []
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", "cli_expert")
+    assert cron_worker._job_belongs_to_this_gateway(tagged) is True
+    assert cron_worker._job_belongs_to_this_gateway(untagged) is False
+    assert cron_worker._job_belongs_to_this_gateway(other) is False
+
+    expert_scheduler = DueScheduler({"alice": [tagged]})
+    expert_executor = RecordingExecutor()
+    expert_submitted = cron_worker._scan_and_submit_due_profile_jobs(
+        FakeCronJobs(),
+        expert_scheduler,
+        profile.parent,
+        {"alice"},
+        adapters=None,
+        loop=SimpleNamespace(is_running=lambda: False),
+        patch_lock=threading.Lock(),
+        executor=expert_executor,
+        in_flight=set(),
+        runner=lambda _profile_home, _job: None,
+    )
+    assert expert_submitted == 1
+    assert expert_scheduler.advanced == [("alice", "expert")]
+    assert [(args[0].name, args[1]["id"]) for _fn, args, _kwargs in expert_executor.submissions] == [
+        ("alice", "expert")
+    ]
+
+
+def test_build_cron_run_request_threads_expert_id_into_event_metadata(tmp_path, monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    profile = _profile(tmp_path / "profiles", "alice")
+    # expert_id is derived from the OWNING gateway's trusted env at execute time,
+    # gated on the job's source_app label — a spoofed job["expert_id"] is ignored.
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    request = cron_worker._build_cron_run_request(
+        {
+            "id": "job1",
+            "name": "Daily",
+            "prompt": "hi",
+            "deliver": "feishu",
+            "owner_profile": "alice",
+            "owner_open_id": "ou_owner",
+            "source_app": "cli_expert",
+            "expert_id": "spoofed-ignored",
+        },
+        profile_home=profile,
+        prompt="run now",
+    )
+
+    assert request.metadata["expert_id"] == "expert-123"
+    assert agent_real._expert_id_for_event(cron_worker._build_cron_event(request)) == "expert-123"
+
+
+def test_run_job_for_profile_current_process_temporarily_disables_readonly_for_authorized_jobs(
+    tmp_path, monkeypatch
+):
+    from hermes_multitenancy.expert_bot_route import feishu_expert_readonly_enabled
+
+    profile = _profile(tmp_path / "profiles", "alice")
+    _install_fake_cron_modules(monkeypatch, profile)
+    monkeypatch.setenv("HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY", "1")
+    monkeypatch.setattr(cron_worker, "_install_cron_subprocess_runtime_pool", lambda: None)
+
+    states: list[bool] = []
+
+    def fake_run(job, _scheduler):
+        states.append(feishu_expert_readonly_enabled())
+        return True, f"output:{job['id']}", "visible", None
+
+    monkeypatch.setattr(cron_worker, "_run_cron_job_body_with_cleanup", fake_run)
+
+    writable = cron_worker._run_job_for_profile_current_process(
+        profile,
+        {"id": "job1", "name": "Daily", "writable_authorized": True},
+    )
+    assert writable["success"] is True
+    assert states == [False]
+    assert os.environ["HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"] == "1"
+
+    states.clear()
+    readonly = cron_worker._run_job_for_profile_current_process(
+        profile,
+        {"id": "job2", "name": "Daily"},
+    )
+    assert readonly["success"] is True
+    assert states == [True]
+    assert os.environ["HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"] == "1"
+
+
+def test_expert_gateway_scan_submits_source_out_job_and_delivery_targets_owner(tmp_path, monkeypatch):
+    profile = _profile(tmp_path / "profiles", "alice")
+    job = {
+        "id": "job1",
+        "name": "Daily",
+        "owner_open_id": "ou_owner",
+        "owner_profile": "alice",
+        "source_app": "cli_expert",
+        "expert_id": "expert-123",
+    }
+
+    monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", "cli_expert")
+
+    scheduler = DueScheduler({"alice": [job]})
+    executor = RecordingExecutor()
+    submitted = cron_worker._scan_and_submit_due_profile_jobs(
+        FakeCronJobs(),
+        scheduler,
+        profile.parent,
+        {"alice"},
+        adapters=None,
+        loop=SimpleNamespace(is_running=lambda: False),
+        patch_lock=threading.Lock(),
+        executor=executor,
+        in_flight=set(),
+        runner=lambda _profile_home, _job: None,
+    )
+
+    assert submitted == 1
+    assert scheduler.advanced == [("alice", "job1")]
+    assert cron_worker._cron_deliver_target(job, "ou_owner") == {
+        "platform": "feishu",
+        "chat_id": "ou_owner",
+        "thread_id": None,
+    }
+
+
+def test_scheduled_execution_appends_security_audit_with_hashed_owner(tmp_path, monkeypatch):
+    profile = _profile(tmp_path / "profiles", "alice")
+    audit_path = tmp_path / "audit.jsonl"
+    _install_fake_cron_modules(monkeypatch, profile)
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit_path))
+    # Trusted expert_id is derived from the owning gateway env, gated on source_app.
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.setattr(cron_worker, "_install_cron_subprocess_runtime_pool", lambda: None)
+    monkeypatch.setattr(
+        cron_worker,
+        "_run_cron_job_body_with_cleanup",
+        lambda job, _scheduler: (True, f"output:{job['id']}", "visible", None),
+    )
+
+    result = cron_worker._run_job_for_profile_current_process(
+        profile,
+        {
+            "id": "job1",
+            "name": "Daily",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "alice",
+            "source_app": "cli_expert",
+            "expert_id": "spoofed-ignored",
+            "writable_authorized": True,
+        },
+    )
+
+    assert result["success"] is True
+    [line] = audit_path.read_text(encoding="utf-8").splitlines()
+    event = json.loads(line)
+    assert event["event_type"] == "cron_scheduled_execution"
+    assert event["expert_id"] == "expert-123"
+    assert event["run_id"] == "job1"
+    assert event["decision"] == "writable"
+    assert event["open_id_hash"]
+    assert "ou_owner" not in line
+
+
+def test_router_regression_without_fixed_expert_keeps_untagged_jobs_unchanged(tmp_path, monkeypatch):
+    profile = _profile(tmp_path / "profiles", "alice")
+    monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_owner")
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", raising=False)
+
+    assert cron_worker.infer_cron_owner_context({}, profile_home=profile) == {
+        "owner_open_id": "ou_owner",
+        "owner_profile": "alice",
+    }
+
+    scheduler = DueScheduler({"alice": [{"id": "plain", "name": "plain"}]})
+    executor = RecordingExecutor()
+    submitted = cron_worker._scan_and_submit_due_profile_jobs(
+        FakeCronJobs(),
+        scheduler,
+        profile.parent,
+        {"alice"},
+        adapters=None,
+        loop=SimpleNamespace(is_running=lambda: False),
+        patch_lock=threading.Lock(),
+        executor=executor,
+        in_flight=set(),
+        runner=lambda _profile_home, _job: None,
+    )
+
+    assert submitted == 1
+    assert scheduler.advanced == [("alice", "plain")]
+    assert [(args[0].name, args[1]["id"]) for _fn, args, _kwargs in executor.submissions] == [
+        ("alice", "plain")
+    ]

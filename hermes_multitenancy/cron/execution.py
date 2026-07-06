@@ -42,6 +42,7 @@ except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
 
 from .. import cron_worker as _cw
+from ..expert_bot_route import READONLY_ENV
 
 # Keep the historical logger name so log records are attributed to
 # ``hermes_multitenancy.cron_worker`` exactly as before the split.
@@ -178,10 +179,13 @@ def _install_cron_subprocess_runtime_pool() -> None:
 def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[str, Any]:
     profile_home = Path(profile_home).expanduser().resolve()
     previous_home = os.environ.get("HERMES_HOME")
+    previous_readonly = os.environ.get(READONLY_ENV)
     cron_jobs = None
     cron_scheduler = None
     saved_cron_state: Optional[tuple[Any, ...]] = None
     os.environ["HERMES_HOME"] = str(profile_home)
+    if job.get("writable_authorized"):
+        os.environ.pop(READONLY_ENV, None)
     try:
         _cw._install_cron_subprocess_runtime_pool()
 
@@ -208,6 +212,20 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
         cron_scheduler._LOCK_DIR = cron_jobs.CRON_DIR
         cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
 
+        try:
+            from ..security_audit import append_security_event
+
+            append_security_event(
+                event_type="cron_scheduled_execution",
+                point="cron.scheduled",
+                open_id=job.get("owner_open_id"),
+                profile=job.get("owner_profile"),
+                run_id=job.get("id"),
+                expert_id=_cw._expert_id_for_cron_job(job),
+                decision="writable" if job.get("writable_authorized") else "readonly",
+            )
+        except Exception:
+            logger.debug("[multitenancy] cron scheduled execution audit skipped", exc_info=True)
         success, output, final_response, error = _cw._run_cron_job_body_with_cleanup(job, cron_scheduler)
         return {
             "success": bool(success),
@@ -245,6 +263,10 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = previous_home
+        if previous_readonly is None:
+            os.environ.pop(READONLY_ENV, None)
+        else:
+            os.environ[READONLY_ENV] = previous_readonly
 
 
 _CRON_JOB_TIMEOUT_DEFAULT_SECONDS = 1800  # 30min — bounds a hung job; long agent runs still fit

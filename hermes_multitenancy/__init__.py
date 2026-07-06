@@ -27,7 +27,11 @@ from .credential_audit import run_startup_audit
 from .credential_renewal_worker import ensure_renewal_worker_started
 from .router import on_pre_gateway_dispatch
 from . import webui_broker_server
-from .gateway_ownership import install_gateway_ownership_guard, is_router_profile_runtime
+from .gateway_ownership import (
+    install_gateway_ownership_guard,
+    is_router_profile_runtime,
+    may_own_cron_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,17 +102,17 @@ def register(ctx) -> None:
     # dynamic == static, so it is harmless. See skills_dir_dynamic for why.
     from .skills_dir_dynamic import install_dynamic_skills_dir_patch
     install_dynamic_skills_dir_patch()
-    if is_router_profile_runtime():
+    install_profile_native_cron_guard()
+    if may_own_cron_runtime():
         install_cron_runtime_patches()
         install_gateway_startup_watcher()
+    if is_router_profile_runtime():
         from .group_inviter_hook import install_feishu_bot_added_hook
         install_feishu_bot_added_hook()
         from .feishu_helpdesk_events import install_feishu_helpdesk_events_patch
         install_feishu_helpdesk_events_patch()
         webui_broker_server.ensure_run_broker_server_started()
         _start_credential_renewal_subsystem()
-    else:
-        install_profile_native_cron_guard()
 
     register_credential_status_tool(ctx)
     _register_optional_vod_image_gen_provider(ctx)
@@ -161,7 +165,7 @@ def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     if is_router_profile_runtime():
         webui_broker_server.ensure_run_broker_server_started()
     gateway = kwargs.get("gateway")
-    if gateway is not None and is_router_profile_runtime():
+    if gateway is not None and may_own_cron_runtime():
         try:
             ensure_cron_worker_started(gateway)
         except Exception:

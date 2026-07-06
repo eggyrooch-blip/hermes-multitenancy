@@ -1202,7 +1202,7 @@ def _install_profile_cron_owner_patch(default_profile_home: Path) -> None:
         raw = os.environ.get("HERMES_HOME", "").strip()
         return Path(raw).expanduser() if raw else Path(default_profile_home).expanduser()
 
-    def _owner_updates(job: dict) -> dict[str, str]:
+    def _owner_updates(job: dict) -> dict[str, Any]:
         from ..cron_worker import infer_cron_owner_context
 
         return infer_cron_owner_context(job, profile_home=_profile_home())
@@ -1722,6 +1722,12 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_MAX_ITERATIONS",
     "HERMES_MULTITENANCY_APPROVAL_TIMEOUT",
     "HERMES_MULTITENANCY_TOOLSETS_MODE",
+    # Expert-bot cron routing LABEL only (the expert app id). Safe to forward:
+    # unlike HERMES_MULTITENANCY_FIXED_EXPERT (deliberately NOT allowlisted — it
+    # would flip _may_own_feishu_runtime() in a per-user subprocess), the app id
+    # is an identifier, not an ownership grant, and only the expert gateway ever
+    # sets it. Lets the create subprocess tag a cron job's source_app.
+    "HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID",
     "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY",
     "HERMES_MULTITENANCY_CREDENTIAL_KEY",
     "HERMES_CREDENTIAL_KEY",

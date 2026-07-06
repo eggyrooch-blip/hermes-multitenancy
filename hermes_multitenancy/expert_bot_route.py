@@ -12,6 +12,7 @@ from .expert_overlay import role_override_block_for
 logger = logging.getLogger(__name__)
 
 FIXED_EXPERT_ENV = "HERMES_MULTITENANCY_FIXED_EXPERT"
+FIXED_EXPERT_APP_ID_ENV = "HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID"
 READONLY_ENV = "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"
 # Session-control slash commands — always safe in the fixed-expert bot.
 SAFE_FIXED_EXPERT_SLASH_COMMANDS = frozenset({"new", "reset", "status", "stop"})
@@ -50,6 +51,10 @@ class FixedExpertRejection:
 
 def fixed_expert_id_from_env() -> str:
     return str(os.getenv(FIXED_EXPERT_ENV) or "").strip()
+
+
+def fixed_expert_app_id_from_env() -> str:
+    return str(os.getenv(FIXED_EXPERT_APP_ID_ENV) or "").strip()
 
 
 def feishu_expert_readonly_enabled() -> bool:
