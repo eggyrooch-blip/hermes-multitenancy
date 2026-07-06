@@ -213,6 +213,7 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
         cron_scheduler._LOCK_FILE = cron_jobs.CRON_DIR / ".tick.lock"
 
         source_app = str(job.get("source_app") or "").strip()
+        audit_ok = True
         try:
             from ..security_audit import append_security_event
 
@@ -220,7 +221,7 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
             # audit IS the compensating control (SPEC guardrail), so force it to
             # land even under a default-off audit gate. Non-expert user cron keeps
             # the existing gate (byte-identical).
-            append_security_event(
+            audit_ok = append_security_event(
                 event_type="cron_scheduled_execution",
                 point="cron.scheduled",
                 open_id=job.get("owner_open_id"),
@@ -231,15 +232,28 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
                 force=bool(source_app),
             )
         except Exception:
-            if source_app:
-                logger.warning(
-                    "[multitenancy] cron scheduled execution audit FAILED for expert job=%s "
-                    "(compensating control for writable no-approval path)",
-                    job.get("id"),
-                    exc_info=True,
-                )
-            else:
-                logger.debug("[multitenancy] cron scheduled execution audit skipped", exc_info=True)
+            audit_ok = False
+            logger.warning(
+                "[multitenancy] cron scheduled execution audit raised for job=%s",
+                job.get("id"),
+                exc_info=True,
+            )
+        # Fail closed for expert (source_app) jobs: if the compensating-control
+        # audit could not be recorded, refuse to run the writable no-approval body
+        # — "可写不上 approval" is only acceptable because every run is audited.
+        # Normal user cron (no source_app) is unaffected.
+        if source_app and not audit_ok:
+            logger.error(
+                "[multitenancy] cron scheduled execution BLOCKED for expert job=%s: "
+                "compensating audit could not be recorded (fail-closed)",
+                job.get("id"),
+            )
+            return {
+                "success": False,
+                "output": "",
+                "final_response": "",
+                "error": "scheduled execution blocked: security audit (compensating control) could not be recorded",
+            }
         success, output, final_response, error = _cw._run_cron_job_body_with_cleanup(job, cron_scheduler)
         return {
             "success": bool(success),

@@ -114,13 +114,17 @@ def _redact_embedded_ids(value: str) -> str:
     return _EMBEDDED_ID_RE.sub(_sub, value)
 
 
-def append_security_event(*, event_type: str, force: bool = False, **fields: Any) -> None:
+def append_security_event(*, event_type: str, force: bool = False, **fields: Any) -> bool:
     # ``force`` bypasses the default-off gate for events that are themselves a
     # required security control (e.g. the expert-bot writable scheduled-cron audit,
     # the compensating control that replaces per-execution approval). Normal
     # callers leave force=False and stay byte-identical under a default-off deploy.
+    #
+    # Returns True when the event was recorded OR intentionally skipped (audit off
+    # and not forced — no audit obligation); False ONLY when a write was attempted
+    # and failed. A force= caller uses the False signal to fail closed.
     if not (force or security_audit_enabled()):
-        return
+        return True
 
     event: dict[str, str] = {
         "@timestamp": _timestamp_iso(),
@@ -151,5 +155,7 @@ def append_security_event(*, event_type: str, force: bool = False, **fields: Any
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
             fh.write("\n")
+        return True
     except Exception:
         logger.exception("[multitenancy] security audit append failed")
+        return False

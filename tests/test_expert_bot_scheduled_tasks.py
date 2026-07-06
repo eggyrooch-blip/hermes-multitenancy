@@ -310,6 +310,41 @@ def test_scheduled_execution_appends_security_audit_with_hashed_owner(tmp_path, 
     assert "ou_owner" not in line
 
 
+def test_expert_scheduled_execution_fails_closed_when_audit_cannot_be_recorded(tmp_path, monkeypatch):
+    import hermes_multitenancy.security_audit as security_audit
+
+    profile = _profile(tmp_path / "profiles", "alice")
+    _install_fake_cron_modules(monkeypatch, profile)
+    monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "expert-123")
+    monkeypatch.setattr(cron_worker, "_install_cron_subprocess_runtime_pool", lambda: None)
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        cron_worker,
+        "_run_cron_job_body_with_cleanup",
+        lambda job, _sched: (ran.append(job["id"]), (True, "out", "vis", None))[1],
+    )
+    # audit write attempted but fails (disk full / unwritable path).
+    monkeypatch.setattr(security_audit, "append_security_event", lambda **_kw: False)
+
+    result = cron_worker._run_job_for_profile_current_process(
+        profile,
+        {
+            "id": "job1",
+            "name": "Daily",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "alice",
+            "source_app": "cli_expert",
+            "writable_authorized": True,
+        },
+    )
+
+    # Compensating control could not be recorded → writable body must NOT run.
+    assert result["success"] is False
+    assert "audit" in (result["error"] or "").lower()
+    assert ran == []
+
+
 def test_router_regression_without_fixed_expert_keeps_untagged_jobs_unchanged(tmp_path, monkeypatch):
     profile = _profile(tmp_path / "profiles", "alice")
     monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)
