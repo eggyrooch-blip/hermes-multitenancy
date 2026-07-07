@@ -18,10 +18,17 @@ def _prepare_shared_home(tmp_path, monkeypatch):
     monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
     monkeypatch.setenv("FEISHU_APP_SECRET", "app-secret")
 
+    from hermes_multitenancy import router as router_mod
     from hermes_multitenancy.routing import RoutingTable
 
-    table = RoutingTable(shared / "multitenancy.db")
-    table.upsert(user_id="owner", profile_name="owner", open_id="ou_owner")
+    routing_db = shared / "multitenancy.db"
+    table = RoutingTable(routing_db)
+    table.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    table.close()
+    # The autouse conftest fixture pins routing to an empty ":memory:" table. Point the
+    # owner-scoped broker resolver at this seeded db so ou_owner→owner verifies; the same
+    # fixture resets the override back to ":memory:" after the test.
+    router_mod.override_routing_table(routing_db)
     return shared
 
 

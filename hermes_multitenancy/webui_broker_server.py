@@ -1730,7 +1730,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = await asyncio.to_thread(
                 cron_api.list_jobs,
@@ -1740,6 +1740,8 @@ def create_run_broker_app(
             return web.json_response({"jobs": jobs})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron list failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1749,11 +1751,13 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             payload = await request.json()
-            profile_name, user_key = _tenant_from_request(request, payload)
+            profile_name, user_key = _owner_scoped_tenant(request, payload)
             job = await asyncio.to_thread(cron_api.create_job, profile_name, user_key, payload)
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron create failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1762,11 +1766,13 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             job = await asyncio.to_thread(cron_api.get_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron get failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1775,7 +1781,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             shadow = request.query.get("shadow", "1").lower() in {"1", "true", "yes", "on"}
             due_raw = request.query.get("due")
             due = None if due_raw is None else due_raw.lower() in {"1", "true", "yes", "on"}
@@ -1789,6 +1795,8 @@ def create_run_broker_app(
             return web.json_response({"plan": plan})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron plan failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1798,7 +1806,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             payload = await request.json()
-            profile_name, _user_key = _tenant_from_request(request, payload)
+            profile_name, _user_key = _owner_scoped_tenant(request, payload)
             job = await asyncio.to_thread(
                 cron_api.update_job,
                 profile_name,
@@ -1808,6 +1816,8 @@ def create_run_broker_app(
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron update failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1816,11 +1826,13 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             await asyncio.to_thread(cron_api.delete_job, profile_name, request.match_info["job_id"])
             return web.json_response({"ok": True})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron delete failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1829,11 +1841,13 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             job = await asyncio.to_thread(cron_api.pause_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron pause failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1842,11 +1856,13 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             job = await asyncio.to_thread(cron_api.resume_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron resume failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1855,11 +1871,13 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _tenant_from_request(request)
+            profile_name, _user_key = _owner_scoped_tenant(request)
             job = await asyncio.to_thread(cron_api.trigger_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job, "queued": True})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI cron run trigger failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1870,7 +1888,7 @@ def create_run_broker_app(
         from . import feishu_uat_auth
 
         try:
-            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_name, user_key = _owner_scoped_tenant(request)
             status = feishu_uat_auth.credential_status(
                 profile_name=profile_name,
                 open_id=user_key,
@@ -1881,6 +1899,8 @@ def create_run_broker_app(
             return web.json_response({"error": exc.message}, status=exc.status)
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI Feishu UAT status failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1902,7 +1922,7 @@ def create_run_broker_app(
         from . import credential_hub
 
         try:
-            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_name, user_key = _owner_scoped_tenant(request)
             # Offload to a thread: the aggregation may shell out to meegle/kep-auth
             # (subprocess), which must not block the aiohttp event loop.
             rows = await asyncio.to_thread(
@@ -1919,6 +1939,8 @@ def create_run_broker_app(
             )
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI credential hub failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1938,7 +1960,7 @@ def create_run_broker_app(
         from .connectors import registry
 
         try:
-            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_name, user_key = _owner_scoped_tenant(request)
             # Serve from the short-TTL cache by default so repeat panel loads are instant
             # (the readers shell out to meegle/kep-auth — ~1.2s even parallelized). The
             # WebUI passes ?fresh=1 for its post-auth poll and the manual refresh button,
@@ -1960,6 +1982,8 @@ def create_run_broker_app(
             )
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI connectors failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1978,7 +2002,7 @@ def create_run_broker_app(
         from . import expert_overlay
 
         try:
-            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_name, user_key = _owner_scoped_tenant(request)
             profile_home = _profile_home_for_name(profile_name)
             # SERVER-SIDE department resolution from the TRUSTED tenant. The
             # caller-supplied ?department_ids= query param is deliberately IGNORED:
@@ -1999,6 +2023,8 @@ def create_run_broker_app(
             return web.json_response({"profile_name": profile_name, "experts": experts})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI experts failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -2171,7 +2197,7 @@ def create_run_broker_app(
 
         try:
             payload = await request.json()
-            profile_name, user_key = _tenant_from_request(request, payload)
+            profile_name, user_key = _owner_scoped_tenant(request, payload)
             body = feishu_uat_auth.start_session(
                 profile_name=profile_name,
                 open_id=user_key,
@@ -2182,6 +2208,8 @@ def create_run_broker_app(
             return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI Feishu auth start failed")
             return web.json_response({"error": str(exc), "status": "error"}, status=500)
@@ -2192,7 +2220,7 @@ def create_run_broker_app(
         from . import feishu_uat_auth
 
         try:
-            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_name, user_key = _owner_scoped_tenant(request)
             body = feishu_uat_auth.poll_session(
                 session_id=request.match_info["session_id"],
                 profile_name=profile_name,
@@ -2204,6 +2232,8 @@ def create_run_broker_app(
             return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI Feishu auth poll failed")
             return web.json_response({"error": str(exc), "status": "error"}, status=500)
@@ -2214,7 +2244,7 @@ def create_run_broker_app(
         from . import feishu_uat_auth
 
         try:
-            profile_name, user_key = _tenant_from_request(request, _tenant_payload_from_query(request))
+            profile_name, user_key = _owner_scoped_tenant(request)
             body = feishu_uat_auth.cancel_session(
                 session_id=request.match_info["session_id"],
                 profile_name=profile_name,
@@ -2225,6 +2255,8 @@ def create_run_broker_app(
             return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message, "status": "error"}, status=exc.status)
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI Feishu auth cancel failed")
             return web.json_response({"error": str(exc), "status": "error"}, status=500)

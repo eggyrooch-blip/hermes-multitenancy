@@ -22,6 +22,28 @@ from hermes_multitenancy import expert_overlay as eo
 from hermes_multitenancy import plugin_ingest as pi
 
 
+def _seed_owner_routing(tmp_path, owner_open_id="ou_test", profile_name="feishu_test"):
+    """Owner-scoped broker resolver verifies the caller owns the requested profile.
+
+    Seed <owner>→<profile> and point the resolver at it; the autouse conftest
+    fixture resets routing back to ":memory:" after the test.
+    """
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+
+    db_path = tmp_path / "expert_routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id=owner_open_id,
+        profile_name=profile_name,
+        open_id=owner_open_id,
+        provenance="sync",
+    )
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+    return owner_open_id
+
+
 AGENT_MD = """---
 name: kep-trevi-resource-delivery-expert
 description: 资源投放专家
@@ -315,6 +337,8 @@ def test_experts_endpoint(tmp_path, monkeypatch):
     profile_home = shared / "profiles" / "feishu_test"
     monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
 
+    owner = _seed_owner_routing(tmp_path)
+
     async def runner():
         app = broker.create_run_broker_app(
             mark_seen=lambda _request: True, sandbox_available=lambda: True
@@ -324,7 +348,7 @@ def test_experts_endpoint(tmp_path, monkeypatch):
         try:
             resp = await client.get(
                 "/api/run-broker/experts",
-                headers={"X-Hermes-Profile": "feishu_test"},
+                headers={"X-Hermes-User-Key": owner, "X-Hermes-Profile": "feishu_test"},
             )
             assert resp.status == 200, await resp.text()
             data = await resp.json()
@@ -350,6 +374,7 @@ def test_plugin_asset_endpoint_serves_registered_avatar(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "secret")
     (shared / "profiles" / "bob" / "skills").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: shared / "profiles" / profile_name)
+    owner = _seed_owner_routing(tmp_path)
 
     async def runner():
         app = broker.create_run_broker_app(
@@ -360,7 +385,7 @@ def test_plugin_asset_endpoint_serves_registered_avatar(tmp_path, monkeypatch):
         try:
             catalog = await client.get(
                 "/api/run-broker/experts",
-                headers={"Authorization": "Bearer secret", "X-Hermes-Profile": "feishu_test"},
+                headers={"Authorization": "Bearer secret", "X-Hermes-User-Key": owner, "X-Hermes-Profile": "feishu_test"},
             )
             assert catalog.status == 200, await catalog.text()
             data = await catalog.json()
@@ -482,6 +507,8 @@ def test_department_resolution_is_server_side_query_cannot_bypass(tmp_path, monk
     profile_home = shared / "profiles" / "feishu_test"
     monkeypatch.setattr(broker, "_profile_home_for_name", lambda profile_name: profile_home)
 
+    owner = _seed_owner_routing(tmp_path)
+
     def _query(profile_in_dept_123: bool):
         # Server-side resolver returns the TRUSTED departments, ignoring any query.
         monkeypatch.setattr(
@@ -500,7 +527,7 @@ def test_department_resolution_is_server_side_query_cannot_bypass(tmp_path, monk
                 # attacker always tries to spoof dept 123 via the query param
                 resp = await client.get(
                     "/api/run-broker/experts?department_ids=123",
-                    headers={"X-Hermes-Profile": "feishu_test"},
+                    headers={"X-Hermes-User-Key": owner, "X-Hermes-Profile": "feishu_test"},
                 )
                 assert resp.status == 200, await resp.text()
                 return await resp.json()

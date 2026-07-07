@@ -1805,6 +1805,83 @@ def _resolve_owner_scoped_profile(
     return owner_root.profile_name, None
 
 
+def _owner_scoped_tenant(request: Any, payload: Optional[dict[str, Any]] = None) -> tuple[str, str]:
+    """Return (profile_name, user_key) bound to a server-asserted owner.
+
+    Raises PermissionError (caller maps to HTTP 403) when the owner is missing
+    or the requested profile is not owned by / shared to that owner. Fail-closed:
+    a trusted-owner assertion that cannot be verified against routing state never
+    falls back to the client-supplied profile_name.
+    """
+    payload = payload or {}
+    trusted_owner = ""
+    for value in (
+        request.headers.get(_OWNER_OPEN_ID_HEADER),
+        request.headers.get("X-Hermes-User-Key"),
+        payload.get("user_key"),
+        payload.get("user"),
+        request.query.get("user_key"),
+        request.query.get("user"),
+    ):
+        trusted_owner = str(value or "").strip()
+        if trusted_owner:
+            break
+    if not trusted_owner:
+        raise PermissionError("owner identity required (X-Hermes-Owner-Open-Id)")
+
+    requested_profile = ""
+    for value in (
+        request.headers.get("X-Hermes-Profile"),
+        payload.get("profile_name"),
+        payload.get("profile"),
+        request.query.get("profile_name"),
+        request.query.get("profile"),
+    ):
+        requested_profile = str(value or "").strip()
+        if requested_profile:
+            break
+    if requested_profile:
+        requested_profile = cron_api.validate_profile_name(requested_profile)
+
+    from .. import router as router_mod
+
+    table = router_mod._get_routing_table()
+    if table is None:
+        raise PermissionError("trusted owner header requires routing table verification")
+
+    owner_root = table.resolve_owner_root(trusted_owner)
+    owned = set()
+    if owner_root is not None:
+        owned.add(owner_root.profile_name)
+    for row in table.list_agents_for_owner(trusted_owner):
+        owned.add(row.profile_name)
+
+    if requested_profile:
+        if requested_profile in owned:
+            profile = requested_profile
+        else:
+            row = table.lookup_by_profile_name(requested_profile)
+            shared_ok = False
+            if row is not None and getattr(row, "agent_id", None):
+                try:
+                    role = table.get_agent_share_role(row.agent_id, trusted_owner)
+                except Exception:
+                    role = None
+                shared_ok = bool(role)
+            if shared_ok:
+                profile = requested_profile
+            else:
+                raise PermissionError(
+                    f"profile_name '{requested_profile}' is not accessible for asserted owner"
+                )
+    else:
+        if owner_root is None:
+            raise PermissionError(f"asserted owner '{trusted_owner}' has no sync-root profile")
+        profile = owner_root.profile_name
+
+    return profile, trusted_owner
+
+
 def _agent_share_context_for_request(
     request: Any,
     payload: dict[str, Any],

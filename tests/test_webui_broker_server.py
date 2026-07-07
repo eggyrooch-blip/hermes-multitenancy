@@ -1171,7 +1171,7 @@ def test_webui_streamed_remote_media_additions_runs_scoping_off_event_loop(tmp_p
     assert all(thread_id != loop_thread for thread_id in scoped_threads)
 
 
-def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monkeypatch):
+def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monkeypatch, tmp_path):
     import threading
     import time
 
@@ -1179,7 +1179,17 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
 
     from hermes_multitenancy import cron_api
     from hermes_multitenancy import cron_worker
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver now verifies X-Hermes-User-Key against routing state; seed
+    # ou_owner→owner and point the resolver at it (conftest resets to ":memory:" post-test).
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
 
     def acquire_cron_patch_lock():
         with cron_worker._cron_module_patch_lock:
@@ -1914,7 +1924,16 @@ def _install_fake_cron(monkeypatch):
 def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_owner→owner.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
 
     async def runner():
         store = _install_fake_cron(monkeypatch)
@@ -2007,7 +2026,16 @@ def test_webui_run_broker_job_run_requires_authorization(monkeypatch, tmp_path):
 def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_yaojunhua→yaojunhua.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="ou_yaojunhua", profile_name="yaojunhua", open_id="ou_yaojunhua", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
 
     async def runner():
         _install_fake_cron(monkeypatch)
@@ -2047,7 +2075,16 @@ def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path)
 def test_webui_run_broker_jobs_expose_shadow_plan(monkeypatch, tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_owner→owner.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
 
     async def runner():
         _install_fake_cron(monkeypatch)
@@ -4510,17 +4547,26 @@ def test_ensure_run_broker_server_started_is_noop_when_disabled(monkeypatch):
     asyncio.run(runner())
 
 
-def test_connectors_handler_maps_fresh_query_to_use_cache(monkeypatch):
+def test_connectors_handler_maps_fresh_query_to_use_cache(monkeypatch, tmp_path):
     """The /connectors handler must map ?fresh=1 → use_cache=False (live read) and
     its absence → use_cache=True (serve from the short-TTL cache)."""
     import asyncio
 
     from aiohttp.test_utils import TestClient, TestServer
 
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
     from hermes_multitenancy.connectors import registry
 
     monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)  # _authorized → open
+
+    # Owner-scoped resolver verifies the query user_key owns the profile; seed ou_o→owner.
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="ou_o", profile_name="owner", open_id="ou_o", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
     captured: list[bool] = []
 
     def fake_collect(*, profile_name, open_id, use_cache=False, **kw):
