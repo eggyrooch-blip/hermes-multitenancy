@@ -190,7 +190,7 @@ def search_profiles(
             return result
         where = ""
         params: list[Any] = []
-        term = str(q or "").strip()
+        term = str(q or "").strip()[:128]  # clamp: multi-KB patterns buy nothing but LIKE cost
         if term:
             pattern = f"%{_like_escape(term)}%"
             match_cols = ("display_label", "profile_name", "open_id", "union_id", "chat_id", "user_id")
