@@ -2755,4 +2755,9 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/jobs/{job_id}/pause", handle_pause_job)
     app.router.add_post("/api/run-broker/jobs/{job_id}/resume", handle_resume_job)
     app.router.add_post("/api/run-broker/jobs/{job_id}/run", handle_run_job)
+    # Hermes Console M1a read-only fleet endpoints live in their own module
+    # (console_api) — registered here, implemented there (god-file split rule).
+    from . import console_api as _console_api
+
+    _console_api.register_console_routes(app)
     return app
