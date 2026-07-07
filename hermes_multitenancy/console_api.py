@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,11 @@ _PROFILES_MAX_LIMIT = 100
 
 _STARTED_AT = time.time()
 _reauth_cache: dict[str, Any] = {"ts": 0.0, "items": []}
+# Miss-lock: on TTL expiry, exactly ONE thread performs the marker scan while
+# concurrent requests wait and then serve the refreshed cache — without it, a
+# burst of duplicate requests at expiry would each walk profiles/*/feishu_uat
+# (the mechanical-disk red line this cache exists to protect).
+_reauth_lock = threading.Lock()
 
 # Only these routing columns ever leave the API. An allowlist (rather than
 # ``SELECT *``) so future columns holding anything sensitive stay internal.
@@ -97,7 +103,12 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 
 def _project_routing_row(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
-    return {field: row[field] for field in _ROUTING_FIELDS if field in keys}
+    out = {field: row[field] for field in _ROUTING_FIELDS if field in keys}
+    # SPEC pins the public field name as ``profile`` (the storage column is
+    # ``profile_name``) — rename at the projection boundary.
+    if "profile_name" in out:
+        out["profile"] = out.pop("profile_name")
+    return out
 
 
 def _now_iso() -> str:
@@ -153,7 +164,7 @@ def overview_snapshot(
         "active": active_by_kind,
         "skillhub": skillhub,
         "reauth_pending_count": len(reauth["items"]),
-        "reauth_cache_age_s": reauth["cache_age_s"],
+        "cache_age_s": reauth["cache_age_s"],
         "generated_at": _now_iso(),
     }
 
@@ -343,12 +354,32 @@ def reauth_pending_snapshot(
     The profiles/*/feishu_uat glob is the only directory walk in this module
     and it runs ONLY here, only on cache expiry — the mechanical-disk red line.
     """
-    now = time.time()
-    age = now - float(_reauth_cache["ts"] or 0.0)
-    if not force and _reauth_cache["ts"] and age < _REAUTH_TTL_S:
-        return {"items": list(_reauth_cache["items"]), "cache_age_s": round(age, 1)}
+    def _cached(now: float) -> Optional[dict[str, Any]]:
+        age = now - float(_reauth_cache["ts"] or 0.0)
+        if not force and _reauth_cache["ts"] and age < _REAUTH_TTL_S:
+            return {"items": list(_reauth_cache["items"]), "cache_age_s": round(age, 1)}
+        return None
 
-    home = Path(shared_home) if shared_home is not None else _shared_home_from_env()
+    hit = _cached(time.time())
+    if hit is not None:
+        return hit
+
+    with _reauth_lock:
+        # Double-check under the lock: a concurrent request may have refreshed
+        # while we waited — serve its result instead of scanning again.
+        hit = _cached(time.time())
+        if hit is not None:
+            return hit
+
+        home = Path(shared_home) if shared_home is not None else _shared_home_from_env()
+        items = _scan_reauth_markers(home)
+        _reauth_cache["ts"] = time.time()
+        _reauth_cache["items"] = items
+        return {"items": list(items), "cache_age_s": 0.0}
+
+
+def _scan_reauth_markers(home: Path) -> list[dict[str, Any]]:
+    """The one directory walk in this module — call only under ``_reauth_lock``."""
     items: list[dict[str, Any]] = []
     profiles_dir = home / "profiles"
     if profiles_dir.is_dir():
@@ -367,10 +398,7 @@ def reauth_pending_snapshot(
                 items.append(entry)
         except OSError:
             logger.exception("[console] reauth marker scan failed")
-
-    _reauth_cache["ts"] = now
-    _reauth_cache["items"] = items
-    return {"items": list(items), "cache_age_s": 0.0}
+    return items
 
 
 # --------------------------------------------------------------- handlers --

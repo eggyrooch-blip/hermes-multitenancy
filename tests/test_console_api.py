@@ -140,6 +140,7 @@ def test_overview_shape_and_counts(console_env):
     assert body["active"] == {"group": 1, "user": 2}  # active=1 rows only
     assert body["skillhub"] == {"queued": 2, "failed": 1, "installed": 1, "total": 4}
     assert body["reauth_pending_count"] == 1
+    assert body["cache_age_s"] >= 0.0  # SPEC-pinned key name
     assert body["generated_at"]
 
 
@@ -182,12 +183,13 @@ def test_profile_search_matches_and_pages(console_env):
 
     by_name, by_ou, paged = _run_with_client(scenario)
     assert by_name["total"] == 1
-    assert by_name["items"][0]["profile_name"] == "feishu_aaa111"
+    assert by_name["items"][0]["profile"] == "feishu_aaa111"  # SPEC-pinned key name
+    assert "profile_name" not in by_name["items"][0]
     assert by_name["items"][0]["display_label"] == "张三"
     assert by_ou["total"] == 1 and by_ou["items"][0]["open_id"] == "ou_bbb222"
     assert paged["total"] == 4 and len(paged["items"]) == 2
     # newest activity first
-    assert paged["items"][0]["profile_name"] == "feishu_aaa111"
+    assert paged["items"][0]["profile"] == "feishu_aaa111"
 
 
 def test_profile_search_clamps_and_validates_limit(console_env):
@@ -315,6 +317,38 @@ def test_reauth_pending_lists_and_caches(console_env):
 
 def test_reauth_ttl_floor_is_600s():
     assert console_api._REAUTH_TTL_S >= 600
+
+
+def test_reauth_expiry_burst_scans_exactly_once(console_env, monkeypatch):
+    """Concurrent requests at TTL expiry must trigger ONE marker scan (miss-lock)."""
+    import threading
+
+    calls = {"n": 0}
+    started = threading.Barrier(8)
+
+    def fake_scan(home):
+        calls["n"] += 1
+        return [{"profile": "p", "open_id": "ou", "reason": "r", "ts": 1}]
+
+    monkeypatch.setattr(console_api, "_scan_reauth_markers", fake_scan)
+    console_api._reauth_cache["ts"] = 0.0
+    console_api._reauth_cache["items"] = []
+
+    results: list[dict] = []
+
+    def worker():
+        started.wait(timeout=10)
+        results.append(console_api.reauth_pending_snapshot())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert calls["n"] == 1  # exactly one directory walk for the whole burst
+    assert len(results) == 8
+    assert all(r["items"][0]["profile"] == "p" for r in results)
 
 
 # ---------------------------------------------------------------- degraded --
