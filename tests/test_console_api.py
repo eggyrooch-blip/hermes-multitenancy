@@ -153,13 +153,49 @@ def test_overview_unauthorized_without_key(console_env):
 
 
 def test_console_endpoints_reject_post(console_env):
-    async def scenario(client):
-        resp = await client.post(
-            "/api/run-broker/console/overview", headers=console_env["headers"]
-        )
-        return resp.status
+    paths = [
+        "/api/run-broker/console/overview",
+        "/api/run-broker/console/profiles",
+        "/api/run-broker/console/profiles/feishu_aaa111",
+        "/api/run-broker/console/reauth-pending",
+    ]
 
-    assert _run_with_client(scenario) == 405
+    async def scenario(client):
+        statuses = []
+        for path in paths:
+            resp = await client.post(path, headers=console_env["headers"])
+            statuses.append(resp.status)
+        return statuses
+
+    assert _run_with_client(scenario) == [405, 405, 405, 405]
+
+
+def test_reauth_ttl_env_garbage_does_not_crash(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("HERMES_CONSOLE_REAUTH_TTL_S", "not-a-number")
+    try:
+        importlib.reload(console_api)
+        assert console_api._REAUTH_TTL_S == 600  # fallback + floor
+    finally:
+        monkeypatch.delenv("HERMES_CONSOLE_REAUTH_TTL_S", raising=False)
+        importlib.reload(console_api)
+
+
+def test_dirty_markers_are_bounded(console_env):
+    marker_dir = console_env["shared_home"] / "profiles" / "feishu_bbb222" / "feishu_uat"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "ou_huge.needs_reauth").write_text(
+        json.dumps({"reason": "x" * 100_000}), encoding="utf-8"
+    )
+    (marker_dir / "ou_garbage.needs_reauth").write_text("{not json", encoding="utf-8")
+
+    console_api._reauth_cache["ts"] = 0.0
+    snap = console_api.reauth_pending_snapshot()
+    by_id = {item["open_id"]: item for item in snap["items"]}
+    assert by_id["ou_huge"]["reason"] == "unreadable_marker"  # oversized rejected pre-read
+    assert by_id["ou_garbage"]["reason"] == "unreadable_marker"
+    assert all(len(item["reason"]) <= 200 for item in snap["items"])
 
 
 # ---------------------------------------------------------------- profiles --

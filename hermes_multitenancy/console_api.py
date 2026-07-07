@@ -40,9 +40,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
 
+def _int_env(name: str, default: int) -> int:
+    """Tolerant int env parse — garbage falls back to the default, never raises."""
+    try:
+        return int(str(os.environ.get(name, "") or default).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # Floor of 600s is a hard SPEC constraint (mechanical-disk red line): the env
 # override can lengthen the TTL but never shorten it below 10 minutes.
-_REAUTH_TTL_S = max(600, int(os.environ.get("HERMES_CONSOLE_REAUTH_TTL_S", "600") or "600"))
+_REAUTH_TTL_S = max(600, _int_env("HERMES_CONSOLE_REAUTH_TTL_S", 600))
+
+_MARKER_MAX_BYTES = 4096  # a .needs_reauth marker is a tiny json; bigger = dirty
+_MARKER_REASON_MAX_CHARS = 200
 
 _AUDIT_TAIL_MAX_BYTES = 1_048_576  # bounded tail read of conversation-audit.jsonl
 _RECENT_ERRORS_LIMIT = 20
@@ -390,9 +401,12 @@ def _scan_reauth_markers(home: Path) -> list[dict[str, Any]]:
                     "open_id": marker.name[: -len(".needs_reauth")].removesuffix(".json"),
                 }
                 try:
+                    if marker.stat().st_size > _MARKER_MAX_BYTES:
+                        raise ValueError("oversized marker")
                     payload = json.loads(marker.read_text(encoding="utf-8"))
-                    entry["reason"] = str(payload.get("reason") or "")
-                    entry["ts"] = payload.get("ts")
+                    entry["reason"] = str(payload.get("reason") or "")[:_MARKER_REASON_MAX_CHARS]
+                    ts = payload.get("ts")
+                    entry["ts"] = ts if isinstance(ts, (int, float)) else None
                 except (OSError, ValueError):
                     entry["reason"] = "unreadable_marker"
                 items.append(entry)
