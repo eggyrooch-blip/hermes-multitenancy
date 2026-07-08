@@ -26,6 +26,23 @@ REASON_ACCESS_TOKEN_EXPIRED = "access_token_expired"
 REASON_REFRESH_TOKEN_EXPIRED = "refresh_token_expired"
 REASON_REFRESH_REJECTED = "refresh_rejected"
 REASON_REFRESH_DIAGNOSTIC = "refresh_diagnostic"
+REASON_MALFORMED_UAT_JSON = "malformed_uat_json"
+
+# Reasons derived PURELY from reading UAT files on disk (classify_uat_payload /
+# json parse). A currently-usable UAT anywhere refutes such a marker regardless
+# of mtime ordering — the broken file was just a stale copy (e.g. the legacy
+# shared-home file after credentials went profile-local). Server-authoritative
+# REASON_REFRESH_REJECTED is deliberately NOT here: a real Feishu rejection
+# outranks a valid-LOOKING local file and keeps the strict mtime rule.
+LOCAL_STRUCTURAL_REAUTH_REASONS = frozenset(
+    {
+        REASON_EMPTY_REFRESH_TOKEN,
+        REASON_SCOPE_STRIPPED_BY_FEISHU,
+        REASON_ACCESS_TOKEN_EXPIRED,
+        REASON_REFRESH_TOKEN_EXPIRED,
+        REASON_MALFORMED_UAT_JSON,
+    }
+)
 
 SCOPE_STRIPPED_REASONS = frozenset({REASON_SCOPE_STRIPPED_BY_FEISHU})
 
@@ -381,7 +398,25 @@ def clear_reauth_markers_if_uat_recovered(
             recovered_mtime = max(recovered_mtime or 0.0, uat_mtime)
 
     if recovered_mtime is None:
-        return False
+        # The mtime rule alone can deadlock: a startup L5 audit (re)writes the
+        # marker AFTER the operative token's last refresh, so the marker stays
+        # forever "newer" than the valid UAT and recovery never fires
+        # (2026-07-08: valid profile token refreshed 09:24, gateway restart
+        # wrote the marker 10:09 → every cron for the owner falsely deferred).
+        # A LOCAL-STRUCTURAL marker is refuted by ANY currently-usable UAT.
+        body = read_needs_reauth_marker(marker_path) or {}
+        reason = str(body.get("reason") or "")
+        if reason not in LOCAL_STRUCTURAL_REAUTH_REASONS:
+            return False
+        if not current_valid_uat_exists(shared_home, open_id):
+            return False
+        for stale_marker in _iter_reauth_markers_for_open_id(shared_home, open_id):
+            stale_body = read_needs_reauth_marker(stale_marker) or {}
+            # Only clear structural markers; an authoritative refresh_rejected
+            # marker for the same open_id must survive this fallback.
+            if str(stale_body.get("reason") or "") in LOCAL_STRUCTURAL_REAUTH_REASONS:
+                clear_needs_reauth_marker(stale_marker)
+        return True
 
     for stale_marker in _iter_reauth_markers_for_open_id(shared_home, open_id):
         try:

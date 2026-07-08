@@ -70,31 +70,41 @@ def run_startup_audit(shared_home: Path) -> AuditReport:
 
 
 def _audit_uat_files(shared_home: Path, report: AuditReport) -> None:
+    # Two passes: classify everything first, so a broken STALE COPY of an
+    # open_id whose CURRENT token is usable elsewhere (e.g. the legacy
+    # shared-home file after credentials went profile-local) never gets a
+    # needs_reauth marker. That false positive deferred every cron job and
+    # reauth-prompted owners whose auth was actually valid (2026-07-08).
+    broken: list[tuple[Any, str, str]] = []  # (loc, reason, detail)
+    usable_open_ids: set[str] = set()
     for loc in iter_uat_locations(shared_home):
         report.scanned += 1
         payload = _load_payload(loc.path)
         if payload is None:
             # Malformed JSON treated as broken; write a marker so notifier surfaces it.
-            _maybe_write_marker(
-                loc.path.parent,
-                loc.open_id,
-                reason="malformed_uat_json",
-                detail=f"unreadable UAT at {loc.path}",
-                report=report,
-                profile=loc.profile_name,
-            )
-            report.needs_reauth += 1
+            broken.append((loc, "malformed_uat_json", f"unreadable UAT at {loc.path}"))
             continue
         reason = classify_uat_payload(payload)
         if reason is None:
             report.valid += 1
+            usable_open_ids.add(loc.open_id)
+            continue
+        broken.append((loc, reason, f"L5 audit detected broken UAT at {loc.path.name}"))
+
+    for loc, reason, detail in broken:
+        if loc.open_id in usable_open_ids:
+            logger.info(
+                "[credential_audit] stale UAT copy ignored (usable UAT exists elsewhere): %s reason=%s",
+                loc.path,
+                reason,
+            )
             continue
         report.needs_reauth += 1
         _maybe_write_marker(
             loc.path.parent,
             loc.open_id,
             reason=reason,
-            detail=f"L5 audit detected broken UAT at {loc.path.name}",
+            detail=detail,
             report=report,
             profile=loc.profile_name,
         )

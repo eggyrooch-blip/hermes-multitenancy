@@ -188,6 +188,67 @@ def test_l5_skips_fixtures_dir(tmp_path: Path):
     assert report.scanned == 0
 
 
+def test_l5_audit_skips_marker_when_usable_uat_exists_elsewhere(tmp_path: Path):
+    """A broken STALE COPY must not mark an open_id whose current token is fine.
+
+    Regression (2026-07-08): legacy shared-home UAT (expired May copy) + valid
+    profile-store UAT → startup audit wrote a refresh_token_expired marker →
+    every cron job for the owner falsely deferred as "needs reauth".
+    """
+    open_id = "ou_dual"
+    stale = _valid_payload(open_id)
+    stale["refresh_expires_at"] = int(time.time() * 1000) - 3600 * 1000  # expired copy
+    _seed_uat(tmp_path, None, open_id, stale)  # legacy shared-home copy
+    _seed_uat(tmp_path, "kate", open_id, _valid_payload(open_id))  # operative, valid
+
+    report = credential_audit.run_startup_audit(tmp_path)
+
+    assert report.valid == 1
+    assert report.needs_reauth == 0
+    assert report.fresh_markers == 0
+    assert not (tmp_path / "feishu_uat" / f"{open_id}.needs_reauth").is_file()
+
+
+def test_recovery_clears_structural_marker_even_when_marker_is_newer(tmp_path: Path):
+    """mtime deadlock: a startup audit (re)writes the marker AFTER the token's
+    last refresh, so "valid UAT newer than marker" never holds. A LOCAL-STRUCTURAL
+    marker must still be refuted by a currently-usable UAT."""
+    open_id = "ou_deadlock"
+    uat = _seed_uat(tmp_path, "kate", open_id, _valid_payload(open_id))
+    marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+        detail="stale copy scan",
+    )
+    past = time.time() - 3600
+    os.utime(uat, (past, past))  # valid UAT strictly OLDER than the marker
+
+    assert common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker) is True
+    assert not marker.is_file()
+
+
+def test_recovery_keeps_authoritative_refresh_rejected_marker(tmp_path: Path):
+    """Server-authoritative rejection outranks a valid-LOOKING local file —
+    the structural fallback must not clear it."""
+    open_id = "ou_srv"
+    uat = _seed_uat(tmp_path, "kate", open_id, _valid_payload(open_id))
+    marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="feishu rejected refresh",
+        extra={"authoritative": True, "refresh_class": "invalid"},
+    )
+    past = time.time() - 3600
+    os.utime(uat, (past, past))
+
+    assert common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker) is False
+    assert marker.is_file()
+
+
 # ---------------------------------------------------------------------------
 # L3 — passive marker maintenance, no proactive DM
 # ---------------------------------------------------------------------------
