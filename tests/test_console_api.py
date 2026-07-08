@@ -297,6 +297,37 @@ def test_profile_detail_aggregates_and_redacts(console_env, monkeypatch):
     assert "SECRET_BODY_MUST_NOT_LEAK" not in json.dumps(body)
 
 
+def test_profile_name_canonical_guard(console_env, monkeypatch):
+    """A7: dirty profile names never reach the DB / filesystem reader."""
+    # if a dirty name somehow reached sqlite/registry the test would see this flag
+    from hermes_multitenancy.connectors import registry
+    touched = {"fs": False}
+    monkeypatch.setattr(registry, "collect_connector_statuses",
+                        lambda **k: touched.__setitem__("fs", True) or [])
+    for bad in ["../../etc/passwd", "feishu_g41a5b5g/../other", "a" * 300,
+                "feishu\x00null", "has space", "..", "/abs/path", "slash/name"]:
+        assert console_api.profile_detail(bad) is None, f"expected None for {bad!r}"
+    assert touched["fs"] is False  # no FS-touching reader was ever called
+
+    # canonical real-world samples must all pass the guard (not be false-rejected)
+    for good in ["feishu_group_1a10fb26ac51_f1", "codex_harden_175624",
+                 "test-group", "123", "multitenancy_router", "feishu_g41a5b5g"]:
+        assert console_api._is_canonical_profile_name(good) is True, good
+
+
+def test_profile_name_traversal_returns_404_over_http(console_env):
+    async def scenario(client):
+        # %2f-encoded traversal — aiohttp routes it to the detail handler
+        resp = await client.get(
+            "/api/run-broker/console/profiles/..%2f..%2fetc%2fpasswd",
+            headers=console_env["headers"],
+        )
+        return resp.status
+
+    # 404 (not found / rejected), never 500
+    assert _run_with_client(scenario) in (404, 400)
+
+
 def test_recent_errors_tail_is_bounded(console_env, monkeypatch):
     # A file larger than the tail window must still be read only partially.
     audit = console_env["audit"]

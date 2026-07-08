@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -124,6 +125,22 @@ def _project_routing_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# A canonical profile name is what the sync path ever produces — alphanumerics
+# plus `_ . -` (real samples: feishu_group_1a10…, codex_harden_175624, test-group,
+# multitenancy_router, 123). Anything else (path separators, `..`, control chars,
+# over-length) is rejected BEFORE the name reaches a filesystem-touching reader
+# (connector status at <shared>/profiles/<name>). Belt-and-suspenders vs a dirty
+# routing row — the SQL is already parameterized; this guards the FS path. The
+# BFF/shell reuses the same ruler. (hardening A7, Forge/codex 2026-07-08)
+_CANONICAL_PROFILE = re.compile(r"\A[A-Za-z0-9_.-]{1,128}\Z")
+
+
+def _is_canonical_profile_name(name: str) -> bool:
+    if not _CANONICAL_PROFILE.match(name or ""):
+        return False
+    return ".." not in name  # defense in depth: no traversal even within the charset
 
 
 def _like_escape(term: str) -> str:
@@ -234,7 +251,14 @@ def profile_detail(
     shared_home: Optional[Path] = None,
     audit_path: Optional[Path] = None,
 ) -> Optional[dict[str, Any]]:
-    """Aggregate one profile; ``None`` when no routing row exists (-> 404)."""
+    """Aggregate one profile; ``None`` when no routing row exists (-> 404).
+
+    Rejects non-canonical names up front (path traversal / control chars /
+    over-length) so a dirty routing row can never steer the downstream
+    connector reader outside the profiles root.
+    """
+    if not _is_canonical_profile_name(str(profile_name)):
+        return None
     conn = _connect_ro(db_path or _db_path())
     if conn is None:
         return None
