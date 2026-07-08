@@ -197,6 +197,48 @@ def overview_snapshot(
     }
 
 
+def agents_for_owner(
+    owner_open_id: str,
+    *,
+    limit: int = 100,
+    db_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Agent-kind routing rows owned by ``owner_open_id``.
+
+    The developer self-view needs "my agents" — an OWNER-column query, not the
+    text search of ``search_profiles`` (which matches display_label/open_id/… but
+    NOT owner_open_id, so ``q=<open_id>`` would never surface the agents a user
+    owns). The BFF derives ``owner_open_id`` from the session and passes it here;
+    this function trusts its (master-key-gated) caller.
+    """
+    limit = min(max(int(limit), 1), _PROFILES_MAX_LIMIT)
+    result: dict[str, Any] = {"owner_open_id": owner_open_id, "items": [], "available": False}
+    if not owner_open_id:
+        result["available"] = True  # a valid query for "no owner" is simply empty
+        return result
+    conn = _connect_ro(db_path or _db_path())
+    if conn is None:
+        return result
+    try:
+        if not _has_table(conn, "multitenancy_routing"):
+            return result
+        rows = conn.execute(
+            "SELECT * FROM multitenancy_routing"
+            " WHERE kind = 'agent' AND owner_open_id = ?"
+            " ORDER BY (last_active_at IS NULL), last_active_at DESC, user_id"
+            " LIMIT ?",
+            (str(owner_open_id), limit),
+        ).fetchall()
+        result["items"] = [_project_routing_row(row) for row in rows]
+        result["available"] = True
+        return result
+    except sqlite3.Error:
+        logger.exception("[console] agents_for_owner read failed")
+        return result
+    finally:
+        conn.close()
+
+
 def search_profiles(
     q: str = "",
     *,
@@ -454,6 +496,7 @@ def register_console_routes(app) -> None:
     app.router.add_get(
         "/api/run-broker/console/reauth-pending", handle_console_reauth_pending
     )
+    app.router.add_get("/api/run-broker/console/agents", handle_console_agents)
 
 
 async def handle_console_overview(request):
@@ -466,6 +509,20 @@ async def handle_console_overview(request):
         return web.json_response(snapshot)
     except Exception as exc:
         logger.exception("[console] overview failed")
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def handle_console_agents(request):
+    from aiohttp import web
+
+    if not _authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    owner = str(request.query.get("owner") or "").strip()
+    try:
+        result = await asyncio.to_thread(agents_for_owner, owner)
+        return web.json_response(result)
+    except Exception as exc:
+        logger.exception("[console] agents failed")
         return web.json_response({"error": str(exc)}, status=500)
 
 

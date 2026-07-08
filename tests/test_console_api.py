@@ -257,6 +257,67 @@ def test_profile_search_like_wildcards_are_literal(console_env):
     assert body["total"] == 0  # '%' is matched literally, not as a wildcard
 
 
+# ------------------------------------------------------------- agents-by-owner --
+
+
+def test_agents_for_owner_returns_only_owned_agents(tmp_path):
+    """The developer self-view query: agents owned by a given open_id, and ONLY
+    those — not the owner's user row, not another owner's agents, and text search
+    of the open_id (search_profiles) must not be relied on."""
+    import sqlite3
+    from hermes_multitenancy import console_api
+
+    db = tmp_path / "mt.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE multitenancy_routing (user_id TEXT PRIMARY KEY, profile_name TEXT,"
+        " open_id TEXT, union_id TEXT, kind TEXT, active INTEGER, chat_id TEXT,"
+        " owner_open_id TEXT, display_label TEXT, last_active_at INTEGER, synced_at INTEGER, provenance TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO multitenancy_routing VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            # the developer's own user row — must NOT be returned by an agents query
+            ("u-self", "feishu_self", "ou_self", "on_self", "user", 1, None, None, "我", 200, 100, "sync"),
+            # two agents the developer owns — MUST be returned
+            ("ag-1", "webui_ag1", None, None, "agent", 1, None, "ou_self", "我的Agent1", 150, 100, "auto"),
+            ("ag-2", "webui_ag2", None, None, "agent", 1, None, "ou_self", "我的Agent2", 120, 100, "auto"),
+            # another owner's agent — must NEVER leak
+            ("ag-x", "webui_agx", None, None, "agent", 1, None, "ou_other", "别人的", 100, 100, "auto"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    r = console_api.agents_for_owner("ou_self", db_path=db)
+    assert r["available"] is True
+    names = sorted(a["display_label"] for a in r["items"])
+    assert names == ["我的Agent1", "我的Agent2"]  # own agents only
+    assert all(a.get("owner_open_id") == "ou_self" for a in r["items"])
+    # not the user row, not another owner's agent
+    assert "我" not in names and "别人的" not in names
+
+    # empty owner is a valid empty result, never a wildcard
+    empty = console_api.agents_for_owner("", db_path=db)
+    assert empty["available"] is True and empty["items"] == []
+    # unknown owner → empty
+    assert console_api.agents_for_owner("ou_nobody", db_path=db)["items"] == []
+
+
+def test_agents_endpoint_http(console_env):
+    async def scenario(client):
+        ok = await client.get(
+            "/api/run-broker/console/agents", params={"owner": "ou_aaa111"},
+            headers=console_env["headers"],
+        )
+        noauth = await client.get("/api/run-broker/console/agents", params={"owner": "ou_aaa111"})
+        return ok.status, await ok.json(), noauth.status
+
+    status, body, noauth_status = _run_with_client(scenario)
+    assert status == 200 and body["available"] is True
+    assert noauth_status == 401  # master-key gated like the rest
+
+
 # ------------------------------------------------------------------ detail --
 
 
