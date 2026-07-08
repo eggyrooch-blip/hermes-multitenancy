@@ -204,17 +204,17 @@ def agents_for_owner(
     offset: int = 0,
     db_path: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Active agent-kind routing rows owned by ``owner_open_id``.
+    """Active routing rows owned by ``owner_open_id``.
 
-    The developer self-view needs "my agents" — an OWNER-column query, not the
+    The developer self-view needs "my owner fleet" — an OWNER-column query, not the
     text search of ``search_profiles`` (which matches display_label/open_id/… but
-    NOT owner_open_id, so ``q=<open_id>`` would never surface the agents a user
+    NOT owner_open_id, so ``q=<open_id>`` would never surface rows a user
     owns). The BFF derives ``owner_open_id`` from the session and passes it here;
     this function trusts its (master-key-gated) caller.
 
     Filters ``active = 1`` to match the canonical owner enumerator
     (routing.list_agents_for_owner) and overview_snapshot's active count — a
-    soft-deleted agent must not linger in the self-view nor disagree with the
+    soft-deleted row must not linger in the self-view nor disagree with the
     overview. Carries the same pagination contract as ``search_profiles``
     (limit clamp + offset + total).
     """
@@ -233,7 +233,7 @@ def agents_for_owner(
     try:
         if not _has_table(conn, "multitenancy_routing"):
             return result
-        where = "WHERE kind = 'agent' AND owner_open_id = ? AND active = 1"
+        where = "WHERE owner_open_id = ? AND active = 1"
         result["total"] = int(
             conn.execute(
                 f"SELECT COUNT(*) FROM multitenancy_routing {where}", (str(owner_open_id),)

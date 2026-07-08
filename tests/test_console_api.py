@@ -34,8 +34,8 @@ def _seed_db(db_path: Path) -> None:
             """
         )
         rows = [
-            ("u-1", "feishu_aaa111", "ou_aaa111", "on_aaa111", "user", 1, None, None, "张三", 200, 100, "sync"),
-            ("u-2", "feishu_bbb222", "ou_bbb222", "on_bbb222", "user", 1, None, None, "李四", 100, 100, "sync"),
+            ("u-1", "feishu_aaa111", "ou_aaa111", "on_aaa111", "user", 1, None, "ou_aaa111", "张三", 200, 100, "sync"),
+            ("u-2", "feishu_bbb222", "ou_bbb222", "on_bbb222", "user", 1, None, "ou_bbb222", "李四", 100, 100, "sync"),
             ("g-1", "feishu_group_ccc", None, None, "group", 1, "oc_ccc333", "ou_aaa111", "数据组日常", None, 100, "auto"),
             ("u-3", "feishu_gone", "ou_gone", None, "user", 0, None, None, "离职者", 50, 100, "sync"),
         ]
@@ -260,10 +260,10 @@ def test_profile_search_like_wildcards_are_literal(console_env):
 # ------------------------------------------------------------- agents-by-owner --
 
 
-def test_agents_for_owner_returns_only_owned_agents(tmp_path):
-    """The developer self-view query: agents owned by a given open_id, and ONLY
-    those — not the owner's user row, not another owner's agents, and text search
-    of the open_id (search_profiles) must not be relied on."""
+def test_agents_for_owner_returns_full_owned_active_fleet(tmp_path):
+    """The developer self-view query: every active route owned by a given open_id,
+    and ONLY those — not another owner's rows, and text search of the open_id
+    (search_profiles) must not be relied on."""
     import sqlite3
     from hermes_multitenancy import console_api
 
@@ -277,15 +277,14 @@ def test_agents_for_owner_returns_only_owned_agents(tmp_path):
     conn.executemany(
         "INSERT INTO multitenancy_routing VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         [
-            # the developer's own user row — must NOT be returned by an agents query
-            ("u-self", "feishu_self", "ou_self", "on_self", "user", 1, None, None, "我", 200, 100, "sync"),
+            # the developer's own user/profile row — MUST be returned
+            ("u-self", "feishu_self", "ou_self", "on_self", "user", 1, None, "ou_self", "我", 200, 100, "sync"),
             # two ACTIVE agents the developer owns — MUST be returned
             ("ag-1", "webui_ag1", None, None, "agent", 1, None, "ou_self", "我的Agent1", 150, 100, "auto"),
             ("ag-2", "webui_ag2", None, None, "agent", 1, None, "ou_self", "我的Agent2", 120, 100, "auto"),
             # a SOFT-DELETED agent the developer owns — must NOT leak (active=0)
             ("ag-del", "webui_agdel", None, None, "agent", 0, None, "ou_self", "已删Agent", 110, 100, "auto"),
-            # an owned GROUP row (group rows carry the puller's owner_open_id) —
-            # pins the kind='agent' scoping: must NOT surface as an agent
+            # an owned GROUP row (group rows carry the puller's owner_open_id) — MUST be returned
             ("grp-self", "feishu_group_x", None, None, "group", 1, "oc_x", "ou_self", "我拉的群", 130, 100, "auto"),
             # another owner's agent — must NEVER leak
             ("ag-x", "webui_agx", None, None, "agent", 1, None, "ou_other", "别人的", 100, 100, "auto"),
@@ -297,11 +296,12 @@ def test_agents_for_owner_returns_only_owned_agents(tmp_path):
     r = console_api.agents_for_owner("ou_self", db_path=db)
     assert r["available"] is True
     names = sorted(a["display_label"] for a in r["items"])
-    assert names == ["我的Agent1", "我的Agent2"]  # active own agents only
-    assert r["total"] == 2  # pagination contract: total present, excludes soft-deleted
+    assert names == ["我", "我拉的群", "我的Agent1", "我的Agent2"]  # active own fleet only
+    assert r["total"] == 4  # pagination contract: total present, excludes soft-deleted
     assert all(a.get("owner_open_id") == "ou_self" for a in r["items"])
-    # not the user row, not the soft-deleted agent, not the owned group, not another owner's
-    for excluded in ("我", "已删Agent", "我拉的群", "别人的"):
+    assert {a.get("kind") for a in r["items"]} == {"user", "agent", "group"}
+    # not the soft-deleted agent, not another owner's
+    for excluded in ("已删Agent", "别人的"):
         assert excluded not in names
 
     # empty owner is a valid empty result, never a wildcard
@@ -322,6 +322,8 @@ def test_agents_endpoint_http(console_env):
 
     status, body, noauth_status = _run_with_client(scenario)
     assert status == 200 and body["available"] is True
+    assert body["total"] == 2
+    assert {row["kind"] for row in body["items"]} == {"user", "group"}
     assert noauth_status == 401  # master-key gated like the rest
 
 
