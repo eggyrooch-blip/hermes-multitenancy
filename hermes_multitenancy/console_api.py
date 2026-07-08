@@ -201,18 +201,29 @@ def agents_for_owner(
     owner_open_id: str,
     *,
     limit: int = 100,
+    offset: int = 0,
     db_path: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Agent-kind routing rows owned by ``owner_open_id``.
+    """Active agent-kind routing rows owned by ``owner_open_id``.
 
     The developer self-view needs "my agents" — an OWNER-column query, not the
     text search of ``search_profiles`` (which matches display_label/open_id/… but
     NOT owner_open_id, so ``q=<open_id>`` would never surface the agents a user
     owns). The BFF derives ``owner_open_id`` from the session and passes it here;
     this function trusts its (master-key-gated) caller.
+
+    Filters ``active = 1`` to match the canonical owner enumerator
+    (routing.list_agents_for_owner) and overview_snapshot's active count — a
+    soft-deleted agent must not linger in the self-view nor disagree with the
+    overview. Carries the same pagination contract as ``search_profiles``
+    (limit clamp + offset + total).
     """
     limit = min(max(int(limit), 1), _PROFILES_MAX_LIMIT)
-    result: dict[str, Any] = {"owner_open_id": owner_open_id, "items": [], "available": False}
+    offset = max(int(offset), 0)
+    result: dict[str, Any] = {
+        "owner_open_id": owner_open_id, "items": [], "total": 0,
+        "limit": limit, "offset": offset, "available": False,
+    }
     if not owner_open_id:
         result["available"] = True  # a valid query for "no owner" is simply empty
         return result
@@ -222,12 +233,17 @@ def agents_for_owner(
     try:
         if not _has_table(conn, "multitenancy_routing"):
             return result
+        where = "WHERE kind = 'agent' AND owner_open_id = ? AND active = 1"
+        result["total"] = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM multitenancy_routing {where}", (str(owner_open_id),)
+            ).fetchone()[0]
+        )
         rows = conn.execute(
-            "SELECT * FROM multitenancy_routing"
-            " WHERE kind = 'agent' AND owner_open_id = ?"
+            f"SELECT * FROM multitenancy_routing {where}"
             " ORDER BY (last_active_at IS NULL), last_active_at DESC, user_id"
-            " LIMIT ?",
-            (str(owner_open_id), limit),
+            " LIMIT ? OFFSET ?",
+            (str(owner_open_id), limit, offset),
         ).fetchall()
         result["items"] = [_project_routing_row(row) for row in rows]
         result["available"] = True
@@ -519,7 +535,12 @@ async def handle_console_agents(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     owner = str(request.query.get("owner") or "").strip()
     try:
-        result = await asyncio.to_thread(agents_for_owner, owner)
+        try:
+            limit = int(request.query.get("limit", "100"))
+            offset = int(request.query.get("offset", "0"))
+        except ValueError:
+            return web.json_response({"error": "limit/offset must be integers"}, status=400)
+        result = await asyncio.to_thread(agents_for_owner, owner, limit=limit, offset=offset)
         return web.json_response(result)
     except Exception as exc:
         logger.exception("[console] agents failed")

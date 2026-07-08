@@ -279,9 +279,14 @@ def test_agents_for_owner_returns_only_owned_agents(tmp_path):
         [
             # the developer's own user row — must NOT be returned by an agents query
             ("u-self", "feishu_self", "ou_self", "on_self", "user", 1, None, None, "我", 200, 100, "sync"),
-            # two agents the developer owns — MUST be returned
+            # two ACTIVE agents the developer owns — MUST be returned
             ("ag-1", "webui_ag1", None, None, "agent", 1, None, "ou_self", "我的Agent1", 150, 100, "auto"),
             ("ag-2", "webui_ag2", None, None, "agent", 1, None, "ou_self", "我的Agent2", 120, 100, "auto"),
+            # a SOFT-DELETED agent the developer owns — must NOT leak (active=0)
+            ("ag-del", "webui_agdel", None, None, "agent", 0, None, "ou_self", "已删Agent", 110, 100, "auto"),
+            # an owned GROUP row (group rows carry the puller's owner_open_id) —
+            # pins the kind='agent' scoping: must NOT surface as an agent
+            ("grp-self", "feishu_group_x", None, None, "group", 1, "oc_x", "ou_self", "我拉的群", 130, 100, "auto"),
             # another owner's agent — must NEVER leak
             ("ag-x", "webui_agx", None, None, "agent", 1, None, "ou_other", "别人的", 100, 100, "auto"),
         ],
@@ -292,10 +297,12 @@ def test_agents_for_owner_returns_only_owned_agents(tmp_path):
     r = console_api.agents_for_owner("ou_self", db_path=db)
     assert r["available"] is True
     names = sorted(a["display_label"] for a in r["items"])
-    assert names == ["我的Agent1", "我的Agent2"]  # own agents only
+    assert names == ["我的Agent1", "我的Agent2"]  # active own agents only
+    assert r["total"] == 2  # pagination contract: total present, excludes soft-deleted
     assert all(a.get("owner_open_id") == "ou_self" for a in r["items"])
-    # not the user row, not another owner's agent
-    assert "我" not in names and "别人的" not in names
+    # not the user row, not the soft-deleted agent, not the owned group, not another owner's
+    for excluded in ("我", "已删Agent", "我拉的群", "别人的"):
+        assert excluded not in names
 
     # empty owner is a valid empty result, never a wildcard
     empty = console_api.agents_for_owner("", db_path=db)
