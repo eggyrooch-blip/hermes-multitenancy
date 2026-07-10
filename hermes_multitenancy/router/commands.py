@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from .. import router as _m
+from ..feishu_message_trace import reset_trace_context, set_trace_context
 
 
 async def handle_async(*, event: Any, gateway: Any) -> None:
@@ -22,9 +23,17 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
     from .. import expert_bot_route
     from ..commands import parse_command
 
+    trace_tokens = None
     try:
         source = getattr(event, "source", None)
         chat_id = getattr(source, "chat_id", "unknown") if source else "unknown"
+        try:
+            # Trace setup must never affect message handling: a raw_event whose
+            # "event" is truthy-but-not-a-dict would AttributeError in
+            # _event_message_id and silently swallow the whole message.
+            trace_tokens = set_trace_context(_m._event_message_id(event), chat_id)
+        except Exception:
+            pass
         fallback_sender = getattr(source, "user_id", "unknown") if source else "unknown"
         sender = _m._resolve_sender_for_routing(event, fallback=fallback_sender)
         if _m._is_feishu_open_id(sender):
@@ -407,6 +416,12 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         raise
     except Exception as exc:
         _m.logger.exception("multitenancy: handle_async failed: %s", exc)
+    finally:
+        # Restore the caller's trace context. Matters for the nested
+        # ``await handle_async(...)`` auth-complete replay, which runs in the
+        # long-lived outer task's context (see _dispatch_synthetic_auth_complete).
+        if trace_tokens is not None:
+            reset_trace_context(trace_tokens)
 
 
 def _processing_outcome(*, failed: bool) -> Any:

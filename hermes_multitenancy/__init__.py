@@ -113,6 +113,14 @@ def register(ctx) -> None:
         install_feishu_helpdesk_events_patch()
         from .feishu_media_retry import install_feishu_media_retry_patch
         install_feishu_media_retry_patch()
+        try:
+            from .feishu_message_trace import install_message_trace_filter
+            install_message_trace_filter()
+        except Exception:
+            # Diagnostic sugar must not block the broker / credential subsystems
+            # that this same block starts right after (sibling installs above
+            # swallow too, for the same reason).
+            logger.exception("[message_trace] install failed; continuing without per-message log tracing")
         webui_broker_server.ensure_run_broker_server_started()
         _start_credential_renewal_subsystem()
 

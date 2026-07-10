@@ -24,11 +24,15 @@ from __future__ import annotations
 import json
 import os
 import platform as _platform
+import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+
+from .feishu_message_trace import trace_prefix
 
 
 FeishuLocale = str  # "zh_cn" | "en_us"
@@ -641,3 +645,113 @@ def render_diagnose(
         multitenancy=multitenancy,
     )
     return render_diagnose_markdown(report, locale)
+
+
+# ---------------------------------------------------------------------------
+# Per-message log trace (see feishu_message_trace for the writer side)
+# ---------------------------------------------------------------------------
+
+# EXTRACTION ONLY — stage classification (replied/duplicate/error keyword
+# analysis) was cut by decision (sunke, 2026-07-10) after five review rounds
+# each constructed a new in-band forgery against whichever heuristic the
+# classifier used; the durable value is "one command greps a message's full
+# trail out of agent.log", and that is all this does. The operator reads the
+# extracted lines; the machine does not opine on them.
+#
+# Ownership rules (each survived an adversarial review round):
+# * A record is attributed ONLY when its VALIDATED real prefix token sits
+#   immediately after the timestamped log header — the factory prepends the
+#   token to ``record.msg``, so nothing can appear between header and token.
+#   Tokens anywhere later in a line are content (echoed reply text, hostile
+#   exception strings) and never attribute.
+# * There is NO bare/line-start token format: a multiline hostile payload can
+#   fabricate a line-start ``[msg:...]`` via an embedded newline
+#   (review-reproduced), so only the timestamped header frame is trusted.
+#   The DEPLOYED formatter is ``%(name)s: %(message)s`` (verified against live
+#   ~/.hermes/profiles/multitenancy_router/logs/agent.log:
+#   ``2026-07-08 14:22:01,415 INFO hermes_multitenancy.credential_renewal_worker: [credential_renewal] tick ...``);
+#   colon-less logger names stay accepted.
+# * Continuation lines (traceback frames — no timestamped header) belong to the
+#   current owner and cannot re-attribute regardless of embedded tokens.
+# Residual (documented, accepted): hostile content that byte-mimics a FULL
+# timestamped header + token on its own line still forges — this is the
+# theoretical limit of in-band text markers; structured logging is the real
+# fix and deliberately out of scope (diagnostic aid, not a security boundary).
+
+# Matches the ``[msg:<id>]`` token the factory injects. ``[^\]]*`` (no regex
+# ``\b``, so CJK-safe) captures the id.
+_MSG_TOKEN_RE = re.compile(r"\[msg:([^\]]*)\]")
+_LOG_LEVELS = r"(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL|TRACE|EXCEPTION)"
+_TIMESTAMPED_TRACED_RE = re.compile(
+    r"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}\S*\s+" + _LOG_LEVELS + r"\s+[\w.\-]+:?\s+\[msg:([^\]]*)\]\s?(.*)$"
+)
+# An UNTRACED record boundary must match the COMPLETE header grammar
+# (timestamp + level word + dotted logger name) — a bare timestamp-looking
+# string inside a traceback/hostile payload must not terminate continuation
+# capture and truncate the owner's trail (review round-6, reproduced).
+_RECORD_START_RE = re.compile(
+    r"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}\S*\s+" + _LOG_LEVELS + r"\s+[\w.\-]+:?\s"
+)
+
+
+@dataclass
+class MessageTrace:
+    """Structured result of :func:`trace_by_message_id`. All fields default, so
+    the empty-token / read-error early returns stay KeyError-free."""
+
+    message_id: str
+    matched_lines: list[str] = field(default_factory=list)
+    received: bool = False
+    read_error: Optional[str] = None
+
+
+def _owned_lines(lines, target_id: str):
+    """Yield the log lines belonging to ``target_id`` (see ownership rules in
+    the section comment above)."""
+    attributing = False
+    for line in lines:
+        match = _TIMESTAMPED_TRACED_RE.match(line)
+        if match is not None:
+            attributing = match.group(1) == target_id
+            if attributing:
+                yield line
+        elif _RECORD_START_RE.match(line):
+            attributing = False  # untraced record boundary — stop capture
+        elif attributing:
+            yield line  # traceback / continuation of the owned record
+
+
+def trace_by_message_id(msg_id: object, log_path: object) -> MessageTrace:
+    """Extract one message's log lines (record + traceback continuations) from
+    ``log_path``. ``received`` is True iff any line was found — meaning only
+    "the router process holds traces of this id" (a healthy message may log
+    little; absence proves nothing about upstream delivery)."""
+    try:
+        token = trace_prefix(msg_id)
+    except Exception:
+        token = ""  # a raising msg_id.__str__ must not crash the diagnostic
+    target_id = _sanitized_from_prefix(token)
+    result = MessageTrace(message_id=target_id)
+    if not token:
+        return result
+
+    try:
+        # Stream — agent.log is unbounded (rotation aside); slurping the whole
+        # file into memory on the DIAGNOSTIC path would be its own incident.
+        with open(str(log_path), "r", encoding="utf-8", errors="replace") as handle:  # str() inside try: raising __str__ lands in read_error
+            result.matched_lines = list(
+                _owned_lines((line.rstrip("\n") for line in handle), target_id)
+            )
+    except Exception as exc:  # OSError + pathological __str__/__fspath__ inputs
+        result.read_error = f"{exc.__class__.__name__}: {exc}"
+        return result
+
+    result.received = bool(result.matched_lines)
+    return result
+
+
+def _sanitized_from_prefix(token: str) -> str:
+    """Recover the sanitized id from a ``[msg:<id>]`` token (``""`` if empty)."""
+    if not token:
+        return ""
+    return token[len("[msg:") : -1]
