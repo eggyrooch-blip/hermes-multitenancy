@@ -130,11 +130,16 @@ async def handle_feishu_clarify_required(adapter: Any, chat_id: str, payload: An
             exc_info=True,
         )
         # Unblock the polling agent instead of stranding it for the full timeout.
-        _write_clarify_response(
-            clarify_id,
-            "The clarify card could not be delivered to the user. "
-            "Use your best judgement to make the choice and proceed.",
-        )
+        # The fallback write must ALSO never propagate — killing the stream here
+        # is exactly the failure this except exists to prevent.
+        try:
+            _write_clarify_response(
+                clarify_id,
+                "The clarify card could not be delivered to the user. "
+                "Use your best judgement to make the choice and proceed.",
+            )
+        except Exception:
+            logger.warning("[multitenancy] clarify fallback write failed", exc_info=True)
 
 
 def install_feishu_clarify_card_action_patch() -> None:
