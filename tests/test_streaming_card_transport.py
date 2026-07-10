@@ -218,6 +218,48 @@ class _CardCapableAdapter:
         return SimpleNamespace(success=True, message_id=message_id)
 
 
+def test_streaming_clarify_event_sends_cardkit_form(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import feishu_clarify_cards
+
+    adapter = _CardCapableAdapter()
+    sent: list[dict] = []
+
+    async def fake_stream(*_args, **_kwargs):
+        yield "clarify_required", {
+            "clarify_id": "clarify_0123456789abcdef0123456789abcdef",
+            "question": "选择报告格式",
+            "choices": ["brief", "detailed"],
+        }
+        yield "content", "继续"
+        yield "done", "继续"
+
+    async def fake_send(*, adapter, chat_id, card):
+        sent.append({"adapter": adapter, "chat_id": chat_id, "card": card})
+        return {"message_id": "om_clarify"}
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(feishu_clarify_cards, "send_auth_card", fake_send)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None)
+
+    result = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "oc_test",
+            "profile",
+            tmp_path,
+            SimpleNamespace(source=SimpleNamespace(chat_type="dm")),
+        )
+    )
+
+    assert result == "继续"
+    assert sent[0]["adapter"] is adapter
+    assert sent[0]["chat_id"] == "oc_test"
+    assert sent[0]["card"]["body"]["elements"][-1]["tag"] == "form"
+    assert any(update["content"] == "等待你的选择" for update in adapter.status_updates)
+
+
 class _DeferredLifecycleCardAdapter(_CardCapableAdapter):
     def __init__(self):
         super().__init__()

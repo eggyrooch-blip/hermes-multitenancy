@@ -4976,6 +4976,44 @@ def test_run_with_aiagent_bridges_webui_clarify_to_event_sink(monkeypatch, tmp_p
     assert events[1]["response"] == "brief"
 
 
+def test_run_with_aiagent_bridges_feishu_clarify_to_event_sink(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - clarify\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path / "clarify"))
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_TIMEOUT", "1")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id):
+            return {"final_response": f"picked:{self.kwargs['clarify_callback']('Which?', ['A', 'B'])}"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+
+    def sink(event, **payload):
+        events.append({"event": event, **payload})
+        if event == "clarify_required":
+            Path(payload["response_path"]).write_text(json.dumps({"response": "A"}), encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    assert agent_real._run_with_aiagent(_event(), profile_home, event_sink=sink) == "picked:A"
+    assert events[0]["session_key"] == "multitenancy:feishu:coder:oc_test:ou_test"
+
+
 def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy.run_models import RunRequest

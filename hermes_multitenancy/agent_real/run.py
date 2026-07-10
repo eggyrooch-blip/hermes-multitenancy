@@ -309,11 +309,14 @@ def _run_with_aiagent(
             if tool_name:
                 _emit("tool_started", name=str(tool_name), preview="generating arguments")
 
-        clarify_callback = (
-            _configure_webui_clarify_bridge(event_sink, str(gateway_session_key))
-            if platform_key == "webui"
-            else None
-        )
+        if platform_key == "webui":
+            clarify_callback = _configure_webui_clarify_bridge(event_sink, str(gateway_session_key))
+        elif platform_key == "feishu":
+            from ..feishu_clarify_cards import _configure_feishu_clarify_bridge
+
+            clarify_callback = _configure_feishu_clarify_bridge(event_sink, str(gateway_session_key))
+        else:
+            clarify_callback = None
 
         agent_kwargs: dict[str, Any] = {
             # AIAgent expects the bare model name (e.g. "glm-5.1"), not the

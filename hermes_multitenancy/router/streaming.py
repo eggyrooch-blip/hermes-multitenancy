@@ -694,6 +694,16 @@ async def _stream_into_feishu_shared_consumer(
                             _m.logger.debug("multitenancy: approval status update failed: %s", exc)
                         continue
 
+                    if kind == "clarify_required":
+                        from ..feishu_clarify_cards import handle_feishu_clarify_required
+
+                        await handle_feishu_clarify_required(adapter, chat_id, delta)
+                        try:
+                            await consumer.update_streaming_card_status("等待你的选择")
+                        except Exception as exc:
+                            _m.logger.debug("multitenancy: clarify status update failed: %s", exc)
+                        continue
+
                     if kind == "approval_resolved":
                         if isinstance(delta, dict):
                             _m._clear_pending_approval(delta)
@@ -1075,6 +1085,23 @@ async def _stream_into_feishu(
                             )
                         except Exception as exc:
                             _m.logger.debug("multitenancy: approval status update failed: %s", exc)
+                        last_edit_time = time.monotonic()
+                        last_render_len = len(render())
+                        continue
+                    elif kind == "clarify_required":
+                        from ..feishu_clarify_cards import handle_feishu_clarify_required
+
+                        await handle_feishu_clarify_required(adapter, chat_id, delta)
+                        try:
+                            await _update_feishu_stream_status(
+                                adapter,
+                                chat_id,
+                                placeholder_id,
+                                "等待你的选择",
+                                mode=stream_mode,
+                            )
+                        except Exception as exc:
+                            _m.logger.debug("multitenancy: clarify status update failed: %s", exc)
                         last_edit_time = time.monotonic()
                         last_render_len = len(render())
                         continue
