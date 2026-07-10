@@ -26,6 +26,7 @@ from .lark_cli_guard import (
 )
 from .runtime import strict_context_enabled
 from .update_center import sanitize_user_visible_output
+from .feishu_permission_errors import annotate_permission_error
 
 try:
     from tools.registry import registry, tool_error, tool_result
@@ -799,18 +800,20 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     stdout = _strip_non_business_notices(_redact(completed.stdout))
     stderr = _strip_non_business_notices(_redact(completed.stderr))
     parsed = _parse_json_output(stdout)
-    return tool_result(
-        ok=completed.returncode == 0,
-        approval_required=False,
-        mode=mode,
-        identity=identity,
-        command=argv,
-        exit_code=completed.returncode,
-        json=parsed,
-        stdout=stdout if parsed is None else "",
-        stderr_redacted=stderr,
-        files=_existing_output_files(output_paths),
-    )
+    result = {
+        "ok": completed.returncode == 0,
+        "approval_required": False,
+        "mode": mode,
+        "identity": identity,
+        "command": argv,
+        "exit_code": completed.returncode,
+        "json": parsed,
+        "stdout": stdout if parsed is None else "",
+        "stderr_redacted": stderr,
+        "files": _existing_output_files(output_paths),
+    }
+    result = annotate_permission_error(result, app_id=env.get("LARKSUITE_CLI_APP_ID"))
+    return tool_result(**result)
 
 
 if registry is not None:
