@@ -20,6 +20,40 @@ _HOOK_INSTALLED = False
 _CARD_ACTION_FLAG = "_hermes_multitenancy_clarify_card_action_patched"
 _CLARIFY_ID_RE = re.compile(r"clarify_[0-9a-f]{32}")
 
+# Truncate, never reject — a hostile/huge clarify payload must not bloat the card or the response file.
+_MAX_QUESTION_CHARS = 2000  # ponytail: question markdown ceiling
+_MAX_CHOICE_CHARS = 100  # ponytail: per-choice option text ceiling
+_MAX_CHOICES = 10  # ponytail: rendered-choice ceiling, extras dropped
+_MAX_ANSWER_CHARS = 2000  # ponytail: submitted-answer ceiling
+
+# Same-chat stale-card invalidation. In-process only; a restart forgets these and
+# falls back to first-writer-wins, which is acceptable.
+_CLARIFY_CHAT_BY_ID: dict[str, str] = {}  # clarify_id -> chat_id
+_LATEST_CLARIFY_BY_CHAT: dict[str, str] = {}  # chat_id -> latest clarify_id
+_CLARIFY_MAP_MAX = 256  # ponytail: in-flight clarify ceiling per process; oldest-first eviction
+
+
+def _remember(store: dict[str, str], key: str, value: str) -> None:
+    """Record key->value with most-recent at the end, bounded oldest-first."""
+    if key in store:
+        del store[key]
+    store[key] = value
+    while len(store) > _CLARIFY_MAP_MAX:
+        del store[next(iter(store))]
+
+
+def _is_stale_clarify(clarify_id: str) -> bool:
+    """True only when this clarify is known AND a newer card superseded it for its chat.
+
+    Unknown ids (process restart, never registered) and chats whose latest entry was
+    evicted stay fail-open, so a legitimate answer is never wrongly rejected.
+    """
+    chat_id = _CLARIFY_CHAT_BY_ID.get(clarify_id)
+    if chat_id is None:
+        return False
+    latest = _LATEST_CLARIFY_BY_CHAT.get(chat_id)
+    return latest is not None and latest != clarify_id
+
 
 def _configure_feishu_clarify_bridge(event_sink, session_key: str):
     """Reuse the core's response-file and timeout protocol for Feishu runs."""
@@ -28,7 +62,11 @@ def _configure_feishu_clarify_bridge(event_sink, session_key: str):
 
 def build_clarify_card(*, clarify_id: str, question: Any, choices: Any) -> dict[str, Any]:
     raw_choices = choices if isinstance(choices, list) else []
-    normalized_choices = [str(choice).strip() for choice in raw_choices if str(choice).strip()]
+    normalized_choices = [
+        str(choice).strip()[:_MAX_CHOICE_CHARS]
+        for choice in raw_choices
+        if str(choice).strip()
+    ][:_MAX_CHOICES]
     fields: list[dict[str, Any]]
     if normalized_choices:
         fields = [{
@@ -60,7 +98,7 @@ def build_clarify_card(*, clarify_id: str, question: Any, choices: Any) -> dict[
         "schema": "2.0",
         "header": {"title": {"tag": "plain_text", "content": "需要你的选择"}, "template": "blue"},
         "body": {"elements": [
-            {"tag": "markdown", "content": str(question or "").strip()},
+            {"tag": "markdown", "content": str(question or "").strip()[:_MAX_QUESTION_CHARS]},
             {"tag": "form", "elements": fields},
         ]},
     }
@@ -73,15 +111,30 @@ async def handle_feishu_clarify_required(adapter: Any, chat_id: str, payload: An
     if not _CLARIFY_ID_RE.fullmatch(clarify_id):
         logger.warning("[multitenancy] ignored malformed clarify id")
         return
-    await send_auth_card(
-        adapter=adapter,
-        chat_id=chat_id,
-        card=build_clarify_card(
-            clarify_id=clarify_id,
-            question=data.get("question"),
-            choices=data.get("choices"),
-        ),
-    )
+    # Register before sending so a later card for this chat supersedes this one.
+    _remember(_CLARIFY_CHAT_BY_ID, clarify_id, chat_id)
+    _remember(_LATEST_CLARIFY_BY_CHAT, chat_id, clarify_id)
+    try:
+        await send_auth_card(
+            adapter=adapter,
+            chat_id=chat_id,
+            card=build_clarify_card(
+                clarify_id=clarify_id,
+                question=data.get("question"),
+                choices=data.get("choices"),
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "[multitenancy] clarify card delivery failed; unblocking agent with fallback",
+            exc_info=True,
+        )
+        # Unblock the polling agent instead of stranding it for the full timeout.
+        _write_clarify_response(
+            clarify_id,
+            "The clarify card could not be delivered to the user. "
+            "Use your best judgement to make the choice and proceed.",
+        )
 
 
 def install_feishu_clarify_card_action_patch() -> None:
@@ -119,6 +172,8 @@ def _patch_card_action(adapter_class: Any) -> bool:
             answer = _clarify_answer(_read_value(action, "form_value"))
             if not _CLARIFY_ID_RE.fullmatch(clarify_id) or not answer:
                 return _toast_response("回答无效，请重新提交。", level="error")
+            if _is_stale_clarify(clarify_id):
+                return _toast_response("该卡片已过期，请在最新的卡片上回答。", level="error")
             if not _write_clarify_response(clarify_id, answer):
                 return _toast_response("已提交，请勿重复操作。", level="info")
             return _toast_response("已提交，正在继续。")
@@ -156,7 +211,8 @@ def _read_action_value(value: Any) -> dict[str, Any]:
 def _clarify_answer(form_value: Any) -> str:
     if not isinstance(form_value, dict):
         return ""
-    return str(form_value.get("clarify_answer") or form_value.get("clarify_choice") or "").strip()
+    answer = str(form_value.get("clarify_answer") or form_value.get("clarify_choice") or "").strip()
+    return answer[:_MAX_ANSWER_CHARS]  # ponytail: cap oversized submitted answer
 
 
 def _write_clarify_response(clarify_id: str, answer: str) -> bool:

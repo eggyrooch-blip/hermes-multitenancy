@@ -215,3 +215,102 @@ def test_install_retries_after_adapter_method_appears(monkeypatch):
     LateAdapter._on_card_action_trigger = _CardAdapter._on_card_action_trigger
     feishu_clarify_cards.install_feishu_clarify_card_action_patch()
     assert getattr(LateAdapter._on_card_action_trigger, "_hermes_multitenancy_clarify_card_action_patched", False)
+
+
+def test_undeliverable_clarify_card_unblocks_agent(monkeypatch, tmp_path):
+    """FIX 1: a failed card send writes a fallback response so the agent isn't stranded."""
+    import asyncio
+
+    from hermes_multitenancy.agent_real import _clarify_bridge_dir, _read_clarify_response
+    from hermes_multitenancy.feishu_clarify_cards import handle_feishu_clarify_required
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path))
+
+    async def boom(*, adapter, chat_id, card):
+        raise RuntimeError("delivery down")
+
+    monkeypatch.setattr("hermes_multitenancy.feishu_clarify_cards.send_auth_card", boom)
+    clarify_id = "clarify_" + "a" * 32
+    payload = {"clarify_id": clarify_id, "question": "Which?", "choices": ["x", "y"]}
+
+    # Must not raise — the stream consumer has to survive an undeliverable card.
+    asyncio.run(handle_feishu_clarify_required("adapter", "oc_undeliverable", payload))
+
+    response = _read_clarify_response(_clarify_bridge_dir() / f"{clarify_id}.json")
+    assert response is not None
+    assert "could not be delivered" in response
+    assert "best judgement" in response
+
+
+def test_clarify_card_and_answer_enforce_size_caps():
+    """FIX 2: oversized question/choices/answer are truncated and choices capped at 10."""
+    from hermes_multitenancy.feishu_clarify_cards import _clarify_answer, build_clarify_card
+
+    card = build_clarify_card(
+        clarify_id="clarify_" + "0" * 32,
+        question="q" * 3000,
+        choices=["y" * 200] + [f"c{i}" for i in range(20)],
+    )
+    question_el = card["body"]["elements"][0]
+    assert question_el["tag"] == "markdown"
+    assert len(question_el["content"]) == 2000
+
+    form = card["body"]["elements"][-1]
+    select = form["elements"][0]
+    assert select["tag"] == "select_static"
+    options = select["options"]
+    assert len(options) == 10
+    assert all(len(opt["text"]["content"]) <= 100 for opt in options)
+    assert len(options[0]["text"]["content"]) == 100  # the "y" * 200 choice, truncated
+
+    assert len(_clarify_answer({"clarify_answer": "z" * 3000})) == 2000
+
+
+def test_stale_clarify_card_is_rejected_but_unknown_stays_fail_open(monkeypatch, tmp_path):
+    """FIX 3: an older card for a re-clarified chat is rejected; unknown ids stay fail-open."""
+    import asyncio
+
+    from hermes_multitenancy import feishu_clarify_cards
+    from hermes_multitenancy.agent_real import _clarify_bridge_dir, _read_clarify_response
+    from hermes_multitenancy.feishu_clarify_cards import (
+        _patch_card_action,
+        handle_feishu_clarify_required,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path))
+    feishu_clarify_cards._CLARIFY_CHAT_BY_ID.clear()
+    feishu_clarify_cards._LATEST_CLARIFY_BY_CHAT.clear()
+
+    async def ok(*, adapter, chat_id, card):
+        return {"message_id": "om_x"}
+
+    monkeypatch.setattr("hermes_multitenancy.feishu_clarify_cards.send_auth_card", ok)
+    _patch_card_action(_CardAdapter)
+
+    chat = "oc_restale"
+    old_id = "clarify_" + "0" * 31 + "1"
+    new_id = "clarify_" + "0" * 31 + "2"
+    asyncio.run(handle_feishu_clarify_required("adapter", chat, {"clarify_id": old_id, "question": "Q1"}))
+    asyncio.run(handle_feishu_clarify_required("adapter", chat, {"clarify_id": new_id, "question": "Q2"}))
+
+    adapter = _CardAdapter()
+
+    stale = adapter._on_card_action_trigger(
+        _card_data(action_value={"hermes_action": "clarify", "clarify_id": old_id}, answer="late")
+    )
+    assert stale["toast"]["type"] == "error"
+    assert stale["toast"]["content"] == "该卡片已过期，请在最新的卡片上回答。"
+    assert not (_clarify_bridge_dir() / f"{old_id}.json").exists()
+
+    fresh = adapter._on_card_action_trigger(
+        _card_data(action_value={"hermes_action": "clarify", "clarify_id": new_id}, answer="onnew")
+    )
+    assert fresh["toast"]["type"] == "success"
+    assert _read_clarify_response(_clarify_bridge_dir() / f"{new_id}.json") == "onnew"
+
+    unknown_id = "clarify_" + "f" * 32
+    unknown = adapter._on_card_action_trigger(
+        _card_data(action_value={"hermes_action": "clarify", "clarify_id": unknown_id}, answer="anon")
+    )
+    assert unknown["toast"]["type"] == "success"
+    assert _read_clarify_response(_clarify_bridge_dir() / f"{unknown_id}.json") == "anon"
