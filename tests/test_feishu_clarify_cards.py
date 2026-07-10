@@ -169,3 +169,49 @@ def test_duplicate_clarify_submit_keeps_the_first_answer(monkeypatch, tmp_path):
     assert adapter._on_card_action_trigger(_card_data(action_value=action, answer="first"))["toast"]["type"] == "success"
     assert adapter._on_card_action_trigger(_card_data(action_value=action, answer="second"))["toast"]["type"] == "info"
     assert _read_clarify_response(_clarify_bridge_dir() / f"{action['clarify_id']}.json") == "first"
+
+
+def test_card_uses_text_input_for_non_list_choices():
+    from hermes_multitenancy.feishu_clarify_cards import build_clarify_card
+
+    card = build_clarify_card(
+        clarify_id="clarify_0123456789abcdef0123456789abcdef",
+        question="Which?",
+        choices=42,
+    )
+
+    assert card["body"]["elements"][-1]["elements"][0]["tag"] == "input"
+
+
+def test_stringified_action_value_is_accepted(monkeypatch, tmp_path):
+    from hermes_multitenancy.agent_real import _clarify_bridge_dir, _read_clarify_response
+    from hermes_multitenancy.feishu_clarify_cards import _patch_card_action
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path))
+    _patch_card_action(_CardAdapter)
+    clarify_id = "clarify_0123456789abcdef0123456789abcdef"
+    response = _CardAdapter()._on_card_action_trigger(
+        _card_data(action_value=json.dumps({"hermes_action": "clarify", "clarify_id": clarify_id}), answer="answer")
+    )
+
+    assert response["toast"]["type"] == "success"
+    assert _read_clarify_response(_clarify_bridge_dir() / f"{clarify_id}.json") == "answer"
+
+
+def test_install_retries_after_adapter_method_appears(monkeypatch):
+    from hermes_multitenancy import feishu_clarify_cards
+
+    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+
+    class LateAdapter:
+        pass
+
+    synthetic.FeishuAdapter = LateAdapter
+    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+    monkeypatch.setattr(feishu_clarify_cards, "_HOOK_INSTALLED", False)
+    feishu_clarify_cards.install_feishu_clarify_card_action_patch()
+    assert feishu_clarify_cards._HOOK_INSTALLED is False
+
+    LateAdapter._on_card_action_trigger = _CardAdapter._on_card_action_trigger
+    feishu_clarify_cards.install_feishu_clarify_card_action_patch()
+    assert getattr(LateAdapter._on_card_action_trigger, "_hermes_multitenancy_clarify_card_action_patched", False)

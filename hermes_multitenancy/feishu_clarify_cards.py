@@ -27,7 +27,8 @@ def _configure_feishu_clarify_bridge(event_sink, session_key: str):
 
 
 def build_clarify_card(*, clarify_id: str, question: Any, choices: Any) -> dict[str, Any]:
-    normalized_choices = [str(choice).strip() for choice in choices or [] if str(choice).strip()]
+    raw_choices = choices if isinstance(choices, list) else []
+    normalized_choices = [str(choice).strip() for choice in raw_choices if str(choice).strip()]
     fields: list[dict[str, Any]]
     if normalized_choices:
         fields = [{
@@ -96,21 +97,22 @@ def install_feishu_clarify_card_action_patch() -> None:
             exc,
         )
         return
-    _patch_card_action(adapter_class)
-    _HOOK_INSTALLED = True
+    _HOOK_INSTALLED = _patch_card_action(adapter_class)
 
 
-def _patch_card_action(adapter_class: Any) -> None:
+def _patch_card_action(adapter_class: Any) -> bool:
     original = getattr(adapter_class, "_on_card_action_trigger", None)
-    if original is None or getattr(original, _CARD_ACTION_FLAG, False):
-        return
+    if original is None:
+        return False
+    if getattr(original, _CARD_ACTION_FLAG, False):
+        return True
 
     @functools.wraps(original)
     def wrapped(self: Any, data: Any) -> Any:
         try:
             event = _read_value(data, "event")
             action = _read_value(event, "action")
-            value = _read_value(action, "value") or {}
+            value = _read_action_value(_read_value(action, "value"))
             if not isinstance(value, dict) or value.get("hermes_action") != "clarify":
                 return original(self, data)
             clarify_id = str(value.get("clarify_id") or "")
@@ -130,12 +132,25 @@ def _patch_card_action(adapter_class: Any) -> None:
     setattr(wrapped, _CARD_ACTION_FLAG, True)
     adapter_class._on_card_action_trigger = wrapped
     logger.info("[multitenancy] installed clarify card-action hook on %s.FeishuAdapter", adapter_class.__module__)
+    return True
 
 
 def _read_value(value: Any, name: str) -> Any:
     if isinstance(value, dict):
         return value.get(name)
     return getattr(value, name, None)
+
+
+def _read_action_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _clarify_answer(form_value: Any) -> str:
