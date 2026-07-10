@@ -119,6 +119,31 @@ def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_p
     assert ("run_broker_server", None) in calls
 
 
+def test_router_register_installs_clarify_after_media_retry(monkeypatch):
+    import hermes_multitenancy
+    from hermes_multitenancy import feishu_clarify_cards, feishu_media_retry
+    from hermes_multitenancy import feishu_helpdesk_events, group_inviter_hook
+
+    calls: list[str] = []
+
+    class FakeCtx:
+        def register_hook(self, *_args):
+            pass
+
+    monkeypatch.setattr(hermes_multitenancy, "may_own_cron_runtime", lambda: False)
+    monkeypatch.setattr(hermes_multitenancy, "is_router_profile_runtime", lambda: True)
+    monkeypatch.setattr(group_inviter_hook, "install_feishu_bot_added_hook", lambda: None)
+    monkeypatch.setattr(feishu_helpdesk_events, "install_feishu_helpdesk_events_patch", lambda: None)
+    monkeypatch.setattr(feishu_media_retry, "install_feishu_media_retry_patch", lambda: calls.append("media"))
+    monkeypatch.setattr(feishu_clarify_cards, "install_feishu_clarify_card_action_patch", lambda: calls.append("clarify"))
+    monkeypatch.setattr(hermes_multitenancy.webui_broker_server, "ensure_run_broker_server_started", lambda: None)
+    monkeypatch.setattr(hermes_multitenancy, "_start_credential_renewal_subsystem", lambda: None)
+
+    hermes_multitenancy.register(FakeCtx())
+
+    assert calls == ["media", "clarify"]
+
+
 def test_runtime_pool_settings_can_be_overridden_from_env(monkeypatch):
     """Production can relax runtime cache/timeout without code changes."""
     monkeypatch.setenv("HERMES_MULTITENANCY_MAX_LOADED_RUNTIMES", "12")

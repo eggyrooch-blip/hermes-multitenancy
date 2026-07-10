@@ -113,6 +113,8 @@ def register(ctx) -> None:
         install_feishu_helpdesk_events_patch()
         from .feishu_media_retry import install_feishu_media_retry_patch
         install_feishu_media_retry_patch()
+        from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
+        install_feishu_clarify_card_action_patch()
         try:
             from .feishu_message_trace import install_message_trace_filter
             install_message_trace_filter()

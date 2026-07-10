@@ -116,8 +116,9 @@ def _patch_card_action(adapter_class: Any) -> None:
             clarify_id = str(value.get("clarify_id") or "")
             answer = _clarify_answer(_read_value(action, "form_value"))
             if not _CLARIFY_ID_RE.fullmatch(clarify_id) or not answer:
-                return _toast_response("回答无效，请重新提交。")
-            _write_clarify_response(clarify_id, answer)
+                return _toast_response("回答无效，请重新提交。", level="error")
+            if not _write_clarify_response(clarify_id, answer):
+                return _toast_response("已提交，请勿重复操作。", level="info")
             return _toast_response("已提交，正在继续。")
         except Exception:
             logger.debug(
@@ -143,17 +144,20 @@ def _clarify_answer(form_value: Any) -> str:
     return str(form_value.get("clarify_answer") or form_value.get("clarify_choice") or "").strip()
 
 
-def _write_clarify_response(clarify_id: str, answer: str) -> Path:
+def _write_clarify_response(clarify_id: str, answer: str) -> bool:
     path = _clarify_bridge_dir() / f"{clarify_id}.json"
     fd, temporary = tempfile.mkstemp(prefix=f".{clarify_id}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"response": answer}, handle, ensure_ascii=False)
-        Path(temporary).replace(path)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
     finally:
         Path(temporary).unlink(missing_ok=True)
-    return path
+    return True
 
 
-def _toast_response(content: str) -> dict[str, Any]:
-    return {"toast": {"type": "success", "content": content}}
+def _toast_response(content: str, *, level: str = "success") -> dict[str, Any]:
+    return {"toast": {"type": level, "content": content}}

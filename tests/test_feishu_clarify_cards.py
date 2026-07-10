@@ -141,3 +141,31 @@ def test_clarify_patch_error_delegates_to_original(monkeypatch):
         )
     ) == "ORIGINAL_CALLED"
     assert len(adapter.original_calls) == 1
+
+
+def test_clarify_invalid_submit_is_not_a_success_toast():
+    from hermes_multitenancy.feishu_clarify_cards import _patch_card_action
+
+    _patch_card_action(_CardAdapter)
+
+    response = _CardAdapter()._on_card_action_trigger(
+        _card_data(
+            action_value={"hermes_action": "clarify", "clarify_id": "clarify_0123456789abcdef0123456789abcdef"},
+        )
+    )
+
+    assert response["toast"]["type"] == "error"
+
+
+def test_duplicate_clarify_submit_keeps_the_first_answer(monkeypatch, tmp_path):
+    from hermes_multitenancy.agent_real import _clarify_bridge_dir, _read_clarify_response
+    from hermes_multitenancy.feishu_clarify_cards import _patch_card_action
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path))
+    _patch_card_action(_CardAdapter)
+    action = {"hermes_action": "clarify", "clarify_id": "clarify_0123456789abcdef0123456789abcdef"}
+    adapter = _CardAdapter()
+
+    assert adapter._on_card_action_trigger(_card_data(action_value=action, answer="first"))["toast"]["type"] == "success"
+    assert adapter._on_card_action_trigger(_card_data(action_value=action, answer="second"))["toast"]["type"] == "info"
+    assert _read_clarify_response(_clarify_bridge_dir() / f"{action['clarify_id']}.json") == "first"
