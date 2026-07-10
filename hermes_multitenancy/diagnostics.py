@@ -27,6 +27,7 @@ import platform as _platform
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -674,24 +675,37 @@ def render_diagnose(
 # * Continuation lines (traceback frames — no timestamped header) belong to the
 #   current owner and cannot re-attribute regardless of embedded tokens.
 # Residual (documented, accepted): hostile content that byte-mimics a FULL
-# timestamped header + token on its own line still forges — this is the
-# theoretical limit of in-band text markers; structured logging is the real
-# fix and deliberately out of scope (diagnostic aid, not a security boundary).
+# timestamped header + token on its own line AND carries a real calendar
+# datetime still forges — this is the theoretical limit of in-band text
+# markers; structured logging is the real fix and deliberately out of scope
+# (diagnostic aid, not a security boundary). Impossible timestamps
+# (2026-99-99) no longer frame records (round-8 fix, _real_header_ts).
 
 # Matches the ``[msg:<id>]`` token the factory injects. ``[^\]]*`` (no regex
 # ``\b``, so CJK-safe) captures the id.
 _MSG_TOKEN_RE = re.compile(r"\[msg:([^\]]*)\]")
 _LOG_LEVELS = r"(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL|TRACE|EXCEPTION)"
 _TIMESTAMPED_TRACED_RE = re.compile(
-    r"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}\S*\s+" + _LOG_LEVELS + r"\s+[\w.\-]+:?\s+\[msg:([^\]]*)\]\s?(.*)$"
+    r"^\s*(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})\S*\s+" + _LOG_LEVELS + r"\s+[\w.\-]+:?\s+\[msg:(?P<mid>[^\]]*)\]\s?.*$"
 )
 # An UNTRACED record boundary must match the COMPLETE header grammar
 # (timestamp + level word + dotted logger name) — a bare timestamp-looking
 # string inside a traceback/hostile payload must not terminate continuation
 # capture and truncate the owner's trail (review round-6, reproduced).
 _RECORD_START_RE = re.compile(
-    r"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}\S*\s+" + _LOG_LEVELS + r"\s+[\w.\-]+:?\s"
+    r"^\s*(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})\S*\s+" + _LOG_LEVELS + r"\s+[\w.\-]+:?\s"
 )
+
+
+def _real_header_ts(match: "re.Match[str]") -> bool:
+    """A header only frames a record if its timestamp is a real calendar
+    datetime (review round-8, codex-reproduced: ``2026-99-99 99:99`` byte-mimics
+    the grammar and forged attribution). Forged headers become plain content."""
+    try:
+        datetime.strptime(match.group("ts").replace("T", " "), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass
@@ -711,11 +725,13 @@ def _owned_lines(lines, target_id: str):
     attributing = False
     for line in lines:
         match = _TIMESTAMPED_TRACED_RE.match(line)
-        if match is not None:
-            attributing = match.group(1) == target_id
+        if match is not None and _real_header_ts(match):
+            attributing = match.group("mid") == target_id
             if attributing:
                 yield line
-        elif _RECORD_START_RE.match(line):
+            continue
+        start = _RECORD_START_RE.match(line)
+        if start is not None and _real_header_ts(start):
             attributing = False  # untraced record boundary — stop capture
         elif attributing:
             yield line  # traceback / continuation of the owned record

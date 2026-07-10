@@ -420,3 +420,37 @@ def test_pathological_str_inputs_never_crash(tmp_path):
     result2 = diagnostics.trace_by_message_id("om_ok", Boom())
     assert result2.read_error is not None
     assert result2.received is False
+
+
+def test_impossible_timestamp_header_never_attributes(tmp_path):
+    """codex round-8 reproduced attack: hostile content that byte-mimics the
+    FULL header grammar but carries an impossible calendar timestamp
+    (2026-99-99 99:99) forged attribution. Only a real datetime frames a
+    record; a forged header is content of the current record, not a boundary."""
+    path = _write_log(
+        tmp_path,
+        [
+            _line("om_owner", "start of owner record"),
+            "2026-99-99 99:99:99,000 ERROR hermes.forged: [msg:om_victim] forged",
+        ],
+    )
+    victim = diagnostics.trace_by_message_id("om_victim", path)
+    assert victim.matched_lines == []
+    owner = diagnostics.trace_by_message_id("om_owner", path)
+    assert len(owner.matched_lines) == 2  # forged line stays inside owner's trail
+
+
+def test_impossible_timestamp_record_start_does_not_truncate_trail(tmp_path):
+    """Same validation on the UNTRACED boundary regex: an impossible-timestamp
+    header inside a hostile traceback must not terminate continuation capture."""
+    path = _write_log(
+        tmp_path,
+        [
+            _line("om_owner", "boom", level="ERROR"),
+            "Traceback (most recent call last):",
+            "2026-13-40 25:61:00,000 INFO fake.logger: not a real record",
+            "RuntimeError: hostile",
+        ],
+    )
+    owner = diagnostics.trace_by_message_id("om_owner", path)
+    assert len(owner.matched_lines) == 4  # all continuations kept
