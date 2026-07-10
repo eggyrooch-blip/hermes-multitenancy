@@ -16,15 +16,16 @@ class _CardAdapter:
         return "ORIGINAL_CALLED"
 
 
-def _card_data(*, action_value, answer="", choice=""):
-    return SimpleNamespace(
-        event=SimpleNamespace(
-            action=SimpleNamespace(
-                value=action_value,
-                form_value={"clarify_answer": answer, "clarify_choice": choice},
-            )
+def _card_data(*, action_value, answer="", choice="", chat=""):
+    event = SimpleNamespace(
+        action=SimpleNamespace(
+            value=action_value,
+            form_value={"clarify_answer": answer, "clarify_choice": choice},
         )
     )
+    if chat:
+        event.context = SimpleNamespace(open_chat_id=chat)
+    return SimpleNamespace(event=event)
 
 
 def test_feishu_clarify_callback_card_submit_writes_webui_protocol(monkeypatch, tmp_path):
@@ -314,3 +315,53 @@ def test_stale_clarify_card_is_rejected_but_unknown_stays_fail_open(monkeypatch,
     )
     assert unknown["toast"]["type"] == "success"
     assert _read_clarify_response(_clarify_bridge_dir() / f"{unknown_id}.json") == "anon"
+
+
+def test_cross_chat_clarify_submit_is_rejected(monkeypatch, tmp_path):
+    """grok review: a clarify answer must come from the chat the card was issued
+    to — event.context.open_chat_id is Feishu-signed and can't be spoofed by a
+    click. Same-chat and missing-context submits keep working (fail-open)."""
+    import asyncio
+
+    from hermes_multitenancy import feishu_clarify_cards
+    from hermes_multitenancy.agent_real import _clarify_bridge_dir, _read_clarify_response
+    from hermes_multitenancy.feishu_clarify_cards import (
+        _patch_card_action,
+        handle_feishu_clarify_required,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CLARIFY_DIR", str(tmp_path))
+    feishu_clarify_cards._CLARIFY_CHAT_BY_ID.clear()
+    feishu_clarify_cards._LATEST_CLARIFY_BY_CHAT.clear()
+
+    async def ok(*, adapter, chat_id, card):
+        return {"message_id": "om_x"}
+
+    monkeypatch.setattr("hermes_multitenancy.feishu_clarify_cards.send_auth_card", ok)
+    _patch_card_action(_CardAdapter)
+
+    owner_chat = "oc_owner"
+    cid = "clarify_" + "b" * 32
+    asyncio.run(handle_feishu_clarify_required("adapter", owner_chat, {"clarify_id": cid, "question": "Q"}))
+
+    adapter = _CardAdapter()
+    foreign = adapter._on_card_action_trigger(
+        _card_data(
+            action_value={"hermes_action": "clarify", "clarify_id": cid},
+            answer="inject",
+            chat="oc_attacker",
+        )
+    )
+    assert foreign["toast"]["type"] == "error"
+    assert foreign["toast"]["content"] == "该卡片不属于当前会话。"
+    assert not (_clarify_bridge_dir() / f"{cid}.json").exists()
+
+    same = adapter._on_card_action_trigger(
+        _card_data(
+            action_value={"hermes_action": "clarify", "clarify_id": cid},
+            answer="mine",
+            chat=owner_chat,
+        )
+    )
+    assert same["toast"]["type"] == "success"
+    assert _read_clarify_response(_clarify_bridge_dir() / f"{cid}.json") == "mine"

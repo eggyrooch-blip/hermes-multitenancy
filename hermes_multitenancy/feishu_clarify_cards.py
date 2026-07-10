@@ -177,6 +177,14 @@ def _patch_card_action(adapter_class: Any) -> bool:
             answer = _clarify_answer(_read_value(action, "form_value"))
             if not _CLARIFY_ID_RE.fullmatch(clarify_id) or not answer:
                 return _toast_response("回答无效，请重新提交。", level="error")
+            issued_chat = _CLARIFY_CHAT_BY_ID.get(clarify_id)
+            signed_chat = str(_read_value(_read_value(event, "context"), "open_chat_id") or "").strip()
+            if issued_chat and signed_chat and signed_chat != issued_chat:
+                # Feishu signs event.context — a click can't spoof it (same trust
+                # anchor as feishu_auth_hub_actions._signed_chat_id). Cross-chat
+                # submits with a leaked clarify id are rejected; unknown ids
+                # (process restart) or missing context stay fail-open.
+                return _toast_response("该卡片不属于当前会话。", level="error")
             if _is_stale_clarify(clarify_id):
                 return _toast_response("该卡片已过期，请在最新的卡片上回答。", level="error")
             if not _write_clarify_response(clarify_id, answer):
