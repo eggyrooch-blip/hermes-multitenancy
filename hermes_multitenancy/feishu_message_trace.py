@@ -104,9 +104,21 @@ def set_trace_context(message_id: object, chat_id: object) -> TraceTokens:
     *outer* task's context, so without a reset it would permanently overwrite
     the outer message's binding.
     """
+    # Convert BOTH values before setting EITHER contextvar: a raising
+    # __str__ halfway through would otherwise leave the message token set
+    # with no reset tokens returned to the caller (grok review, reproduced
+    # with a pathological chat_id) — the context would leak across tasks.
+    try:
+        message_value = _sanitize_id(message_id) or None
+    except Exception:
+        message_value = None  # hostile __str__ ⇒ no prefix, never a crash
+    try:
+        chat_value = str(chat_id or "") or None
+    except Exception:
+        chat_value = None
     return (
-        _message_id_var.set(_sanitize_id(message_id) or None),
-        _chat_id_var.set(str(chat_id or "") or None),
+        _message_id_var.set(message_value),
+        _chat_id_var.set(chat_value),
     )
 
 

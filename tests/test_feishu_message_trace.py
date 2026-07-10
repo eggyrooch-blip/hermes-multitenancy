@@ -422,6 +422,24 @@ def test_pathological_str_inputs_never_crash(tmp_path):
     assert result2.received is False
 
 
+def test_raising_chat_id_does_not_leak_partial_context():
+    """grok review: str(chat_id) raising after the message var was already set
+    left a bound context with no reset tokens. Both conversions must happen
+    before either contextvar is set, and neither may raise."""
+    class Boom:
+        def __str__(self):
+            raise RuntimeError("hostile __str__")
+
+    tokens = trace.set_trace_context("om_ok", Boom())
+    try:
+        assert trace.trace_prefix("om_ok")  # message context usable
+    finally:
+        trace.reset_trace_context(tokens)  # tokens valid → resettable
+
+    tokens2 = trace.set_trace_context(Boom(), "oc_1")  # raising msg id
+    trace.reset_trace_context(tokens2)
+
+
 def test_impossible_timestamp_header_never_attributes(tmp_path):
     """codex round-8 reproduced attack: hostile content that byte-mimics the
     FULL header grammar but carries an impossible calendar timestamp
