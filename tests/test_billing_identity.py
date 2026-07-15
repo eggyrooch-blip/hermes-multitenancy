@@ -211,6 +211,54 @@ def test_direct_litellm_ensure_creates_user_in_department_team(tmp_path, monkeyp
     ]
 
 
+def test_direct_litellm_ensure_reuses_existing_user_without_team_lookup(monkeypatch):
+    from hermes_multitenancy.billing_identity import _ensure_user_over_http
+
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
+    seen_paths = []
+
+    class Response:
+        def __init__(self, payload):
+            self.raw = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return self.raw
+
+    def urlopen(request, *, timeout):
+        assert timeout == 5
+        path = request.full_url.removeprefix("https://litellm.example")
+        seen_paths.append(path)
+        if path.startswith("/user/list?"):
+            return Response({
+                "users": [{
+                    "user_id": "llm-actor",
+                    "user_email": "actor@keep.com",
+                    "metadata": {},
+                }],
+            })
+        if path == "/user/update":
+            return Response({"user_id": "llm-actor"})
+        raise AssertionError(path)
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    result = _ensure_user_over_http("actor")
+
+    assert result["litellm_user_id"] == "llm-actor"
+    assert result["created"] is False
+    assert seen_paths == [
+        "/user/list?user_email=actor%40keep.com",
+        "/user/update",
+    ]
+
+
 def test_group_is_billed_to_group_owner_not_sender():
     preparer, calls = _preparer()
 
