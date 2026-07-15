@@ -343,6 +343,14 @@ def _run_with_aiagent(
             "clarify_callback": clarify_callback,
             "tool_gen_callback": _tool_gen_event_callback if event_sink is not None else None,
         }
+        from ..billing_identity import request_overrides_for_endpoint
+
+        billing_request_overrides = request_overrides_for_endpoint(
+            event_metadata,
+            base_url or "",
+        )
+        if billing_request_overrides:
+            agent_kwargs["request_overrides"] = billing_request_overrides
         if enabled_toolsets is not None:
             agent_kwargs["enabled_toolsets"] = enabled_toolsets
         if disabled_toolsets:
@@ -388,6 +396,7 @@ def _run_with_aiagent(
             base_url=base_url,
             api_key=api_key,
             api_mode=str(runtime_kwargs.get("api_mode") or ""),
+            request_overrides=billing_request_overrides,
         )
         agent = None
         try:

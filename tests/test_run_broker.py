@@ -107,6 +107,41 @@ def test_run_broker_dedupes_before_dispatch():
     assert calls == ["hi"]
 
 
+def test_run_broker_prepares_request_after_dedupe_before_dispatch():
+    from dataclasses import replace
+
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    prepared = []
+    dispatched = []
+
+    async def prepare(request):
+        prepared.append(request.message_id)
+        return replace(request, metadata={"litellm_billing_user_id": "user-1"})
+
+    async def dispatch(request):
+        dispatched.append(request.metadata)
+        return "ok"
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        prepare_request=prepare,
+        mark_seen=lambda request: request.message_id != "duplicate",
+    )
+    duplicate = RunRequest(
+        channel="feishu", profile_name="owner", user_key="ou_1",
+        content="hi", message_id="duplicate",
+    )
+    fresh = replace(duplicate, message_id="fresh")
+
+    asyncio.run(broker.run(duplicate))
+    asyncio.run(broker.run(fresh))
+
+    assert prepared == ["fresh"]
+    assert dispatched == [{"litellm_billing_user_id": "user-1"}]
+
+
 def test_router_mark_seen_dedupes_webui_with_explicit_idempotency_key(tmp_path):
     from hermes_multitenancy import router
     from hermes_multitenancy.run_broker import RunBroker

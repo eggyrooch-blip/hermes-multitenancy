@@ -349,6 +349,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             if feishu_full:
                 # Streaming path — card stream when available; text edit fallback.
                 async def _dispatch_streaming(_request):
+                    run_event = _m._event_with_run_metadata(
+                        agent_event, _request.metadata
+                    )
                     stream_kwargs = {"messages": conversation}
                     try:
                         if "gateway" in inspect.signature(_m._stream_into_feishu).parameters:
@@ -356,12 +359,12 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     except (TypeError, ValueError):
                         stream_kwargs["gateway"] = gateway
                     stream_response = await _m._stream_into_feishu(
-                        adapter, chat_id, profile_name, profile_home, agent_event,
+                        adapter, chat_id, profile_name, profile_home, run_event,
                         **stream_kwargs,
                     )
                     if stream_response:
                         await _m._deliver_media_from_stream_response(
-                            gateway, stream_response, agent_event, adapter, profile_home
+                            gateway, stream_response, run_event, adapter, profile_home
                         )
                     return stream_response
 
@@ -374,7 +377,12 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 if adapter is not None:
                     await _m._safe_call(adapter.send_typing, chat_id)
                 async def _dispatch_nonstream(_request):
-                    return await _m._get_pool().dispatch(profile_name, profile_home, agent_event)
+                    run_event = _m._event_with_run_metadata(
+                        agent_event, _request.metadata
+                    )
+                    return await _m._get_pool().dispatch(
+                        profile_name, profile_home, run_event
+                    )
 
                 run_result = await _m._make_routed_run_broker(
                     dispatch_agent=_dispatch_nonstream,

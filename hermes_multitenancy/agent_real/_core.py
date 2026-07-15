@@ -2717,6 +2717,7 @@ def _sync_auxiliary_runtime_main_for_aiagent(
     base_url: str | None,
     api_key: Any,
     api_mode: str | None = None,
+    request_overrides: Optional[dict[str, Any]] = None,
 ):
     """Tell Hermes core auxiliary calls which live main model this run uses."""
     try:
@@ -2734,6 +2735,7 @@ def _sync_auxiliary_runtime_main_for_aiagent(
             base_url=base_url or "",
             api_key=api_key if isinstance(api_key, str) else "",
             api_mode=api_mode or "",
+            request_overrides=request_overrides or {},
         )
     except TypeError:
         try:

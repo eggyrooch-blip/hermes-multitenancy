@@ -4578,11 +4578,24 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
     _install_fake_feishu_oapi(monkeypatch)
 
-    assert agent_real._run_with_aiagent(_event(), profile_home) == "ok"
+    event = _event()
+    event.raw_event = {
+        "metadata": {
+            "litellm_billing_user_id": "litellm-user-1",
+            "litellm_billing_base_url": "https://litellm.example/v1",
+        }
+    }
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
 
     assert captured["model"] == "tencent-sonnet-4-6"
     assert captured["provider"] == "custom:litellm-sre"
     assert captured["base_url"] == "https://litellm.example/v1"
+    assert captured["request_overrides"] == {
+        "extra_headers": {
+            "X-Hermes-User-Id": "litellm-user-1",
+            "X-Hermes-Source": "hermes",
+        }
+    }
     assert captured["runtime_at_run"] == [
         (
             "set",
@@ -4592,6 +4605,12 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
                 "base_url": "https://litellm.example/v1",
                 "api_key": "test-key",
                 "api_mode": "",
+                "request_overrides": {
+                    "extra_headers": {
+                        "X-Hermes-User-Id": "litellm-user-1",
+                        "X-Hermes-Source": "hermes",
+                    }
+                },
             },
         )
     ]
@@ -4631,6 +4650,7 @@ def test_aux_runtime_sync_fallback_cleanup_without_clear(monkeypatch):
                 "base_url": "https://litellm.example/v1",
                 "api_key": "test-key",
                 "api_mode": "",
+                "request_overrides": {},
             },
         ),
         ("", "", {"base_url": "", "api_key": "", "api_mode": ""}),

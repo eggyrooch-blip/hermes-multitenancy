@@ -600,6 +600,12 @@ def _run_request_for_routed_event(
     from ..run_models import RunRequest
 
     user_key = _tenant_user_key(sender, sender_alt)
+    metadata = {
+        "sender_open_id": sender,
+        "chat_type": _extract_chat_type(event),
+    }
+    if sender_alt:
+        metadata["sender_alt"] = sender_alt
     return RunRequest(
         channel="feishu",
         profile_name=profile_name,
@@ -609,17 +615,19 @@ def _run_request_for_routed_event(
         message_id=_event_message_id(event),
         credential_subject=user_key,
         requires_host_tools=_host_tools_require_sandbox(),
-        metadata={"sender_alt": sender_alt} if sender_alt else {},
+        metadata=metadata,
     )
 
 
 def _make_routed_run_broker(*, dispatch_agent: Any = None):
+    from ..billing_identity import prepare_billing_request
     from ..run_broker import RunBroker
 
     return RunBroker(
         dispatch_agent=dispatch_agent or (lambda _request: ""),
         mark_seen=_mark_run_request_seen,
         sandbox_available=_router_sandbox_available,
+        prepare_request=prepare_billing_request,
     )
 
 
@@ -723,6 +731,17 @@ def _event_with_text(event: Any, text: str) -> Any:
         return event
     cloned = copy.copy(event)
     setattr(cloned, "text", text)
+    return cloned
+
+
+def _event_with_run_metadata(event: Any, metadata: dict[str, Any]) -> Any:
+    """Copy trusted RunBroker metadata into the agent subprocess event."""
+    cloned = copy.copy(event)
+    raw_event = dict(getattr(event, "raw_event", None) or {})
+    raw_metadata = dict(raw_event.get("metadata") or {})
+    raw_metadata.update(metadata or {})
+    raw_event["metadata"] = raw_metadata
+    setattr(cloned, "raw_event", raw_event)
     return cloned
 
 

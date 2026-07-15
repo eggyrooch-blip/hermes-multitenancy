@@ -341,6 +341,33 @@ If sync goes wrong: stop the timer, inspect `pull-feishu --dry-run` and the late
 
 ## 📊 Cost & usage observability
 
+### Optional LiteLLM employee billing layer
+
+The billing layer keeps one server-side LiteLLM key for Hermes while charging
+each run to a trusted employee identity. Multitenancy resolves the payer once
+at the Run Broker boundary, stores only the employee-to-LiteLLM user mapping,
+and forwards `X-Hermes-User-Id` only to the exact configured LiteLLM endpoint.
+Main agents, delegated agents, auxiliary model calls, Feishu groups, and WebUI
+runs therefore inherit the same payer without per-profile API keys.
+
+Enable the identity path only after the ai-gateway ensure endpoint and the
+LiteLLM callback in `deploy/litellm/` are ready:
+
+```bash
+export HERMES_LITELLM_BILLING_ENABLED=true
+export HERMES_LITELLM_BILLING_BASE_URL="https://<litellm-host>/v1"
+export HERMES_LITELLM_IDENTITY_ENSURE_URL="http://<private-ai-gateway>:8788/internal/v1/litellm/users/ensure"
+export AI_GATEWAY_INTERNAL_API_TOKEN="<independent-server-secret>"
+```
+
+The LiteLLM callback uses the existing spend log as the ledger and requires
+the proxy's shared Redis for cross-pod atomic reservations. Configure the one
+Hermes shared-key hash, employee email domain, and monthly budget in the
+LiteLLM deployment; do not set the shared key itself to the per-employee cap.
+If Redis, pricing, employee identity, or account state cannot be verified, the
+managed employee request fails before a provider call. LiteLLM management/UI
+routes remain available after the model budget is reached.
+
 Give every employee's Hermes consumption a place on the company AI leaderboard — one person's many agents (including group chats where the bot was `@`-mentioned) all roll up to them.
 
 **1. Per-turn token ledger** (`token_usage_ledger.py`, opt-in). Each turn appends one line — `who (open_id) / profile / platform / group-or-DM / model / in·out·total tokens` — to `/var/log/hermes/token-usage.jsonl`. The token counter lives in the sandboxed child, but the sandbox can't write the log, so the child passes usage up and the **non-sandboxed gateway parent writes the ledger**. Flip it on in the gateway process env only (one switch covers all users — do not edit per-profile `.env` files):

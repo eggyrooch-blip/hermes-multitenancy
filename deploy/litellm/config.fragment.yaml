@@ -1,0 +1,17 @@
+# Mount hermes_employee_budget.py on the LiteLLM Python path before enabling.
+litellm_settings:
+  callbacks:
+    - hermes_employee_budget.hermes_employee_budget_guard
+
+general_settings:
+  store_prompts_in_spend_logs: true
+  user_header_mappings:
+    - header_name: X-Hermes-User-Id
+      litellm_user_role: internal_user
+
+# Required environment variables:
+# HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED=true
+# HERMES_LITELLM_SHARED_KEY_HASH=<LiteLLM hash of the one Hermes shared key>
+# HERMES_LITELLM_MONTHLY_BUDGET_USD=120
+# HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN=<company-domain>
+# HERMES_LITELLM_RESERVATION_TTL_SECONDS=7200

@@ -23,6 +23,7 @@ DispatchAgent = Callable[[RunRequest], Awaitable[str] | str]
 EmitEvent = Callable[[RunEvent], Awaitable[None] | None]
 MarkSeen = Callable[[RunRequest], bool]
 SandboxAvailable = Callable[[], bool]
+PrepareRequest = Callable[[RunRequest], Awaitable[RunRequest] | RunRequest]
 
 
 def _default_sandbox_available() -> bool:
@@ -50,12 +51,14 @@ class RunBroker:
         emit_event: Optional[EmitEvent] = None,
         mark_seen: Optional[MarkSeen] = None,
         sandbox_available: Optional[SandboxAvailable] = None,
+        prepare_request: Optional[PrepareRequest] = None,
         require_sandbox_for_host_tools: bool = True,
     ) -> None:
         self._dispatch_agent = dispatch_agent
         self._emit_event = emit_event
         self._mark_seen = mark_seen
         self._sandbox_available = sandbox_available or _default_sandbox_available
+        self._prepare_request = prepare_request
         self._require_sandbox_for_host_tools = require_sandbox_for_host_tools
 
     async def run(self, request: RunRequest, *, admitted: bool = False) -> RunResult:
@@ -66,6 +69,9 @@ class RunBroker:
             if admission.duplicate:
                 await self._emit(RunEvent(kind="done"))
                 return admission
+
+        if self._prepare_request is not None:
+            request = await _maybe_await(self._prepare_request(request))
 
         response = await _maybe_await(self._dispatch_agent(request))
         content = str(response or "")
