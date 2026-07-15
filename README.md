@@ -378,10 +378,14 @@ Before enabling the callback on PostgreSQL, apply
 transaction; it prevents each per-employee monthly reconciliation from scanning
 the full SpendLogs month. Each request then reconciles Redis upward from the
 current month's SpendLogs before reserving and uses a server-generated
-reservation id. Known response costs settle immediately. An unknown failure or
-missing response cost remains a short-lived pending reservation (300 seconds by
-default), then the LiteLLM SpendLogs ledger decides permanent spend; an estimate
-is never converted into permanent "ghost" consumption. Shared-key rows receive
+reservation id, which also replaces the request's SpendLog id for exact
+reconciliation. Known response costs settle immediately. An unknown failure or
+missing response cost remains pending until its request-correlated SpendLog row
+appears (or the billing period expires); this fails closed without converting
+the estimate into permanent "ghost" consumption or opening a timed bypass.
+Personal keys without a valid employee user are rejected by default. Intentional
+service-only keys must be audited and explicitly allowlisted by LiteLLM key hash
+in `HERMES_LITELLM_NON_EMPLOYEE_KEY_HASHES`. Shared-key rows receive
 `spend_logs_metadata.source=hermes`;
 prompt and response bodies remain disabled in spend logs.
 If Redis, pricing, employee identity, or account state cannot be verified, the

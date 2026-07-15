@@ -16,6 +16,7 @@ general_settings:
 # HERMES_LITELLM_MONTHLY_BUDGET_USD=120
 # HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN=<company-domain>
 # HERMES_LITELLM_RESERVATION_TTL_SECONDS=7200
-# HERMES_LITELLM_UNKNOWN_COST_GRACE_SECONDS=300
+# Optional, audited exception for service-only keys that are intentionally not employees:
+# HERMES_LITELLM_NON_EMPLOYEE_KEY_HASHES=<comma-separated LiteLLM key hashes>
 # Multitenancy side: HERMES_LITELLM_BILLING_ALLOWED_PATHS=/v1,/anthropic
 # Apply migrations/001_employee_budget_spendlogs_index.sql before enabling.

@@ -198,6 +198,12 @@ def test_client_litellm_call_id_cannot_reuse_a_reservation(
 
     assert len(harness.pending) == 2
     assert "client-controlled" not in harness.pending
+    assert first["litellm_call_id"] in harness.pending
+    assert second["litellm_call_id"] in harness.pending
+    assert first["litellm_call_id"] != second["litellm_call_id"]
+    assert first["metadata"]["spend_logs_metadata"]["hermes_reservation_id"] == first[
+        "litellm_call_id"
+    ]
 
 
 def test_one_employee_at_limit_does_not_block_another_on_shared_key(
@@ -273,9 +279,12 @@ def test_one_employee_at_limit_does_not_block_another_on_shared_key(
     assert set(pending) == {"employee-a:actual", "employee-b:actual"}
 
 
-def test_non_employee_personal_key_is_unchanged(callback_module, monkeypatch):
+def test_explicitly_allowlisted_non_employee_key_is_unchanged(
+    callback_module, monkeypatch
+):
     monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
+    monkeypatch.setenv("HERMES_LITELLM_NON_EMPLOYEE_KEY_HASHES", "personal-hash")
     harness = _Harness(callback_module, employee=False)
 
     result = asyncio.run(
@@ -284,6 +293,38 @@ def test_non_employee_personal_key_is_unchanged(callback_module, monkeypatch):
 
     assert result is None
     assert harness.pending == {}
+
+
+def test_unassigned_personal_key_cannot_bypass_employee_budget(
+    callback_module, monkeypatch
+):
+    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
+    guard = callback_module.HermesEmployeeBudgetGuard()
+
+    with pytest.raises(callback_module.HTTPException) as rejected:
+        asyncio.run(
+            guard.async_pre_call_hook(
+                _auth(user_id=""), None, _data(), "acompletion"
+            )
+        )
+
+    assert rejected.value.status_code == 403
+
+
+def test_non_employee_user_requires_explicit_key_allowlist(
+    callback_module, monkeypatch
+):
+    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
+    harness = _Harness(callback_module, employee=False)
+
+    with pytest.raises(callback_module.HTTPException) as rejected:
+        asyncio.run(
+            harness.guard.async_pre_call_hook(_auth(), None, _data(), "acompletion")
+        )
+
+    assert rejected.value.status_code == 403
 
 
 def test_employee_personal_key_source_cannot_spoof_hermes(
@@ -419,6 +460,10 @@ def test_ledger_reconciliation_raises_redis_actual_after_crash(
         async def group_by(self, **_kwargs):
             return [{"_sum": {"spend": 3.5}}]
 
+        async def find_many(self, **kwargs):
+            assert kwargs["where"]["request_id"] == {"in": ["call-1"]}
+            return [SimpleNamespace(request_id="call-1")]
+
     proxy_server.prisma_client = SimpleNamespace(
         db=SimpleNamespace(litellm_spendlogs=SpendLogs())
     )
@@ -430,17 +475,31 @@ def test_ledger_reconciliation_raises_redis_actual_after_crash(
     async def sync(*, keys, args):
         calls.append((keys, args))
 
-    guard._ensure_scripts = lambda _redis: setattr(guard, "_sync_actual_script", sync)
+    async def pending(*, keys, args):
+        assert keys == ["pending-key"]
+        assert args == []
+        return [b"call-1"]
+
+    def ensure(_redis):
+        guard._sync_actual_script = sync
+        guard._pending_ids_script = pending
+
+    guard._ensure_scripts = ensure
     from datetime import datetime, timezone
 
     asyncio.run(
         guard._sync_actual_spend(
-            object(), "actual-key", "employee-uuid",
+            object(), ("actual-key", "pending-key", "expires-key"), "employee-uuid",
             datetime(2026, 7, 1, tzinfo=timezone.utc), 3600,
         )
     )
 
-    assert calls == [(["actual-key"], [3.5, 3600])]
+    assert calls == [
+        (
+            ["actual-key", "pending-key", "expires-key"],
+            [3.5, 3600, "call-1"],
+        )
+    ]
 
 
 def test_missing_response_cost_stays_pending_for_ledger(callback_module, caplog):
@@ -471,3 +530,36 @@ def test_missing_response_cost_stays_pending_for_ledger(callback_module, caplog)
     assert settled == []
     assert deferred == [reservation]
     assert "response cost missing" in caplog.text
+
+
+def test_unknown_cost_pending_is_retained_for_the_billing_period(callback_module):
+    from datetime import datetime, timezone
+
+    guard = callback_module.HermesEmployeeBudgetGuard()
+    calls = []
+
+    async def defer(*, keys, args):
+        calls.append((keys, args))
+
+    guard._redis_cache = lambda: object()
+    guard._redis_keys = lambda *_args: ("actual", "pending", "expires")
+
+    def ensure(_redis):
+        guard._defer_script = defer
+
+    guard._ensure_scripts = ensure
+    reservation = {
+        "employee_user_id": "employee-uuid",
+        "period": "2026-07",
+        "request_id": "server-call-1",
+        "reserved_cost": 0.75,
+        "period_ttl": 3600,
+    }
+    before = int(datetime.now(timezone.utc).timestamp())
+
+    asyncio.run(guard._defer_unknown_cost(reservation))
+
+    assert calls[0][0] == ["actual", "pending", "expires"]
+    assert calls[0][1][0] == "server-call-1"
+    assert calls[0][1][1] >= before + 3600
+    assert calls[0][1][2] == 3600

@@ -47,6 +47,15 @@ class _Evt:
     text = "hi"
 
 
+class _BillingEvt(_Evt):
+    raw_event = {
+        "metadata": {
+            "litellm_billing_user_id": "employee-uuid",
+            "litellm_billing_base_url": "https://litellm.example/v1",
+        }
+    }
+
+
 def test_failed_turn_falls_back_not_silent(monkeypatch, tmp_path):
     """Failed subprocess turn → real_run_agent falls back to legacy (non-empty),
     instead of returning '' (dead air)."""
@@ -76,3 +85,36 @@ def test_total_failure_raises_for_router_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(ar, "_legacy_real_run_agent", legacy_boom)
     with pytest.raises(RuntimeError):
         asyncio.run(ar.real_run_agent(_Evt(), tmp_path))
+
+
+def test_billing_bound_failure_never_calls_legacy_runner(monkeypatch, tmp_path):
+    async def boom(event, profile_home, messages=None):
+        raise RuntimeError("subprocess unavailable")
+
+    async def legacy_must_not_run(event, profile_home, messages=None):
+        raise AssertionError("unmetered legacy runner must not be called")
+
+    monkeypatch.setattr(ar, "_run_aiagent_subprocess", boom)
+    monkeypatch.setattr(ar, "_legacy_real_run_agent", legacy_must_not_run)
+
+    with pytest.raises(RuntimeError, match="Billing-bound run"):
+        asyncio.run(ar.real_run_agent(_BillingEvt(), tmp_path))
+
+
+def test_billing_bound_stream_failure_never_calls_legacy_stream(monkeypatch, tmp_path):
+    async def boom(event, profile_home, messages=None):
+        raise RuntimeError("subprocess unavailable")
+        yield  # pragma: no cover
+
+    async def legacy_must_not_run(event, profile_home, messages=None):
+        raise AssertionError("unmetered legacy stream must not be called")
+        yield  # pragma: no cover
+
+    async def collect():
+        return [item async for item in ar.stream_run_agent(_BillingEvt(), tmp_path)]
+
+    monkeypatch.setattr(ar, "_stream_aiagent_subprocess", boom)
+    monkeypatch.setattr(ar, "_stream_loop", legacy_must_not_run)
+
+    with pytest.raises(RuntimeError, match="Billing-bound run"):
+        asyncio.run(collect())

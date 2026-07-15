@@ -285,6 +285,10 @@ async def stream_run_agent(  # type: ignore[override]
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
             return
+        if _event_metadata(event).get("litellm_billing_user_id"):
+            raise RuntimeError(
+                "Billing-bound run cannot fall back to the unmetered legacy stream"
+            ) from exc
     finally:
         _CREDENTIAL_EXPIRY_SIGNAL.reset(signal_token)
 
@@ -342,6 +346,10 @@ async def real_run_agent(
             "[multitenancy] AIAgent path failed (%s); falling back to legacy spike",
             exc, exc_info=True,
         )
+        if _event_metadata(event).get("litellm_billing_user_id"):
+            raise RuntimeError(
+                "Billing-bound run cannot fall back to the unmetered legacy runner"
+            ) from exc
     # Legacy / fallback path — no tool-loop, but still answers.
     return await _legacy_real_run_agent(event, profile_home, messages=messages)
 
