@@ -4521,6 +4521,12 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
 
     from hermes_multitenancy import agent_real
 
+    monkeypatch.setattr(
+        agent_real,
+        "_resolve_enabled_toolsets",
+        lambda *_args, **_kwargs: ["moa", "terminal"],
+    )
+
     profile_home = tmp_path / "profiles" / "coder"
     profile_home.mkdir(parents=True)
     (profile_home / "config.yaml").write_text(
@@ -4596,6 +4602,9 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
             "X-Hermes-Source": "hermes",
         }
     }
+    assert captured["request_overrides_base_url"] == "https://litellm.example/v1"
+    assert captured["enabled_toolsets"] == ["terminal"]
+    assert "moa" in captured["disabled_toolsets"]
     assert captured["runtime_at_run"] == [
         (
             "set",
@@ -4611,6 +4620,7 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
                         "X-Hermes-Source": "hermes",
                     }
                 },
+                "request_overrides_base_url": "https://litellm.example/v1",
             },
         )
     ]
@@ -4651,6 +4661,7 @@ def test_aux_runtime_sync_fallback_cleanup_without_clear(monkeypatch):
                 "api_key": "test-key",
                 "api_mode": "",
                 "request_overrides": {},
+                "request_overrides_base_url": "",
             },
         ),
         ("", "", {"base_url": "", "api_key": "", "api_mode": ""}),

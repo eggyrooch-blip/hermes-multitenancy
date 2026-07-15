@@ -230,6 +230,8 @@ async def _dispatch_cron_request(request: RunRequest, profile_home: Path) -> str
 
 
 def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, Optional[str]]:
+    from ..billing_identity import prepare_billing_request
+
     profile_home = _cw._current_profile_home()
     job = _cw.with_cron_owner_context(job, profile_home=profile_home)
     job_id = str(job.get("id") or "")
@@ -242,6 +244,7 @@ def _run_job_through_broker(job: dict, scheduler: Any) -> tuple[bool, str, str, 
             dispatch_agent=lambda run_request: _cw._dispatch_cron_request(run_request, profile_home),
             sandbox_available=lambda: os.environ.get("HERMES_USE_SANDBOX", "").strip().lower()
             in {"1", "true", "yes", "on"},
+            prepare_request=prepare_billing_request,
         )
         result = asyncio.run(broker.run(request))
         final_response = _cw._visible_cron_response(job, result.content)

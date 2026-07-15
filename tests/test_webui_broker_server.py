@@ -68,6 +68,58 @@ def test_webui_run_broker_endpoint_streams_channel_neutral_events():
     asyncio.run(runner())
 
 
+def test_webui_and_ingest_execution_brokers_prepare_billing(monkeypatch):
+    from dataclasses import replace
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    async def prepare(request):
+        return replace(
+            request,
+            metadata={**dict(request.metadata or {}), "billing_prepared": True},
+        )
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "ingest-secret")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request)
+        return "ok"
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            webui = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_owner",
+                "content": "hello",
+            })
+            await webui.text()
+            ingest = await client.post(
+                "/api/run-broker/ingest",
+                json={"content": "ingest"},
+                headers={"Authorization": "Bearer ingest-secret"},
+            )
+            await ingest.text()
+        finally:
+            await client.close()
+        assert (webui.status, ingest.status) == (200, 200)
+
+    asyncio.run(runner())
+    assert [request.metadata["billing_prepared"] for request in seen] == [True, True]
+
+
 def test_webui_run_broker_strips_ingest_secret_metadata_from_caller(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 

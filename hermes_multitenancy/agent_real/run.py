@@ -349,8 +349,25 @@ def _run_with_aiagent(
             event_metadata,
             base_url or "",
         )
+        if event_metadata.get("litellm_billing_user_id") and not billing_request_overrides:
+            raise RuntimeError(
+                "Billing-bound run cannot use an unapproved LiteLLM endpoint"
+            )
         if billing_request_overrides:
             agent_kwargs["request_overrides"] = billing_request_overrides
+            # Bind the headers to the actual approved protocol path. A later
+            # provider/transport switch must fail closed instead of silently
+            # running without an employee identity.
+            agent_kwargs["request_overrides_base_url"] = str(base_url or "")
+            # Hermes' MoA tool calls OpenRouter directly for its reference and
+            # aggregate models. Until it supports the trusted billing runtime,
+            # remove the whole toolset so tool-internal calls cannot escape the
+            # employee's LiteLLM budget.
+            if enabled_toolsets is not None:
+                enabled_toolsets = [
+                    toolset for toolset in enabled_toolsets if toolset != "moa"
+                ]
+            disabled_toolsets = sorted(set(disabled_toolsets) | {"moa"})
         if enabled_toolsets is not None:
             agent_kwargs["enabled_toolsets"] = enabled_toolsets
         if disabled_toolsets:
@@ -397,6 +414,9 @@ def _run_with_aiagent(
             api_key=api_key,
             api_mode=str(runtime_kwargs.get("api_mode") or ""),
             request_overrides=billing_request_overrides,
+            request_overrides_base_url=str(base_url or "")
+            if billing_request_overrides
+            else "",
         )
         agent = None
         try:

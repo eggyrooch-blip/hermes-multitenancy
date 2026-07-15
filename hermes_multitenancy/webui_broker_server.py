@@ -103,6 +103,7 @@ def create_run_broker_app(
         from aiohttp import web
     except Exception as exc:  # pragma: no cover - production dependency guard
         raise RuntimeError("aiohttp is required for the WebUI run broker endpoint") from exc
+    from .billing_identity import prepare_billing_request
 
     async def _stream_run_request(request, run_request, *, stash_payload):
         """Admit + SSE-stream a run_request. Shared by handle_run and replay.
@@ -176,6 +177,7 @@ def create_run_broker_app(
             emit_event=emit_event,
             mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
+            prepare_request=prepare_billing_request,
         )
 
         try:
@@ -623,6 +625,7 @@ def create_run_broker_app(
             emit_event=sink,
             mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
+            prepare_request=prepare_billing_request,
         )
         timeout_s = _ingest_async_timeout()
         result = None
@@ -1059,6 +1062,7 @@ def create_run_broker_app(
             emit_event=sink,
             mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
+            prepare_request=prepare_billing_request,
         )
 
         timeout_s = _ingest_timeout()

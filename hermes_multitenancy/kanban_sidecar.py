@@ -688,6 +688,11 @@ def build_run_broker_spawn(
         event = SimpleNamespace(
             text=request.content,
             message_id=request.message_id,
+            raw_event={
+                "channel": request.channel,
+                "session_id": request.session_id,
+                "metadata": dict(request.metadata or {}),
+            },
             source=SimpleNamespace(
                 platform=SimpleNamespace(value="kanban"),
                 chat_id=request.chat_id or "",
@@ -702,9 +707,12 @@ def build_run_broker_spawn(
         return await real_run_agent(event, profile_home)
 
     async def run_request(request: RunRequest) -> str:
+        from .billing_identity import prepare_billing_request
+
         broker = RunBroker(
             dispatch_agent=dispatch_agent or default_dispatch,
             sandbox_available=sandbox_available,
+            prepare_request=prepare_billing_request,
         )
         result = await broker.run(request)
         return result.content

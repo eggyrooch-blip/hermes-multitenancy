@@ -406,11 +406,21 @@ def test_cron_job_body_with_cleanup_sweeps_mcp_orphans_after_error(monkeypatch):
 
 
 def test_cron_subprocess_runtime_pool_uses_real_runner_for_visible_response(tmp_path, monkeypatch):
-    from hermes_multitenancy import agent_real, router
+    from dataclasses import replace
+    from hermes_multitenancy import agent_real, billing_identity, router
+
+    async def prepare(request):
+        return replace(
+            request,
+            metadata={**dict(request.metadata or {}), "billing_prepared": True},
+        )
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
 
     async def fake_real_run_agent(event, profile_home, **_kwargs):
         assert profile_home == tmp_path / "profiles" / "sunke"
         assert "Do not respond with [SILENT]" in event.text
+        assert event.raw_event["metadata"]["billing_prepared"] is True
         return "REAL_VISIBLE_CRON_BODY"
 
     monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)

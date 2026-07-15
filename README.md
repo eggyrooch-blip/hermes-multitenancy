@@ -346,9 +346,14 @@ If sync goes wrong: stop the timer, inspect `pull-feishu --dry-run` and the late
 The billing layer keeps one server-side LiteLLM key for Hermes while charging
 each run to a trusted employee identity. Multitenancy resolves the payer once
 at the Run Broker boundary, stores only the employee-to-LiteLLM user mapping,
-and forwards `X-Hermes-User-Id` only to the exact configured LiteLLM endpoint.
-Main agents, delegated agents, auxiliary model calls, Feishu groups, and WebUI
-runs therefore inherit the same payer without per-profile API keys.
+and forwards `X-Hermes-User-Id` only to approved protocol paths on the configured
+LiteLLM origin (`/v1` and `/anthropic` by default).
+Main agents, delegated agents, auxiliary model calls, Feishu groups, WebUI/SSE
+and ingest runs, cron jobs, and Kanban runs therefore inherit the same payer
+without per-profile API keys.
+Once a run is billing-bound, main fallback, delegated agents, and auxiliary
+calls fail closed if they try to leave that approved endpoint; headers are
+never silently removed while an unbilled model call continues.
 
 Enable the identity path only after the ai-gateway ensure endpoint and the
 LiteLLM callback in `deploy/litellm/` are ready:
@@ -356,6 +361,7 @@ LiteLLM callback in `deploy/litellm/` are ready:
 ```bash
 export HERMES_LITELLM_BILLING_ENABLED=true
 export HERMES_LITELLM_BILLING_BASE_URL="https://<litellm-host>/v1"
+export HERMES_LITELLM_BILLING_ALLOWED_PATHS="/v1,/anthropic"
 export HERMES_LITELLM_IDENTITY_ENSURE_URL="http://<private-ai-gateway>:8788/internal/v1/litellm/users/ensure"
 export AI_GATEWAY_INTERNAL_API_TOKEN="<independent-server-secret>"
 ```
@@ -364,9 +370,23 @@ The LiteLLM callback uses the existing spend log as the ledger and requires
 the proxy's shared Redis for cross-pod atomic reservations. Configure the one
 Hermes shared-key hash, employee email domain, and monthly budget in the
 LiteLLM deployment; do not set the shared key itself to the per-employee cap.
+Before enabling the callback on PostgreSQL, apply
+`deploy/litellm/migrations/001_employee_budget_spendlogs_index.sql` outside a
+transaction; it prevents each per-employee monthly reconciliation from scanning
+the full SpendLogs month. Each request then reconciles Redis upward from the
+current month's SpendLogs before reserving and uses a server-generated
+reservation id. Known response costs settle immediately. An unknown failure or
+missing response cost remains a short-lived pending reservation (300 seconds by
+default), then the LiteLLM SpendLogs ledger decides permanent spend; an estimate
+is never converted into permanent "ghost" consumption. Shared-key rows receive
+`spend_logs_metadata.source=hermes`;
+prompt and response bodies remain disabled in spend logs.
 If Redis, pricing, employee identity, or account state cannot be verified, the
 managed employee request fails before a provider call. LiteLLM management/UI
-routes remain available after the model budget is reached.
+routes remain available after the model budget is reached. The ai-gateway
+ensure operation clears legacy native user `max_budget` fields and marks the
+account `hermes_billing_active`; SCIM `scim_active=false` or an explicit false
+Hermes marker disables shared-key use for only that employee.
 
 Give every employee's Hermes consumption a place on the company AI leaderboard — one person's many agents (including group chats where the bot was `@`-mentioned) all roll up to them.
 

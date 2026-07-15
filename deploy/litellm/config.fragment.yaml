@@ -4,7 +4,8 @@ litellm_settings:
     - hermes_employee_budget.hermes_employee_budget_guard
 
 general_settings:
-  store_prompts_in_spend_logs: true
+  # Employees can inspect cost logs without exposing Hermes prompt/response bodies.
+  store_prompts_in_spend_logs: false
   user_header_mappings:
     - header_name: X-Hermes-User-Id
       litellm_user_role: internal_user
@@ -15,3 +16,6 @@ general_settings:
 # HERMES_LITELLM_MONTHLY_BUDGET_USD=120
 # HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN=<company-domain>
 # HERMES_LITELLM_RESERVATION_TTL_SECONDS=7200
+# HERMES_LITELLM_UNKNOWN_COST_GRACE_SECONDS=300
+# Multitenancy side: HERMES_LITELLM_BILLING_ALLOWED_PATHS=/v1,/anthropic
+# Apply migrations/001_employee_budget_spendlogs_index.sql before enabling.

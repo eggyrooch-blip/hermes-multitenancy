@@ -87,6 +87,41 @@ def test_dm_identity_is_created_once_then_reused():
     assert second.metadata["litellm_billing_email"] == "actor@keep.com"
 
 
+def test_existing_mapping_survives_identity_service_outage_and_new_user_fails():
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentity,
+        BillingIdentityPreparer,
+    )
+    from hermes_multitenancy.run_broker import RunRejected
+
+    store = _Store()
+    store.put(BillingIdentity("actor", "actor@keep.com", "llm-actor"))
+
+    def unavailable(_employee_user_id):
+        raise RunRejected("employee billing identity service is unavailable")
+
+    preparer = BillingIdentityPreparer(
+        routing=_Routing(),
+        store=store,
+        ensure_user=unavailable,
+        billing_base_url="https://litellm.example/v1",
+    )
+
+    existing = preparer.prepare(_request())
+    assert existing.metadata["litellm_billing_user_id"] == "llm-actor"
+
+    routing = _Routing()
+    routing.users["ou_actor"] = "new-actor"
+    new_preparer = BillingIdentityPreparer(
+        routing=routing,
+        store=store,
+        ensure_user=unavailable,
+        billing_base_url="https://litellm.example/v1",
+    )
+    with pytest.raises(RunRejected, match="identity service is unavailable"):
+        new_preparer.prepare(_request())
+
+
 def test_group_is_billed_to_group_owner_not_sender():
     preparer, calls = _preparer()
 
@@ -131,7 +166,7 @@ def test_disabled_billing_strips_spoofed_reserved_metadata(monkeypatch):
     assert "litellm_billing_base_url" not in prepared.metadata
 
 
-def test_headers_require_exact_billing_gateway():
+def test_headers_require_allowed_path_on_exact_billing_origin(monkeypatch):
     from hermes_multitenancy.billing_identity import request_overrides_for_endpoint
 
     metadata = {
@@ -140,7 +175,15 @@ def test_headers_require_exact_billing_gateway():
     }
 
     same = request_overrides_for_endpoint(metadata, "https://litellm.example/v1/")
+    anthropic = request_overrides_for_endpoint(
+        metadata, "https://litellm.example/anthropic"
+    )
     other = request_overrides_for_endpoint(metadata, "https://api.external.example/v1")
+    unapproved = request_overrides_for_endpoint(
+        metadata, "https://litellm.example/admin"
+    )
 
     assert same["extra_headers"]["X-Hermes-User-Id"] == "llm-actor"
+    assert anthropic["extra_headers"]["X-Hermes-User-Id"] == "llm-actor"
     assert other == {}
+    assert unapproved == {}

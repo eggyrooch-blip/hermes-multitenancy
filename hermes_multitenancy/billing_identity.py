@@ -269,12 +269,12 @@ def request_overrides_for_endpoint(
     metadata: dict[str, Any],
     destination_base_url: str,
 ) -> dict[str, Any]:
-    """Return trusted headers only when the actual model endpoint matches."""
+    """Return trusted headers only for an allowed path on the billing origin."""
     user_id = str(metadata.get("litellm_billing_user_id") or "").strip()
     billing_base_url = str(metadata.get("litellm_billing_base_url") or "").strip()
     if not _LITELLM_USER_ID_RE.fullmatch(user_id):
         return {}
-    if not _same_endpoint(billing_base_url, destination_base_url):
+    if not _allowed_billing_endpoint(billing_base_url, destination_base_url):
         return {}
     return {
         "extra_headers": {
@@ -284,16 +284,27 @@ def request_overrides_for_endpoint(
     }
 
 
-def _same_endpoint(left: str, right: str) -> bool:
+def _allowed_billing_endpoint(left: str, right: str) -> bool:
     try:
         a = urlparse(left)
         b = urlparse(right)
     except (TypeError, ValueError):
         return False
-    return bool(
+    same_origin = bool(
         a.scheme
         and a.netloc
         and a.scheme.lower() == b.scheme.lower()
         and a.netloc.lower() == b.netloc.lower()
-        and a.path.rstrip("/") == b.path.rstrip("/")
     )
+    if not same_origin:
+        return False
+    configured = os.environ.get(
+        "HERMES_LITELLM_BILLING_ALLOWED_PATHS", "/v1,/anthropic"
+    )
+    allowed_paths = {
+        path.strip().rstrip("/") or "/"
+        for path in configured.split(",")
+        if path.strip().startswith("/")
+    }
+    allowed_paths.add(a.path.rstrip("/") or "/")
+    return (b.path.rstrip("/") or "/") in allowed_paths

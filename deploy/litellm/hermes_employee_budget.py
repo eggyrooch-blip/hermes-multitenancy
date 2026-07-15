@@ -26,6 +26,18 @@ _TRUE = frozenset({"1", "true", "yes", "on"})
 _USER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _RESERVATION_METADATA_KEY = "hermes_employee_budget_reservation"
 
+_SYNC_ACTUAL_SCRIPT = """
+local ledger_spend = tonumber(ARGV[1])
+local period_ttl = tonumber(ARGV[2])
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if ledger_spend > current then
+  current = ledger_spend
+  redis.call('SET', KEYS[1], tostring(current))
+end
+redis.call('EXPIRE', KEYS[1], period_ttl)
+return tostring(current)
+"""
+
 _RESERVE_SCRIPT = """
 local now = tonumber(ARGV[1])
 local budget = tonumber(ARGV[2])
@@ -76,11 +88,17 @@ redis.call('EXPIRE', KEYS[1], period_ttl)
 return {1, tostring(total)}
 """
 
-_RELEASE_SCRIPT = """
+_DEFER_SCRIPT = """
 local request_id = ARGV[1]
-local removed = redis.call('HDEL', KEYS[1], request_id)
-redis.call('ZREM', KEYS[2], request_id)
-return removed
+local expires_at = tonumber(ARGV[2])
+local period_ttl = tonumber(ARGV[3])
+if redis.call('HEXISTS', KEYS[2], request_id) == 0 then
+  return 0
+end
+redis.call('ZADD', KEYS[3], expires_at, request_id)
+redis.call('EXPIRE', KEYS[2], period_ttl)
+redis.call('EXPIRE', KEYS[3], period_ttl)
+return 1
 """
 
 
@@ -143,9 +161,10 @@ class HermesEmployeeBudgetGuard(CustomLogger):
 
     def __init__(self) -> None:
         self._scripts_for_redis: Any = None
+        self._sync_actual_script: Any = None
         self._reserve_script: Any = None
         self._settle_script: Any = None
-        self._release_script: Any = None
+        self._defer_script: Any = None
 
     @property
     def enabled(self) -> bool:
@@ -188,19 +207,36 @@ class HermesEmployeeBudgetGuard(CustomLogger):
             if shared_request:
                 raise HTTPException(status_code=403, detail="Unknown Hermes billing user")
             return None
-        if bool(_value(user, "blocked", False)):
-            raise HTTPException(status_code=403, detail="LiteLLM employee account is blocked")
+        user_metadata = _value(user, "metadata", {})
+        if not isinstance(user_metadata, dict):
+            user_metadata = {}
+        if user_metadata.get("scim_active") is False:
+            raise HTTPException(status_code=403, detail="LiteLLM employee account is inactive")
+        if shared_request and user_metadata.get("hermes_billing_active") is not True:
+            raise HTTPException(status_code=403, detail="Hermes employee billing is inactive")
+
+        spend_metadata = metadata.get("spend_logs_metadata")
+        if not isinstance(spend_metadata, dict):
+            spend_metadata = {}
+        metadata["spend_logs_metadata"] = {
+            **spend_metadata,
+            # Overwrite client input so the log source is authoritative.
+            "source": "hermes" if shared_request else "personal_key",
+        }
 
         reservation_cost = self._estimate_cost(data, user_api_key_dict)
         period, period_start, period_ttl = _month()
         redis_cache = self._redis_cache()
         keys = self._redis_keys(redis_cache, employee_user_id, period)
-        await self._seed_actual_spend(
+        await self._sync_actual_spend(
             redis_cache, keys[0], employee_user_id, period_start, period_ttl
         )
         self._ensure_scripts(redis_cache)
 
-        request_id = str(data.get("litellm_call_id") or uuid.uuid4())
+        # Never use litellm_call_id here: request JSON can carry arbitrary
+        # extra fields, so a personal-key caller could reuse it concurrently
+        # and make multiple calls share one reservation.
+        request_id = str(uuid.uuid4())
         reservation_ttl = self._reservation_ttl()
         now = int(datetime.now(timezone.utc).timestamp())
         result = await self._reserve_script(
@@ -215,13 +251,18 @@ class HermesEmployeeBudgetGuard(CustomLogger):
             ],
         )
         status = int(result[0])
+        if status == 2:
+            raise HTTPException(
+                status_code=503,
+                detail="Employee budget reservation id collision",
+            )
         if status == 0:
             actual = float(result[1])
             pending = float(result[2])
             raise HTTPException(
                 status_code=429,
                 detail=(
-                    "Employee monthly budget reached "
+                    "HERMES_EMPLOYEE_BUDGET_EXCEEDED: Employee monthly budget reached "
                     f"(spent=${actual:.4f}, pending=${pending:.4f}, "
                     f"limit=${self.budget:.2f})"
                 ),
@@ -242,7 +283,7 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         user_api_key_dict: Any,
         traceback_str: Optional[str] = None,
     ) -> None:
-        await self._release(request_data)
+        await self._settle_failure(request_data)
 
     async def async_log_failure_event(
         self,
@@ -251,7 +292,7 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
-        await self._release(kwargs)
+        await self._settle_failure(kwargs)
 
     async def async_log_success_event(
         self,
@@ -265,13 +306,15 @@ class HermesEmployeeBudgetGuard(CustomLogger):
             return
         actual_cost = _response_cost(kwargs, response_obj)
         if actual_cost is None:
-            # Charging the reservation is conservative and prevents a missing
-            # provider cost from silently opening the budget gate.
-            actual_cost = float(reservation["reserved_cost"])
-            logger.error(
-                "LiteLLM response cost missing; settling reserved amount user_id=%s",
+            # Keep a short-lived pending reservation while SpendLogs catches
+            # up. Never convert an estimate into permanent employee spend:
+            # the LiteLLM ledger remains the source of truth.
+            await self._defer_unknown_cost(reservation)
+            logger.warning(
+                "LiteLLM response cost missing; awaiting ledger user_id=%s",
                 reservation["employee_user_id"],
             )
+            return
         await self._settle(reservation, actual_cost)
 
     async def _employee_for_request(
@@ -348,9 +391,10 @@ class HermesEmployeeBudgetGuard(CustomLogger):
     def _ensure_scripts(self, redis_cache: Any) -> None:
         if self._scripts_for_redis is redis_cache:
             return
+        self._sync_actual_script = redis_cache.async_register_script(_SYNC_ACTUAL_SCRIPT)
         self._reserve_script = redis_cache.async_register_script(_RESERVE_SCRIPT)
         self._settle_script = redis_cache.async_register_script(_SETTLE_SCRIPT)
-        self._release_script = redis_cache.async_register_script(_RELEASE_SCRIPT)
+        self._defer_script = redis_cache.async_register_script(_DEFER_SCRIPT)
         self._scripts_for_redis = redis_cache
 
     def _redis_keys(self, redis_cache: Any, user_id: str, period: str) -> tuple[str, str, str]:
@@ -362,7 +406,7 @@ class HermesEmployeeBudgetGuard(CustomLogger):
             for suffix in ("actual", "reservations", "expires")
         )  # type: ignore[return-value]
 
-    async def _seed_actual_spend(
+    async def _sync_actual_spend(
         self,
         redis_cache: Any,
         actual_key: str,
@@ -370,9 +414,6 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         period_start: datetime,
         period_ttl: int,
     ) -> None:
-        client = redis_cache.init_async_client()
-        if await client.exists(actual_key):
-            return
         from litellm.proxy.proxy_server import prisma_client
 
         if prisma_client is None:
@@ -386,7 +427,11 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         if rows:
             total = _value(rows[0], "_sum", {})
             spend = float(_value(total, "spend", 0.0) or 0.0)
-        await client.set(actual_key, str(max(0.0, spend)), ex=period_ttl, nx=True)
+        self._ensure_scripts(redis_cache)
+        await self._sync_actual_script(
+            keys=[actual_key],
+            args=[max(0.0, spend), period_ttl],
+        )
 
     def _reservation_ttl(self) -> int:
         try:
@@ -394,6 +439,17 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         except ValueError as exc:
             raise RuntimeError("invalid HERMES_LITELLM_RESERVATION_TTL_SECONDS") from exc
         return max(60, min(value, 86400))
+
+    def _unknown_cost_grace(self) -> int:
+        try:
+            value = int(
+                os.environ.get("HERMES_LITELLM_UNKNOWN_COST_GRACE_SECONDS", "300")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "invalid HERMES_LITELLM_UNKNOWN_COST_GRACE_SECONDS"
+            ) from exc
+        return max(30, min(value, self._reservation_ttl()))
 
     def _reservation(self, data: dict[str, Any]) -> Optional[dict[str, Any]]:
         candidates = [data]
@@ -423,20 +479,33 @@ class HermesEmployeeBudgetGuard(CustomLogger):
             ],
         )
 
-    async def _release(self, data: dict[str, Any]) -> None:
+    async def _settle_failure(self, data: dict[str, Any]) -> None:
         reservation = self._reservation(data)
         if reservation is None:
             return
+        actual_cost = _response_cost(data, None)
+        if actual_cost is None:
+            await self._defer_unknown_cost(reservation)
+            return
+        await self._settle(reservation, actual_cost)
+
+    async def _defer_unknown_cost(self, reservation: dict[str, Any]) -> None:
+        """Retain an estimate briefly; let SpendLogs decide permanent spend."""
         redis_cache = self._redis_cache()
         self._ensure_scripts(redis_cache)
-        _actual, reservations, expires = self._redis_keys(
+        keys = self._redis_keys(
             redis_cache,
             str(reservation["employee_user_id"]),
             str(reservation["period"]),
         )
-        await self._release_script(
-            keys=[reservations, expires],
-            args=[str(reservation["request_id"])],
+        now = int(datetime.now(timezone.utc).timestamp())
+        await self._defer_script(
+            keys=list(keys),
+            args=[
+                str(reservation["request_id"]),
+                now + self._unknown_cost_grace(),
+                int(reservation["period_ttl"]),
+            ],
         )
 
 

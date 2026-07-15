@@ -241,7 +241,16 @@ def test_kanban_task_builds_profile_scoped_run_request(tmp_path: Path):
 
 
 def test_kanban_sidecar_run_broker_spawn_completes_task(monkeypatch):
-    from hermes_multitenancy import kanban_sidecar
+    from dataclasses import replace
+    from hermes_multitenancy import billing_identity, kanban_sidecar
+
+    async def prepare(request):
+        return replace(
+            request,
+            metadata={**dict(request.metadata or {}), "billing_prepared": True},
+        )
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
 
     completed: list[dict] = []
     dispatched = []
@@ -297,6 +306,7 @@ def test_kanban_sidecar_run_broker_spawn_completes_task(monkeypatch):
     assert dispatched[0].channel == "kanban"
     assert dispatched[0].profile_name == "worker_a"
     assert dispatched[0].delivery_mode == "webui"
+    assert dispatched[0].metadata["billing_prepared"] is True
     assert completed == [
         {
             "task_id": "task-live",
@@ -311,3 +321,63 @@ def test_kanban_sidecar_run_broker_spawn_completes_task(monkeypatch):
             },
         }
     ]
+
+
+def test_kanban_default_dispatch_preserves_prepared_billing_metadata(
+    monkeypatch, tmp_path: Path
+):
+    from dataclasses import replace
+    from hermes_multitenancy import agent_real, billing_identity, kanban_sidecar
+
+    async def prepare(request):
+        return replace(
+            request,
+            metadata={**dict(request.metadata or {}), "billing_prepared": True},
+        )
+
+    captured = {}
+
+    async def fake_real_run_agent(event, profile_home):
+        captured["metadata"] = event.raw_event["metadata"]
+        captured["profile_home"] = profile_home
+        return "DEFAULT_KANBAN_OK"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class FakeKanbanDb:
+        @staticmethod
+        def connect(*, board=None):
+            return SimpleNamespace(close=lambda: None)
+
+        @staticmethod
+        def complete_task(*_args, **_kwargs):
+            return True
+
+    config = kanban_sidecar.KanbanSidecarConfig(
+        enabled=True,
+        board="ops",
+        sidecar_profile="kanban_orchestrator",
+        allowed_task_profiles=("worker_a",),
+        profile_user_keys={"worker_a": "ou_worker_a"},
+    )
+    spawn = kanban_sidecar.build_run_broker_spawn(
+        config,
+        kanban_db=FakeKanbanDb,
+        sandbox_available=lambda: True,
+    )
+    task = SimpleNamespace(
+        id="task-default",
+        title="Do the work",
+        body="Return the marker",
+        assignee="worker_a",
+        tenant=None,
+        created_by="ou_creator",
+        current_run_id=8,
+    )
+
+    spawn(task, str(tmp_path / "task-default"), board="ops")
+
+    assert captured["metadata"]["billing_prepared"] is True
+    assert captured["profile_home"] == tmp_path / "profiles" / "worker_a"
