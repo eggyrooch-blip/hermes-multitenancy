@@ -5,12 +5,14 @@ import asyncio
 from dataclasses import dataclass, replace
 import json
 import os
+from pathlib import Path
 import re
 import sqlite3
 import threading
 import time
 from typing import Any, Callable, Optional
 import urllib.error
+import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
 
@@ -23,6 +25,7 @@ from .token_usage_uploader import make_owner_resolver
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _EMPLOYEE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _LITELLM_USER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_MAX_ADMIN_RESPONSE_BYTES = 1024 * 1024
 _RESERVED_METADATA = frozenset({
     "litellm_billing_user_id",
     "litellm_billing_employee_user_id",
@@ -188,44 +191,280 @@ def _identity_from_ensure_response(
     litellm_user_id = str(payload.get("litellm_user_id") or "").strip()
     email_local, separator, _domain = email.partition("@")
     if returned_user_id != employee_user_id or not separator:
-        raise RunRejected("ai-gateway returned a mismatched employee identity")
+        raise RunRejected("LiteLLM returned a mismatched employee identity")
     if email_local.lower() != employee_user_id.lower():
-        raise RunRejected("ai-gateway returned a mismatched employee email")
+        raise RunRejected("LiteLLM returned a mismatched employee email")
     if not _LITELLM_USER_ID_RE.fullmatch(litellm_user_id):
-        raise RunRejected("ai-gateway returned an invalid LiteLLM user id")
+        raise RunRejected("LiteLLM returned an invalid user id")
     return BillingIdentity(employee_user_id, email, litellm_user_id)
 
 
-def _ensure_user_over_http(employee_user_id: str) -> dict[str, Any]:
-    endpoint = os.environ.get("HERMES_LITELLM_IDENTITY_ENSURE_URL", "").strip()
-    token = os.environ.get("AI_GATEWAY_INTERNAL_API_TOKEN", "").strip()
-    if not endpoint or not token:
-        raise RunRejected("employee billing identity service is not configured")
-    body = json.dumps({"user_id": employee_user_id}).encode("utf-8")
+class _LiteLLMAdminError(RuntimeError):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"LiteLLM management API returned HTTP {status}")
+        self.status = status
+
+
+def _admin_base_url() -> str:
+    raw = (
+        os.environ.get("HERMES_LITELLM_ADMIN_BASE_URL", "").strip()
+        or os.environ.get("HERMES_LITELLM_BILLING_BASE_URL", "").strip()
+    ).rstrip("/")
+    for suffix in ("/v1", "/anthropic", "/v1beta"):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RunRejected("LiteLLM management API is not configured")
+    return raw
+
+
+def _admin_timeout() -> float:
+    try:
+        return max(
+            0.1,
+            min(float(os.environ.get("HERMES_LITELLM_ADMIN_TIMEOUT", "5")), 30.0),
+        )
+    except ValueError as exc:
+        raise RunRejected("LiteLLM management timeout is invalid") from exc
+
+
+def _admin_request(
+    method: str,
+    path: str,
+    *,
+    body: Optional[dict[str, Any]] = None,
+) -> Any:
+    token = os.environ.get("HERMES_LITELLM_ADMIN_KEY", "").strip()
+    if not token:
+        raise RunRejected("LiteLLM management API is not configured")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(
-        endpoint,
-        data=body,
+        f"{_admin_base_url()}{path}",
+        data=data,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        method="POST",
+        method=method,
     )
     try:
-        timeout = max(0.1, min(float(os.environ.get("HERMES_LITELLM_IDENTITY_TIMEOUT", "3")), 10.0))
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read(65537)
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
-        raise RunRejected("employee billing identity service is unavailable") from exc
-    if len(raw) > 65536:
-        raise RunRejected("employee billing identity service returned an invalid response")
+        with urllib.request.urlopen(request, timeout=_admin_timeout()) as response:
+            raw = response.read(_MAX_ADMIN_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise _LiteLLMAdminError(int(exc.code)) from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RunRejected("LiteLLM management API is unavailable") from exc
+    if len(raw) > _MAX_ADMIN_RESPONSE_BYTES:
+        raise RunRejected("LiteLLM management API returned an invalid response")
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RunRejected("employee billing identity service returned invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise RunRejected("employee billing identity service returned an invalid response")
-    return payload
+        raise RunRejected("LiteLLM management API returned invalid JSON") from exc
+
+
+def _latest_org_snapshot(db_path: str) -> Optional[dict[str, Any]]:
+    directory = Path(
+        os.environ.get("HERMES_ORG_SNAPSHOT_DIR", "").strip()
+        or Path(db_path).expanduser().parent / "org-snapshots"
+    ).expanduser()
+    try:
+        files = list(directory.glob("org-*.json"))
+        newest = max(files, key=lambda path: path.stat().st_mtime)
+        payload = json.loads(newest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _team_alias_for_employee(employee_user_id: str, db_path: str) -> str:
+    fallback = (
+        os.environ.get("HERMES_LITELLM_DEFAULT_TEAM_ALIAS", "FD").strip()
+        or "FD"
+    )
+    snapshot = _latest_org_snapshot(db_path)
+    if snapshot is None:
+        return fallback
+    employees = snapshot.get("employees")
+    departments = snapshot.get("departments")
+    if not isinstance(employees, dict) or not isinstance(departments, list):
+        return fallback
+    employee = next(
+        (
+            value
+            for key, value in employees.items()
+            if isinstance(value, dict)
+            and (
+                str(key) == employee_user_id
+                or str(value.get("user_id") or "") == employee_user_id
+            )
+        ),
+        None,
+    )
+    if employee is None:
+        return fallback
+    by_id = {
+        str(dept.get("dept_id")): dept
+        for dept in departments
+        if isinstance(dept, dict) and dept.get("dept_id")
+    }
+    path: list[str] = []
+    dept_id = str(employee.get("dept_id") or "")
+    visited: set[str] = set()
+    while dept_id and dept_id not in visited:
+        visited.add(dept_id)
+        dept = by_id.get(dept_id)
+        if dept is None:
+            break
+        name = str(dept.get("name") or "").strip()
+        if name:
+            path.insert(0, name)
+        parent_id = str(dept.get("parent_id") or "")
+        if not parent_id or parent_id == "0":
+            break
+        dept_id = parent_id
+    if not path:
+        return fallback
+    first_level = path[0]
+    cooperator = os.environ.get(
+        "HERMES_LITELLM_COOPERATOR_DEPT_NAME", "合作商"
+    ).strip()
+    if first_level != cooperator:
+        return first_level
+    separator = os.environ.get("HERMES_LITELLM_COOPERATOR_SEPARATOR", "-")
+    vendor = path[-1].split(separator, 1)[0].strip() if separator else path[-1]
+    return vendor or fallback
+
+
+def _team_from_payload(payload: Any, alias: str) -> Optional[str]:
+    teams = (
+        payload
+        if isinstance(payload, list)
+        else payload.get("teams", []) if isinstance(payload, dict) else []
+    )
+    for team in teams:
+        if isinstance(team, dict) and team.get("team_alias") == alias:
+            team_id = str(team.get("team_id") or "").strip()
+            if team_id:
+                return team_id
+    return None
+
+
+def _team_id_for_new_user(employee_user_id: str, db_path: str) -> str:
+    fallback_id = os.environ.get("HERMES_LITELLM_DEFAULT_TEAM_ID", "").strip()
+    if not fallback_id:
+        raise RunRejected("LiteLLM default team is not configured")
+    fallback_alias = os.environ.get(
+        "HERMES_LITELLM_DEFAULT_TEAM_ALIAS", "FD"
+    ).strip() or "FD"
+    alias = _team_alias_for_employee(employee_user_id, db_path)
+    if alias == fallback_alias:
+        return fallback_id
+    try:
+        found = _team_from_payload(_admin_request("GET", "/team/list"), alias)
+        if found:
+            return found
+        created = _admin_request(
+            "POST",
+            "/team/new",
+            body={"team_alias": alias, "models": ["all-proxy-models"]},
+        )
+        team_id = str(created.get("team_id") or "").strip() if isinstance(created, dict) else ""
+        return team_id or fallback_id
+    except _LiteLLMAdminError as exc:
+        if exc.status == 409:
+            try:
+                return (
+                    _team_from_payload(_admin_request("GET", "/team/list"), alias)
+                    or fallback_id
+                )
+            except (_LiteLLMAdminError, RunRejected):
+                pass
+        return fallback_id
+    except RunRejected:
+        return fallback_id
+
+
+def _find_user_by_email(email: str) -> Optional[dict[str, Any]]:
+    query = urllib.parse.urlencode({"user_email": email})
+    payload = _admin_request("GET", f"/user/list?{query}")
+    users = (
+        payload
+        if isinstance(payload, list)
+        else payload.get("users", []) if isinstance(payload, dict) else []
+    )
+    for user in users:
+        if (
+            isinstance(user, dict)
+            and str(user.get("user_email") or "").strip().lower() == email.lower()
+        ):
+            return user
+    return None
+
+
+def _ensure_user_over_http(
+    employee_user_id: str,
+    *,
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    domain = (
+        os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
+        .strip()
+        .lower()
+    )
+    if not domain or "@" in domain or "/" in domain:
+        raise RunRejected("LiteLLM employee email domain is invalid")
+    email = f"{employee_user_id}@{domain}"
+    path = str(db_path or DEFAULT_DB_PATH)
+    try:
+        user = _find_user_by_email(email)
+        created = user is None
+        if user is None:
+            team_id = _team_id_for_new_user(employee_user_id, path)
+            try:
+                user = _admin_request(
+                    "POST",
+                    "/user/new",
+                    body={
+                        "user_email": email,
+                        "user_alias": employee_user_id,
+                        "user_role": "internal_user",
+                        "auto_create_key": False,
+                        "teams": [team_id],
+                        "send_invite_email": True,
+                    },
+                )
+            except _LiteLLMAdminError as exc:
+                if exc.status != 409:
+                    raise
+                user = _find_user_by_email(email)
+                created = False
+        if not isinstance(user, dict):
+            raise RunRejected("LiteLLM user could not be resolved")
+        litellm_user_id = str(user.get("user_id") or "").strip()
+        if not _LITELLM_USER_ID_RE.fullmatch(litellm_user_id):
+            raise RunRejected("LiteLLM returned an invalid user id")
+        metadata = dict(user.get("metadata") or {})
+        metadata["hermes_billing_active"] = True
+        _admin_request(
+            "POST",
+            "/user/update",
+            body={
+                "user_id": litellm_user_id,
+                "max_budget": None,
+                "budget_duration": None,
+                "metadata": metadata,
+            },
+        )
+    except _LiteLLMAdminError as exc:
+        raise RunRejected("LiteLLM management API is unavailable") from exc
+    return {
+        "user_id": employee_user_id,
+        "email": email,
+        "litellm_user_id": litellm_user_id,
+        "created": created,
+    }
 
 
 def _billing_enabled() -> bool:
@@ -247,7 +486,10 @@ def _default_preparer() -> BillingIdentityPreparer:
             _DEFAULT_PREPARER = BillingIdentityPreparer(
                 routing=RoutingTable(db_path),
                 store=BillingIdentityStore(db_path),
-                ensure_user=_ensure_user_over_http,
+                ensure_user=lambda employee_user_id: _ensure_user_over_http(
+                    employee_user_id,
+                    db_path=db_path,
+                ),
                 billing_base_url=billing_base_url,
             )
         return _DEFAULT_PREPARER

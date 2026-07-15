@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -87,7 +88,7 @@ def test_dm_identity_is_created_once_then_reused():
     assert second.metadata["litellm_billing_email"] == "actor@keep.com"
 
 
-def test_existing_mapping_survives_identity_service_outage_and_new_user_fails():
+def test_existing_mapping_survives_management_api_outage_and_new_user_fails():
     from hermes_multitenancy.billing_identity import (
         BillingIdentity,
         BillingIdentityPreparer,
@@ -98,7 +99,7 @@ def test_existing_mapping_survives_identity_service_outage_and_new_user_fails():
     store.put(BillingIdentity("actor", "actor@keep.com", "llm-actor"))
 
     def unavailable(_employee_user_id):
-        raise RunRejected("employee billing identity service is unavailable")
+        raise RunRejected("LiteLLM management API is unavailable")
 
     preparer = BillingIdentityPreparer(
         routing=_Routing(),
@@ -118,8 +119,96 @@ def test_existing_mapping_survives_identity_service_outage_and_new_user_fails():
         ensure_user=unavailable,
         billing_base_url="https://litellm.example/v1",
     )
-    with pytest.raises(RunRejected, match="identity service is unavailable"):
+    with pytest.raises(RunRejected, match="management API is unavailable"):
         new_preparer.prepare(_request())
+
+
+def test_direct_litellm_ensure_creates_user_in_department_team(tmp_path, monkeypatch):
+    from hermes_multitenancy.billing_identity import _ensure_user_over_http
+
+    snapshot_dir = tmp_path / "org-snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "org-latest.json").write_text(
+        json.dumps(
+            {
+                "departments": [
+                    {"dept_id": "od_tech", "name": "技术平台部", "parent_id": "0"},
+                    {"dept_id": "od_it", "name": "IT组", "parent_id": "od_tech"},
+                ],
+                "employees": {
+                    "actor": {"user_id": "actor", "dept_id": "od_it"},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_ORG_SNAPSHOT_DIR", str(snapshot_dir))
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
+    monkeypatch.setenv("HERMES_LITELLM_DEFAULT_TEAM_ID", "team-fd")
+    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
+
+    requests = []
+
+    class Response:
+        def __init__(self, payload):
+            self.raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return self.raw
+
+    def urlopen(request, *, timeout):
+        requests.append((request, timeout))
+        path = request.full_url.removeprefix("https://litellm.example")
+        if path.startswith("/user/list?"):
+            return Response({"users": []})
+        if path == "/team/list":
+            return Response([
+                {"team_id": "team-tech", "team_alias": "技术平台部"},
+            ])
+        if path == "/user/new":
+            body = json.loads(request.data)
+            assert body["teams"] == ["team-tech"]
+            assert body["auto_create_key"] is False
+            return Response({
+                "user_id": "llm-actor",
+                "user_email": "actor@keep.com",
+                "metadata": {"scim_active": True},
+            })
+        if path == "/user/update":
+            body = json.loads(request.data)
+            assert body["max_budget"] is None
+            assert body["budget_duration"] is None
+            assert body["metadata"] == {
+                "scim_active": True,
+                "hermes_billing_active": True,
+            }
+            return Response({"user_id": "llm-actor"})
+        raise AssertionError(path)
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    result = _ensure_user_over_http("actor", db_path=str(tmp_path / "multitenancy.db"))
+
+    assert result == {
+        "user_id": "actor",
+        "email": "actor@keep.com",
+        "litellm_user_id": "llm-actor",
+        "created": True,
+    }
+    assert [request.method for request, _timeout in requests] == [
+        "GET",
+        "GET",
+        "POST",
+        "POST",
+    ]
 
 
 def test_group_is_billed_to_group_owner_not_sender():

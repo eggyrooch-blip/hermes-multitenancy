@@ -358,16 +358,28 @@ The optional `moa` toolset is disabled for billing-bound runs because its
 reference/aggregate calls currently connect to OpenRouter directly; it can be
 re-enabled only after those calls use the trusted billing transport.
 
-Enable the identity path only after the ai-gateway ensure endpoint and the
-LiteLLM callback in `deploy/litellm/` are ready:
+Enable the identity path only after the LiteLLM management credential and the
+callback in `deploy/litellm/` are ready. Multitenancy queries/creates the user
+directly; AI-Gateway is not a runtime dependency:
 
 ```bash
 export HERMES_LITELLM_BILLING_ENABLED=true
 export HERMES_LITELLM_BILLING_BASE_URL="https://<litellm-host>/v1"
 export HERMES_LITELLM_BILLING_ALLOWED_PATHS="/v1,/anthropic"
-export HERMES_LITELLM_IDENTITY_ENSURE_URL="http://<private-ai-gateway>:8788/internal/v1/litellm/users/ensure"
-export AI_GATEWAY_INTERNAL_API_TOKEN="<independent-server-secret>"
+export HERMES_LITELLM_ADMIN_BASE_URL="https://<litellm-host>"
+export HERMES_LITELLM_ADMIN_KEY="<management-key>"
+export HERMES_LITELLM_DEFAULT_TEAM_ID="<fallback-team-id>"
+export HERMES_LITELLM_DEFAULT_TEAM_ALIAS="FD"
+export HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN="keep.com"
+export HERMES_ORG_SNAPSHOT_DIR="$HERMES_HOME/org-snapshots"
 ```
+
+On a missing local identity mapping, Multitenancy first queries `/user/list`.
+Only a missing user triggers department-to-Team resolution from the trusted
+Feishu snapshot, `/team/list` (and `/team/new` when the alias is absent), then
+`/user/new` with `teams=[team_id]` and `auto_create_key=false`. Existing local
+mappings never call the management API. The management key stays server-side
+and is never copied into a Profile or model request.
 
 The LiteLLM callback uses the existing spend log as the ledger and requires
 the proxy's shared Redis for cross-pod atomic reservations. Configure the one
@@ -390,8 +402,8 @@ in `HERMES_LITELLM_NON_EMPLOYEE_KEY_HASHES`. Shared-key rows receive
 prompt and response bodies remain disabled in spend logs.
 If Redis, pricing, employee identity, or account state cannot be verified, the
 managed employee request fails before a provider call. LiteLLM management/UI
-routes remain available after the model budget is reached. The ai-gateway
-ensure operation clears legacy native user `max_budget` fields and marks the
+routes remain available after the model budget is reached. The Multitenancy
+account ensure operation clears legacy native user `max_budget` fields and marks the
 account `hermes_billing_active`; SCIM `scim_active=false` or an explicit false
 Hermes marker disables shared-key use for only that employee.
 
