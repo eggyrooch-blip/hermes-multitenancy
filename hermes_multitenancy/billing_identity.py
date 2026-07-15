@@ -371,36 +371,56 @@ def _team_id_for_new_user(employee_user_id: str, db_path: str) -> str:
             body={"team_alias": alias, "models": ["all-proxy-models"]},
         )
         team_id = str(created.get("team_id") or "").strip() if isinstance(created, dict) else ""
-        return team_id or fallback_id
+        if team_id:
+            return team_id
+        raise RunRejected("LiteLLM team could not be resolved")
     except _LiteLLMAdminError as exc:
         if exc.status == 409:
             try:
-                return (
-                    _team_from_payload(_admin_request("GET", "/team/list"), alias)
-                    or fallback_id
-                )
-            except (_LiteLLMAdminError, RunRejected):
-                pass
-        return fallback_id
-    except RunRejected:
-        return fallback_id
+                found = _team_from_payload(_admin_request("GET", "/team/list"), alias)
+                if found:
+                    return found
+            except (_LiteLLMAdminError, RunRejected) as retry_exc:
+                raise RunRejected("LiteLLM team could not be resolved") from retry_exc
+        raise RunRejected("LiteLLM team could not be resolved") from exc
 
 
 def _find_user_by_email(email: str) -> Optional[dict[str, Any]]:
-    query = urllib.parse.urlencode({"user_email": email})
-    payload = _admin_request("GET", f"/user/list?{query}")
-    users = (
-        payload
-        if isinstance(payload, list)
-        else payload.get("users", []) if isinstance(payload, dict) else []
-    )
-    for user in users:
-        if (
-            isinstance(user, dict)
-            and str(user.get("user_email") or "").strip().lower() == email.lower()
+    page_size = 100
+    for page in range(1, 102):
+        query = urllib.parse.urlencode({
+            "user_email": email,
+            "page": page,
+            "page_size": page_size,
+        })
+        payload = _admin_request("GET", f"/user/list?{query}")
+        users = (
+            payload
+            if isinstance(payload, list)
+            else payload.get("users", []) if isinstance(payload, dict) else []
+        )
+        for user in users:
+            if (
+                isinstance(user, dict)
+                and str(user.get("user_email") or "").strip().lower()
+                == email.lower()
+            ):
+                return user
+        total_pages = payload.get("total_pages") if isinstance(payload, dict) else None
+        if len(users) < page_size or (
+            isinstance(total_pages, int) and page >= total_pages
         ):
-            return user
-    return None
+            return None
+    raise RunRejected("LiteLLM user list exceeded the supported page limit")
+
+
+def _get_user_by_id(user_id: str) -> dict[str, Any]:
+    query = urllib.parse.urlencode({"user_id": user_id})
+    payload = _admin_request("GET", f"/user/info?{query}")
+    user = payload.get("user_info", payload) if isinstance(payload, dict) else None
+    if not isinstance(user, dict):
+        raise RunRejected("LiteLLM user could not be resolved")
+    return user
 
 
 def _ensure_user_over_http(
@@ -445,7 +465,11 @@ def _ensure_user_over_http(
         litellm_user_id = str(user.get("user_id") or "").strip()
         if not _LITELLM_USER_ID_RE.fullmatch(litellm_user_id):
             raise RunRejected("LiteLLM returned an invalid user id")
-        metadata = dict(user.get("metadata") or {})
+        full_user = _get_user_by_id(litellm_user_id)
+        metadata_value = full_user.get("metadata") or {}
+        if not isinstance(metadata_value, dict):
+            raise RunRejected("LiteLLM returned invalid user metadata")
+        metadata = dict(metadata_value)
         metadata["hermes_billing_active"] = True
         _admin_request(
             "POST",

@@ -1363,6 +1363,8 @@ async def test_hook_schedules_background_task():
     import tempfile
 
     clear_spike_routes()
+
+
     with tempfile.TemporaryDirectory() as tmp:
         add_spike_route("ou_test_bg", Path(tmp))
 
@@ -1401,6 +1403,52 @@ async def test_hook_schedules_background_task():
         assert len(send_calls) == 1
         assert send_calls[0][0] == "chat-123"
 
+    clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_first_billing_identity_failure_is_visible_and_retryable(monkeypatch, tmp_path):
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.run_broker import RunRejected
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    add_spike_route("ou_billing_retry", tmp_path)
+    sent = []
+    admitted = []
+
+    async def reject(_request):
+        raise RunRejected("LiteLLM management API is unavailable")
+
+    async def must_not_enrich(*_args, **_kwargs):
+        raise AssertionError("model-backed enrichment must not start")
+
+    class Adapter:
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", reject)
+    monkeypatch.setattr(
+        router_mod,
+        "_mark_run_request_seen",
+        lambda request: admitted.append(request) or True,
+    )
+    monkeypatch.setattr(
+        router_mod,
+        "_call_enrich_via_hermes_pipeline",
+        must_not_enrich,
+    )
+
+    event = _build_event(text="hello", user_id="ou_billing_retry")
+    event.message_id = "om_billing_retry"
+    await router_mod.handle_async(
+        event=event,
+        gateway=SimpleNamespace(adapters={"feishu": Adapter()}),
+    )
+
+    assert sent == [("chat-123", "当前无法确认员工计费身份，请稍后重试。")]
+    assert admitted == []
     clear_spike_routes()
 
 

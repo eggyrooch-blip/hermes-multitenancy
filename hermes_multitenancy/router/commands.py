@@ -5,6 +5,7 @@ Shim helpers/state routed through ``_m`` for monkeypatch fidelity.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 import inspect
 import json
@@ -239,11 +240,47 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             and hasattr(adapter, "on_processing_complete")
         )
 
-        # Multi-modal enrichment must happen before RunRequest admission because
-        # file-only Feishu events have empty event.text.  The enriched content is
-        # the real prompt and the dedupe/admission key should reflect it.
+        # Resolve the trusted employee identity before any model call, including
+        # image preprocessing. This happens before admission so a transient
+        # LiteLLM management failure remains retryable with the same message.
         _m._materialize_inbound_media_for_profile(event, profile_home)
-        enriched_text = await _m._call_enrich_via_hermes_pipeline(event, gateway, profile_home=profile_home)
+        seed_content = text or (
+            "[media attachment]" if getattr(event, "media_urls", None) else ""
+        )
+        run_request = _m._run_request_for_routed_event(
+            event=event,
+            profile_name=profile_name,
+            sender=sender,
+            sender_alt=sender_alt,
+            chat_id=chat_id,
+            text=seed_content,
+        )
+        from ..billing_identity import prepare_billing_request
+        from ..run_broker import RunRejected
+
+        try:
+            prepared_request = await prepare_billing_request(run_request)
+            enriched_text = await _m._call_enrich_via_hermes_pipeline(
+                event,
+                gateway,
+                profile_home=profile_home,
+                billing_metadata=prepared_request.metadata,
+            )
+        except RunRejected as exc:
+            _m.logger.warning(
+                "multitenancy: employee billing preparation rejected "
+                "profile=%s sender=%s: %s",
+                profile_name,
+                sender,
+                exc,
+            )
+            if adapter is not None:
+                await _m._safe_call(
+                    adapter.send,
+                    chat_id,
+                    "当前无法确认员工计费身份，请稍后重试。",
+                )
+            return
         vision_blocked = _m._image_vision_unavailable_response(event, enriched_text)
         if vision_blocked:
             _m.logger.info(
@@ -269,7 +306,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             chat_id=chat_id,
             text=run_content,
         )
-        from ..run_broker import RunRejected
+        run_request = replace(run_request, metadata=prepared_request.metadata)
 
         try:
             run_admission = await _m._make_routed_run_broker().admit(run_request)
@@ -400,6 +437,20 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             if current not in _m._suppress_interruption_marker_tasks:
                 _m._persist_interruption_marker(hist_key)
             raise
+        except RunRejected as exc:
+            outcome_failed = True
+            retry_message = "当前无法确认员工计费身份，请稍后重试。"
+            _m._persist_failure_marker(hist_key)
+            _m._persist_assistant_message(hist_key, retry_message)
+            _m.logger.warning(
+                "multitenancy: prepared routed run rejected "
+                "profile=%s sender=%s: %s",
+                profile_name,
+                sender,
+                exc,
+            )
+            if adapter is not None:
+                await _m._safe_call(adapter.send, chat_id, retry_message)
         except Exception:
             outcome_failed = True
             _m._persist_failure_marker(hist_key)

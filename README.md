@@ -374,14 +374,20 @@ export HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN="keep.com"
 export HERMES_ORG_SNAPSHOT_DIR="$HERMES_HOME/org-snapshots"
 ```
 
-On a missing local identity mapping, Multitenancy first queries `/user/list`.
+On a missing local identity mapping, Multitenancy first queries `/user/list`
+with LiteLLM's tested maximum `page_size=100` until the exact email is found.
 Only a missing user triggers department-to-Team resolution from the trusted
 Feishu snapshot, `/team/list` (and `/team/new` when the alias is absent), then
 `/user/new` with `teams=[team_id]` and `auto_create_key=false`. Existing local
 mappings never call the management API. The management key stays server-side
-and is never copied into a Profile or model request.
+and is never copied into a Profile or model request. Before writing the Hermes
+active marker, `/user/info` supplies the complete existing metadata so SCIM and
+other fields are preserved.
 
-The LiteLLM callback uses the existing spend log as the ledger and requires
+Once loaded in LiteLLM, the callback is always active for model requests; it
+has no second enable flag that can drift from Multitenancy's
+`HERMES_LITELLM_BILLING_ENABLED`. The callback uses the existing spend log as
+the ledger and requires
 the proxy's shared Redis for cross-pod atomic reservations. Configure the one
 Hermes shared-key hash, employee email domain, and monthly budget in the
 LiteLLM deployment; do not set the shared key itself to the per-employee cap.

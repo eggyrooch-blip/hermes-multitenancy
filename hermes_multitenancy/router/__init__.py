@@ -1079,6 +1079,7 @@ _IMAGE_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".he
 
 
 _AUX_MAIN_RUNTIME_FIELDS = (
+    "_RUNTIME_MAIN",
     "_RUNTIME_MAIN_PROVIDER",
     "_RUNTIME_MAIN_MODEL",
     "_RUNTIME_MAIN_BASE_URL",

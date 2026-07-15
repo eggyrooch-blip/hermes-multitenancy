@@ -22,7 +22,6 @@ from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger(__name__)
 
-_TRUE = frozenset({"1", "true", "yes", "on"})
 _USER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _RESERVATION_METADATA_KEY = "hermes_employee_budget_reservation"
 
@@ -112,11 +111,6 @@ return 1
 """
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    return default if value is None else value.strip().lower() in _TRUE
-
-
 def _month(now: Optional[datetime] = None) -> tuple[str, datetime, int]:
     """Return UTC calendar-month key, start, and Redis TTL."""
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -178,10 +172,6 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         self._defer_script: Any = None
 
     @property
-    def enabled(self) -> bool:
-        return _env_bool("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED")
-
-    @property
     def budget(self) -> float:
         try:
             value = float(os.environ.get("HERMES_LITELLM_MONTHLY_BUDGET_USD", "120"))
@@ -213,9 +203,6 @@ class HermesEmployeeBudgetGuard(CustomLogger):
         data: dict[str, Any],
         call_type: str,
     ) -> Optional[dict[str, Any]]:
-        if not self.enabled:
-            return None
-
         metadata = _metadata(data)
         metadata.pop(_RESERVATION_METADATA_KEY, None)
         employee_user_id, shared_request = await self._employee_for_request(

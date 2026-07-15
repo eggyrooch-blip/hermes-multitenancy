@@ -182,6 +182,13 @@ def test_direct_litellm_ensure_creates_user_in_department_team(tmp_path, monkeyp
                 "user_email": "actor@keep.com",
                 "metadata": {"scim_active": True},
             })
+        if path == "/user/info?user_id=llm-actor":
+            return Response({
+                "user_info": {
+                    "user_id": "llm-actor",
+                    "metadata": {"scim_active": True},
+                },
+            })
         if path == "/user/update":
             body = json.loads(request.data)
             assert body["max_budget"] is None
@@ -207,6 +214,7 @@ def test_direct_litellm_ensure_creates_user_in_department_team(tmp_path, monkeyp
         "GET",
         "GET",
         "POST",
+        "GET",
         "POST",
     ]
 
@@ -243,7 +251,18 @@ def test_direct_litellm_ensure_reuses_existing_user_without_team_lookup(monkeypa
                     "metadata": {},
                 }],
             })
+        if path == "/user/info?user_id=llm-actor":
+            return Response({
+                "user_info": {
+                    "user_id": "llm-actor",
+                    "metadata": {"existing": "kept"},
+                },
+            })
         if path == "/user/update":
+            assert json.loads(request.data)["metadata"] == {
+                "existing": "kept",
+                "hermes_billing_active": True,
+            }
             return Response({"user_id": "llm-actor"})
         raise AssertionError(path)
 
@@ -254,9 +273,104 @@ def test_direct_litellm_ensure_reuses_existing_user_without_team_lookup(monkeypa
     assert result["litellm_user_id"] == "llm-actor"
     assert result["created"] is False
     assert seen_paths == [
-        "/user/list?user_email=actor%40keep.com",
+        "/user/list?user_email=actor%40keep.com&page=1&page_size=100",
+        "/user/info?user_id=llm-actor",
         "/user/update",
     ]
+
+
+def test_direct_litellm_user_lookup_reads_later_pages(monkeypatch):
+    from hermes_multitenancy.billing_identity import _find_user_by_email
+
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
+    paths = []
+
+    class Response:
+        def __init__(self, payload):
+            self.raw = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return self.raw
+
+    def urlopen(request, *, timeout):
+        paths.append(request.full_url.removeprefix("https://litellm.example"))
+        if "&page=1&" in request.full_url:
+            return Response({
+                "users": [
+                    {"user_id": f"other-{index}", "user_email": f"other-{index}@keep.com"}
+                    for index in range(100)
+                ],
+                "total_pages": 2,
+            })
+        return Response({
+            "users": [{
+                "user_id": "llm-actor",
+                "user_email": "actor@keep.com",
+            }],
+            "total_pages": 2,
+        })
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    assert _find_user_by_email("actor@keep.com")["user_id"] == "llm-actor"
+    assert paths == [
+        "/user/list?user_email=actor%40keep.com&page=1&page_size=100",
+        "/user/list?user_email=actor%40keep.com&page=2&page_size=100",
+    ]
+
+
+def test_department_team_management_failure_does_not_use_default_team(tmp_path, monkeypatch):
+    from hermes_multitenancy.billing_identity import _ensure_user_over_http
+    from hermes_multitenancy.run_broker import RunRejected
+
+    snapshot_dir = tmp_path / "org-snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "org-latest.json").write_text(
+        json.dumps({
+            "departments": [
+                {"dept_id": "od_tech", "name": "技术平台部", "parent_id": "0"},
+            ],
+            "employees": {"actor": {"user_id": "actor", "dept_id": "od_tech"}},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_ORG_SNAPSHOT_DIR", str(snapshot_dir))
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
+    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
+    monkeypatch.setenv("HERMES_LITELLM_DEFAULT_TEAM_ID", "team-fd")
+
+    class Response:
+        def __init__(self, payload):
+            self.raw = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return self.raw
+
+    def urlopen(request, *, timeout):
+        path = request.full_url.removeprefix("https://litellm.example")
+        if path.startswith("/user/list?"):
+            return Response({"users": []})
+        if path == "/team/list":
+            raise OSError("team service unavailable")
+        raise AssertionError(f"must not create a user in the default team: {path}")
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    with pytest.raises(RunRejected, match="management API is unavailable"):
+        _ensure_user_over_http("actor", db_path=str(tmp_path / "multitenancy.db"))
 
 
 def test_group_is_billed_to_group_owner_not_sender():

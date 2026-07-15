@@ -64,3 +64,49 @@ def test_context_manager_derives_provider_from_default_only_config(monkeypatch, 
     asyncio.run(drive())
     assert seen["inside"] == "glm-4.6v"   # derived provider 'zai' → patched
     assert seen["after"] == "glm-5v-turbo"  # restored
+
+
+def test_image_prep_runtime_inherits_employee_billing_headers(monkeypatch, tmp_path):
+    import asyncio
+
+    fake = _install_fake_aux(monkeypatch, {})
+    fake._RUNTIME_MAIN = {"previous": True}
+    captured = {}
+
+    def set_runtime_main(provider, model, **kwargs):
+        captured.update({"provider": provider, "model": model, **kwargs})
+        fake._RUNTIME_MAIN = dict(captured)
+
+    fake.set_runtime_main = set_runtime_main
+    monkeypatch.setattr(
+        router,
+        "_profile_main_runtime_for_image_prep",
+        lambda _home: {
+            "provider": "custom:litellm",
+            "model": "vision-model",
+            "base_url": "https://litellm.example/v1",
+            "api_key": "shared-key",
+            "api_mode": "openai",
+        },
+    )
+
+    async def drive():
+        async with router._profile_image_prep_runtime(
+            tmp_path,
+            billing_metadata={
+                "litellm_billing_user_id": "llm-actor",
+                "litellm_billing_base_url": "https://litellm.example/v1",
+            },
+        ):
+            assert fake._RUNTIME_MAIN["request_overrides"]["extra_headers"] == {
+                "X-Hermes-User-Id": "llm-actor",
+                "X-Hermes-Source": "hermes",
+            }
+            assert fake._RUNTIME_MAIN["request_overrides_base_url"] == (
+                "https://litellm.example/v1"
+            )
+
+    asyncio.run(drive())
+
+    assert captured["api_key"] == "shared-key"
+    assert fake._RUNTIME_MAIN == {"previous": True}

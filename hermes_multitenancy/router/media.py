@@ -1002,7 +1002,10 @@ def _profile_main_runtime_for_image_prep(profile_home: Path) -> Optional[dict[st
     }
 
 
-def _install_auxiliary_main_runtime_patch(runtime: Optional[dict[str, str]]) -> tuple[Optional[Any], dict[str, tuple[bool, Any]]]:
+def _install_auxiliary_main_runtime_patch(
+    runtime: Optional[dict[str, str]],
+    billing_metadata: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[Any], dict[str, tuple[bool, Any]]]:
     """Patch hermes-agent auxiliary runtime readers under the env lock."""
     if not runtime:
         return None, {}
@@ -1019,12 +1022,57 @@ def _install_auxiliary_main_runtime_patch(runtime: Optional[dict[str, str]]) -> 
     base_url = runtime.get("base_url", "")
     api_key = runtime.get("api_key", "")
     api_mode = runtime.get("api_mode", "")
+    request_overrides: dict[str, Any] = {}
+    if (billing_metadata or {}).get("litellm_billing_user_id"):
+        from ..billing_identity import request_overrides_for_endpoint
+        from ..run_broker import RunRejected
+
+        request_overrides = request_overrides_for_endpoint(
+            billing_metadata or {},
+            base_url,
+        )
+        if not request_overrides:
+            raise RunRejected(
+                "Billing-bound image preprocessing cannot use an unapproved endpoint"
+            )
 
     set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
+    if request_overrides and (not callable(set_runtime_main) or not api_key):
+        raise RunRejected("Billing-bound image preprocessing runtime is unavailable")
     if callable(set_runtime_main) and api_key:
         try:
-            set_runtime_main(provider, model, base_url=base_url, api_key=api_key, api_mode=api_mode)
+            set_runtime_main(
+                provider,
+                model,
+                base_url=base_url,
+                api_key=api_key,
+                api_mode=api_mode,
+                request_overrides=request_overrides,
+                request_overrides_base_url=base_url if request_overrides else "",
+            )
+        except TypeError as exc:
+            if request_overrides:
+                raise RunRejected(
+                    "Billing-bound image preprocessing runtime is unavailable"
+                ) from exc
+            try:
+                set_runtime_main(
+                    provider,
+                    model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    api_mode=api_mode,
+                )
+            except Exception as fallback_exc:
+                _m.logger.debug(
+                    "multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)",
+                    fallback_exc,
+                )
         except Exception as exc:
+            if request_overrides:
+                raise RunRejected(
+                    "Billing-bound image preprocessing runtime is unavailable"
+                ) from exc
             _m.logger.debug("multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)", exc)
 
     setattr(auxiliary_client, "_read_main_provider", lambda: provider)
@@ -1146,7 +1194,10 @@ def _restore_auxiliary_main_runtime_patch(auxiliary_client: Optional[Any], saved
 
 
 @asynccontextmanager
-async def _profile_image_prep_runtime(profile_home: Optional[Path]):
+async def _profile_image_prep_runtime(
+    profile_home: Optional[Path],
+    billing_metadata: Optional[dict[str, Any]] = None,
+):
     """Temporarily scope Hermes' private inbound media preprocessing to a profile."""
     if profile_home is None:
         yield
@@ -1156,6 +1207,10 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
 
     profile_home = Path(profile_home)
     runtime = _m._profile_main_runtime_for_image_prep(profile_home)
+    if (billing_metadata or {}).get("litellm_billing_user_id") and runtime is None:
+        from ..run_broker import RunRejected
+
+        raise RunRejected("Billing-bound image preprocessing runtime is unavailable")
     token = _PROFILE_HOME_VAR.set(profile_home)
     try:
         async with _get_env_lock():
@@ -1169,7 +1224,10 @@ async def _profile_image_prep_runtime(profile_home: Optional[Path]):
             saved_vte: dict[str, tuple[bool, Any]] = {}
             try:
                 os.environ[HERMES_HOME_ENV] = str(profile_home)
-                auxiliary_client, saved_aux = _m._install_auxiliary_main_runtime_patch(runtime)
+                auxiliary_client, saved_aux = _m._install_auxiliary_main_runtime_patch(
+                    runtime,
+                    billing_metadata,
+                )
                 # Scope the vision auxiliary task at this profile's custom
                 # endpoint directly — the auto-detect-by-name chain 404s for
                 # custom providers with no matching custom_providers entry
@@ -1287,6 +1345,7 @@ async def _enrich_via_hermes_pipeline(
     gateway: Any,
     *,
     profile_home: Optional[Path] = None,
+    billing_metadata: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
     """Delegate inbound preprocessing to hermes' ``_prepare_inbound_message_text``.
 
@@ -1308,7 +1367,10 @@ async def _enrich_via_hermes_pipeline(
         Enriched text string, or None on failure (caller falls back to event.text).
     """
     media_profile_home = profile_home if (getattr(event, "media_urls", None) or []) else None
-    async with _m._profile_image_prep_runtime(media_profile_home):
+    async with _m._profile_image_prep_runtime(
+        media_profile_home,
+        billing_metadata=billing_metadata,
+    ):
         native_text: Optional[str] = None
         if _m._event_has_image_media(event):
             strategy = os.getenv("HERMES_MULTITENANCY_IMAGE_PREP_STRATEGY", "gateway").strip().lower()
@@ -1352,18 +1414,24 @@ async def _call_enrich_via_hermes_pipeline(
     gateway: Any,
     *,
     profile_home: Optional[Path],
+    billing_metadata: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
     """Call enrichment with profile context while preserving monkeypatch compatibility."""
     try:
         params = inspect.signature(_m._enrich_via_hermes_pipeline).parameters
     except (TypeError, ValueError):
         params = {}
-    accepts_profile_home = "profile_home" in params or any(
+    accepts_kwargs = any(
         param.kind == inspect.Parameter.VAR_KEYWORD
         for param in params.values()
     )
-    if accepts_profile_home:
-        return await _m._enrich_via_hermes_pipeline(event, gateway, profile_home=profile_home)
+    kwargs: dict[str, Any] = {}
+    if "profile_home" in params or accepts_kwargs:
+        kwargs["profile_home"] = profile_home
+    if "billing_metadata" in params or accepts_kwargs:
+        kwargs["billing_metadata"] = billing_metadata
+    if kwargs:
+        return await _m._enrich_via_hermes_pipeline(event, gateway, **kwargs)
     return await _m._enrich_via_hermes_pipeline(event, gateway)
 
 

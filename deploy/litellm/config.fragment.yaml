@@ -11,7 +11,6 @@ general_settings:
       litellm_user_role: internal_user
 
 # Required environment variables:
-# HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED=true
 # HERMES_LITELLM_SHARED_KEY_HASH=<LiteLLM hash of the one Hermes shared key>
 # HERMES_LITELLM_MONTHLY_BUDGET_USD=120
 # HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN=<company-domain>

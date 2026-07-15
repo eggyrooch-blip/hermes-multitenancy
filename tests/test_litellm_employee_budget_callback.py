@@ -157,7 +157,6 @@ class _Harness:
 def test_only_one_concurrent_request_can_reserve_last_budget(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     monkeypatch.setenv("HERMES_LITELLM_MONTHLY_BUDGET_USD", "1.5")
     harness = _Harness(callback_module, estimate=1.0)
@@ -184,7 +183,6 @@ def test_only_one_concurrent_request_can_reserve_last_budget(
 def test_client_litellm_call_id_cannot_reuse_a_reservation(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     monkeypatch.setenv("HERMES_LITELLM_MONTHLY_BUDGET_USD", "2.1")
     harness = _Harness(callback_module, estimate=1.0)
@@ -209,7 +207,6 @@ def test_client_litellm_call_id_cannot_reuse_a_reservation(
 def test_one_employee_at_limit_does_not_block_another_on_shared_key(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     monkeypatch.setenv("HERMES_LITELLM_MONTHLY_BUDGET_USD", "1")
     monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
@@ -282,7 +279,6 @@ def test_one_employee_at_limit_does_not_block_another_on_shared_key(
 def test_explicitly_allowlisted_non_employee_key_is_unchanged(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     monkeypatch.setenv("HERMES_LITELLM_NON_EMPLOYEE_KEY_HASHES", "personal-hash")
     harness = _Harness(callback_module, employee=False)
@@ -298,7 +294,6 @@ def test_explicitly_allowlisted_non_employee_key_is_unchanged(
 def test_unassigned_personal_key_cannot_bypass_employee_budget(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     guard = callback_module.HermesEmployeeBudgetGuard()
 
@@ -315,7 +310,6 @@ def test_unassigned_personal_key_cannot_bypass_employee_budget(
 def test_non_employee_user_requires_explicit_key_allowlist(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     harness = _Harness(callback_module, employee=False)
 
@@ -330,7 +324,6 @@ def test_non_employee_user_requires_explicit_key_allowlist(
 def test_employee_personal_key_source_cannot_spoof_hermes(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     harness = _Harness(callback_module)
     data = _data()
@@ -344,7 +337,6 @@ def test_employee_personal_key_source_cannot_spoof_hermes(
 
 
 def test_inactive_employee_is_rejected_before_reservation(callback_module, monkeypatch):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     harness = _Harness(callback_module, blocked=True)
 
@@ -360,7 +352,6 @@ def test_inactive_employee_is_rejected_before_reservation(callback_module, monke
 def test_shared_key_fails_closed_without_hermes_active_marker(
     callback_module, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_SHARED_KEY_HASH", "shared-hash")
     monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
     guard = callback_module.HermesEmployeeBudgetGuard()
