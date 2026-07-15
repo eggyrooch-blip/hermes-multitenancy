@@ -354,6 +354,9 @@ without per-profile API keys.
 Once a run is billing-bound, main fallback, delegated agents, and auxiliary
 calls fail closed if they try to leave that approved endpoint; headers are
 never silently removed while an unbilled model call continues.
+The optional `moa` toolset is disabled for billing-bound runs because its
+reference/aggregate calls currently connect to OpenRouter directly; it can be
+re-enabled only after those calls use the trusted billing transport.
 
 Enable the identity path only after the ai-gateway ensure endpoint and the
 LiteLLM callback in `deploy/litellm/` are ready:
