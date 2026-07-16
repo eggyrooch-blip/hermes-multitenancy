@@ -225,6 +225,90 @@ async def test_reply_quote_skips_interactive_preview_image_download() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reply_quote_interactive_raw_card_reaches_final_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeFeishuAdapter, saved = _install_fake_feishu()
+    try:
+        from hermes_multitenancy.feishu_inbound_richtext import _extract_interactive_card_text
+
+        feishu_module = sys.modules["gateway.platforms.feishu"]
+        base_normalize = feishu_module.normalize_feishu_message
+
+        def _rich_normalize(*, message_type: str, raw_content: str, **kwargs: Any) -> Any:
+            result = base_normalize(message_type=message_type, raw_content=raw_content, **kwargs)
+            if message_type == "interactive":
+                result.text_content = _extract_interactive_card_text(json.loads(raw_content))
+            return result
+
+        feishu_module.normalize_feishu_message = _rich_normalize
+        reply_module = _load_reply_module()
+        reply_module.install_feishu_reply_quote_api_patch()
+        adapter = FakeFeishuAdapter()
+        json_card = json.dumps(
+            {
+                "header": {
+                    "property": {
+                        "title": {
+                            "tag": "plain_text",
+                            "property": {"content": "⏰ 付款单日报"},
+                        }
+                    }
+                },
+                "body": {
+                    "property": {
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "id": "element-secret-noise",
+                                "property": {"content": "Token 已过期"},
+                            }
+                        ]
+                    }
+                },
+            },
+            ensure_ascii=False,
+        )
+        monkeypatch.setattr(
+            reply_module,
+            "_fetch_parent_message_blocking",
+            lambda message_id, _open_id: {
+                "message_id": message_id,
+                "msg_type": "interactive",
+                "body": {
+                    "content": json.dumps(
+                        {"json_card": json_card, "image_key": "img_v3_cardkit_preview"},
+                        ensure_ascii=False,
+                    )
+                },
+                "sender": {"id": "ou_parent_author"},
+            },
+        )
+        monkeypatch.setattr(
+            reply_module,
+            "_resolve_names_blocking",
+            lambda _open_ids, _replying_open_id: {"ou_parent_author": "Hermes"},
+        )
+
+        await adapter._process_inbound_message(
+            data={},
+            message=SimpleNamespace(parent_id="om_parent_card", upper_message_id=None),
+            sender_id=SimpleNamespace(open_id="ou_replying_user"),
+            chat_type="p2p",
+            message_id="om_reply_card",
+        )
+
+        assert adapter.last_reply_to_text == (
+            "[message_id=om_parent_card] Hermes: 主题: ⏰ 付款单日报\n正文: Token 已过期"
+        )
+        assert all(
+            noise not in adapter.last_reply_to_text
+            for noise in ("json_card", "element-secret-noise", "img_v3_cardkit_preview")
+        )
+        assert adapter.downloaded_images == []
+    finally:
+        _restore(saved)
+
+
+@pytest.mark.asyncio
 async def test_reply_quote_patch_replaces_degraded_parent_text_even_if_core_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeFeishuAdapter, saved = _install_fake_feishu()
     try:
@@ -631,6 +715,18 @@ async def test_reply_quote_failed_raw_fetch_hides_card_preview_key(monkeypatch: 
         assert "img_v3_02ad_secret_preview" not in adapter.last_reply_to_text
     finally:
         _restore(saved)
+
+
+def test_reply_quote_preview_key_is_redacted_even_without_upgrade_hint() -> None:
+    reply_module = _load_reply_module()
+
+    sanitized = reply_module._sanitize_degraded_preview(
+        "om_parent_preview",
+        "img img_v3_02ad_secret_preview",
+    )
+
+    assert sanitized == "img [card-preview]"
+    assert "img_v3_02ad_secret_preview" not in sanitized
 
 
 @pytest.mark.asyncio

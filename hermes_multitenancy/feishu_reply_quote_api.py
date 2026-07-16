@@ -129,9 +129,11 @@ def _format_reply_quote_text(message_id: str, sender_name: str, full_content: st
 def _sanitize_degraded_preview(message_id: str, value: Any) -> Any:
     text = str(value or "")
     lowered = text.lower()
-    if _CARD_PREVIEW_KEY_RE.search(text) and any(hint.lower() in lowered for hint in _CARD_PREVIEW_HINTS):
+    if not _CARD_PREVIEW_KEY_RE.search(text):
+        return value
+    if any(hint.lower() in lowered for hint in _CARD_PREVIEW_HINTS):
         return _format_reply_quote_text(message_id, "", "[interactive 消息内容暂不可用]")
-    return value
+    return _CARD_PREVIEW_KEY_RE.sub("[card-preview]", text)
 
 
 def _fetch_parent_message_blocking(message_id: str, replying_open_id: str) -> Optional[dict[str, Any]]:

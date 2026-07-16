@@ -263,6 +263,46 @@ def test_interactive_malformed_raw_card_content_uses_safe_placeholder() -> None:
     assert "img_v3_secret" not in result.text_content
 
 
+def test_interactive_raw_card_content_reads_column_set_text() -> None:
+    install_feishu_inbound_richtext_patch()
+    result = _normalize(
+        "interactive",
+        {
+            "json_card": json.dumps(
+                {
+                    "body": {
+                        "property": {
+                            "elements": [
+                                {
+                                    "tag": "column_set",
+                                    "property": {
+                                        "columns": [
+                                            {
+                                                "tag": "column",
+                                                "property": {
+                                                    "elements": [
+                                                        {
+                                                            "tag": "markdown",
+                                                            "property": {"content": "认证状态：需要重新授权"},
+                                                        }
+                                                    ]
+                                                },
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    assert result.text_content == "正文: 认证状态：需要重新授权"
+
+
 @pytest.mark.parametrize(
     ("message_type", "payload"),
     [

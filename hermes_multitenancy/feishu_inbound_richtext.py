@@ -324,7 +324,7 @@ def _extract_card_element_text(element: Any) -> str:
         _extract_card_text_value(prop.get("title")),
         _extract_card_text_value(prop.get("label")),
     ]
-    for key in ("elements", "fields", "items"):
+    for key in ("elements", "fields", "items", "columns"):
         parts.append(_extract_card_element_text(prop.get(key)))
     return _join_lines(parts)
 
