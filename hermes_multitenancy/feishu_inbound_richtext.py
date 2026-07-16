@@ -224,6 +224,18 @@ def _extract_merge_forward_enrichment(
 
 
 def _extract_interactive_card_text(payload: dict[str, Any]) -> str:
+    if "json_card" in payload:
+        raw_card = payload.get("json_card")
+        try:
+            card_payload = json.loads(raw_card) if isinstance(raw_card, str) else raw_card
+        except json.JSONDecodeError:
+            return "[interactive 消息]"
+        if not isinstance(card_payload, dict):
+            return "[interactive 消息]"
+        subject = _find_header_title(card_payload)
+        body = _join_lines(_extract_card_element_text(item) for item in _card_elements(card_payload))
+        return _join_lines([subject and f"主题: {subject}", body and f"正文: {body}"]) or "[interactive 消息]"
+
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
     subject = _find_header_title(card_payload) or _find_first_text(
         card_payload,
@@ -273,6 +285,69 @@ def _extract_interactive_card_text(payload: dict[str, Any]) -> str:
     if remaining_body and remaining_body != body_text:
         lines.append(remaining_body)
     return _join_lines(lines) or "[interactive 消息]"
+
+
+def _card_elements(card: dict[str, Any]) -> list[Any]:
+    direct = card.get("elements")
+    if isinstance(direct, list):
+        return direct
+    body = card.get("body")
+    if not isinstance(body, dict):
+        return []
+    body_property = body.get("property")
+    if isinstance(body_property, dict) and isinstance(body_property.get("elements"), list):
+        return body_property["elements"]
+    return body.get("elements") if isinstance(body.get("elements"), list) else []
+
+
+def _extract_card_element_text(element: Any) -> str:
+    if isinstance(element, str):
+        return _normalize_whitespace(element)
+    if isinstance(element, list):
+        return _join_lines(_extract_card_element_text(item) for item in element)
+    if not isinstance(element, dict):
+        return ""
+
+    tag = str(element.get("tag") or "").strip().lower()
+    if tag in {"hr", "br", "img", "image", "card_header"}:
+        return ""
+    prop = element.get("property") if isinstance(element.get("property"), dict) else element
+    if tag in {"link", "button"}:
+        label = _extract_card_text_value(prop.get("text") or prop.get("content") or prop.get("title"))
+        url = str(prop.get("url") or prop.get("href") or "").strip()
+        if url:
+            return f"[{label}]({url})" if label else url
+
+    parts = [
+        _extract_card_text_value(prop.get("text")),
+        _extract_card_text_value(prop.get("content")),
+        _extract_card_text_value(prop.get("title")),
+        _extract_card_text_value(prop.get("label")),
+    ]
+    for key in ("elements", "fields", "items"):
+        parts.append(_extract_card_element_text(prop.get(key)))
+    return _join_lines(parts)
+
+
+def _extract_card_text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _normalize_whitespace(value)
+    if isinstance(value, list):
+        return "".join(_extract_card_text_value(item) for item in value)
+    if not isinstance(value, dict):
+        return ""
+    prop = value.get("property") if isinstance(value.get("property"), dict) else value
+    i18n = prop.get("i18nContent")
+    if isinstance(i18n, dict):
+        for language in ("zh_cn", "en_us", "ja_jp"):
+            text = _extract_card_text_value(i18n.get(language))
+            if text:
+                return text
+    for key in ("content", "text", "title", "elements"):
+        text = _extract_card_text_value(prop.get(key))
+        if text:
+            return text
+    return ""
 
 
 def _render_forward_entry(item: Any) -> tuple[str, list[str], list[dict[str, Any]]]:
@@ -389,7 +464,11 @@ def _find_header_title(payload: Any) -> str:
     header = payload.get("header")
     if not isinstance(header, dict):
         return ""
-    title = header.get("title")
+    header_property = header.get("property")
+    title = header_property.get("title") if isinstance(header_property, dict) else header.get("title")
+    nested_title = _extract_card_text_value(title)
+    if nested_title:
+        return nested_title
     if isinstance(title, dict):
         return _join_lines(
             [

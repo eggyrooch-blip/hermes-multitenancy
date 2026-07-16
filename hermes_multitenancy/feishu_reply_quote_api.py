@@ -24,6 +24,7 @@ import asyncio
 import functools
 import json
 import logging
+import re
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
@@ -54,6 +55,8 @@ _REPLY_SENDER_ATTR = "_mt_reply_quote_sender_by_parent_mid"
 _REPLY_MEDIA_ATTR = "_mt_reply_quote_media_by_parent_mid"
 _REPLY_SENDER_MAP_MAX = 256
 _QUOTE_MEDIA_MAX = 8
+_CARD_PREVIEW_KEY_RE = re.compile(r"\bimg_v\d+_[A-Za-z0-9_-]+\b")
+_CARD_PREVIEW_HINTS = ("请升级至最新版本客户端", "update to the latest version")
 
 
 def _reply_sender_map(adapter: Any) -> dict[str, str]:
@@ -123,13 +126,22 @@ def _format_reply_quote_text(message_id: str, sender_name: str, full_content: st
     return f"{prefix} {content}"
 
 
+def _sanitize_degraded_preview(message_id: str, value: Any) -> Any:
+    text = str(value or "")
+    lowered = text.lower()
+    if _CARD_PREVIEW_KEY_RE.search(text) and any(hint.lower() in lowered for hint in _CARD_PREVIEW_HINTS):
+        return _format_reply_quote_text(message_id, "", "[interactive 消息内容暂不可用]")
+    return value
+
+
 def _fetch_parent_message_blocking(message_id: str, replying_open_id: str) -> Optional[dict[str, Any]]:
     if not message_id:
         raise RuntimeError("reply quote enrichment requires parent message_id")
     token = _resolve_uat_token(replying_open_id)
     url = (
         f"{_feishu_api_host()}/open-apis/im/v1/messages/"
-        f"{urllib.parse.quote(message_id, safe='')}?user_id_type=open_id"
+        f"{urllib.parse.quote(message_id, safe='')}?"
+        f"{urllib.parse.urlencode({'user_id_type': 'open_id', 'card_msg_content_type': 'raw_card_content'})}"
     )
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 (fixed host)
@@ -232,6 +244,8 @@ def _parent_media_refs(item: dict[str, Any], normalized: Any) -> list[tuple[str,
 
 
 async def _download_reply_quote_media(adapter: Any, message_id: str, item: dict[str, Any]) -> list[tuple[str, str]]:
+    if str(item.get("msg_type") or "").strip().lower() in {"interactive", "card"}:
+        return []
     normalized = _normalize_parent_item(item)
     media: list[tuple[str, str]] = []
 
@@ -409,7 +423,8 @@ def _patch_fetch_message_text(FeishuAdapter: Any) -> None:
                 exc,
                 exc_info=True,
             )
-        return await original(self, message_id, *args, **kwargs)
+        fallback = await original(self, message_id, *args, **kwargs)
+        return _sanitize_degraded_preview(normalized_message_id, fallback)
 
     setattr(wrapped, _FETCH_FLAG, True)
     FeishuAdapter._fetch_message_text = wrapped

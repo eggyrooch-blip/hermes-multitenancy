@@ -208,6 +208,61 @@ def test_interactive_card_enrichment_surfaces_applicant_subject_status_and_body(
     assert "正文: 6 月 10 日下午请假半天" in result.text_content
 
 
+def test_interactive_raw_card_content_extracts_only_readable_card_text() -> None:
+    install_feishu_inbound_richtext_patch()
+    json_card = {
+        "schema": 2,
+        "header": {
+            "tag": "card_header",
+            "property": {
+                "title": {
+                    "tag": "plain_text",
+                    "property": {"content": "⏰ 付款单日报"},
+                }
+            },
+        },
+        "body": {
+            "property": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "id": "element-production-noise",
+                        "property": {
+                            "content": "**付款单日报**\nToken 已过期\n[查看详情](https://example.com/report)",
+                            "text_size": "normal",
+                        },
+                    }
+                ]
+            }
+        },
+    }
+
+    result = _normalize(
+        "interactive",
+        {
+            "json_card": json.dumps(json_card, ensure_ascii=False),
+            "card_schema": 2,
+        },
+    )
+
+    assert result.text_content == (
+        "主题: ⏰ 付款单日报\n"
+        "正文: **付款单日报**\nToken 已过期\n[查看详情](https://example.com/report)"
+    )
+    assert "element-production-noise" not in result.text_content
+    assert "text_size" not in result.text_content
+    assert "json_card" not in result.text_content
+
+
+def test_interactive_malformed_raw_card_content_uses_safe_placeholder() -> None:
+    install_feishu_inbound_richtext_patch()
+
+    result = _normalize("interactive", {"json_card": "{not-json", "image_key": "img_v3_secret"})
+
+    assert result.text_content == "[interactive 消息]"
+    assert "img_v3_secret" not in result.text_content
+
+
 @pytest.mark.parametrize(
     ("message_type", "payload"),
     [

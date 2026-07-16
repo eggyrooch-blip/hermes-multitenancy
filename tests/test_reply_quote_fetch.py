@@ -13,6 +13,7 @@ from pathlib import Path
 import sys
 import types
 from typing import Any
+import urllib.parse
 
 import pytest
 
@@ -163,6 +164,64 @@ def _load_reply_module():
     sys.modules.pop("hermes_multitenancy.feishu_reply_quote_api", None)
     module = importlib.import_module("hermes_multitenancy.feishu_reply_quote_api")
     return importlib.reload(module)
+
+
+def test_parent_message_fetch_requests_raw_card_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    reply_module = _load_reply_module()
+    requested_urls: list[str] = []
+
+    class _Response:
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return b'{"code":0,"data":{"items":[{"msg_type":"interactive"}]}}'
+
+    def _urlopen(request: Any, timeout: int) -> _Response:
+        assert timeout == 10
+        requested_urls.append(request.full_url)
+        return _Response()
+
+    monkeypatch.setattr(reply_module, "_resolve_uat_token", lambda _open_id: "uat")
+    monkeypatch.setattr(reply_module.urllib.request, "urlopen", _urlopen)
+
+    item = reply_module._fetch_parent_message_blocking("om parent", "ou_replying_user")
+
+    assert item == {"msg_type": "interactive"}
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(requested_urls[0]).query)
+    assert query == {
+        "user_id_type": ["open_id"],
+        "card_msg_content_type": ["raw_card_content"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_reply_quote_skips_interactive_preview_image_download() -> None:
+    FakeFeishuAdapter, saved = _install_fake_feishu()
+    try:
+        reply_module = _load_reply_module()
+        adapter = FakeFeishuAdapter()
+        item = {
+            "msg_type": "interactive",
+            "body": {
+                "content": json.dumps(
+                    {
+                        "json_card": "{}",
+                        "image_key": "img_v3_cardkit_preview",
+                    },
+                    ensure_ascii=False,
+                )
+            },
+        }
+
+        assert await reply_module._download_reply_quote_media(adapter, "om_parent", item) == []
+        assert adapter.downloaded_images == []
+    finally:
+        _restore(saved)
 
 
 @pytest.mark.asyncio
@@ -536,6 +595,40 @@ async def test_reply_quote_patch_fails_open_to_original_text(monkeypatch: pytest
             message_id="om_reply_4",
         )
         assert adapter.last_reply_to_text == "正文: img <key> text"
+    finally:
+        _restore(saved)
+
+
+@pytest.mark.asyncio
+async def test_reply_quote_failed_raw_fetch_hides_card_preview_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeFeishuAdapter, saved = _install_fake_feishu()
+    try:
+        async def _preview_fallback(self: Any, message_id: str | None) -> str | None:
+            del self, message_id
+            return "img img_v3_02ad_secret_preview 请升级至最新版本客户端，以查看内容"
+
+        FakeFeishuAdapter._fetch_message_text = _preview_fallback
+        reply_module = _load_reply_module()
+        reply_module.install_feishu_reply_quote_api_patch()
+        monkeypatch.setattr(
+            reply_module,
+            "_fetch_parent_message_blocking",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("no uat")),
+        )
+        adapter = FakeFeishuAdapter()
+
+        await adapter._process_inbound_message(
+            data={},
+            message=SimpleNamespace(parent_id="om_parent_preview", upper_message_id=None),
+            sender_id=SimpleNamespace(open_id="ou_replying_user"),
+            chat_type="group",
+            message_id="om_reply_preview",
+        )
+
+        assert adapter.last_reply_to_text == (
+            "[message_id=om_parent_preview] [interactive 消息内容暂不可用]"
+        )
+        assert "img_v3_02ad_secret_preview" not in adapter.last_reply_to_text
     finally:
         _restore(saved)
 
