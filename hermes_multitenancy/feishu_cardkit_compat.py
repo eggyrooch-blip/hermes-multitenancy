@@ -7,12 +7,13 @@ keep working without a touch to ``router.py`` / ``agent_real.py`` / tests.
 """
 from __future__ import annotations
 
-from .card import ensure_feishu_cardkit_streaming
+from .card import ensure_feishu_cardkit_streaming, supports_streaming_closed_recovery
 from .card.builder import _render_cardkit_initial_card
 from .card.markdown_style import _optimize_markdown_style
 
 __all__ = [
     "ensure_feishu_cardkit_streaming",
+    "supports_streaming_closed_recovery",
     "_render_cardkit_initial_card",
     "_optimize_markdown_style",
 ]

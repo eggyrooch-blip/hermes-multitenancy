@@ -109,6 +109,31 @@ def test_aborted_footer_uses_bilingual_stopped_labels():
     assert footer["en_us"].splitlines() == ["Stopped · Elapsed 11.3s", "tokens ↑5"]
 
 
+def test_errored_footer_is_honest_and_preserves_partial_content():
+    state = _state_with(finalized=True, errored=True, started_at=1.0, content="partial answer")
+    footer = _render_footer(state, now=12.3, show_metrics="0")
+    card = _render_message_card(state)
+    assert footer["zh_cn"] == "出错 · 耗时 11.3s"
+    assert footer["en_us"] == "Error · Elapsed 11.3s"
+    assert card["header"]["template"] == "red"
+    assert "partial answer" in str(card)
+
+
+def test_fail_streaming_card_marks_error_terminal():
+    adapter = _adapter_with_started_card()
+    assert callable(getattr(adapter, "fail_streaming_card", None))
+    result = asyncio.run(
+        adapter.fail_streaming_card(
+            chat_id="chat-1", message_id="msg-1", content="partial answer"
+        )
+    )
+    assert result.success is True
+    final_card = adapter.sent[-1]["card"]
+    assert final_card["header"]["template"] == "red"
+    assert "partial answer" in str(final_card)
+    assert "出错 · 耗时" in str(final_card)
+
+
 def test_footer_elapsed_uses_minutes_and_seconds_when_over_one_minute():
     state = _state_with(finalized=True, started_at=1.0)
     footer = _render_footer(state, now=66.2, show_metrics="0")

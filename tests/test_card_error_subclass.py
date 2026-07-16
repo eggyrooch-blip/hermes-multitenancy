@@ -14,6 +14,7 @@ import pytest
 from hermes_multitenancy.card.card_error import (
     CardKitApiError,
     RateLimitError,
+    StreamingClosedError,
     TableLimitError,
     UnavailableError,
     _raise_on_lark_error,
@@ -38,6 +39,14 @@ def test_rate_limit_error_on_230020():
     assert exc.api == "card.create"
     assert isinstance(exc, CardKitApiError)
     assert isinstance(exc, RuntimeError)  # backward compat
+
+
+@pytest.mark.parametrize("code", [200850, 300309])
+def test_streaming_closed_error_on_official_codes(code):
+    with pytest.raises(StreamingClosedError) as info:
+        _raise_on_lark_error(_response(code, "streaming closed"), "cardElement.content")
+    assert info.value.code == code
+    assert isinstance(info.value, CardKitApiError)
 
 
 def test_table_limit_error_on_230099_with_sub_code_11310():

@@ -10,6 +10,7 @@ rather than raised so production behavior is preserved verbatim.
 Phase ordering::
 
     idle ─► creating ─► streaming ─► completed
+                    │             ├► error
                     │             ├► aborted
                     │             └► terminated
                     └► creation_failed
@@ -26,11 +27,14 @@ logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
 _INSTALLED_ATTR = "_hermes_mt_cardkit_compat_installed"
 _STATE_ATTR = "_hermes_mt_streaming_card_state"
 _EPOCH_ATTR = "_hermes_mt_streaming_card_epoch"
+_TERMINAL_ATTR = "_hermes_mt_streaming_card_terminal"
+_TERMINAL_LIMIT = 4096
 
 CardPhase = Literal[
     "idle",
     "creating",
     "streaming",
+    "error",
     "completed",
     "aborted",
     "terminated",
@@ -40,6 +44,7 @@ CardPhase = Literal[
 PHASE_IDLE: CardPhase = "idle"
 PHASE_CREATING: CardPhase = "creating"
 PHASE_STREAMING: CardPhase = "streaming"
+PHASE_ERROR: CardPhase = "error"
 PHASE_COMPLETED: CardPhase = "completed"
 PHASE_ABORTED: CardPhase = "aborted"
 PHASE_TERMINATED: CardPhase = "terminated"
@@ -52,9 +57,10 @@ _PHASE_TRANSITIONS: dict[CardPhase, frozenset[CardPhase]] = {
     # never-started or already-popped ``message_id`` (where ``_state_for``
     # materializes a fresh idle state) records the abort intent cleanly
     # instead of producing illegal-transition log noise.
-    PHASE_IDLE: frozenset({PHASE_CREATING, PHASE_ABORTED}),
-    PHASE_CREATING: frozenset({PHASE_STREAMING, PHASE_CREATION_FAILED, PHASE_ABORTED, PHASE_TERMINATED}),
-    PHASE_STREAMING: frozenset({PHASE_COMPLETED, PHASE_ABORTED, PHASE_TERMINATED}),
+    PHASE_IDLE: frozenset({PHASE_CREATING, PHASE_ABORTED, PHASE_ERROR}),
+    PHASE_CREATING: frozenset({PHASE_STREAMING, PHASE_CREATION_FAILED, PHASE_ABORTED, PHASE_TERMINATED, PHASE_ERROR}),
+    PHASE_STREAMING: frozenset({PHASE_COMPLETED, PHASE_ABORTED, PHASE_TERMINATED, PHASE_ERROR}),
+    PHASE_ERROR: frozenset(),
     PHASE_COMPLETED: frozenset(),
     PHASE_ABORTED: frozenset(),
     PHASE_TERMINATED: frozenset(),
@@ -75,6 +81,7 @@ def _new_state() -> dict[str, Any]:
         "started_at": time.monotonic(),
         "finalized": False,
         "aborted": False,
+        "errored": False,
         "card_id": None,
         "original_card_id": None,
         "sequence": 0,
@@ -100,8 +107,37 @@ def _states(adapter: Any) -> dict[str, dict[str, Any]]:
     return state
 
 
+def _mark_terminal_message(adapter: Any, message_id: str) -> None:
+    terminal = getattr(adapter, _TERMINAL_ATTR, None)
+    if not isinstance(terminal, dict):
+        terminal = {}
+        setattr(adapter, _TERMINAL_ATTR, terminal)
+    key = str(message_id)
+    terminal[key] = None
+    # ponytail: recent bounded tombstones; raise only if >4096 cards can still emit late callbacks.
+    if len(terminal) > _TERMINAL_LIMIT:
+        terminal.pop(next(iter(terminal)))
+
+
+def _is_terminal_message(adapter: Any, message_id: str) -> bool:
+    terminal = getattr(adapter, _TERMINAL_ATTR, None)
+    return isinstance(terminal, dict) and str(message_id) in terminal
+
+
 def _state_for(adapter: Any, message_id: str) -> dict[str, Any]:
-    return _states(adapter).setdefault(str(message_id), _new_state())
+    states = _states(adapter)
+    key = str(message_id)
+    state = states.get(key)
+    if state is not None:
+        return state
+    if _is_terminal_message(adapter, key):
+        state = _new_state()
+        state["finalized"] = True
+        state["phase"] = PHASE_TERMINATED
+        return state
+    state = _new_state()
+    states[key] = state
+    return state
 
 
 def _next_sequence(state: dict[str, Any]) -> int:

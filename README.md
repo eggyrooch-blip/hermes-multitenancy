@@ -265,6 +265,8 @@ Status and canary surfaces are secret-free and may use the profile-local UAT JSO
 
 Known gotcha: a 2026-06-23 production incident produced fresh `refresh_rejected` markers from a local credential-encryption-key failure while affected users still had usable Feishu UAT material. The root cause was treating every proactive refresh exception as user-actionable reauth. The guardrail is that background marker scans never send Feishu DMs; only an actual blocked task may surface passive `/feishu_auth` guidance, and unknown or infrastructure failures must remain diagnostic-only.
 
+Known gotcha: Feishu automatically closes CardKit streaming mode after a long-running reply; later updates return `200850` or `300309`. Treating those codes as a generic card failure makes the conversation appear to stop when the user leaves the chat. The compat controller now re-enables streaming and retries that frame exactly once with a monotonic sequence; an unrecoverable provider failure preserves partial content and ends in an Error card, never a false Completed footer or a duplicate provider run.
+
 ### 4. Sync profiles and routes
 
 With Feishu Contact read scopes, use org sync (dry-run first):

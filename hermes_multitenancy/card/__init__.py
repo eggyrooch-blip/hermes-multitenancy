@@ -6,6 +6,9 @@ with the legacy `hermes_multitenancy.feishu_cardkit_compat` import path.
 """
 from __future__ import annotations
 
-from .streaming_controller import ensure_feishu_cardkit_streaming
+from .streaming_controller import (
+    ensure_feishu_cardkit_streaming,
+    supports_streaming_closed_recovery,
+)
 
-__all__ = ["ensure_feishu_cardkit_streaming"]
+__all__ = ["ensure_feishu_cardkit_streaming", "supports_streaming_closed_recovery"]

@@ -11,6 +11,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_multitenancy import router as router_mod
+
+
+def test_file_generation_guidance_uses_profile_downloads_not_tmp():
+    guidance = router_mod._LARK_CLI_SOUL_GUIDANCE
+    assert "execute_code" in guidance
+    assert "/workspace/Downloads" in guidance
+    assert "/tmp" in guidance
+
 
 def _build_event(
     text: str = "hi",

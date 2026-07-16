@@ -150,7 +150,7 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    return {
+    card = {
         "config": {
             "wide_screen_mode": _should_use_wide_screen_mode(
                 content=content,
@@ -163,6 +163,12 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
         },
         "elements": elements,
     }
+    if state.get("errored"):
+        card["header"] = {
+            "template": "red",
+            "title": {"tag": "plain_text", "content": "执行出错"},
+        }
+    return card
 
 
 def _render_tool_section_panel(tools: list[Any]) -> dict[str, Any] | None:
@@ -257,9 +263,9 @@ def _render_done_footer(state: dict[str, Any]) -> _I18nMarkdown:
 
 def _format_footer_primary_line(state: dict[str, Any], elapsed: str, *, locale: str) -> str:
     if locale == "zh_cn":
-        label = "已停止" if state.get("aborted") else "已完成"
+        label = "出错" if state.get("errored") else "已停止" if state.get("aborted") else "已完成"
         return f"{label} · 耗时 {elapsed}"
-    label = "Stopped" if state.get("aborted") else "Completed"
+    label = "Error" if state.get("errored") else "Stopped" if state.get("aborted") else "Completed"
     return f"{label} · Elapsed {elapsed}"
 
 

@@ -12,6 +12,7 @@ Class hierarchy::
     RuntimeError
     └── CardKitApiError              (base — any non-zero Lark code)
         ├── RateLimitError           (code 230020 — CardKit rate limit)
+        ├── StreamingClosedError     (codes 200850 / 300309)
         ├── TableLimitError          (code 230099 sub_code 11310 — table limit)
         └── UnavailableError         (code 99991663 recalled, 230006 deleted)
 """
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover
 
 
 _RATE_LIMIT_CODE = 230020
+_STREAMING_CLOSED_CODES = frozenset({200850, 300309})
 _TABLE_LIMIT_CODE = 230099
 _TABLE_LIMIT_SUB_CODE = 11310
 _RECALLED_CODE = 99991663
@@ -68,6 +70,10 @@ class RateLimitError(CardKitApiError):
     """Lark CardKit rate limit (code 230020)."""
 
 
+class StreamingClosedError(CardKitApiError):
+    """Card streaming mode has closed and must be enabled again."""
+
+
 class TableLimitError(CardKitApiError):
     """Card hit a table-element shape limit (code 230099, sub_code 11310)."""
 
@@ -93,6 +99,8 @@ def _classify_lark_error(api: str, code: int, msg: str, sub_code: Optional[int])
         return UnavailableError(api, code, msg, sub_code)
     if code == _RATE_LIMIT_CODE:
         return RateLimitError(api, code, msg, sub_code)
+    if code in _STREAMING_CLOSED_CODES:
+        return StreamingClosedError(api, code, msg, sub_code)
     if code == _TABLE_LIMIT_CODE and sub_code == _TABLE_LIMIT_SUB_CODE:
         return TableLimitError(api, code, msg, sub_code)
     return CardKitApiError(api, code, msg, sub_code)

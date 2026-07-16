@@ -91,6 +91,7 @@ _LARK_CLI_SOUL_GUIDANCE = "\n".join(
         "- 当用户要求生成文件、图片、报表、PDF、docx、xlsx、csv、json、markdown 并发回时，不要要求用户提供本机路径。",
         "- 直接在回复中输出一个 ```hermes-artifact-json fenced block，字段使用 filename、format、marker/content/data/rows/title；不要使用宿主机绝对路径。",
         "- filename 只写普通文件名，例如 report.md、summary.pdf、chart.png；Hermes 会自动保存到当前 profile 的 Downloads 并通过飞书发送；markdown 源文件必须自动交付给用户。",
+        "- 使用 execute_code 分段生成大文件时，必须直接写入 /workspace/Downloads/<普通文件名>；不得写入 /tmp 或宿主机路径后宣称已交付。",
         "- 图片如果要作为可下载原文件发送，在 artifact JSON 中设置 as_document=true。",
         "- artifact JSON 是内部交付协议；除必要的测试标记和简短说明外，不要把本机路径、/workspace 路径或 MEDIA 指令解释给用户。",
     ]

@@ -127,6 +127,8 @@ class _CardCapableAdapter:
         self.tool_starts = []
         self.tool_completions = []
         self.aborts = []
+        self.failures = []
+        self.reopens = []
 
     def supports_streaming_card(self):
         return True
@@ -199,6 +201,15 @@ class _CardCapableAdapter:
             {"chat_id": chat_id, "message_id": message_id, "content": content}
         )
         return SimpleNamespace(success=True, message_id=message_id)
+
+    async def fail_streaming_card(self, *, chat_id, message_id, content=None):
+        self.failures.append(
+            {"chat_id": chat_id, "message_id": message_id, "content": content}
+        )
+        return SimpleNamespace(success=True, message_id=message_id)
+
+    async def reopen_streaming_card(self, *, chat_id, message_id):
+        self.reopens.append({"chat_id": chat_id, "message_id": message_id})
 
     async def send(self, chat_id, content, *, reply_to=None, metadata=None):
         self.sent.append(
@@ -631,6 +642,269 @@ async def _run_stream_into_feishu_installs_cardkit_compat_for_clean_feishu_adapt
     assert "**Lark cli (300 ms)**" in rendered
     assert "Hello from clean adapter" in rendered
     assert "已完成 · 耗时" in rendered
+
+
+def test_direct_stream_failure_is_error_terminal_and_does_not_rerun_provider(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+    from hermes_multitenancy.agent_real import _PARTIAL_FAILURE_NOTICE
+
+    calls = 0
+
+    async def stream_then_fail(*_args, **_kwargs):
+        yield "content", "partial answer"
+        raise RuntimeError("provider failed")
+
+    async def forbidden_nonstream(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return "duplicate answer"
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", stream_then_fail)
+    monkeypatch.setattr(agent_real, "real_run_agent", forbidden_nonstream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+    adapter = _CleanFeishuLikeAdapter()
+
+    response = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "chat-1",
+            "profile",
+            tmp_path,
+            SimpleNamespace(text="hi"),
+        )
+    )
+
+    assert calls == 0
+    assert response == f"partial answer\n\n{_PARTIAL_FAILURE_NOTICE}"
+    final_card = adapter.card_patches[-1]["card"]
+    assert final_card["header"]["template"] == "red"
+    assert "partial answer" in str(final_card)
+    assert "出错 · 耗时" in str(final_card)
+    assert "已完成 · 耗时" not in str(final_card)
+
+
+def test_shared_stream_failure_uses_adapter_error_terminal_without_rerun(
+    monkeypatch, tmp_path
+):
+    from hermes_multitenancy import agent_real, router as router_mod
+    from hermes_multitenancy.agent_real import _PARTIAL_FAILURE_NOTICE
+
+    calls = 0
+
+    async def stream_then_fail(*_args, **_kwargs):
+        yield "content", "partial answer"
+        raise RuntimeError("provider failed")
+
+    async def forbidden_nonstream(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return "duplicate answer"
+
+    class RecordingAdapter(_CardCapableAdapter):
+        def __init__(self):
+            super().__init__()
+            self.failures = []
+
+        async def fail_streaming_card(self, *, chat_id, message_id, content=None):
+            self.failures.append(
+                {"chat_id": chat_id, "message_id": message_id, "content": content}
+            )
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    class RecordingConsumer:
+        created = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.deltas = []
+            self.finished = False
+            self.failure_attempts = []
+            self._done = asyncio.Event()
+            type(self).created.append(self)
+
+        @property
+        def message_id(self):
+            return "card-1"
+
+        async def ensure_streaming_card_started(self):
+            return True
+
+        async def run(self):
+            await self._done.wait()
+
+        def on_delta(self, text):
+            self.deltas.append(text)
+
+        async def update_streaming_card_status(self, *_args, **_kwargs):
+            return True
+
+        async def update_streaming_card_reasoning(self, *_args, **_kwargs):
+            return True
+
+        async def update_streaming_card_tool_started(self, *_args, **_kwargs):
+            return True
+
+        async def update_streaming_card_tool_completed(self, *_args, **_kwargs):
+            return True
+
+        async def fail_streaming_card(self, content=None):
+            self.failure_attempts.append(content)
+            return SimpleNamespace(success=False)
+
+        def finish(self):
+            self.finished = True
+            self._done.set()
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", stream_then_fail)
+    monkeypatch.setattr(agent_real, "real_run_agent", forbidden_nonstream)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", RecordingConsumer)
+    monkeypatch.setattr(
+        router_mod,
+        "StreamConsumerConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    adapter = RecordingAdapter()
+
+    response = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "chat-1",
+            "profile",
+            tmp_path,
+            SimpleNamespace(text="hi"),
+        )
+    )
+
+    assert calls == 0
+    assert response == f"partial answer\n\n{_PARTIAL_FAILURE_NOTICE}"
+    assert RecordingConsumer.created[0].finished is False
+    assert RecordingConsumer.created[0].failure_attempts == [response]
+    assert adapter.failures == [
+        {"chat_id": "chat-1", "message_id": "card-1", "content": response}
+    ]
+
+
+def test_native_card_without_failure_terminal_uses_edit_transport(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real, router as router_mod
+    from hermes_multitenancy.agent_real import _PARTIAL_FAILURE_NOTICE
+
+    async def stream_then_fail(*_args, **_kwargs):
+        yield "content", "partial answer"
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", stream_then_fail)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+    adapter = _CardCapableAdapter()
+    adapter.fail_streaming_card = None
+
+    response = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "chat-1",
+            "profile",
+            tmp_path,
+            SimpleNamespace(text="hi"),
+        )
+    )
+
+    assert response == f"partial answer\n\n{_PARTIAL_FAILURE_NOTICE}"
+    assert adapter.started == []
+    assert adapter.edits[-1]["content"] == response
+    assert adapter.edits[-1]["finalize"] is True
+
+
+def test_native_card_without_close_recovery_uses_edit_transport(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def stream_once(*_args, **_kwargs):
+        yield "content", "answer"
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", stream_once)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None, raising=False)
+    adapter = _CardCapableAdapter()
+    adapter.reopen_streaming_card = None
+
+    response = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "chat-1",
+            "profile",
+            tmp_path,
+            SimpleNamespace(text="hi"),
+        )
+    )
+
+    assert response == "answer"
+    assert adapter.started == []
+    assert adapter.edits[-1]["content"] == "answer"
+    assert adapter.edits[-1]["finalize"] is True
+
+
+def test_native_card_reopens_closed_stream_once_before_retry():
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.card.card_error import StreamingClosedError
+
+    class ClosingNativeAdapter(_CardCapableAdapter):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        async def update_streaming_card(
+            self, *, chat_id, message_id, content, finalize=False
+        ):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise StreamingClosedError("cardElement.content", 300309, "closed")
+            return await super().update_streaming_card(
+                chat_id=chat_id,
+                message_id=message_id,
+                content=content,
+                finalize=finalize,
+            )
+
+    async def driver():
+        adapter = ClosingNativeAdapter()
+        assert router_mod._adapter_supports_streaming_card(adapter) is True
+        result = await router_mod._update_feishu_stream_target(
+            adapter,
+            "chat-1",
+            "card-1",
+            "continued",
+            mode="card",
+        )
+        assert result.success is True
+        assert adapter.attempts == 2
+        assert adapter.reopens == [{"chat_id": "chat-1", "message_id": "card-1"}]
+
+    asyncio.run(driver())
+
+
+@pytest.mark.parametrize("failure_mode", ["false", "raise"])
+def test_failed_error_terminal_falls_back_to_final_edit_not_abort(failure_mode):
+    from hermes_multitenancy.router import streaming as streaming_router
+
+    class FailingTerminalAdapter(_CardCapableAdapter):
+        async def fail_streaming_card(self, *, chat_id, message_id, content=None):
+            if failure_mode == "raise":
+                raise RuntimeError("terminal unavailable")
+            return SimpleNamespace(success=False, message_id=message_id)
+
+    async def driver():
+        adapter = FailingTerminalAdapter()
+        result = await streaming_router._fail_feishu_stream_target(
+            adapter,
+            "chat-1",
+            "card-1",
+            "partial\n\n执行出错",
+            mode="card",
+        )
+        assert result.success is True
+        assert adapter.aborts == []
+        assert adapter.edits[-1]["content"] == "partial\n\n执行出错"
+        assert adapter.edits[-1]["finalize"] is True
+
+    asyncio.run(driver())
 
 
 def test_stream_into_feishu_updates_interactive_card_without_auth_patch_helper(
@@ -2567,8 +2841,7 @@ async def test_stream_into_feishu_idle_timeout_finalizes_without_nonstream_rerun
     assert "Phase 2 running" in response
     assert "produced no stream events" in response
     assert adapter.status_updates[-1]["content"] == "任务长时间没有新的运行事件，已停止。"
-    assert "produced no stream events" in adapter.updates[-1]["content"]
-    assert adapter.updates[-1]["finalize"] is True
+    assert "produced no stream events" in adapter.failures[-1]["content"]
 
 
 def test_stream_into_feishu_streams_raw_reasoning_in_card(monkeypatch, tmp_path):

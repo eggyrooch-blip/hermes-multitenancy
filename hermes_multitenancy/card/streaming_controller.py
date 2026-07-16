@@ -10,12 +10,15 @@ CardKit / IM-patch / IM-update fallback.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
+import inspect
 import json
 import logging
 import os
 import time
 from types import MethodType
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .builder import (
     _TOOLS_ELEMENT_ID,
@@ -24,7 +27,7 @@ from .builder import (
     _render_stream_text,
     _to_cardkit2,
 )
-from .card_error import RateLimitError, TableLimitError, UnavailableError, _finalize, _result
+from .card_error import RateLimitError, StreamingClosedError, TableLimitError, UnavailableError, _finalize, _result
 from .cardkit_client import (
     _create_cardkit_card,
     _patch_interactive_message,
@@ -50,10 +53,12 @@ from .state import (
     PHASE_COMPLETED,
     PHASE_CREATING,
     PHASE_CREATION_FAILED,
+    PHASE_ERROR,
     PHASE_STREAMING,
     _acquire_epoch,
     _new_state,
     _next_sequence,
+    _mark_terminal_message,
     _state_for,
     _states,
     _transition,
@@ -71,6 +76,25 @@ from .unavailable_guard import UnavailableGuard
 # observable logger name must not change with the modularization.
 logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
 _FLUSH_CONTROLLERS_ATTR = "_hermes_mt_streaming_flush_controllers"
+_NATIVE_RECOVERY_WRAPPED_ATTR = "_hermes_mt_native_streaming_recovery_wrapped"
+
+
+def _is_terminal_state(state: dict[str, Any]) -> bool:
+    return bool(
+        state.get("finalized")
+        or state.get("aborted")
+        or state.get("errored")
+        or state.get("phase") in {PHASE_ABORTED, PHASE_COMPLETED, PHASE_ERROR}
+    )
+
+
+def _card_write_lock(state: dict[str, Any]) -> asyncio.Lock:
+    lock = state.get("_write_lock")
+    if isinstance(lock, asyncio.Lock):
+        return lock
+    lock = asyncio.Lock()
+    state["_write_lock"] = lock
+    return lock
 
 
 def _card_content_throttle_s() -> float:
@@ -118,7 +142,10 @@ def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
     """Install streaming-card methods on a Feishu adapter when they are absent."""
     if adapter is None:
         return None
-    if _has_native_streaming_surface(adapter) or getattr(adapter, _INSTALLED_ATTR, False):
+    if _has_native_streaming_surface(adapter):
+        _wrap_native_streaming_recovery(adapter)
+        return adapter
+    if getattr(adapter, _INSTALLED_ATTR, False):
         return adapter
     if not _can_install_compat(adapter):
         return adapter
@@ -129,6 +156,7 @@ def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
     adapter.start_streaming_card = MethodType(_start_streaming_card, adapter)
     adapter.update_streaming_card = MethodType(_update_streaming_card, adapter)
     adapter.abort_streaming_card = MethodType(_abort_streaming_card, adapter)
+    adapter.fail_streaming_card = MethodType(_fail_streaming_card, adapter)
     adapter.update_streaming_card_reasoning = MethodType(_update_streaming_card_reasoning, adapter)
     adapter.update_streaming_card_status = MethodType(_update_streaming_card_status, adapter)
     adapter.update_streaming_card_tool_started = MethodType(_update_streaming_card_tool_started, adapter)
@@ -137,6 +165,66 @@ def ensure_feishu_cardkit_streaming(adapter: Any) -> Any:
     setattr(adapter, _INSTALLED_ATTR, True)
     logger.info("multitenancy: installed Feishu CardKit compat streaming surface")
     return adapter
+
+
+def supports_streaming_closed_recovery(adapter: Any) -> bool:
+    """Whether the selected streaming surface has bounded close-code recovery."""
+    return bool(
+        getattr(adapter, _INSTALLED_ATTR, False)
+        or getattr(adapter, _NATIVE_RECOVERY_WRAPPED_ATTR, False)
+    )
+
+
+def _wrap_native_streaming_recovery(adapter: Any) -> bool:
+    """Wrap an explicit native reopen contract with one retry per write.
+
+    Native adapters own their CardKit sequence counter, so the required
+    ``reopen_streaming_card`` method must re-enable streaming with its next
+    sequence. Adapters without that contract are left untouched; the router
+    selects edit transport before opening a card.
+    """
+    if getattr(adapter, _NATIVE_RECOVERY_WRAPPED_ATTR, False):
+        return True
+    reopener = getattr(adapter, "reopen_streaming_card", None)
+    if not callable(reopener):
+        return False
+
+    method_names = (
+        "update_streaming_card",
+        "update_streaming_card_reasoning",
+        "update_streaming_card_status",
+        "update_streaming_card_tool_started",
+        "update_streaming_card_tool_completed",
+        "fail_streaming_card",
+    )
+    for method_name in method_names:
+        original = getattr(adapter, method_name, None)
+        if not callable(original):
+            continue
+
+        def _make_wrapper(method: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
+            @functools.wraps(method)
+            async def _wrapped(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    result = method(*args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+                except StreamingClosedError:
+                    reopened = reopener(
+                        chat_id=str(kwargs.get("chat_id") or ""),
+                        message_id=str(kwargs.get("message_id") or ""),
+                    )
+                    if inspect.isawaitable(reopened):
+                        await reopened
+                    result = method(*args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+
+            return _wrapped
+
+        setattr(adapter, method_name, _make_wrapper(original))
+
+    setattr(adapter, _NATIVE_RECOVERY_WRAPPED_ATTR, True)
+    logger.info("multitenancy: wrapped native Feishu CardKit close-code recovery")
+    return True
 
 
 def _has_native_streaming_surface(adapter: Any) -> bool:
@@ -249,19 +337,22 @@ async def _update_streaming_card(
     del chat_id
     if not UnavailableGuard.should_proceed(self, message_id):
         return _result(False, message_id=str(message_id), error="card unavailable")
-    state = _state_for(self, message_id)
     formatted = _format(self, content)
-    raw_tool_intents, visible_text = _extract_raw_tool_call_intents(formatted)
-    _merge_raw_tool_intents(state, raw_tool_intents)
-    answer_text, reasoning_text = _split_reasoning_text(visible_text)
-    if reasoning_text:
-        state["reasoning"] = reasoning_text
-    if state.get("reasoning_started_at") and not state.get("reasoning_elapsed"):
-        state["reasoning_elapsed"] = max(0.0, time.monotonic() - float(state["reasoning_started_at"]))
-    state["content"] = answer_text
-    state["finalized"] = bool(finalize)
-    if finalize:
-        state["status"] = ""
+    state = _state_for(self, message_id)
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return _result(True, message_id=str(message_id))
+        raw_tool_intents, visible_text = _extract_raw_tool_call_intents(formatted)
+        _merge_raw_tool_intents(state, raw_tool_intents)
+        answer_text, reasoning_text = _split_reasoning_text(visible_text)
+        if reasoning_text:
+            state["reasoning"] = reasoning_text
+        if state.get("reasoning_started_at") and not state.get("reasoning_elapsed"):
+            state["reasoning_elapsed"] = max(0.0, time.monotonic() - float(state["reasoning_started_at"]))
+        state["content"] = answer_text
+        state["finalized"] = bool(finalize)
+        if finalize:
+            state["status"] = ""
     return await _flush_state(self, message_id, state, final=finalize, pop=finalize)
 
 
@@ -276,12 +367,39 @@ async def _abort_streaming_card(
     if not UnavailableGuard.should_proceed(self, message_id):
         return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
-    if content:
-        state["content"] = _format(self, content)
-    state["status"] = "Aborted."
-    state["aborted"] = True
-    state["finalized"] = True
-    _transition(state, PHASE_ABORTED)
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return _result(True, message_id=str(message_id))
+        if content:
+            state["content"] = _format(self, content)
+        state["status"] = "Aborted."
+        state["aborted"] = True
+        state["finalized"] = True
+        _transition(state, PHASE_ABORTED)
+    return await _flush_state(self, message_id, state, final=True, pop=True)
+
+
+async def _fail_streaming_card(
+    self: Any,
+    *,
+    chat_id: str,
+    message_id: str,
+    content: Optional[str] = None,
+) -> Any:
+    del chat_id
+    if not UnavailableGuard.should_proceed(self, message_id):
+        return _result(False, message_id=str(message_id), error="card unavailable")
+    state = _state_for(self, message_id)
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return _result(True, message_id=str(message_id))
+        if content:
+            state["content"] = _format(self, content)
+        state["status"] = ""
+        state["reasoning"] = ""
+        state["errored"] = True
+        state["finalized"] = True
+        _transition(state, PHASE_ERROR)
     return await _flush_state(self, message_id, state, final=True, pop=True)
 
 
@@ -310,6 +428,8 @@ def _update_streaming_card_metrics(
     state = states.get(str(message_id))
     if state is None:
         return _result(False, message_id=str(message_id), error="unknown message_id")
+    if _is_terminal_state(state):
+        return _result(True, message_id=str(message_id))
     if tokens_in is not None:
         state["tokens_in"] = tokens_in
     if tokens_out is not None:
@@ -334,10 +454,13 @@ async def _update_streaming_card_reasoning(
     if not UnavailableGuard.should_proceed(self, message_id):
         return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
-    if not state.get("reasoning_started_at"):
-        state["reasoning_started_at"] = time.monotonic()
-    answer_text, reasoning_text = _split_reasoning_text(_format(self, content))
-    state["reasoning"] = reasoning_text or answer_text
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return _result(True, message_id=str(message_id))
+        if not state.get("reasoning_started_at"):
+            state["reasoning_started_at"] = time.monotonic()
+        answer_text, reasoning_text = _split_reasoning_text(_format(self, content))
+        state["reasoning"] = reasoning_text or answer_text
     # issue #4: route reasoning through the throttled _flush_state (it pushes the
     # same _render_stream_text content) so rapid thinking tokens coalesce into a
     # smooth typewriter instead of one blocking round-trip per token.
@@ -358,17 +481,21 @@ async def _update_streaming_card_status(
     if _is_invisible_card_status(formatted):
         return _result(True, message_id=str(message_id))
     state = _state_for(self, message_id)
-    state["status"] = formatted
-    if state.get("card_id"):
-        try:
-            await _stream_cardkit_content(
-                self,
-                str(state["card_id"]),
-                str(state.get("status") or " "),
-                _next_sequence(state),
-            )
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
             return _result(True, message_id=str(message_id))
-        except Exception as exc:
+        state["status"] = formatted
+    if state.get("card_id"):
+        attempted, exc = await _write_cardkit_frame(
+            self,
+            state,
+            lambda card_id, sequence: _stream_cardkit_content(
+                self, card_id, str(state.get("status") or " "), sequence
+            ),
+        )
+        if attempted and exc is None:
+            return _result(True, message_id=str(message_id))
+        if exc is not None:
             handled = _handle_cardkit_exc(self, message_id, state, exc)
             if handled is True:
                 return _result(True, message_id=str(message_id))
@@ -395,25 +522,32 @@ async def _update_streaming_card_tool_started(
     if not UnavailableGuard.should_proceed(self, message_id):
         return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
-    state["tools"].append(
-        {
-            "name": str(tool_name or "tool"),
-            "status": "running",
-            "preview": str(preview or "")[:240],
-            "args": args,
-        }
-    )
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return _result(True, message_id=str(message_id))
+        state["tools"].append(
+            {
+                "name": str(tool_name or "tool"),
+                "status": "running",
+                "preview": str(preview or "")[:240],
+                "args": args,
+            }
+        )
     if state.get("card_id"):
-        try:
-            await _stream_cardkit_element(
+        attempted, exc = await _write_cardkit_frame(
+            self,
+            state,
+            lambda card_id, sequence: _stream_cardkit_element(
                 self,
-                str(state["card_id"]),
+                card_id,
                 _TOOLS_ELEMENT_ID,
                 _render_tool_calls_section(list(state.get("tools") or [])) or " ",
-                _next_sequence(state),
-            )
+                sequence,
+            ),
+        )
+        if attempted and exc is None:
             return _result(True, message_id=str(message_id))
-        except Exception as exc:
+        if exc is not None:
             handled = _handle_cardkit_exc(self, message_id, state, exc)
             if handled is True:
                 return _result(True, message_id=str(message_id))
@@ -435,37 +569,94 @@ async def _update_streaming_card_tool_completed(
     if not UnavailableGuard.should_proceed(self, message_id):
         return _result(False, message_id=str(message_id), error="card unavailable")
     state = _state_for(self, message_id)
-    name = str(tool_name or "tool")
-    for tool in reversed(state["tools"]):
-        if tool.get("name") == name and tool.get("status") == "running":
-            tool["status"] = "error" if is_error else "done"
-            tool["duration"] = duration
-            break
-    else:
-        state["tools"].append(
-            {
-                "name": name,
-                "status": "error" if is_error else "done",
-                "duration": duration,
-            }
-        )
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return _result(True, message_id=str(message_id))
+        name = str(tool_name or "tool")
+        for tool in reversed(state["tools"]):
+            if tool.get("name") == name and tool.get("status") == "running":
+                tool["status"] = "error" if is_error else "done"
+                tool["duration"] = duration
+                break
+        else:
+            state["tools"].append(
+                {
+                    "name": name,
+                    "status": "error" if is_error else "done",
+                    "duration": duration,
+                }
+            )
     if state.get("card_id"):
-        try:
-            await _stream_cardkit_element(
+        attempted, exc = await _write_cardkit_frame(
+            self,
+            state,
+            lambda card_id, sequence: _stream_cardkit_element(
                 self,
-                str(state["card_id"]),
+                card_id,
                 _TOOLS_ELEMENT_ID,
                 _render_tool_calls_section(list(state.get("tools") or [])) or " ",
-                _next_sequence(state),
-            )
+                sequence,
+            ),
+        )
+        if attempted and exc is None:
             return _result(True, message_id=str(message_id))
-        except Exception as exc:
+        if exc is not None:
             handled = _handle_cardkit_exc(self, message_id, state, exc)
             if handled is True:
                 return _result(True, message_id=str(message_id))
             if handled is False:
                 return _result(False, message_id=str(message_id), error=str(exc))
     return await _flush_state(self, message_id, state)
+
+
+async def _recover_closed_stream(
+    adapter: Any,
+    state: dict[str, Any],
+    card_id: str,
+    exc: Exception,
+    retry: Callable[[int], Awaitable[Any]],
+) -> Optional[Exception]:
+    """Re-enable an auto-closed CardKit stream and retry the frame once."""
+    if not isinstance(exc, StreamingClosedError):
+        return exc
+    try:
+        await _set_card_streaming_mode(adapter, card_id, True, _next_sequence(state))
+        await retry(_next_sequence(state))
+    except Exception as recovery_exc:
+        logger.warning(
+            "multitenancy: Feishu CardKit stream recovery failed after code=%s: %s",
+            exc.code,
+            recovery_exc,
+        )
+        return recovery_exc
+    logger.info("multitenancy: Feishu CardKit stream reopened after code=%s", exc.code)
+    return None
+
+
+async def _write_cardkit_frame(
+    adapter: Any,
+    state: dict[str, Any],
+    write: Callable[[str, int], Awaitable[Any]],
+) -> tuple[bool, Optional[Exception]]:
+    """Serialize one card write and its optional reopen/retry pair."""
+    async with _card_write_lock(state):
+        if _is_terminal_state(state):
+            return True, None
+        card_id = str(state.get("card_id") or "")
+        if not card_id:
+            return False, None
+        try:
+            await write(card_id, _next_sequence(state))
+        except Exception as exc:
+            exc = await _recover_closed_stream(
+                adapter,
+                state,
+                card_id,
+                exc,
+                lambda sequence: write(card_id, sequence),
+            )
+            return True, exc
+        return True, None
 
 
 def _handle_cardkit_exc(
@@ -502,36 +693,45 @@ async def _flush_state(
 
     async def _flush_body() -> Any:
         try:
+            if not final and _is_terminal_state(state):
+                return _result(True, message_id=str(message_id))
             card_id = str(state.get("card_id") or "")
             original_card_id = str(state.get("original_card_id") or "")
-            if final and original_card_id:
-                return await _deliver_final_card(adapter, message_id, state, pop=pop)
+            if final:
+                async with _card_write_lock(state):
+                    return await _deliver_final_card(adapter, message_id, state, pop=pop)
 
             if card_id:
-                try:
-                    rendered = _render_stream_text(state)
-                    missing = object()
-                    last_flushed = state.get("last_flushed_text", missing)
-                    if last_flushed is not missing and rendered == last_flushed:
-                        return _result(True, message_id=str(message_id))
-                    await _stream_cardkit_content(adapter, card_id, rendered, _next_sequence(state))
+                rendered = _render_stream_text(state)
+                missing = object()
+                last_flushed = state.get("last_flushed_text", missing)
+                if last_flushed is not missing and rendered == last_flushed:
+                    return _result(True, message_id=str(message_id))
+                attempted, exc = await _write_cardkit_frame(
+                    adapter,
+                    state,
+                    lambda current_card_id, sequence: _stream_cardkit_content(
+                        adapter, current_card_id, rendered, sequence
+                    ),
+                )
+                if attempted and exc is None:
                     state["last_flushed_text"] = rendered
                     return _result(True, message_id=str(message_id))
-                except Exception as exc:
+                if exc is not None:
                     handled = _handle_cardkit_exc(adapter, message_id, state, exc)
                     if handled is True:
                         return _result(True, message_id=str(message_id))
                     if handled is False:
                         return _result(False, message_id=str(message_id), error=str(exc))
-                    return _result(True, message_id=str(message_id))
+                return _result(True, message_id=str(message_id))
 
             if original_card_id:
                 return _result(True, message_id=str(message_id))
 
-            if final:
-                return await _deliver_final_card(adapter, message_id, state, pop=pop)
-
-            success = await _patch_interactive_state(adapter, str(message_id), state)
+            async with _card_write_lock(state):
+                if _is_terminal_state(state):
+                    return _result(True, message_id=str(message_id))
+                success = await _patch_interactive_state(adapter, str(message_id), state)
             return _result(bool(success), message_id=str(message_id), error=None if success else "card patch failed")
         except Exception as exc:
             if isinstance(exc, UnavailableError):
@@ -583,7 +783,10 @@ async def _patch_interactive_state(adapter: Any, message_id: str, state: dict[st
     card = _render_message_card(state)
     patch_auth_card = getattr(adapter, "_patch_auth_card", None)
     if callable(patch_auth_card):
-        return bool(await patch_auth_card(message_id, card))
+        result = patch_auth_card(message_id, card)
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
     if _can_patch_interactive_message(adapter):
         return await _patch_interactive_message(adapter, message_id, card)
     if _can_update_interactive_message(adapter):
@@ -610,9 +813,23 @@ async def _deliver_final_card(
                 _next_sequence(state),
             )
         except Exception as exc:
-            if isinstance(exc, UnavailableError):
+            exc = await _recover_closed_stream(
+                adapter,
+                state,
+                card_id,
+                exc,
+                lambda sequence: _stream_cardkit_content(
+                    adapter,
+                    card_id,
+                    _render_stream_text(state),
+                    sequence,
+                ),
+            )
+            if exc is None:
+                pass
+            elif isinstance(exc, UnavailableError):
                 UnavailableGuard.mark_unavailable(adapter, str(message_id), exc.code)
-            if isinstance(exc, RateLimitError):
+            elif isinstance(exc, RateLimitError):
                 logger.debug("multitenancy: Feishu CardKit rate limited (230020) during final stream, skipping frame")
             else:
                 logger.warning(
@@ -647,23 +864,26 @@ async def _deliver_final_card(
                     exc,
                 )
             else:
-                if not state.get("aborted"):
+                if not state.get("aborted") and not state.get("errored"):
                     _transition(state, PHASE_COMPLETED)
                 if pop:
+                    _mark_terminal_message(adapter, message_id)
                     _states(adapter).pop(str(message_id), None)
                 return _result(True, message_id=str(message_id))
 
     patch_success = await _patch_interactive_state(adapter, str(message_id), state)
     if patch_success:
-        if not state.get("aborted"):
+        if not state.get("aborted") and not state.get("errored"):
             _transition(state, PHASE_COMPLETED)
         if pop:
+            _mark_terminal_message(adapter, message_id)
             _states(adapter).pop(str(message_id), None)
         return _result(True, message_id=str(message_id))
 
     text_success = await _send_plaintext_last_resort(adapter, state)
     if text_success:
         if pop:
+            _mark_terminal_message(adapter, message_id)
             _states(adapter).pop(str(message_id), None)
         return _result(True, message_id=str(message_id))
     return _result(False, message_id=str(message_id), error="final delivery failed")

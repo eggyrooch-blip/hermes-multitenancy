@@ -50,6 +50,15 @@ def _clean_stream_delta_text(text: str, profile_home: Optional[Path] = None) -> 
     return cleaned
 
 
+def _stream_failure_content(text: str, profile_home: Optional[Path] = None) -> str:
+    from ..agent_real import _PARTIAL_FAILURE_NOTICE
+
+    partial = _clean_stream_display_text(text, profile_home).rstrip()
+    if _PARTIAL_FAILURE_NOTICE in partial:
+        return partial
+    return f"{partial}\n\n{_PARTIAL_FAILURE_NOTICE}" if partial else _PARTIAL_FAILURE_NOTICE
+
+
 def _start_hub_flow_poll(
     *,
     profile_name: str,
@@ -218,20 +227,37 @@ def _adapter_supports_streaming_card(adapter) -> bool:
     """Return True when the shared Feishu adapter can drive card streaming."""
     if adapter is None:
         return False
+    recovery_supported = False
     try:
-        from ..feishu_cardkit_compat import ensure_feishu_cardkit_streaming
+        from ..feishu_cardkit_compat import (
+            ensure_feishu_cardkit_streaming,
+            supports_streaming_closed_recovery,
+        )
 
         ensure_feishu_cardkit_streaming(adapter)
+        recovery_supported = supports_streaming_closed_recovery(adapter)
     except Exception as exc:
         _m.logger.debug("multitenancy: Feishu CardKit compat install skipped: %s", exc)
     supports = getattr(adapter, "supports_streaming_card", None)
     if callable(supports):
         try:
-            return bool(supports())
+            supported = bool(supports())
         except Exception as exc:
             _m.logger.debug("multitenancy: supports_streaming_card failed: %s", exc)
             return False
-    return bool(getattr(adapter, "SUPPORTS_STREAMING_CARD", False))
+    else:
+        supported = bool(getattr(adapter, "SUPPORTS_STREAMING_CARD", False))
+    if supported and not recovery_supported:
+        _m.logger.warning(
+            "multitenancy: native streaming card adapter lacks close-code recovery; using edit transport"
+        )
+        return False
+    if supported and not callable(getattr(adapter, "fail_streaming_card", None)):
+        _m.logger.warning(
+            "multitenancy: streaming card adapter lacks failure terminal; using edit transport"
+        )
+        return False
+    return supported
 
 
 async def _start_feishu_stream_target(
@@ -328,6 +354,42 @@ async def _abort_feishu_stream_target(
         chat_id,
         message_id,
         content or "Aborted.",
+        mode=mode,
+        finalize=True,
+    )
+
+
+async def _fail_feishu_stream_target(
+    adapter, chat_id, message_id, content, *, mode: str
+):
+    """Finish a failed card honestly, never converting failure into user abort."""
+    if mode == "card":
+        failer = getattr(adapter, "fail_streaming_card", None)
+        if callable(failer):
+            try:
+                result = await failer(chat_id=chat_id, message_id=message_id, content=content)
+                if getattr(result, "success", False):
+                    return result
+            except Exception as exc:
+                _m.logger.debug(
+                    "multitenancy: fail_streaming_card failed: %s",
+                    type(exc).__name__,
+                )
+            _m.logger.warning("multitenancy: fail_streaming_card failed; using final edit")
+        else:
+            _m.logger.warning("multitenancy: fail_streaming_card unavailable; using final edit")
+        return await _m._edit_with_retry(
+            adapter,
+            chat_id,
+            message_id,
+            content,
+            finalize=True,
+        )
+    return await _m._update_feishu_stream_target(
+        adapter,
+        chat_id,
+        message_id,
+        content,
         mode=mode,
         finalize=True,
     )
@@ -513,7 +575,7 @@ async def _stream_into_feishu_shared_consumer(
         return None
 
     import time
-    from ..agent_real import stream_run_agent, real_run_agent
+    from ..agent_real import stream_run_agent
     from ..runtime import _PROFILE_HOME_VAR
 
     stream_started_at = time.monotonic()
@@ -547,6 +609,7 @@ async def _stream_into_feishu_shared_consumer(
     terminal_update_sent = False
     first_agent_event_seen = False
     content_delta_seen = False
+    stream_failed = False
     content = ""
     thinking = ""
     last_reasoning_edit = 0.0
@@ -584,6 +647,30 @@ async def _stream_into_feishu_shared_consumer(
             return
         consumer.finish()
         await consumer_task
+
+    async def _fail_consumer(failure_content: str) -> bool:
+        terminal = getattr(consumer, "fail_streaming_card", None)
+        if callable(terminal):
+            try:
+                result = await terminal(failure_content)
+                if result is True or getattr(result, "success", False):
+                    return True
+            except Exception as exc:
+                _m.logger.debug(
+                    "multitenancy: shared fail seam failed: %s",
+                    type(exc).__name__,
+                )
+        message_id = getattr(consumer, "message_id", None)
+        if not message_id:
+            return False
+        result = await _fail_feishu_stream_target(
+            adapter,
+            chat_id,
+            message_id,
+            failure_content,
+            mode="card",
+        )
+        return bool(result is True or getattr(result, "success", False))
 
     try:
         start_task = asyncio.create_task(consumer.ensure_streaming_card_started())
@@ -729,24 +816,28 @@ async def _stream_into_feishu_shared_consumer(
                     content += timeout_notice
                     consumer.on_delta(_clean_stream_display_text(timeout_notice, profile_home))
                     content_delta_seen = True
+                    stream_failed = True
                 else:
-                    _m.logger.info("multitenancy: shared streaming failed (%s) — falling back to non-stream", exc)
-                    try:
-                        content = await real_run_agent(event, profile_home, messages=messages)
-                    except Exception as fallback_exc:
-                        _m.logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
-                        content = (
-                            "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
-                            "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
-                        )
-                    if not content_delta_seen:
-                        consumer.on_delta(_clean_stream_display_text(content, profile_home))
-                        content_delta_seen = True
+                    _m.logger.info(
+                        "multitenancy: shared streaming recovery exhausted (%s)",
+                        type(exc).__name__,
+                    )
+                    content = _stream_failure_content(content, profile_home)
+                    stream_failed = True
         finally:
             _PROFILE_HOME_VAR.reset(token)
             await _stop_idle_card_heartbeat()
 
         full = content if content else (thinking if thinking else "(empty response)")
+        if stream_failed:
+            terminal_update_sent = await _fail_consumer(full)
+            if consumer_task is not None:
+                consumer_task.cancel()
+                try:
+                    await consumer_task
+                except asyncio.CancelledError:
+                    pass
+            return full
         if not content_delta_seen:
             consumer.on_delta(_clean_stream_display_text(full, profile_home))
 
@@ -846,6 +937,7 @@ async def _stream_into_feishu(
     content_started = False
     first_agent_event_seen = False
     terminal_update_sent = False
+    stream_failed = False
     card_reasoning_sent = False
     idle_heartbeat_task: Optional[asyncio.Task] = None
 
@@ -1257,21 +1349,18 @@ async def _stream_into_feishu(
                         )
                     except Exception as status_exc:
                         _m.logger.debug("multitenancy: idle-timeout status update failed: %s", status_exc)
+                    stream_failed = True
                 else:
-                    _m.logger.info("multitenancy: streaming failed (%s) — falling back to non-stream", exc)
-                    try:
-                        content = await real_run_agent(event, profile_home, messages=messages)
-                        full_content = content
-                    except Exception as fallback_exc:
-                        # Both stream + non-stream LLM paths failed (e.g. region block,
-                        # exhausted credentials). Surface a user-visible error instead
-                        # of leaving the "..." placeholder hanging.
-                        _m.logger.warning("multitenancy: LLM fully unavailable: %s", fallback_exc)
-                        content = (
-                            "⚠️ 模型暂时不可用 (LLM provider rejected the request).\n"
-                            "请检查 profile 的 config.yaml 模型/凭据, 或稍后再试。"
-                        )
-                        full_content = content
+                    _m.logger.info(
+                        "multitenancy: streaming recovery exhausted (%s)",
+                        type(exc).__name__,
+                    )
+                    full_content = _stream_failure_content(
+                        full_content or content,
+                        profile_home,
+                    )
+                    content = _stream_failure_content(content, profile_home)
+                    stream_failed = True
         finally:
             _PROFILE_HOME_VAR.reset(token)
             await _stop_idle_card_heartbeat()
@@ -1286,6 +1375,27 @@ async def _stream_into_feishu(
             message_id=placeholder_id,
             profile_home=profile_home,
         )
+        if stream_failed:
+            try:
+                result = await _run_terminal_stream_update(
+                    _fail_feishu_stream_target(
+                        adapter,
+                        chat_id,
+                        placeholder_id,
+                        display_current,
+                        mode=stream_mode,
+                    ),
+                    label="stream failure update",
+                )
+                terminal_update_sent = bool(
+                    result is True or getattr(result, "success", False)
+                )
+            except Exception as exc:
+                _m.logger.debug(
+                    "multitenancy: failure stream update failed: %s",
+                    type(exc).__name__,
+                )
+            return full
         try:
             await _run_terminal_stream_update(
                 _m._update_feishu_stream_target(

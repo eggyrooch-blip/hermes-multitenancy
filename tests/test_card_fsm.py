@@ -19,6 +19,7 @@ from hermes_multitenancy.card.state import (
     PHASE_COMPLETED,
     PHASE_CREATING,
     PHASE_CREATION_FAILED,
+    PHASE_ERROR,
     PHASE_IDLE,
     PHASE_STREAMING,
     PHASE_TERMINATED,
@@ -33,6 +34,7 @@ _ALL_PHASES = {
     PHASE_IDLE,
     PHASE_CREATING,
     PHASE_STREAMING,
+    PHASE_ERROR,
     PHASE_COMPLETED,
     PHASE_ABORTED,
     PHASE_TERMINATED,
@@ -47,6 +49,7 @@ def test_new_state_starts_at_idle_phase_with_epoch_zero():
     # Backward-compat fields must remain present and falsy on a fresh state.
     assert state["finalized"] is False
     assert state["aborted"] is False
+    assert state["errored"] is False
 
 
 def test_phase_transitions_table_covers_all_states():
@@ -55,7 +58,7 @@ def test_phase_transitions_table_covers_all_states():
     for successors in _PHASE_TRANSITIONS.values():
         assert successors <= _ALL_PHASES
     # Terminal phases have no successors.
-    for terminal in (PHASE_COMPLETED, PHASE_ABORTED, PHASE_TERMINATED, PHASE_CREATION_FAILED):
+    for terminal in (PHASE_COMPLETED, PHASE_ABORTED, PHASE_ERROR, PHASE_TERMINATED, PHASE_CREATION_FAILED):
         assert _PHASE_TRANSITIONS[terminal] == frozenset()
 
 
