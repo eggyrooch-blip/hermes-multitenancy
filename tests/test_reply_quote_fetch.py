@@ -225,7 +225,11 @@ async def test_reply_quote_skips_interactive_preview_image_download() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reply_quote_interactive_raw_card_reaches_final_context(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("chat_type", ["p2p", "group"])
+async def test_reply_quote_interactive_raw_card_reaches_final_context(
+    monkeypatch: pytest.MonkeyPatch,
+    chat_type: str,
+) -> None:
     FakeFeishuAdapter, saved = _install_fake_feishu()
     try:
         from hermes_multitenancy.feishu_inbound_richtext import _extract_interactive_card_text
@@ -292,7 +296,7 @@ async def test_reply_quote_interactive_raw_card_reaches_final_context(monkeypatc
             data={},
             message=SimpleNamespace(parent_id="om_parent_card", upper_message_id=None),
             sender_id=SimpleNamespace(open_id="ou_replying_user"),
-            chat_type="p2p",
+            chat_type=chat_type,
             message_id="om_reply_card",
         )
 
