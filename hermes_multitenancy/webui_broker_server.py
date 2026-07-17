@@ -763,18 +763,22 @@ def create_run_broker_app(
             )
 
         try:
-            # Billing identity preparation can call the profile apiserver and
-            # fail transiently. Keep this request retryable until preparation
-            # succeeds; admission is the point that consumes the idempotency key.
-            prepared.run_request = await prepare_billing_request(prepared.run_request)
-            admission_broker = RunBroker(
+            # Reject policy/sandbox failures before any profile or billing I/O,
+            # but do not consume the real idempotency key during this preflight.
+            policy_broker = RunBroker(
                 dispatch_agent=lambda _req: "",
-                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+                mark_seen=lambda _request: True,
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            admission = await admission_broker.admit(prepared.run_request)
+            await policy_broker.admit(prepared.run_request)
         except RunRejected as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
+
+        try:
+            # Billing identity preparation can call the profile apiserver and
+            # fail transiently. Keep this request retryable until preparation
+            # succeeds; admission below is the point that consumes the key.
+            prepared.run_request = await prepare_billing_request(prepared.run_request)
         except Exception:
             logger.exception(
                 "[multitenancy] async ingest billing preparation failed profile=%s",
@@ -789,6 +793,16 @@ def create_run_broker_app(
                 },
                 status=503,
             )
+
+        try:
+            admission_broker = RunBroker(
+                dispatch_agent=lambda _req: "",
+                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+                sandbox_available=sandbox_available or _default_sandbox_available,
+            )
+            admission = await admission_broker.admit(prepared.run_request)
+        except RunRejected as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=403)
 
         if admission.duplicate:
             return web.json_response(

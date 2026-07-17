@@ -938,6 +938,7 @@ def test_ingest_async_billing_failure_keeps_idempotency_retryable(monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
 
     from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.run_broker import RunRejected
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
 
     prepare_attempts = 0
@@ -949,7 +950,7 @@ def test_ingest_async_billing_failure_keeps_idempotency_retryable(monkeypatch):
         nonlocal prepare_attempts
         prepare_attempts += 1
         if prepare_attempts == 1:
-            raise RuntimeError("temporary billing lookup failure")
+            raise RunRejected("temporary billing lookup failure")
         return replace(request, metadata={**request.metadata, "billing_prepared": True})
 
     def mark_seen(request):
@@ -1022,6 +1023,11 @@ def test_ingest_async_billing_failure_keeps_idempotency_retryable(monkeypatch):
 
 def test_ingest_async_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatch):
     calls = {"n": 0}
+    prepares = {"n": 0}
+
+    async def prepare(request):
+        prepares["n"] += 1
+        return request
 
     async def dispatch(request):
         calls["n"] += 1
@@ -1031,7 +1037,10 @@ def test_ingest_async_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatc
     monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
     monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
 
+    from hermes_multitenancy import billing_identity
     from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
 
     app = create_run_broker_app(
         dispatch_agent=dispatch,
@@ -1060,6 +1069,7 @@ def test_ingest_async_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatc
     assert body["ok"] is False
     assert "run_id" not in body
     assert calls["n"] == 0
+    assert prepares["n"] == 0
 
 def test_ingest_async_submit_returns_run_id_and_poll_eventually_succeeds(monkeypatch):
     release = asyncio.Event()
