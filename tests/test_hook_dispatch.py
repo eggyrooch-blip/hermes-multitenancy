@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import replace
 import json
 import zlib
 import zipfile
@@ -1462,6 +1463,180 @@ async def test_first_billing_identity_failure_is_visible_and_retryable(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_feishu_duplicate_coalesces_prepare_enrichment_and_admission(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    add_spike_route("ou_feishu_coalesce", tmp_path)
+    seen = set()
+    prepare_calls = 0
+    enrich_calls = 0
+    dispatches = []
+    enrich_started = asyncio.Event()
+    release_enrich = asyncio.Event()
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return replace(request, metadata={"litellm_billing_user_id": "employee-1"})
+
+    async def enrich(_event, _gateway, **_kwargs):
+        nonlocal enrich_calls
+        enrich_calls += 1
+        enrich_started.set()
+        await release_enrich.wait()
+        return "enriched Feishu content"
+
+    def is_seen(request):
+        return request.effective_idempotency_key in seen
+
+    def mark_seen(request):
+        key = request.effective_idempotency_key
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    async def stream(_adapter, _chat_id, _profile, _home, event, **_kwargs):
+        dispatches.append((event.text, event.raw_event["metadata"]))
+        return "ok"
+
+    class FullFeishuAdapter:
+        async def on_processing_start(self, _event):
+            return None
+
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router_mod, "_call_enrich_via_hermes_pipeline", enrich)
+    monkeypatch.setattr(router_mod, "_is_run_request_seen", is_seen)
+    monkeypatch.setattr(router_mod, "_mark_run_request_seen", mark_seen)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", stream)
+    gateway = SimpleNamespace(adapters={"feishu": FullFeishuAdapter()})
+    first_event = _build_event(text="same delivery", user_id="ou_feishu_coalesce")
+    second_event = _build_event(text="same delivery", user_id="ou_feishu_coalesce")
+    first_event.message_id = second_event.message_id = "om_feishu_coalesce"
+
+    try:
+        first = asyncio.create_task(router_mod.handle_async(event=first_event, gateway=gateway))
+        await enrich_started.wait()
+        second = asyncio.create_task(router_mod.handle_async(event=second_event, gateway=gateway))
+        await asyncio.sleep(0)
+
+        assert prepare_calls == 1
+        assert enrich_calls == 1
+
+        release_enrich.set()
+        await asyncio.gather(first, second)
+
+        assert prepare_calls == 1
+        assert enrich_calls == 1
+        assert len(seen) == 1
+        assert dispatches == [
+            ("enriched Feishu content", {"litellm_billing_user_id": "employee-1"})
+        ]
+    finally:
+        clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_feishu_without_message_id_keeps_canonical_key_after_enrichment(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    add_spike_route("ou_feishu_content_key", tmp_path)
+    seen = set()
+    marked = []
+    prepare_calls = 0
+    enrich_calls = 0
+    dispatches = []
+
+    def canonical_key(request):
+        record = router_mod._run_request_dedupe_record(request)
+        assert record is not None
+        return record[0]
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return replace(request, metadata={"litellm_billing_user_id": "employee-2"})
+
+    async def enrich(_event, _gateway, **_kwargs):
+        nonlocal enrich_calls
+        enrich_calls += 1
+        return "a different enriched payload that must only be used for dispatch"
+
+    def mark_seen(request):
+        key = canonical_key(request)
+        marked.append(key)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    async def stream(_adapter, _chat_id, _profile, _home, event, **_kwargs):
+        dispatches.append(event.text)
+        return "ok"
+
+    class FullFeishuAdapter:
+        async def on_processing_start(self, _event):
+            return None
+
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router_mod, "_call_enrich_via_hermes_pipeline", enrich)
+    monkeypatch.setattr(
+        router_mod,
+        "_is_run_request_seen",
+        lambda request: canonical_key(request) in seen,
+    )
+    monkeypatch.setattr(router_mod, "_mark_run_request_seen", mark_seen)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", stream)
+    gateway = SimpleNamespace(adapters={"feishu": FullFeishuAdapter()})
+    original = "the original Feishu content is intentionally long enough for content dedupe"
+
+    try:
+        await router_mod.handle_async(
+            event=_build_event(text=original, user_id="ou_feishu_content_key"),
+            gateway=gateway,
+        )
+        await router_mod.handle_async(
+            event=_build_event(text=original, user_id="ou_feishu_content_key"),
+            gateway=gateway,
+        )
+
+        assert prepare_calls == 1
+        assert enrich_calls == 1
+        assert dispatches == [
+            "a different enriched payload that must only be used for dispatch"
+        ]
+        assert len(marked) == 1
+        assert marked[0].startswith("content:")
+        assert not marked[0].startswith("idem:")
+    finally:
+        clear_spike_routes()
+
+
+@pytest.mark.asyncio
 async def test_hook_defers_gateway_processing_complete_for_routed_message(monkeypatch):
     """Base gateway completion must not remove Feishu Typing while router task runs."""
     from hermes_multitenancy import on_pre_gateway_dispatch
@@ -1592,21 +1767,13 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
         def __init__(self, request):
             self.request = request
 
-        def with_request(self, request):
-            return FakePrepared(request)
-
     class FakeBroker:
-        def check_policy(self, request):
-            return request
+        async def prepare_and_admit(self, request, *, transform_request):
+            dispatch_request = await transform_request(FakePrepared(request))
+            admitted.append(dispatch_request)
+            return FakePrepared(dispatch_request), RunResult(content="", duplicate=False)
 
-        async def prepare_if_fresh(self, request):
-            return FakePrepared(request)
-
-        async def admit_prepared(self, prepared):
-            admitted.append(prepared.request)
-            return RunResult(content="", duplicate=False)
-
-        async def run_prepared(self, prepared):
+        async def run_admitted(self, prepared, *, dispatch_agent):
             return RunResult(content="ok", duplicate=False)
 
     class MockPool:
@@ -1652,28 +1819,16 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
         def __init__(self, request):
             self.request = request
 
-        def with_request(self, request):
-            return FakePrepared(request)
-
     class FakeBroker:
-        def check_policy(self, request):
-            return request
+        async def prepare_and_admit(self, request, *, transform_request):
+            dispatch_request = await transform_request(FakePrepared(request))
+            broker_calls.append(("admit", dispatch_request.content))
+            return FakePrepared(dispatch_request), RunResult(content="", duplicate=False)
 
-        async def prepare_if_fresh(self, request):
-            return FakePrepared(request)
-
-        async def admit_prepared(self, prepared):
-            broker_calls.append(("admit", prepared.request.content))
-            return RunResult(content="", duplicate=False)
-
-        async def run_prepared(self, prepared):
+        async def run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
-            broker_calls.append(("run_prepared", request.content))
-            response = await router_mod._get_pool().dispatch(
-                request.profile_name,
-                profile_home,
-                SimpleNamespace(text=request.content),
-            )
+            broker_calls.append(("run_admitted", request.content))
+            response = await dispatch_agent(request)
             return RunResult(content=response, duplicate=False)
 
     class MockPool:
@@ -1691,7 +1846,7 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
 
     assert broker_calls == [
         ("admit", "hello nonstream broker"),
-        ("run_prepared", "hello nonstream broker"),
+        ("run_admitted", "hello nonstream broker"),
     ]
     assert pool_calls == [("owner", "hello nonstream broker")]
     clear_spike_routes()
@@ -1717,27 +1872,16 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
         def __init__(self, request):
             self.request = request
 
-        def with_request(self, request):
-            return FakePrepared(request)
-
     class FakeBroker:
-        def __init__(self, dispatch_agent=None):
-            self.dispatch_agent = dispatch_agent
+        async def prepare_and_admit(self, request, *, transform_request):
+            dispatch_request = await transform_request(FakePrepared(request))
+            broker_calls.append(("admit", dispatch_request.content))
+            return FakePrepared(dispatch_request), RunResult(content="", duplicate=False)
 
-        def check_policy(self, request):
-            return request
-
-        async def prepare_if_fresh(self, request):
-            return FakePrepared(request)
-
-        async def admit_prepared(self, prepared):
-            broker_calls.append(("admit", prepared.request.content))
-            return RunResult(content="", duplicate=False)
-
-        async def run_prepared(self, prepared):
+        async def run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
-            broker_calls.append(("run_prepared", request.content))
-            response = await self.dispatch_agent(request)
+            broker_calls.append(("run_admitted", request.content))
+            response = await dispatch_agent(request)
             return RunResult(content=response, duplicate=False)
 
     class FullAdapter:
@@ -1760,7 +1904,7 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     monkeypatch.setattr(
         router_mod,
         "_make_routed_run_broker",
-        lambda **kwargs: FakeBroker(kwargs.get("dispatch_agent")),
+        lambda **_kwargs: FakeBroker(),
     )
     monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
     monkeypatch.setattr(router_mod, "_deliver_media_from_stream_response", fake_media)
@@ -1774,7 +1918,7 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
 
     assert broker_calls == [
         ("admit", "hello streaming broker"),
-        ("run_prepared", "hello streaming broker"),
+        ("run_admitted", "hello streaming broker"),
     ]
     assert stream_calls == [("chat-123", "owner", "owner", "hello streaming broker", 1)]
     assert media_calls == [("stream ok", "hello streaming broker", "owner")]

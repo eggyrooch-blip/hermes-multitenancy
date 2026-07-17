@@ -950,18 +950,25 @@ def _ingest_materialize_secret_dir(
     except Exception:
         pass
     secret_dir = root / run_id
-    secret_dir.mkdir(parents=False, exist_ok=False, mode=0o700)
-    for item in secret_spec.entries:
-        path = secret_dir / item["name"]
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, item["value"].encode("utf-8"))
-        finally:
-            os.close(fd)
-        try:
-            path.chmod(0o600)
-        except Exception:
-            pass
+    created = False
+    try:
+        secret_dir.mkdir(parents=False, exist_ok=False, mode=0o700)
+        created = True
+        for item in secret_spec.entries:
+            path = secret_dir / item["name"]
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, item["value"].encode("utf-8"))
+            finally:
+                os.close(fd)
+            try:
+                path.chmod(0o600)
+            except Exception:
+                pass
+    except Exception:
+        if created:
+            _ingest_cleanup_secret_dir(secret_dir)
+        raise
     logger.info(
         "[multitenancy] ingest secrets materialized profile=%s run_id=%s secrets=%s",
         profile_name,

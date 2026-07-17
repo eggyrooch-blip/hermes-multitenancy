@@ -1021,6 +1021,197 @@ def test_ingest_async_billing_failure_keeps_idempotency_retryable(monkeypatch):
     assert dispatched[0].metadata["billing_prepared"] is True
 
 
+def test_ingest_async_secret_materialization_failure_keeps_idempotency_retryable(
+    monkeypatch, tmp_path
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker import periphery
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_calls = 0
+    marked = []
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        return True
+
+    async def dispatch(request):
+        dispatched.append(request)
+        return "ok"
+
+    real_write = periphery.os.write
+    fail_once = True
+
+    def flaky_write(fd, data):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OSError("simulated secret write failure")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(periphery.os, "write", flaky_write)
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "shared"))
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+    secret_root = tmp_path / "shared" / "profiles" / "owner" / "tmp" / "ingest-secrets"
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "content": "hi",
+            "idempotency_key": "async-secret-retry",
+            "secrets": {"cms": {"type": "opaque", "value": "retry-secret"}},
+        }
+        headers = {"Authorization": "Bearer testkey"}
+        try:
+            failed = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            failed_body = await failed.json()
+            leftovers_after_failure = list(secret_root.iterdir()) if secret_root.exists() else []
+
+            retry = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            retry_body = await retry.json()
+            final_body = {}
+            for _ in range(20):
+                poll = await client.get(retry_body["poll_url"], headers=headers)
+                final_body = await poll.json()
+                if final_body["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            duplicate = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            return (
+                failed.status,
+                failed_body,
+                leftovers_after_failure,
+                retry.status,
+                retry_body,
+                final_body,
+                duplicate.status,
+                await duplicate.json(),
+            )
+        finally:
+            await client.close()
+
+    (
+        failed_status,
+        failed_body,
+        leftovers_after_failure,
+        retry_status,
+        retry_body,
+        final_body,
+        duplicate_status,
+        duplicate_body,
+    ) = asyncio.run(runner())
+
+    assert failed_status == 400
+    assert failed_body["error"] == "invalid secrets"
+    assert leftovers_after_failure == []
+    assert retry_status == 202
+    assert retry_body["duplicate"] is False
+    assert final_body["status"] == "succeeded"
+    assert duplicate_status == 202
+    assert duplicate_body["duplicate"] is True
+    assert duplicate_body["run_id"] == retry_body["run_id"]
+    assert prepare_calls == 1
+    assert len(marked) == 1
+    assert len(dispatched) == 1
+
+
+def test_ingest_async_cancelled_prepare_cleans_secrets_and_keeps_retryable(
+    monkeypatch, tmp_path
+):
+    from aiohttp import ClientConnectionError, ServerDisconnectedError
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_calls = 0
+    marked = []
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 1:
+            raise asyncio.CancelledError()
+        return request
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        return True
+
+    async def dispatch(request):
+        dispatched.append(request)
+        return "ok"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "shared"))
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+    secret_root = tmp_path / "shared" / "profiles" / "owner" / "tmp" / "ingest-secrets"
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "content": "hi",
+            "idempotency_key": "async-cancel-retry",
+            "secrets": {"cms": {"type": "opaque", "value": "retry-secret"}},
+        }
+        headers = {"Authorization": "Bearer testkey"}
+        try:
+            with pytest.raises((ServerDisconnectedError, ClientConnectionError)):
+                await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            leftovers_after_cancel = list(secret_root.iterdir()) if secret_root.exists() else []
+
+            retry = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            retry_body = await retry.json()
+            final_body = {}
+            for _ in range(20):
+                poll = await client.get(retry_body["poll_url"], headers=headers)
+                final_body = await poll.json()
+                if final_body["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            return leftovers_after_cancel, retry.status, retry_body, final_body
+        finally:
+            await client.close()
+
+    leftovers_after_cancel, retry_status, retry_body, final_body = asyncio.run(runner())
+
+    assert leftovers_after_cancel == []
+    assert retry_status == 202
+    assert retry_body["duplicate"] is False
+    assert final_body["status"] == "succeeded"
+    assert prepare_calls == 2
+    assert len(marked) == 1
+    assert len(dispatched) == 1
+
+
 def test_ingest_async_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatch):
     calls = {"n": 0}
     prepares = {"n": 0}

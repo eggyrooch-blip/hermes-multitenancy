@@ -171,23 +171,22 @@ def create_run_broker_app(
                 sandbox_available=sandbox_available or _default_sandbox_available,
                 prepare_request=prepare_billing_request,
             )
-            prepared_run, admission = await admission_broker.prepare_and_admit(run_request)
+            admitted_run, admission = await admission_broker.prepare_and_admit(run_request)
             if admission.duplicate:
                 await emit_event(RunEvent(kind="done"))
                 return response
-            assert prepared_run is not None
+            assert admitted_run is not None
 
             broker_dispatch = dispatch_agent or (
                 lambda req: _default_dispatch_agent(
                     req, emit_event=emit_event, auth_signal_run_id=signal_run_id
                 )
             )
-            broker = RunBroker(
+            await admission_broker.run_admitted(
+                admitted_run,
                 dispatch_agent=broker_dispatch,
                 emit_event=emit_event,
-                sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            await broker.run_prepared(prepared_run)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
             await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
@@ -626,11 +625,6 @@ def create_run_broker_app(
         broker_dispatch = dispatch_agent or (
             lambda req: _default_dispatch_agent(req, emit_event=sink)
         )
-        broker = RunBroker(
-            dispatch_agent=broker_dispatch,
-            emit_event=sink,
-            sandbox_available=sandbox_available or _default_sandbox_available,
-        )
         timeout_s = _ingest_async_timeout()
         result = None
 
@@ -638,7 +632,11 @@ def create_run_broker_app(
             _ingest_async_touch(job, "running")
             if prepared.interactive:
                 run_task = asyncio.ensure_future(
-                    broker.run_prepared(prepared.prepared_run)
+                    prepared.admission_broker.run_admitted(
+                        prepared.admitted_run,
+                        dispatch_agent=broker_dispatch,
+                        emit_event=sink,
+                    )
                 )
                 interrupt_task = asyncio.ensure_future(interrupt.wait())
                 done, _pending = await asyncio.wait(
@@ -673,7 +671,11 @@ def create_run_broker_app(
                     result = run_task.result()
             else:
                 result = await asyncio.wait_for(
-                    broker.run_prepared(prepared.prepared_run),
+                    prepared.admission_broker.run_admitted(
+                        prepared.admitted_run,
+                        dispatch_agent=broker_dispatch,
+                        emit_event=sink,
+                    ),
                     timeout=timeout_s,
                 )
         except asyncio.TimeoutError:
@@ -784,14 +786,38 @@ def create_run_broker_app(
         except RunRejected as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
 
+        run_id = "ing_" + secrets.token_urlsafe(16)
+        secret_dir = ""
+        try:
+            # Materialization is part of request preparation, not dispatch. It
+            # must finish before billing/admission so a local write failure
+            # cannot permanently consume the idempotency key.
+            secret_dir = _ingest_materialize_secret_dir(
+                profile_name=prepared.bound_profile,
+                run_id=run_id,
+                secret_spec=prepared.secret_spec,
+            )
+        except Exception:
+            logger.exception("[multitenancy] async ingest secret store failed")
+            return web.json_response({"ok": False, "error": "invalid secrets"}, status=400)
+        if secret_dir:
+            prepared.run_request = replace(
+                prepared.run_request,
+                metadata={**prepared.run_request.metadata, "ingest_secret_dir": secret_dir},
+            )
+
         try:
             # Billing identity preparation can call the profile apiserver and
             # fail transiently. A persistent read-only duplicate check happens
             # first; concurrent retries then share the same preparation task.
-            prepared_run, admission = await admission_broker.prepare_and_admit(
+            admitted_run, admission = await admission_broker.prepare_and_admit(
                 prepared.run_request
             )
+        except asyncio.CancelledError:
+            _ingest_cleanup_secret_dir(secret_dir)
+            raise
         except Exception:
+            _ingest_cleanup_secret_dir(secret_dir)
             logger.exception(
                 "[multitenancy] async ingest billing preparation failed profile=%s",
                 prepared.bound_profile,
@@ -807,6 +833,7 @@ def create_run_broker_app(
             )
 
         if admission.duplicate:
+            _ingest_cleanup_secret_dir(secret_dir)
             return web.json_response(
                 {
                     "ok": False,
@@ -816,28 +843,10 @@ def create_run_broker_app(
                 },
                 status=200,
             )
-        assert prepared_run is not None
-        prepared.prepared_run = prepared_run
-        prepared.run_request = prepared_run.request
-
-        run_id = "ing_" + secrets.token_urlsafe(16)
-        try:
-            secret_dir = _ingest_materialize_secret_dir(
-                profile_name=prepared.bound_profile,
-                run_id=run_id,
-                secret_spec=prepared.secret_spec,
-            )
-        except Exception:
-            logger.exception("[multitenancy] async ingest secret store failed")
-            return web.json_response({"ok": False, "error": "invalid secrets"}, status=400)
-        if secret_dir:
-            prepared.run_request = replace(
-                prepared.run_request,
-                metadata={**prepared.run_request.metadata, "ingest_secret_dir": secret_dir},
-            )
-            prepared.prepared_run = prepared.prepared_run.with_request(
-                prepared.run_request
-            )
+        assert admitted_run is not None
+        prepared.admission_broker = admission_broker
+        prepared.admitted_run = admitted_run
+        prepared.run_request = admitted_run.request
         now = time.time()
         job = {
             "run_id": run_id,

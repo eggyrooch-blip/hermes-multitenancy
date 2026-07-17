@@ -502,7 +502,7 @@ def test_run_broker_admit_prepared_rejects_different_prepare_boundary():
         asyncio.run(admission.admit_prepared(prepared))
 
 
-def test_run_broker_run_prepared_can_dispatch_after_prior_admit():
+def test_run_broker_admitted_capability_dispatches_once():
     from hermes_multitenancy.run_broker import RunBroker
     from hermes_multitenancy.run_models import RunRequest
 
@@ -528,15 +528,74 @@ def test_run_broker_run_prepared_can_dispatch_after_prior_admit():
             message_id="om_1",
             )
         )
-        admission = await broker.admit_prepared(prepared)
-        assert admission.duplicate is False
-        return await broker.run_prepared(prepared)
+        admitted = await broker.admit_prepared(prepared)
+        assert admitted.duplicate is False
+        first = await broker.run_admitted(admitted)
+        with pytest.raises(TypeError, match="already claimed"):
+            await broker.run_admitted(admitted)
+        return first
 
     result = asyncio.run(exercise())
 
     assert result.content == "ok"
     assert result.duplicate is False
     assert calls == [("dispatch", "hi")]
+
+
+def test_run_broker_prepared_capability_cannot_dispatch():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "must not run",
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    prepared = asyncio.run(broker.prepare(RunRequest(
+        channel="feishu",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        message_id="om_1",
+    )))
+
+    with pytest.raises(TypeError, match="AdmittedRun"):
+        asyncio.run(broker.run_prepared(prepared))
+
+
+def test_run_broker_admitted_capability_rejects_cross_broker_dispatch():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    calls = []
+    issuer = RunBroker(
+        dispatch_agent=lambda request: calls.append(request.content) or "ok",
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    other = RunBroker(
+        dispatch_agent=lambda request: calls.append(request.content) or "wrong",
+        sandbox_available=lambda: True,
+    )
+
+    async def exercise():
+        admitted, admission = await issuer.prepare_and_admit(RunRequest(
+            channel="feishu",
+            profile_name="owner",
+            user_key="ou_1",
+            content="hi",
+            message_id="om_1",
+        ))
+        assert admission.duplicate is False
+        assert admitted is not None
+        with pytest.raises(TypeError, match="different broker authority"):
+            await other.run_admitted(admitted)
+        return await issuer.run_admitted(admitted)
+
+    result = asyncio.run(exercise())
+
+    assert result.content == "ok"
+    assert calls == ["hi"]
 
 
 def test_run_broker_concurrent_duplicates_share_one_prepare_across_brokers():
@@ -595,6 +654,78 @@ def test_run_broker_concurrent_duplicates_share_one_prepare_across_brokers():
     assert prepare_calls == 1
     assert dispatches == [{"litellm_billing_user_id": "user-1"}]
     assert sorted(result.duplicate for result in results) == [False, True]
+
+
+@pytest.mark.parametrize("cancel_stage", ["prepare", "transform"])
+def test_run_broker_cancelled_last_waiter_does_not_consume_admission(cancel_stage):
+    from dataclasses import replace
+
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    stage_started = asyncio.Event()
+    never_finish = asyncio.Event()
+    prepare_calls = 0
+    transform_calls = 0
+    marked = []
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if cancel_stage == "prepare" and prepare_calls == 1:
+            stage_started.set()
+            await never_finish.wait()
+        return request
+
+    async def transform(prepared):
+        nonlocal transform_calls
+        transform_calls += 1
+        if cancel_stage == "transform" and transform_calls == 1:
+            stage_started.set()
+            await never_finish.wait()
+        return replace(prepared.request, content="enriched")
+
+    broker = RunBroker(
+        dispatch_agent=lambda request: dispatched.append(request.content) or "ok",
+        prepare_request=prepare,
+        mark_seen=lambda request: marked.append(request.effective_idempotency_key) or True,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="feishu",
+        profile_name="owner",
+        user_key="ou_1",
+        content="original",
+        message_id="om_cancel",
+    )
+
+    async def exercise():
+        cancelled = asyncio.create_task(
+            broker.prepare_and_admit(request, transform_request=transform)
+        )
+        await stage_started.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await asyncio.sleep(0)
+        assert marked == []
+
+        admitted, admission = await broker.prepare_and_admit(
+            request,
+            transform_request=transform,
+        )
+        assert admission.duplicate is False
+        assert admitted is not None
+        return await broker.run_admitted(admitted)
+
+    result = asyncio.run(exercise())
+
+    assert result.content == "ok"
+    assert prepare_calls == 2
+    assert transform_calls == (1 if cancel_stage == "prepare" else 2)
+    assert len(marked) == 1
+    assert dispatched == ["enriched"]
 
 
 def test_run_broker_emits_channel_neutral_events():

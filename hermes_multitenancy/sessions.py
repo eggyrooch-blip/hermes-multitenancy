@@ -18,6 +18,7 @@ Default DB path is ``~/.hermes/multitenancy.db`` so it co-resides with
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -56,6 +57,7 @@ class SessionStore:
         self.db_path = str(db_path) if db_path is not None else str(DEFAULT_DB_PATH)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript("PRAGMA journal_mode=WAL;")
@@ -65,42 +67,46 @@ class SessionStore:
     def append(self, profile_name: str, user_key: str, role: str, content: str) -> None:
         """Append one message to a user's history. Microsecond ts dedups bursts."""
         ts = time.monotonic_ns()
-        self._conn.execute(
-            "INSERT OR IGNORE INTO multitenancy_sessions"
-            " (profile_name, user_key, ts, role, content) VALUES (?, ?, ?, ?, ?)",
-            (profile_name, user_key, ts, role, content),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO multitenancy_sessions"
+                " (profile_name, user_key, ts, role, content) VALUES (?, ?, ?, ?, ?)",
+                (profile_name, user_key, ts, role, content),
+            )
+            self._conn.commit()
 
     def load_recent(self, profile_name: str, user_key: str, limit: int) -> list[dict]:
         """Return the last ``limit`` messages oldest-first (LLM order)."""
-        cur = self._conn.execute(
-            "SELECT role, content FROM multitenancy_sessions"
-            " WHERE profile_name = ? AND user_key = ?"
-            " ORDER BY ts DESC LIMIT ?",
-            (profile_name, user_key, limit),
-        )
-        rows = list(cur.fetchall())
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT role, content FROM multitenancy_sessions"
+                " WHERE profile_name = ? AND user_key = ?"
+                " ORDER BY ts DESC LIMIT ?",
+                (profile_name, user_key, limit),
+            )
+            rows = list(cur.fetchall())
         rows.reverse()  # back to oldest-first
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
     def clear(self, profile_name: str, user_key: str) -> int:
         """Hard-delete a user's history. Returns rows removed."""
-        cur = self._conn.execute(
-            "DELETE FROM multitenancy_sessions WHERE profile_name = ? AND user_key = ?",
-            (profile_name, user_key),
-        )
-        self._conn.commit()
-        return cur.rowcount
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM multitenancy_sessions WHERE profile_name = ? AND user_key = ?",
+                (profile_name, user_key),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def count(self, profile_name: str, user_key: str) -> int:
         """Number of messages stored for a (profile, user). Diagnostic only."""
-        cur = self._conn.execute(
-            "SELECT COUNT(*) FROM multitenancy_sessions"
-            " WHERE profile_name = ? AND user_key = ?",
-            (profile_name, user_key),
-        )
-        return int(cur.fetchone()[0])
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM multitenancy_sessions"
+                " WHERE profile_name = ? AND user_key = ?",
+                (profile_name, user_key),
+            )
+            return int(cur.fetchone()[0])
 
     def mark_event_processed(
         self,
@@ -113,39 +119,51 @@ class SessionStore:
         ttl_seconds: int,
     ) -> bool:
         """Record an inbound event key, returning False for a recent duplicate."""
-        now = int(time.time())
-        ttl = max(0, int(ttl_seconds))
-        cutoff = now - ttl
-        cur = self._conn.execute(
-            "SELECT ts FROM multitenancy_processed_events WHERE event_key = ?",
-            (event_key,),
-        )
-        row = cur.fetchone()
-        if row is not None and int(row["ts"]) >= cutoff:
-            return False
-
-        self._conn.execute(
-            "INSERT OR REPLACE INTO multitenancy_processed_events"
-            " (event_key, profile_name, user_key, message_id, content_hash, ts)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (event_key, profile_name, user_key, message_id, content_hash, now),
-        )
-        self._conn.execute(
-            "DELETE FROM multitenancy_processed_events WHERE ts < ?",
-            (now - max(ttl, 86400),),
-        )
-        self._conn.commit()
-        return True
+        with self._lock:
+            now = int(time.time())
+            ttl = max(0, int(ttl_seconds))
+            cutoff = now - ttl
+            cur = self._conn.execute(
+                "INSERT INTO multitenancy_processed_events"
+                " (event_key, profile_name, user_key, message_id, content_hash, ts)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(event_key) DO UPDATE SET"
+                " profile_name = excluded.profile_name,"
+                " user_key = excluded.user_key,"
+                " message_id = excluded.message_id,"
+                " content_hash = excluded.content_hash,"
+                " ts = excluded.ts"
+                " WHERE multitenancy_processed_events.ts < ?",
+                (
+                    event_key,
+                    profile_name,
+                    user_key,
+                    message_id,
+                    content_hash,
+                    now,
+                    cutoff,
+                ),
+            )
+            accepted = cur.rowcount == 1
+            if accepted:
+                self._conn.execute(
+                    "DELETE FROM multitenancy_processed_events WHERE ts < ?",
+                    (now - max(ttl, 86400),),
+                )
+            self._conn.commit()
+            return accepted
 
     def is_event_processed(self, event_key: str, ttl_seconds: int) -> bool:
         """Return whether an event key is recent without changing stored state."""
         cutoff = int(time.time()) - max(0, int(ttl_seconds))
-        cur = self._conn.execute(
-            "SELECT ts FROM multitenancy_processed_events WHERE event_key = ?",
-            (event_key,),
-        )
-        row = cur.fetchone()
-        return row is not None and int(row["ts"]) >= cutoff
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT ts FROM multitenancy_processed_events WHERE event_key = ?",
+                (event_key,),
+            )
+            row = cur.fetchone()
+            return row is not None and int(row["ts"]) >= cutoff
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

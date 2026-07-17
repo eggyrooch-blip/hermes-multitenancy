@@ -27,12 +27,17 @@ MarkSeen = Callable[[RunRequest], bool]
 IsSeen = Callable[[RunRequest], bool]
 SandboxAvailable = Callable[[], bool]
 PrepareRequest = Callable[[RunRequest], Awaitable[RunRequest] | RunRequest]
+TransformRequest = Callable[["PreparedRun"], Awaitable[RunRequest] | RunRequest]
 
 
 _PREPARED_RUN_PROOF = object()
+_ADMITTED_RUN_PROOF = object()
 _PREPARE_INFLIGHT_LOCK = threading.Lock()
 _PREPARE_INFLIGHT: dict[
     tuple[int, int, str, str, str, str], asyncio.Task["PreparedRun"]
+] = {}
+_ADMISSION_INFLIGHT: dict[
+    tuple[int, int, int, str, str, str, str], "_AdmissionInflight"
 ] = {}
 
 
@@ -45,6 +50,14 @@ def _request_identity(request: RunRequest) -> tuple[str, str, str, str]:
     )
 
 
+class _PreparedAdmissionState:
+    __slots__ = ("lock", "spent")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.spent = False
+
+
 class PreparedRun:
     """Opaque proof that a broker successfully prepared one request.
 
@@ -53,7 +66,14 @@ class PreparedRun:
     raw request was already prepared and bypassing billing/identity work.
     """
 
-    __slots__ = ("_request", "_identity", "_authority", "_proof")
+    __slots__ = (
+        "_request",
+        "_admission_request",
+        "_identity",
+        "_authority",
+        "_admission_state",
+        "_proof",
+    )
 
     def __new__(cls, *_args, **_kwargs):
         raise TypeError("PreparedRun values are issued by RunBroker.prepare()")
@@ -67,31 +87,40 @@ class PreparedRun:
         return self._request
 
     def with_request(self, request: RunRequest) -> "PreparedRun":
-        """Carry the proof across trusted enrichment without changing identity."""
+        """Attach enriched dispatch data without changing canonical admission data."""
         _require_prepared(self)
         if not isinstance(request, RunRequest):
             raise TypeError("prepared request must be a RunRequest")
         if _request_identity(request)[:3] != self._identity[:3]:
             raise ValueError("prepared request identity cannot change")
-        if request.effective_idempotency_key != self._identity[3]:
-            request = replace(request, idempotency_key=self._identity[3])
         return _issue_prepared(
             request,
+            admission_request=self._admission_request,
             identity=self._identity,
             authority=self._authority,
+            admission_state=self._admission_state,
         )
 
 
 def _issue_prepared(
     request: RunRequest,
     *,
+    admission_request: Optional[RunRequest] = None,
     identity: Optional[tuple[str, str, str, str]] = None,
     authority: object,
+    admission_state: Optional[_PreparedAdmissionState] = None,
 ) -> PreparedRun:
     prepared = object.__new__(PreparedRun)
     object.__setattr__(prepared, "_request", request)
-    object.__setattr__(prepared, "_identity", identity or _request_identity(request))
+    canonical_request = admission_request or request
+    object.__setattr__(prepared, "_admission_request", canonical_request)
+    object.__setattr__(prepared, "_identity", identity or _request_identity(canonical_request))
     object.__setattr__(prepared, "_authority", authority)
+    object.__setattr__(
+        prepared,
+        "_admission_state",
+        admission_state or _PreparedAdmissionState(),
+    )
     object.__setattr__(prepared, "_proof", _PREPARED_RUN_PROOF)
     return prepared
 
@@ -103,6 +132,58 @@ def _require_prepared(value: object) -> PreparedRun:
     ):
         raise TypeError("a RunBroker-issued PreparedRun is required")
     return value
+
+
+class AdmittedRun:
+    """One-shot authority to dispatch a successfully admitted request."""
+
+    __slots__ = ("_request", "_authority", "_claim_lock", "_claimed", "_proof")
+
+    def __new__(cls, *_args, **_kwargs):
+        raise TypeError("AdmittedRun values are issued by RunBroker admission")
+
+    def __setattr__(self, _name, _value) -> None:
+        raise AttributeError("AdmittedRun is immutable")
+
+    @property
+    def request(self) -> RunRequest:
+        _require_admitted(self)
+        return self._request
+
+    @property
+    def duplicate(self) -> bool:
+        return False
+
+
+def _issue_admitted(request: RunRequest, *, authority: object) -> AdmittedRun:
+    admitted = object.__new__(AdmittedRun)
+    object.__setattr__(admitted, "_request", request)
+    object.__setattr__(admitted, "_authority", authority)
+    object.__setattr__(admitted, "_claim_lock", threading.Lock())
+    object.__setattr__(admitted, "_claimed", False)
+    object.__setattr__(admitted, "_proof", _ADMITTED_RUN_PROOF)
+    return admitted
+
+
+def _require_admitted(value: object) -> AdmittedRun:
+    if (
+        not isinstance(value, AdmittedRun)
+        or getattr(value, "_proof", None) is not _ADMITTED_RUN_PROOF
+    ):
+        raise TypeError("a RunBroker-issued AdmittedRun is required")
+    return value
+
+
+class _AdmissionInflight:
+    __slots__ = ("task", "delivered", "waiters")
+
+    def __init__(
+        self,
+        task: asyncio.Task[tuple[Optional[PreparedRun], RunResult]],
+    ) -> None:
+        self.task = task
+        self.delivered = False
+        self.waiters = 0
 
 
 def _default_sandbox_available() -> bool:
@@ -145,24 +226,50 @@ class RunBroker:
 
     async def run(self, request: RunRequest) -> RunResult:
         """Prepare, admit, and execute one request through every boundary."""
-        prepared, admission = await self.prepare_and_admit(request)
+        admitted, admission = await self.prepare_and_admit(request)
         if admission.duplicate:
             await self._emit(RunEvent(kind="done"))
             return admission
-        assert prepared is not None
-        return await self.run_prepared(prepared)
+        assert admitted is not None
+        return await self.run_admitted(admitted)
 
-    async def run_prepared(self, prepared: PreparedRun) -> RunResult:
-        """Execute only a broker-issued request whose admission ran elsewhere."""
-        prepared = _require_prepared(prepared)
-        request = prepared.request
+    async def run_admitted(
+        self,
+        admitted: AdmittedRun,
+        *,
+        dispatch_agent: Optional[DispatchAgent] = None,
+        emit_event: Optional[EmitEvent] = None,
+    ) -> RunResult:
+        """Atomically claim and dispatch this broker's admitted capability once."""
+        admitted = _require_admitted(admitted)
+        if admitted._authority is not self:
+            raise TypeError("AdmittedRun was issued by a different broker authority")
+        with admitted._claim_lock:
+            if admitted._claimed:
+                raise TypeError("AdmittedRun was already claimed")
+            object.__setattr__(admitted, "_claimed", True)
+        request = admitted.request
         self._assert_policy(request)
-        response = await _maybe_await(self._dispatch_agent(request))
+        response = await _maybe_await((dispatch_agent or self._dispatch_agent)(request))
         content = str(response or "")
         if content:
-            await self._emit(RunEvent(kind="content", text=content))
-        await self._emit(RunEvent(kind="done"))
+            await self._emit_to(RunEvent(kind="content", text=content), emit_event)
+        await self._emit_to(RunEvent(kind="done"), emit_event)
         return RunResult(content=content, duplicate=False)
+
+    async def run_prepared(
+        self,
+        admitted: AdmittedRun,
+        *,
+        dispatch_agent: Optional[DispatchAgent] = None,
+        emit_event: Optional[EmitEvent] = None,
+    ) -> RunResult:
+        """Compatibility name; execution still requires an ``AdmittedRun``."""
+        return await self.run_admitted(
+            admitted,
+            dispatch_agent=dispatch_agent,
+            emit_event=emit_event,
+        )
 
     async def admit(self, request: RunRequest) -> RunResult:
         """Prepare and consume idempotency without dispatching the agent."""
@@ -170,13 +277,60 @@ class RunBroker:
         return admission
 
     async def prepare_and_admit(
-        self, request: RunRequest
-    ) -> tuple[Optional[PreparedRun], RunResult]:
-        """Skip known duplicates, prepare once, then atomically consume admission."""
-        prepared = await self.prepare_if_fresh(request)
-        if prepared is None:
-            return None, RunResult(content="", duplicate=True)
-        return prepared, self._consume_idempotency(prepared.request)
+        self,
+        request: RunRequest,
+        *,
+        transform_request: Optional[TransformRequest] = None,
+    ) -> tuple[Optional[AdmittedRun], RunResult]:
+        """Coalesce canonical prepare/transform/admission and issue one executor."""
+        request = self.check_policy(request)
+        loop = asyncio.get_running_loop()
+        identity = _request_identity(request)
+        key = (
+            id(loop),
+            id(self._preparation_authority),
+            id(self._mark_seen),
+            *identity,
+        )
+        with _PREPARE_INFLIGHT_LOCK:
+            entry = _ADMISSION_INFLIGHT.get(key)
+            if entry is None:
+                task = loop.create_task(
+                    self._prepare_transform_once(request, transform_request)
+                )
+                entry = _AdmissionInflight(task)
+                _ADMISSION_INFLIGHT[key] = entry
+            entry.waiters += 1
+
+        released = False
+        try:
+            prepared, admission = await asyncio.shield(entry.task)
+            if admission.duplicate or prepared is None:
+                self._drop_admission_inflight(key, entry)
+                return None, admission
+            with _PREPARE_INFLIGHT_LOCK:
+                if entry.delivered:
+                    return None, RunResult(content="", duplicate=True)
+                entry.delivered = True
+            try:
+                if not self._claim_prepared_admission(prepared):
+                    return None, RunResult(content="", duplicate=True)
+                admission = self._consume_idempotency(prepared._admission_request)
+            finally:
+                self._drop_admission_inflight(key, entry)
+            if admission.duplicate:
+                return None, admission
+            return _issue_admitted(prepared.request, authority=self), admission
+        except asyncio.CancelledError:
+            self._release_admission_waiter(key, entry, cancel_if_last=True)
+            released = True
+            raise
+        except BaseException:
+            self._drop_admission_inflight(key, entry)
+            raise
+        finally:
+            if not released:
+                self._release_admission_waiter(key, entry, cancel_if_last=False)
 
     def check_policy(self, request: RunRequest) -> RunRequest:
         """Rewrite and validate a request without preparation or idempotency."""
@@ -201,13 +355,72 @@ class RunBroker:
         request = self.check_policy(request)
         return await self._prepare_checked(request)
 
-    async def admit_prepared(self, prepared: PreparedRun) -> RunResult:
-        """Consume idempotency only for a broker-issued prepared capability."""
+    async def admit_prepared(self, prepared: PreparedRun) -> AdmittedRun | RunResult:
+        """Consume canonical idempotency and issue a one-shot dispatch capability."""
         prepared = _require_prepared(prepared)
         if prepared._authority is not self._preparation_authority:
             raise TypeError("PreparedRun was issued by a different preparation boundary")
+        if not self._claim_prepared_admission(prepared):
+            return RunResult(content="", duplicate=True)
         self._assert_policy(prepared.request)
-        return self._consume_idempotency(prepared.request)
+        admission = self._consume_idempotency(prepared._admission_request)
+        if admission.duplicate:
+            return admission
+        return _issue_admitted(prepared.request, authority=self)
+
+    async def _prepare_transform_once(
+        self,
+        request: RunRequest,
+        transform_request: Optional[TransformRequest],
+    ) -> tuple[Optional[PreparedRun], RunResult]:
+        if self._known_duplicate(request):
+            return None, RunResult(content="", duplicate=True)
+        if self._prepare_request is None:
+            prepared = _issue_prepared(
+                request,
+                authority=self._preparation_authority,
+            )
+        else:
+            prepared = await self._prepare_once(request)
+        if transform_request is not None:
+            dispatch_request = await _maybe_await(transform_request(prepared))
+            if not isinstance(dispatch_request, RunRequest):
+                raise TypeError("transform_request must return a RunRequest")
+            prepared = prepared.with_request(self.check_policy(dispatch_request))
+        return prepared, RunResult(content="", duplicate=False)
+
+    @staticmethod
+    def _drop_admission_inflight(
+        key: tuple[int, int, int, str, str, str, str],
+        entry: _AdmissionInflight,
+    ) -> None:
+        with _PREPARE_INFLIGHT_LOCK:
+            if _ADMISSION_INFLIGHT.get(key) is entry:
+                _ADMISSION_INFLIGHT.pop(key, None)
+
+    @staticmethod
+    def _release_admission_waiter(
+        key: tuple[int, int, int, str, str, str, str],
+        entry: _AdmissionInflight,
+        *,
+        cancel_if_last: bool,
+    ) -> None:
+        with _PREPARE_INFLIGHT_LOCK:
+            entry.waiters -= 1
+            if cancel_if_last and entry.waiters == 0:
+                if not entry.task.done():
+                    entry.task.cancel()
+                if _ADMISSION_INFLIGHT.get(key) is entry:
+                    _ADMISSION_INFLIGHT.pop(key, None)
+
+    def _claim_prepared_admission(self, prepared: PreparedRun) -> bool:
+        if prepared._authority is not self._preparation_authority:
+            raise TypeError("PreparedRun was issued by a different preparation boundary")
+        with prepared._admission_state.lock:
+            if prepared._admission_state.spent:
+                return False
+            prepared._admission_state.spent = True
+            return True
 
     async def _prepare_checked(self, request: RunRequest) -> PreparedRun:
         if self._prepare_request is None:
@@ -245,6 +458,7 @@ class RunBroker:
         self._assert_policy(prepared_request)
         return _issue_prepared(
             prepared_request,
+            admission_request=request,
             identity=_request_identity(request),
             authority=self._preparation_authority,
         )
@@ -267,9 +481,17 @@ class RunBroker:
         return self._is_seen is not None and bool(self._is_seen(request))
 
     async def _emit(self, event: RunEvent) -> None:
-        if self._emit_event is None:
+        await self._emit_to(event, None)
+
+    async def _emit_to(
+        self,
+        event: RunEvent,
+        emit_event: Optional[EmitEvent],
+    ) -> None:
+        emitter = emit_event or self._emit_event
+        if emitter is None:
             return
-        await _maybe_await(self._emit_event(event))
+        await _maybe_await(emitter(event))
 
 
 def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:

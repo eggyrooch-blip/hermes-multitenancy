@@ -261,38 +261,32 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         run_broker = _m._make_routed_run_broker(
             prepare_request=prepare_billing_request,
         )
-        try:
-            prepared_run = await run_broker.prepare_if_fresh(run_request)
-            if prepared_run is None:
-                _m.logger.info(
-                    "multitenancy: duplicate inbound event skipped before billing "
-                    "profile=%s sender=%s message_id=%s",
-                    profile_name,
-                    sender,
-                    _m._event_message_id(event) or "",
-                )
-                if feishu_full:
-                    try:
-                        out = _m._processing_outcome(failed=False)
-                        complete_deferred = getattr(
-                            adapter, "complete_deferred_processing", None
-                        )
-                        if callable(complete_deferred):
-                            await complete_deferred(event, out)
-                        else:
-                            await adapter.on_processing_complete(event, out)
-                    except Exception as exc:
-                        _m.logger.debug(
-                            "multitenancy: duplicate processing_complete failed: %s",
-                            exc,
-                        )
-                return
+
+        async def _enrich_prepared(prepared_run):
             prepared_request = prepared_run.request
-            enriched_text = await _m._call_enrich_via_hermes_pipeline(
+            enriched = await _m._call_enrich_via_hermes_pipeline(
                 event,
                 gateway,
                 profile_home=profile_home,
                 billing_metadata=prepared_request.metadata,
+            )
+            run_content = enriched or text
+            if not run_content and getattr(event, "media_urls", None):
+                run_content = "[media attachment]"
+            dispatch_request = _m._run_request_for_routed_event(
+                event=event,
+                profile_name=profile_name,
+                sender=sender,
+                sender_alt=sender_alt,
+                chat_id=chat_id,
+                text=run_content,
+            )
+            return replace(dispatch_request, metadata=prepared_request.metadata)
+
+        try:
+            admitted_run, run_admission = await run_broker.prepare_and_admit(
+                run_request,
+                transform_request=_enrich_prepared,
             )
         except RunRejected as exc:
             _m.logger.warning(
@@ -309,6 +303,32 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     "当前无法确认员工计费身份，请稍后重试。",
                 )
             return
+        if run_admission.duplicate:
+            _m.logger.info(
+                "multitenancy: duplicate inbound event skipped profile=%s sender=%s message_id=%s",
+                profile_name,
+                sender,
+                _m._event_message_id(event) or "",
+            )
+            if feishu_full:
+                try:
+                    out = _m._processing_outcome(failed=False)
+                    complete_deferred = getattr(
+                        adapter, "complete_deferred_processing", None
+                    )
+                    if callable(complete_deferred):
+                        await complete_deferred(event, out)
+                    else:
+                        await adapter.on_processing_complete(event, out)
+                except Exception as exc:
+                    _m.logger.debug(
+                        "multitenancy: duplicate processing_complete failed: %s",
+                        exc,
+                    )
+            return
+
+        assert admitted_run is not None
+        enriched_text = admitted_run.request.content
         vision_blocked = _m._image_vision_unavailable_response(event, enriched_text)
         if vision_blocked:
             _m.logger.info(
@@ -321,58 +341,6 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             _m._persist_turn(hist_key, user_msg, vision_blocked)
             if adapter is not None:
                 await _m._safe_call(adapter.send, chat_id, vision_blocked)
-            return
-        run_content = enriched_text or text
-        if not run_content and getattr(event, "media_urls", None):
-            run_content = "[media attachment]"
-
-        run_request = _m._run_request_for_routed_event(
-            event=event,
-            profile_name=profile_name,
-            sender=sender,
-            sender_alt=sender_alt,
-            chat_id=chat_id,
-            text=run_content,
-        )
-        run_request = replace(run_request, metadata=prepared_request.metadata)
-        # Enrichment can change the final content; apply the normal slash
-        # rewrite again without re-running billing preparation.
-        run_request = run_broker.check_policy(run_request)
-        prepared_run = prepared_run.with_request(run_request)
-
-        try:
-            run_admission = await run_broker.admit_prepared(prepared_run)
-        except RunRejected as exc:
-            _m.logger.warning("multitenancy: routed run rejected profile=%s sender=%s: %s", profile_name, sender, exc)
-            if feishu_full:
-                try:
-                    out = _m._processing_outcome(failed=True)
-                    complete_deferred = getattr(adapter, "complete_deferred_processing", None)
-                    if callable(complete_deferred):
-                        await complete_deferred(event, out)
-                    else:
-                        await adapter.on_processing_complete(event, out)
-                except Exception as complete_exc:
-                    _m.logger.debug("multitenancy: rejected processing_complete failed: %s", complete_exc)
-            return
-
-        if run_admission.duplicate:
-            _m.logger.info(
-                "multitenancy: duplicate inbound event skipped profile=%s sender=%s message_id=%s",
-                profile_name,
-                sender,
-                _m._event_message_id(event) or "",
-            )
-            if feishu_full:
-                try:
-                    out = _m._processing_outcome(failed=False)
-                    complete_deferred = getattr(adapter, "complete_deferred_processing", None)
-                    if callable(complete_deferred):
-                        await complete_deferred(event, out)
-                    else:
-                        await adapter.on_processing_complete(event, out)
-                except Exception as exc:
-                    _m.logger.debug("multitenancy: duplicate processing_complete failed: %s", exc)
             return
 
         # Register self in the context-scoped in-flight slot (replace previous)
@@ -437,9 +405,10 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                         )
                     return stream_response
 
-                run_result = await _m._make_routed_run_broker(
+                run_result = await run_broker.run_admitted(
+                    admitted_run,
                     dispatch_agent=_dispatch_streaming,
-                ).run_prepared(prepared_run)
+                )
                 response_text = run_result.content
             else:
                 # Mock / minimal adapter — old non-stream path (send_typing + pool.dispatch + send)
@@ -453,9 +422,10 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                         profile_name, profile_home, run_event
                     )
 
-                run_result = await _m._make_routed_run_broker(
+                run_result = await run_broker.run_admitted(
+                    admitted_run,
                     dispatch_agent=_dispatch_nonstream,
-                ).run_prepared(prepared_run)
+                )
                 response_text = run_result.content
                 if adapter is not None:
                     await _m._safe_call(adapter.send, chat_id, response_text)
