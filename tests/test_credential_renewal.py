@@ -711,9 +711,11 @@ def test_l2_authoritative_reauth_marker_stops_refresh_until_removed(
     assert refreshes[0]["force"] is True
 
 
+@pytest.mark.parametrize("authoritative", [False, "false", 0, 1])
 def test_l2_non_authoritative_refresh_marker_does_not_stop_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authoritative,
 ):
     profile_name = "alice"
     open_id = "ou_transient"
@@ -728,7 +730,7 @@ def test_l2_non_authoritative_refresh_marker_does_not_stop_refresh(
         extra={
             "layer": "L2",
             "profile": profile_name,
-            "authoritative": False,
+            "authoritative": authoritative,
             "refresh_class": "transient",
         },
     )

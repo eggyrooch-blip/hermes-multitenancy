@@ -437,7 +437,7 @@ def marker_requires_reauth(marker_body: dict[str, Any]) -> bool:
     reason = str(marker_body.get("reason") or "")
     if reason != REASON_REFRESH_REJECTED:
         return True
-    return bool(marker_body.get("authoritative")) and str(marker_body.get("refresh_class") or "") == "invalid"
+    return marker_body.get("authoritative") is True and str(marker_body.get("refresh_class") or "") == "invalid"
 
 
 def find_marker_for_open_id(shared_home: Path, open_id: str) -> Optional[Path]:

@@ -932,6 +932,94 @@ def test_ingest_times_out_on_slow_run(monkeypatch):
 
 # ── Async polling ingest ─────────────────────────────────────────────────
 
+def test_ingest_async_billing_failure_keeps_idempotency_retryable(monkeypatch):
+    from dataclasses import replace
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_attempts = 0
+    marked = []
+    seen = set()
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_attempts
+        prepare_attempts += 1
+        if prepare_attempts == 1:
+            raise RuntimeError("temporary billing lookup failure")
+        return replace(request, metadata={**request.metadata, "billing_prepared": True})
+
+    def mark_seen(request):
+        key = request.effective_idempotency_key
+        marked.append(key)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    async def dispatch(request):
+        dispatched.append(request)
+        return "ok"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+
+    app = create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {"content": "hi", "idempotency_key": "async-turn-1"}
+        headers = {"Authorization": "Bearer testkey"}
+        try:
+            failed = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            failed_body = await failed.json()
+            retry = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            retry_body = await retry.json()
+            final_body = {}
+            for _ in range(20):
+                poll = await client.get(retry_body["poll_url"], headers=headers)
+                final_body = await poll.json()
+                if final_body["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            duplicate = await client.post("/api/run-broker/ingest/async", json=payload, headers=headers)
+            return (
+                failed.status,
+                failed_body,
+                retry.status,
+                retry_body,
+                final_body,
+                duplicate.status,
+                await duplicate.json(),
+            )
+        finally:
+            await client.close()
+
+    failed_status, failed_body, retry_status, retry_body, final_body, duplicate_status, duplicate_body = asyncio.run(runner())
+
+    assert failed_status == 503
+    assert failed_body["status"] == "prepare_failed"
+    assert retry_status == 202
+    assert retry_body["duplicate"] is False
+    assert final_body["status"] == "succeeded"
+    assert duplicate_status == 202
+    assert duplicate_body["duplicate"] is True
+    assert duplicate_body["run_id"] == retry_body["run_id"]
+    assert len(marked) == 1
+    assert len(dispatched) == 1
+    assert dispatched[0].metadata["billing_prepared"] is True
+
+
 def test_ingest_async_ignores_host_tools_opt_out_and_requires_sandbox(monkeypatch):
     calls = {"n": 0}
 

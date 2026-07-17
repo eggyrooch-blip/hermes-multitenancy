@@ -12,6 +12,10 @@ Status: local ftask worktree only; not pushed or released to production.
   `.needs_reauth` marker exists. Removing the marker after successful user
   authorization restores normal proactive refresh. Non-authoritative markers
   continue through the ordinary retry/diagnostic path.
+- Async ingest now performs the same billing preparation before admission; a
+  preparation failure returns a retryable 503 without consuming the key. Marker
+  authority is strict JSON boolean `true`, so dirty strings/numbers cannot freeze
+  credential renewal.
 
 Known gotcha: never move billing preparation back behind `mark_seen`; a profile
 apiserver outage would turn a safe retry into a permanent duplicate. Never skip
@@ -20,8 +24,8 @@ markers are terminal until reauthorization.
 
 ## Local evidence
 
-- Focused RunBroker, credential-renewal, and WebUI broker tests: 132 passed.
-- Full suite: 2331 passed, 1 skipped, 3 deselected.
+- Focused RunBroker, ingest, credential-renewal, and WebUI broker tests: 188 passed.
+- Full suite: 2335 passed, 1 skipped, 3 deselected.
 - No real Feishu message was sent and no production service or database was
   changed during this task.
 
