@@ -1964,25 +1964,26 @@ def _employee(name: str = "alice"):
     )
 
 
-def _inject_aidock_install(profile_home: Path, shared: Path, rel_path: str = "keep-report-download") -> dict:
-    """Simulate what skillhub_installer._install_into_profile leaves behind."""
-    skill_dir = profile_home / "skills" / rel_path
-    if not (skill_dir.exists() or skill_dir.is_symlink()):
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("# keep-report-download 1.0.3\n", encoding="utf-8")
+def _install_via_skillhub(profile_home: Path, shared: Path, rel_path: str = "keep-report-download") -> dict:
+    """Drive the real skillhub installer write-path (dir link + manifest + lock)."""
+    from hermes_multitenancy import skillhub_installer
+
     canonical = shared / "_managed" / "aidock-skillhub" / rel_path / "1.0.3"
-    entry = {
-        "source": str(canonical),
-        "target": str(canonical),
-        "version": "1.0.3",
-        "release_id": "181",
-        "origin": "aidock-skillhub",
-        "credential": "kep-cli",
-    }
-    manifest_path = profile_home / "skills" / ".hermes-managed.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["skills"][rel_path] = entry
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not canonical.is_dir():
+        canonical.mkdir(parents=True)
+        (canonical / "SKILL.md").write_text(f"# {rel_path} 1.0.3\n", encoding="utf-8")
+    result = skillhub_installer._install_into_profile(
+        profile_home=profile_home,
+        skill_code=rel_path,
+        version="1.0.3",
+        release_id="181",
+        canonical_skill_root=canonical,
+    )
+    assert result["status"] in {"installed", "repointed"}
+    entry = json.loads(
+        (profile_home / "skills" / ".hermes-managed.json").read_text(encoding="utf-8")
+    )["skills"][rel_path]
+    assert entry["origin"] == "aidock-skillhub"
     return entry
 
 
@@ -1997,11 +1998,15 @@ def test_org_sync_preserves_foreign_origin_skill_installs(tmp_path):
     owner_home = shared / "profiles" / "alice"
     assert _sync_default_profile_skills(owner_home, shared, owner) is True
 
-    entry = _inject_aidock_install(owner_home, shared)
+    entry = _install_via_skillhub(owner_home, shared)
+    lock_before = (owner_home / "skills" / ".keephub" / "lock.json").read_text(encoding="utf-8")
 
     _sync_default_profile_skills(owner_home, shared, owner)
 
-    assert (owner_home / "skills" / "keep-report-download" / "SKILL.md").is_file()
+    skill_dir = owner_home / "skills" / "keep-report-download"
+    assert (skill_dir / "SKILL.md").is_file()
+    assert skill_dir.is_symlink()  # installer's symlink materialization untouched
+    assert (owner_home / "skills" / ".keephub" / "lock.json").read_text(encoding="utf-8") == lock_before
     after = json.loads((owner_home / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
     assert after["keep-report-download"] == entry
     assert "org/readonly" in after
@@ -2020,7 +2025,7 @@ def test_org_sync_desired_wins_over_foreign_origin_on_same_path(tmp_path):
     assert _sync_default_profile_skills(owner_home, shared, owner) is True
 
     # Foreign entry colliding with an org-desired path: admin config wins.
-    _inject_aidock_install(owner_home, shared, rel_path="org/readonly")
+    _install_via_skillhub(owner_home, shared, rel_path="org/readonly")
     _sync_default_profile_skills(owner_home, shared, owner)
 
     after = json.loads((owner_home / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
@@ -2033,9 +2038,37 @@ def test_is_foreign_origin_skill_entry_predicate():
     assert _is_foreign_origin_skill_entry({"origin": "aidock-skillhub"}) is True
     assert _is_foreign_origin_skill_entry({"origin": ""}) is False
     assert _is_foreign_origin_skill_entry({"origin": None}) is False
+    assert _is_foreign_origin_skill_entry({"origin": True}) is False
+    assert _is_foreign_origin_skill_entry({"origin": ["aidock-skillhub"]}) is False
+    assert _is_foreign_origin_skill_entry({"origin": 1}) is False
     assert _is_foreign_origin_skill_entry({}) is False
     assert _is_foreign_origin_skill_entry(None) is False
     assert _is_foreign_origin_skill_entry("not-a-dict") is False
+
+
+def test_org_sync_noncanonical_foreign_alias_dropped_but_desired_dir_kept(tmp_path):
+    """A corrupt manifest key like ' org/readonly ' (canonicalizes to a desired
+    path) must not dodge the desired-wins rule, leave duplicate entries, or get
+    the desired directory deleted by prune."""
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared = _org_shared_home_with_one_skill(tmp_path)
+    owner = _employee()
+    owner_home = shared / "profiles" / "alice"
+    assert _sync_default_profile_skills(owner_home, shared, owner) is True
+
+    manifest_path = owner_home / "skills" / ".hermes-managed.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"][" org/readonly "] = {"origin": "aidock-skillhub", "version": "9.9.9"}
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    _sync_default_profile_skills(owner_home, shared, owner)
+
+    after = json.loads(manifest_path.read_text(encoding="utf-8"))["skills"]
+    assert " org/readonly " not in after
+    assert "org/readonly" in after
+    assert after["org/readonly"].get("origin") is None
+    assert (owner_home / "skills" / "org" / "readonly" / "SKILL.md").is_file()
 
 
 def test_org_sync_still_prunes_its_own_removed_skills(tmp_path):
@@ -2047,7 +2080,7 @@ def test_org_sync_still_prunes_its_own_removed_skills(tmp_path):
     assert _sync_default_profile_skills(owner_home, shared, owner) is True
     assert (owner_home / "skills" / "org" / "readonly").exists()
 
-    _inject_aidock_install(owner_home, shared)
+    _install_via_skillhub(owner_home, shared)
 
     # Admin removes the org skill from the bundle config.
     (shared / "skill-bundles.yaml").write_text(

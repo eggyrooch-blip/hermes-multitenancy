@@ -1446,11 +1446,15 @@ def _is_foreign_origin_skill_entry(entry: Any) -> bool:
     """Entry installed by another manager (e.g. origin=aidock-skillhub events).
 
     Org sync only owns manifest entries it generates, which never carry an
-    ``origin`` field. Entries with a non-empty origin are preserved verbatim —
+    ``origin`` field. Entries with a non-empty string origin are preserved —
     never pruned, never dropped on manifest rewrite — unless the same path is
-    also desired by org config (admin config wins on path conflict).
+    also desired by org config (admin config wins on path conflict). Non-string
+    origins (corrupt manifests) are NOT foreign, so org cleanup still applies.
     """
-    return isinstance(entry, dict) and bool(entry.get("origin"))
+    if not isinstance(entry, dict):
+        return False
+    origin = entry.get("origin")
+    return isinstance(origin, str) and bool(origin)
 
 
 def _prune_removed_managed_skills(profile_home: Path, desired: dict[str, dict[str, Any]]) -> bool:
@@ -1461,6 +1465,10 @@ def _prune_removed_managed_skills(profile_home: Path, desired: dict[str, dict[st
             continue
         rel_path = _safe_skill_relative_path(rel_raw)
         if rel_path is None:
+            continue
+        if str(rel_path) in desired:
+            # Non-canonical alias (" foo ", "foo//bar") of a desired path:
+            # the directory belongs to desired — never delete it.
             continue
         target = profile_home / "skills" / rel_path
         if target.exists() or target.is_symlink():
@@ -1483,11 +1491,16 @@ def _write_managed_skill_manifest(profile_home: Path, desired: dict[str, dict[st
     path = profile_home / "skills" / MANAGED_SKILL_MANIFEST
     path.parent.mkdir(parents=True, exist_ok=True)
     previous = _read_managed_skill_manifest(profile_home)
-    skills = {
-        rel_raw: entry
-        for rel_raw, entry in previous.items()
-        if rel_raw not in desired and _is_foreign_origin_skill_entry(entry)
-    }
+    skills: dict[str, Any] = {}
+    for rel_raw, entry in previous.items():
+        if not _is_foreign_origin_skill_entry(entry):
+            continue
+        canonical = _safe_skill_relative_path(rel_raw)
+        # Keep only canonical-keyed foreign entries; non-canonical aliases
+        # (corrupt/hand-edited) are dropped, and desired wins on conflict.
+        if canonical is None or str(canonical) != rel_raw or str(canonical) in desired:
+            continue
+        skills[rel_raw] = entry
     skills.update(desired)
     content = json.dumps(
         {
