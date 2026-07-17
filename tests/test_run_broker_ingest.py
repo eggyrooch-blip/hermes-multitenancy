@@ -1514,12 +1514,12 @@ def test_ingest_sync_outer_cancel_after_mark_preserves_secret_until_execution_fi
     assert dispatches == 1
 
 
-def test_ingest_sync_stable_task_cancelled_before_first_step_cleans_secret(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("stable_task_failure", ["raise", "cancel"])
+def test_ingest_sync_stable_task_failure_before_first_step_is_fresh_retry(
+    monkeypatch, tmp_path, stable_task_failure
 ):
     from pathlib import Path
 
-    from aiohttp import ClientConnectionError, ServerDisconnectedError
     from aiohttp.test_utils import TestClient, TestServer
 
     from hermes_multitenancy import run_broker as broker_mod
@@ -1563,14 +1563,22 @@ def test_ingest_sync_stable_task_cancelled_before_first_step_cleans_secret(
         return "unexpected"
 
     real_create_task = broker_mod.asyncio.create_task
+    cancel_once = True
 
-    def cancel_stable_task(coro):
-        task = real_create_task(coro)
-        if getattr(getattr(coro, "cr_code", None), "co_name", "") == (
-            "_run_execute_admitted"
+    def fail_stable_task(coro):
+        nonlocal cancel_once
+        if (
+            cancel_once
+            and getattr(getattr(coro, "cr_code", None), "co_name", "")
+            == "_run_after_admission"
         ):
+            cancel_once = False
+            if stable_task_failure == "raise":
+                raise RuntimeError("stable task factory failed")
+            task = real_create_task(coro)
             task.cancel()
-        return task
+            return task
+        return real_create_task(coro)
 
     monkeypatch.setattr(
         server_mod,
@@ -1578,7 +1586,7 @@ def test_ingest_sync_stable_task_cancelled_before_first_step_cleans_secret(
         materialize,
     )
     monkeypatch.setattr(server_mod, "_ingest_cleanup_secret_dir", capture_cleanup)
-    monkeypatch.setattr(broker_mod.asyncio, "create_task", cancel_stable_task)
+    monkeypatch.setattr(broker_mod.asyncio, "create_task", fail_stable_task)
     monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
     monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
     monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
@@ -1600,14 +1608,14 @@ def test_ingest_sync_stable_task_cancelled_before_first_step_cleans_secret(
         }
         headers = {"Authorization": "Bearer testkey"}
         try:
-            with pytest.raises((ServerDisconnectedError, ClientConnectionError)):
-                await client.post(
-                    "/api/run-broker/ingest",
-                    json=payload,
-                    headers=headers,
-                )
+            failed = await client.post(
+                "/api/run-broker/ingest",
+                json=payload,
+                headers=headers,
+            )
+            failed_body = await failed.json()
             await asyncio.wait_for(cleanup_done.wait(), timeout=1)
-            mismatch = await client.post(
+            retry = await client.post(
                 "/api/run-broker/ingest",
                 json={
                     **payload,
@@ -1615,31 +1623,42 @@ def test_ingest_sync_stable_task_cancelled_before_first_step_cleans_secret(
                 },
                 headers=headers,
             )
-            mismatch_body = await mismatch.json()
-            retry = await client.post(
+            retry_body = await retry.json()
+            mismatch = await client.post(
                 "/api/run-broker/ingest",
                 json=payload,
                 headers=headers,
             )
             return (
-                mismatch.status,
-                mismatch_body,
+                failed.status,
+                failed_body,
                 retry.status,
-                await retry.json(),
+                retry_body,
+                mismatch.status,
+                await mismatch.json(),
             )
         finally:
             await client.close()
 
-    mismatch_status, mismatch_body, retry_status, retry_body = asyncio.run(runner())
+    (
+        failed_status,
+        failed_body,
+        retry_status,
+        retry_body,
+        mismatch_status,
+        mismatch_body,
+    ) = asyncio.run(runner())
 
+    assert failed_status == 500
+    assert failed_body["error"] == "internal error"
+    assert retry_status == 200
+    assert retry_body["ok"] is True
+    assert retry_body["duplicate"] is False
     assert mismatch_status == 409
     assert mismatch_body["error"] == "secret_mismatch"
-    assert retry_status == 200
-    assert retry_body["status"] == "duplicate_pending"
-    assert retry_body["duplicate"] is True
     assert len(marked) == 1
-    assert dispatches == 0
-    assert cleanup_calls == [secret_dir]
+    assert dispatches == 1
+    assert cleanup_calls == [secret_dir, secret_dir]
     assert not secret_dir.exists()
 
 
@@ -2406,6 +2425,335 @@ def test_ingest_async_cancelled_prepare_cleans_secrets_and_keeps_retryable(
     assert prepare_calls == 2
     assert len(marked) == 1
     assert len(dispatched) == 1
+
+
+def test_ingest_async_job_cancelled_before_first_step_is_retryable(
+    monkeypatch, tmp_path, caplog
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import webui_broker_server as server_mod
+
+    secret_value = "prestep-plain-secret"
+    prepare_calls = 0
+    materialize_calls = 0
+    marked = 0
+    dispatched = 0
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    real_materialize = server_mod._ingest_materialize_secret_dir
+
+    def materialize(**kwargs):
+        nonlocal materialize_calls
+        materialize_calls += 1
+        return real_materialize(**kwargs)
+
+    def mark_seen(_request):
+        nonlocal marked
+        marked += 1
+        return True
+
+    async def dispatch(_request):
+        nonlocal dispatched
+        dispatched += 1
+        return "ok"
+
+    real_create_task = server_mod.asyncio.create_task
+    cancel_once = True
+
+    def cancel_job_before_first_step(coro, *args, **kwargs):
+        nonlocal cancel_once
+        task = real_create_task(coro, *args, **kwargs)
+        if (
+            cancel_once
+            and getattr(getattr(coro, "cr_code", None), "co_name", "")
+            == "_run_registered_ingest_async_job"
+        ):
+            cancel_once = False
+            task.cancel()
+        return task
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(server_mod, "_ingest_materialize_secret_dir", materialize)
+    monkeypatch.setattr(server_mod.asyncio, "create_task", cancel_job_before_first_step)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "shared"))
+    caplog.set_level("ERROR")
+
+    app = server_mod.create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "content": "hi",
+            "idempotency_key": "async-prestep-cancel",
+            "secrets": {"cms": {"type": "opaque", "value": secret_value}},
+        }
+        headers = {"Authorization": "Bearer testkey"}
+        try:
+            failed = await client.post(
+                "/api/run-broker/ingest/async", json=payload, headers=headers
+            )
+            failed_body = await failed.json()
+            retry = await client.post(
+                "/api/run-broker/ingest/async", json=payload, headers=headers
+            )
+            retry_body = await retry.json()
+            final_body = {}
+            for _ in range(50):
+                poll = await client.get(retry_body["poll_url"], headers=headers)
+                final_body = await poll.json()
+                if final_body["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            return failed.status, failed_body, retry.status, retry_body, final_body
+        finally:
+            await client.close()
+
+    failed_status, failed_body, retry_status, retry_body, final_body = asyncio.run(
+        runner()
+    )
+
+    assert failed_status == 503
+    assert failed_body["status"] == "prepare_failed"
+    assert "run_id" not in failed_body
+    assert retry_status == 202
+    assert retry_body["duplicate"] is False
+    assert final_body["status"] == "succeeded"
+    assert prepare_calls == 1
+    assert materialize_calls == 1
+    assert marked == 1
+    assert dispatched == 1
+    assert secret_value not in json.dumps(failed_body)
+    assert secret_value not in caplog.text
+
+
+def test_ingest_async_running_task_cancel_is_terminal_and_reclaims_capacity(
+    monkeypatch, tmp_path, caplog
+):
+    from pathlib import Path
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as server_mod
+
+    secret_value = "running-cancel-plain-secret"
+    dispatch_started = asyncio.Event()
+    job_tasks: list[asyncio.Task] = []
+    dispatches = 0
+    first_secret_dir: Path | None = None
+
+    async def dispatch(request):
+        nonlocal dispatches, first_secret_dir
+        dispatches += 1
+        if dispatches == 1:
+            first_secret_dir = Path(request.metadata["ingest_secret_dir"])
+            assert (first_secret_dir / "cms").read_text(encoding="utf-8") == secret_value
+            dispatch_started.set()
+            await asyncio.Event().wait()
+        return "ok"
+
+    real_create_task = server_mod.asyncio.create_task
+
+    def capture_job_task(coro, *args, **kwargs):
+        task = real_create_task(coro, *args, **kwargs)
+        if (
+            getattr(getattr(coro, "cr_code", None), "co_name", "")
+            == "_run_registered_ingest_async_job"
+        ):
+            job_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(server_mod.asyncio, "create_task", capture_job_task)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "shared"))
+    monkeypatch.setenv("HERMES_INGEST_ASYNC_CAP", "1")
+    caplog.set_level("ERROR")
+
+    app = server_mod.create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+    async def wait_for_terminal(client, poll_url, headers):
+        body = {}
+        for _ in range(50):
+            poll = await client.get(poll_url, headers=headers)
+            body = await poll.json()
+            if body.get("status") in {"failed", "succeeded"}:
+                return body
+            await asyncio.sleep(0.01)
+        return body
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {"Authorization": "Bearer testkey"}
+        first_payload = {
+            "content": "first",
+            "idempotency_key": "async-running-cancel",
+            "secrets": {"cms": {"type": "opaque", "value": secret_value}},
+        }
+        try:
+            first = await client.post(
+                "/api/run-broker/ingest/async",
+                json=first_payload,
+                headers=headers,
+            )
+            first_body = await first.json()
+            await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+            assert job_tasks
+            job_tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await job_tasks[0]
+            failed_body = await wait_for_terminal(
+                client, first_body["poll_url"], headers
+            )
+
+            second = await client.post(
+                "/api/run-broker/ingest/async",
+                json={"content": "second", "idempotency_key": "capacity-reuse"},
+                headers=headers,
+            )
+            second_body = await second.json()
+            second_final = await wait_for_terminal(
+                client, second_body["poll_url"], headers
+            )
+            return first.status, failed_body, second.status, second_body, second_final
+        finally:
+            await client.close()
+
+    first_status, failed_body, second_status, second_body, second_final = asyncio.run(
+        runner()
+    )
+
+    assert first_status == 202
+    assert failed_body["status"] == "failed"
+    assert failed_body["error"] == "async ingest task cancelled"
+    assert first_secret_dir is not None and not first_secret_dir.exists()
+    assert second_status == 202
+    assert second_body["duplicate"] is False
+    assert second_final["status"] == "succeeded"
+    assert dispatches == 2
+    assert secret_value not in json.dumps(failed_body)
+    assert secret_value not in caplog.text
+
+
+def test_ingest_async_task_factory_throw_is_retryable_and_redacted(
+    monkeypatch, tmp_path, caplog
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import webui_broker_server as server_mod
+
+    secret_value = "factory-throw-plain-secret"
+    prepare_calls = 0
+    marked = 0
+    dispatched = 0
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    def mark_seen(_request):
+        nonlocal marked
+        marked += 1
+        return True
+
+    async def dispatch(_request):
+        nonlocal dispatched
+        dispatched += 1
+        return "ok"
+
+    real_create_task = server_mod.asyncio.create_task
+    fail_once = True
+
+    def fail_job_task_creation(coro, *args, **kwargs):
+        nonlocal fail_once
+        if (
+            fail_once
+            and getattr(getattr(coro, "cr_code", None), "co_name", "")
+            == "_run_registered_ingest_async_job"
+        ):
+            fail_once = False
+            raise RuntimeError(f"task factory exposed {secret_value}")
+        return real_create_task(coro, *args, **kwargs)
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(server_mod.asyncio, "create_task", fail_job_task_creation)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
+    monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "shared"))
+    caplog.set_level("ERROR")
+
+    app = server_mod.create_run_broker_app(
+        dispatch_agent=dispatch,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {"Authorization": "Bearer testkey"}
+        payload = {
+            "content": "hi",
+            "idempotency_key": "async-task-factory-throw",
+            "secrets": {"cms": {"type": "opaque", "value": secret_value}},
+        }
+        try:
+            failed = await client.post(
+                "/api/run-broker/ingest/async", json=payload, headers=headers
+            )
+            failed_body = await failed.json()
+            retry = await client.post(
+                "/api/run-broker/ingest/async", json=payload, headers=headers
+            )
+            retry_body = await retry.json()
+            final_body = {}
+            for _ in range(50):
+                poll = await client.get(retry_body["poll_url"], headers=headers)
+                final_body = await poll.json()
+                if final_body["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            return failed.status, failed_body, retry.status, retry_body, final_body
+        finally:
+            await client.close()
+
+    failed_status, failed_body, retry_status, retry_body, final_body = asyncio.run(
+        runner()
+    )
+
+    assert failed_status == 503
+    assert failed_body["status"] == "prepare_failed"
+    assert "run_id" not in failed_body
+    assert retry_status == 202
+    assert retry_body["duplicate"] is False
+    assert final_body["status"] == "succeeded"
+    assert prepare_calls == 1
+    assert marked == 1
+    assert dispatched == 1
+    assert secret_value not in json.dumps(failed_body)
+    assert secret_value not in caplog.text
 
 
 def test_ingest_async_outer_cancel_after_mark_preserves_handed_off_secrets(

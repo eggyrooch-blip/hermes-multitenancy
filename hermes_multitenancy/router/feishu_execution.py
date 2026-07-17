@@ -12,6 +12,26 @@ from ..run_models import RunResult
 from .vision_admission import vision_block_reply
 
 
+async def _complete_feishu_processing(adapter: Any, event: Any, *, failed: bool) -> None:
+    """Close the gateway-owned Feishu lifecycle exactly once for this run."""
+    try:
+        outcome = _m._processing_outcome(failed=failed)
+        complete_deferred = getattr(
+            adapter,
+            "complete_deferred_processing",
+            None,
+        )
+        if callable(complete_deferred):
+            await complete_deferred(event, outcome)
+        else:
+            await adapter.on_processing_complete(event, outcome)
+    except Exception as exc:
+        _m.logger.debug(
+            "multitenancy: on_processing_complete failed: %s",
+            exc,
+        )
+
+
 async def execute_admitted_feishu_run(
     admitted_run: AdmittedRun,
     *,
@@ -31,19 +51,33 @@ async def execute_admitted_feishu_run(
     enriched_text = admitted_run.request.content
     vision_blocked = vision_block_reply(admitted_run)
     if vision_blocked:
-        hist_key = _m._dispatch_session_scope(
-            profile_name,
-            sender,
-            sender_alt,
-            chat_id,
-            event,
-        ).history_key
-        user_msg = _m._build_user_message(event, text_override=enriched_text)
-        _m._persist_turn(hist_key, user_msg, vision_blocked)
-        return await run_broker._run_admitted(
-            admitted_run,
-            dispatch_agent=lambda _request: "",
-        )
+        outcome_failed = False
+        try:
+            hist_key = _m._dispatch_session_scope(
+                profile_name,
+                sender,
+                sender_alt,
+                chat_id,
+                event,
+            ).history_key
+            user_msg = _m._build_user_message(event, text_override=enriched_text)
+            _m._persist_turn(hist_key, user_msg, vision_blocked)
+            return await run_broker._run_admitted(
+                admitted_run,
+                dispatch_agent=lambda _request: "",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            outcome_failed = True
+            raise
+        finally:
+            if feishu_full:
+                await _complete_feishu_processing(
+                    adapter,
+                    event,
+                    failed=outcome_failed,
+                )
 
     current = asyncio.current_task()
     scope = _m._dispatch_session_scope(
@@ -180,22 +214,11 @@ async def execute_admitted_feishu_run(
         return RunResult(content="", duplicate=False)
     finally:
         if feishu_full:
-            try:
-                out = _m._processing_outcome(failed=outcome_failed)
-                complete_deferred = getattr(
-                    adapter,
-                    "complete_deferred_processing",
-                    None,
-                )
-                if callable(complete_deferred):
-                    await complete_deferred(event, out)
-                else:
-                    await adapter.on_processing_complete(event, out)
-            except Exception as exc:
-                _m.logger.debug(
-                    "multitenancy: on_processing_complete failed: %s",
-                    exc,
-                )
+            await _complete_feishu_processing(
+                adapter,
+                event,
+                failed=outcome_failed,
+            )
         if _m._user_inflight_tasks.get(inflight_key) is current:
             _m._user_inflight_tasks.pop(inflight_key, None)
             _m._user_inflight_history_keys.pop(inflight_key, None)

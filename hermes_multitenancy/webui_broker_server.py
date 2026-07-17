@@ -44,6 +44,10 @@ class _IngestSecretMaterializationError(RuntimeError):
     """Secret staging failed before durable async-ingest admission."""
 
 
+class _IngestAsyncTaskStartError(RuntimeError):
+    """The async job owner could not be established before admission."""
+
+
 class _IngestAsyncSecretClaim:
     """Reference-counted in-process claim for one idempotency/fingerprint pair."""
 
@@ -687,6 +691,8 @@ def create_run_broker_app(
         )
         timeout_s = _ingest_async_timeout()
         result = None
+        run_task: Optional[asyncio.Task] = None
+        interrupt_task: Optional[asyncio.Task] = None
 
         try:
             _ingest_async_touch(job, "running")
@@ -738,6 +744,17 @@ def create_run_broker_app(
                     ),
                     timeout=timeout_s,
                 )
+        except asyncio.CancelledError:
+            pending_children = [
+                task
+                for task in (run_task, interrupt_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending_children:
+                task.cancel()
+            if pending_children:
+                await asyncio.gather(*pending_children, return_exceptions=True)
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "[multitenancy] async ingest run timed out run_id=%s profile=%s session_id=%s timeout_s=%s",
@@ -876,7 +893,10 @@ def create_run_broker_app(
             "expires_at": now + _ingest_async_ttl(),
             "secret_dir": secret_dir,
         }
+        shared_entry_owned = asyncio.Event()
         execution_owned = asyncio.Event()
+        job_start_gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        job_task: Optional[asyncio.Task] = None
 
         claim_ref_released = False
 
@@ -896,8 +916,65 @@ def create_run_broker_app(
             ):
                 _ingest_async_secret_fingerprints.pop(idempotency_secret_key, None)
 
+        def _cleanup_staged_secret() -> None:
+            staged = str(job.get("secret_dir") or "")
+            if not staged:
+                return
+            job["secret_dir"] = ""
+            _ingest_cleanup_secret_dir(staged)
+
+        def _job_task_unavailable() -> bool:
+            if job_task is None or job_task.done():
+                return True
+            cancelling = getattr(job_task, "cancelling", None)
+            return bool(callable(cancelling) and cancelling())
+
+        def _cancel_waiting_job_task() -> None:
+            if not job_start_gate.done():
+                job_start_gate.cancel()
+            if job_task is not None and not job_task.done():
+                job_task.cancel()
+
         def _abandon_staged_resources() -> None:
-            _ingest_cleanup_secret_dir(secret_dir)
+            _cleanup_staged_secret()
+            _cancel_waiting_job_task()
+
+        def _finalize_job_task(done_task: asyncio.Task) -> None:
+            if job.get("_task_finalized"):
+                return
+            job["_task_finalized"] = True
+            failure = ""
+            try:
+                if done_task.cancelled():
+                    failure = "async ingest task cancelled"
+                else:
+                    exc = done_task.exception()
+                    if exc is not None:
+                        failure = _ingest_classify_agent_error(
+                            _ingest_redact_text(str(exc), prepared.secret_spec)
+                        )
+            except BaseException as exc:
+                failure = f"async ingest task failed ({type(exc).__name__})"
+
+            if _ingest_async_jobs.get(run_id) is not job:
+                _cleanup_staged_secret()
+                return
+            if not _ingest_async_is_active(job):
+                return
+            failure = failure or "async ingest task ended before terminal status"
+            job["error"] = failure
+            _ingest_async_touch(job, "failed")
+            logger.error(
+                "[multitenancy] async ingest background task failed "
+                "run_id=%s profile=%s error=%s",
+                run_id,
+                prepared.bound_profile,
+                failure,
+            )
+
+        async def _run_registered_ingest_async_job() -> None:
+            await job_start_gate
+            await _run_ingest_async_job(run_id, prepared)
 
         def _stage_secret(prepared_run):
             nonlocal secret_dir
@@ -928,6 +1005,12 @@ def create_run_broker_app(
             job["secret_dir"] = staged_secret_dir
             return staged_request
 
+        def _ensure_job_task_available(_prepared_run) -> None:
+            if _job_task_unavailable():
+                raise _IngestAsyncTaskStartError(
+                    "async ingest task unavailable before admission"
+                )
+
         def _handoff(admitted_run):
             try:
                 prepared.admission_broker = admission_broker
@@ -939,7 +1022,11 @@ def create_run_broker_app(
                     secret_claim
                 )
                 secret_claim.job_owned = True
-                job["task"] = asyncio.create_task(_run_ingest_async_job(run_id, prepared))
+                if _job_task_unavailable() or job_start_gate.done():
+                    job["error"] = "async ingest task unavailable after admission"
+                    _ingest_async_touch(job, "failed")
+                else:
+                    job_start_gate.set_result(None)
                 return RunResult(content="", duplicate=False)
             except BaseException:
                 if _ingest_async_jobs.get(run_id) is job:
@@ -953,28 +1040,60 @@ def create_run_broker_app(
                     is secret_claim
                 ):
                     _ingest_async_secret_fingerprints.pop(idempotency_secret_key, None)
-                _ingest_cleanup_secret_dir(secret_dir)
+                _cleanup_staged_secret()
+                _cancel_waiting_job_task()
                 raise
 
         try:
+            job_coro = _run_registered_ingest_async_job()
+            try:
+                job_task = asyncio.create_task(job_coro)
+            except BaseException as exc:
+                job_coro.close()
+                job_start_gate.cancel()
+                if isinstance(exc, Exception):
+                    raise _IngestAsyncTaskStartError(
+                        "async ingest task creation failed"
+                    ) from None
+                raise
+            job["task"] = job_task
+            job_task.add_done_callback(_finalize_job_task)
+            if _job_task_unavailable():
+                raise _IngestAsyncTaskStartError(
+                    "async ingest task unavailable before preparation"
+                )
+
             # Billing identity preparation can call the profile apiserver and
             # fail transiently. A persistent read-only duplicate check happens
             # first; concurrent retries then share the same preparation task.
-            try:
-                admission = await admission_broker.prepare_and_execute(
-                    prepared.run_request,
-                    execute=_handoff,
-                    transform_request=_stage_secret,
-                    execution_owned=execution_owned,
-                    on_abandon=_abandon_staged_resources,
-                )
-            finally:
-                _release_fingerprint_claim_ref()
+            admission = await admission_broker.prepare_and_execute(
+                prepared.run_request,
+                execute=_handoff,
+                transform_request=_stage_secret,
+                before_admit=_ensure_job_task_available,
+                shared_entry_owned=shared_entry_owned,
+                execution_owned=execution_owned,
+                on_abandon=_abandon_staged_resources,
+            )
         except asyncio.CancelledError:
             # Known gotcha: the shared broker entry—not an outer request waiter—
             # owns staged secrets through pre-mark cancellation.  It either
             # abandons+cleans them or transfers them to the stable execution.
             raise
+        except _IngestAsyncTaskStartError:
+            logger.error(
+                "[multitenancy] async ingest task startup failed profile=%s",
+                prepared.bound_profile,
+            )
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "prepare_failed",
+                    "error": "async ingest task startup failed",
+                    "profile": prepared.bound_profile,
+                },
+                status=503,
+            )
         except _IngestSecretMaterializationError:
             logger.exception("[multitenancy] async ingest secret store failed")
             return web.json_response(
@@ -995,6 +1114,10 @@ def create_run_broker_app(
                 },
                 status=503,
             )
+        finally:
+            _release_fingerprint_claim_ref()
+            if not shared_entry_owned.is_set() and not execution_owned.is_set():
+                _cancel_waiting_job_task()
 
         if execution_owned.is_set():
             return web.json_response(
@@ -1005,7 +1128,7 @@ def create_run_broker_app(
         # A concurrent waiter can observe the leader's successful execution
         # result without owning its staged resources.  Return the one job that
         # the shared leader registered.
-        _ingest_cleanup_secret_dir(secret_dir)
+        _cleanup_staged_secret()
         existing_id = _ingest_async_by_cache.get(async_cache_key)
         existing = _ingest_async_jobs.get(existing_id or "")
         if existing is not None:
@@ -1348,10 +1471,10 @@ def create_run_broker_app(
             return staged_request
 
         async def _execute_sync(admitted_run):
-            # This child is created synchronously with durable mark and is the
-            # first stable owner. Persist the fingerprint before dispatch can
-            # yield so request cancellation cannot reopen the key to a peer
-            # carrying different credentials.
+            # RunBroker created this stable child behind a closed gate before
+            # durable mark. Once the gate opens, persist the fingerprint before
+            # dispatch can yield so request cancellation cannot reopen the key
+            # to a peer carrying different credentials.
             _commit_sync_secret_claim()
             return await broker._run_admitted(admitted_run)
 
@@ -1486,9 +1609,9 @@ def create_run_broker_app(
                             await asyncio.shield(settled)
                         except asyncio.CancelledError:
                             continue
-            # The stable child normally commits first. This event check closes
-            # the tiny create-task-to-first-run window when the outer HTTP task
-            # is cancelled synchronously by mark_seen or a hard timeout.
+            # The stable child normally commits first. This event check covers
+            # cancellation after mark opens its gate but before the child gets
+            # its next coroutine step.
             if execution_owned.is_set():
                 _commit_sync_secret_claim()
             if not (

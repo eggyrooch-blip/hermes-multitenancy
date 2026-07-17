@@ -265,6 +265,58 @@ def test_webui_session_store_mark_failure_emits_error_and_retry_succeeds(monkeyp
     assert dispatches == ["hello"]
 
 
+def test_webui_missing_session_store_emits_error_eof_without_dispatch(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity, router
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_calls = []
+    dispatches = []
+
+    async def prepare(request):
+        prepare_calls.append(request.content)
+        return request
+
+    async def dispatch(request):
+        dispatches.append(request.content)
+        return "unexpected"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router, "_get_session_store", lambda: None)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                json={
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_owner",
+                    "content": "hello",
+                    "idempotency_key": "webui:missing-session-store",
+                },
+            )
+            return response.status, await response.text()
+        finally:
+            await client.close()
+
+    status, body = asyncio.run(runner())
+
+    assert status == 200
+    assert '"kind": "error"' in body
+    assert "SessionStore unavailable" in body
+    assert body.endswith("\n\n")
+    assert prepare_calls == []
+    assert dispatches == []
+
+
 def test_webui_run_broker_strips_ingest_secret_metadata_from_caller(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 

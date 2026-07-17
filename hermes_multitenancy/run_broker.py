@@ -258,6 +258,53 @@ async def _run_execute_admitted(
     return await _maybe_await(execute(admitted))
 
 
+async def _run_after_admission(
+    admission_gate: asyncio.Future[AdmittedRun],
+    execute: ExecuteAdmitted,
+) -> RunResult:
+    """Keep a stable task parked until durable admission has succeeded."""
+    admitted = await admission_gate
+    return await _run_execute_admitted(execute, admitted)
+
+
+def _consume_task_exception(done_task: asyncio.Task[RunResult]) -> None:
+    try:
+        done_task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+def _cancel_unadmitted_execution(
+    admission_gate: asyncio.Future[AdmittedRun],
+    execution_task: asyncio.Task[RunResult],
+) -> None:
+    if not admission_gate.done():
+        admission_gate.cancel()
+    if not execution_task.done():
+        execution_task.cancel()
+
+
+def _create_gated_execution_task(
+    execute: ExecuteAdmitted,
+) -> tuple[asyncio.Future[AdmittedRun], asyncio.Task[RunResult]]:
+    """Create and validate the stable owner before idempotency is consumed."""
+    loop = asyncio.get_running_loop()
+    admission_gate: asyncio.Future[AdmittedRun] = loop.create_future()
+    execution_coro = _run_after_admission(admission_gate, execute)
+    try:
+        execution_task = asyncio.create_task(execution_coro)
+    except BaseException:
+        execution_coro.close()
+        admission_gate.cancel()
+        raise
+    execution_task.add_done_callback(_consume_task_exception)
+    cancelling = getattr(execution_task, "cancelling", None)
+    if execution_task.done() or (callable(cancelling) and cancelling()):
+        _cancel_unadmitted_execution(admission_gate, execution_task)
+        raise RuntimeError("stable execution task unavailable before admission")
+    return admission_gate, execution_task
+
+
 class RunBroker:
     """Single execution boundary for tenant-scoped agent runs."""
 
@@ -433,27 +480,27 @@ class RunBroker:
         if not self._claim_prepared_admission(prepared):
             return RunResult(content="", duplicate=True)
         self._assert_policy(prepared.request)
-        admission = self._consume_idempotency(prepared._admission_request)
-        if admission.duplicate:
-            return admission
         admitted = _issue_admitted(
             prepared.request,
             authority=self,
             internal_metadata=prepared._internal_metadata,
         )
-        execution_task = asyncio.create_task(self._run_admitted(
-            admitted,
-            dispatch_agent=dispatch_agent,
-            emit_event=emit_event,
-        ))
-
-        def _consume_unobserved_error(done_task: asyncio.Task[RunResult]) -> None:
-            try:
-                done_task.exception()
-            except asyncio.CancelledError:
-                pass
-
-        execution_task.add_done_callback(_consume_unobserved_error)
+        admission_gate, execution_task = _create_gated_execution_task(
+            lambda value: self._run_admitted(
+                value,
+                dispatch_agent=dispatch_agent,
+                emit_event=emit_event,
+            )
+        )
+        try:
+            admission = self._consume_idempotency(prepared._admission_request)
+        except BaseException:
+            _cancel_unadmitted_execution(admission_gate, execution_task)
+            raise
+        if admission.duplicate:
+            _cancel_unadmitted_execution(admission_gate, execution_task)
+            return admission
+        admission_gate.set_result(admitted)
         return await asyncio.shield(execution_task)
 
     async def admit(self, request: RunRequest) -> RunResult:
@@ -562,33 +609,42 @@ class RunBroker:
                 return admission
             if not self._claim_prepared_admission(prepared):
                 return RunResult(content="", duplicate=True)
-            admission = self._consume_idempotency(prepared._admission_request)
-            if admission.duplicate:
-                return admission
-
             admitted = _issue_admitted(
                 prepared.request,
                 authority=self,
                 internal_metadata=prepared._internal_metadata,
             )
-            # Creating the child task is synchronous with the durable mark: once
-            # the key is consumed, a stable owner exists even if every outer
-            # waiter is cancelled before it observes the result.
-            execution_task = asyncio.create_task(
-                _run_execute_admitted(execute, admitted)
+            # Park and fully instrument the stable child before durable mark.
+            # Opening its gate after mark is synchronous, so a successful
+            # admission can never exist without an execution owner.
+            admission_gate, execution_task = _create_gated_execution_task(
+                execute,
             )
             if on_execution_done is not None:
                 def _finalize_execution(_done_task: asyncio.Task[RunResult]) -> None:
+                    with _PREPARE_INFLIGHT_LOCK:
+                        committed = entry.committed
+                    if not committed:
+                        return
                     try:
                         on_execution_done()
                     except Exception:
                         logger.exception("RunBroker execution cleanup failed")
 
                 execution_task.add_done_callback(_finalize_execution)
+            try:
+                admission = self._consume_idempotency(prepared._admission_request)
+            except BaseException:
+                _cancel_unadmitted_execution(admission_gate, execution_task)
+                raise
+            if admission.duplicate:
+                _cancel_unadmitted_execution(admission_gate, execution_task)
+                return admission
             with _PREPARE_INFLIGHT_LOCK:
                 entry.committed = True
             if execution_owned is not None:
                 execution_owned.set()
+            admission_gate.set_result(admitted)
             try:
                 result = await asyncio.shield(execution_task)
             except asyncio.CancelledError:

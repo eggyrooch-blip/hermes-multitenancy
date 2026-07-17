@@ -16,7 +16,10 @@ from typing import Any, Optional
 
 from .. import router as _m
 from ..feishu_message_trace import reset_trace_context, set_trace_context
-from .feishu_execution import execute_admitted_feishu_run
+from .feishu_execution import (
+    _complete_feishu_processing,
+    execute_admitted_feishu_run,
+)
 from .vision_admission import (
     attach_vision_block,
     send_vision_block_before_admission,
@@ -321,65 +324,66 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 feishu_full=feishu_full,
             )
 
+        execution_owned = asyncio.Event()
+        pre_admission_failed = False
         try:
-            run_admission = await run_broker.prepare_and_execute(
-                run_request,
-                execute=_execute_admitted,
-                transform_request=_enrich_prepared,
-                before_admit=_send_vision_block_before_admission,
-            )
-        except RunRejected as exc:
-            _m.logger.warning(
-                "multitenancy: employee billing preparation rejected "
-                "profile=%s sender=%s: %s",
-                profile_name,
-                sender,
-                exc,
-            )
-            if adapter is not None:
-                await _m._safe_call(
-                    adapter.send,
-                    chat_id,
-                    "当前无法确认员工计费身份，请稍后重试。",
+            try:
+                run_admission = await run_broker.prepare_and_execute(
+                    run_request,
+                    execute=_execute_admitted,
+                    transform_request=_enrich_prepared,
+                    before_admit=_send_vision_block_before_admission,
+                    execution_owned=execution_owned,
                 )
-            return
-        except Exception as exc:
-            _m.logger.exception(
-                "multitenancy: durable run admission failed profile=%s sender=%s: %s",
-                profile_name,
-                sender,
-                exc,
-            )
-            if adapter is not None:
-                await _m._safe_call(
-                    adapter.send,
-                    chat_id,
-                    "请求状态暂时无法保存，请稍后重试。",
+            except asyncio.CancelledError:
+                pre_admission_failed = True
+                raise
+            except RunRejected as exc:
+                pre_admission_failed = True
+                _m.logger.warning(
+                    "multitenancy: employee billing preparation rejected "
+                    "profile=%s sender=%s: %s",
+                    profile_name,
+                    sender,
+                    exc,
                 )
-            return
-        if run_admission.duplicate:
-            _m.logger.info(
-                "multitenancy: duplicate inbound event skipped profile=%s sender=%s message_id=%s",
-                profile_name,
-                sender,
-                _m._event_message_id(event) or "",
-            )
-            if feishu_full:
-                try:
-                    out = _m._processing_outcome(failed=False)
-                    complete_deferred = getattr(
-                        adapter, "complete_deferred_processing", None
+                if adapter is not None:
+                    await _m._safe_call(
+                        adapter.send,
+                        chat_id,
+                        "当前无法确认员工计费身份，请稍后重试。",
                     )
-                    if callable(complete_deferred):
-                        await complete_deferred(event, out)
-                    else:
-                        await adapter.on_processing_complete(event, out)
-                except Exception as exc:
-                    _m.logger.debug(
-                        "multitenancy: duplicate processing_complete failed: %s",
-                        exc,
+                return
+            except Exception as exc:
+                pre_admission_failed = True
+                _m.logger.exception(
+                    "multitenancy: durable run admission failed profile=%s sender=%s: %s",
+                    profile_name,
+                    sender,
+                    exc,
+                )
+                if adapter is not None:
+                    await _m._safe_call(
+                        adapter.send,
+                        chat_id,
+                        "请求状态暂时无法保存，请稍后重试。",
                     )
-            return
+                return
+            if run_admission.duplicate:
+                _m.logger.info(
+                    "multitenancy: duplicate inbound event skipped profile=%s sender=%s message_id=%s",
+                    profile_name,
+                    sender,
+                    _m._event_message_id(event) or "",
+                )
+                return
+        finally:
+            if feishu_full and not execution_owned.is_set():
+                await _complete_feishu_processing(
+                    adapter,
+                    event,
+                    failed=pre_admission_failed,
+                )
 
         return
     except asyncio.CancelledError:

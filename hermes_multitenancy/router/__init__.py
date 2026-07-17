@@ -558,12 +558,12 @@ def _run_request_dedupe_record(request: Any) -> Optional[tuple[str, Optional[str
 
 def _mark_run_request_seen(request: Any) -> bool:
     """Return False when this broker RunRequest was processed recently."""
-    store = _get_session_store()
-    if store is None:
-        return True
     record = _run_request_dedupe_record(request)
     if record is None:
         return True
+    store = _get_session_store()
+    if store is None:
+        raise RuntimeError("SessionStore unavailable for idempotent run")
     event_key, message_id, content_hash, ttl = record
     return bool(store.mark_event_processed(
         event_key,
@@ -577,12 +577,12 @@ def _mark_run_request_seen(request: Any) -> bool:
 
 def _is_run_request_seen(request: Any) -> bool:
     """Return recent duplicate state without consuming the event key."""
-    store = _get_session_store()
-    if store is None:
-        return False
     record = _run_request_dedupe_record(request)
     if record is None:
         return False
+    store = _get_session_store()
+    if store is None:
+        raise RuntimeError("SessionStore unavailable for idempotent run")
     event_key, _message_id, _content_hash, ttl = record
     try:
         return bool(store.is_event_processed(event_key, ttl))

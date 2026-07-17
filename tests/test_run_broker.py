@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -352,6 +353,29 @@ def test_router_mark_seen_propagates_session_store_failure():
             ))
     finally:
         router.override_session_store(None)
+
+
+def test_router_canonical_dedupe_fails_closed_without_session_store(monkeypatch):
+    from hermes_multitenancy import router
+    from hermes_multitenancy.run_models import RunRequest
+
+    monkeypatch.setattr(router, "_get_session_store", lambda: None)
+    canonical = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        idempotency_key="webui:missing-store",
+    )
+
+    with pytest.raises(RuntimeError, match="SessionStore unavailable"):
+        router._is_run_request_seen(canonical)
+    with pytest.raises(RuntimeError, match="SessionStore unavailable"):
+        router._mark_run_request_seen(canonical)
+
+    unkeyed_webui = replace(canonical, idempotency_key=None)
+    assert router._is_run_request_seen(unkeyed_webui) is False
+    assert router._mark_run_request_seen(unkeyed_webui) is True
 
 
 def test_router_mark_seen_does_not_content_dedupe_webui_without_explicit_key(tmp_path):
@@ -1101,7 +1125,7 @@ def test_run_broker_shared_entry_finalizer_abandons_when_cancelled_before_first_
     assert marked == []
 
 
-def test_run_broker_execution_finalizer_runs_when_task_cancelled_before_first_step(
+def test_run_broker_stable_task_cancel_before_first_step_does_not_consume_key(
     monkeypatch,
 ):
     from hermes_multitenancy import run_broker as broker_mod
@@ -1117,7 +1141,7 @@ def test_run_broker_execution_finalizer_runs_when_task_cancelled_before_first_st
     def cancel_stable_task(coro):
         task = real_create_task(coro)
         if getattr(getattr(coro, "cr_code", None), "co_name", "") == (
-            "_run_execute_admitted"
+            "_run_after_admission"
         ):
             task.cancel()
         return task
@@ -1137,7 +1161,7 @@ def test_run_broker_execution_finalizer_runs_when_task_cancelled_before_first_st
         return RunResult(content="unexpected", duplicate=False)
 
     async def exercise():
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(RuntimeError, match="stable execution task unavailable"):
             await broker.prepare_and_execute(
                 RunRequest(
                     channel="webui",
@@ -1154,10 +1178,132 @@ def test_run_broker_execution_finalizer_runs_when_task_cancelled_before_first_st
 
     asyncio.run(exercise())
 
-    assert len(marked) == 1
+    assert marked == []
     assert executed == []
-    assert abandoned == []
+    assert abandoned == ["cleanup"]
+    assert finalized == []
+
+
+def test_run_broker_stable_task_creation_failure_is_retryable(monkeypatch):
+    from hermes_multitenancy import run_broker as broker_mod
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest, RunResult
+
+    marked = []
+    dispatched = []
+    abandoned = []
+    finalized = []
+    real_create_task = broker_mod.asyncio.create_task
+    injected = False
+
+    def fail_stable_task(coro):
+        nonlocal injected
+        if (
+            not injected
+            and getattr(getattr(coro, "cr_code", None), "co_name", "")
+            == "_run_after_admission"
+        ):
+            injected = True
+            raise RuntimeError("stable create failed")
+        return real_create_task(coro)
+
+    monkeypatch.setattr(broker_mod.asyncio, "create_task", fail_stable_task)
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "unused",
+        mark_seen=lambda request: marked.append(
+            request.effective_idempotency_key
+        )
+        or True,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="owner",
+        content="retry stable task creation",
+        idempotency_key="retry-stable-create",
+    )
+
+    async def execute(_admitted):
+        dispatched.append(True)
+        return RunResult(content="accepted", duplicate=False)
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="stable create failed"):
+            await broker.prepare_and_execute(
+                request,
+                execute=execute,
+                on_abandon=lambda: abandoned.append("cleanup"),
+                on_execution_done=lambda: finalized.append("cleanup"),
+            )
+        result = await broker.prepare_and_execute(
+            request,
+            execute=execute,
+            on_abandon=lambda: abandoned.append("cleanup"),
+            on_execution_done=lambda: finalized.append("cleanup"),
+        )
+        await asyncio.sleep(0)
+        return result
+
+    result = asyncio.run(exercise())
+
+    assert result.content == "accepted"
+    assert len(marked) == 1
+    assert dispatched == [True]
+    assert abandoned == ["cleanup"]
     assert finalized == ["cleanup"]
+
+
+def test_run_prepared_task_creation_failure_does_not_consume_key(monkeypatch):
+    from hermes_multitenancy import run_broker as broker_mod
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    marked = []
+    dispatched = []
+    real_create_task = broker_mod.asyncio.create_task
+    injected = False
+
+    def fail_stable_task(coro):
+        nonlocal injected
+        if (
+            not injected
+            and getattr(getattr(coro, "cr_code", None), "co_name", "")
+            == "_run_after_admission"
+        ):
+            injected = True
+            raise RuntimeError("stable create failed")
+        return real_create_task(coro)
+
+    monkeypatch.setattr(broker_mod.asyncio, "create_task", fail_stable_task)
+    broker = RunBroker(
+        dispatch_agent=lambda request: dispatched.append(request.content) or "ok",
+        mark_seen=lambda request: marked.append(
+            request.effective_idempotency_key
+        )
+        or True,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="owner",
+        content="run prepared retry",
+        idempotency_key="run-prepared-stable-create",
+    )
+
+    async def exercise():
+        first = await broker.prepare(request)
+        with pytest.raises(RuntimeError, match="stable create failed"):
+            await broker.run_prepared(first)
+        retry = await broker.prepare(request)
+        return await broker.run_prepared(retry)
+
+    result = asyncio.run(exercise())
+
+    assert result.content == "ok"
+    assert len(marked) == 1
+    assert dispatched == ["run prepared retry"]
 
 
 def test_run_admitted_does_not_recheck_policy_after_durable_admission():

@@ -1859,14 +1859,16 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
             self,
             request,
             *,
-            execute,
-            transform_request,
-            before_admit,
-        ):
-            prepared = await transform_request(FakePrepared(request))
-            await before_admit(prepared)
-            admitted.append(prepared.request)
-            return await execute(prepared)
+                execute,
+                transform_request,
+                before_admit,
+                execution_owned,
+            ):
+                prepared = await transform_request(FakePrepared(request))
+                await before_admit(prepared)
+                admitted.append(prepared.request)
+                execution_owned.set()
+                return await execute(prepared)
 
         async def _run_admitted(self, prepared, *, dispatch_agent):
             return RunResult(content="ok", duplicate=False)
@@ -1925,14 +1927,16 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
             self,
             request,
             *,
-            execute,
-            transform_request,
-            before_admit,
-        ):
-            prepared = await transform_request(FakePrepared(request))
-            await before_admit(prepared)
-            broker_calls.append(("admit", prepared.request.content))
-            return await execute(prepared)
+                execute,
+                transform_request,
+                before_admit,
+                execution_owned,
+            ):
+                prepared = await transform_request(FakePrepared(request))
+                await before_admit(prepared)
+                broker_calls.append(("admit", prepared.request.content))
+                execution_owned.set()
+                return await execute(prepared)
 
         async def _run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
@@ -1992,14 +1996,16 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
             self,
             request,
             *,
-            execute,
-            transform_request,
-            before_admit,
-        ):
-            prepared = await transform_request(FakePrepared(request))
-            await before_admit(prepared)
-            broker_calls.append(("admit", prepared.request.content))
-            return await execute(prepared)
+                execute,
+                transform_request,
+                before_admit,
+                execution_owned,
+            ):
+                prepared = await transform_request(FakePrepared(request))
+                await before_admit(prepared)
+                broker_calls.append(("admit", prepared.request.content))
+                execution_owned.set()
+                return await execute(prepared)
 
         async def _run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
@@ -2639,6 +2645,139 @@ async def test_handle_async_short_circuits_when_image_vision_is_unavailable(monk
     assert "FEISHU_MEDIA_FILE_JPG_TEST" in sent[0][1]
 
     clear_spike_routes()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_outcome"),
+    [
+        ("vision_success", "ProcessingOutcome.SUCCESS"),
+        ("vision_send_failure", "ProcessingOutcome.FAILURE"),
+        ("billing_failure", "ProcessingOutcome.FAILURE"),
+        ("session_store_unavailable", "ProcessingOutcome.FAILURE"),
+        ("durable_mark_failure", "ProcessingOutcome.FAILURE"),
+        ("duplicate", "ProcessingOutcome.SUCCESS"),
+    ],
+)
+async def test_hook_completes_deferred_processing_once_across_admission_outcomes(
+    monkeypatch,
+    tmp_path,
+    case,
+    expected_outcome,
+):
+    """The hook must hand completion to exactly one pre- or post-admission owner."""
+    from hermes_multitenancy import billing_identity, on_pre_gateway_dispatch
+    from hermes_multitenancy.run_broker import RunRejected
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / case
+    profile_home.mkdir()
+    user_id = f"ou_{case}"
+    message_id = f"om_{case}"
+    add_spike_route(user_id, profile_home)
+
+    event = _build_event(text="hello", user_id=user_id)
+    event.message_id = message_id
+    if case.startswith("vision_"):
+        event.text = ""
+        event.media_urls = [str(profile_home / "cache" / "images" / "hook.jpg")]
+        event.media_types = ["image/jpeg"]
+    calls = []
+    completed = asyncio.Event()
+    prepare_calls = 0
+    enrich_calls = 0
+    dispatch_calls = 0
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if case == "billing_failure":
+            raise RunRejected("LiteLLM management API is unavailable")
+        return request
+
+    async def fake_enrich(value, _gateway):
+        nonlocal enrich_calls
+        enrich_calls += 1
+        if case.startswith("vision_"):
+            return (
+                "[The user sent an image but something went wrong when I tried to look at it~ "
+                "You can try examining it yourself with vision_analyze using image_url: "
+                f"{value.media_urls[0]}]"
+            )
+        return "enriched"
+
+    def mark_seen(request):
+        if case == "durable_mark_failure":
+            raise RuntimeError("session store write failed")
+        return True
+
+    async def fake_stream(*_args, **_kwargs):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        return "ok"
+
+    class FullFeishuAdapter:
+        def defer_processing_complete(self, value):
+            calls.append(("defer", value.message_id))
+
+        async def send(self, _chat_id, text):
+            calls.append(("send", text))
+            if case == "vision_send_failure" and "vision_analyze" in text:
+                raise RuntimeError("temporary Feishu send failure")
+
+        async def on_processing_start(self, _event):
+            calls.append(("start", _event.message_id))
+
+        async def on_processing_complete(self, *_args):
+            raise AssertionError("deferred lifecycle should use its matching completion API")
+
+        async def complete_deferred_processing(self, value, outcome):
+            calls.append(("complete_deferred", value.message_id, str(outcome)))
+            completed.set()
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+    if case == "session_store_unavailable":
+        monkeypatch.setattr(router_mod, "_get_session_store", lambda: None)
+    else:
+        monkeypatch.setattr(
+            router_mod,
+            "_is_run_request_seen",
+            lambda _request: case == "duplicate",
+        )
+        monkeypatch.setattr(router_mod, "_mark_run_request_seen", mark_seen)
+    gateway = SimpleNamespace(adapters={"feishu": FullFeishuAdapter()})
+
+    try:
+        result = on_pre_gateway_dispatch(
+            event=event,
+            gateway=gateway,
+            session_store=None,
+        )
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.sleep(0.05)
+
+        assert result == {
+            "action": "skip",
+            "reason": "multitenancy router took over",
+        }
+        assert calls[0] == ("defer", message_id)
+        assert [call for call in calls if call[0] == "complete_deferred"] == [
+            ("complete_deferred", message_id, expected_outcome)
+        ]
+        assert not [call for call in calls if call[0] == "start"]
+        if case == "session_store_unavailable":
+            assert [call[1] for call in calls if call[0] == "send"] == [
+                "请求状态暂时无法保存，请稍后重试。"
+            ]
+            assert (prepare_calls, enrich_calls, dispatch_calls) == (0, 0, 0)
+    finally:
+        clear_spike_routes()
 
 
 @pytest.mark.asyncio
