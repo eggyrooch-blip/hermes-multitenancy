@@ -1463,6 +1463,87 @@ async def test_first_billing_identity_failure_is_visible_and_retryable(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_feishu_session_store_mark_failure_is_visible_and_retryable(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    class FlakyStore:
+        def __init__(self):
+            self.mark_calls = 0
+            self.seen = set()
+
+        def is_event_processed(self, event_key, _ttl):
+            return event_key in self.seen
+
+        def mark_event_processed(self, event_key, **_kwargs):
+            self.mark_calls += 1
+            if self.mark_calls == 1:
+                raise RuntimeError("session store write failed")
+            self.seen.add(event_key)
+            return True
+
+    clear_spike_routes()
+    add_spike_route("ou_store_retry", tmp_path)
+    store = FlakyStore()
+    prepare_calls = 0
+    sent = []
+    dispatches = []
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    async def enrich(_event, _gateway, **_kwargs):
+        return "enriched"
+
+    async def stream(_adapter, _chat_id, _profile, _home, event, **_kwargs):
+        dispatches.append(event.text)
+        return "ok"
+
+    class FullFeishuAdapter:
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        async def on_processing_start(self, _event):
+            return None
+
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router_mod, "_call_enrich_via_hermes_pipeline", enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", stream)
+    router_mod.override_session_store(store)
+    gateway = SimpleNamespace(adapters={"feishu": FullFeishuAdapter()})
+
+    def event():
+        value = _build_event(text="hello", user_id="ou_store_retry")
+        value.message_id = "om_store_retry"
+        return value
+
+    try:
+        await router_mod.handle_async(event=event(), gateway=gateway)
+        await router_mod.handle_async(event=event(), gateway=gateway)
+        await router_mod.handle_async(event=event(), gateway=gateway)
+    finally:
+        router_mod.override_session_store(None)
+        clear_spike_routes()
+
+    assert sent == [("chat-123", "请求状态暂时无法保存，请稍后重试。")]
+    assert prepare_calls == 2
+    assert store.mark_calls == 2
+    assert dispatches == ["enriched"]
+
+
+@pytest.mark.asyncio
 async def test_feishu_duplicate_coalesces_prepare_enrichment_and_admission(
     monkeypatch,
     tmp_path,
@@ -1766,14 +1847,28 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
     class FakePrepared:
         def __init__(self, request):
             self.request = request
+            self.internal_metadata = {}
+
+        def with_request(self, request, *, internal_metadata=None):
+            prepared = FakePrepared(request)
+            prepared.internal_metadata = dict(internal_metadata or {})
+            return prepared
 
     class FakeBroker:
-        async def prepare_and_admit(self, request, *, transform_request):
-            dispatch_request = await transform_request(FakePrepared(request))
-            admitted.append(dispatch_request)
-            return FakePrepared(dispatch_request), RunResult(content="", duplicate=False)
+        async def prepare_and_execute(
+            self,
+            request,
+            *,
+            execute,
+            transform_request,
+            before_admit,
+        ):
+            prepared = await transform_request(FakePrepared(request))
+            await before_admit(prepared)
+            admitted.append(prepared.request)
+            return await execute(prepared)
 
-        async def run_admitted(self, prepared, *, dispatch_agent):
+        async def _run_admitted(self, prepared, *, dispatch_agent):
             return RunResult(content="ok", duplicate=False)
 
     class MockPool:
@@ -1818,14 +1913,28 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     class FakePrepared:
         def __init__(self, request):
             self.request = request
+            self.internal_metadata = {}
+
+        def with_request(self, request, *, internal_metadata=None):
+            prepared = FakePrepared(request)
+            prepared.internal_metadata = dict(internal_metadata or {})
+            return prepared
 
     class FakeBroker:
-        async def prepare_and_admit(self, request, *, transform_request):
-            dispatch_request = await transform_request(FakePrepared(request))
-            broker_calls.append(("admit", dispatch_request.content))
-            return FakePrepared(dispatch_request), RunResult(content="", duplicate=False)
+        async def prepare_and_execute(
+            self,
+            request,
+            *,
+            execute,
+            transform_request,
+            before_admit,
+        ):
+            prepared = await transform_request(FakePrepared(request))
+            await before_admit(prepared)
+            broker_calls.append(("admit", prepared.request.content))
+            return await execute(prepared)
 
-        async def run_admitted(self, prepared, *, dispatch_agent):
+        async def _run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
             broker_calls.append(("run_admitted", request.content))
             response = await dispatch_agent(request)
@@ -1871,14 +1980,28 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     class FakePrepared:
         def __init__(self, request):
             self.request = request
+            self.internal_metadata = {}
+
+        def with_request(self, request, *, internal_metadata=None):
+            prepared = FakePrepared(request)
+            prepared.internal_metadata = dict(internal_metadata or {})
+            return prepared
 
     class FakeBroker:
-        async def prepare_and_admit(self, request, *, transform_request):
-            dispatch_request = await transform_request(FakePrepared(request))
-            broker_calls.append(("admit", dispatch_request.content))
-            return FakePrepared(dispatch_request), RunResult(content="", duplicate=False)
+        async def prepare_and_execute(
+            self,
+            request,
+            *,
+            execute,
+            transform_request,
+            before_admit,
+        ):
+            prepared = await transform_request(FakePrepared(request))
+            await before_admit(prepared)
+            broker_calls.append(("admit", prepared.request.content))
+            return await execute(prepared)
 
-        async def run_admitted(self, prepared, *, dispatch_agent):
+        async def _run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
             broker_calls.append(("run_admitted", request.content))
             response = await dispatch_agent(request)
@@ -2516,6 +2639,115 @@ async def test_handle_async_short_circuits_when_image_vision_is_unavailable(monk
     assert "FEISHU_MEDIA_FILE_JPG_TEST" in sent[0][1]
 
     clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_vision_block_send_failure_does_not_mark_and_retry_is_deduped(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "vision-retry-profile"
+    profile_home.mkdir()
+    add_spike_route("ou_image_retry", profile_home)
+    seen = set()
+    prepare_calls = 0
+    enrich_calls = 0
+    send_attempts = 0
+    error_replies = []
+    marked = []
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    async def fake_enrich(event, _gateway):
+        nonlocal enrich_calls
+        enrich_calls += 1
+        return (
+            "[The user sent an image but something went wrong when I tried to look at it~ "
+            "You can try examining it yourself with vision_analyze using image_url: "
+            f"{event.media_urls[0]}]"
+        )
+
+    def is_seen(request):
+        return request.effective_idempotency_key in seen
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        if request.effective_idempotency_key in seen:
+            return False
+        seen.add(request.effective_idempotency_key)
+        return True
+
+    class FullFeishuAdapter:
+        async def send(self, _chat_id, _text):
+            nonlocal send_attempts
+            if _text == "请求状态暂时无法保存，请稍后重试。":
+                error_replies.append(_text)
+                return
+            send_attempts += 1
+            if send_attempts == 1:
+                raise RuntimeError("temporary Feishu send failure")
+            send_started.set()
+            await release_send.wait()
+
+        async def on_processing_start(self, _event):
+            return None
+
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    async def must_not_dispatch(*_args, **_kwargs):
+        raise AssertionError("vision-block reply must not enter normal agent dispatch")
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_is_run_request_seen", is_seen)
+    monkeypatch.setattr(router_mod, "_mark_run_request_seen", mark_seen)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", must_not_dispatch)
+    gateway = SimpleNamespace(adapters={"feishu": FullFeishuAdapter()})
+
+    def event():
+        value = _build_event(text="", user_id="ou_image_retry")
+        value.message_id = "om_image_retry"
+        value.media_urls = [str(profile_home / "cache" / "images" / "retry.jpg")]
+        value.media_types = ["image/jpeg"]
+        return value
+
+    try:
+        await router_mod.handle_async(event=event(), gateway=gateway)
+        assert marked == []
+
+        retry = asyncio.create_task(router_mod.handle_async(event=event(), gateway=gateway))
+        await send_started.wait()
+        peer = asyncio.create_task(router_mod.handle_async(event=event(), gateway=gateway))
+        await asyncio.sleep(0)
+        assert prepare_calls == 2
+        assert enrich_calls == 2
+        assert send_attempts == 2
+        assert error_replies == ["请求状态暂时无法保存，请稍后重试。"]
+        release_send.set()
+        await asyncio.gather(retry, peer)
+        await router_mod.handle_async(event=event(), gateway=gateway)
+
+        assert prepare_calls == 2
+        assert enrich_calls == 2
+        assert send_attempts == 2
+        assert len(marked) == 1
+        assert marked == list(seen)
+    finally:
+        clear_spike_routes()
 
 
 def test_image_vision_unavailable_response_reports_timeout_without_provider_repair(tmp_path):

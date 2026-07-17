@@ -184,9 +184,85 @@ def test_webui_billing_failure_keeps_idempotency_key_retryable(monkeypatch):
     assert '"kind": "error"' in failed_body
     assert '"text": "ok"' in retry_body
     assert '"kind": "content"' not in duplicate_body
-    assert marked == ["webui:session-1:turn-1", "webui:session-1:turn-1"]
+    assert prepare_attempts == 2
+    assert marked == ["webui:session-1:turn-1"]
     assert len(dispatched) == 1
     assert dispatched[0].metadata["billing_prepared"] is True
+
+
+def test_webui_session_store_mark_failure_emits_error_and_retry_succeeds(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity, router
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    class FlakyStore:
+        def __init__(self):
+            self.mark_calls = 0
+            self.seen = set()
+
+        def is_event_processed(self, event_key, _ttl):
+            return event_key in self.seen
+
+        def mark_event_processed(self, event_key, **_kwargs):
+            self.mark_calls += 1
+            if self.mark_calls == 1:
+                raise RuntimeError("session store write failed")
+            self.seen.add(event_key)
+            return True
+
+    store = FlakyStore()
+    prepare_calls = 0
+    dispatches = []
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return request
+
+    async def dispatch(request):
+        dispatches.append(request.content)
+        return "ok"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    router.override_session_store(store)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "channel": "webui",
+            "profile_name": "owner",
+            "user_key": "ou_owner",
+            "content": "hello",
+            "idempotency_key": "webui:session-store-retry",
+        }
+        try:
+            responses = []
+            for _ in range(3):
+                response = await client.post("/api/run-broker/runs", json=payload)
+                responses.append((response.status, await response.text()))
+            return responses
+        finally:
+            await client.close()
+
+    try:
+        responses = asyncio.run(runner())
+    finally:
+        router.override_session_store(None)
+
+    assert [status for status, _body in responses] == [200, 200, 200]
+    assert '"kind": "error"' in responses[0][1]
+    assert "session store write failed" in responses[0][1]
+    assert '"text": "ok"' in responses[1][1]
+    assert '"kind": "content"' not in responses[2][1]
+    assert prepare_calls == 2
+    assert store.mark_calls == 2
+    assert dispatches == ["hello"]
 
 
 def test_webui_run_broker_strips_ingest_secret_metadata_from_caller(tmp_path):

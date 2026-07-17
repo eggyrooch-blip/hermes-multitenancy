@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import hashlib
-import inspect
 import json
 import os
 import time
@@ -17,6 +16,11 @@ from typing import Any, Optional
 
 from .. import router as _m
 from ..feishu_message_trace import reset_trace_context, set_trace_context
+from .feishu_execution import execute_admitted_feishu_run
+from .vision_admission import (
+    attach_vision_block,
+    send_vision_block_before_admission,
+)
 
 
 async def handle_async(*, event: Any, gateway: Any) -> None:
@@ -281,12 +285,48 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 chat_id=chat_id,
                 text=run_content,
             )
-            return replace(dispatch_request, metadata=prepared_request.metadata)
+            dispatch_request = replace(
+                dispatch_request,
+                metadata=prepared_request.metadata,
+            )
+            return attach_vision_block(
+                prepared_run,
+                dispatch_request,
+                event=event,
+                text=run_content,
+            )
+
+        async def _send_vision_block_before_admission(prepared_run):
+            await send_vision_block_before_admission(
+                prepared_run,
+                adapter=adapter,
+                chat_id=chat_id,
+                profile_name=profile_name,
+                event=event,
+            )
+
+        async def _execute_admitted(admitted_run):
+            return await execute_admitted_feishu_run(
+                admitted_run,
+                run_broker=run_broker,
+                event=event,
+                gateway=gateway,
+                adapter=adapter,
+                chat_id=chat_id,
+                profile_name=profile_name,
+                profile_home=profile_home,
+                sender=sender,
+                sender_alt=sender_alt,
+                text=text,
+                feishu_full=feishu_full,
+            )
 
         try:
-            admitted_run, run_admission = await run_broker.prepare_and_admit(
+            run_admission = await run_broker.prepare_and_execute(
                 run_request,
+                execute=_execute_admitted,
                 transform_request=_enrich_prepared,
+                before_admit=_send_vision_block_before_admission,
             )
         except RunRejected as exc:
             _m.logger.warning(
@@ -301,6 +341,20 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     adapter.send,
                     chat_id,
                     "当前无法确认员工计费身份，请稍后重试。",
+                )
+            return
+        except Exception as exc:
+            _m.logger.exception(
+                "multitenancy: durable run admission failed profile=%s sender=%s: %s",
+                profile_name,
+                sender,
+                exc,
+            )
+            if adapter is not None:
+                await _m._safe_call(
+                    adapter.send,
+                    chat_id,
+                    "请求状态暂时无法保存，请稍后重试。",
                 )
             return
         if run_admission.duplicate:
@@ -327,152 +381,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     )
             return
 
-        assert admitted_run is not None
-        enriched_text = admitted_run.request.content
-        vision_blocked = _m._image_vision_unavailable_response(event, enriched_text)
-        if vision_blocked:
-            _m.logger.info(
-                "multitenancy: sending image vision unavailable response profile=%s message_id=%s",
-                profile_name,
-                _m._event_message_id(event) or "",
-            )
-            hist_key = _m._dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key
-            user_msg = _m._build_user_message(event, text_override=enriched_text)
-            _m._persist_turn(hist_key, user_msg, vision_blocked)
-            if adapter is not None:
-                await _m._safe_call(adapter.send, chat_id, vision_blocked)
-            return
-
-        # Register self in the context-scoped in-flight slot (replace previous)
-        current = asyncio.current_task()
-        inflight_key = _m._dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).inflight_key
-        prev = _m._user_inflight_tasks.get(inflight_key)
-        if prev is not None and not prev.done() and prev is not current:
-            prev_hist_key = _m._user_inflight_history_keys.get(inflight_key)
-            if prev_hist_key is not None:
-                _m._persist_interruption_marker(prev_hist_key)
-            _m._suppress_interruption_marker_tasks.add(prev)
-            prev.cancel()
-        if current is not None:
-            _m._user_inflight_tasks[inflight_key] = current
-
-        outcome_failed = False
-        if feishu_full:
-            try:
-                await adapter.on_processing_start(event)
-            except Exception as exc:
-                _m.logger.debug("multitenancy: on_processing_start failed: %s", exc)
-
-        # Build the conversation: prior history + current user message (with
-        # reply context spliced in). The runner prepends the profile's SOUL.
-        # First lookup for a (profile, user) pair hydrates from SessionStore.
-        hist_key = _m._dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key
-        prior = _m._load_history(hist_key)
-        contextual_text = _m._append_recent_profile_file_context(
-            enriched_text or text,
-            profile_name=profile_name,
-            chat_id=chat_id,
-            profile_home=profile_home,
-            prior_messages=prior,
-        )
-        user_msg = _m._build_user_message(event, text_override=contextual_text)
-        conversation = prior + [user_msg]
-        _m._persist_user_message(hist_key, user_msg)
-        if current is not None and _m._user_inflight_tasks.get(inflight_key) is current:
-            _m._user_inflight_history_keys[inflight_key] = hist_key
-        agent_event = _m._event_with_text(event, user_msg["content"])
-
-        try:
-            if feishu_full:
-                # Streaming path — card stream when available; text edit fallback.
-                async def _dispatch_streaming(_request):
-                    run_event = _m._event_with_run_metadata(
-                        agent_event, _request.metadata
-                    )
-                    stream_kwargs = {"messages": conversation}
-                    try:
-                        if "gateway" in inspect.signature(_m._stream_into_feishu).parameters:
-                            stream_kwargs["gateway"] = gateway
-                    except (TypeError, ValueError):
-                        stream_kwargs["gateway"] = gateway
-                    stream_response = await _m._stream_into_feishu(
-                        adapter, chat_id, profile_name, profile_home, run_event,
-                        **stream_kwargs,
-                    )
-                    if stream_response:
-                        await _m._deliver_media_from_stream_response(
-                            gateway, stream_response, run_event, adapter, profile_home
-                        )
-                    return stream_response
-
-                run_result = await run_broker.run_admitted(
-                    admitted_run,
-                    dispatch_agent=_dispatch_streaming,
-                )
-                response_text = run_result.content
-            else:
-                # Mock / minimal adapter — old non-stream path (send_typing + pool.dispatch + send)
-                if adapter is not None:
-                    await _m._safe_call(adapter.send_typing, chat_id)
-                async def _dispatch_nonstream(_request):
-                    run_event = _m._event_with_run_metadata(
-                        agent_event, _request.metadata
-                    )
-                    return await _m._get_pool().dispatch(
-                        profile_name, profile_home, run_event
-                    )
-
-                run_result = await run_broker.run_admitted(
-                    admitted_run,
-                    dispatch_agent=_dispatch_nonstream,
-                )
-                response_text = run_result.content
-                if adapter is not None:
-                    await _m._safe_call(adapter.send, chat_id, response_text)
-
-            # Record turn into history + persist to SessionStore.
-            if response_text and isinstance(response_text, str):
-                _m._persist_assistant_message(hist_key, response_text)
-
-            _m._touch_route(sender, sender_alt)
-        except asyncio.CancelledError:
-            if current not in _m._suppress_interruption_marker_tasks:
-                _m._persist_interruption_marker(hist_key)
-            raise
-        except RunRejected as exc:
-            outcome_failed = True
-            retry_message = "当前无法确认员工计费身份，请稍后重试。"
-            _m._persist_failure_marker(hist_key)
-            _m._persist_assistant_message(hist_key, retry_message)
-            _m.logger.warning(
-                "multitenancy: prepared routed run rejected "
-                "profile=%s sender=%s: %s",
-                profile_name,
-                sender,
-                exc,
-            )
-            if adapter is not None:
-                await _m._safe_call(adapter.send, chat_id, retry_message)
-        except Exception:
-            outcome_failed = True
-            _m._persist_failure_marker(hist_key)
-            raise
-        finally:
-            if feishu_full:
-                try:
-                    out = _m._processing_outcome(failed=outcome_failed)
-                    complete_deferred = getattr(adapter, "complete_deferred_processing", None)
-                    if callable(complete_deferred):
-                        await complete_deferred(event, out)
-                    else:
-                        await adapter.on_processing_complete(event, out)
-                except Exception as exc:
-                    _m.logger.debug("multitenancy: on_processing_complete failed: %s", exc)
-            if _m._user_inflight_tasks.get(inflight_key) is current:
-                _m._user_inflight_tasks.pop(inflight_key, None)
-                _m._user_inflight_history_keys.pop(inflight_key, None)
-            if current is not None:
-                _m._suppress_interruption_marker_tasks.discard(current)
+        return
     except asyncio.CancelledError:
         raise
     except Exception as exc:

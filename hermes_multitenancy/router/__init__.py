@@ -565,18 +565,14 @@ def _mark_run_request_seen(request: Any) -> bool:
     if record is None:
         return True
     event_key, message_id, content_hash, ttl = record
-    try:
-        return bool(store.mark_event_processed(
-            event_key,
-            profile_name=str(getattr(request, "profile_name", "") or ""),
-            user_key=str(getattr(request, "user_key", "") or ""),
-            message_id=message_id,
-            content_hash=content_hash,
-            ttl_seconds=ttl,
-        ))
-    except Exception as exc:
-        logger.debug("multitenancy: run request dedupe check failed (%s)", exc)
-        return True
+    return bool(store.mark_event_processed(
+        event_key,
+        profile_name=str(getattr(request, "profile_name", "") or ""),
+        user_key=str(getattr(request, "user_key", "") or ""),
+        message_id=message_id,
+        content_hash=content_hash,
+        ttl_seconds=ttl,
+    ))
 
 
 def _is_run_request_seen(request: Any) -> bool:

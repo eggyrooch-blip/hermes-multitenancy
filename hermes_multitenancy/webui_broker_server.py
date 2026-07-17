@@ -34,10 +34,36 @@ from .credential_broker import (
     verify_lease,
 )
 from .run_broker import RunBroker, RunRejected
-from .run_models import RunEvent, RunRequest
+from .run_models import RunEvent, RunRequest, RunResult
 from .security_audit import append_security_event
 
 logger = logging.getLogger(__name__)
+
+
+class _IngestSecretMaterializationError(RuntimeError):
+    """Secret staging failed before durable async-ingest admission."""
+
+
+class _IngestAsyncSecretClaim:
+    """Reference-counted in-process claim for one idempotency/fingerprint pair."""
+
+    __slots__ = ("fingerprint", "request_refs", "job_owned")
+
+    def __init__(self, fingerprint: str) -> None:
+        self.fingerprint = fingerprint
+        self.request_refs = 0
+        self.job_owned = False
+
+
+class _IngestSyncSecretClaim:
+    """Transient fingerprint claim until synchronous admission is durable."""
+
+    __slots__ = ("fingerprint", "request_refs", "committed")
+
+    def __init__(self, fingerprint: str) -> None:
+        self.fingerprint = fingerprint
+        self.request_refs = 0
+        self.committed = False
 
 from types import ModuleType as _ModuleType
 import sys as _sys
@@ -106,12 +132,44 @@ def create_run_broker_app(
         raise RuntimeError("aiohttp is required for the WebUI run broker endpoint") from exc
     from .billing_identity import prepare_billing_request
 
-    effective_mark_seen = mark_seen if mark_seen is not None else _default_mark_seen
-    effective_is_seen = (
-        is_seen
-        if is_seen is not None
-        else (_default_is_seen if mark_seen is None else None)
-    )
+    if mark_seen is not None and is_seen is None:
+        # ponytail: this mirror is process-local; custom multi-process hooks need
+        # to supply their own shared is_seen callback.
+        locally_seen: dict[tuple[str, str, str, str], float] = {}
+
+        def _local_seen_key(request: RunRequest):
+            if not (request.idempotency_key or request.message_id):
+                return None
+            return (
+                request.channel,
+                request.profile_name,
+                request.user_key,
+                request.effective_idempotency_key,
+            )
+
+        def effective_mark_seen(request: RunRequest) -> bool:
+            accepted = bool(mark_seen(request))
+            key = _local_seen_key(request)
+            if key is not None:
+                locally_seen[key] = time.time()
+                while len(locally_seen) > _INGEST_RESULT_CAP:
+                    locally_seen.pop(next(iter(locally_seen)))
+            return accepted
+
+        def effective_is_seen(request: RunRequest) -> bool:
+            key = _local_seen_key(request)
+            if key is None:
+                return False
+            seen_at = locally_seen.get(key)
+            if seen_at is None:
+                return False
+            if time.time() - seen_at > _INGEST_RESULT_TTL:
+                locally_seen.pop(key, None)
+                return False
+            return True
+    else:
+        effective_mark_seen = mark_seen if mark_seen is not None else _default_mark_seen
+        effective_is_seen = is_seen if is_seen is not None else _default_is_seen
 
     async def _stream_run_request(request, run_request, *, stash_payload):
         """Admit + SSE-stream a run_request. Shared by handle_run and replay.
@@ -171,22 +229,21 @@ def create_run_broker_app(
                 sandbox_available=sandbox_available or _default_sandbox_available,
                 prepare_request=prepare_billing_request,
             )
-            admitted_run, admission = await admission_broker.prepare_and_admit(run_request)
-            if admission.duplicate:
-                await emit_event(RunEvent(kind="done"))
-                return response
-            assert admitted_run is not None
-
             broker_dispatch = dispatch_agent or (
                 lambda req: _default_dispatch_agent(
                     req, emit_event=emit_event, auth_signal_run_id=signal_run_id
                 )
             )
-            await admission_broker.run_admitted(
-                admitted_run,
-                dispatch_agent=broker_dispatch,
-                emit_event=emit_event,
+            result = await admission_broker.prepare_and_execute(
+                run_request,
+                execute=lambda admitted: admission_broker._run_admitted(
+                    admitted,
+                    dispatch_agent=broker_dispatch,
+                    emit_event=emit_event,
+                ),
             )
+            if result.duplicate:
+                await emit_event(RunEvent(kind="done"))
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
             await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
@@ -324,6 +381,7 @@ def create_run_broker_app(
     _ingest_results_at: dict[str, float] = {}
     _ingest_secret_fingerprints: dict[str, str] = {}
     _ingest_secret_fingerprints_at: dict[str, float] = {}
+    _ingest_sync_secret_claims: dict[str, _IngestSyncSecretClaim] = {}
     _INGEST_RESULT_TTL = 3600.0
     _INGEST_RESULT_CAP = 256
 
@@ -501,7 +559,7 @@ def create_run_broker_app(
 
     _ingest_async_jobs: dict[str, dict[str, Any]] = {}
     _ingest_async_by_cache: dict[str, str] = {}
-    _ingest_async_secret_fingerprints: dict[str, str] = {}
+    _ingest_async_secret_fingerprints: dict[str, _IngestAsyncSecretClaim] = {}
     _INGEST_ASYNC_ACTIVE_STATUSES = {"pending", "running"}
 
     def _ingest_async_is_active(job: dict[str, Any]) -> bool:
@@ -516,15 +574,17 @@ def create_run_broker_app(
         if cache and _ingest_async_by_cache.get(cache) == run_id:
             _ingest_async_by_cache.pop(cache, None)
         idempotency_cache = str(job.get("async_idempotency_cache_key") or "")
-        if (
-            idempotency_cache
-            and idempotency_cache in _ingest_async_secret_fingerprints
-            and not any(
+        claim = _ingest_async_secret_fingerprints.get(idempotency_cache)
+        if idempotency_cache and claim is not None and not any(
                 str(other.get("async_idempotency_cache_key") or "") == idempotency_cache
                 for other in _ingest_async_jobs.values()
-            )
         ):
-            _ingest_async_secret_fingerprints.pop(idempotency_cache, None)
+            claim.job_owned = False
+            if (
+                claim.request_refs == 0
+                and _ingest_async_secret_fingerprints.get(idempotency_cache) is claim
+            ):
+                _ingest_async_secret_fingerprints.pop(idempotency_cache, None)
 
     def _ingest_async_prune() -> None:
         now = time.time()
@@ -632,7 +692,7 @@ def create_run_broker_app(
             _ingest_async_touch(job, "running")
             if prepared.interactive:
                 run_task = asyncio.ensure_future(
-                    prepared.admission_broker.run_admitted(
+                    prepared.admission_broker._run_admitted(
                         prepared.admitted_run,
                         dispatch_agent=broker_dispatch,
                         emit_event=sink,
@@ -671,7 +731,7 @@ def create_run_broker_app(
                     result = run_task.result()
             else:
                 result = await asyncio.wait_for(
-                    prepared.admission_broker.run_admitted(
+                    prepared.admission_broker._run_admitted(
                         prepared.admitted_run,
                         dispatch_agent=broker_dispatch,
                         emit_event=sink,
@@ -749,8 +809,8 @@ def create_run_broker_app(
         _ingest_async_prune()
 
         idempotency_secret_key = f"{prepared.auth_fingerprint}\x00{prepared.idempotency_cache_key}"
-        known_fingerprint = _ingest_async_secret_fingerprints.get(idempotency_secret_key)
-        if known_fingerprint and known_fingerprint != prepared.secret_fingerprint:
+        known_claim = _ingest_async_secret_fingerprints.get(idempotency_secret_key)
+        if known_claim is not None and known_claim.fingerprint != prepared.secret_fingerprint:
             return _ingest_secret_mismatch_response(prepared.bound_profile)
 
         async_cache_key = f"{prepared.auth_fingerprint}\x00{prepared.cache_key}"
@@ -786,67 +846,20 @@ def create_run_broker_app(
         except RunRejected as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
 
+        # Claim the idempotency/secret pairing before the first shared await so
+        # a concurrent request cannot join the same broker entry with different
+        # credentials.  The shared leader releases this claim on abandonment;
+        # a successful handoff keeps it for the registered job's lifetime.
+        secret_claim = _ingest_async_secret_fingerprints.get(idempotency_secret_key)
+        if secret_claim is not None and secret_claim.fingerprint != prepared.secret_fingerprint:
+            return _ingest_secret_mismatch_response(prepared.bound_profile)
+        if secret_claim is None:
+            secret_claim = _IngestAsyncSecretClaim(prepared.secret_fingerprint)
+            _ingest_async_secret_fingerprints[idempotency_secret_key] = secret_claim
+        secret_claim.request_refs += 1
+
         run_id = "ing_" + secrets.token_urlsafe(16)
         secret_dir = ""
-        try:
-            # Materialization is part of request preparation, not dispatch. It
-            # must finish before billing/admission so a local write failure
-            # cannot permanently consume the idempotency key.
-            secret_dir = _ingest_materialize_secret_dir(
-                profile_name=prepared.bound_profile,
-                run_id=run_id,
-                secret_spec=prepared.secret_spec,
-            )
-        except Exception:
-            logger.exception("[multitenancy] async ingest secret store failed")
-            return web.json_response({"ok": False, "error": "invalid secrets"}, status=400)
-        if secret_dir:
-            prepared.run_request = replace(
-                prepared.run_request,
-                metadata={**prepared.run_request.metadata, "ingest_secret_dir": secret_dir},
-            )
-
-        try:
-            # Billing identity preparation can call the profile apiserver and
-            # fail transiently. A persistent read-only duplicate check happens
-            # first; concurrent retries then share the same preparation task.
-            admitted_run, admission = await admission_broker.prepare_and_admit(
-                prepared.run_request
-            )
-        except asyncio.CancelledError:
-            _ingest_cleanup_secret_dir(secret_dir)
-            raise
-        except Exception:
-            _ingest_cleanup_secret_dir(secret_dir)
-            logger.exception(
-                "[multitenancy] async ingest billing preparation failed profile=%s",
-                prepared.bound_profile,
-            )
-            return web.json_response(
-                {
-                    "ok": False,
-                    "status": "prepare_failed",
-                    "error": "billing preparation failed",
-                    "profile": prepared.bound_profile,
-                },
-                status=503,
-            )
-
-        if admission.duplicate:
-            _ingest_cleanup_secret_dir(secret_dir)
-            return web.json_response(
-                {
-                    "ok": False,
-                    "status": "duplicate_pending",
-                    "profile": prepared.bound_profile,
-                    "duplicate": True,
-                },
-                status=200,
-            )
-        assert admitted_run is not None
-        prepared.admission_broker = admission_broker
-        prepared.admitted_run = admitted_run
-        prepared.run_request = admitted_run.request
         now = time.time()
         job = {
             "run_id": run_id,
@@ -863,13 +876,165 @@ def create_run_broker_app(
             "expires_at": now + _ingest_async_ttl(),
             "secret_dir": secret_dir,
         }
-        _ingest_async_jobs[run_id] = job
-        _ingest_async_by_cache[async_cache_key] = run_id
-        _ingest_async_secret_fingerprints[idempotency_secret_key] = prepared.secret_fingerprint
-        job["task"] = asyncio.create_task(_run_ingest_async_job(run_id, prepared))
+        execution_owned = asyncio.Event()
+
+        claim_ref_released = False
+
+        def _release_fingerprint_claim_ref() -> None:
+            nonlocal claim_ref_released
+            if claim_ref_released:
+                return
+            claim_ref_released = True
+            secret_claim.request_refs -= 1
+            if secret_claim.request_refs < 0:
+                raise RuntimeError("async ingest secret claim reference underflow")
+            if (
+                secret_claim.request_refs == 0
+                and not secret_claim.job_owned
+                and _ingest_async_secret_fingerprints.get(idempotency_secret_key)
+                is secret_claim
+            ):
+                _ingest_async_secret_fingerprints.pop(idempotency_secret_key, None)
+
+        def _abandon_staged_resources() -> None:
+            _ingest_cleanup_secret_dir(secret_dir)
+
+        def _stage_secret(prepared_run):
+            nonlocal secret_dir
+            staged_secret_dir = ""
+            try:
+                # The shared broker entry stages one secret directory after
+                # billing succeeds but before durable admission.  A cancelled
+                # leader with a live peer therefore cannot delete resources
+                # that the shared execution will later use.
+                staged_secret_dir = _ingest_materialize_secret_dir(
+                    profile_name=prepared.bound_profile,
+                    run_id=run_id,
+                    secret_spec=prepared.secret_spec,
+                )
+                staged_request = prepared_run.request
+                if staged_secret_dir:
+                    staged_request = replace(
+                        staged_request,
+                        metadata={
+                            **staged_request.metadata,
+                            "ingest_secret_dir": staged_secret_dir,
+                        },
+                    )
+            except Exception as exc:
+                _ingest_cleanup_secret_dir(staged_secret_dir)
+                raise _IngestSecretMaterializationError from exc
+            secret_dir = staged_secret_dir
+            job["secret_dir"] = staged_secret_dir
+            return staged_request
+
+        def _handoff(admitted_run):
+            try:
+                prepared.admission_broker = admission_broker
+                prepared.admitted_run = admitted_run
+                prepared.run_request = admitted_run.request
+                _ingest_async_jobs[run_id] = job
+                _ingest_async_by_cache[async_cache_key] = run_id
+                _ingest_async_secret_fingerprints[idempotency_secret_key] = (
+                    secret_claim
+                )
+                secret_claim.job_owned = True
+                job["task"] = asyncio.create_task(_run_ingest_async_job(run_id, prepared))
+                return RunResult(content="", duplicate=False)
+            except BaseException:
+                if _ingest_async_jobs.get(run_id) is job:
+                    _ingest_async_jobs.pop(run_id, None)
+                if _ingest_async_by_cache.get(async_cache_key) == run_id:
+                    _ingest_async_by_cache.pop(async_cache_key, None)
+                secret_claim.job_owned = False
+                if (
+                    secret_claim.request_refs == 0
+                    and _ingest_async_secret_fingerprints.get(idempotency_secret_key)
+                    is secret_claim
+                ):
+                    _ingest_async_secret_fingerprints.pop(idempotency_secret_key, None)
+                _ingest_cleanup_secret_dir(secret_dir)
+                raise
+
+        try:
+            # Billing identity preparation can call the profile apiserver and
+            # fail transiently. A persistent read-only duplicate check happens
+            # first; concurrent retries then share the same preparation task.
+            try:
+                admission = await admission_broker.prepare_and_execute(
+                    prepared.run_request,
+                    execute=_handoff,
+                    transform_request=_stage_secret,
+                    execution_owned=execution_owned,
+                    on_abandon=_abandon_staged_resources,
+                )
+            finally:
+                _release_fingerprint_claim_ref()
+        except asyncio.CancelledError:
+            # Known gotcha: the shared broker entry—not an outer request waiter—
+            # owns staged secrets through pre-mark cancellation.  It either
+            # abandons+cleans them or transfers them to the stable execution.
+            raise
+        except _IngestSecretMaterializationError:
+            logger.exception("[multitenancy] async ingest secret store failed")
+            return web.json_response(
+                {"ok": False, "error": "invalid secrets"},
+                status=400,
+            )
+        except Exception:
+            logger.exception(
+                "[multitenancy] async ingest billing preparation failed profile=%s",
+                prepared.bound_profile,
+            )
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "prepare_failed",
+                    "error": "billing preparation failed",
+                    "profile": prepared.bound_profile,
+                },
+                status=503,
+            )
+
+        if execution_owned.is_set():
+            return web.json_response(
+                _ingest_async_submit_response(job, duplicate=False),
+                status=202,
+            )
+
+        # A concurrent waiter can observe the leader's successful execution
+        # result without owning its staged resources.  Return the one job that
+        # the shared leader registered.
+        _ingest_cleanup_secret_dir(secret_dir)
+        existing_id = _ingest_async_by_cache.get(async_cache_key)
+        existing = _ingest_async_jobs.get(existing_id or "")
+        if existing is not None:
+            return web.json_response(
+                _ingest_async_submit_response(existing, duplicate=True),
+                status=202,
+            )
+        if admission.duplicate:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "duplicate_pending",
+                    "profile": prepared.bound_profile,
+                    "duplicate": True,
+                },
+                status=200,
+            )
+        logger.error(
+            "[multitenancy] async ingest execution completed without an owned or registered job profile=%s",
+            prepared.bound_profile,
+        )
         return web.json_response(
-            _ingest_async_submit_response(job, duplicate=False),
-            status=202,
+            {
+                "ok": False,
+                "status": "handoff_missing",
+                "error": "async ingest handoff missing",
+                "profile": prepared.bound_profile,
+            },
+            status=503,
         )
 
     async def handle_ingest_async_result(request):
@@ -1048,7 +1213,7 @@ def create_run_broker_app(
         secret_fingerprint = secret_spec.fingerprint if secret_spec else ""
         _ingest_prune_secret_fingerprints(time.time())
         known_fingerprint = _ingest_secret_fingerprints.get(idempotency_cache_key)
-        if known_fingerprint and known_fingerprint != secret_fingerprint:
+        if known_fingerprint is not None and known_fingerprint != secret_fingerprint:
             return _ingest_secret_mismatch_response(bound_profile)
         cache_key = f"{idempotency_cache_key}\x00secret:{secret_fingerprint}"
         run_request = replace(
@@ -1060,22 +1225,6 @@ def create_run_broker_app(
             ),
         )
         secret_dir = ""
-        try:
-            secret_dir = _ingest_materialize_secret_dir(
-                profile_name=bound_profile,
-                run_id="sync_" + secrets.token_urlsafe(16),
-                secret_spec=secret_spec,
-            )
-        except Exception:
-            logger.exception("[multitenancy] ingest secret store failed")
-            return web.json_response({"ok": False, "error": "invalid secrets"}, status=400)
-        if secret_dir:
-            run_request = replace(
-                run_request,
-                metadata={**run_request.metadata, "ingest_secret_dir": secret_dir},
-            )
-        _ingest_secret_fingerprints[idempotency_cache_key] = secret_fingerprint
-        _ingest_secret_fingerprints_at[idempotency_cache_key] = time.time()
         collected: list[str] = []
         error_text: dict[str, str] = {}
         clarify_holder: dict[str, Any] = {}
@@ -1111,16 +1260,125 @@ def create_run_broker_app(
             sandbox_available=sandbox_available or _default_sandbox_available,
             prepare_request=prepare_billing_request,
         )
+        shared_entry_owned = asyncio.Event()
+        execution_owned = asyncio.Event()
+
+        # Claim the key/fingerprint pairing before the first shared await. A
+        # different-secret peer must never join this broker entry and reuse the
+        # leader's staged credentials. The claim is transient until durable
+        # admission creates the stable execution child; pre-admission failure
+        # or cancellation releases it so a corrected secret can retry.
+        sync_secret_claim = _ingest_sync_secret_claims.get(idempotency_cache_key)
+        if (
+            sync_secret_claim is not None
+            and sync_secret_claim.fingerprint != secret_fingerprint
+        ):
+            return _ingest_secret_mismatch_response(bound_profile)
+        if sync_secret_claim is None:
+            sync_secret_claim = _IngestSyncSecretClaim(secret_fingerprint)
+            _ingest_sync_secret_claims[idempotency_cache_key] = sync_secret_claim
+        sync_secret_claim.request_refs += 1
+        sync_claim_ref_released = False
+
+        def _commit_sync_secret_claim() -> None:
+            if sync_secret_claim.committed:
+                return
+            sync_secret_claim.committed = True
+            if (
+                _ingest_sync_secret_claims.get(idempotency_cache_key)
+                is sync_secret_claim
+            ):
+                _ingest_secret_fingerprints[idempotency_cache_key] = (
+                    sync_secret_claim.fingerprint
+                )
+                _ingest_secret_fingerprints_at[idempotency_cache_key] = time.time()
+
+        def _release_sync_secret_claim_ref() -> None:
+            nonlocal sync_claim_ref_released
+            if sync_claim_ref_released:
+                return
+            sync_claim_ref_released = True
+            sync_secret_claim.request_refs -= 1
+            if sync_secret_claim.request_refs < 0:
+                raise RuntimeError("sync ingest secret claim reference underflow")
+            if (
+                sync_secret_claim.request_refs == 0
+                and _ingest_sync_secret_claims.get(idempotency_cache_key)
+                is sync_secret_claim
+            ):
+                _ingest_sync_secret_claims.pop(idempotency_cache_key, None)
+
+        def _abandon_sync_resources() -> None:
+            try:
+                _ingest_cleanup_secret_dir(secret_dir)
+            finally:
+                _release_sync_secret_claim_ref()
+
+        def _finalize_sync_execution() -> None:
+            # A stable task proves durable admission even if cancellation
+            # prevents the execute coroutine from taking its first step.
+            _commit_sync_secret_claim()
+            try:
+                _ingest_cleanup_secret_dir(secret_dir)
+            finally:
+                _release_sync_secret_claim_ref()
+
+        def _stage_sync_secret(prepared_run):
+            nonlocal secret_dir
+            staged_secret_dir = ""
+            try:
+                staged_secret_dir = _ingest_materialize_secret_dir(
+                    profile_name=bound_profile,
+                    run_id="sync_" + secrets.token_urlsafe(16),
+                    secret_spec=secret_spec,
+                )
+                staged_request = prepared_run.request
+                if staged_secret_dir:
+                    staged_request = replace(
+                        staged_request,
+                        metadata={
+                            **staged_request.metadata,
+                            "ingest_secret_dir": staged_secret_dir,
+                        },
+                    )
+            except Exception as exc:
+                _ingest_cleanup_secret_dir(staged_secret_dir)
+                raise _IngestSecretMaterializationError from exc
+            secret_dir = staged_secret_dir
+            return staged_request
+
+        async def _execute_sync(admitted_run):
+            # This child is created synchronously with durable mark and is the
+            # first stable owner. Persist the fingerprint before dispatch can
+            # yield so request cancellation cannot reopen the key to a peer
+            # carrying different credentials.
+            _commit_sync_secret_claim()
+            return await broker._run_admitted(admitted_run)
+
+        async def _run_sync_request():
+            return await broker.prepare_and_execute(
+                run_request,
+                execute=_execute_sync,
+                transform_request=_stage_sync_secret,
+                shared_entry_owned=shared_entry_owned,
+                execution_owned=execution_owned,
+                on_abandon=_abandon_sync_resources,
+                on_execution_done=_finalize_sync_execution,
+            )
 
         timeout_s = _ingest_timeout()
 
-        # Review BLOCKING fix + NB4: every path is bounded by a hard timeout,
-        # and interactive runs are abandoned the instant a human-input event
-        # appears so the synchronous connection never waits on the bridge.
+        # Review BLOCKING fix + NB4: every HTTP wait is bounded by a hard
+        # timeout. Once durable admission succeeds, the stable execution task
+        # continues independently and owns staged credentials until it exits.
+        # Interactive runs stop holding the connection as soon as a human-input
+        # event appears; their bridge task resolves on its own bounded timeout.
         result = None
+        run_task: Optional[asyncio.Task] = None
+        interrupt_task: Optional[asyncio.Task] = None
         try:
             if interactive:
-                run_task = asyncio.ensure_future(broker.run(run_request))
+                run_task = asyncio.ensure_future(_run_sync_request())
                 interrupt_task = asyncio.ensure_future(interrupt.wait())
                 done, _pending = await asyncio.wait(
                     {run_task, interrupt_task},
@@ -1162,12 +1420,18 @@ def create_run_broker_app(
                     interrupt_task.cancel()
                     result = run_task.result()
             else:
-                result = await asyncio.wait_for(broker.run(run_request), timeout=timeout_s)
+                result = await asyncio.wait_for(_run_sync_request(), timeout=timeout_s)
         except asyncio.TimeoutError:
             logger.warning("[multitenancy] ingest run timed out after %ss", timeout_s)
             return web.json_response(
                 {"ok": False, "status": "timeout", "profile": bound_profile},
                 status=504,
+            )
+        except _IngestSecretMaterializationError:
+            logger.exception("[multitenancy] ingest secret store failed")
+            return web.json_response(
+                {"ok": False, "error": "invalid secrets"},
+                status=400,
             )
         except RunRejected as exc:
             # Policy rejection text is safe-ish, but keep it short.
@@ -1191,7 +1455,47 @@ def create_run_broker_app(
                 {"ok": False, "error": "internal error"}, status=500
             )
         finally:
-            _ingest_cleanup_secret_dir(secret_dir)
+            if interactive:
+                # The aiohttp handler owns these child waiters. In particular,
+                # an outer disconnect during billing must stop and await the
+                # broker waiter before its transient fingerprint ref is
+                # released; otherwise a different-secret request can join the
+                # still-running old generation. After durable admission,
+                # cancelling this waiter leaves the stable execution child
+                # running by RunBroker contract.
+                child_tasks = [
+                    task
+                    for task in (run_task, interrupt_task)
+                    if task is not None
+                ]
+                for task in child_tasks:
+                    if not task.done():
+                        task.cancel()
+                if child_tasks:
+                    settled = asyncio.gather(
+                        *child_tasks,
+                        return_exceptions=True,
+                    )
+                    # A second transport/server cancellation must not cancel
+                    # the cleanup gather and let the claim release race ahead
+                    # of a still-live broker waiter. Shield and keep settling;
+                    # the original outer cancellation is re-raised naturally
+                    # after this finally block completes.
+                    while not settled.done():
+                        try:
+                            await asyncio.shield(settled)
+                        except asyncio.CancelledError:
+                            continue
+            # The stable child normally commits first. This event check closes
+            # the tiny create-task-to-first-run window when the outer HTTP task
+            # is cancelled synchronously by mark_seen or a hard timeout.
+            if execution_owned.is_set():
+                _commit_sync_secret_claim()
+            if not (
+                shared_entry_owned.is_set()
+                and not execution_owned.is_set()
+            ):
+                _release_sync_secret_claim_ref()
 
         if error_text.get("error"):
             logger.error(
