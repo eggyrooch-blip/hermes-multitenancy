@@ -1925,3 +1925,133 @@ skills:
     # Conflicting path: distribution entry overlays the default (defaults never
     # carry a version; the distribution entry does).
     assert by_path["lark-docs"].get("version") == "9.9.9"
+
+
+def _org_shared_home_with_one_skill(tmp_path: Path) -> Path:
+    shared = tmp_path / ".hermes"
+    org_skill = shared / "skills" / "org" / "readonly"
+    org_skill.mkdir(parents=True)
+    (org_skill / "SKILL.md").write_text("# readonly\n", encoding="utf-8")
+    (shared / "skill-bundles.yaml").write_text(
+        """
+skill_bundles:
+  default: [org-default]
+  bundles:
+    org-default:
+      audience: all
+      skills:
+        - path: org/readonly
+          install_mode: symlink
+          requires_token: false
+""",
+        encoding="utf-8",
+    )
+    return shared
+
+
+def _employee(name: str = "alice"):
+    from hermes_multitenancy.sync.feishu_org import Employee
+
+    return Employee(
+        open_id=f"ou_{name}",
+        user_id=name,
+        agent_id=name,
+        profile_name=name,
+        name=name.capitalize(),
+        dept_id="od_ops",
+        dept_name="Ops",
+        leader_user_id=None,
+    )
+
+
+def _inject_aidock_install(profile_home: Path, shared: Path, rel_path: str = "keep-report-download") -> dict:
+    """Simulate what skillhub_installer._install_into_profile leaves behind."""
+    skill_dir = profile_home / "skills" / rel_path
+    if not (skill_dir.exists() or skill_dir.is_symlink()):
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# keep-report-download 1.0.3\n", encoding="utf-8")
+    canonical = shared / "_managed" / "aidock-skillhub" / rel_path / "1.0.3"
+    entry = {
+        "source": str(canonical),
+        "target": str(canonical),
+        "version": "1.0.3",
+        "release_id": "181",
+        "origin": "aidock-skillhub",
+        "credential": "kep-cli",
+    }
+    manifest_path = profile_home / "skills" / ".hermes-managed.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"][rel_path] = entry
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return entry
+
+
+def test_org_sync_preserves_foreign_origin_skill_installs(tmp_path):
+    """Regression for 2026-07-14: AiDock skillhub installs (manifest entries
+    carrying origin=aidock-skillhub) must survive an org sync round — the
+    hourly sync used to prune their dirs and rewrite them out of the manifest."""
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills, plan_profile_skill_sync
+
+    shared = _org_shared_home_with_one_skill(tmp_path)
+    owner = _employee()
+    owner_home = shared / "profiles" / "alice"
+    assert _sync_default_profile_skills(owner_home, shared, owner) is True
+
+    entry = _inject_aidock_install(owner_home, shared)
+
+    _sync_default_profile_skills(owner_home, shared, owner)
+
+    assert (owner_home / "skills" / "keep-report-download" / "SKILL.md").is_file()
+    after = json.loads((owner_home / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
+    assert after["keep-report-download"] == entry
+    assert "org/readonly" in after
+
+    plan = plan_profile_skill_sync(owner_home, shared, owner)
+    removed = {item["path"] for item in plan["items"] if item["change"] == "multitenancy_removed"}
+    assert "keep-report-download" not in removed
+
+
+def test_org_sync_desired_wins_over_foreign_origin_on_same_path(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared = _org_shared_home_with_one_skill(tmp_path)
+    owner = _employee()
+    owner_home = shared / "profiles" / "alice"
+    assert _sync_default_profile_skills(owner_home, shared, owner) is True
+
+    # Foreign entry colliding with an org-desired path: admin config wins.
+    _inject_aidock_install(owner_home, shared, rel_path="org/readonly")
+    _sync_default_profile_skills(owner_home, shared, owner)
+
+    after = json.loads((owner_home / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
+    assert after["org/readonly"].get("origin") is None
+
+
+def test_org_sync_still_prunes_its_own_removed_skills(tmp_path):
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared = _org_shared_home_with_one_skill(tmp_path)
+    owner = _employee()
+    owner_home = shared / "profiles" / "alice"
+    assert _sync_default_profile_skills(owner_home, shared, owner) is True
+    assert (owner_home / "skills" / "org" / "readonly").exists()
+
+    _inject_aidock_install(owner_home, shared)
+
+    # Admin removes the org skill from the bundle config.
+    (shared / "skill-bundles.yaml").write_text(
+        """
+skill_bundles:
+  default: []
+  bundles: {}
+""",
+        encoding="utf-8",
+    )
+    _sync_default_profile_skills(owner_home, shared, owner)
+
+    after = json.loads((owner_home / "skills" / ".hermes-managed.json").read_text(encoding="utf-8"))["skills"]
+    assert not (owner_home / "skills" / "org" / "readonly").exists()
+    assert "org/readonly" not in after
+    # The foreign install still survives the same round.
+    assert "keep-report-download" in after
+    assert (owner_home / "skills" / "keep-report-download" / "SKILL.md").is_file()

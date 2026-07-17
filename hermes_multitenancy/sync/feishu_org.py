@@ -873,6 +873,8 @@ def plan_profile_skill_sync(
     for rel_raw in sorted(set(previous) - set(desired)):
         if _safe_skill_relative_path(rel_raw) is None:
             continue
+        if _is_foreign_origin_skill_entry(previous.get(rel_raw)):
+            continue
         items.append(
             {
                 "path": rel_raw,
@@ -1440,10 +1442,23 @@ def _link_shared_skill_tree(src: Path, dst: Path) -> bool:
     return True
 
 
+def _is_foreign_origin_skill_entry(entry: Any) -> bool:
+    """Entry installed by another manager (e.g. origin=aidock-skillhub events).
+
+    Org sync only owns manifest entries it generates, which never carry an
+    ``origin`` field. Entries with a non-empty origin are preserved verbatim —
+    never pruned, never dropped on manifest rewrite — unless the same path is
+    also desired by org config (admin config wins on path conflict).
+    """
+    return isinstance(entry, dict) and bool(entry.get("origin"))
+
+
 def _prune_removed_managed_skills(profile_home: Path, desired: dict[str, dict[str, Any]]) -> bool:
     changed = False
     previous = _read_managed_skill_manifest(profile_home)
     for rel_raw in sorted(set(previous) - set(desired)):
+        if _is_foreign_origin_skill_entry(previous.get(rel_raw)):
+            continue
         rel_path = _safe_skill_relative_path(rel_raw)
         if rel_path is None:
             continue
@@ -1467,10 +1482,17 @@ def _read_managed_skill_manifest(profile_home: Path) -> dict[str, Any]:
 def _write_managed_skill_manifest(profile_home: Path, desired: dict[str, dict[str, Any]]) -> bool:
     path = profile_home / "skills" / MANAGED_SKILL_MANIFEST
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous = _read_managed_skill_manifest(profile_home)
+    skills = {
+        rel_raw: entry
+        for rel_raw, entry in previous.items()
+        if rel_raw not in desired and _is_foreign_origin_skill_entry(entry)
+    }
+    skills.update(desired)
     content = json.dumps(
         {
             "version": 1,
-            "skills": desired,
+            "skills": skills,
         },
         ensure_ascii=False,
         indent=2,
