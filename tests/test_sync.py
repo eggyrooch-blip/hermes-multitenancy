@@ -2027,6 +2027,17 @@ def test_org_sync_desired_wins_over_foreign_origin_on_same_path(tmp_path):
     assert after["org/readonly"].get("origin") is None
 
 
+def test_is_foreign_origin_skill_entry_predicate():
+    from hermes_multitenancy.sync.feishu_org import _is_foreign_origin_skill_entry
+
+    assert _is_foreign_origin_skill_entry({"origin": "aidock-skillhub"}) is True
+    assert _is_foreign_origin_skill_entry({"origin": ""}) is False
+    assert _is_foreign_origin_skill_entry({"origin": None}) is False
+    assert _is_foreign_origin_skill_entry({}) is False
+    assert _is_foreign_origin_skill_entry(None) is False
+    assert _is_foreign_origin_skill_entry("not-a-dict") is False
+
+
 def test_org_sync_still_prunes_its_own_removed_skills(tmp_path):
     from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
 
