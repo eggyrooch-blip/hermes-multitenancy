@@ -401,7 +401,7 @@ def test_router_mark_seen_keeps_content_dedupe_for_non_webui_without_explicit_ke
     assert calls == [content]
 
 
-def test_run_broker_admit_runs_policy_and_dedupe_without_dispatch():
+def test_run_broker_admit_prepared_runs_policy_and_dedupe_without_dispatch():
     from hermes_multitenancy.run_broker import RunBroker
     from hermes_multitenancy.run_models import RunRequest
 
@@ -432,8 +432,8 @@ def test_run_broker_admit_runs_policy_and_dedupe_without_dispatch():
         message_id="om_1",
     )
 
-    first = asyncio.run(broker.admit(request))
-    second = asyncio.run(broker.admit(request))
+    first = asyncio.run(broker.admit_prepared(request))
+    second = asyncio.run(broker.admit_prepared(request))
 
     assert first.duplicate is False
     assert second.duplicate is True
