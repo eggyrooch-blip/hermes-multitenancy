@@ -272,7 +272,7 @@ def _read_marker(marker_path: Path) -> Optional[dict[str, Any]]:
         if len(raw) > MAX_REAUTH_MARKER_BYTES:
             return None
         data = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 

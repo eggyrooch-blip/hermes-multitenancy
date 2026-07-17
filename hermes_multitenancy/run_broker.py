@@ -6,9 +6,11 @@ rendering ``RunEvent`` objects back to their clients.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import inspect
 import os
+import threading
 from typing import Awaitable, Callable, Optional
 
 from .run_models import RunEvent, RunRequest, RunResult
@@ -22,8 +24,85 @@ class RunRejected(RuntimeError):
 DispatchAgent = Callable[[RunRequest], Awaitable[str] | str]
 EmitEvent = Callable[[RunEvent], Awaitable[None] | None]
 MarkSeen = Callable[[RunRequest], bool]
+IsSeen = Callable[[RunRequest], bool]
 SandboxAvailable = Callable[[], bool]
 PrepareRequest = Callable[[RunRequest], Awaitable[RunRequest] | RunRequest]
+
+
+_PREPARED_RUN_PROOF = object()
+_PREPARE_INFLIGHT_LOCK = threading.Lock()
+_PREPARE_INFLIGHT: dict[
+    tuple[int, int, str, str, str, str], asyncio.Task["PreparedRun"]
+] = {}
+
+
+def _request_identity(request: RunRequest) -> tuple[str, str, str, str]:
+    return (
+        request.channel,
+        request.profile_name,
+        request.user_key,
+        request.effective_idempotency_key,
+    )
+
+
+class PreparedRun:
+    """Opaque proof that a broker successfully prepared one request.
+
+    Instances can only be issued by :meth:`RunBroker.prepare`.  Keeping the
+    proof separate from ``RunRequest`` prevents public callers from claiming a
+    raw request was already prepared and bypassing billing/identity work.
+    """
+
+    __slots__ = ("_request", "_identity", "_authority", "_proof")
+
+    def __new__(cls, *_args, **_kwargs):
+        raise TypeError("PreparedRun values are issued by RunBroker.prepare()")
+
+    def __setattr__(self, _name, _value) -> None:
+        raise AttributeError("PreparedRun is immutable")
+
+    @property
+    def request(self) -> RunRequest:
+        _require_prepared(self)
+        return self._request
+
+    def with_request(self, request: RunRequest) -> "PreparedRun":
+        """Carry the proof across trusted enrichment without changing identity."""
+        _require_prepared(self)
+        if not isinstance(request, RunRequest):
+            raise TypeError("prepared request must be a RunRequest")
+        if _request_identity(request)[:3] != self._identity[:3]:
+            raise ValueError("prepared request identity cannot change")
+        if request.effective_idempotency_key != self._identity[3]:
+            request = replace(request, idempotency_key=self._identity[3])
+        return _issue_prepared(
+            request,
+            identity=self._identity,
+            authority=self._authority,
+        )
+
+
+def _issue_prepared(
+    request: RunRequest,
+    *,
+    identity: Optional[tuple[str, str, str, str]] = None,
+    authority: object,
+) -> PreparedRun:
+    prepared = object.__new__(PreparedRun)
+    object.__setattr__(prepared, "_request", request)
+    object.__setattr__(prepared, "_identity", identity or _request_identity(request))
+    object.__setattr__(prepared, "_authority", authority)
+    object.__setattr__(prepared, "_proof", _PREPARED_RUN_PROOF)
+    return prepared
+
+
+def _require_prepared(value: object) -> PreparedRun:
+    if (
+        not isinstance(value, PreparedRun)
+        or getattr(value, "_proof", None) is not _PREPARED_RUN_PROOF
+    ):
+        raise TypeError("a RunBroker-issued PreparedRun is required")
+    return value
 
 
 def _default_sandbox_available() -> bool:
@@ -50,6 +129,7 @@ class RunBroker:
         dispatch_agent: DispatchAgent,
         emit_event: Optional[EmitEvent] = None,
         mark_seen: Optional[MarkSeen] = None,
+        is_seen: Optional[IsSeen] = None,
         sandbox_available: Optional[SandboxAvailable] = None,
         prepare_request: Optional[PrepareRequest] = None,
         require_sandbox_for_host_tools: bool = True,
@@ -57,24 +137,26 @@ class RunBroker:
         self._dispatch_agent = dispatch_agent
         self._emit_event = emit_event
         self._mark_seen = mark_seen
+        self._is_seen = is_seen
         self._sandbox_available = sandbox_available or _default_sandbox_available
         self._prepare_request = prepare_request
+        self._preparation_authority = prepare_request if prepare_request is not None else self
         self._require_sandbox_for_host_tools = require_sandbox_for_host_tools
 
-    async def run(self, request: RunRequest, *, admitted: bool = False) -> RunResult:
-        """Execute a request after policy and idempotency checks."""
-        request = _rewrite_skill_slash_request(request)
-        if not admitted:
-            self._assert_policy(request)
-        if self._prepare_request is not None:
-            request = await _maybe_await(self._prepare_request(request))
+    async def run(self, request: RunRequest) -> RunResult:
+        """Prepare, admit, and execute one request through every boundary."""
+        prepared, admission = await self.prepare_and_admit(request)
+        if admission.duplicate:
+            await self._emit(RunEvent(kind="done"))
+            return admission
+        assert prepared is not None
+        return await self.run_prepared(prepared)
 
-        if not admitted:
-            admission = self._consume_idempotency(request)
-            if admission.duplicate:
-                await self._emit(RunEvent(kind="done"))
-                return admission
-
+    async def run_prepared(self, prepared: PreparedRun) -> RunResult:
+        """Execute only a broker-issued request whose admission ran elsewhere."""
+        prepared = _require_prepared(prepared)
+        request = prepared.request
+        self._assert_policy(request)
         response = await _maybe_await(self._dispatch_agent(request))
         content = str(response or "")
         if content:
@@ -84,8 +166,17 @@ class RunBroker:
 
     async def admit(self, request: RunRequest) -> RunResult:
         """Prepare and consume idempotency without dispatching the agent."""
-        request = await self.prepare(request)
-        return self._consume_idempotency(request)
+        _prepared, admission = await self.prepare_and_admit(request)
+        return admission
+
+    async def prepare_and_admit(
+        self, request: RunRequest
+    ) -> tuple[Optional[PreparedRun], RunResult]:
+        """Skip known duplicates, prepare once, then atomically consume admission."""
+        prepared = await self.prepare_if_fresh(request)
+        if prepared is None:
+            return None, RunResult(content="", duplicate=True)
+        return prepared, self._consume_idempotency(prepared.request)
 
     def check_policy(self, request: RunRequest) -> RunRequest:
         """Rewrite and validate a request without preparation or idempotency."""
@@ -93,17 +184,70 @@ class RunBroker:
         self._assert_policy(request)
         return request
 
-    async def prepare(self, request: RunRequest) -> RunRequest:
-        """Validate and prepare a request before any idempotency mutation."""
+    def is_duplicate(self, request: RunRequest) -> bool:
+        """Return persistent duplicate state without mutating admission state."""
         request = self.check_policy(request)
-        if self._prepare_request is not None:
-            request = await _maybe_await(self._prepare_request(request))
-        return request
+        return self._known_duplicate(request)
 
-    async def admit_prepared(self, request: RunRequest) -> RunResult:
-        """Consume idempotency for a request already prepared by the caller."""
+    async def prepare_if_fresh(self, request: RunRequest) -> Optional[PreparedRun]:
+        """Return a prepared capability, or ``None`` for a known duplicate."""
         request = self.check_policy(request)
-        return self._consume_idempotency(request)
+        if self._known_duplicate(request):
+            return None
+        return await self._prepare_checked(request)
+
+    async def prepare(self, request: RunRequest) -> PreparedRun:
+        """Validate and issue an opaque capability before idempotency mutation."""
+        request = self.check_policy(request)
+        return await self._prepare_checked(request)
+
+    async def admit_prepared(self, prepared: PreparedRun) -> RunResult:
+        """Consume idempotency only for a broker-issued prepared capability."""
+        prepared = _require_prepared(prepared)
+        if prepared._authority is not self._preparation_authority:
+            raise TypeError("PreparedRun was issued by a different preparation boundary")
+        self._assert_policy(prepared.request)
+        return self._consume_idempotency(prepared.request)
+
+    async def _prepare_checked(self, request: RunRequest) -> PreparedRun:
+        if self._prepare_request is None:
+            return _issue_prepared(request, authority=self._preparation_authority)
+
+        loop = asyncio.get_running_loop()
+        key = (
+            id(loop),
+            id(self._prepare_request),
+            request.channel,
+            request.profile_name,
+            request.user_key,
+            request.effective_idempotency_key,
+        )
+        with _PREPARE_INFLIGHT_LOCK:
+            task = _PREPARE_INFLIGHT.get(key)
+            if task is None:
+                task = loop.create_task(self._prepare_once(request))
+                _PREPARE_INFLIGHT[key] = task
+
+                def _cleanup(done_task: asyncio.Task[PreparedRun]) -> None:
+                    with _PREPARE_INFLIGHT_LOCK:
+                        if _PREPARE_INFLIGHT.get(key) is done_task:
+                            _PREPARE_INFLIGHT.pop(key, None)
+
+                task.add_done_callback(_cleanup)
+        return await asyncio.shield(task)
+
+    async def _prepare_once(self, request: RunRequest) -> PreparedRun:
+        prepared_request = await _maybe_await(self._prepare_request(request))
+        if not isinstance(prepared_request, RunRequest):
+            raise TypeError("prepare_request must return a RunRequest")
+        if _request_identity(prepared_request) != _request_identity(request):
+            raise ValueError("prepare_request cannot change request identity")
+        self._assert_policy(prepared_request)
+        return _issue_prepared(
+            prepared_request,
+            identity=_request_identity(request),
+            authority=self._preparation_authority,
+        )
 
     def _assert_policy(self, request: RunRequest) -> None:
         if (
@@ -118,6 +262,9 @@ class RunBroker:
             return RunResult(content="", duplicate=True)
 
         return RunResult(content="", duplicate=False)
+
+    def _known_duplicate(self, request: RunRequest) -> bool:
+        return self._is_seen is not None and bool(self._is_seen(request))
 
     async def _emit(self, event: RunEvent) -> None:
         if self._emit_event is None:

@@ -2272,6 +2272,12 @@ def _default_mark_seen(request: RunRequest) -> bool:
     return router_mod._mark_run_request_seen(request)
 
 
+def _default_is_seen(request: RunRequest) -> bool:
+    from .. import router as router_mod
+
+    return router_mod._is_run_request_seen(request)
+
+
 def _skillhub_discovery_source(payload: dict[str, Any]) -> str | None:
     for key in ("discovery_source", "catalog_source", "source_kind", "source_type"):
         value = str(payload.get(key) or "").strip()

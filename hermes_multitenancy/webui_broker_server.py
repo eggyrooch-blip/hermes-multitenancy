@@ -97,6 +97,7 @@ def create_run_broker_app(
     *,
     dispatch_agent: Optional[DispatchAgent] = None,
     mark_seen: Optional[MarkSeen] = None,
+    is_seen: Optional[IsSeen] = None,
     sandbox_available: Optional[SandboxAvailable] = None,
 ):
     try:
@@ -104,6 +105,13 @@ def create_run_broker_app(
     except Exception as exc:  # pragma: no cover - production dependency guard
         raise RuntimeError("aiohttp is required for the WebUI run broker endpoint") from exc
     from .billing_identity import prepare_billing_request
+
+    effective_mark_seen = mark_seen if mark_seen is not None else _default_mark_seen
+    effective_is_seen = (
+        is_seen
+        if is_seen is not None
+        else (_default_is_seen if mark_seen is None else None)
+    )
 
     async def _stream_run_request(request, run_request, *, stash_payload):
         """Admit + SSE-stream a run_request. Shared by handle_run and replay.
@@ -156,18 +164,18 @@ def create_run_broker_app(
             await emitter.emit(event)
 
         try:
-            # Billing identity preparation can call the profile apiserver and
-            # fail transiently.  Keep the turn retryable until it succeeds.
-            prepared_run_request = await prepare_billing_request(run_request)
             admission_broker = RunBroker(
                 dispatch_agent=lambda _req: "",
-                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+                mark_seen=effective_mark_seen,
+                is_seen=effective_is_seen,
                 sandbox_available=sandbox_available or _default_sandbox_available,
+                prepare_request=prepare_billing_request,
             )
-            admission = await admission_broker.admit_prepared(prepared_run_request)
+            prepared_run, admission = await admission_broker.prepare_and_admit(run_request)
             if admission.duplicate:
                 await emit_event(RunEvent(kind="done"))
                 return response
+            assert prepared_run is not None
 
             broker_dispatch = dispatch_agent or (
                 lambda req: _default_dispatch_agent(
@@ -179,7 +187,7 @@ def create_run_broker_app(
                 emit_event=emit_event,
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            await broker.run(prepared_run_request, admitted=True)
+            await broker.run_prepared(prepared_run)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
             await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
@@ -621,7 +629,6 @@ def create_run_broker_app(
         broker = RunBroker(
             dispatch_agent=broker_dispatch,
             emit_event=sink,
-            mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
         )
         timeout_s = _ingest_async_timeout()
@@ -630,7 +637,9 @@ def create_run_broker_app(
         try:
             _ingest_async_touch(job, "running")
             if prepared.interactive:
-                run_task = asyncio.ensure_future(broker.run(prepared.run_request, admitted=True))
+                run_task = asyncio.ensure_future(
+                    broker.run_prepared(prepared.prepared_run)
+                )
                 interrupt_task = asyncio.ensure_future(interrupt.wait())
                 done, _pending = await asyncio.wait(
                     {run_task, interrupt_task},
@@ -664,7 +673,7 @@ def create_run_broker_app(
                     result = run_task.result()
             else:
                 result = await asyncio.wait_for(
-                    broker.run(prepared.run_request, admitted=True),
+                    broker.run_prepared(prepared.prepared_run),
                     timeout=timeout_s,
                 )
         except asyncio.TimeoutError:
@@ -762,23 +771,26 @@ def create_run_broker_app(
                 status=503,
             )
 
+        admission_broker = RunBroker(
+            dispatch_agent=lambda _req: "",
+            mark_seen=effective_mark_seen,
+            is_seen=effective_is_seen,
+            sandbox_available=sandbox_available or _default_sandbox_available,
+            prepare_request=prepare_billing_request,
+        )
         try:
-            # Reject policy/sandbox failures before any profile or billing I/O,
-            # but do not consume the real idempotency key during this preflight.
-            policy_broker = RunBroker(
-                dispatch_agent=lambda _req: "",
-                mark_seen=lambda _request: True,
-                sandbox_available=sandbox_available or _default_sandbox_available,
-            )
-            policy_broker.check_policy(prepared.run_request)
+            # Preserve policy rejection precedence before billing I/O.
+            admission_broker.check_policy(prepared.run_request)
         except RunRejected as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
 
         try:
             # Billing identity preparation can call the profile apiserver and
-            # fail transiently. Keep this request retryable until preparation
-            # succeeds; admission below is the point that consumes the key.
-            prepared.run_request = await prepare_billing_request(prepared.run_request)
+            # fail transiently. A persistent read-only duplicate check happens
+            # first; concurrent retries then share the same preparation task.
+            prepared_run, admission = await admission_broker.prepare_and_admit(
+                prepared.run_request
+            )
         except Exception:
             logger.exception(
                 "[multitenancy] async ingest billing preparation failed profile=%s",
@@ -794,16 +806,6 @@ def create_run_broker_app(
                 status=503,
             )
 
-        try:
-            admission_broker = RunBroker(
-                dispatch_agent=lambda _req: "",
-                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
-                sandbox_available=sandbox_available or _default_sandbox_available,
-            )
-            admission = await admission_broker.admit_prepared(prepared.run_request)
-        except RunRejected as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=403)
-
         if admission.duplicate:
             return web.json_response(
                 {
@@ -814,6 +816,9 @@ def create_run_broker_app(
                 },
                 status=200,
             )
+        assert prepared_run is not None
+        prepared.prepared_run = prepared_run
+        prepared.run_request = prepared_run.request
 
         run_id = "ing_" + secrets.token_urlsafe(16)
         try:
@@ -829,6 +834,9 @@ def create_run_broker_app(
             prepared.run_request = replace(
                 prepared.run_request,
                 metadata={**prepared.run_request.metadata, "ingest_secret_dir": secret_dir},
+            )
+            prepared.prepared_run = prepared.prepared_run.with_request(
+                prepared.run_request
             )
         now = time.time()
         job = {
@@ -1089,7 +1097,8 @@ def create_run_broker_app(
         broker = RunBroker(
             dispatch_agent=broker_dispatch,
             emit_event=sink,
-            mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+            mark_seen=effective_mark_seen,
+            is_seen=effective_is_seen,
             sandbox_available=sandbox_available or _default_sandbox_available,
             prepare_request=prepare_billing_request,
         )

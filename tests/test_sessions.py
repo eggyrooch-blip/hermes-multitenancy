@@ -72,3 +72,31 @@ def test_mark_event_processed_rejects_duplicate_within_ttl(store):
         content_hash=None,
         ttl_seconds=3600,
     ) is False
+
+
+def test_is_event_processed_is_read_only_and_uses_mark_ttl(store, monkeypatch):
+    import hermes_multitenancy.sessions as sessions
+
+    monkeypatch.setattr(sessions.time, "time", lambda: 1_000)
+    assert store.is_event_processed("event-1", 60) is False
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM multitenancy_processed_events"
+    ).fetchone()[0] == 0
+
+    assert store.mark_event_processed(
+        "event-1",
+        profile_name="p",
+        user_key="u",
+        message_id="om_1",
+        content_hash=None,
+        ttl_seconds=60,
+    ) is True
+    assert store.is_event_processed("event-1", 60) is True
+
+    monkeypatch.setattr(sessions.time, "time", lambda: 1_060)
+    assert store.is_event_processed("event-1", 60) is True
+    monkeypatch.setattr(sessions.time, "time", lambda: 1_061)
+    assert store.is_event_processed("event-1", 60) is False
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM multitenancy_processed_events"
+    ).fetchone()[0] == 1

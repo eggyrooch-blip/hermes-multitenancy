@@ -1588,12 +1588,25 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
     admitted = []
     dispatched = []
 
+    class FakePrepared:
+        def __init__(self, request):
+            self.request = request
+
+        def with_request(self, request):
+            return FakePrepared(request)
+
     class FakeBroker:
-        async def admit_prepared(self, request):
-            admitted.append(request)
+        def check_policy(self, request):
+            return request
+
+        async def prepare_if_fresh(self, request):
+            return FakePrepared(request)
+
+        async def admit_prepared(self, prepared):
+            admitted.append(prepared.request)
             return RunResult(content="", duplicate=False)
 
-        async def run(self, request, *, admitted=False):
+        async def run_prepared(self, prepared):
             return RunResult(content="ok", duplicate=False)
 
     class MockPool:
@@ -1635,13 +1648,27 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     broker_calls = []
     pool_calls = []
 
+    class FakePrepared:
+        def __init__(self, request):
+            self.request = request
+
+        def with_request(self, request):
+            return FakePrepared(request)
+
     class FakeBroker:
-        async def admit_prepared(self, request):
-            broker_calls.append(("admit", request.content))
+        def check_policy(self, request):
+            return request
+
+        async def prepare_if_fresh(self, request):
+            return FakePrepared(request)
+
+        async def admit_prepared(self, prepared):
+            broker_calls.append(("admit", prepared.request.content))
             return RunResult(content="", duplicate=False)
 
-        async def run(self, request, *, admitted=False):
-            broker_calls.append(("run", request.content, admitted))
+        async def run_prepared(self, prepared):
+            request = prepared.request
+            broker_calls.append(("run_prepared", request.content))
             response = await router_mod._get_pool().dispatch(
                 request.profile_name,
                 profile_home,
@@ -1664,7 +1691,7 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
 
     assert broker_calls == [
         ("admit", "hello nonstream broker"),
-        ("run", "hello nonstream broker", True),
+        ("run_prepared", "hello nonstream broker"),
     ]
     assert pool_calls == [("owner", "hello nonstream broker")]
     clear_spike_routes()
@@ -1686,16 +1713,30 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     media_calls = []
     lifecycle = []
 
+    class FakePrepared:
+        def __init__(self, request):
+            self.request = request
+
+        def with_request(self, request):
+            return FakePrepared(request)
+
     class FakeBroker:
         def __init__(self, dispatch_agent=None):
             self.dispatch_agent = dispatch_agent
 
-        async def admit_prepared(self, request):
-            broker_calls.append(("admit", request.content))
+        def check_policy(self, request):
+            return request
+
+        async def prepare_if_fresh(self, request):
+            return FakePrepared(request)
+
+        async def admit_prepared(self, prepared):
+            broker_calls.append(("admit", prepared.request.content))
             return RunResult(content="", duplicate=False)
 
-        async def run(self, request, *, admitted=False):
-            broker_calls.append(("run", request.content, admitted))
+        async def run_prepared(self, prepared):
+            request = prepared.request
+            broker_calls.append(("run_prepared", request.content))
             response = await self.dispatch_agent(request)
             return RunResult(content=response, duplicate=False)
 
@@ -1733,7 +1774,7 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
 
     assert broker_calls == [
         ("admit", "hello streaming broker"),
-        ("run", "hello streaming broker", True),
+        ("run_prepared", "hello streaming broker"),
     ]
     assert stream_calls == [("chat-123", "owner", "owner", "hello streaming broker", 1)]
     assert media_calls == [("stream ok", "hello streaming broker", "owner")]

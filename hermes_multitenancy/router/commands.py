@@ -258,8 +258,36 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         from ..billing_identity import prepare_billing_request
         from ..run_broker import RunRejected
 
+        run_broker = _m._make_routed_run_broker(
+            prepare_request=prepare_billing_request,
+        )
         try:
-            prepared_request = await prepare_billing_request(run_request)
+            prepared_run = await run_broker.prepare_if_fresh(run_request)
+            if prepared_run is None:
+                _m.logger.info(
+                    "multitenancy: duplicate inbound event skipped before billing "
+                    "profile=%s sender=%s message_id=%s",
+                    profile_name,
+                    sender,
+                    _m._event_message_id(event) or "",
+                )
+                if feishu_full:
+                    try:
+                        out = _m._processing_outcome(failed=False)
+                        complete_deferred = getattr(
+                            adapter, "complete_deferred_processing", None
+                        )
+                        if callable(complete_deferred):
+                            await complete_deferred(event, out)
+                        else:
+                            await adapter.on_processing_complete(event, out)
+                    except Exception as exc:
+                        _m.logger.debug(
+                            "multitenancy: duplicate processing_complete failed: %s",
+                            exc,
+                        )
+                return
+            prepared_request = prepared_run.request
             enriched_text = await _m._call_enrich_via_hermes_pipeline(
                 event,
                 gateway,
@@ -307,9 +335,13 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             text=run_content,
         )
         run_request = replace(run_request, metadata=prepared_request.metadata)
+        # Enrichment can change the final content; apply the normal slash
+        # rewrite again without re-running billing preparation.
+        run_request = run_broker.check_policy(run_request)
+        prepared_run = prepared_run.with_request(run_request)
 
         try:
-            run_admission = await _m._make_routed_run_broker().admit_prepared(run_request)
+            run_admission = await run_broker.admit_prepared(prepared_run)
         except RunRejected as exc:
             _m.logger.warning("multitenancy: routed run rejected profile=%s sender=%s: %s", profile_name, sender, exc)
             if feishu_full:
@@ -407,7 +439,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
 
                 run_result = await _m._make_routed_run_broker(
                     dispatch_agent=_dispatch_streaming,
-                ).run(run_request, admitted=True)
+                ).run_prepared(prepared_run)
                 response_text = run_result.content
             else:
                 # Mock / minimal adapter — old non-stream path (send_typing + pool.dispatch + send)
@@ -423,7 +455,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
 
                 run_result = await _m._make_routed_run_broker(
                     dispatch_agent=_dispatch_nonstream,
-                ).run(run_request, admitted=True)
+                ).run_prepared(prepared_run)
                 response_text = run_result.content
                 if adapter is not None:
                     await _m._safe_call(adapter.send, chat_id, response_text)

@@ -15,6 +15,9 @@ EmitRunEvent = Callable[[RunEvent], Awaitable[None] | None]
 MarkSeen = Callable[[RunRequest], bool]
 
 
+IsSeen = Callable[[RunRequest], bool]
+
+
 SandboxAvailable = Callable[[], bool]
 
 
@@ -161,6 +164,7 @@ __all__ = [
     'DispatchAgent',
     'EmitRunEvent',
     'MarkSeen',
+    'IsSeen',
     'SandboxAvailable',
     '_OWNER_OPEN_ID_HEADER',
     '_EXPERT_ID_HEADER',

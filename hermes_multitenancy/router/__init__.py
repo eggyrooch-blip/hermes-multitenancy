@@ -579,6 +579,22 @@ def _mark_run_request_seen(request: Any) -> bool:
         return True
 
 
+def _is_run_request_seen(request: Any) -> bool:
+    """Return recent duplicate state without consuming the event key."""
+    store = _get_session_store()
+    if store is None:
+        return False
+    record = _run_request_dedupe_record(request)
+    if record is None:
+        return False
+    event_key, _message_id, _content_hash, ttl = record
+    try:
+        return bool(store.is_event_processed(event_key, ttl))
+    except Exception as exc:
+        logger.debug("multitenancy: run request dedupe lookup failed (%s)", exc)
+        return False
+
+
 def _host_tools_require_sandbox() -> bool:
     value = os.environ.get("HERMES_REQUIRE_SANDBOX_FOR_HOST_TOOLS", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -620,7 +636,7 @@ def _run_request_for_routed_event(
     )
 
 
-def _make_routed_run_broker(*, dispatch_agent: Any = None):
+def _make_routed_run_broker(*, dispatch_agent: Any = None, prepare_request: Any = None):
     from ..run_broker import RunBroker
 
     # commands.py resolves billing identity before admission so transient
@@ -628,7 +644,9 @@ def _make_routed_run_broker(*, dispatch_agent: Any = None):
     return RunBroker(
         dispatch_agent=dispatch_agent or (lambda _request: ""),
         mark_seen=_mark_run_request_seen,
+        is_seen=_is_run_request_seen,
         sandbox_available=_router_sandbox_available,
+        prepare_request=prepare_request,
     )
 
 

@@ -755,8 +755,13 @@ def test_l2_non_authoritative_refresh_marker_does_not_stop_refresh(
 
 @pytest.mark.parametrize(
     "marker_bytes",
-    [b"\xff\xfe", b"{" + b" " * common.MAX_REAUTH_MARKER_BYTES + b"}"],
-    ids=["invalid-utf8", "oversized"],
+    [
+        b"\xff\xfe",
+        b"{" + b" " * common.MAX_REAUTH_MARKER_BYTES + b"}",
+        b"[" * 10_000 + b"{}" + b"]" * 10_000,
+        b'{"value":' + b"9" * 50_000 + b"}",
+    ],
+    ids=["invalid-utf8", "oversized", "deeply-nested-json", "oversized-integer"],
 )
 def test_l2_untrusted_reauth_marker_does_not_freeze_refresh(
     tmp_path: Path,

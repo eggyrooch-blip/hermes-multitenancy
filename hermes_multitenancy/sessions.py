@@ -137,5 +137,15 @@ class SessionStore:
         self._conn.commit()
         return True
 
+    def is_event_processed(self, event_key: str, ttl_seconds: int) -> bool:
+        """Return whether an event key is recent without changing stored state."""
+        cutoff = int(time.time()) - max(0, int(ttl_seconds))
+        cur = self._conn.execute(
+            "SELECT ts FROM multitenancy_processed_events WHERE event_key = ?",
+            (event_key,),
+        )
+        row = cur.fetchone()
+        return row is not None and int(row["ts"]) >= cutoff
+
     def close(self) -> None:
         self._conn.close()

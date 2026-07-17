@@ -107,7 +107,7 @@ def test_run_broker_dedupes_before_dispatch():
     assert calls == ["hi"]
 
 
-def test_run_broker_prepares_request_before_dedupe_and_dispatch():
+def test_run_broker_skips_preparation_for_known_duplicate():
     from dataclasses import replace
 
     from hermes_multitenancy.run_broker import RunBroker
@@ -127,6 +127,7 @@ def test_run_broker_prepares_request_before_dedupe_and_dispatch():
     broker = RunBroker(
         dispatch_agent=dispatch,
         prepare_request=prepare,
+        is_seen=lambda request: request.message_id == "duplicate",
         mark_seen=lambda request: request.message_id != "duplicate",
     )
     duplicate = RunRequest(
@@ -138,7 +139,7 @@ def test_run_broker_prepares_request_before_dedupe_and_dispatch():
     asyncio.run(broker.run(duplicate))
     asyncio.run(broker.run(fresh))
 
-    assert prepared == ["duplicate", "fresh"]
+    assert prepared == ["fresh"]
     assert dispatched == [{"litellm_billing_user_id": "user-1"}]
 
 
@@ -173,6 +174,7 @@ def test_run_broker_prepare_failure_does_not_consume_idempotency_key():
     broker = RunBroker(
         dispatch_agent=dispatch,
         prepare_request=prepare,
+        is_seen=lambda request: request.effective_idempotency_key in seen,
         mark_seen=mark_seen,
         sandbox_available=lambda: True,
     )
@@ -191,6 +193,7 @@ def test_run_broker_prepare_failure_does_not_consume_idempotency_key():
 
     assert retry.content == "ok"
     assert duplicate.duplicate is True
+    assert prepare_attempts == 2
     assert len(seen) == 1
     assert dispatched == [{"litellm_billing_user_id": "user-1"}]
 
@@ -288,6 +291,11 @@ def test_router_mark_seen_dedupes_webui_with_explicit_idempotency_key(tmp_path):
 
     router.override_session_store(SessionStore(tmp_path / "sessions.db"))
     calls = []
+    prepares = []
+
+    async def prepare(request):
+        prepares.append(request.content)
+        return request
 
     async def dispatch(request):
         calls.append(request.content)
@@ -295,6 +303,8 @@ def test_router_mark_seen_dedupes_webui_with_explicit_idempotency_key(tmp_path):
 
     broker = RunBroker(
         dispatch_agent=dispatch,
+        prepare_request=prepare,
+        is_seen=router._is_run_request_seen,
         mark_seen=router._mark_run_request_seen,
         sandbox_available=lambda: True,
     )
@@ -318,6 +328,7 @@ def test_router_mark_seen_dedupes_webui_with_explicit_idempotency_key(tmp_path):
 
     assert first.duplicate is False
     assert second.duplicate is True
+    assert prepares == ["first turn content with enough words to avoid short-content exemptions"]
     assert calls == ["first turn content with enough words to avoid short-content exemptions"]
 
 
@@ -432,15 +443,66 @@ def test_run_broker_admit_prepared_runs_policy_and_dedupe_without_dispatch():
         message_id="om_1",
     )
 
-    first = asyncio.run(broker.admit_prepared(request))
-    second = asyncio.run(broker.admit_prepared(request))
+    prepared = asyncio.run(broker.prepare(request))
+    first = asyncio.run(broker.admit_prepared(prepared))
+    second = asyncio.run(broker.admit_prepared(prepared))
 
     assert first.duplicate is False
     assert second.duplicate is True
     assert calls == []
 
 
-def test_run_broker_run_can_skip_admission_after_prior_admit():
+def test_run_broker_admit_prepared_rejects_raw_request():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "should not run",
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="feishu",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        message_id="om_1",
+    )
+
+    with pytest.raises(TypeError, match="PreparedRun"):
+        asyncio.run(broker.admit_prepared(request))
+
+
+def test_run_broker_admit_prepared_rejects_different_prepare_boundary():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    async def prepare_a(request):
+        return request
+
+    async def prepare_b(request):
+        return request
+
+    issuer = RunBroker(dispatch_agent=lambda _request: "", prepare_request=prepare_a)
+    admission = RunBroker(
+        dispatch_agent=lambda _request: "",
+        prepare_request=prepare_b,
+        mark_seen=lambda _request: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        idempotency_key="turn-1",
+    )
+    prepared = asyncio.run(issuer.prepare(request))
+
+    with pytest.raises(TypeError, match="different preparation boundary"):
+        asyncio.run(admission.admit_prepared(prepared))
+
+
+def test_run_broker_run_prepared_can_dispatch_after_prior_admit():
     from hermes_multitenancy.run_broker import RunBroker
     from hermes_multitenancy.run_models import RunRequest
 
@@ -450,29 +512,89 @@ def test_run_broker_run_can_skip_admission_after_prior_admit():
         calls.append(("dispatch", request.content))
         return "ok"
 
-    def mark_seen(_request):
-        raise AssertionError("admitted run should not repeat idempotency check")
-
     broker = RunBroker(
         dispatch_agent=dispatch,
-        mark_seen=mark_seen,
+        mark_seen=lambda _request: True,
         sandbox_available=lambda: True,
     )
 
-    result = asyncio.run(broker.run(
-        RunRequest(
+    async def exercise():
+        prepared = await broker.prepare(
+            RunRequest(
             channel="feishu",
             profile_name="owner",
             user_key="ou_1",
             content="hi",
             message_id="om_1",
-        ),
-        admitted=True,
-    ))
+            )
+        )
+        admission = await broker.admit_prepared(prepared)
+        assert admission.duplicate is False
+        return await broker.run_prepared(prepared)
+
+    result = asyncio.run(exercise())
 
     assert result.content == "ok"
     assert result.duplicate is False
     assert calls == [("dispatch", "hi")]
+
+
+def test_run_broker_concurrent_duplicates_share_one_prepare_across_brokers():
+    from dataclasses import replace
+
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    prepare_calls = 0
+    dispatches = []
+    seen = set()
+
+    async def prepare(request):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        await asyncio.sleep(0.01)
+        return replace(request, metadata={"litellm_billing_user_id": "user-1"})
+
+    def is_seen(request):
+        return request.effective_idempotency_key in seen
+
+    def mark_seen(request):
+        key = request.effective_idempotency_key
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    async def dispatch(request):
+        dispatches.append(request.metadata)
+        return "ok"
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        idempotency_key="turn-1",
+    )
+
+    async def exercise():
+        brokers = [
+            RunBroker(
+                dispatch_agent=dispatch,
+                prepare_request=prepare,
+                is_seen=is_seen,
+                mark_seen=mark_seen,
+                sandbox_available=lambda: True,
+            )
+            for _ in range(2)
+        ]
+        return await asyncio.gather(*(broker.run(request) for broker in brokers))
+
+    results = asyncio.run(exercise())
+
+    assert prepare_calls == 1
+    assert dispatches == [{"litellm_billing_user_id": "user-1"}]
+    assert sorted(result.duplicate for result in results) == [False, True]
 
 
 def test_run_broker_emits_channel_neutral_events():

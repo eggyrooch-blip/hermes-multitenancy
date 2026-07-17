@@ -9,15 +9,24 @@ Status: local ftask worktree only; not pushed or released to production.
   apiserver failure therefore leaves the same request retryable. WebUI SSE uses
   the same ordering and preserves its existing `error` event plus EOF behavior.
 - The public broker contract now names its three stages: `check_policy()` is
-  non-consuming, `admit_prepared()` consumes only an already-prepared request,
-  and `admit()` performs prepare-before-mark itself. Feishu/WebUI/async callers
-  no longer use one ambiguous method for both policy-only and real admission.
+  non-consuming, `prepare()` issues an opaque `PreparedRun`,
+  `admit_prepared()` accepts only a capability from the same preparation
+  boundary, and `admit()` performs prepare-before-mark itself. A raw
+  `RunRequest` can no longer claim that billing already happened.
+- `SessionStore.is_event_processed()` checks recent admission state without a
+  write. Sequential retries therefore skip billing preparation, while
+  concurrent retries for the same key share one in-flight preparation task;
+  atomic `mark_seen` still selects the only request allowed to dispatch.
+  Feishu, WebUI SSE, and async ingest now carry the signed prepared capability
+  through enrichment/admission/dispatch instead of using `admitted=True`.
 - Feishu credential renewal skips a user while an authoritative invalid-refresh
   `.needs_reauth` marker exists. Removing the marker after successful user
   authorization restores normal proactive refresh. Non-authoritative markers
   continue through the ordinary retry/diagnostic path. Marker JSON is read as
   bounded UTF-8; invalid or oversized files are not trusted as authoritative
-  and therefore cannot freeze the worker loop.
+  and therefore cannot freeze the worker loop. Parser recursion and integer
+  digit-limit failures are also treated as untrusted input, so hostile
+  10,000-level JSON or a 50,000-digit number cannot crash the renewal tick.
 - Async ingest first runs sandbox policy with a non-consuming admission, then
   performs billing preparation, and only then commits real admission. Any billing
   preparation exception (including `RunRejected`) returns a retryable 503 without
@@ -32,9 +41,9 @@ markers are terminal until reauthorization.
 
 ## Local evidence
 
-- New blocker-focused RunBroker, ingest, credential-renewal, WebUI broker, and
-  Feishu routing selection: 31 passed.
-- Full suite: 2340 passed, 1 skipped, 3 deselected.
+- Blocker-focused RunBroker, ingest, credential-renewal, SessionStore, WebUI
+  broker, and Feishu routing selection: 292 passed.
+- Full suite: 2346 passed, 1 skipped, 3 deselected.
 - No real Feishu message was sent and no production service or database was
   changed during this task.
 
