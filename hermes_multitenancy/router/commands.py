@@ -309,7 +309,7 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         run_request = replace(run_request, metadata=prepared_request.metadata)
 
         try:
-            run_admission = await _m._make_routed_run_broker().admit(run_request)
+            run_admission = await _m._make_routed_run_broker().admit_prepared(run_request)
         except RunRejected as exc:
             _m.logger.warning("multitenancy: routed run rejected profile=%s sender=%s: %s", profile_name, sender, exc)
             if feishu_full:

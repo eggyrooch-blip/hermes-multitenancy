@@ -47,6 +47,7 @@ LOCAL_STRUCTURAL_REAUTH_REASONS = frozenset(
 SCOPE_STRIPPED_REASONS = frozenset({REASON_SCOPE_STRIPPED_BY_FEISHU})
 
 FIXTURE_DIRNAMES = frozenset({"feishu_uat.fixtures.bak"})
+MAX_REAUTH_MARKER_BYTES = 64 * 1024
 
 
 # Benign, non-secret env vars a third-party credential-status/login CLI
@@ -262,20 +263,26 @@ def preserve_reauth_marker_as_refresh_diagnostic(
     )
 
 
-def read_needs_reauth_marker(marker_path: Path) -> Optional[dict[str, Any]]:
+def _read_marker(marker_path: Path) -> Optional[dict[str, Any]]:
     try:
-        data = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        if marker_path.stat().st_size > MAX_REAUTH_MARKER_BYTES:
+            return None
+        with marker_path.open("rb") as stream:
+            raw = stream.read(MAX_REAUTH_MARKER_BYTES + 1)
+        if len(raw) > MAX_REAUTH_MARKER_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_needs_reauth_marker(marker_path: Path) -> Optional[dict[str, Any]]:
+    return _read_marker(marker_path)
 
 
 def read_refresh_diagnostic_marker(marker_path: Path) -> Optional[dict[str, Any]]:
-    try:
-        data = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _read_marker(marker_path)
 
 
 def clear_needs_reauth_marker(marker_path: Path) -> bool:

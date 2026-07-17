@@ -129,7 +129,7 @@ def create_run_broker_app(
                 dispatch_agent=lambda _req: "",
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            await policy_broker.admit(run_request)
+            policy_broker.check_policy(run_request)
         except RunRejected as exc:
             _auth_signal_consume(signal_run_id)
             return web.json_response({"error": str(exc)}, status=403)
@@ -164,7 +164,7 @@ def create_run_broker_app(
                 mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            admission = await admission_broker.admit(prepared_run_request)
+            admission = await admission_broker.admit_prepared(prepared_run_request)
             if admission.duplicate:
                 await emit_event(RunEvent(kind="done"))
                 return response
@@ -770,7 +770,7 @@ def create_run_broker_app(
                 mark_seen=lambda _request: True,
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            await policy_broker.admit(prepared.run_request)
+            policy_broker.check_policy(prepared.run_request)
         except RunRejected as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
 
@@ -800,7 +800,7 @@ def create_run_broker_app(
                 mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            admission = await admission_broker.admit(prepared.run_request)
+            admission = await admission_broker.admit_prepared(prepared.run_request)
         except RunRejected as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
 

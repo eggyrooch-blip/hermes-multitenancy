@@ -1589,7 +1589,7 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
     dispatched = []
 
     class FakeBroker:
-        async def admit(self, request):
+        async def admit_prepared(self, request):
             admitted.append(request)
             return RunResult(content="", duplicate=False)
 
@@ -1636,7 +1636,7 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
     pool_calls = []
 
     class FakeBroker:
-        async def admit(self, request):
+        async def admit_prepared(self, request):
             broker_calls.append(("admit", request.content))
             return RunResult(content="", duplicate=False)
 
@@ -1690,7 +1690,7 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
         def __init__(self, dispatch_agent=None):
             self.dispatch_agent = dispatch_agent
 
-        async def admit(self, request):
+        async def admit_prepared(self, request):
             broker_calls.append(("admit", request.content))
             return RunResult(content="", duplicate=False)
 

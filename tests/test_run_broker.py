@@ -195,6 +195,62 @@ def test_run_broker_prepare_failure_does_not_consume_idempotency_key():
     assert dispatched == [{"litellm_billing_user_id": "user-1"}]
 
 
+def test_run_broker_public_admit_prepares_before_consuming_idempotency():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    prepare_attempts = 0
+    marked = []
+
+    async def prepare(request):
+        nonlocal prepare_attempts
+        prepare_attempts += 1
+        if prepare_attempts == 1:
+            raise RuntimeError("temporary billing lookup failure")
+        return request
+
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "should not run",
+        prepare_request=prepare,
+        mark_seen=lambda request: marked.append(request.effective_idempotency_key) or True,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        idempotency_key="webui:session-1:turn-1",
+    )
+
+    with pytest.raises(RuntimeError, match="temporary billing lookup failure"):
+        asyncio.run(broker.admit(request))
+    admitted = asyncio.run(broker.admit(request))
+
+    assert admitted.duplicate is False
+    assert marked == ["webui:session-1:turn-1"]
+
+
+def test_run_broker_policy_check_has_no_prepare_or_idempotency_side_effects():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "should not run",
+        prepare_request=lambda _request: (_ for _ in ()).throw(AssertionError("must not prepare")),
+        mark_seen=lambda _request: (_ for _ in ()).throw(AssertionError("must not mark")),
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+    )
+
+    assert broker.check_policy(request) == request
+
+
 def test_run_broker_rejects_policy_before_preparing_request():
     from hermes_multitenancy.run_broker import RunBroker, RunRejected
     from hermes_multitenancy.run_models import RunRequest

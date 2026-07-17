@@ -711,7 +711,7 @@ def test_l2_authoritative_reauth_marker_stops_refresh_until_removed(
     assert refreshes[0]["force"] is True
 
 
-@pytest.mark.parametrize("authoritative", [False, "false", 0, 1])
+@pytest.mark.parametrize("authoritative", [False, "false", "true", 0, 1])
 def test_l2_non_authoritative_refresh_marker_does_not_stop_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -731,9 +731,49 @@ def test_l2_non_authoritative_refresh_marker_does_not_stop_refresh(
             "layer": "L2",
             "profile": profile_name,
             "authoritative": authoritative,
-            "refresh_class": "transient",
+            "refresh_class": "invalid",
         },
     )
+
+    payload = _valid_payload(open_id)
+    refreshes = []
+    monkeypatch.setattr(fua, "_load_best_uat_payload", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(fua, "_payload_needs_refresh", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        fua,
+        "refresh_uat_if_needed",
+        lambda **kwargs: refreshes.append(kwargs),
+    )
+
+    outcome = credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    )
+
+    assert outcome == "refreshed"
+    assert len(refreshes) == 1
+
+
+@pytest.mark.parametrize(
+    "marker_bytes",
+    [b"\xff\xfe", b"{" + b" " * common.MAX_REAUTH_MARKER_BYTES + b"}"],
+    ids=["invalid-utf8", "oversized"],
+)
+def test_l2_untrusted_reauth_marker_does_not_freeze_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_bytes: bytes,
+):
+    profile_name = "alice"
+    open_id = "ou_untrusted_marker"
+    marker = (
+        tmp_path
+        / "profiles"
+        / profile_name
+        / "feishu_uat"
+        / f"{open_id}.needs_reauth"
+    )
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(marker_bytes)
 
     payload = _valid_payload(open_id)
     refreshes = []

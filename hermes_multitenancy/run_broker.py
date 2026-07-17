@@ -64,13 +64,8 @@ class RunBroker:
     async def run(self, request: RunRequest, *, admitted: bool = False) -> RunResult:
         """Execute a request after policy and idempotency checks."""
         request = _rewrite_skill_slash_request(request)
-
         if not admitted:
             self._assert_policy(request)
-
-        # Preparation may resolve a billable employee identity through the
-        # apiserver and can fail transiently.  Do it before consuming the
-        # idempotency key so the same request remains retryable on failure.
         if self._prepare_request is not None:
             request = await _maybe_await(self._prepare_request(request))
 
@@ -88,9 +83,26 @@ class RunBroker:
         return RunResult(content=content, duplicate=False)
 
     async def admit(self, request: RunRequest) -> RunResult:
-        """Run policy/idempotency checks without dispatching the agent."""
+        """Prepare and consume idempotency without dispatching the agent."""
+        request = await self.prepare(request)
+        return self._consume_idempotency(request)
+
+    def check_policy(self, request: RunRequest) -> RunRequest:
+        """Rewrite and validate a request without preparation or idempotency."""
         request = _rewrite_skill_slash_request(request)
         self._assert_policy(request)
+        return request
+
+    async def prepare(self, request: RunRequest) -> RunRequest:
+        """Validate and prepare a request before any idempotency mutation."""
+        request = self.check_policy(request)
+        if self._prepare_request is not None:
+            request = await _maybe_await(self._prepare_request(request))
+        return request
+
+    async def admit_prepared(self, request: RunRequest) -> RunResult:
+        """Consume idempotency for a request already prepared by the caller."""
+        request = self.check_policy(request)
         return self._consume_idempotency(request)
 
     def _assert_policy(self, request: RunRequest) -> None:
