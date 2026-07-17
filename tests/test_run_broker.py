@@ -107,7 +107,7 @@ def test_run_broker_dedupes_before_dispatch():
     assert calls == ["hi"]
 
 
-def test_run_broker_prepares_request_after_dedupe_before_dispatch():
+def test_run_broker_prepares_request_before_dedupe_and_dispatch():
     from dataclasses import replace
 
     from hermes_multitenancy.run_broker import RunBroker
@@ -138,8 +138,90 @@ def test_run_broker_prepares_request_after_dedupe_before_dispatch():
     asyncio.run(broker.run(duplicate))
     asyncio.run(broker.run(fresh))
 
-    assert prepared == ["fresh"]
+    assert prepared == ["duplicate", "fresh"]
     assert dispatched == [{"litellm_billing_user_id": "user-1"}]
+
+
+def test_run_broker_prepare_failure_does_not_consume_idempotency_key():
+    from dataclasses import replace
+
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    prepare_attempts = 0
+    seen = set()
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_attempts
+        prepare_attempts += 1
+        if prepare_attempts == 1:
+            raise RuntimeError("temporary billing lookup failure")
+        return replace(request, metadata={"litellm_billing_user_id": "user-1"})
+
+    def mark_seen(request):
+        key = request.effective_idempotency_key
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    async def dispatch(request):
+        dispatched.append(request.metadata)
+        return "ok"
+
+    broker = RunBroker(
+        dispatch_agent=dispatch,
+        prepare_request=prepare,
+        mark_seen=mark_seen,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        idempotency_key="webui:session-1:turn-1",
+    )
+
+    with pytest.raises(RuntimeError, match="temporary billing lookup failure"):
+        asyncio.run(broker.run(request))
+    retry = asyncio.run(broker.run(request))
+    duplicate = asyncio.run(broker.run(request))
+
+    assert retry.content == "ok"
+    assert duplicate.duplicate is True
+    assert len(seen) == 1
+    assert dispatched == [{"litellm_billing_user_id": "user-1"}]
+
+
+def test_run_broker_rejects_policy_before_preparing_request():
+    from hermes_multitenancy.run_broker import RunBroker, RunRejected
+    from hermes_multitenancy.run_models import RunRequest
+
+    prepared = []
+
+    async def prepare(request):
+        prepared.append(request)
+        return request
+
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "should not run",
+        prepare_request=prepare,
+        sandbox_available=lambda: False,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_1",
+        content="hi",
+        requires_host_tools=True,
+    )
+
+    with pytest.raises(RunRejected, match="sandbox"):
+        asyncio.run(broker.run(request))
+
+    assert prepared == []
 
 
 def test_router_mark_seen_dedupes_webui_with_explicit_idempotency_key(tmp_path):

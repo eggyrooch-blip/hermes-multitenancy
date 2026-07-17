@@ -64,14 +64,21 @@ class RunBroker:
     async def run(self, request: RunRequest, *, admitted: bool = False) -> RunResult:
         """Execute a request after policy and idempotency checks."""
         request = _rewrite_skill_slash_request(request)
+
         if not admitted:
-            admission = await self.admit(request)
+            self._assert_policy(request)
+
+        # Preparation may resolve a billable employee identity through the
+        # apiserver and can fail transiently.  Do it before consuming the
+        # idempotency key so the same request remains retryable on failure.
+        if self._prepare_request is not None:
+            request = await _maybe_await(self._prepare_request(request))
+
+        if not admitted:
+            admission = self._consume_idempotency(request)
             if admission.duplicate:
                 await self._emit(RunEvent(kind="done"))
                 return admission
-
-        if self._prepare_request is not None:
-            request = await _maybe_await(self._prepare_request(request))
 
         response = await _maybe_await(self._dispatch_agent(request))
         content = str(response or "")
@@ -83,6 +90,10 @@ class RunBroker:
     async def admit(self, request: RunRequest) -> RunResult:
         """Run policy/idempotency checks without dispatching the agent."""
         request = _rewrite_skill_slash_request(request)
+        self._assert_policy(request)
+        return self._consume_idempotency(request)
+
+    def _assert_policy(self, request: RunRequest) -> None:
         if (
             request.requires_host_tools
             and self._require_sandbox_for_host_tools
@@ -90,6 +101,7 @@ class RunBroker:
         ):
             raise RunRejected("sandbox is required for host-tool-capable runs")
 
+    def _consume_idempotency(self, request: RunRequest) -> RunResult:
         if self._mark_seen is not None and not self._mark_seen(request):
             return RunResult(content="", duplicate=True)
 

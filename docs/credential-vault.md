@@ -101,6 +101,11 @@ Operational rules:
 
 - Set `HERMES_MULTITENANCY_CREDENTIAL_KEY` or `HERMES_CREDENTIAL_KEY` before
   enabling DB-backed credentials in production.
+- An authoritative Feishu invalid-refresh marker
+  (`reason=refresh_rejected`, `authoritative=true`, `refresh_class=invalid`)
+  pauses the proactive renewal worker for that user. It must stay paused until
+  successful user authorization removes the marker. Non-authoritative or
+  transient refresh markers do not pause renewal.
 - Do not classify a missing credential key as user re-auth by itself. If a valid
   profile-local Feishu UAT JSON exists, lark-cli can still run through the
   authsidecar broker; status and canary checks should report that connector path

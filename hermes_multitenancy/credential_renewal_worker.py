@@ -28,7 +28,9 @@ from .credential_renewal_common import (
     REASON_REFRESH_REJECTED,
     classify_uat_payload,
     is_fixture_path,
+    marker_requires_reauth,
     marker_path_for_open_id,
+    read_needs_reauth_marker,
     refresh_diagnostic_path_for_open_id,
     write_refresh_diagnostic_marker,
     write_needs_reauth_marker,
@@ -153,6 +155,25 @@ def _refresh_one(
 ) -> str:
     """``"refreshed"`` if we called refresh, ``"skipped"`` otherwise."""
     from .feishu_uat_auth import _load_best_uat_payload, _payload_needs_refresh, refresh_uat_if_needed
+
+    marker_dirs = (
+        shared_home / "profiles" / profile_name / "feishu_uat",
+        shared_home / "feishu_uat",
+    )
+    for marker_dir in marker_dirs:
+        marker = read_needs_reauth_marker(marker_path_for_open_id(marker_dir, open_id))
+        if (
+            marker is not None
+            and marker.get("reason") == REASON_REFRESH_REJECTED
+            and marker_requires_reauth(marker)
+        ):
+            logger.info(
+                "[credential_renewal] authoritative reauth pending; refresh skipped "
+                "user=%s profile=%s",
+                open_id,
+                profile_name,
+            )
+            return "skipped"
 
     payload = _load_best_uat_payload(shared_home, profile_name, open_id)
     if payload is None:

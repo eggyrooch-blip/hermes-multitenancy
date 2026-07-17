@@ -125,13 +125,13 @@ def create_run_broker_app(
         auth_required_seen = False
 
         try:
-            admission_broker = RunBroker(
+            policy_broker = RunBroker(
                 dispatch_agent=lambda _req: "",
-                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
                 sandbox_available=sandbox_available or _default_sandbox_available,
             )
-            admission = await admission_broker.admit(run_request)
+            await policy_broker.admit(run_request)
         except RunRejected as exc:
+            _auth_signal_consume(signal_run_id)
             return web.json_response({"error": str(exc)}, status=403)
 
         response = web.StreamResponse(
@@ -155,33 +155,31 @@ def create_run_broker_app(
                 _auth_signal_touch(signal_run_id)  # restart TTL/eviction clock at emission
             await emitter.emit(event)
 
-        if admission.duplicate:
-            _auth_signal_consume(signal_run_id)  # dup run never re-auths; drop speculative entry
-            await emit_event(RunEvent(kind="done"))
-            if not emitter.disconnected:
-                try:
-                    await response.write_eof()
-                except Exception as exc:
-                    if not _is_client_transport_closed(exc):
-                        raise
-            return response
-
-        broker_dispatch = dispatch_agent or (
-            lambda req: _default_dispatch_agent(
-                req, emit_event=emit_event, auth_signal_run_id=signal_run_id
-            )
-        )
-
-        broker = RunBroker(
-            dispatch_agent=broker_dispatch,
-            emit_event=emit_event,
-            mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
-            sandbox_available=sandbox_available or _default_sandbox_available,
-            prepare_request=prepare_billing_request,
-        )
-
         try:
-            await broker.run(run_request, admitted=True)
+            # Billing identity preparation can call the profile apiserver and
+            # fail transiently.  Keep the turn retryable until it succeeds.
+            prepared_run_request = await prepare_billing_request(run_request)
+            admission_broker = RunBroker(
+                dispatch_agent=lambda _req: "",
+                mark_seen=mark_seen if mark_seen is not None else _default_mark_seen,
+                sandbox_available=sandbox_available or _default_sandbox_available,
+            )
+            admission = await admission_broker.admit(prepared_run_request)
+            if admission.duplicate:
+                await emit_event(RunEvent(kind="done"))
+                return response
+
+            broker_dispatch = dispatch_agent or (
+                lambda req: _default_dispatch_agent(
+                    req, emit_event=emit_event, auth_signal_run_id=signal_run_id
+                )
+            )
+            broker = RunBroker(
+                dispatch_agent=broker_dispatch,
+                emit_event=emit_event,
+                sandbox_available=sandbox_available or _default_sandbox_available,
+            )
+            await broker.run(prepared_run_request, admitted=True)
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
             await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))

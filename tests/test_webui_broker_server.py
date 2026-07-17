@@ -120,6 +120,75 @@ def test_webui_and_ingest_execution_brokers_prepare_billing(monkeypatch):
     assert [request.metadata["billing_prepared"] for request in seen] == [True, True]
 
 
+def test_webui_billing_failure_keeps_idempotency_key_retryable(monkeypatch):
+    from dataclasses import replace
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    prepare_attempts = 0
+    marked = []
+    seen = set()
+    dispatched = []
+
+    async def prepare(request):
+        nonlocal prepare_attempts
+        prepare_attempts += 1
+        if prepare_attempts == 1:
+            raise RuntimeError("temporary billing lookup failure")
+        return replace(request, metadata={**request.metadata, "billing_prepared": True})
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        if request.effective_idempotency_key in seen:
+            return False
+        seen.add(request.effective_idempotency_key)
+        return True
+
+    async def dispatch(request):
+        dispatched.append(request)
+        return "ok"
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=mark_seen,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        payload = {
+            "channel": "webui",
+            "profile_name": "owner",
+            "user_key": "ou_owner",
+            "content": "hello",
+            "idempotency_key": "webui:session-1:turn-1",
+        }
+        try:
+            failed = await client.post("/api/run-broker/runs", json=payload)
+            failed_body = await failed.text()
+            retry = await client.post("/api/run-broker/runs", json=payload)
+            retry_body = await retry.text()
+            duplicate = await client.post("/api/run-broker/runs", json=payload)
+            duplicate_body = await duplicate.text()
+        finally:
+            await client.close()
+        return failed, failed_body, retry, retry_body, duplicate, duplicate_body
+
+    failed, failed_body, retry, retry_body, duplicate, duplicate_body = asyncio.run(runner())
+
+    assert (failed.status, retry.status, duplicate.status) == (200, 200, 200)
+    assert '"kind": "error"' in failed_body
+    assert '"text": "ok"' in retry_body
+    assert '"kind": "content"' not in duplicate_body
+    assert marked == ["webui:session-1:turn-1", "webui:session-1:turn-1"]
+    assert len(dispatched) == 1
+    assert dispatched[0].metadata["billing_prepared"] is True
+
+
 def test_webui_run_broker_strips_ingest_secret_metadata_from_caller(tmp_path):
     from aiohttp.test_utils import TestClient, TestServer
 

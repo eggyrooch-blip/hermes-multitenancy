@@ -621,14 +621,14 @@ def _run_request_for_routed_event(
 
 
 def _make_routed_run_broker(*, dispatch_agent: Any = None):
-    from ..billing_identity import prepare_billing_request
     from ..run_broker import RunBroker
 
+    # commands.py resolves billing identity before admission so transient
+    # apiserver failures do not consume the inbound message idempotency key.
     return RunBroker(
         dispatch_agent=dispatch_agent or (lambda _request: ""),
         mark_seen=_mark_run_request_seen,
         sandbox_available=_router_sandbox_available,
-        prepare_request=prepare_billing_request,
     )
 
 

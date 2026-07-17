@@ -662,6 +662,95 @@ def test_l2_authoritative_invalid_refresh_writes_reauth_marker(tmp_path: Path):
     assert body["authoritative"] is True
 
 
+def test_l2_authoritative_reauth_marker_stops_refresh_until_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_invalid"
+    marker = (
+        tmp_path
+        / "profiles"
+        / profile_name
+        / "feishu_uat"
+        / f"{open_id}.needs_reauth"
+    )
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="Feishu rejected the refresh token",
+        extra={
+            "layer": "L2",
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+
+    payload = _valid_payload(open_id)
+    refreshes = []
+    monkeypatch.setattr(fua, "_load_best_uat_payload", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(fua, "_payload_needs_refresh", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        fua,
+        "refresh_uat_if_needed",
+        lambda **kwargs: refreshes.append(kwargs),
+    )
+
+    first = credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    )
+    marker.unlink()
+    second = credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    )
+
+    assert first == "skipped"
+    assert second == "refreshed"
+    assert len(refreshes) == 1
+    assert refreshes[0]["force"] is True
+
+
+def test_l2_non_authoritative_refresh_marker_does_not_stop_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_transient"
+    common.write_needs_reauth_marker(
+        tmp_path
+        / "profiles"
+        / profile_name
+        / "feishu_uat"
+        / f"{open_id}.needs_reauth",
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="local timeout",
+        extra={
+            "layer": "L2",
+            "profile": profile_name,
+            "authoritative": False,
+            "refresh_class": "transient",
+        },
+    )
+
+    payload = _valid_payload(open_id)
+    refreshes = []
+    monkeypatch.setattr(fua, "_load_best_uat_payload", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(fua, "_payload_needs_refresh", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        fua,
+        "refresh_uat_if_needed",
+        lambda **kwargs: refreshes.append(kwargs),
+    )
+
+    outcome = credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    )
+
+    assert outcome == "refreshed"
+    assert len(refreshes) == 1
+
+
 def test_l2_refresh_http_error_json_body_is_classified_invalid(monkeypatch: pytest.MonkeyPatch):
     payload = json.dumps(
         {"code": fua.LARK_REFRESH_ERROR["REFRESH_TOKEN_INVALID"], "msg": "invalid refresh token"}
