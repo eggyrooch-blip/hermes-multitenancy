@@ -7,6 +7,7 @@ credential vault plus the profile-local compatibility JSON.
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -97,6 +98,27 @@ class FeishuAuthSession:
 
 _sessions: dict[str, FeishuAuthSession] = {}
 _POLL_STORE_LOCK_TIMEOUT_SECONDS = 0.05
+
+
+def _is_transient_uat_store_error(exc: Exception) -> bool:
+    if isinstance(exc, sqlite3.OperationalError):
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int):
+            return code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        return str(exc).lower().startswith(
+            (
+                "database is locked",
+                "database table is locked",
+                "database schema is locked",
+                "database is busy",
+            )
+        )
+    return isinstance(exc, OSError) and exc.errno in {
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.EINTR,
+        errno.ETIMEDOUT,
+    }
 
 FEISHU_ACCOUNTS_BASE_URL = os.environ.get(
     "FEISHU_ACCOUNTS_BASE_URL", "https://accounts.feishu.cn"
@@ -616,8 +638,13 @@ def poll_session(
         )
     except CredentialIdentityLockTimeout:
         return _session_public(session)
-    except Exception:
+    except Exception as exc:
+        if _is_transient_uat_store_error(exc):
+            return _session_public(session)
         session._pending_token_payload = None
+        if isinstance(exc, FeishuUatAuthError):
+            session.status = "error"
+            session.error = exc.message
         raise
     session._pending_token_payload = None
     session.status = "success"

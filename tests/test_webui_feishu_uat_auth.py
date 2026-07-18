@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import json
+import sqlite3
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
+
+import pytest
 
 
 def _prepare_shared_home(tmp_path, monkeypatch):
@@ -31,6 +35,24 @@ def _prepare_shared_home(tmp_path, monkeypatch):
     # fixture resets the override back to ":memory:" after the test.
     router_mod.override_routing_table(routing_db)
     return shared
+
+
+def _add_pending_auth_session(feishu_uat_auth, *, session_id: str, device_code: str):
+    session = feishu_uat_auth.FeishuAuthSession(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        device_code=device_code,
+        user_code="TEST-1234",
+        verification_uri="https://accounts.feishu.cn/device?user_code=TEST-1234",
+        scope="wiki:wiki:readonly offline_access",
+        client_id="cli_test",
+        client_secret="secret",
+        expires_at=int(time.time()) + 600,
+        interval=1,
+    )
+    feishu_uat_auth._sessions[session_id] = session
+    return session
 
 
 def test_webui_feishu_uat_status_is_route_scoped_and_redacted(tmp_path, monkeypatch):
@@ -846,18 +868,10 @@ def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path
 
     shared = _prepare_shared_home(tmp_path, monkeypatch)
     session_id = "busy-store"
-    feishu_uat_auth._sessions[session_id] = feishu_uat_auth.FeishuAuthSession(
+    _add_pending_auth_session(
+        feishu_uat_auth,
         session_id=session_id,
-        profile_name="owner",
-        open_id="ou_owner",
         device_code="device-busy",
-        user_code="BUSY-1234",
-        verification_uri="https://accounts.feishu.cn/device?user_code=BUSY-1234",
-        scope="wiki:wiki:readonly offline_access",
-        client_id="cli_test",
-        client_secret="secret",
-        expires_at=int(time.time()) + 600,
-        interval=1,
     )
     poll_calls: list[str] = []
 
@@ -924,6 +938,164 @@ def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path
         )["access_token"] == "one-time-access"
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "store_error",
+    [
+        sqlite3.OperationalError("database is locked"),
+        OSError(errno.EBUSY, "store is busy"),
+    ],
+    ids=["sqlite-busy", "filesystem-busy"],
+)
+def test_poll_session_reuses_exchanged_token_after_transient_store_error(
+    tmp_path, monkeypatch, store_error
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session_id = f"transient-{type(store_error).__name__}"
+    _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=session_id,
+        device_code="device-transient",
+    )
+    poll_calls: list[str] = []
+    store_calls = 0
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "one-time-refresh",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def store_uat(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+        if store_calls == 1:
+            raise store_error
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
+
+    first = feishu_uat_auth.poll_session(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+    second = feishu_uat_auth.poll_session(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert first["status"] == "pending"
+    assert "one-time-access" not in str(first)
+    assert second["status"] == "success"
+    assert poll_calls == ["device-transient"]
+    assert store_calls == 2
+
+
+def test_poll_session_stabilizes_terminal_store_error_without_repoll(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session_id = "terminal-store"
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=session_id,
+        device_code="device-terminal",
+    )
+    poll_calls: list[str] = []
+    store_calls = 0
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def reject_store(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+        raise feishu_uat_auth.FeishuUatAuthError("terminal L1 rejection", status=400)
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", reject_store)
+
+    with pytest.raises(feishu_uat_auth.FeishuUatAuthError, match="terminal L1 rejection"):
+        feishu_uat_auth.poll_session(
+            session_id=session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+    second = feishu_uat_auth.poll_session(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert second["status"] == "error"
+    assert second["error"] == "terminal L1 rejection"
+    assert session._pending_token_payload is None
+    assert poll_calls == ["device-terminal"]
+    assert store_calls == 1
+
+
+@pytest.mark.parametrize(
+    "store_error",
+    [
+        sqlite3.OperationalError("no such table: multitenancy_credentials"),
+        OSError(errno.ENOSPC, "credential store is full"),
+        RuntimeError("unexpected credential store failure"),
+    ],
+    ids=["sqlite-schema", "filesystem-full", "unknown"],
+)
+def test_poll_session_discards_token_after_nonretryable_store_error(
+    tmp_path, monkeypatch, store_error
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session_id = f"nonretryable-{type(store_error).__name__}"
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=session_id,
+        device_code="device-nonretryable",
+    )
+    session._pending_token_payload = {
+        "access_token": "one-time-access",
+        "refresh_token": "one-time-refresh",
+        "user_open_id": "ou_owner",
+    }
+
+    def fail_store(*_args, **_kwargs):
+        raise store_error
+
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", fail_store)
+
+    with pytest.raises(type(store_error)):
+        feishu_uat_auth.poll_session(
+            session_id=session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+
+    assert session._pending_token_payload is None
 
 
 def test_webui_feishu_auth_session_uses_vault_app_credentials_when_env_missing(tmp_path, monkeypatch):
