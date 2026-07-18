@@ -176,6 +176,23 @@ class CredentialStore:
         secret_kind: str = "uat",
     ) -> dict[str, Any]:
         """Return decrypted payload for internal runtime use only."""
+        payload, _updated_at = self.get_secret_for_runtime_with_updated_at(
+            profile_name=profile_name,
+            subject_id=subject_id,
+            provider=provider,
+            secret_kind=secret_kind,
+        )
+        return payload
+
+    def get_secret_for_runtime_with_updated_at(
+        self,
+        *,
+        profile_name: str,
+        subject_id: str,
+        provider: str,
+        secret_kind: str = "uat",
+    ) -> tuple[dict[str, Any], int]:
+        """Return one decrypted runtime payload with its canonical write time."""
         row = self._get_row(
             profile_name=profile_name,
             subject_id=subject_id,
@@ -184,7 +201,10 @@ class CredentialStore:
         )
         if row is None:
             raise PermissionError("credential not found for current profile/subject/provider")
-        return _open_json(row["encrypted_payload"], _require_key(self._key))
+        return (
+            _open_json(row["encrypted_payload"], _require_key(self._key)),
+            int(row["updated_at"]),
+        )
 
     def close(self) -> None:
         self._conn.close()

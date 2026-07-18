@@ -734,6 +734,164 @@ def test_recovery_keeps_authoritative_refresh_rejected_marker(tmp_path: Path):
     assert marker.is_file()
 
 
+def test_recovery_uses_newer_vault_uat_after_profile_json_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    profile_name = "alice"
+    open_id = "ou_vault_recovered"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    markers = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
+        tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
+    )
+    for marker in markers:
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail="old token rejected",
+            extra={
+                "layer": "L2",
+                "profile": profile_name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+    monkeypatch.setattr(
+        fua,
+        "_atomic_write_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    payload = _valid_payload(open_id)
+    with pytest.raises(OSError, match="disk full"):
+        fua._store_uat(tmp_path, profile_name, open_id, payload)
+
+    assert not (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+    ).exists()
+    newer_ms = max(marker.stat().st_mtime_ns for marker in markers) // 1_000_000 + 1
+    with sqlite3.connect(tmp_path / "multitenancy.db") as conn:
+        conn.execute(
+            "UPDATE multitenancy_credentials SET updated_at = ? "
+            "WHERE profile_name = ? AND subject_id = ?",
+            (newer_ms, profile_name, open_id),
+        )
+        conn.commit()
+    store = CredentialStore(tmp_path / "multitenancy.db")
+    try:
+        assert store.get_secret_for_runtime(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+        ) == payload
+    finally:
+        store.close()
+
+    assert common.clear_reauth_markers_if_uat_recovered(
+        tmp_path, open_id, markers[0]
+    ) is True
+    assert all(not marker.exists() for marker in markers)
+
+
+def test_recovery_keeps_authoritative_marker_for_older_vault_uat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    profile_name = "alice"
+    open_id = "ou_old_vault"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    store = CredentialStore(tmp_path / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+            payload=_valid_payload(open_id),
+            scopes=["offline_access"],
+        )
+    finally:
+        store.close()
+    marker = tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        extra={
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    old_ms = marker.stat().st_mtime_ns // 1_000_000
+    with sqlite3.connect(tmp_path / "multitenancy.db") as conn:
+        conn.execute(
+            "UPDATE multitenancy_credentials SET updated_at = ? "
+            "WHERE profile_name = ? AND subject_id = ?",
+            (old_ms, profile_name, open_id),
+        )
+        conn.commit()
+
+    assert common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker) is False
+    assert marker.is_file()
+
+
+@pytest.mark.parametrize("vault_case", ["unusable", "undecryptable", "wrong_profile"])
+def test_recovery_keeps_authoritative_marker_for_invalid_newer_vault_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    vault_case: str,
+):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    profile_name = "alice"
+    stored_profile = "bob" if vault_case == "wrong_profile" else profile_name
+    open_id = "ou_invalid_vault"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    marker = tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        extra={
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    payload = _valid_payload(open_id)
+    if vault_case == "unusable":
+        payload["refresh_token"] = ""
+    store = CredentialStore(tmp_path / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name=stored_profile,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+            payload=payload,
+            scopes=["offline_access"],
+        )
+    finally:
+        store.close()
+    newer_ms = marker.stat().st_mtime_ns // 1_000_000 + 1
+    with sqlite3.connect(tmp_path / "multitenancy.db") as conn:
+        conn.execute(
+            "UPDATE multitenancy_credentials SET updated_at = ? "
+            "WHERE profile_name = ? AND subject_id = ?",
+            (newer_ms, stored_profile, open_id),
+        )
+        conn.commit()
+    if vault_case == "undecryptable":
+        monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "wrong-key")
+
+    assert common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker) is False
+    assert marker.is_file()
+
+
 # ---------------------------------------------------------------------------
 # L3 — passive marker maintenance, no proactive DM
 # ---------------------------------------------------------------------------

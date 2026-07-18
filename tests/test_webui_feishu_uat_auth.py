@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -836,6 +837,93 @@ def test_webui_feishu_auth_session_polls_success_and_saves_vault(tmp_path, monke
     )
     assert status["status"] == "valid"
     assert (shared / "profiles" / "owner" / "feishu_uat" / "ou_owner.json").is_file()
+
+
+def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path, monkeypatch):
+    from hermes_multitenancy import credential_renewal_common as common
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session_id = "busy-store"
+    feishu_uat_auth._sessions[session_id] = feishu_uat_auth.FeishuAuthSession(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        device_code="device-busy",
+        user_code="BUSY-1234",
+        verification_uri="https://accounts.feishu.cn/device?user_code=BUSY-1234",
+        scope="wiki:wiki:readonly offline_access",
+        client_id="cli_test",
+        client_secret="secret",
+        expires_at=int(time.time()) + 600,
+        interval=1,
+    )
+    poll_calls: list[str] = []
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "one-time-refresh",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    entered = threading.Barrier(2)
+    release = threading.Event()
+    holder_errors: list[BaseException] = []
+
+    def hold_identity_lock() -> None:
+        try:
+            with common.credential_identity_lock(shared, "owner", "ou_owner"):
+                entered.wait(timeout=2)
+                release.wait(timeout=1)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            holder_errors.append(exc)
+
+    holder = threading.Thread(target=hold_identity_lock)
+    holder.start()
+    entered.wait(timeout=2)
+    started = time.monotonic()
+    try:
+        first = feishu_uat_auth.poll_session(
+            session_id=session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+        elapsed = time.monotonic() - started
+        assert first["status"] == "pending"
+        assert elapsed < 0.5
+        assert poll_calls == ["device-busy"]
+        assert "one-time-access" not in str(first)
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert holder_errors == []
+    second = feishu_uat_auth.poll_session(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+    assert second["status"] == "success"
+    assert poll_calls == ["device-busy"]
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        assert store.get_secret_for_runtime(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+        )["access_token"] == "one-time-access"
+    finally:
+        store.close()
 
 
 def test_webui_feishu_auth_session_uses_vault_app_credentials_when_env_missing(tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ Single source of truth for:
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -70,6 +71,10 @@ class _IdentityLockEntry:
 _IDENTITY_LOCKS: dict[tuple[str, str, str], _IdentityLockEntry] = {}
 
 
+class CredentialIdentityLockTimeout(TimeoutError):
+    """The bounded credential identity-lock attempt did not acquire in time."""
+
+
 def _claim_identity_process_lock(key: tuple[str, str, str]) -> _IdentityLockEntry:
     with _IDENTITY_LOCKS_GUARD:
         entry = _IDENTITY_LOCKS.get(key)
@@ -91,7 +96,13 @@ def _release_identity_process_lock(
 
 
 @contextlib.contextmanager
-def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str) -> Iterator[None]:
+def credential_identity_lock(
+    shared_home: Path,
+    profile_name: str,
+    open_id: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> Iterator[None]:
     """Serialize credential refresh/recovery for one routed Feishu identity.
 
     The renewal worker can run in more than one gateway process while a WebUI
@@ -99,7 +110,8 @@ def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str)
     complete refresh/failure-marker/store/marker-clear sequence therefore uses
     both an in-process re-entrant lock and a POSIX ``flock``.  Re-entry is
     required because a successful refresh calls ``_store_uat`` while the
-    worker already owns this identity lock.
+    worker already owns this identity lock. ``timeout_seconds=None`` preserves
+    blocking acquisition; callers may opt into one bounded attempt.
     """
     canonical_home = Path(os.path.realpath(shared_home))
     profile = str(profile_name)
@@ -110,11 +122,26 @@ def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str)
         or Path(profile).name != profile
     ):
         raise ValueError("profile_name must be one profile directory name")
+    deadline = (
+        None
+        if timeout_seconds is None
+        else time.monotonic() + max(0.0, float(timeout_seconds))
+    )
     key = (str(canonical_home), profile, str(open_id))
     entry = _claim_identity_process_lock(key)
+    process_lock_acquired = False
 
     try:
-        with entry.lock:
+        if deadline is None:
+            entry.lock.acquire()
+            process_lock_acquired = True
+        else:
+            process_lock_acquired = entry.lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+            if not process_lock_acquired:
+                raise CredentialIdentityLockTimeout("credential identity lock is busy")
+        try:
             depths = getattr(_IDENTITY_LOCK_DEPTH, "values", None)
             if depths is None:
                 depths = {}
@@ -145,7 +172,26 @@ def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str)
             try:
                 os.fchmod(lock_fd, 0o600)
                 if fcntl is not None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    if deadline is None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    else:
+                        while True:
+                            try:
+                                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except OSError as exc:
+                                if exc.errno not in {
+                                    errno.EACCES,
+                                    errno.EAGAIN,
+                                    errno.EWOULDBLOCK,
+                                }:
+                                    raise
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise CredentialIdentityLockTimeout(
+                                        "credential identity lock is busy"
+                                    ) from exc
+                                time.sleep(min(0.01, remaining))
                 depths[key] = 1
                 try:
                     yield
@@ -155,6 +201,9 @@ def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str)
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)
             finally:
                 os.close(lock_fd)
+        finally:
+            if process_lock_acquired:
+                entry.lock.release()
     finally:
         _release_identity_process_lock(key, entry)
 
@@ -495,13 +544,17 @@ def clear_reauth_markers_if_uat_recovered(
 ) -> bool:
     """Clear reauth markers when a newer valid UAT proves recovery."""
     try:
-        marker_mtime = marker_path.stat().st_mtime
+        marker_stat = marker_path.stat()
     except OSError:
         return False
+    marker_mtime = marker_stat.st_mtime
+    marker_profile = _profile_name_for_reauth_marker(shared_home, marker_path)
 
     recovered_mtime: float | None = None
     for loc in iter_uat_locations(shared_home):
         if loc.open_id != open_id:
+            continue
+        if marker_profile and not loc.legacy and loc.profile_name != marker_profile:
             continue
         try:
             uat_mtime = loc.path.stat().st_mtime
@@ -512,6 +565,29 @@ def clear_reauth_markers_if_uat_recovered(
             continue
         if isinstance(payload, dict) and payload_is_currently_usable(payload):
             recovered_mtime = max(recovered_mtime or 0.0, uat_mtime)
+
+    if marker_profile:
+        vault_mtime = _newer_usable_vault_uat_mtime(
+            shared_home,
+            marker_profile,
+            open_id,
+            marker_stat.st_mtime_ns,
+        )
+        if vault_mtime is not None:
+            recovered_mtime = max(recovered_mtime or 0.0, vault_mtime)
+
+    recovery_markers = (
+        (
+            shared_home
+            / "profiles"
+            / marker_profile
+            / "feishu_uat"
+            / f"{open_id}.needs_reauth",
+            shared_home / "feishu_uat" / f"{open_id}.needs_reauth",
+        )
+        if marker_profile
+        else tuple(_iter_reauth_markers_for_open_id(shared_home, open_id))
+    )
 
     if recovered_mtime is None:
         # The mtime rule alone can deadlock: a startup L5 audit (re)writes the
@@ -526,7 +602,7 @@ def clear_reauth_markers_if_uat_recovered(
             return False
         if not current_valid_uat_exists(shared_home, open_id):
             return False
-        for stale_marker in _iter_reauth_markers_for_open_id(shared_home, open_id):
+        for stale_marker in recovery_markers:
             stale_body = read_needs_reauth_marker(stale_marker) or {}
             # Only clear structural markers; an authoritative refresh_rejected
             # marker for the same open_id must survive this fallback.
@@ -534,13 +610,64 @@ def clear_reauth_markers_if_uat_recovered(
                 clear_needs_reauth_marker(stale_marker)
         return True
 
-    for stale_marker in _iter_reauth_markers_for_open_id(shared_home, open_id):
+    for stale_marker in recovery_markers:
         try:
             if stale_marker.stat().st_mtime <= recovered_mtime:
                 clear_needs_reauth_marker(stale_marker)
         except OSError:
             continue
     return True
+
+
+def _profile_name_for_reauth_marker(shared_home: Path, marker_path: Path) -> str | None:
+    try:
+        relative = marker_path.relative_to(shared_home / "profiles")
+    except ValueError:
+        candidate = str((read_needs_reauth_marker(marker_path) or {}).get("profile") or "")
+    else:
+        candidate = relative.parts[0] if len(relative.parts) >= 3 else ""
+    if (
+        not candidate
+        or candidate != candidate.strip()
+        or candidate in {".", ".."}
+        or Path(candidate).name != candidate
+    ):
+        return None
+    return candidate
+
+
+def _newer_usable_vault_uat_mtime(
+    shared_home: Path,
+    profile_name: str,
+    open_id: str,
+    marker_mtime_ns: int,
+) -> float | None:
+    db_path = shared_home / "multitenancy.db"
+    if not db_path.is_file():
+        return None
+    store = None
+    try:
+        # Local import keeps the shared validation module independent from the
+        # auth module that imports it during startup.
+        from .credentials import CredentialStore
+
+        store = CredentialStore(db_path)
+        payload, updated_at = store.get_secret_for_runtime_with_updated_at(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+        )
+    except Exception:
+        return None
+    finally:
+        if store is not None:
+            store.close()
+    if updated_at * 1_000_000 <= marker_mtime_ns:
+        return None
+    if not payload_is_currently_usable(payload):
+        return None
+    return updated_at / 1000.0
 
 
 def marker_requires_reauth(marker_body: dict[str, Any]) -> bool:
