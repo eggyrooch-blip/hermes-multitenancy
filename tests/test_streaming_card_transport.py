@@ -1402,7 +1402,7 @@ async def _run_stream_into_feishu_uses_openclaw_cardkit_protocol_when_available(
     assert sent_payload == {"type": "card", "data": {"card_id": "ck-1"}}
     assert adapter.content_updates
     assert any("Hello" in req.request_body.content for req in adapter.content_updates)
-    assert adapter.settings_updates[-1].request_body.settings == json.dumps({"streaming_mode": False})
+    assert adapter.settings_updates[-1].request_body.settings == '{"config":{"streaming_mode":false}}'
     assert adapter.card_updates[-1].card_id == "ck-1"
     final_card = json.loads(adapter.card_updates[-1].request_body.card["data"])
     assert final_card["schema"] == "2.0"

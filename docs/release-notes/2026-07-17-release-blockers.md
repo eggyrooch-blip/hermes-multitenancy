@@ -15,6 +15,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - Feishu enrichment preserves the original canonical admission request/key. A user-visible vision-block reply must send successfully before mark; failed send remains retryable and internal vision metadata never reaches normal dispatch.
 - Feishu's deferred processing owner is bound to the shared broker entry rather than an individual waiter. A gated, prevalidated async finalizer closes exactly once on vision success/send failure, billing/store/mark failure, duplicate, cancellation, and normal stable execution; leader cancellation with a live peer and post-mark zero-waiter redelivery cannot issue extra FAILURE/SUCCESS completions. Every successful adapter defer also receives an ordered adapter/message generation, and completion snapshots its covered generation immediately before entering the adapter without an intervening await. A late defer that lands after the old snapshot but before shared-entry cleanup therefore completes as its own generation instead of leaking the deferred ID or double-completing the old one. Adapter completion has a five-second timeout.
 - A custom `mark_seen`-only WebUI app maintains the existing bounded local duplicate mirror so sequential redelivery does not re-run billing.
+- WebUI per-run model metadata now treats an explicit provider as the selector boundary. A slash-bearing raw model ID such as `kimi/k3` therefore resolves to `custom:litellm-sre/kimi/k3`; a full selector without a separate provider and an already same-provider-prefixed selector remain unchanged.
+- CardKit stream recovery now sends the required nested settings envelope (`config.streaming_mode=true`) before retrying the same failed frame exactly once. Final close uses the same envelope with `false`; the retry keeps the original card and strictly advances sequence numbers.
 
 ## Ingest secret ownership
 
@@ -56,6 +58,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - Only strict authoritative invalid-refresh markers stop renewal. A blanket `.needs_reauth` skip would freeze recoverable credentials.
 - Persisting a fresh UAT without clearing both exact reauth-marker paths leaves L2 permanently frozen; marker cleanup belongs after the vault and JSON writes and must fail visibly.
 - Never release the identity lock between a refresh exception and `_record_failure`, or between a successful user authorization write and exact marker cleanup. That gap lets an older attempt permanently refreeze the replacement UAT.
+- A slash inside a WebUI `model` field does not prove that the value already contains its provider. When `provider` is present, preserve that boundary and only treat an exact same-provider prefix as already assembled.
+- CardKit `card.settings` does not accept `streaming_mode` at the top level. Keep it under `config` for both reopen and close; a successful settings call is required before the one same-frame retry.
 
 ## Local evidence
 
@@ -67,6 +71,7 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
 - Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.
 - A later formal review caught the stale-refresh/concurrent-reauthorization marker race. Thread-barrier, same-thread re-entry, profile-path validation, persistent lock-location, and real cross-process `flock` regressions now cover that finding; a fresh non-failing formal review is still required before release.
+- Focused K3/CardKit regression: 67 passed. Final full repository gate: 2427 passed, 1 skipped, 3 deselected in 64.13s.
 
 No production service, database, model setting, Feishu credential, or user session was changed while collecting this evidence.
 

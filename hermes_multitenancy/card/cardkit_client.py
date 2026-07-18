@@ -116,7 +116,10 @@ def _build_content_card_element_request(card_id: str, element_id: str, content: 
 
 
 def _build_settings_card_request(card_id: str, streaming_mode: bool, sequence: int) -> Any:
-    settings = json.dumps({"streaming_mode": streaming_mode})
+    settings = json.dumps(
+        {"config": {"streaming_mode": streaming_mode}},
+        separators=(",", ":"),
+    )
     if SettingsCardRequest is not None and SettingsCardRequestBody is not None:
         body = SettingsCardRequestBody.builder().settings(settings).sequence(sequence).build()
         return SettingsCardRequest.builder().card_id(card_id).request_body(body).build()

@@ -704,11 +704,14 @@ def _model_spec_for_event(default_spec: str, event: Any) -> str:
     model = str(metadata.get("model") or "").strip()
     if not model:
         return default_spec
-    if "/" in model:
-        return model
     provider = str(metadata.get("provider") or "").strip()
     if provider:
+        provider_prefix = f"{provider}/"
+        if model.startswith(provider_prefix):
+            return model
         return f"{provider}/{model}"
+    if "/" in model:
+        return model
     default_provider, _default_model = _split_model_spec(default_spec)
     return f"{default_provider}/{model}"
 

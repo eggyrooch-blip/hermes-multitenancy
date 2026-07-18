@@ -22,6 +22,7 @@
 - 对:`default: anthropic/custom-model-a3`、`default: zai/glm-5.1`
 - 错:`default: custom-model-a3`、`default: glm-5.1`(部分 profile 长期 bare `glm-5.1` 就是这个老 bug,一直静默失败)
 - 自动 provision(`router.py:_profile_config_from_shared_home`)会在 `default` 无 `/` 且有 `provider` 时补成 `provider/default`;但**别依赖它**,直接写全 `provider/model`。
+- WebUI 单次覆盖会分别传 `provider` 和 `model`。只要显式提供了 `provider`，`model` 就是该 provider 内的原始模型 ID，即使 ID 自身包含 `/` 也不能被误判成完整 selector：`provider=custom:litellm-sre` + `model=kimi/k3` 必须解析为 `custom:litellm-sre/kimi/k3`。未传 provider 的完整 selector 保持不变；已经带同一 provider 前缀的值也保持幂等，不能重复拼接。
 
 ## 3. Anthropic 协议的自定义端点(如腾讯 MaaS / tokenhub)
 

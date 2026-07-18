@@ -215,6 +215,47 @@ async def _run_rate_limit_midstream_skips_frames_but_keeps_card_alive() -> None:
     assert "final full answer" in _card_text(_update_card(adapter.card_updates[-1])["body"]["elements"])
 
 
+def test_closed_stream_reopen_uses_config_envelope_and_retries_same_frame_once():
+    asyncio.run(_run_closed_stream_reopen_uses_config_envelope_and_retries_same_frame_once())
+
+
+async def _run_closed_stream_reopen_uses_config_envelope_and_retries_same_frame_once() -> None:
+    adapter = ensure_feishu_cardkit_streaming(
+        _ProgrammableCardKitAdapter(
+            {
+                "cardElement.content": [
+                    _error(200850, "streaming mode closed"),
+                    _ok(),
+                ]
+            }
+        )
+    )
+
+    started = await adapter.start_streaming_card(chat_id="chat-1")
+    result = await adapter.update_streaming_card(
+        chat_id="chat-1",
+        message_id=started.message_id,
+        content="same frame",
+    )
+
+    assert result.success is True
+    assert len(adapter.created_cards) == 1
+    assert len(adapter.content_updates) == 2
+    assert len(adapter.settings_updates) == 1
+    assert [
+        adapter.content_updates[0].request_body.sequence,
+        adapter.settings_updates[0].request_body.sequence,
+        adapter.content_updates[1].request_body.sequence,
+    ] == [2, 3, 4]
+    assert [request.request_body.content for request in adapter.content_updates] == [
+        "same frame",
+        "same frame",
+    ]
+    settings = adapter.settings_updates[0].request_body.settings
+    assert settings == '{"config":{"streaming_mode":true}}'
+    assert "streaming_mode" not in json.loads(settings)
+
+
 def test_table_limit_midstream_drops_streaming_id_but_finalizes_via_original_card():
     asyncio.run(_run_table_limit_midstream_drops_streaming_id_but_finalizes_via_original_card())
 
@@ -314,7 +355,7 @@ async def _run_plain_text_last_resort_fires_when_final_card_and_patch_both_fail(
             "metadata": None,
         }
     ]
-    assert adapter.settings_updates[-1].request_body.settings == json.dumps({"streaming_mode": False})
+    assert adapter.settings_updates[-1].request_body.settings == '{"config":{"streaming_mode":false}}'
     assert state["phase"] != "completed"
     assert started.message_id not in adapter._hermes_mt_streaming_card_state
 
