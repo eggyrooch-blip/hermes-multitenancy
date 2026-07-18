@@ -1,6 +1,7 @@
 """Tests for the 5-layer credential renewal hardening (SPEC: credential-renewal-hardening)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -447,6 +448,48 @@ def test_authoritative_refresh_failure_cannot_refreeze_concurrent_reauthorizatio
         headroom_seconds=300,
     ) == "refreshed"
     assert len(refresh_calls) == 2
+
+
+def test_renewal_tick_isolates_identity_lock_failure_and_scans_next_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    routes = [("broken", "ou_bad_lock"), ("healthy", "ou_good_lock")]
+    monkeypatch.setattr(
+        credential_renewal_worker,
+        "_iter_active_user_routes",
+        lambda _shared_home: iter(routes),
+    )
+    real_lock = credential_renewal_worker.credential_identity_lock
+
+    @contextlib.contextmanager
+    def fail_one_identity_lock(shared_home: Path, profile_name: str, open_id: str):
+        if profile_name == "broken":
+            raise PermissionError("profile UAT directory is read-only")
+        with real_lock(shared_home, profile_name, open_id):
+            yield
+
+    refreshes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        credential_renewal_worker,
+        "credential_identity_lock",
+        fail_one_identity_lock,
+    )
+    monkeypatch.setattr(
+        credential_renewal_worker,
+        "_refresh_one",
+        lambda _shared_home, profile_name, open_id, _headroom: (
+            refreshes.append((profile_name, open_id)) or "skipped"
+        ),
+    )
+
+    report = credential_renewal_worker.run_renewal_tick(tmp_path, headroom_seconds=300)
+
+    assert report == {"scanned": 2, "refreshed": 0, "skipped": 1, "failed": 1}
+    assert refreshes == [("healthy", "ou_good_lock")]
+    assert not (
+        tmp_path / "profiles" / "broken" / "feishu_uat" / "ou_bad_lock.needs_reauth"
+    ).exists()
 
 
 @pytest.mark.skipif(common.fcntl is None, reason="cross-process identity lock requires POSIX flock")

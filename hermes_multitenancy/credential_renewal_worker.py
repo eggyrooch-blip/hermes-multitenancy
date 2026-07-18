@@ -107,13 +107,27 @@ def run_renewal_tick(shared_home: Path, *, headroom_seconds: int) -> dict[str, i
     counters = {"scanned": 0, "refreshed": 0, "skipped": 0, "failed": 0}
     for profile_name, open_id in _iter_active_user_routes(shared_home):
         counters["scanned"] += 1
-        with credential_identity_lock(shared_home, profile_name, open_id):
-            try:
-                outcome = _refresh_one(shared_home, profile_name, open_id, headroom_seconds)
-            except Exception as exc:
-                counters["failed"] += 1
-                _record_failure(shared_home, profile_name, open_id, exc)
-                continue
+        outcome: str | None = None
+        try:
+            with credential_identity_lock(shared_home, profile_name, open_id):
+                try:
+                    outcome = _refresh_one(shared_home, profile_name, open_id, headroom_seconds)
+                except Exception as exc:
+                    # Keep the identity lock through authoritative failure-marker
+                    # creation so a concurrent successful authorization clears
+                    # this marker after, never before, the stale attempt records it.
+                    _record_failure(shared_home, profile_name, open_id, exc)
+        except Exception:
+            counters["failed"] += 1
+            logger.exception(
+                "[credential_renewal] route refresh/lock failed user=%s profile=%s",
+                open_id,
+                profile_name,
+            )
+            continue
+        if outcome is None:
+            counters["failed"] += 1
+            continue
         if outcome == "refreshed":
             counters["refreshed"] += 1
         else:

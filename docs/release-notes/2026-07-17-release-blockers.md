@@ -35,6 +35,7 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - Invalid UTF-8, oversized content, deep JSON, overlong integers, non-boolean authority and other malformed/non-authoritative markers are untrusted and do not freeze renewal or crash the tick.
 - Refresh, authorization storage and authoritative failure-marker creation now share one exact-identity critical section. A stale refresh cannot finish after a new authorization and overwrite its UAT or recreate the marker that authorization just cleared.
 - The critical section is re-entrant in one process and uses a persistent profile-local `flock` across gateway, WebUI and sandbox processes. The hashed `0600` lock file is placed under the profile's writable `feishu_uat` mount; shared-home-only lock inodes are deliberately avoided because Linux bwrap does not bind that directory and the macOS profile does not allow writing it.
+- Lock acquisition, unlock, and failure-marker errors are isolated per route. One malformed or read-only profile counts as failed and does not prevent later identities in the same renewal tick from being scanned.
 
 ## Known gotchas
 
@@ -59,8 +60,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 
 - RunBroker + sync/async ingest: 114 passed.
 - Lifecycle-focused credential, hook, broker, ingest and streaming-card selection: 315 passed in 2.04s.
-- Feishu UAT storage and renewal focused files: 80 passed; renewal/cron/WebUI-auth audit set: 83 passed.
-- Repository TEST gate (`make test`): 2419 passed, 1 skipped, 3 deselected in 58.60s.
+- Feishu UAT storage and renewal focused files: 81 passed; renewal/cron/WebUI-auth audit set: 84 passed.
+- Repository TEST gate (`make test`): 2420 passed, 1 skipped, 3 deselected in 57.43s.
 - Python compile checks and `git diff --check`: passed.
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
 - Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.
