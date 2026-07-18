@@ -352,6 +352,14 @@ def marker_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
     return parent_dir / f"{open_id}.needs_reauth"
 
 
+def marker_paths_for_open_id(parent_dir: Path, open_id: str) -> tuple[Path, Path]:
+    """Return the canonical and historical exact marker paths for one identity."""
+    return (
+        marker_path_for_open_id(parent_dir, open_id),
+        marker_path_for(parent_dir / f"{open_id}.json"),
+    )
+
+
 def refresh_diagnostic_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
     """Compute the non-user-facing refresh diagnostic sidecar path."""
     return parent_dir / f"{open_id}.refresh_diagnostic"
@@ -629,12 +637,11 @@ def _clear_reauth_markers_if_uat_recovered_locked(
             recovered_mtime = max(recovered_mtime or 0.0, vault_mtime)
 
     recovery_markers = (
-        shared_home
-        / "profiles"
-        / marker_profile
-        / "feishu_uat"
-        / f"{open_id}.needs_reauth",
-        shared_home / "feishu_uat" / f"{open_id}.needs_reauth",
+        *marker_paths_for_open_id(
+            shared_home / "profiles" / marker_profile / "feishu_uat",
+            open_id,
+        ),
+        *marker_paths_for_open_id(shared_home / "feishu_uat", open_id),
     )
 
     if recovered_mtime is None:

@@ -18,7 +18,7 @@ def test_credential_store_commit_guard_rolls_back(tmp_path):
             provider="feishu",
             secret_kind="uat",
             payload={"access_token": "too-late"},
-            commit_if=lambda: False,
+            commit_if=lambda _conn: False,
         )
 
         assert stored is False

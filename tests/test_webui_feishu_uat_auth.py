@@ -5,11 +5,13 @@ import errno
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -1146,6 +1148,141 @@ def test_store_uat_serializes_route_mutation_after_in_lock_validation(
     ).is_file()
 
 
+def test_store_uat_rechecks_route_in_vault_transaction_when_profile_was_missing(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    assert not (shared / "profiles" / "owner").exists()
+    route_ready = tmp_path / "route-ready"
+    route_go = tmp_path / "route-go"
+    child_code = """
+import contextlib
+import sys
+import time
+import types
+from pathlib import Path
+from hermes_multitenancy.routing import RoutingTable
+
+db_path = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+go = Path(sys.argv[3])
+table = RoutingTable(db_path)
+original = table._credential_identity_locks
+@contextlib.contextmanager
+def pause_after_missing_profile_check(_self, identities):
+    with original(identities):
+        ready.write_text("ready", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        while not go.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("parent did not release route update")
+            time.sleep(0.01)
+        yield
+table._credential_identity_locks = types.MethodType(
+    pause_after_missing_profile_check,
+    table,
+)
+table.upsert(
+    user_id="owner",
+    profile_name="replacement",
+    open_id="ou_owner",
+    provenance="sync",
+)
+table.close()
+"""
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(shared / "multitenancy.db"),
+            str(route_ready),
+            str(route_go),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    store_entered = threading.Event()
+    release_store = threading.Event()
+    store_errors: list[BaseException] = []
+    real_put = CredentialStore.put_credential
+
+    def pause_before_vault_insert(self, **kwargs):
+        store_entered.set()
+        if not release_store.wait(timeout=5):
+            raise TimeoutError("route update did not release credential store")
+        return real_put(self, **kwargs)
+
+    monkeypatch.setattr(CredentialStore, "put_credential", pause_before_vault_insert)
+    payload = {
+        "app_id": "cli_test",
+        "user_open_id": "ou_owner",
+        "access_token": "must-not-land-in-old-profile",
+        "refresh_token": "one-time-refresh",
+        "expires_at": int(time.time() * 1000) + 3600_000,
+        "refresh_expires_at": int(time.time() * 1000) + 30 * 24 * 3600_000,
+        "scope": "wiki:wiki:readonly offline_access",
+        "granted_at": int(time.time() * 1000),
+    }
+
+    def store_uat() -> None:
+        try:
+            feishu_uat_auth._store_uat(shared, "owner", "ou_owner", payload)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            store_errors.append(exc)
+
+    worker: threading.Thread | None = None
+    try:
+        deadline = time.monotonic() + 3
+        while not route_ready.exists():
+            if child.poll() is not None:
+                _stdout, stderr = child.communicate()
+                pytest.fail(f"route updater exited early: {stderr}")
+            if time.monotonic() >= deadline:
+                pytest.fail("timed out waiting for route updater")
+            time.sleep(0.01)
+
+        worker = threading.Thread(target=store_uat)
+        worker.start()
+        assert store_entered.wait(timeout=3)
+        route_go.write_text("go", encoding="utf-8")
+        _stdout, stderr = child.communicate(timeout=3)
+        assert child.returncode == 0, stderr
+        release_store.set()
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+    finally:
+        route_go.write_text("go", encoding="utf-8")
+        release_store.set()
+        if worker is not None:
+            worker.join(timeout=1)
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=3)
+
+    assert len(store_errors) == 1
+    assert isinstance(store_errors[0], feishu_uat_auth.FeishuUatAuthError)
+    assert store_errors[0].status == 403
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        assert store.get_status(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+        )["status"] == "missing"
+    finally:
+        store.close()
+    assert not (
+        shared / "profiles" / "owner" / "feishu_uat" / "ou_owner.json"
+    ).exists()
+
+
 def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
 
@@ -1286,6 +1423,78 @@ def test_poll_session_reuses_exchanged_token_after_transient_store_error(
     assert store_calls == 2
 
 
+def test_poll_session_retries_transient_user_info_without_reexchange(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="transient-user-info",
+        device_code="device-transient-user-info",
+    )
+    exchange_calls: list[str] = []
+    user_info_calls: list[str] = []
+    stored_payloads: list[dict] = []
+
+    def poll_token(device_code, _client_id, _client_secret):
+        exchange_calls.append(device_code)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "one-time-refresh",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def fetch_user_info(access_token):
+        user_info_calls.append(access_token)
+        if len(user_info_calls) == 1:
+            raise feishu_uat_auth.FeishuUatAuthError(
+                "temporary user-info failure",
+                status=503,
+            )
+        return {"open_id": "ou_owner"}
+
+    def store_uat(_shared, _profile_name, _open_id, payload, **_kwargs):
+        stored_payloads.append(payload)
+        return True
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", fetch_user_info)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
+
+    with pytest.raises(
+        feishu_uat_auth.FeishuUatAuthError,
+        match="temporary user-info failure",
+    ):
+        feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+    public = feishu_uat_auth._session_public(session)
+    assert "one-time-access" not in str(public)
+    assert session._pending_exchange_result is not None
+
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert second["status"] == "success"
+    assert exchange_calls == ["device-transient-user-info"]
+    assert user_info_calls == ["one-time-access", "one-time-access"]
+    assert len(stored_payloads) == 1
+    assert session._pending_exchange_result is None
+    assert session._pending_token_payload is None
+
+
 def test_busy_poll_preserves_terminal_session_state(tmp_path):
     from hermes_multitenancy import feishu_uat_auth
 
@@ -1374,6 +1583,10 @@ def test_poll_session_expires_and_clears_cached_payload(tmp_path, monkeypatch):
         device_code="device-expired",
     )
     session.expires_at = int(time.time()) - 1
+    session._pending_exchange_result = {
+        "access_token": "unverified-access",
+        "refresh_token": "unverified-refresh",
+    }
     session._pending_token_payload = {
         "access_token": "one-time-access",
         "refresh_token": "one-time-refresh",
@@ -1402,9 +1615,35 @@ def test_poll_session_expires_and_clears_cached_payload(tmp_path, monkeypatch):
 
     assert result["status"] == "expired"
     assert result["error"] == "authorization session expired"
+    assert session._pending_exchange_result is None
     assert session._pending_token_payload is None
     assert poll_calls == []
     assert store_calls == 0
+
+
+def test_cancel_session_clears_pending_token_state():
+    from hermes_multitenancy import feishu_uat_auth
+
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="cancel-pending-token-state",
+        device_code="device-cancel",
+    )
+    session._pending_exchange_result = {"access_token": "unverified-access"}
+    session._pending_token_payload = {"access_token": "verified-access"}
+    try:
+        result = feishu_uat_auth.cancel_session(
+            session_id=session.session_id,
+            profile_name=session.profile_name,
+            open_id=session.open_id,
+        )
+    finally:
+        feishu_uat_auth._sessions.pop(session.session_id, None)
+
+    assert result["status"] == "error"
+    assert result["error"] == "cancelled"
+    assert session._pending_exchange_result is None
+    assert session._pending_token_payload is None
 
 
 def test_find_active_session_evicts_expired_cached_payload():
@@ -1428,6 +1667,10 @@ def test_find_active_session_evicts_expired_cached_payload():
         "access_token": "abandoned-access",
         "refresh_token": "abandoned-refresh",
     }
+    session._pending_exchange_result = {
+        "access_token": "abandoned-unverified-access",
+        "refresh_token": "abandoned-unverified-refresh",
+    }
     feishu_uat_auth._sessions[session_id] = session
     try:
         assert feishu_uat_auth.find_active_session(
@@ -1435,6 +1678,7 @@ def test_find_active_session_evicts_expired_cached_payload():
             open_id=session.open_id,
         ) is None
         assert session_id not in feishu_uat_auth._sessions
+        assert session._pending_exchange_result is None
         assert session._pending_token_payload is None
     finally:
         feishu_uat_auth._sessions.pop(session_id, None)

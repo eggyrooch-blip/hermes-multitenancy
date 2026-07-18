@@ -31,6 +31,7 @@ from .credential_renewal_common import (
     clear_needs_reauth_marker,
     credential_identity_lock,
     marker_path_for_open_id,
+    marker_paths_for_open_id,
     payload_has_offline_access,
     payload_has_refresh_token,
     write_needs_reauth_marker,
@@ -98,6 +99,7 @@ class FeishuAuthSession:
     interval: int
     status: str = "pending"
     error: str = ""
+    _pending_exchange_result: dict[str, Any] | None = field(default=None, repr=False)
     _pending_token_payload: dict[str, Any] | None = field(default=None, repr=False)
     # Session-owned: no side registry survives after the session is released.
     _poll_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -155,7 +157,7 @@ def _bounded_ttl_seconds(
 
 
 def _expire_session(session: FeishuAuthSession) -> dict[str, Any]:
-    session._pending_token_payload = None
+    _clear_pending_token_state(session)
     session.status = "expired"
     session.error = "authorization session expired"
     return _session_public(session)
@@ -163,6 +165,11 @@ def _expire_session(session: FeishuAuthSession) -> dict[str, Any]:
 
 def _deadline_reached(expires_at: int) -> bool:
     return time.time() >= float(expires_at)
+
+
+def _clear_pending_token_state(session: FeishuAuthSession) -> None:
+    session._pending_exchange_result = None
+    session._pending_token_payload = None
 
 
 def _evict_expired_sessions() -> None:
@@ -178,7 +185,7 @@ def _evict_expired_sessions() -> None:
                 _sessions.get(session_id) is session
                 and now >= float(session.expires_at)
             ):
-                session._pending_token_payload = None
+                _clear_pending_token_state(session)
                 _sessions.pop(session_id, None)
         finally:
             session._poll_lock.release()
@@ -188,7 +195,7 @@ def _stabilize_protocol_error(
     session: FeishuAuthSession,
     exc: FeishuUatAuthProtocolError,
 ) -> None:
-    session._pending_token_payload = None
+    _clear_pending_token_state(session)
     session.status = "error"
     session.error = exc.message
 
@@ -685,40 +692,64 @@ def poll_session(
     try:
         _assert_route(shared, profile_name, open_id)
         if session.status in {"success", "error", "expired"}:
+            _clear_pending_token_state(session)
             return _session_public(session)
         if _deadline_reached(session.expires_at):
             return _expire_session(session)
 
         payload = session._pending_token_payload
         if payload is None:
-            try:
-                result = _poll_device_token(
-                    session.device_code,
-                    session.client_id,
-                    session.client_secret,
-                )
-            except FeishuUatAuthProtocolError as exc:
-                _stabilize_protocol_error(session, exc)
-                raise
-            if _deadline_reached(session.expires_at):
-                return _expire_session(session)
-            error = str(result.get("error") or "").strip()
-            if error in {"authorization_pending", "slow_down"} or (not error and not result.get("access_token")):
-                return _session_public(session)
-            if error:
-                session.status = "error"
-                session.error = str(result.get("error_description") or error)
-                return _session_public(session)
+            result = session._pending_exchange_result
+            if result is None:
+                try:
+                    result = _poll_device_token(
+                        session.device_code,
+                        session.client_id,
+                        session.client_secret,
+                    )
+                except FeishuUatAuthProtocolError as exc:
+                    _stabilize_protocol_error(session, exc)
+                    raise
+                if _deadline_reached(session.expires_at):
+                    return _expire_session(session)
+                error = str(result.get("error") or "").strip()
+                if error in {"authorization_pending", "slow_down"} or (
+                    not error and not result.get("access_token")
+                ):
+                    return _session_public(session)
+                if error:
+                    _clear_pending_token_state(session)
+                    session.status = "error"
+                    session.error = str(result.get("error_description") or error)
+                    return _session_public(session)
+                result = dict(result)
+                session._pending_exchange_result = result
 
             token_open_id = str(result.get("open_id") or "").strip()
             if not token_open_id:
-                user_info = _fetch_user_info(str(result.get("access_token") or ""))
+                try:
+                    user_info = _fetch_user_info(str(result.get("access_token") or ""))
+                except FeishuUatAuthError as exc:
+                    if exc.status >= 500:
+                        raise
+                    _clear_pending_token_state(session)
+                    session.status = "error"
+                    session.error = exc.message
+                    raise
+                except (OSError, TimeoutError):
+                    raise
+                except Exception:
+                    _clear_pending_token_state(session)
+                    session.status = "error"
+                    session.error = "authorization identity verification failed; please authorize again"
+                    raise
                 token_open_id = str(user_info.get("open_id") or "").strip()
             # Known gotcha: user-info is a second network hop and can finish
             # after the device-flow deadline even when token exchange did not.
             if _deadline_reached(session.expires_at):
                 return _expire_session(session)
             if token_open_id != open_id:
+                _clear_pending_token_state(session)
                 session.status = "error"
                 session.error = f"authorized account does not match requesting Feishu user ({token_open_id} does not match {open_id})"
                 raise FeishuUatAuthError(session.error, status=403)
@@ -734,6 +765,7 @@ def poll_session(
                 _stabilize_protocol_error(session, exc)
                 raise
             session._pending_token_payload = payload
+            session._pending_exchange_result = None
         if _deadline_reached(session.expires_at):
             return _expire_session(session)
         try:
@@ -754,7 +786,7 @@ def poll_session(
                 if _deadline_reached(session.expires_at):
                     return _expire_session(session)
                 return _session_public(session)
-            session._pending_token_payload = None
+            _clear_pending_token_state(session)
             session.status = "error"
             session.error = (
                 exc.message
@@ -764,7 +796,7 @@ def poll_session(
             raise
         if stored is False:
             return _expire_session(session)
-        session._pending_token_payload = None
+        _clear_pending_token_state(session)
         session.status = "success"
         return _session_public(session)
     finally:
@@ -778,7 +810,7 @@ def cancel_session(*, session_id: str, profile_name: str, open_id: str) -> dict[
     if session.profile_name != profile_name or session.open_id != open_id:
         raise FeishuUatAuthError("authorization session does not belong to this user", status=403)
     with session._poll_lock:
-        session._pending_token_payload = None
+        _clear_pending_token_state(session)
         session.status = "error"
         session.error = "cancelled"
         return _session_public(session)
@@ -799,13 +831,20 @@ def _profile_name_for_open_id(shared_home: Path, open_id: str) -> str:
         raise FeishuUatAuthError("multitenancy routing DB is missing", status=503)
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
-            rows = conn.execute(
-                "SELECT profile_name FROM multitenancy_routing "
-                "WHERE open_id = ? AND active = 1 AND kind = 'user' LIMIT 2",
-                (open_id,),
-            ).fetchall()
+            return _profile_name_for_open_id_in_connection(conn, open_id)
     except sqlite3.Error as exc:
         raise FeishuUatAuthError(f"routing lookup failed: {exc}", status=503) from exc
+
+
+def _profile_name_for_open_id_in_connection(
+    conn: sqlite3.Connection,
+    open_id: str,
+) -> str:
+    rows = conn.execute(
+        "SELECT profile_name FROM multitenancy_routing "
+        "WHERE open_id = ? AND active = 1 AND kind = 'user' LIMIT 2",
+        (open_id,),
+    ).fetchall()
     if len(rows) != 1:
         raise FeishuUatAuthError("Feishu user is not bound to this Hermes profile", status=403)
     return str(rows[0][0])
@@ -957,6 +996,20 @@ def _store_uat(
                 and _deadline_reached(not_after_epoch_seconds)
             ):
                 return False
+
+            def commit_if_route_is_current(conn: sqlite3.Connection) -> bool:
+                if (
+                    not_after_epoch_seconds is not None
+                    and _deadline_reached(not_after_epoch_seconds)
+                ):
+                    return False
+                if _profile_name_for_open_id_in_connection(conn, open_id) != profile_name:
+                    raise FeishuUatAuthError(
+                        "Feishu user is not bound to this Hermes profile",
+                        status=403,
+                    )
+                return True
+
             stored = store.put_credential(
                 profile_name=profile_name,
                 subject_id=open_id,
@@ -965,11 +1018,7 @@ def _store_uat(
                 payload=payload,
                 scopes=scopes,
                 expires_at=int(payload["expires_at"]) if payload.get("expires_at") else None,
-                commit_if=(
-                    None
-                    if not_after_epoch_seconds is None
-                    else lambda: not _deadline_reached(not_after_epoch_seconds)
-                ),
+                commit_if=commit_if_route_is_current,
             )
             if not stored:
                 return False
@@ -979,8 +1028,8 @@ def _store_uat(
         _atomic_write_json(target, payload)
 
         marker_paths = (
-            marker_path_for_open_id(target.parent, open_id),
-            marker_path_for_open_id(shared_home / "feishu_uat", open_id),
+            *marker_paths_for_open_id(target.parent, open_id),
+            *marker_paths_for_open_id(shared_home / "feishu_uat", open_id),
         )
         failed_markers = [
             marker for marker in marker_paths if not clear_needs_reauth_marker(marker)

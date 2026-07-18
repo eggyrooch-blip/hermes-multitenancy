@@ -71,7 +71,7 @@ class CredentialStore:
         payload: dict[str, Any],
         scopes: Iterable[str] | None = None,
         expires_at: int | None = None,
-        commit_if: Callable[[], bool] | None = None,
+        commit_if: Callable[[sqlite3.Connection], bool] | None = None,
     ) -> bool:
         profile_name = _clean_id("profile_name", profile_name)
         subject_id = _clean_id("subject_id", subject_id)
@@ -108,7 +108,7 @@ class CredentialStore:
                     now,
                 ),
             )
-            if commit_if is not None and not commit_if():
+            if commit_if is not None and not commit_if(self._conn):
                 self._conn.rollback()
                 return False
             self._conn.commit()
