@@ -162,6 +162,7 @@ TransformRequest = Callable[
 BeforeAdmit = Callable[[PreparedRun], Awaitable[None] | None]
 OnAbandon = Callable[[], None]
 OnExecutionDone = Callable[[], None]
+OnEntryDone = Callable[[bool], Awaitable[None] | None]
 
 
 class AdmittedRun:
@@ -226,7 +227,14 @@ ExecuteAdmitted = Callable[[AdmittedRun], Awaitable[RunResult] | RunResult]
 
 
 class _ExecutionInflight:
-    __slots__ = ("task", "committed", "delivered", "waiters", "abandoned")
+    __slots__ = (
+        "task",
+        "committed",
+        "delivered",
+        "waiters",
+        "abandoned",
+        "entry_done",
+    )
 
     def __init__(self) -> None:
         self.task: Optional[asyncio.Task[RunResult]] = None
@@ -234,6 +242,65 @@ class _ExecutionInflight:
         self.delivered = False
         self.waiters = 0
         self.abandoned = False
+        self.entry_done: Optional[_EntryDoneFinalizer] = None
+
+
+class _EntryDoneFinalizer:
+    """Run one async shared-entry finalizer even on pre-first-step cancel."""
+
+    __slots__ = ("_callback", "_gate", "_lock", "_started", "_task")
+
+    def __init__(self, callback: OnEntryDone) -> None:
+        self._callback = callback
+        self._lock = threading.Lock()
+        self._started = False
+        loop = asyncio.get_running_loop()
+        self._gate: asyncio.Future[bool] = loop.create_future()
+        completion_coro = self._run_entry_done()
+        try:
+            task = loop.create_task(completion_coro)
+        except BaseException:
+            completion_coro.close()
+            self._gate.cancel()
+            raise
+        task.add_done_callback(_consume_task_exception)
+        cancelling = getattr(task, "cancelling", None)
+        if task.done() or (callable(cancelling) and cancelling()):
+            if not self._gate.done():
+                self._gate.cancel()
+            if not task.done():
+                task.cancel()
+            raise RuntimeError("shared entry finalizer task unavailable")
+        self._task = task
+
+    def ensure(self, *, failed: bool) -> asyncio.Task[None]:
+        with self._lock:
+            if not self._gate.done():
+                self._gate.set_result(failed)
+            return self._task
+
+    def cancel_unowned(self) -> None:
+        with self._lock:
+            if not self._gate.done():
+                self._gate.cancel()
+            if not self._task.done():
+                self._task.cancel()
+
+    def subscribe_started(self, started: Optional[asyncio.Event]) -> None:
+        if started is None:
+            return
+        with self._lock:
+            if self._started:
+                started.set()
+
+    async def _run_entry_done(self) -> None:
+        failed = await self._gate
+        with self._lock:
+            self._started = True
+        try:
+            await _maybe_await(self._callback(failed))
+        except Exception:
+            logger.exception("RunBroker shared-entry completion failed")
 
 
 def _default_sandbox_available() -> bool:
@@ -267,7 +334,7 @@ async def _run_after_admission(
     return await _run_execute_admitted(execute, admitted)
 
 
-def _consume_task_exception(done_task: asyncio.Task[RunResult]) -> None:
+def _consume_task_exception(done_task: asyncio.Task) -> None:
     try:
         done_task.exception()
     except asyncio.CancelledError:
@@ -372,6 +439,9 @@ class RunBroker:
         execution_owned: Optional[asyncio.Event] = None,
         on_abandon: Optional[OnAbandon] = None,
         on_execution_done: Optional[OnExecutionDone] = None,
+        entry_completion_owned: Optional[asyncio.Event] = None,
+        entry_completion_started: Optional[asyncio.Event] = None,
+        on_entry_done: Optional[OnEntryDone] = None,
     ) -> RunResult:
         """Share preparation, durable admission, and one stable execution owner.
 
@@ -395,6 +465,13 @@ class RunBroker:
         after success, failure, or cancellation even when the coroutine is
         cancelled before its first step, where a coroutine-body ``finally``
         would never execute.
+
+        ``on_entry_done`` belongs to the shared entry, not an HTTP/channel
+        waiter. It is invoked once with ``failed=True`` when preparation,
+        admission, or execution raises/cancels, and with ``failed=False`` for
+        success or a durable duplicate. ``entry_completion_owned`` tells every
+        waiter covered by that shared finalizer not to finish the same channel
+        lifecycle independently.
         """
         request = self.check_policy(request)
         loop = asyncio.get_running_loop()
@@ -411,28 +488,42 @@ class RunBroker:
                 # every original waiter has gone away (for example a bounded
                 # synchronous HTTP request timed out).  A retry must not attach
                 # to that unobserved task and inherit an unbounded wait.
+                if entry_completion_owned is not None and entry.entry_done is not None:
+                    entry.entry_done.subscribe_started(entry_completion_started)
+                    entry_completion_owned.set()
                 return RunResult(content="", duplicate=True)
             if entry is None:
                 entry = _ExecutionInflight()
-                entry.task = loop.create_task(
-                    self._prepare_admit_execute_once(
-                        entry,
-                        request,
-                        execute=execute,
-                        transform_request=transform_request,
-                        before_admit=before_admit,
-                        execution_owned=execution_owned,
-                        on_abandon=on_abandon,
-                        on_execution_done=on_execution_done,
+                if on_entry_done is not None:
+                    entry.entry_done = _EntryDoneFinalizer(on_entry_done)
+                try:
+                    entry.task = loop.create_task(
+                        self._prepare_admit_execute_once(
+                            entry,
+                            request,
+                            execute=execute,
+                            transform_request=transform_request,
+                            before_admit=before_admit,
+                            execution_owned=execution_owned,
+                            on_abandon=on_abandon,
+                            on_execution_done=on_execution_done,
+                            entry_done=entry.entry_done,
+                        )
                     )
-                )
+                except BaseException:
+                    if entry.entry_done is not None:
+                        entry.entry_done.cancel_unowned()
+                    raise
                 _EXECUTION_INFLIGHT[key] = entry
 
                 def _cleanup_execution(done_task: asyncio.Task[RunResult]) -> None:
+                    failed = done_task.cancelled()
                     try:
-                        done_task.exception()
+                        failed = done_task.exception() is not None
                     except asyncio.CancelledError:
-                        pass
+                        failed = True
+                    if entry.entry_done is not None:
+                        entry.entry_done.ensure(failed=failed)
                     self._run_on_abandon_once(entry, on_abandon)
                     with _PREPARE_INFLIGHT_LOCK:
                         if _EXECUTION_INFLIGHT.get(key) is entry:
@@ -441,6 +532,12 @@ class RunBroker:
                 entry.task.add_done_callback(_cleanup_execution)
                 if shared_entry_owned is not None:
                     shared_entry_owned.set()
+            if (
+                entry_completion_owned is not None
+                and entry.entry_done is not None
+            ):
+                entry.entry_done.subscribe_started(entry_completion_started)
+                entry_completion_owned.set()
             entry.waiters += 1
 
         released = False
@@ -598,7 +695,9 @@ class RunBroker:
         execution_owned: Optional[asyncio.Event],
         on_abandon: Optional[OnAbandon],
         on_execution_done: Optional[OnExecutionDone],
+        entry_done: Optional[_EntryDoneFinalizer],
     ) -> RunResult:
+        failed = True
         try:
             prepared, admission = await self._prepare_before_admit_once(
                 request,
@@ -606,8 +705,10 @@ class RunBroker:
                 before_admit,
             )
             if prepared is None or admission.duplicate:
+                failed = False
                 return admission
             if not self._claim_prepared_admission(prepared):
+                failed = False
                 return RunResult(content="", duplicate=True)
             admitted = _issue_admitted(
                 prepared.request,
@@ -639,6 +740,7 @@ class RunBroker:
                 raise
             if admission.duplicate:
                 _cancel_unadmitted_execution(admission_gate, execution_task)
+                failed = False
                 return admission
             with _PREPARE_INFLIGHT_LOCK:
                 entry.committed = True
@@ -656,9 +758,12 @@ class RunBroker:
                 result = await execution_task
             if not isinstance(result, RunResult):
                 raise TypeError("execute must return a RunResult")
+            failed = False
             return result
         finally:
             self._run_on_abandon_once(entry, on_abandon)
+            if entry_done is not None:
+                await asyncio.shield(entry_done.ensure(failed=failed))
 
     @staticmethod
     def _run_on_abandon_once(

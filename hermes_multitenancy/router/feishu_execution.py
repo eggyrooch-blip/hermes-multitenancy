@@ -9,12 +9,20 @@ from typing import Any, Optional
 from .. import router as _m
 from ..run_broker import AdmittedRun, RunBroker, RunRejected
 from ..run_models import RunResult
+from .feishu_completion import begin_deferred_completion
 from .vision_admission import vision_block_reply
+
+
+_FEISHU_COMPLETION_TIMEOUT_SECONDS = 5.0
 
 
 async def _complete_feishu_processing(adapter: Any, event: Any, *, failed: bool) -> None:
     """Close the gateway-owned Feishu lifecycle exactly once for this run."""
-    try:
+    async def _complete() -> None:
+        # No await is allowed between this snapshot and entering the adapter
+        # coroutine: its deferred-id discard therefore covers exactly these
+        # registered hook generations, not a later redelivery.
+        begin_deferred_completion(adapter, event)
         outcome = _m._processing_outcome(failed=failed)
         complete_deferred = getattr(
             adapter,
@@ -25,6 +33,15 @@ async def _complete_feishu_processing(adapter: Any, event: Any, *, failed: bool)
             await complete_deferred(event, outcome)
         else:
             await adapter.on_processing_complete(event, outcome)
+
+    try:
+        async with asyncio.timeout(_FEISHU_COMPLETION_TIMEOUT_SECONDS):
+            await _complete()
+    except asyncio.TimeoutError:
+        _m.logger.warning(
+            "multitenancy: Feishu processing completion timed out message_id=%s",
+            getattr(event, "message_id", "") or "",
+        )
     except Exception as exc:
         _m.logger.debug(
             "multitenancy: on_processing_complete failed: %s",
@@ -46,12 +63,12 @@ async def execute_admitted_feishu_run(
     sender_alt: Optional[str],
     text: str,
     feishu_full: bool,
+    completion_failed: Optional[asyncio.Event] = None,
 ) -> RunResult:
     """Own setup, dispatch, persistence, and cleanup after durable admission."""
     enriched_text = admitted_run.request.content
     vision_blocked = vision_block_reply(admitted_run)
     if vision_blocked:
-        outcome_failed = False
         try:
             hist_key = _m._dispatch_session_scope(
                 profile_name,
@@ -69,15 +86,9 @@ async def execute_admitted_feishu_run(
         except asyncio.CancelledError:
             raise
         except Exception:
-            outcome_failed = True
+            if completion_failed is not None:
+                completion_failed.set()
             raise
-        finally:
-            if feishu_full:
-                await _complete_feishu_processing(
-                    adapter,
-                    event,
-                    failed=outcome_failed,
-                )
 
     current = asyncio.current_task()
     scope = _m._dispatch_session_scope(
@@ -98,7 +109,6 @@ async def execute_admitted_feishu_run(
     if current is not None:
         _m._user_inflight_tasks[inflight_key] = current
 
-    outcome_failed = False
     if feishu_full:
         try:
             await adapter.on_processing_start(event)
@@ -189,7 +199,8 @@ async def execute_admitted_feishu_run(
             _m._persist_interruption_marker(hist_key)
         raise
     except RunRejected as exc:
-        outcome_failed = True
+        if completion_failed is not None:
+            completion_failed.set()
         retry_message = "当前无法确认员工计费身份，请稍后重试。"
         _m._persist_failure_marker(hist_key)
         _m._persist_assistant_message(hist_key, retry_message)
@@ -203,7 +214,8 @@ async def execute_admitted_feishu_run(
             await _m._safe_call(adapter.send, chat_id, retry_message)
         return RunResult(content=retry_message, duplicate=False)
     except Exception as exc:
-        outcome_failed = True
+        if completion_failed is not None:
+            completion_failed.set()
         _m._persist_failure_marker(hist_key)
         _m.logger.exception(
             "multitenancy: admitted Feishu execution failed profile=%s sender=%s: %s",
@@ -213,12 +225,6 @@ async def execute_admitted_feishu_run(
         )
         return RunResult(content="", duplicate=False)
     finally:
-        if feishu_full:
-            await _complete_feishu_processing(
-                adapter,
-                event,
-                failed=outcome_failed,
-            )
         if _m._user_inflight_tasks.get(inflight_key) is current:
             _m._user_inflight_tasks.pop(inflight_key, None)
             _m._user_inflight_history_keys.pop(inflight_key, None)

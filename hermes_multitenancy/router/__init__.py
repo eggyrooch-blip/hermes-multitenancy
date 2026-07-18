@@ -1305,6 +1305,9 @@ def _defer_gateway_processing_complete(event: Any, gateway: Any) -> None:
         return
     try:
         defer(event)
+        from .feishu_completion import register_deferred_completion
+
+        register_deferred_completion(adapter, event)
     except Exception as exc:
         logger.debug("multitenancy: defer_processing_complete failed: %s", exc)
 

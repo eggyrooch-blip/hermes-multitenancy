@@ -16,6 +16,10 @@ from typing import Any, Optional
 
 from .. import router as _m
 from ..feishu_message_trace import reset_trace_context, set_trace_context
+from .feishu_completion import (
+    deferred_completion_is_covered,
+    has_deferred_completion_claim,
+)
 from .feishu_execution import (
     _complete_feishu_processing,
     execute_admitted_feishu_run,
@@ -322,9 +326,22 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 sender_alt=sender_alt,
                 text=text,
                 feishu_full=feishu_full,
+                completion_failed=completion_failed,
             )
 
         execution_owned = asyncio.Event()
+        entry_completion_owned = asyncio.Event()
+        entry_completion_started = asyncio.Event()
+        completion_failed = asyncio.Event()
+
+        async def _complete_shared_entry(entry_failed: bool) -> None:
+            if feishu_full:
+                await _complete_feishu_processing(
+                    adapter,
+                    event,
+                    failed=entry_failed or completion_failed.is_set(),
+                )
+
         pre_admission_failed = False
         try:
             try:
@@ -334,6 +351,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     transform_request=_enrich_prepared,
                     before_admit=_send_vision_block_before_admission,
                     execution_owned=execution_owned,
+                    entry_completion_owned=entry_completion_owned,
+                    entry_completion_started=entry_completion_started,
+                    on_entry_done=_complete_shared_entry if feishu_full else None,
                 )
             except asyncio.CancelledError:
                 pre_admission_failed = True
@@ -378,7 +398,18 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 )
                 return
         finally:
-            if feishu_full and not execution_owned.is_set():
+            complete_locally = not entry_completion_owned.is_set()
+            if (
+                entry_completion_owned.is_set()
+                and entry_completion_started.is_set()
+                and has_deferred_completion_claim(adapter, event)
+                and not deferred_completion_is_covered(adapter, event)
+            ):
+                # This hook deferred after the old shared finalizer had already
+                # snapshotted its covered generations but before the entry was
+                # removed from the inflight map. It needs its own completion.
+                complete_locally = True
+            if feishu_full and complete_locally:
                 await _complete_feishu_processing(
                     adapter,
                     event,

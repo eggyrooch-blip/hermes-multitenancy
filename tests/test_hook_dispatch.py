@@ -1863,12 +1863,21 @@ def test_handle_async_submits_routed_feishu_run_request_to_broker(monkeypatch, t
                 transform_request,
                 before_admit,
                 execution_owned,
+                entry_completion_owned,
+                entry_completion_started,
+                on_entry_done,
             ):
                 prepared = await transform_request(FakePrepared(request))
                 await before_admit(prepared)
                 admitted.append(prepared.request)
                 execution_owned.set()
-                return await execute(prepared)
+                if on_entry_done is not None:
+                    entry_completion_owned.set()
+                    entry_completion_started.set()
+                result = await execute(prepared)
+                if on_entry_done is not None:
+                    await on_entry_done(False)
+                return result
 
         async def _run_admitted(self, prepared, *, dispatch_agent):
             return RunResult(content="ok", duplicate=False)
@@ -1931,12 +1940,21 @@ def test_handle_async_nonstream_dispatch_runs_inside_broker(monkeypatch, tmp_pat
                 transform_request,
                 before_admit,
                 execution_owned,
+                entry_completion_owned,
+                entry_completion_started,
+                on_entry_done,
             ):
                 prepared = await transform_request(FakePrepared(request))
                 await before_admit(prepared)
                 broker_calls.append(("admit", prepared.request.content))
                 execution_owned.set()
-                return await execute(prepared)
+                if on_entry_done is not None:
+                    entry_completion_owned.set()
+                    entry_completion_started.set()
+                result = await execute(prepared)
+                if on_entry_done is not None:
+                    await on_entry_done(False)
+                return result
 
         async def _run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
@@ -2000,12 +2018,21 @@ def test_handle_async_streaming_dispatch_runs_inside_broker(monkeypatch, tmp_pat
                 transform_request,
                 before_admit,
                 execution_owned,
+                entry_completion_owned,
+                entry_completion_started,
+                on_entry_done,
             ):
                 prepared = await transform_request(FakePrepared(request))
                 await before_admit(prepared)
                 broker_calls.append(("admit", prepared.request.content))
                 execution_owned.set()
-                return await execute(prepared)
+                if on_entry_done is not None:
+                    entry_completion_owned.set()
+                    entry_completion_started.set()
+                result = await execute(prepared)
+                if on_entry_done is not None:
+                    await on_entry_done(False)
+                return result
 
         async def _run_admitted(self, prepared, *, dispatch_agent):
             request = prepared.request
@@ -2778,6 +2805,294 @@ async def test_hook_completes_deferred_processing_once_across_admission_outcomes
             assert (prepare_calls, enrich_calls, dispatch_calls) == (0, 0, 0)
     finally:
         clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_hook_leader_cancel_with_live_peer_completes_deferred_processing_once(
+    monkeypatch,
+    tmp_path,
+):
+    """A cancelled broker waiter must not complete a shared Feishu lifecycle twice."""
+    from contextlib import suppress
+
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import run_broker as run_broker_mod
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "leader-cancel-live-peer"
+    profile_home.mkdir()
+    add_spike_route("ou_leader_cancel_peer", profile_home)
+
+    prepare_started = asyncio.Event()
+    release_prepare = asyncio.Event()
+    completed = asyncio.Event()
+    tracked_tasks = []
+    lifecycle = []
+    marked = []
+    dispatches = 0
+
+    async def prepare(request):
+        prepare_started.set()
+        await release_prepare.wait()
+        return request
+
+    async def fake_enrich(_event, _gateway):
+        return "enriched"
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        return True
+
+    async def fake_stream(*_args, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        return "ok"
+
+    class FullFeishuAdapter:
+        def defer_processing_complete(self, value):
+            lifecycle.append(("defer", value.message_id))
+
+        async def complete_deferred_processing(self, value, outcome):
+            lifecycle.append(("complete", value.message_id, str(outcome)))
+            completed.set()
+
+        async def on_processing_complete(self, *_args):
+            raise AssertionError("deferred lifecycle must use the matching completion API")
+
+        async def on_processing_start(self, value):
+            lifecycle.append(("start", value.message_id))
+
+        async def send(self, *_args, **_kwargs):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    original_handle_async = router_mod.handle_async
+
+    async def tracked_handle_async(*, event, gateway):
+        tracked_tasks.append(asyncio.current_task())
+        return await original_handle_async(event=event, gateway=gateway)
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(router_mod, "handle_async", tracked_handle_async)
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_is_run_request_seen", lambda _request: False)
+    monkeypatch.setattr(router_mod, "_mark_run_request_seen", mark_seen)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+    gateway = SimpleNamespace(adapters={"feishu": FullFeishuAdapter()})
+
+    def event():
+        value = _build_event(text="hello", user_id="ou_leader_cancel_peer")
+        value.message_id = "om_leader_cancel_peer"
+        return value
+
+    async def wait_for_two_waiters():
+        for _ in range(200):
+            entries = list(run_broker_mod._EXECUTION_INFLIGHT.values())
+            if len(tracked_tasks) >= 2 and any(entry.waiters == 2 for entry in entries):
+                return
+            await asyncio.sleep(0)
+        raise AssertionError("concurrent Feishu requests did not join one broker entry")
+
+    try:
+        router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
+        await asyncio.wait_for(prepare_started.wait(), timeout=2)
+        router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
+        await asyncio.wait_for(wait_for_two_waiters(), timeout=2)
+
+        leader_task = tracked_tasks[0]
+        peer_task = tracked_tasks[1]
+        assert leader_task is not None and peer_task is not None
+        leader_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await leader_task
+
+        release_prepare.set()
+        await asyncio.wait_for(peer_task, timeout=2)
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.sleep(0)
+
+        assert [call for call in lifecycle if call[0] == "defer"] == [
+            ("defer", "om_leader_cancel_peer"),
+            ("defer", "om_leader_cancel_peer"),
+        ]
+        assert [call for call in lifecycle if call[0] == "complete"] == [
+            ("complete", "om_leader_cancel_peer", "ProcessingOutcome.SUCCESS")
+        ]
+        assert len(marked) == 1
+        assert dispatches == 1
+    finally:
+        release_prepare.set()
+        for task in tracked_tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        if tracked_tasks:
+            await asyncio.gather(
+                *(task for task in tracked_tasks if task is not None),
+                return_exceptions=True,
+            )
+        clear_spike_routes()
+
+
+@pytest.mark.asyncio
+async def test_hook_late_defer_after_shared_completion_gets_new_completion(
+    monkeypatch,
+    tmp_path,
+):
+    """A defer after the old finalizer snapshot must not inherit that generation."""
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.runtime import add_spike_route, clear_spike_routes
+
+    clear_spike_routes()
+    profile_home = tmp_path / "late-defer-generation"
+    profile_home.mkdir()
+    add_spike_route("ou_late_defer", profile_home)
+
+    old_finalizer_done = asyncio.Event()
+    release_entry_cleanup = asyncio.Event()
+    tracked_tasks = []
+    completions = []
+    marked = []
+    dispatches = 0
+
+    async def prepare(request):
+        return request
+
+    async def fake_enrich(_event, _gateway):
+        return "enriched"
+
+    def mark_seen(request):
+        marked.append(request.effective_idempotency_key)
+        return True
+
+    async def fake_stream(*_args, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        return "ok"
+
+    class FullFeishuAdapter:
+        def __init__(self):
+            self.deferred = set()
+
+        def defer_processing_complete(self, value):
+            self.deferred.add(value.message_id)
+
+        async def complete_deferred_processing(self, value, outcome):
+            self.deferred.discard(value.message_id)
+            completions.append((value.message_id, str(outcome)))
+
+        async def on_processing_complete(self, *_args):
+            raise AssertionError("deferred lifecycle must use the matching completion API")
+
+        async def on_processing_start(self, _value):
+            return None
+
+        async def send(self, *_args, **_kwargs):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    original_prepare_entry = RunBroker._prepare_admit_execute_once
+
+    async def hold_entry_after_finalizer(self, *args, **kwargs):
+        result = await original_prepare_entry(self, *args, **kwargs)
+        old_finalizer_done.set()
+        await release_entry_cleanup.wait()
+        return result
+
+    original_handle_async = router_mod.handle_async
+
+    async def tracked_handle_async(*, event, gateway):
+        tracked_tasks.append(asyncio.current_task())
+        return await original_handle_async(event=event, gateway=gateway)
+
+    monkeypatch.setattr(billing_identity, "prepare_billing_request", prepare)
+    monkeypatch.setattr(RunBroker, "_prepare_admit_execute_once", hold_entry_after_finalizer)
+    monkeypatch.setattr(router_mod, "handle_async", tracked_handle_async)
+    monkeypatch.setattr(router_mod, "_enrich_via_hermes_pipeline", fake_enrich)
+    monkeypatch.setattr(router_mod, "_is_run_request_seen", lambda _request: False)
+    monkeypatch.setattr(router_mod, "_mark_run_request_seen", mark_seen)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", fake_stream)
+    adapter = FullFeishuAdapter()
+    gateway = SimpleNamespace(adapters={"feishu": adapter})
+
+    def event():
+        value = _build_event(text="hello", user_id="ou_late_defer")
+        value.message_id = "om_late_defer_generation"
+        return value
+
+    try:
+        router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
+        await asyncio.wait_for(old_finalizer_done.wait(), timeout=2)
+        assert completions == [
+            ("om_late_defer_generation", "ProcessingOutcome.SUCCESS")
+        ]
+        assert adapter.deferred == set()
+
+        router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
+        for _ in range(200):
+            if len(tracked_tasks) >= 2 and "om_late_defer_generation" in adapter.deferred:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("late hook did not register its defer generation")
+
+        release_entry_cleanup.set()
+        await asyncio.wait_for(
+            asyncio.gather(*(task for task in tracked_tasks if task is not None)),
+            timeout=2,
+        )
+
+        assert completions == [
+            ("om_late_defer_generation", "ProcessingOutcome.SUCCESS"),
+            ("om_late_defer_generation", "ProcessingOutcome.SUCCESS"),
+        ]
+        assert adapter.deferred == set()
+        assert len(marked) == 1
+        assert dispatches == 1
+    finally:
+        release_entry_cleanup.set()
+        for task in tracked_tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        if tracked_tasks:
+            await asyncio.gather(
+                *(task for task in tracked_tasks if task is not None),
+                return_exceptions=True,
+            )
+        clear_spike_routes()
+
+
+def test_feishu_completion_generation_state_has_hard_bound():
+    from hermes_multitenancy.router import feishu_completion
+
+    adapter = SimpleNamespace()
+    events = []
+    for index in range(feishu_completion._MAX_COMPLETED_STATES):
+        event = SimpleNamespace(message_id=f"om_generation_{index}")
+        events.append(event)
+        feishu_completion.register_deferred_completion(adapter, event)
+
+    overflow = SimpleNamespace(message_id="om_generation_overflow")
+    feishu_completion.register_deferred_completion(adapter, overflow)
+    states = getattr(adapter, feishu_completion._STATES_ATTR)
+
+    assert len(states) == feishu_completion._MAX_COMPLETED_STATES
+    assert not feishu_completion.has_deferred_completion_claim(adapter, overflow)
+
+    feishu_completion.begin_deferred_completion(adapter, events[0])
+    replacement = SimpleNamespace(message_id="om_generation_replacement")
+    feishu_completion.register_deferred_completion(adapter, replacement)
+
+    assert len(states) == feishu_completion._MAX_COMPLETED_STATES
+    assert events[0].message_id not in states
+    assert feishu_completion.has_deferred_completion_claim(adapter, replacement)
 
 
 @pytest.mark.asyncio

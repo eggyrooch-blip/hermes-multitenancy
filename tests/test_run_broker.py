@@ -950,6 +950,8 @@ def test_run_broker_on_abandon_cleans_staged_resource_before_execution_owner():
 
     staged = []
     abandoned = []
+    entry_done = []
+    entry_completion_owned = asyncio.Event()
     executed = []
     broker = RunBroker(
         dispatch_agent=lambda _request: "unused",
@@ -974,6 +976,8 @@ def test_run_broker_on_abandon_cleans_staged_resource_before_execution_owner():
             execute=lambda _admitted: executed.append(True),
             transform_request=transform,
             on_abandon=lambda: abandoned.append("cleanup"),
+            entry_completion_owned=entry_completion_owned,
+            on_entry_done=lambda failed: entry_done.append(failed),
         )
 
     result = asyncio.run(exercise())
@@ -981,6 +985,8 @@ def test_run_broker_on_abandon_cleans_staged_resource_before_execution_owner():
     assert result.duplicate is True
     assert staged == [request.effective_idempotency_key]
     assert abandoned == ["cleanup"]
+    assert entry_completion_owned.is_set()
+    assert entry_done == [False]
     assert executed == []
 
 
@@ -1073,7 +1079,9 @@ def test_run_broker_shared_entry_finalizer_abandons_when_cancelled_before_first_
     from hermes_multitenancy.run_models import RunRequest, RunResult
 
     shared_entry_owned = asyncio.Event()
+    entry_completion_owned = asyncio.Event()
     abandoned = []
+    entry_done = []
     marked = []
     broker = RunBroker(
         dispatch_agent=lambda _request: "unused",
@@ -1113,6 +1121,137 @@ def test_run_broker_shared_entry_finalizer_abandons_when_cancelled_before_first_
                     ),
                     shared_entry_owned=shared_entry_owned,
                     on_abandon=lambda: abandoned.append("cleanup"),
+                    entry_completion_owned=entry_completion_owned,
+                    on_entry_done=lambda failed: entry_done.append(failed),
+                )
+            for _ in range(10):
+                if entry_done:
+                    break
+                await asyncio.sleep(0)
+        finally:
+            loop.create_task = real_create_task
+
+    asyncio.run(exercise())
+
+    assert shared_entry_owned.is_set()
+    assert entry_completion_owned.is_set()
+    assert abandoned == ["cleanup"]
+    assert entry_done == [True]
+    assert marked == []
+
+
+def test_run_broker_post_mark_redelivery_inherits_shared_entry_completion_owner():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest, RunResult
+
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+    first_owned = asyncio.Event()
+    retry_owned = asyncio.Event()
+    first_completed = asyncio.Event()
+    marked = []
+    first_completions = []
+    retry_completions = []
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "unused",
+        mark_seen=lambda request: marked.append(request.effective_idempotency_key) or True,
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="feishu",
+        profile_name="owner",
+        user_key="ou_owner",
+        content="post mark retry",
+        message_id="om_post_mark_retry",
+    )
+
+    async def execute(_admitted):
+        dispatch_started.set()
+        await release_dispatch.wait()
+        return RunResult(content="ok", duplicate=False)
+
+    async def complete_first(failed):
+        first_completions.append(failed)
+        first_completed.set()
+
+    async def exercise():
+        leader = asyncio.create_task(
+            broker.prepare_and_execute(
+                request,
+                execute=execute,
+                entry_completion_owned=first_owned,
+                on_entry_done=complete_first,
+            )
+        )
+        await dispatch_started.wait()
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+
+        retry = await broker.prepare_and_execute(
+            request,
+            execute=execute,
+            entry_completion_owned=retry_owned,
+            on_entry_done=lambda failed: retry_completions.append(failed),
+        )
+        release_dispatch.set()
+        await asyncio.wait_for(first_completed.wait(), timeout=2)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        return retry
+
+    result = asyncio.run(exercise())
+
+    assert result.duplicate is True
+    assert first_owned.is_set()
+    assert retry_owned.is_set()
+    assert first_completions == [False]
+    assert retry_completions == []
+    assert len(marked) == 1
+
+
+def test_run_broker_rejects_cancelled_entry_finalizer_before_transferring_ownership():
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest, RunResult
+
+    completion_owned = asyncio.Event()
+    completions = []
+    marked = []
+    broker = RunBroker(
+        dispatch_agent=lambda _request: "unused",
+        mark_seen=lambda request: marked.append(request.effective_idempotency_key) or True,
+        sandbox_available=lambda: True,
+    )
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        real_create_task = loop.create_task
+
+        def cancel_finalizer_task(coro, *args, **kwargs):
+            task = real_create_task(coro, *args, **kwargs)
+            if getattr(getattr(coro, "cr_code", None), "co_name", "") == (
+                "_run_entry_done"
+            ):
+                task.cancel()
+            return task
+
+        loop.create_task = cancel_finalizer_task
+        try:
+            with pytest.raises(RuntimeError, match="shared entry finalizer task unavailable"):
+                await broker.prepare_and_execute(
+                    RunRequest(
+                        channel="feishu",
+                        profile_name="owner",
+                        user_key="ou_owner",
+                        content="cancel finalizer before first step",
+                        message_id="om_cancel_finalizer",
+                    ),
+                    execute=lambda _admitted: RunResult(
+                        content="unexpected",
+                        duplicate=False,
+                    ),
+                    entry_completion_owned=completion_owned,
+                    on_entry_done=lambda failed: completions.append(failed),
                 )
             await asyncio.sleep(0)
         finally:
@@ -1120,8 +1259,8 @@ def test_run_broker_shared_entry_finalizer_abandons_when_cancelled_before_first_
 
     asyncio.run(exercise())
 
-    assert shared_entry_owned.is_set()
-    assert abandoned == ["cleanup"]
+    assert not completion_owned.is_set()
+    assert completions == []
     assert marked == []
 
 

@@ -11,9 +11,9 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - `PreparedRun` is authority-bound. Public `run_prepared` consumes it once; `AdmittedRun` and `_run_admitted` remain the internal one-shot stable execution boundary. Durable admission is the final rejectable boundary, so execution does not re-run mutable sandbox policy.
 - Shared-entry ownership transfers only after the task is created and its done callback is installed. A guarded shared-task finalizer runs `on_abandon` exactly once, including task creation rollback and cancellation before the coroutine's first step.
 - Stable execution has its own task-done finalizer. Secret cleanup therefore runs after success, exception, normal cancellation, or cancellation before the execute coroutine starts; a coroutine-body `finally` is not relied upon for plaintext cleanup.
-- SessionStore initialization and write exceptions now fail closed whenever a canonical idempotency record is required. WebUI keeps its SSE `error` + EOF behavior and Feishu sends a retryable storage notice; neither bills, enriches, or dispatches until durable state is available.
+- SessionStore initialization and write exceptions now fail closed whenever a canonical idempotency record is required. Initialization unavailability is detected before billing/enrichment; a final atomic-mark write failure can occur after those preparations, but never consumes the key or dispatches. WebUI keeps its SSE `error` + EOF behavior and Feishu sends a retryable storage notice.
 - Feishu enrichment preserves the original canonical admission request/key. A user-visible vision-block reply must send successfully before mark; failed send remains retryable and internal vision metadata never reaches normal dispatch.
-- Feishu's deferred processing owner closes exactly once on vision success/send failure, billing/store/mark failure, duplicate, cancellation, and normal stable execution. Early returns no longer leave a Typing reaction or deferred message-id behind.
+- Feishu's deferred processing owner is bound to the shared broker entry rather than an individual waiter. A gated, prevalidated async finalizer closes exactly once on vision success/send failure, billing/store/mark failure, duplicate, cancellation, and normal stable execution; leader cancellation with a live peer and post-mark zero-waiter redelivery cannot issue extra FAILURE/SUCCESS completions. Every successful adapter defer also receives an ordered adapter/message generation, and completion snapshots its covered generation immediately before entering the adapter without an intervening await. A late defer that lands after the old snapshot but before shared-entry cleanup therefore completes as its own generation instead of leaking the deferred ID or double-completing the old one. Adapter completion has a five-second timeout.
 - A custom `mark_seen`-only WebUI app maintains the existing bounded local duplicate mirror so sequential redelivery does not re-run billing.
 
 ## Ingest secret ownership
@@ -39,6 +39,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - Never return secret cleanup to the HTTP handler after mark; the handler may time out while execution is still using the files.
 - Never rely only on a coroutine-body `finally` for resources: a task cancelled before its first step never enters that body.
 - Never set shared ownership before task creation and finalizer installation; task factory failure would strand the caller's transient claim.
+- Never let Feishu waiters finish deferred processing independently once they join an entry with a shared completion finalizer. This includes the committed/zero-waiter duplicate path and the narrow finalizer-done/entry-cleanup window.
+- Never infer late Feishu lifecycle ownership from entry presence alone. Match each defer generation against the finalizer's covered snapshot; a post-snapshot generation needs its own completion even if it briefly joins the old entry.
 - Never create an async job only after durable mark; precreate it behind a gate so task-factory failure stays pre-admission, and let its done callback terminalize cancellation.
 - A Feishu hook that defers gateway processing must close that lifecycle on every admitted early return; vision-block replies otherwise leave the Typing reaction and deferred message-id behind.
 - Never write the persistent fingerprint before staging/admission. Conversely, do not delay the transient claim until after billing, or a different secret may join the shared entry.
@@ -50,12 +52,12 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 
 ## Local evidence
 
-- RunBroker + sync/async ingest: 111 passed.
-- Release-focused credential, hook, broker, ingest, sessions, owner-scope, slash/env and WebUI selection: 376 passed in 13.22s.
-- Full pytest: 2400 passed, 1 skipped, 3 deselected in 57.52s.
+- RunBroker + sync/async ingest: 114 passed.
+- Lifecycle-focused credential, hook, broker, ingest and streaming-card selection: 315 passed in 2.04s.
+- Full pytest: 2405 passed, 1 skipped, 3 deselected in 55.67s.
 - Python compile checks and `git diff --check`: passed.
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
-- The previous independent review found four real lifecycle/fail-closed gaps; all four now have failing-without-the-fix regressions. Fresh opposite-family review, ftask SIM and LEAK remain release gates.
+- Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.
 
 No production service, database, model setting, Feishu credential, or user session was changed while collecting this evidence.
 
