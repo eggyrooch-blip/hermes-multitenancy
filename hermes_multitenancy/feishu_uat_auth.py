@@ -47,6 +47,10 @@ class FeishuUatAuthError(Exception):
         self.refresh_class = refresh_class
 
 
+class FeishuUatAuthProtocolError(FeishuUatAuthError):
+    """Feishu returned a terminally invalid OAuth response."""
+
+
 LARK_REFRESH_ERROR = MappingProxyType(
     {
         "TOKEN_INVALID": 99991668,
@@ -101,6 +105,9 @@ class FeishuAuthSession:
 
 _sessions: dict[str, FeishuAuthSession] = {}
 _POLL_STORE_LOCK_TIMEOUT_SECONDS = 0.05
+_MAX_DEVICE_AUTH_TTL_SECONDS = 24 * 3600
+_MAX_ACCESS_TOKEN_TTL_SECONDS = 24 * 3600
+_MAX_REFRESH_TOKEN_TTL_SECONDS = 366 * 24 * 3600
 
 
 def _is_transient_uat_store_error(exc: Exception) -> bool:
@@ -122,6 +129,45 @@ def _is_transient_uat_store_error(exc: Exception) -> bool:
         errno.EINTR,
         errno.ETIMEDOUT,
     }
+
+
+def _bounded_ttl_seconds(
+    value: Any,
+    *,
+    field_name: str,
+    default: int,
+    maximum: int,
+) -> int:
+    raw = default if value is None else value
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FeishuUatAuthProtocolError(
+            f"Feishu OAuth response has invalid {field_name}",
+            status=502,
+        ) from exc
+    if isinstance(raw, bool) or seconds <= 0 or seconds > maximum:
+        raise FeishuUatAuthProtocolError(
+            f"Feishu OAuth response has invalid {field_name}",
+            status=502,
+        )
+    return seconds
+
+
+def _expire_session(session: FeishuAuthSession) -> dict[str, Any]:
+    session._pending_token_payload = None
+    session.status = "expired"
+    session.error = "authorization session expired"
+    return _session_public(session)
+
+
+def _stabilize_protocol_error(
+    session: FeishuAuthSession,
+    exc: FeishuUatAuthProtocolError,
+) -> None:
+    session._pending_token_payload = None
+    session.status = "error"
+    session.error = exc.message
 
 FEISHU_ACCOUNTS_BASE_URL = os.environ.get(
     "FEISHU_ACCOUNTS_BASE_URL", "https://accounts.feishu.cn"
@@ -547,7 +593,12 @@ def start_session(
     client_id, client_secret = _feishu_app_credentials(shared)
     data = _begin_device_authorization(client_id, scope, client_secret)
     session_id = secrets.token_urlsafe(18)
-    expires_in = int(data.get("expires_in", 1800))
+    expires_in = _bounded_ttl_seconds(
+        data.get("expires_in"),
+        field_name="expires_in",
+        default=1800,
+        maximum=_MAX_DEVICE_AUTH_TTL_SECONDS,
+    )
     session = FeishuAuthSession(
         session_id=session_id,
         profile_name=profile_name,
@@ -611,14 +662,21 @@ def poll_session(
         if session.status in {"success", "error", "expired"}:
             return _session_public(session)
         if int(time.time()) >= session.expires_at:
-            session._pending_token_payload = None
-            session.status = "expired"
-            session.error = "authorization session expired"
-            return _session_public(session)
+            return _expire_session(session)
 
         payload = session._pending_token_payload
         if payload is None:
-            result = _poll_device_token(session.device_code, session.client_id, session.client_secret)
+            try:
+                result = _poll_device_token(
+                    session.device_code,
+                    session.client_id,
+                    session.client_secret,
+                )
+            except FeishuUatAuthProtocolError as exc:
+                _stabilize_protocol_error(session, exc)
+                raise
+            if int(time.time()) >= session.expires_at:
+                return _expire_session(session)
             error = str(result.get("error") or "").strip()
             if error in {"authorization_pending", "slow_down"} or (not error and not result.get("access_token")):
                 return _session_public(session)
@@ -636,7 +694,16 @@ def poll_session(
                 session.error = f"authorized account does not match requesting Feishu user ({token_open_id} does not match {open_id})"
                 raise FeishuUatAuthError(session.error, status=403)
 
-            payload = _token_payload(result, open_id=open_id, app_id=session.client_id, scope=session.scope)
+            try:
+                payload = _token_payload(
+                    result,
+                    open_id=open_id,
+                    app_id=session.client_id,
+                    scope=session.scope,
+                )
+            except FeishuUatAuthProtocolError as exc:
+                _stabilize_protocol_error(session, exc)
+                raise
             session._pending_token_payload = payload
         try:
             _store_uat(
@@ -694,16 +761,16 @@ def _profile_name_for_open_id(shared_home: Path, open_id: str) -> str:
         raise FeishuUatAuthError("multitenancy routing DB is missing", status=503)
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 "SELECT profile_name FROM multitenancy_routing "
-                "WHERE open_id = ? AND active = 1 AND kind = 'user' LIMIT 1",
+                "WHERE open_id = ? AND active = 1 AND kind = 'user' LIMIT 2",
                 (open_id,),
-            ).fetchone()
+            ).fetchall()
     except sqlite3.Error as exc:
         raise FeishuUatAuthError(f"routing lookup failed: {exc}", status=503) from exc
-    if not row:
+    if len(rows) != 1:
         raise FeishuUatAuthError("Feishu user is not bound to this Hermes profile", status=403)
-    return str(row[0])
+    return str(rows[0][0])
 
 
 def _clean_id(name: str, value: str) -> str:
@@ -778,8 +845,21 @@ def _load_shared_env(shared_home: Path) -> None:
 
 def _token_payload(result: dict[str, Any], *, open_id: str, app_id: str, scope: str) -> dict[str, Any]:
     now_ms = int(time.time() * 1000)
-    expires_in = int(result.get("expires_in") or 7200)
-    refresh_expires_in = int(result.get("refresh_expires_in") or result.get("refresh_token_expires_in") or 30 * 24 * 3600)
+    expires_in = _bounded_ttl_seconds(
+        result.get("expires_in"),
+        field_name="expires_in",
+        default=7200,
+        maximum=_MAX_ACCESS_TOKEN_TTL_SECONDS,
+    )
+    refresh_expires_raw = result.get("refresh_expires_in")
+    if refresh_expires_raw is None:
+        refresh_expires_raw = result.get("refresh_token_expires_in")
+    refresh_expires_in = _bounded_ttl_seconds(
+        refresh_expires_raw,
+        field_name="refresh_expires_in",
+        default=30 * 24 * 3600,
+        maximum=_MAX_REFRESH_TOKEN_TTL_SECONDS,
+    )
     granted_scope = str(result.get("scope") or scope or "").strip()
     return {
         "app_id": app_id,
@@ -817,6 +897,7 @@ def _store_uat(
         open_id,
         timeout_seconds=lock_timeout_seconds,
     ):
+        _assert_route(shared_home, profile_name, open_id)
         rejection = _l1_validate_uat(payload)
         if rejection is not None:
             _l1_write_reject_marker(shared_home, profile_name, open_id, rejection)
@@ -1131,7 +1212,12 @@ def _normalise_refresh_response(data: dict[str, Any], *, require_refresh_token: 
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "expires_in": int(data.get("expires_in") or 7200),
+        "expires_in": _bounded_ttl_seconds(
+            data.get("expires_in"),
+            field_name="expires_in",
+            default=7200,
+            maximum=_MAX_ACCESS_TOKEN_TTL_SECONDS,
+        ),
         "refresh_expires_in": _refresh_token_expires_in(data),
         "scope": scope,
         "token_type": str(data.get("token_type", "Bearer")).strip(),
@@ -1270,7 +1356,12 @@ def _begin_device_authorization_local(
         "user_code": str(data["user_code"]).strip(),
         "verification_uri": str(data.get("verification_uri") or "").strip(),
         "verification_uri_complete": str(data["verification_uri_complete"]).strip(),
-        "expires_in": int(data.get("expires_in", 1800)),
+        "expires_in": _bounded_ttl_seconds(
+            data.get("expires_in"),
+            field_name="expires_in",
+            default=1800,
+            maximum=_MAX_DEVICE_AUTH_TTL_SECONDS,
+        ),
         "interval": max(int(data.get("interval", 3)), 2),
     }
 
@@ -1278,11 +1369,13 @@ def _begin_device_authorization_local(
 def _refresh_token_expires_in(data: dict[str, Any], default: int = 30 * 24 * 3600) -> int:
     raw = data.get("refresh_token_expires_in")
     if raw is None:
-        raw = data.get("refresh_expires_in", default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
+        raw = data.get("refresh_expires_in")
+    return _bounded_ttl_seconds(
+        raw,
+        field_name="refresh_expires_in",
+        default=default,
+        maximum=_MAX_REFRESH_TOKEN_TTL_SECONDS,
+    )
 
 
 def _poll_device_token_local(device_code: str, client_id: str, client_secret: str) -> dict[str, Any]:
@@ -1299,7 +1392,12 @@ def _poll_device_token_local(device_code: str, client_id: str, client_secret: st
         "access_token": str(data.get("access_token", "")).strip() or None,
         "refresh_token": str(data.get("refresh_token", "")).strip() or None,
         "open_id": str(data.get("open_id", "")).strip() or None,
-        "expires_in": int(data.get("expires_in", 7200)),
+        "expires_in": _bounded_ttl_seconds(
+            data.get("expires_in"),
+            field_name="expires_in",
+            default=7200,
+            maximum=_MAX_ACCESS_TOKEN_TTL_SECONDS,
+        ),
         "refresh_expires_in": _refresh_token_expires_in(data),
         "token_type": str(data.get("token_type", "Bearer")).strip(),
         "scope": str(data.get("scope", "")).strip(),

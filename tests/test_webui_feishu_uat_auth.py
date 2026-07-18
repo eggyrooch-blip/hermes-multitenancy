@@ -940,6 +940,85 @@ def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path
         store.close()
 
 
+def test_poll_session_revalidates_route_after_waiting_for_identity_lock(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_multitenancy import credential_renewal_common, feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="route-swap",
+        device_code="device-route-swap",
+    )
+    exchanged = threading.Event()
+    results: list[dict] = []
+    errors: list[BaseException] = []
+    poll_calls: list[str] = []
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        exchanged.set()
+        return {
+            "access_token": "route-swap-access",
+            "refresh_token": "route-swap-refresh",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def run_poll() -> None:
+        try:
+            results.append(
+                feishu_uat_auth.poll_session(
+                    session_id=session.session_id,
+                    profile_name="owner",
+                    open_id="ou_owner",
+                    shared_home=shared,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_POLL_STORE_LOCK_TIMEOUT_SECONDS", 1.0)
+    with credential_renewal_common.credential_identity_lock(shared, "owner", "ou_owner"):
+        worker = threading.Thread(target=run_poll)
+        worker.start()
+        assert exchanged.wait(timeout=2)
+        with sqlite3.connect(shared / "multitenancy.db") as conn:
+            conn.execute(
+                "UPDATE multitenancy_routing SET profile_name = 'replacement' "
+                "WHERE open_id = 'ou_owner' AND active = 1 AND kind = 'user'"
+            )
+            conn.commit()
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], feishu_uat_auth.FeishuUatAuthError)
+    assert errors[0].status == 403
+    assert session.status == "error"
+    assert session._pending_token_payload is None
+    assert poll_calls == ["device-route-swap"]
+    assert not (
+        shared / "profiles" / "owner" / "feishu_uat" / "ou_owner.json"
+    ).exists()
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        assert store.get_status(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+        )["status"] == "missing"
+    finally:
+        store.close()
+
+
 def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
 
@@ -1172,6 +1251,164 @@ def test_poll_session_expires_and_clears_cached_payload(tmp_path, monkeypatch):
     assert result["error"] == "authorization session expired"
     assert session._pending_token_payload is None
     assert poll_calls == []
+    assert store_calls == 0
+
+
+def test_poll_session_expires_if_device_exchange_crosses_deadline(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="expires-during-exchange",
+        device_code="device-expires-during-exchange",
+    )
+    poll_calls: list[str] = []
+    store_calls = 0
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        session.expires_at = int(time.time()) - 1
+        return {
+            "access_token": "late-access",
+            "refresh_token": "late-refresh",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def store_uat(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
+
+    first = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert first["status"] == "expired"
+    assert first["error"] == "authorization session expired"
+    assert second == first
+    assert session._pending_token_payload is None
+    assert poll_calls == ["device-expires-during-exchange"]
+    assert store_calls == 0
+
+
+@pytest.mark.parametrize("ttl", ["not-an-int", -1, 10**15], ids=["invalid", "negative", "huge"])
+def test_start_session_rejects_invalid_device_ttl(tmp_path, monkeypatch, ttl):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "_begin_device_authorization",
+        lambda *_args: {
+            "device_code": "device-invalid-ttl",
+            "user_code": "TTL-INVALID",
+            "verification_uri_complete": "https://accounts.feishu.cn/device?user_code=TTL-INVALID",
+            "expires_in": ttl,
+            "interval": 1,
+        },
+    )
+    existing_sessions = set(feishu_uat_auth._sessions)
+    try:
+        with pytest.raises(feishu_uat_auth.FeishuUatAuthError, match="invalid expires_in"):
+            feishu_uat_auth.start_session(
+                profile_name="owner",
+                open_id="ou_owner",
+                shared_home=shared,
+            )
+    finally:
+        for session_id in set(feishu_uat_auth._sessions) - existing_sessions:
+            feishu_uat_auth._sessions.pop(session_id, None)
+
+
+@pytest.mark.parametrize(
+    ("ttl_field", "ttl"),
+    [
+        ("expires_in", "not-an-int"),
+        ("expires_in", -1),
+        ("expires_in", 10**15),
+        ("refresh_expires_in", "not-an-int"),
+        ("refresh_expires_in", -1),
+        ("refresh_expires_in", 10**15),
+    ],
+    ids=[
+        "access-invalid",
+        "access-negative",
+        "access-huge",
+        "refresh-invalid",
+        "refresh-negative",
+        "refresh-huge",
+    ],
+)
+def test_poll_session_stabilizes_invalid_token_ttl_without_reexchange(
+    tmp_path,
+    monkeypatch,
+    ttl_field,
+    ttl,
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=f"invalid-token-ttl-{ttl_field}-{ttl}",
+        device_code="device-invalid-token-ttl",
+    )
+    poll_calls: list[str] = []
+    store_calls = 0
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        result = {
+            "access_token": "ttl-access",
+            "refresh_token": "ttl-refresh",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+        result[ttl_field] = ttl
+        return result
+
+    def store_uat(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
+
+    with pytest.raises(feishu_uat_auth.FeishuUatAuthError, match=f"invalid {ttl_field}"):
+        feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert second["status"] == "error"
+    assert f"invalid {ttl_field}" in second["error"]
+    assert session._pending_token_payload is None
+    assert poll_calls == ["device-invalid-token-ttl"]
     assert store_calls == 0
 
 

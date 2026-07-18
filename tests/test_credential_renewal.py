@@ -45,6 +45,21 @@ def _valid_payload(open_id: str = "ou_user_a") -> dict[str, Any]:
     }
 
 
+def _seed_active_route(shared_home: Path, profile_name: str, open_id: str) -> None:
+    from hermes_multitenancy.routing import RoutingTable
+
+    table = RoutingTable(shared_home / "multitenancy.db")
+    try:
+        table.upsert(
+            user_id=f"user_{open_id}",
+            profile_name=profile_name,
+            open_id=open_id,
+            provenance="sync",
+        )
+    finally:
+        table.close()
+
+
 # ---------------------------------------------------------------------------
 # L1 — write-time validation
 # ---------------------------------------------------------------------------
@@ -138,6 +153,7 @@ def test_store_uat_clears_profile_and_legacy_reauth_markers_and_unblocks_l2(
     profile_name = "alice"
     open_id = "ou_reauthorized"
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    _seed_active_route(tmp_path, profile_name, open_id)
     marker_paths = (
         tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
         tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
@@ -222,6 +238,7 @@ def test_store_uat_keeps_reauth_markers_when_profile_json_write_fails(
     profile_name = "alice"
     open_id = "ou_json_failure"
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    _seed_active_route(tmp_path, profile_name, open_id)
     marker_paths = (
         tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
         tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
@@ -258,6 +275,7 @@ def test_store_uat_reports_marker_cleanup_failure_without_false_success(
     profile_name = "alice"
     open_id = "ou_marker_failure"
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    _seed_active_route(tmp_path, profile_name, open_id)
     profile_marker = (
         tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
     )
@@ -309,6 +327,7 @@ def test_store_uat_l1_rejection_keeps_both_new_reauth_markers(
 ):
     profile_name = "alice"
     open_id = "ou_l1_rejected"
+    _seed_active_route(tmp_path, profile_name, open_id)
     payload = _valid_payload(open_id)
     payload[broken_field] = broken_value
 
@@ -324,7 +343,11 @@ def test_store_uat_l1_rejection_keeps_both_new_reauth_markers(
         body = common.read_needs_reauth_marker(marker)
         assert body is not None
         assert body["reason"] == expected_reason
-    assert not (tmp_path / "multitenancy.db").exists()
+    with sqlite3.connect(tmp_path / "multitenancy.db") as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'multitenancy_credentials'"
+        ).fetchone() is None
     assert not (tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json").exists()
 
 
@@ -335,6 +358,7 @@ def test_identity_lock_is_reentrant_when_refresh_stores_uat(
     profile_name = "alice"
     open_id = "ou_reentrant"
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    _seed_active_route(tmp_path, profile_name, open_id)
 
     with common.credential_identity_lock(tmp_path, profile_name, open_id):
         fua._store_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
@@ -388,6 +412,7 @@ def test_authoritative_refresh_failure_cannot_refreeze_concurrent_reauthorizatio
     profile_name = "alice"
     open_id = "ou_concurrent_reauth"
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    _seed_active_route(tmp_path, profile_name, open_id)
 
     old_payload = _valid_payload(open_id)
     old_payload["access_token"] = "old-access"
@@ -699,6 +724,7 @@ def test_recovery_clears_structural_marker_even_when_marker_is_newer(tmp_path: P
     last refresh, so "valid UAT newer than marker" never holds. A LOCAL-STRUCTURAL
     marker must still be refuted by a currently-usable UAT."""
     open_id = "ou_deadlock"
+    _seed_active_route(tmp_path, "kate", open_id)
     uat = _seed_uat(tmp_path, "kate", open_id, _valid_payload(open_id))
     marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -731,6 +757,101 @@ def test_recovery_keeps_authoritative_refresh_rejected_marker(tmp_path: Path):
     os.utime(uat, (past, past))
 
     assert common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker) is False
+    assert marker.is_file()
+
+
+def test_recovery_returns_false_when_exact_marker_unlink_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_readonly_marker"
+    marker = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        extra={
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    old = time.time() - 60
+    os.utime(marker, (old, old))
+    _seed_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+
+    real_unlink = Path.unlink
+
+    def readonly_unlink(path: Path, *args, **kwargs):
+        if path == marker:
+            raise OSError("read-only marker")
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "unlink", readonly_unlink)
+        assert common.clear_reauth_markers_if_uat_recovered(
+            tmp_path, open_id, marker
+        ) is False
+    assert marker.is_file()
+
+
+def test_recovery_returns_false_when_newer_authoritative_sibling_survives(tmp_path: Path):
+    profile_name = "alice"
+    open_id = "ou_new_sibling"
+    profile_marker = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    legacy_marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
+    for marker, detail in ((profile_marker, "old"), (legacy_marker, "new")):
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail=detail,
+            extra={
+                "profile": profile_name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+    os.utime(profile_marker, (time.time() - 120, time.time() - 120))
+    uat = _seed_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+    os.utime(uat, (time.time() - 60, time.time() - 60))
+    os.utime(legacy_marker, (time.time() + 60, time.time() + 60))
+
+    assert common.clear_reauth_markers_if_uat_recovered(
+        tmp_path, open_id, profile_marker
+    ) is False
+    assert not profile_marker.exists()
+    assert common.marker_requires_reauth(
+        common.read_needs_reauth_marker(legacy_marker) or {}
+    )
+
+
+def test_recovery_rejects_legacy_marker_profile_that_disagrees_with_active_route(
+    tmp_path: Path,
+):
+    open_id = "ou_wrong_safe_profile"
+    _seed_active_route(tmp_path, "alice", open_id)
+    (tmp_path / "profiles" / "alice").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "profiles" / "bob").mkdir(parents=True, exist_ok=True)
+    marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        extra={
+            "profile": "bob",
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    os.utime(marker, (time.time() - 60, time.time() - 60))
+    _seed_uat(tmp_path, "bob", open_id, _valid_payload(open_id))
+
+    assert common.clear_reauth_markers_if_uat_recovered(
+        tmp_path, open_id, marker
+    ) is False
     assert marker.is_file()
 
 
@@ -830,6 +951,7 @@ def test_recovery_uses_newer_vault_uat_after_profile_json_write_failure(
     profile_name = "alice"
     open_id = "ou_vault_recovered"
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    _seed_active_route(tmp_path, profile_name, open_id)
     markers = (
         tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
         tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",

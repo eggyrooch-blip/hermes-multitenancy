@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -630,7 +631,7 @@ def _clear_reauth_markers_if_uat_recovered_locked(
             # marker for the same open_id must survive this fallback.
             if str(stale_body.get("reason") or "") in LOCAL_STRUCTURAL_REAUTH_REASONS:
                 clear_needs_reauth_marker(stale_marker)
-        return True
+        return _all_markers_absent(recovery_markers)
 
     for stale_marker in recovery_markers:
         try:
@@ -638,6 +639,19 @@ def _clear_reauth_markers_if_uat_recovered_locked(
                 clear_needs_reauth_marker(stale_marker)
         except OSError:
             continue
+    return _all_markers_absent(recovery_markers)
+
+
+def _all_markers_absent(marker_paths: Iterable[Path]) -> bool:
+    """Return True only when every exact marker is observably absent."""
+    for marker_path in marker_paths:
+        try:
+            marker_path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        return False
     return True
 
 
@@ -651,9 +665,11 @@ def _profile_name_for_reauth_marker(
         f"{open_id}.json.needs_reauth",
     }:
         return None
+    legacy = False
     try:
         relative = marker_path.relative_to(shared_home / "profiles")
     except ValueError:
+        legacy = True
         try:
             legacy_relative = marker_path.relative_to(shared_home / "feishu_uat")
         except ValueError:
@@ -661,26 +677,44 @@ def _profile_name_for_reauth_marker(
         if len(legacy_relative.parts) != 1:
             return None
         candidate = str((read_needs_reauth_marker(marker_path) or {}).get("profile") or "")
-        if not candidate:
-            candidates = {
-                loc.profile_name
-                for loc in iter_uat_locations(shared_home)
-                if loc.open_id == open_id and not loc.legacy and loc.profile_name
-            }
-            if len(candidates) != 1:
-                return None
-            candidate = candidates.pop()
     else:
         candidate = (
             relative.parts[0]
             if len(relative.parts) == 3 and relative.parts[1] == "feishu_uat"
             else ""
         )
+    if legacy:
+        routed_profile = _unique_active_user_profile_for_open_id(shared_home, open_id)
+        if routed_profile is None or (candidate and candidate != routed_profile):
+            return None
+        candidate = routed_profile
     if not _safe_identity_component(candidate):
         return None
     if not (shared_home / "profiles" / candidate).is_dir():
         return None
     return candidate
+
+
+def _unique_active_user_profile_for_open_id(
+    shared_home: Path,
+    open_id: str,
+) -> str | None:
+    db_path = shared_home / "multitenancy.db"
+    if not db_path.is_file():
+        return None
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
+            rows = conn.execute(
+                "SELECT profile_name FROM multitenancy_routing "
+                "WHERE open_id = ? AND active = 1 AND kind = 'user' LIMIT 2",
+                (open_id,),
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+    if len(rows) != 1:
+        return None
+    profile_name = str(rows[0][0] or "")
+    return profile_name if _safe_identity_component(profile_name) else None
 
 
 def _safe_identity_component(value: str) -> bool:

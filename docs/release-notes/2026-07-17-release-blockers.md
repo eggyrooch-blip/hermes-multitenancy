@@ -1,6 +1,6 @@
 # 2026-07-17 multitenancy release blockers
 
-Status: local ftask candidate only. Not pushed or deployed; production is unchanged.
+Status: local ftask candidate only. The final-review fixes are an uncommitted working-tree diff based on `30f50aa`; nothing was pushed or deployed and production is unchanged.
 
 ## Fixed contracts
 
@@ -34,6 +34,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - The renewal worker skips refresh only for a strict Feishu-authoritative marker with `reason=refresh_rejected`, JSON boolean `authoritative=true`, and `refresh_class=invalid`.
 - A successful real `_store_uat` clears the exact user's profile-local and legacy marker only after both the credential vault and profile compatibility JSON are durable. Proactive L2 refresh then resumes normally.
 - A profile JSON write failure leaves both markers intact. If either marker cannot be removed, authorization reports an explicit server error rather than claiming recovery while renewal remains frozen.
+- Recovery now reports success only when both exact canonical marker paths are observably absent. A read-only/unlink failure or a newer authoritative sibling therefore leaves the result false instead of treating an attempted unlink as recovery.
+- A legacy marker can resolve a profile only through exactly one active user route for the same `open_id`; an optional safe `profile` in the marker must agree with that route. Missing, duplicate, unsafe, or disagreeing routes fail closed.
 - Invalid UTF-8, oversized content, deep JSON, overlong integers, non-boolean authority and other malformed/non-authoritative markers are untrusted and do not freeze renewal or crash the tick.
 - Refresh, authorization storage and authoritative failure-marker creation now share one exact-identity critical section. A stale refresh cannot finish after a new authorization and overwrite its UAT or recreate the marker that authorization just cleared.
 - The critical section is re-entrant in one process and uses a persistent profile-local `flock` across gateway, WebUI and sandbox processes. The hashed `0600` lock file is placed under the profile's writable `feishu_uat` mount; shared-home-only lock inodes are deliberately avoided because Linux bwrap does not bind that directory and the macOS profile does not allow writing it.
@@ -43,7 +45,9 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - A terminal `FeishuUatAuthError` from storage clears the cached payload and moves the session to a stable `error` state before it is re-raised. Later polls return the original error without polling the consumed device code again. Public session data never contains the cached token.
 - Each authorization session owns one private poll lock. One caller exclusively covers status/expiry check, token exchange, storage, and terminal transition; a concurrent duplicate returns redacted `pending` without exchanging or storing. The lock is released on every return/exception and has no global side registry; cancel uses the same lock.
 - Cached payloads do not extend the device-flow lifetime. At `expires_at`, poll clears the payload and returns stable `expired` without either another exchange or a late store. Every non-transient store exception similarly clears the payload, persists a safe terminal error, then re-raises once.
-- Marker recovery resolves and validates one profile/open_id before taking the existing re-entrant identity lock, then re-resolves and performs the complete marker/evidence/stat/unlink decision inside it. A writer that replaces the marker while owning that lock wins; recovery sees the new generation and leaves it. An authoritative legacy marker with no unique safe profile is never deleted and does not create a guessed profile lock directory.
+- Device authorization and access/refresh token TTLs must parse to positive seconds bounded by protocol limits. Invalid, negative, or implausibly large values fail closed; post-exchange poll rechecks the original device deadline before interpreting or storing a token, and protocol failures become a stable redacted session error without re-exchange.
+- Marker recovery resolves and validates one profile/open_id before taking the existing re-entrant identity lock, then re-resolves and performs the complete marker/evidence/stat/unlink decision inside it. A writer that replaces the marker while owning that lock wins; recovery sees the new generation and leaves it. An authoritative legacy marker with no unique active route, or whose claimed profile disagrees with that route, is never deleted and does not create a guessed profile lock directory.
+- OAuth storage revalidates the unique active route as its first operation inside the exact identity lock. If the route changes while poll waits, the exchanged token is not written into the former profile and the session becomes a stable authorization error.
 
 ## Known gotchas
 
@@ -66,6 +70,9 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - Do not classify every `OperationalError` or `OSError` as retryable. Only concrete lock/busy or retry errno evidence may retain the exchanged token; a missing schema, readonly/corrupt database, full filesystem, or unknown exception must fail closed and clear it.
 - Never make device-token exchange a check-then-act outside the session lock; duplicate WebUI polls otherwise consume the same one-time code twice. A cached token is still bounded by the original session expiry.
 - Never carry a pre-lock marker stat into deletion. Resolve a safe identity, take its lock, then re-read both marker generation and recovery evidence; an ambiguous legacy marker remains authoritative.
+- Marker recovery success is an observed postcondition, not an unlink attempt: both exact canonical markers must be absent, including any newer authoritative sibling.
+- A route check before waiting on the identity lock is stale evidence. Revalidate the unique active user route inside `_store_uat` before any vault or compatibility-JSON write.
+- Never trust Feishu TTL fields as scheduling input. Reject non-positive, invalid, or over-limit values and recheck the device deadline after the network exchange before persisting its result.
 - A slash inside a WebUI `model` field does not prove that the value already contains its provider. When `provider` is present, preserve that boundary and only treat an exact same-provider prefix as already assembled.
 - CardKit `card.settings` does not accept `streaming_mode` at the top level. Keep it under `config` for both reopen and close; a successful settings call is required before the one same-frame retry.
 
@@ -73,13 +80,15 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 
 - RunBroker + sync/async ingest: 114 passed.
 - Lifecycle-focused credential, hook, broker, ingest and streaming-card selection: 315 passed in 2.04s.
-- Final Feishu UAT-auth + renewal files: 100 passed, including eight red-before-green final-review cases.
-- Repository TEST gate (`make test`): 2422 passed, 1 skipped, 3 deselected in 61.42s.
+- Final Feishu UAT-auth + renewal files: 114 passed. The latest reviewer selection had 14 failures before these fixes and 14 passes afterward (unlink/read-only, newer sibling, wrong safe profile, route swap, exchange deadline, and invalid/negative/huge TTL cases).
+- Adjacent credential/cron/WebUI-auth focused set: 144 passed.
+- Repository TEST gate on the current working tree (`make test`): 2458 passed, 1 skipped, 3 deselected in 63.23s.
 - Python compile checks and `git diff --check`: passed.
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
 - Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.
 - A later formal review caught the stale-refresh/concurrent-reauthorization marker race. Thread-barrier, same-thread re-entry, profile-path validation, persistent lock-location, and real cross-process `flock` regressions now cover that finding; a fresh non-failing formal review is still required before release.
-- Focused K3/CardKit regression: 67 passed. Final full repository gate: 2444 passed, 1 skipped, 3 deselected in 80.29s.
+- Focused K3/CardKit regression: 67 passed.
+- SIM scenarios 3, 5, 15 and 16 were recaptured against the working tree (3 + 1 + 10 + 4 passes), and `ftask simulate --check` exits 0. The current SIM hash still describes committed `30f50aa` because ftask hashes merge-base→HEAD only; after the working tree is saved, SIM must be recaptured/rechecked so the final code hash is genuinely bound before release.
 
 No production service, database, model setting, Feishu credential, or user session was changed while collecting this evidence.
 
