@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
+import threading
 import time
 import urllib.error
 from io import BytesIO
@@ -321,6 +324,215 @@ def test_store_uat_l1_rejection_keeps_both_new_reauth_markers(
         assert body["reason"] == expected_reason
     assert not (tmp_path / "multitenancy.db").exists()
     assert not (tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json").exists()
+
+
+def test_identity_lock_is_reentrant_when_refresh_stores_uat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_reentrant"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    with common.credential_identity_lock(tmp_path, profile_name, open_id):
+        fua._store_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+
+    assert (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+    ).is_file()
+
+
+@pytest.mark.parametrize("profile_name", ["", ".", "..", "../bob", "/tmp/bob", " alice"])
+def test_identity_lock_rejects_profile_path_traversal(tmp_path: Path, profile_name: str):
+    with pytest.raises(ValueError, match="profile_name"):
+        with common.credential_identity_lock(tmp_path, profile_name, "ou_invalid_profile"):
+            pytest.fail("invalid profile unexpectedly acquired a lock")
+
+
+def test_authoritative_refresh_failure_cannot_refreeze_concurrent_reauthorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_concurrent_reauth"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    old_payload = _valid_payload(open_id)
+    old_payload["access_token"] = "old-access"
+    old_payload["expires_at"] = int(time.time() * 1000) + 1_000
+    old_payload["granted_at"] -= 10_000
+    fua._store_uat(tmp_path, profile_name, open_id, old_payload)
+
+    refresh_started = threading.Event()
+    release_old_refresh = threading.Event()
+    store_entered = threading.Event()
+    store_finished = threading.Event()
+    refresh_calls: list[dict[str, Any]] = []
+
+    def fail_old_refresh_then_accept_retry(**kwargs):
+        refresh_calls.append(kwargs)
+        if len(refresh_calls) == 1:
+            refresh_started.set()
+            assert release_old_refresh.wait(timeout=3)
+            raise fua.FeishuUatAuthError(
+                "Feishu rejected the old refresh token",
+                status=401,
+                refresh_class="invalid",
+            )
+
+    monkeypatch.setattr(fua, "refresh_uat_if_needed", fail_old_refresh_then_accept_retry)
+    monkeypatch.setattr(
+        credential_renewal_worker,
+        "_iter_active_user_routes",
+        lambda _shared_home: iter([(profile_name, open_id)]),
+    )
+
+    reports: list[dict[str, int]] = []
+    thread_errors: list[BaseException] = []
+
+    def run_tick() -> None:
+        try:
+            reports.append(
+                credential_renewal_worker.run_renewal_tick(
+                    tmp_path,
+                    headroom_seconds=300,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            thread_errors.append(exc)
+
+    fresh_payload = _valid_payload(open_id)
+    fresh_payload["access_token"] = "fresh-access"
+    fresh_payload["expires_at"] = int(time.time() * 1000) + 1_000
+
+    def store_fresh_uat() -> None:
+        store_entered.set()
+        try:
+            fua._store_uat(tmp_path, profile_name, open_id, fresh_payload)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            thread_errors.append(exc)
+        finally:
+            store_finished.set()
+
+    renewal_thread = threading.Thread(target=run_tick)
+    renewal_thread.start()
+    assert refresh_started.wait(timeout=3)
+
+    store_thread = threading.Thread(target=store_fresh_uat)
+    store_thread.start()
+    assert store_entered.wait(timeout=1)
+    try:
+        assert not store_finished.wait(timeout=0.1)
+    finally:
+        release_old_refresh.set()
+
+    renewal_thread.join(timeout=3)
+    store_thread.join(timeout=3)
+    assert not renewal_thread.is_alive()
+    assert not store_thread.is_alive()
+    assert thread_errors == []
+    assert reports == [{"scanned": 1, "refreshed": 0, "skipped": 0, "failed": 1}]
+
+    marker_paths = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
+        tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
+    )
+    assert all(not marker.exists() for marker in marker_paths)
+    assert fua._load_best_uat_payload(tmp_path, profile_name, open_id)["access_token"] == "fresh-access"
+
+    assert credential_renewal_worker._refresh_one(
+        tmp_path,
+        profile_name,
+        open_id,
+        headroom_seconds=300,
+    ) == "refreshed"
+    assert len(refresh_calls) == 2
+
+
+@pytest.mark.skipif(common.fcntl is None, reason="cross-process identity lock requires POSIX flock")
+def test_identity_lock_blocks_another_process_for_same_identity(tmp_path: Path):
+    profile_name = "alice"
+    open_id = "ou_cross_process"
+    held_path = tmp_path / "child-held"
+    release_path = tmp_path / "release-child"
+    child_code = """
+import sys
+import time
+from pathlib import Path
+from hermes_multitenancy.credential_renewal_common import credential_identity_lock
+
+shared_home = Path(sys.argv[1])
+held_path = Path(sys.argv[2])
+release_path = Path(sys.argv[3])
+with credential_identity_lock(shared_home, sys.argv[4], sys.argv[5]):
+    held_path.write_text("held", encoding="utf-8")
+    deadline = time.monotonic() + 5
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("parent did not release child lock")
+        time.sleep(0.01)
+"""
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(tmp_path),
+            str(held_path),
+            str(release_path),
+            profile_name,
+            open_id,
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    acquired = threading.Event()
+    parent_errors: list[BaseException] = []
+
+    def acquire_in_parent() -> None:
+        try:
+            with common.credential_identity_lock(tmp_path, profile_name, open_id):
+                acquired.set()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            parent_errors.append(exc)
+            acquired.set()
+
+    parent_thread: threading.Thread | None = None
+    try:
+        deadline = time.monotonic() + 3
+        while not held_path.exists():
+            if child.poll() is not None:
+                _stdout, stderr = child.communicate()
+                pytest.fail(f"lock holder exited early: {stderr}")
+            if time.monotonic() >= deadline:
+                pytest.fail("timed out waiting for child to hold identity lock")
+            time.sleep(0.01)
+
+        parent_thread = threading.Thread(target=acquire_in_parent)
+        parent_thread.start()
+        assert not acquired.wait(timeout=0.1)
+        release_path.write_text("release", encoding="utf-8")
+        assert acquired.wait(timeout=3)
+        parent_thread.join(timeout=3)
+        assert not parent_thread.is_alive()
+        assert parent_errors == []
+        _stdout, stderr = child.communicate(timeout=3)
+        assert child.returncode == 0, stderr
+        lock_files = list(
+            (tmp_path / "profiles" / profile_name / "feishu_uat").glob(".*.renewal.lock")
+        )
+        assert len(lock_files) == 1
+        assert lock_files[0].stat().st_mode & 0o777 == 0o600
+        assert not (tmp_path / ".credential-locks").exists()
+    finally:
+        release_path.write_text("release", encoding="utf-8")
+        if parent_thread is not None:
+            parent_thread.join(timeout=1)
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=3)
 
 
 # ---------------------------------------------------------------------------

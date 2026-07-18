@@ -33,6 +33,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - A successful real `_store_uat` clears the exact user's profile-local and legacy marker only after both the credential vault and profile compatibility JSON are durable. Proactive L2 refresh then resumes normally.
 - A profile JSON write failure leaves both markers intact. If either marker cannot be removed, authorization reports an explicit server error rather than claiming recovery while renewal remains frozen.
 - Invalid UTF-8, oversized content, deep JSON, overlong integers, non-boolean authority and other malformed/non-authoritative markers are untrusted and do not freeze renewal or crash the tick.
+- Refresh, authorization storage and authoritative failure-marker creation now share one exact-identity critical section. A stale refresh cannot finish after a new authorization and overwrite its UAT or recreate the marker that authorization just cleared.
+- The critical section is re-entrant in one process and uses a persistent profile-local `flock` across gateway, WebUI and sandbox processes. The hashed `0600` lock file is placed under the profile's writable `feishu_uat` mount; shared-home-only lock inodes are deliberately avoided because Linux bwrap does not bind that directory and the macOS profile does not allow writing it.
 
 ## Known gotchas
 
@@ -51,16 +53,18 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - A missing SessionStore is not an in-memory fallback for keyed requests; only a request with no dedupe record may proceed without it.
 - Only strict authoritative invalid-refresh markers stop renewal. A blanket `.needs_reauth` skip would freeze recoverable credentials.
 - Persisting a fresh UAT without clearing both exact reauth-marker paths leaves L2 permanently frozen; marker cleanup belongs after the vault and JSON writes and must fail visibly.
+- Never release the identity lock between a refresh exception and `_record_failure`, or between a successful user authorization write and exact marker cleanup. That gap lets an older attempt permanently refreeze the replacement UAT.
 
 ## Local evidence
 
 - RunBroker + sync/async ingest: 114 passed.
 - Lifecycle-focused credential, hook, broker, ingest and streaming-card selection: 315 passed in 2.04s.
-- Feishu UAT storage and renewal focused files: 71 passed; renewal/cron/WebUI-auth audit set: 74 passed.
-- Repository TEST gate (`make test`): 2410 passed, 1 skipped, 3 deselected in 62.08s.
+- Feishu UAT storage and renewal focused files: 80 passed; renewal/cron/WebUI-auth audit set: 83 passed.
+- Repository TEST gate (`make test`): 2419 passed, 1 skipped, 3 deselected in 58.60s.
 - Python compile checks and `git diff --check`: passed.
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
 - Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.
+- A later formal review caught the stale-refresh/concurrent-reauthorization marker race. Thread-barrier, same-thread re-entry, profile-path validation, persistent lock-location, and real cross-process `flock` regressions now cover that finding; a fresh non-failing formal review is still required before release.
 
 No production service, database, model setting, Feishu credential, or user session was changed while collecting this evidence.
 

@@ -26,6 +26,7 @@ from .credential_renewal_common import (
     REASON_EMPTY_REFRESH_TOKEN,
     REASON_SCOPE_STRIPPED_BY_FEISHU,
     clear_needs_reauth_marker,
+    credential_identity_lock,
     marker_path_for_open_id,
     payload_has_offline_access,
     payload_has_refresh_token,
@@ -390,6 +391,28 @@ def refresh_uat_if_needed(
     A successful refresh must update both in one place to avoid token skew.
     """
     shared = shared_home or resolve_shared_home()
+    with credential_identity_lock(shared, profile_name, open_id):
+        return _refresh_uat_locked(
+            shared=shared,
+            profile_name=profile_name,
+            open_id=open_id,
+            force=force,
+            headroom_seconds=headroom_seconds,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+
+
+def _refresh_uat_locked(
+    *,
+    shared: Path,
+    profile_name: str,
+    open_id: str,
+    force: bool,
+    headroom_seconds: int,
+    client_id: str | None,
+    client_secret: str | None,
+) -> dict[str, Any] | None:
     _load_shared_env(shared)
     _assert_route(shared, profile_name, open_id)
     payload = _load_best_uat_payload(shared, profile_name, open_id)
@@ -714,42 +737,43 @@ def _store_uat(shared_home: Path, profile_name: str, open_id: str, payload: dict
     right owner — owner/admin for scope_stripped (app config), end-user for
     empty_refresh_token (re-auth).
     """
-    rejection = _l1_validate_uat(payload)
-    if rejection is not None:
-        _l1_write_reject_marker(shared_home, profile_name, open_id, rejection)
-        raise FeishuUatAuthError(
-            f"UAT rejected by L1 write-time validation: {rejection['reason']}",
-            status=400,
-        )
-    scopes = parse_scopes(payload.get("scope"))
-    store = CredentialStore(shared_home / "multitenancy.db")
-    try:
-        store.put_credential(
-            profile_name=profile_name,
-            subject_id=open_id,
-            provider="feishu",
-            secret_kind="uat",
-            payload=payload,
-            scopes=scopes,
-            expires_at=int(payload["expires_at"]) if payload.get("expires_at") else None,
-        )
-    finally:
-        store.close()
-    target = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
-    _atomic_write_json(target, payload)
+    with credential_identity_lock(shared_home, profile_name, open_id):
+        rejection = _l1_validate_uat(payload)
+        if rejection is not None:
+            _l1_write_reject_marker(shared_home, profile_name, open_id, rejection)
+            raise FeishuUatAuthError(
+                f"UAT rejected by L1 write-time validation: {rejection['reason']}",
+                status=400,
+            )
+        scopes = parse_scopes(payload.get("scope"))
+        store = CredentialStore(shared_home / "multitenancy.db")
+        try:
+            store.put_credential(
+                profile_name=profile_name,
+                subject_id=open_id,
+                provider="feishu",
+                secret_kind="uat",
+                payload=payload,
+                scopes=scopes,
+                expires_at=int(payload["expires_at"]) if payload.get("expires_at") else None,
+            )
+        finally:
+            store.close()
+        target = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+        _atomic_write_json(target, payload)
 
-    marker_paths = (
-        marker_path_for_open_id(target.parent, open_id),
-        marker_path_for_open_id(shared_home / "feishu_uat", open_id),
-    )
-    failed_markers = [
-        marker for marker in marker_paths if not clear_needs_reauth_marker(marker)
-    ]
-    if failed_markers:
-        raise FeishuUatAuthError(
-            "Feishu UAT was stored, but its reauthorization marker could not be cleared; retry authorization",
-            status=500,
+        marker_paths = (
+            marker_path_for_open_id(target.parent, open_id),
+            marker_path_for_open_id(shared_home / "feishu_uat", open_id),
         )
+        failed_markers = [
+            marker for marker in marker_paths if not clear_needs_reauth_marker(marker)
+        ]
+        if failed_markers:
+            raise FeishuUatAuthError(
+                "Feishu UAT was stored, but its reauthorization marker could not be cleared; retry authorization",
+                status=500,
+            )
 
 
 def _l1_validate_uat(payload: dict[str, Any]) -> Optional[dict[str, str]]:

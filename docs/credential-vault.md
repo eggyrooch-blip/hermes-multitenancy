@@ -110,6 +110,14 @@ Operational rules:
   have been written. A JSON-write or marker-unlink failure is reported instead
   of pretending recovery completed. Non-authoritative or transient refresh
   markers do not pause renewal.
+- Every Feishu UAT refresh and authorization store is serialized by exact
+  `(shared_home, profile_name, open_id)`. The re-entrant lock covers UAT load,
+  the bounded Feishu refresh request, both durable writes, and marker cleanup;
+  the renewal worker retains it through authoritative failure-marker creation.
+  Its cross-process `flock` lives at
+  `profiles/<profile>/feishu_uat/.<identity-hash>.renewal.lock` (mode `0600`)
+  so gateway, WebUI, and the profile's Linux/macOS sandbox all lock the same
+  host inode. The lock file is persistent and contains no identity or secret.
 - Do not classify a missing credential key as user re-auth by itself. If a valid
   profile-local Feishu UAT JSON exists, lark-cli can still run through the
   authsidecar broker; status and canary checks should report that connector path

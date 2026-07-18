@@ -9,14 +9,22 @@ Single source of truth for:
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - project targets POSIX
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +56,85 @@ SCOPE_STRIPPED_REASONS = frozenset({REASON_SCOPE_STRIPPED_BY_FEISHU})
 
 FIXTURE_DIRNAMES = frozenset({"feishu_uat.fixtures.bak"})
 MAX_REAUTH_MARKER_BYTES = 64 * 1024
+
+_IDENTITY_LOCKS_GUARD = threading.Lock()
+_IDENTITY_LOCKS: dict[tuple[str, str, str], threading.RLock] = {}
+_IDENTITY_LOCK_DEPTH = threading.local()
+
+
+def _identity_process_lock(key: tuple[str, str, str]) -> threading.RLock:
+    with _IDENTITY_LOCKS_GUARD:
+        lock = _IDENTITY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _IDENTITY_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str) -> Iterator[None]:
+    """Serialize credential refresh/recovery for one routed Feishu identity.
+
+    The renewal worker can run in more than one gateway process while a WebUI
+    authorization callback writes a replacement UAT in another process.  The
+    complete refresh/failure-marker/store/marker-clear sequence therefore uses
+    both an in-process re-entrant lock and a POSIX ``flock``.  Re-entry is
+    required because a successful refresh calls ``_store_uat`` while the
+    worker already owns this identity lock.
+    """
+    canonical_home = Path(os.path.realpath(shared_home))
+    profile = str(profile_name)
+    if (
+        not profile
+        or profile in {".", ".."}
+        or profile != profile.strip()
+        or Path(profile).name != profile
+    ):
+        raise ValueError("profile_name must be one profile directory name")
+    key = (str(canonical_home), profile, str(open_id))
+    process_lock = _identity_process_lock(key)
+
+    with process_lock:
+        depths = getattr(_IDENTITY_LOCK_DEPTH, "values", None)
+        if depths is None:
+            depths = {}
+            _IDENTITY_LOCK_DEPTH.values = depths
+        current_depth = int(depths.get(key, 0))
+        if current_depth:
+            depths[key] = current_depth + 1
+            try:
+                yield
+            finally:
+                depths[key] -= 1
+            return
+
+        # The routed profile is the only shared writable mount visible both to
+        # gateway/WebUI processes and to Linux/macOS sandboxed agent children.
+        # A lock under shared_home itself would be a private bwrap inode (or be
+        # denied by the macOS profile) and would not provide cross-process
+        # exclusion for direct refresh callers inside those sandboxes.
+        lock_dir = canonical_home / "profiles" / profile / "feishu_uat"
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(lock_dir, 0o700)
+        identity_digest = hashlib.sha256(
+            json.dumps([profile, str(open_id)], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        lock_path = lock_dir / f".{identity_digest}.renewal.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(lock_fd, 0o600)
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            depths[key] = 1
+            try:
+                yield
+            finally:
+                depths.pop(key, None)
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 # Benign, non-secret env vars a third-party credential-status/login CLI

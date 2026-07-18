@@ -27,6 +27,7 @@ from typing import Iterable, Optional
 from .credential_renewal_common import (
     REASON_REFRESH_REJECTED,
     classify_uat_payload,
+    credential_identity_lock,
     is_fixture_path,
     marker_requires_reauth,
     marker_path_for_open_id,
@@ -106,12 +107,13 @@ def run_renewal_tick(shared_home: Path, *, headroom_seconds: int) -> dict[str, i
     counters = {"scanned": 0, "refreshed": 0, "skipped": 0, "failed": 0}
     for profile_name, open_id in _iter_active_user_routes(shared_home):
         counters["scanned"] += 1
-        try:
-            outcome = _refresh_one(shared_home, profile_name, open_id, headroom_seconds)
-        except Exception as exc:
-            counters["failed"] += 1
-            _record_failure(shared_home, profile_name, open_id, exc)
-            continue
+        with credential_identity_lock(shared_home, profile_name, open_id):
+            try:
+                outcome = _refresh_one(shared_home, profile_name, open_id, headroom_seconds)
+            except Exception as exc:
+                counters["failed"] += 1
+                _record_failure(shared_home, profile_name, open_id, exc)
+                continue
         if outcome == "refreshed":
             counters["refreshed"] += 1
         else:
