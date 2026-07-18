@@ -391,6 +391,10 @@ def refresh_uat_if_needed(
     A successful refresh must update both in one place to avoid token skew.
     """
     shared = shared_home or resolve_shared_home()
+    profile_name = _clean_id("profile_name", profile_name)
+    open_id = _clean_id("open_id", open_id)
+    _load_shared_env(shared)
+    _assert_route(shared, profile_name, open_id)
     with credential_identity_lock(shared, profile_name, open_id):
         return _refresh_uat_locked(
             shared=shared,

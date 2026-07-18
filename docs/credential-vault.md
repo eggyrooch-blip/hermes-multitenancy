@@ -118,6 +118,10 @@ Operational rules:
   `profiles/<profile>/feishu_uat/.<identity-hash>.renewal.lock` (mode `0600`)
   so gateway, WebUI, and the profile's Linux/macOS sandbox all lock the same
   host inode. The lock file is persistent and contains no identity or secret.
+  Public refresh validates and normalizes the active route before creating
+  that lock, then rechecks the route inside the critical section. In-process
+  lock entries count owners/waiters and are evicted after the last user exits,
+  so profile churn cannot grow the gateway's lock registry indefinitely.
 - Do not classify a missing credential key as user re-auth by itself. If a valid
   profile-local Feishu UAT JSON exists, lark-cli can still run through the
   authsidecar broker; status and canary checks should report that connector path

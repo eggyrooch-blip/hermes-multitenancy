@@ -58,17 +58,36 @@ FIXTURE_DIRNAMES = frozenset({"feishu_uat.fixtures.bak"})
 MAX_REAUTH_MARKER_BYTES = 64 * 1024
 
 _IDENTITY_LOCKS_GUARD = threading.Lock()
-_IDENTITY_LOCKS: dict[tuple[str, str, str], threading.RLock] = {}
 _IDENTITY_LOCK_DEPTH = threading.local()
 
 
-def _identity_process_lock(key: tuple[str, str, str]) -> threading.RLock:
+@dataclass
+class _IdentityLockEntry:
+    lock: threading.RLock
+    users: int = 0
+
+
+_IDENTITY_LOCKS: dict[tuple[str, str, str], _IdentityLockEntry] = {}
+
+
+def _claim_identity_process_lock(key: tuple[str, str, str]) -> _IdentityLockEntry:
     with _IDENTITY_LOCKS_GUARD:
-        lock = _IDENTITY_LOCKS.get(key)
-        if lock is None:
-            lock = threading.RLock()
-            _IDENTITY_LOCKS[key] = lock
-        return lock
+        entry = _IDENTITY_LOCKS.get(key)
+        if entry is None:
+            entry = _IdentityLockEntry(lock=threading.RLock())
+            _IDENTITY_LOCKS[key] = entry
+        entry.users += 1
+        return entry
+
+
+def _release_identity_process_lock(
+    key: tuple[str, str, str],
+    entry: _IdentityLockEntry,
+) -> None:
+    with _IDENTITY_LOCKS_GUARD:
+        entry.users -= 1
+        if entry.users == 0 and _IDENTITY_LOCKS.get(key) is entry:
+            _IDENTITY_LOCKS.pop(key, None)
 
 
 @contextlib.contextmanager
@@ -92,49 +111,52 @@ def credential_identity_lock(shared_home: Path, profile_name: str, open_id: str)
     ):
         raise ValueError("profile_name must be one profile directory name")
     key = (str(canonical_home), profile, str(open_id))
-    process_lock = _identity_process_lock(key)
+    entry = _claim_identity_process_lock(key)
 
-    with process_lock:
-        depths = getattr(_IDENTITY_LOCK_DEPTH, "values", None)
-        if depths is None:
-            depths = {}
-            _IDENTITY_LOCK_DEPTH.values = depths
-        current_depth = int(depths.get(key, 0))
-        if current_depth:
-            depths[key] = current_depth + 1
-            try:
-                yield
-            finally:
-                depths[key] -= 1
-            return
+    try:
+        with entry.lock:
+            depths = getattr(_IDENTITY_LOCK_DEPTH, "values", None)
+            if depths is None:
+                depths = {}
+                _IDENTITY_LOCK_DEPTH.values = depths
+            current_depth = int(depths.get(key, 0))
+            if current_depth:
+                depths[key] = current_depth + 1
+                try:
+                    yield
+                finally:
+                    depths[key] -= 1
+                return
 
-        # The routed profile is the only shared writable mount visible both to
-        # gateway/WebUI processes and to Linux/macOS sandboxed agent children.
-        # A lock under shared_home itself would be a private bwrap inode (or be
-        # denied by the macOS profile) and would not provide cross-process
-        # exclusion for direct refresh callers inside those sandboxes.
-        lock_dir = canonical_home / "profiles" / profile / "feishu_uat"
-        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(lock_dir, 0o700)
-        identity_digest = hashlib.sha256(
-            json.dumps([profile, str(open_id)], separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        lock_path = lock_dir / f".{identity_digest}.renewal.lock"
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        lock_fd = os.open(lock_path, flags, 0o600)
-        try:
-            os.fchmod(lock_fd, 0o600)
-            if fcntl is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            depths[key] = 1
+            # The routed profile is the only shared writable mount visible both to
+            # gateway/WebUI processes and to Linux/macOS sandboxed agent children.
+            # A lock under shared_home itself would be a private bwrap inode (or be
+            # denied by the macOS profile) and would not provide cross-process
+            # exclusion for direct refresh callers inside those sandboxes.
+            lock_dir = canonical_home / "profiles" / profile / "feishu_uat"
+            lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(lock_dir, 0o700)
+            identity_digest = hashlib.sha256(
+                json.dumps([profile, str(open_id)], separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            lock_path = lock_dir / f".{identity_digest}.renewal.lock"
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(lock_path, flags, 0o600)
             try:
-                yield
-            finally:
-                depths.pop(key, None)
+                os.fchmod(lock_fd, 0o600)
                 if fcntl is not None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                depths[key] = 1
+                try:
+                    yield
+                finally:
+                    depths.pop(key, None)
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+    finally:
+        _release_identity_process_lock(key, entry)
 
 
 # Benign, non-secret env vars a third-party credential-status/login CLI

@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -348,6 +349,36 @@ def test_identity_lock_rejects_profile_path_traversal(tmp_path: Path, profile_na
     with pytest.raises(ValueError, match="profile_name"):
         with common.credential_identity_lock(tmp_path, profile_name, "ou_invalid_profile"):
             pytest.fail("invalid profile unexpectedly acquired a lock")
+
+
+def test_identity_process_lock_registry_evicts_idle_identities(tmp_path: Path):
+    canonical_home = str(tmp_path.resolve())
+
+    for index in range(128):
+        with common.credential_identity_lock(tmp_path, "alice", f"ou_churn_{index}"):
+            pass
+
+    assert all(key[0] != canonical_home for key in common._IDENTITY_LOCKS)
+
+
+def test_refresh_rejects_unrouted_identity_before_creating_lock_artifacts(tmp_path: Path):
+    with sqlite3.connect(tmp_path / "multitenancy.db") as conn:
+        conn.execute(
+            "CREATE TABLE multitenancy_routing "
+            "(profile_name TEXT, open_id TEXT, active INTEGER, kind TEXT)"
+        )
+
+    with pytest.raises(fua.FeishuUatAuthError) as raised:
+        fua.refresh_uat_if_needed(
+            profile_name="unrouted",
+            open_id="ou_unrouted",
+            shared_home=tmp_path,
+            force=True,
+        )
+
+    assert raised.value.status == 403
+    assert not (tmp_path / "profiles").exists()
+    assert all(key[0] != str(tmp_path.resolve()) for key in common._IDENTITY_LOCKS)
 
 
 def test_authoritative_refresh_failure_cannot_refreeze_concurrent_reauthorization(
