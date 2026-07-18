@@ -543,12 +543,34 @@ def clear_reauth_markers_if_uat_recovered(
     marker_path: Path,
 ) -> bool:
     """Clear reauth markers when a newer valid UAT proves recovery."""
+    marker_profile = _profile_name_for_reauth_marker(shared_home, marker_path, open_id)
+    if marker_profile is None:
+        return False
+    try:
+        with credential_identity_lock(shared_home, marker_profile, open_id):
+            if _profile_name_for_reauth_marker(shared_home, marker_path, open_id) != marker_profile:
+                return False
+            return _clear_reauth_markers_if_uat_recovered_locked(
+                shared_home,
+                open_id,
+                marker_path,
+                marker_profile,
+            )
+    except (OSError, ValueError):
+        return False
+
+
+def _clear_reauth_markers_if_uat_recovered_locked(
+    shared_home: Path,
+    open_id: str,
+    marker_path: Path,
+    marker_profile: str,
+) -> bool:
     try:
         marker_stat = marker_path.stat()
     except OSError:
         return False
     marker_mtime = marker_stat.st_mtime
-    marker_profile = _profile_name_for_reauth_marker(shared_home, marker_path)
 
     recovered_mtime: float | None = None
     for loc in iter_uat_locations(shared_home):
@@ -619,21 +641,60 @@ def clear_reauth_markers_if_uat_recovered(
     return True
 
 
-def _profile_name_for_reauth_marker(shared_home: Path, marker_path: Path) -> str | None:
+def _profile_name_for_reauth_marker(
+    shared_home: Path,
+    marker_path: Path,
+    open_id: str,
+) -> str | None:
+    if not _safe_identity_component(open_id) or marker_path.name not in {
+        f"{open_id}.needs_reauth",
+        f"{open_id}.json.needs_reauth",
+    }:
+        return None
     try:
         relative = marker_path.relative_to(shared_home / "profiles")
     except ValueError:
+        try:
+            legacy_relative = marker_path.relative_to(shared_home / "feishu_uat")
+        except ValueError:
+            return None
+        if len(legacy_relative.parts) != 1:
+            return None
         candidate = str((read_needs_reauth_marker(marker_path) or {}).get("profile") or "")
+        if not candidate:
+            candidates = {
+                loc.profile_name
+                for loc in iter_uat_locations(shared_home)
+                if loc.open_id == open_id and not loc.legacy and loc.profile_name
+            }
+            if len(candidates) != 1:
+                return None
+            candidate = candidates.pop()
     else:
-        candidate = relative.parts[0] if len(relative.parts) >= 3 else ""
-    if (
-        not candidate
-        or candidate != candidate.strip()
-        or candidate in {".", ".."}
-        or Path(candidate).name != candidate
-    ):
+        candidate = (
+            relative.parts[0]
+            if len(relative.parts) == 3 and relative.parts[1] == "feishu_uat"
+            else ""
+        )
+    if not _safe_identity_component(candidate):
+        return None
+    if not (shared_home / "profiles" / candidate).is_dir():
         return None
     return candidate
+
+
+def _safe_identity_component(value: str) -> bool:
+    value = str(value or "")
+    return bool(
+        value
+        and value == value.strip()
+        and value not in {".", ".."}
+        and ".." not in value
+        and "/" not in value
+        and "\\" not in value
+        and "\0" not in value
+        and Path(value).name == value
+    )
 
 
 def _newer_usable_vault_uat_mtime(

@@ -734,6 +734,93 @@ def test_recovery_keeps_authoritative_refresh_rejected_marker(tmp_path: Path):
     assert marker.is_file()
 
 
+def test_recovery_rechecks_marker_after_identity_locked_writer_swap(tmp_path: Path):
+    profile_name = "alice"
+    open_id = "ou_marker_swap"
+    marker = tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="old rejected token",
+        extra={
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    old_ts = time.time() - 60
+    os.utime(marker, (old_ts, old_ts))
+    _seed_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+
+    started = threading.Event()
+    finished = threading.Event()
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def recover() -> None:
+        started.set()
+        try:
+            results.append(
+                common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker)
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    with common.credential_identity_lock(tmp_path, profile_name, open_id):
+        worker = threading.Thread(target=recover)
+        worker.start()
+        assert started.wait(timeout=2)
+        assert not finished.wait(timeout=0.1)
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail="new rejected token",
+            extra={
+                "profile": profile_name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+        future = time.time() + 1
+        os.utime(marker, (future, future))
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [False]
+    assert common.read_needs_reauth_marker(marker)["detail"] == "new rejected token"
+
+
+@pytest.mark.parametrize("profile_value", [None, "../unsafe"])
+def test_recovery_keeps_authoritative_legacy_marker_without_safe_profile(
+    tmp_path: Path,
+    profile_value: str | None,
+):
+    open_id = "ou_unsafe_legacy"
+    marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
+    extra: dict[str, Any] = {
+        "authoritative": True,
+        "refresh_class": "invalid",
+    }
+    if profile_value is not None:
+        extra["profile"] = profile_value
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="authoritative legacy marker",
+        extra=extra,
+    )
+    old_ts = time.time() - 60
+    os.utime(marker, (old_ts, old_ts))
+    _seed_uat(tmp_path, None, open_id, _valid_payload(open_id))
+
+    assert common.clear_reauth_markers_if_uat_recovered(tmp_path, open_id, marker) is False
+    assert marker.is_file()
+    assert not (tmp_path / "profiles").exists()
+
+
 def test_recovery_uses_newer_vault_uat_after_profile_json_write_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -790,10 +877,12 @@ def test_recovery_uses_newer_vault_uat_after_profile_json_write_failure(
     finally:
         store.close()
 
-    assert common.clear_reauth_markers_if_uat_recovered(
-        tmp_path, open_id, markers[0]
-    ) is True
+    with common.credential_identity_lock(tmp_path, profile_name, open_id):
+        assert common.clear_reauth_markers_if_uat_recovered(
+            tmp_path, open_id, markers[0]
+        ) is True
     assert all(not marker.exists() for marker in markers)
+    assert common._IDENTITY_LOCKS == {}
 
 
 def test_recovery_keeps_authoritative_marker_for_older_vault_uat(

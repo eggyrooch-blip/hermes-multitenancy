@@ -13,6 +13,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -94,6 +95,8 @@ class FeishuAuthSession:
     status: str = "pending"
     error: str = ""
     _pending_token_payload: dict[str, Any] | None = field(default=None, repr=False)
+    # Session-owned: no side registry survives after the session is released.
+    _poll_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 _sessions: dict[str, FeishuAuthSession] = {}
@@ -598,57 +601,69 @@ def poll_session(
         raise FeishuUatAuthError("authorization session not found", status=404)
     if session.profile_name != profile_name or session.open_id != open_id:
         raise FeishuUatAuthError("authorization session does not belong to this user", status=403)
-    _assert_route(shared, profile_name, open_id)
-    if session.status in {"success", "error", "expired"}:
-        return _session_public(session)
-    if session._pending_token_payload is None and int(time.time()) >= session.expires_at:
-        session.status = "expired"
-        session.error = "authorization session expired"
-        return _session_public(session)
-
-    payload = session._pending_token_payload
-    if payload is None:
-        result = _poll_device_token(session.device_code, session.client_id, session.client_secret)
-        error = str(result.get("error") or "").strip()
-        if error in {"authorization_pending", "slow_down"} or (not error and not result.get("access_token")):
-            return _session_public(session)
-        if error:
-            session.status = "error"
-            session.error = str(result.get("error_description") or error)
-            return _session_public(session)
-
-        token_open_id = str(result.get("open_id") or "").strip()
-        if not token_open_id:
-            user_info = _fetch_user_info(str(result.get("access_token") or ""))
-            token_open_id = str(user_info.get("open_id") or "").strip()
-        if token_open_id != open_id:
-            session.status = "error"
-            session.error = f"authorized account does not match requesting Feishu user ({token_open_id} does not match {open_id})"
-            raise FeishuUatAuthError(session.error, status=403)
-
-        payload = _token_payload(result, open_id=open_id, app_id=session.client_id, scope=session.scope)
-        session._pending_token_payload = payload
+    if not session._poll_lock.acquire(blocking=False):
+        pending = _session_public(session)
+        pending["status"] = "pending"
+        pending.pop("error", None)
+        return pending
     try:
-        _store_uat(
-            shared,
-            profile_name,
-            open_id,
-            payload,
-            lock_timeout_seconds=_POLL_STORE_LOCK_TIMEOUT_SECONDS,
-        )
-    except CredentialIdentityLockTimeout:
-        return _session_public(session)
-    except Exception as exc:
-        if _is_transient_uat_store_error(exc):
+        _assert_route(shared, profile_name, open_id)
+        if session.status in {"success", "error", "expired"}:
             return _session_public(session)
-        session._pending_token_payload = None
-        if isinstance(exc, FeishuUatAuthError):
+        if int(time.time()) >= session.expires_at:
+            session._pending_token_payload = None
+            session.status = "expired"
+            session.error = "authorization session expired"
+            return _session_public(session)
+
+        payload = session._pending_token_payload
+        if payload is None:
+            result = _poll_device_token(session.device_code, session.client_id, session.client_secret)
+            error = str(result.get("error") or "").strip()
+            if error in {"authorization_pending", "slow_down"} or (not error and not result.get("access_token")):
+                return _session_public(session)
+            if error:
+                session.status = "error"
+                session.error = str(result.get("error_description") or error)
+                return _session_public(session)
+
+            token_open_id = str(result.get("open_id") or "").strip()
+            if not token_open_id:
+                user_info = _fetch_user_info(str(result.get("access_token") or ""))
+                token_open_id = str(user_info.get("open_id") or "").strip()
+            if token_open_id != open_id:
+                session.status = "error"
+                session.error = f"authorized account does not match requesting Feishu user ({token_open_id} does not match {open_id})"
+                raise FeishuUatAuthError(session.error, status=403)
+
+            payload = _token_payload(result, open_id=open_id, app_id=session.client_id, scope=session.scope)
+            session._pending_token_payload = payload
+        try:
+            _store_uat(
+                shared,
+                profile_name,
+                open_id,
+                payload,
+                lock_timeout_seconds=_POLL_STORE_LOCK_TIMEOUT_SECONDS,
+            )
+        except CredentialIdentityLockTimeout:
+            return _session_public(session)
+        except Exception as exc:
+            if _is_transient_uat_store_error(exc):
+                return _session_public(session)
+            session._pending_token_payload = None
             session.status = "error"
-            session.error = exc.message
-        raise
-    session._pending_token_payload = None
-    session.status = "success"
-    return _session_public(session)
+            session.error = (
+                exc.message
+                if isinstance(exc, FeishuUatAuthError)
+                else "authorization credential storage failed; please authorize again"
+            )
+            raise
+        session._pending_token_payload = None
+        session.status = "success"
+        return _session_public(session)
+    finally:
+        session._poll_lock.release()
 
 
 def cancel_session(*, session_id: str, profile_name: str, open_id: str) -> dict[str, Any]:
@@ -657,10 +672,11 @@ def cancel_session(*, session_id: str, profile_name: str, open_id: str) -> dict[
         raise FeishuUatAuthError("authorization session not found", status=404)
     if session.profile_name != profile_name or session.open_id != open_id:
         raise FeishuUatAuthError("authorization session does not belong to this user", status=403)
-    session._pending_token_payload = None
-    session.status = "error"
-    session.error = "cancelled"
-    return _session_public(session)
+    with session._poll_lock:
+        session._pending_token_payload = None
+        session.status = "error"
+        session.error = "cancelled"
+        return _session_public(session)
 
 
 def _assert_route(shared_home: Path, profile_name: str, open_id: str) -> None:

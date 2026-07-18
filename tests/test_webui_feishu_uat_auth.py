@@ -940,6 +940,83 @@ def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path
         store.close()
 
 
+def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session_id = "duplicate-poll"
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=session_id,
+        device_code="device-duplicate",
+    )
+    exchange_started = threading.Event()
+    release_exchange = threading.Event()
+    poll_calls: list[str] = []
+    store_calls = 0
+    worker_results: list[dict] = []
+    worker_errors: list[BaseException] = []
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        if len(poll_calls) == 1:
+            exchange_started.set()
+            assert release_exchange.wait(timeout=2)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "one-time-refresh",
+            "open_id": "ou_owner",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def store_uat(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+
+    def poll_in_worker() -> None:
+        try:
+            worker_results.append(
+                feishu_uat_auth.poll_session(
+                    session_id=session_id,
+                    profile_name="owner",
+                    open_id="ou_owner",
+                    shared_home=shared,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            worker_errors.append(exc)
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
+    worker = threading.Thread(target=poll_in_worker)
+    worker.start()
+    assert exchange_started.wait(timeout=2)
+    started = time.monotonic()
+    try:
+        duplicate = feishu_uat_auth.poll_session(
+            session_id=session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+        assert duplicate["status"] == "pending"
+        assert time.monotonic() - started < 0.5
+        assert "one-time-access" not in str(duplicate)
+    finally:
+        release_exchange.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert worker_results[0]["status"] == "success"
+    assert poll_calls == ["device-duplicate"]
+    assert store_calls == 1
+    assert session._poll_lock.acquire(blocking=False)
+    session._poll_lock.release()
+
+
 @pytest.mark.parametrize(
     "store_error",
     [
@@ -1055,6 +1132,49 @@ def test_poll_session_stabilizes_terminal_store_error_without_repoll(tmp_path, m
     assert store_calls == 1
 
 
+def test_poll_session_expires_and_clears_cached_payload(tmp_path, monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="expired-cached-payload",
+        device_code="device-expired",
+    )
+    session.expires_at = int(time.time()) - 1
+    session._pending_token_payload = {
+        "access_token": "one-time-access",
+        "refresh_token": "one-time-refresh",
+        "user_open_id": "ou_owner",
+    }
+    poll_calls: list[str] = []
+    store_calls = 0
+
+    def poll_token(*_args, **_kwargs):
+        poll_calls.append("called")
+        return {}
+
+    def store_uat(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
+
+    result = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert result["status"] == "expired"
+    assert result["error"] == "authorization session expired"
+    assert session._pending_token_payload is None
+    assert poll_calls == []
+    assert store_calls == 0
+
+
 @pytest.mark.parametrize(
     "store_error",
     [
@@ -1064,7 +1184,7 @@ def test_poll_session_stabilizes_terminal_store_error_without_repoll(tmp_path, m
     ],
     ids=["sqlite-schema", "filesystem-full", "unknown"],
 )
-def test_poll_session_discards_token_after_nonretryable_store_error(
+def test_poll_session_stabilizes_nonretryable_store_error_without_reexchange(
     tmp_path, monkeypatch, store_error
 ):
     from hermes_multitenancy import feishu_uat_auth
@@ -1082,9 +1202,19 @@ def test_poll_session_discards_token_after_nonretryable_store_error(
         "user_open_id": "ou_owner",
     }
 
+    poll_calls: list[str] = []
+    store_calls = 0
+
+    def poll_token(*_args, **_kwargs):
+        poll_calls.append("called")
+        return {}
+
     def fail_store(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
         raise store_error
 
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
     monkeypatch.setattr(feishu_uat_auth, "_store_uat", fail_store)
 
     with pytest.raises(type(store_error)):
@@ -1095,7 +1225,18 @@ def test_poll_session_discards_token_after_nonretryable_store_error(
             shared_home=shared,
         )
 
+    second = feishu_uat_auth.poll_session(
+        session_id=session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
     assert session._pending_token_payload is None
+    assert second["status"] == "error"
+    assert second["error"] == "authorization credential storage failed; please authorize again"
+    assert poll_calls == []
+    assert store_calls == 1
 
 
 def test_webui_feishu_auth_session_uses_vault_app_credentials_when_env_missing(tmp_path, monkeypatch):
