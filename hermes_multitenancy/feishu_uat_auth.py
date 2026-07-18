@@ -25,6 +25,7 @@ from .credentials import CredentialStore
 from .credential_renewal_common import (
     REASON_EMPTY_REFRESH_TOKEN,
     REASON_SCOPE_STRIPPED_BY_FEISHU,
+    clear_needs_reauth_marker,
     marker_path_for_open_id,
     payload_has_offline_access,
     payload_has_refresh_token,
@@ -736,6 +737,19 @@ def _store_uat(shared_home: Path, profile_name: str, open_id: str, payload: dict
         store.close()
     target = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
     _atomic_write_json(target, payload)
+
+    marker_paths = (
+        marker_path_for_open_id(target.parent, open_id),
+        marker_path_for_open_id(shared_home / "feishu_uat", open_id),
+    )
+    failed_markers = [
+        marker for marker in marker_paths if not clear_needs_reauth_marker(marker)
+    ]
+    if failed_markers:
+        raise FeishuUatAuthError(
+            "Feishu UAT was stored, but its reauthorization marker could not be cleared; retry authorization",
+            status=500,
+        )
 
 
 def _l1_validate_uat(payload: dict[str, Any]) -> Optional[dict[str, str]]:

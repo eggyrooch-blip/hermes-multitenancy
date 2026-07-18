@@ -30,7 +30,8 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 ## Credential renewal
 
 - The renewal worker skips refresh only for a strict Feishu-authoritative marker with `reason=refresh_rejected`, JSON boolean `authoritative=true`, and `refresh_class=invalid`.
-- Removing the marker through the existing reauthorization flow resumes proactive refresh.
+- A successful real `_store_uat` clears the exact user's profile-local and legacy marker only after both the credential vault and profile compatibility JSON are durable. Proactive L2 refresh then resumes normally.
+- A profile JSON write failure leaves both markers intact. If either marker cannot be removed, authorization reports an explicit server error rather than claiming recovery while renewal remains frozen.
 - Invalid UTF-8, oversized content, deep JSON, overlong integers, non-boolean authority and other malformed/non-authoritative markers are untrusted and do not freeze renewal or crash the tick.
 
 ## Known gotchas
@@ -49,12 +50,14 @@ Status: local ftask candidate only. Not pushed or deployed; production is unchan
 - SQLite `SELECT` followed by `INSERT OR REPLACE` is not an atomic fresh decision; retain the conditional UPSERT.
 - A missing SessionStore is not an in-memory fallback for keyed requests; only a request with no dedupe record may proceed without it.
 - Only strict authoritative invalid-refresh markers stop renewal. A blanket `.needs_reauth` skip would freeze recoverable credentials.
+- Persisting a fresh UAT without clearing both exact reauth-marker paths leaves L2 permanently frozen; marker cleanup belongs after the vault and JSON writes and must fail visibly.
 
 ## Local evidence
 
 - RunBroker + sync/async ingest: 114 passed.
 - Lifecycle-focused credential, hook, broker, ingest and streaming-card selection: 315 passed in 2.04s.
-- Full pytest: 2405 passed, 1 skipped, 3 deselected in 55.67s.
+- Feishu UAT storage and renewal focused files: 71 passed; renewal/cron/WebUI-auth audit set: 74 passed.
+- Repository TEST gate (`make test`): 2410 passed, 1 skipped, 3 deselected in 62.08s.
 - Python compile checks and `git diff --check`: passed.
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
 - Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.

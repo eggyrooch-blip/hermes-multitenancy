@@ -124,6 +124,205 @@ def test_l1_normalise_refresh_response_accepts_valid():
     assert out["refresh_token"] == "t_refresh"
 
 
+def test_store_uat_clears_profile_and_legacy_reauth_markers_and_unblocks_l2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    profile_name = "alice"
+    open_id = "ou_reauthorized"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    marker_paths = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
+        tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
+    )
+    for marker in marker_paths:
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail="Feishu rejected the old refresh token",
+            extra={
+                "layer": "L2",
+                "profile": profile_name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+    unrelated_markers = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / "ou_other.needs_reauth",
+        tmp_path / "profiles" / "bob" / "feishu_uat" / f"{open_id}.needs_reauth",
+    )
+    for marker in unrelated_markers:
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail="unrelated user",
+            extra={
+                "layer": "L2",
+                "profile": marker.parent.parent.name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+    diagnostic = marker_paths[0].with_suffix(".refresh_diagnostic")
+    diagnostic.write_text("keep diagnostic", encoding="utf-8")
+
+    refreshes = []
+    monkeypatch.setattr(
+        fua,
+        "refresh_uat_if_needed",
+        lambda **kwargs: refreshes.append(kwargs),
+    )
+    assert credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    ) == "skipped"
+    assert refreshes == []
+
+    payload = _valid_payload(open_id)
+    payload["expires_at"] = int(time.time() * 1000) + 1_000
+    fua._store_uat(tmp_path, profile_name, open_id, payload)
+
+    assert all(not marker.exists() for marker in marker_paths)
+    assert all(marker.is_file() for marker in unrelated_markers)
+    assert diagnostic.read_text(encoding="utf-8") == "keep diagnostic"
+    assert json.loads(
+        (tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json").read_text(
+            encoding="utf-8"
+        )
+    ) == payload
+    store = CredentialStore(tmp_path / "multitenancy.db")
+    try:
+        assert store.get_secret_for_runtime(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+        ) == payload
+    finally:
+        store.close()
+
+    outcome = credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    )
+
+    assert outcome == "refreshed"
+    assert len(refreshes) == 1
+    assert refreshes[0]["force"] is True
+
+
+def test_store_uat_keeps_reauth_markers_when_profile_json_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_json_failure"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    marker_paths = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
+        tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
+    )
+    for marker in marker_paths:
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail="old token rejected",
+            extra={
+                "layer": "L2",
+                "profile": profile_name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+    monkeypatch.setattr(
+        fua,
+        "_atomic_write_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        fua._store_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+
+    assert all(marker.is_file() for marker in marker_paths)
+    assert all(common.marker_requires_reauth(common.read_needs_reauth_marker(marker) or {}) for marker in marker_paths)
+
+
+def test_store_uat_reports_marker_cleanup_failure_without_false_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_marker_failure"
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    profile_marker = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    legacy_marker = tmp_path / "feishu_uat" / f"{open_id}.needs_reauth"
+    for marker in (profile_marker, legacy_marker):
+        common.write_needs_reauth_marker(
+            marker,
+            reason=common.REASON_REFRESH_REJECTED,
+            detail="old token rejected",
+            extra={
+                "layer": "L2",
+                "profile": profile_name,
+                "authoritative": True,
+                "refresh_class": "invalid",
+            },
+        )
+    real_clear = fua.clear_needs_reauth_marker
+
+    def fail_profile_marker(marker: Path) -> bool:
+        return False if marker == profile_marker else real_clear(marker)
+
+    monkeypatch.setattr(fua, "clear_needs_reauth_marker", fail_profile_marker)
+
+    with pytest.raises(fua.FeishuUatAuthError) as raised:
+        fua._store_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+
+    assert raised.value.status == 500
+    assert profile_marker.is_file()
+    assert not legacy_marker.exists()
+    assert (tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json").is_file()
+    assert common.marker_requires_reauth(common.read_needs_reauth_marker(profile_marker) or {})
+    assert credential_renewal_worker._refresh_one(
+        tmp_path, profile_name, open_id, headroom_seconds=300
+    ) == "skipped"
+
+
+@pytest.mark.parametrize(
+    ("broken_field", "broken_value", "expected_reason"),
+    [
+        ("refresh_token", "", common.REASON_EMPTY_REFRESH_TOKEN),
+        ("scope", "im:message", common.REASON_SCOPE_STRIPPED_BY_FEISHU),
+    ],
+)
+def test_store_uat_l1_rejection_keeps_both_new_reauth_markers(
+    tmp_path: Path,
+    broken_field: str,
+    broken_value: str,
+    expected_reason: str,
+):
+    profile_name = "alice"
+    open_id = "ou_l1_rejected"
+    payload = _valid_payload(open_id)
+    payload[broken_field] = broken_value
+
+    with pytest.raises(fua.FeishuUatAuthError) as raised:
+        fua._store_uat(tmp_path, profile_name, open_id, payload)
+
+    assert raised.value.status == 400
+    marker_paths = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth",
+        tmp_path / "feishu_uat" / f"{open_id}.needs_reauth",
+    )
+    for marker in marker_paths:
+        body = common.read_needs_reauth_marker(marker)
+        assert body is not None
+        assert body["reason"] == expected_reason
+    assert not (tmp_path / "multitenancy.db").exists()
+    assert not (tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json").exists()
+
+
 # ---------------------------------------------------------------------------
 # L5 — startup audit
 # ---------------------------------------------------------------------------

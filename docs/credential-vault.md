@@ -104,8 +104,12 @@ Operational rules:
 - An authoritative Feishu invalid-refresh marker
   (`reason=refresh_rejected`, `authoritative=true`, `refresh_class=invalid`)
   pauses the proactive renewal worker for that user. It must stay paused until
-  successful user authorization removes the marker. Non-authoritative or
-  transient refresh markers do not pause renewal.
+  successful user authorization removes the marker. The authorization store
+  clears only that exact `(profile_name, open_id)` profile-local marker and its
+  legacy mirror, and only after both the credential vault and compatibility JSON
+  have been written. A JSON-write or marker-unlink failure is reported instead
+  of pretending recovery completed. Non-authoritative or transient refresh
+  markers do not pause renewal.
 - Do not classify a missing credential key as user re-auth by itself. If a valid
   profile-local Feishu UAT JSON exists, lark-cli can still run through the
   authsidecar broker; status and canary checks should report that connector path
