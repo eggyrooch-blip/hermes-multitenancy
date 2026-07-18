@@ -1,7 +1,10 @@
 """US-007 / US-03 — RoutingTable behavior and schema migration coverage."""
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -59,6 +62,124 @@ def test_soft_delete_then_resurrect(table):
 
 def test_soft_delete_missing_user_returns_false(table):
     assert table.soft_delete("u_nonexistent") is False
+
+
+@pytest.mark.parametrize("mutation", ["upsert", "soft_delete"])
+def test_route_mutation_does_not_provision_profile_directory(tmp_path, mutation):
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / "shared"
+    table = RoutingTable(shared_home / "multitenancy.db")
+    try:
+        table.upsert(user_id="u_1", profile_name="alice", open_id="ou_1")
+        if mutation == "soft_delete":
+            table.soft_delete("u_1")
+    finally:
+        table.close()
+
+    assert not (shared_home / "profiles").exists()
+
+
+@pytest.mark.parametrize("mutation", ["upsert", "soft_delete"])
+def test_route_mutation_preserves_existing_profile_mode(tmp_path, mutation):
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared_home = tmp_path / "shared"
+    profile_dir = shared_home / "profiles" / "alice"
+    profile_dir.mkdir(parents=True, mode=0o750)
+    profile_dir.chmod(0o750)
+    table = RoutingTable(shared_home / "multitenancy.db")
+    try:
+        table.upsert(user_id="u_1", profile_name="alice", open_id="ou_1")
+        if mutation == "soft_delete":
+            table.soft_delete("u_1")
+    finally:
+        table.close()
+
+    assert profile_dir.stat().st_mode & 0o777 == 0o750
+    assert (profile_dir / "feishu_uat").stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("mutation", ["upsert", "soft_delete"])
+def test_route_mutation_lock_contention_is_bounded_and_logged(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    mutation,
+):
+    from hermes_multitenancy import credential_renewal_common as common
+    from hermes_multitenancy import routing as routing_mod
+
+    shared_home = tmp_path / "shared"
+    table = routing_mod.RoutingTable(shared_home / "multitenancy.db")
+    table.upsert(user_id="u_1", profile_name="alice", open_id="ou_1")
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lock():
+        with common.credential_identity_lock(shared_home, "alice", "ou_1"):
+            lock_held.set()
+            release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert lock_held.wait(timeout=2)
+    monkeypatch.setattr(routing_mod, "_ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS", 0.05)
+    started_at = time.monotonic()
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_multitenancy.routing"):
+            with pytest.raises(common.CredentialIdentityLockTimeout):
+                if mutation == "upsert":
+                    table.upsert(
+                        user_id="u_1",
+                        profile_name="replacement",
+                        open_id="ou_1",
+                    )
+                else:
+                    table.soft_delete("u_1")
+        assert time.monotonic() - started_at < 1
+        assert "profile_name=alice" in caplog.text
+        assert "open_id=ou_1" in caplog.text
+    finally:
+        release_lock.set()
+        holder.join(timeout=2)
+        table.close()
+
+    assert not holder.is_alive()
+
+
+@pytest.mark.parametrize("mutation", ["upsert", "soft_delete"])
+def test_route_mutation_caps_identity_recheck_retries(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    from hermes_multitenancy import routing as routing_mod
+
+    table = routing_mod.RoutingTable(tmp_path / "multitenancy.db")
+    monkeypatch.setattr(routing_mod, "_ROUTE_IDENTITY_RETRY_LIMIT", 3)
+    observations = 0
+
+    def changing_identity(_user_id):
+        nonlocal observations
+        observations += 1
+        return ("alice", f"ou_churn_{observations}")
+
+    monkeypatch.setattr(table, "_active_user_identity", changing_identity)
+    try:
+        with pytest.raises(routing_mod.RouteIdentityConflictError):
+            if mutation == "upsert":
+                table.upsert(
+                    user_id="u_churn",
+                    profile_name="alice",
+                    open_id="ou_target",
+                )
+            else:
+                table.soft_delete("u_churn")
+    finally:
+        table.close()
+
+    assert observations == 6
 
 
 def test_touch_active_updates_last_active_at(table):

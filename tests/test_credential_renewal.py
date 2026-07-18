@@ -384,6 +384,30 @@ def test_identity_lock_hardens_created_profile_directories(tmp_path: Path):
     assert profiles_dir.stat().st_mode & 0o777 == 0o755
 
 
+def test_identity_lock_does_not_chmod_existing_profile_directory(tmp_path: Path):
+    profile_dir = tmp_path / "profiles" / "alice"
+    profile_dir.mkdir(parents=True, mode=0o755)
+    profile_dir.chmod(0o755)
+
+    with common.credential_identity_lock(tmp_path, "alice", "ou_existing_mode"):
+        pass
+
+    assert profile_dir.stat().st_mode & 0o777 == 0o755
+    assert (profile_dir / "feishu_uat").stat().st_mode & 0o777 == 0o700
+
+
+def test_identity_lock_nonprovisioning_mode_creates_no_directories(tmp_path: Path):
+    with common.credential_identity_lock(
+        tmp_path,
+        "alice",
+        "ou_no_provision",
+        create_missing=False,
+    ):
+        pass
+
+    assert not (tmp_path / "profiles").exists()
+
+
 @pytest.mark.parametrize("profile_name", ["", ".", "..", "../bob", "/tmp/bob", " alice"])
 def test_identity_lock_rejects_profile_path_traversal(tmp_path: Path, profile_name: str):
     with pytest.raises(ValueError, match="profile_name"):
@@ -624,6 +648,17 @@ with credential_identity_lock(shared_home, sys.argv[4], sys.argv[5]):
             if time.monotonic() >= deadline:
                 pytest.fail("timed out waiting for child to hold identity lock")
             time.sleep(0.01)
+
+        started_at = time.monotonic()
+        with pytest.raises(common.CredentialIdentityLockTimeout):
+            with common.credential_identity_lock(
+                tmp_path,
+                profile_name,
+                open_id,
+                timeout_seconds=0.05,
+            ):
+                pytest.fail("contended identity lock unexpectedly acquired")
+        assert time.monotonic() - started_at < 1
 
         parent_thread = threading.Thread(target=acquire_in_parent)
         parent_thread.start()

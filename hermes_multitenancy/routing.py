@@ -28,13 +28,22 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from uuid import uuid4
 
-from .credential_renewal_common import credential_identity_lock
+from .credential_renewal_common import (
+    CredentialIdentityLockTimeout,
+    credential_identity_lock,
+)
 
 logger = logging.getLogger(__name__)
 
 # Default db path — independent from ~/.hermes/state.db so router writes don't
 # contend with gateway sessions/pairing/cron writes for the WAL.
 DEFAULT_DB_PATH = Path.home() / ".hermes" / "multitenancy.db"
+_ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS = 5.0
+_ROUTE_IDENTITY_RETRY_LIMIT = 5
+
+
+class RouteIdentityConflictError(RuntimeError):
+    """A route changed too often to acquire a stable old/new identity fence."""
 
 KIND_USER = "user"
 KIND_GROUP = "group"
@@ -396,14 +405,32 @@ class RoutingTable:
         identities: set[tuple[str, str]],
     ) -> Iterator[None]:
         if self.db_path == ":memory:":
+            # In-memory tables are single-process test fixtures and cannot
+            # participate in the profile-local cross-process flock protocol.
             yield
             return
         shared_home = Path(self.db_path).parent
         with contextlib.ExitStack() as stack:
             for profile_name, open_id in sorted(identities):
-                stack.enter_context(
-                    credential_identity_lock(shared_home, profile_name, open_id)
-                )
+                try:
+                    stack.enter_context(
+                        credential_identity_lock(
+                            shared_home,
+                            profile_name,
+                            open_id,
+                            timeout_seconds=_ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS,
+                            create_missing=False,
+                        )
+                    )
+                except CredentialIdentityLockTimeout:
+                    logger.warning(
+                        "Timed out acquiring credential identity lock for route update "
+                        "(profile_name=%s, open_id=%s, timeout_seconds=%s)",
+                        profile_name,
+                        open_id,
+                        _ROUTE_IDENTITY_LOCK_TIMEOUT_SECONDS,
+                    )
+                    raise
             yield
 
     def _migrate(self) -> None:
@@ -789,7 +816,7 @@ class RoutingTable:
         provenance: str = "auto",
     ) -> None:
         """Insert or refresh a USER route. Bumps version, sets synced_at to now."""
-        while True:
+        for attempt in range(_ROUTE_IDENTITY_RETRY_LIMIT):
             previous_identity = self._active_user_identity(user_id)
             # Known gotcha: _store_uat's in-lock route check is a TOCTOU unless
             # route writers hold the same old/new credential identity lock(s).
@@ -801,6 +828,10 @@ class RoutingTable:
                 try:
                     if self._active_user_identity(user_id) != previous_identity:
                         self._conn.rollback()
+                        if attempt + 1 >= _ROUTE_IDENTITY_RETRY_LIMIT:
+                            raise RouteIdentityConflictError(
+                                f"route identity kept changing for user_id={user_id}"
+                            )
                         continue
                     now = _now()
                     self._conn.execute(
@@ -837,6 +868,9 @@ class RoutingTable:
                 except Exception:
                     self._conn.rollback()
                     raise
+        raise RouteIdentityConflictError(
+            f"route identity kept changing for user_id={user_id}"
+        )
 
     def upsert_group(
         self,
@@ -1629,7 +1663,7 @@ class RoutingTable:
 
     def soft_delete(self, user_id: str) -> bool:
         """Mark a route as inactive (kind-agnostic). Returns True on update."""
-        while True:
+        for attempt in range(_ROUTE_IDENTITY_RETRY_LIMIT):
             previous_identity = self._active_user_identity(user_id)
             lock_identities = {previous_identity} if previous_identity else set()
             with self._credential_identity_locks(lock_identities):
@@ -1637,6 +1671,10 @@ class RoutingTable:
                 try:
                     if self._active_user_identity(user_id) != previous_identity:
                         self._conn.rollback()
+                        if attempt + 1 >= _ROUTE_IDENTITY_RETRY_LIMIT:
+                            raise RouteIdentityConflictError(
+                                f"route identity kept changing for user_id={user_id}"
+                            )
                         continue
                     now = _now()
                     cur = self._conn.execute(
@@ -1652,6 +1690,9 @@ class RoutingTable:
                 except Exception:
                     self._conn.rollback()
                     raise
+        raise RouteIdentityConflictError(
+            f"route identity kept changing for user_id={user_id}"
+        )
 
     def soft_delete_group(self, chat_id: str) -> bool:
         """Soft-delete a group row by chat_id. Returns True if a row was updated."""

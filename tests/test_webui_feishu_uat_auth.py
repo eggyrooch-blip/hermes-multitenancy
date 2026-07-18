@@ -601,6 +601,31 @@ def test_feishu_uat_poll_falls_back_without_legacy_helper(monkeypatch):
     assert result["scope"] == "offline_access wiki:wiki"
 
 
+def test_local_device_poll_pending_ignores_unused_invalid_ttls(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "_api_post",
+        lambda *_args, **_kwargs: {
+            "error": "authorization_pending",
+            "error_description": "authorization is still pending",
+            "expires_in": 0,
+            "refresh_expires_in": -1,
+        },
+    )
+
+    result = feishu_uat_auth._poll_device_token_local(
+        "dc_pending",
+        "cli_test",
+        "secret_test",
+    )
+
+    assert result["error"] == "authorization_pending"
+    assert result["expires_in"] is None
+    assert result["refresh_expires_in"] is None
+
+
 def test_feishu_uat_api_post_parses_oauth_error_json_from_http_error(monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
 
@@ -1261,6 +1286,32 @@ def test_poll_session_reuses_exchanged_token_after_transient_store_error(
     assert store_calls == 2
 
 
+def test_busy_poll_preserves_terminal_session_state(tmp_path):
+    from hermes_multitenancy import feishu_uat_auth
+
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="busy-terminal-session",
+        device_code="device-busy-terminal",
+    )
+    session.status = "error"
+    session.error = "terminal authorization failure"
+    assert session._poll_lock.acquire(blocking=False)
+    try:
+        result = feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name=session.profile_name,
+            open_id=session.open_id,
+            shared_home=tmp_path,
+        )
+    finally:
+        session._poll_lock.release()
+        feishu_uat_auth._sessions.pop(session.session_id, None)
+
+    assert result["status"] == "error"
+    assert result["error"] == "terminal authorization failure"
+
+
 def test_poll_session_stabilizes_terminal_store_error_without_repoll(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
 
@@ -1354,6 +1405,39 @@ def test_poll_session_expires_and_clears_cached_payload(tmp_path, monkeypatch):
     assert session._pending_token_payload is None
     assert poll_calls == []
     assert store_calls == 0
+
+
+def test_find_active_session_evicts_expired_cached_payload():
+    from hermes_multitenancy import feishu_uat_auth
+
+    session_id = "expired-abandoned-cached-payload"
+    session = feishu_uat_auth.FeishuAuthSession(
+        session_id=session_id,
+        profile_name="expired-owner",
+        open_id="ou_expired_owner",
+        device_code="device-expired-abandoned",
+        user_code="EXPIRED-1234",
+        verification_uri="https://accounts.feishu.cn/device?user_code=EXPIRED-1234",
+        scope="offline_access",
+        client_id="cli_test",
+        client_secret="secret",
+        expires_at=int(time.time()) - 1,
+        interval=1,
+    )
+    session._pending_token_payload = {
+        "access_token": "abandoned-access",
+        "refresh_token": "abandoned-refresh",
+    }
+    feishu_uat_auth._sessions[session_id] = session
+    try:
+        assert feishu_uat_auth.find_active_session(
+            profile_name=session.profile_name,
+            open_id=session.open_id,
+        ) is None
+        assert session_id not in feishu_uat_auth._sessions
+        assert session._pending_token_payload is None
+    finally:
+        feishu_uat_auth._sessions.pop(session_id, None)
 
 
 def test_poll_session_expires_if_device_exchange_crosses_deadline(tmp_path, monkeypatch):

@@ -76,6 +76,17 @@ class CredentialIdentityLockTimeout(TimeoutError):
     """The bounded credential identity-lock attempt did not acquire in time."""
 
 
+def _create_private_directory_if_missing(path: Path, *, parents: bool = False) -> None:
+    """Create a credential-owned directory without changing an existing one."""
+    try:
+        path.mkdir(parents=parents, mode=0o700)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+    else:
+        os.chmod(path, 0o700)
+
+
 def _claim_identity_process_lock(key: tuple[str, str, str]) -> _IdentityLockEntry:
     with _IDENTITY_LOCKS_GUARD:
         entry = _IDENTITY_LOCKS.get(key)
@@ -103,6 +114,7 @@ def credential_identity_lock(
     open_id: str,
     *,
     timeout_seconds: float | None = None,
+    create_missing: bool = True,
 ) -> Iterator[None]:
     """Serialize credential refresh/recovery for one routed Feishu identity.
 
@@ -113,6 +125,8 @@ def credential_identity_lock(
     required because a successful refresh calls ``_store_uat`` while the
     worker already owns this identity lock. ``timeout_seconds=None`` preserves
     blocking acquisition; callers may opt into one bounded attempt.
+    ``create_missing=False`` is for routing-only callers: it keeps in-process
+    exclusion but does not provision an otherwise absent credential directory.
     """
     canonical_home = Path(os.path.realpath(shared_home))
     profile = str(profile_name)
@@ -164,9 +178,21 @@ def credential_identity_lock(
             profiles_dir = canonical_home / "profiles"
             profile_dir = profiles_dir / profile
             lock_dir = profile_dir / "feishu_uat"
-            lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(profile_dir, 0o700)
-            os.chmod(lock_dir, 0o700)
+            if create_missing:
+                _create_private_directory_if_missing(profile_dir, parents=True)
+                _create_private_directory_if_missing(lock_dir)
+            elif not profile_dir.is_dir():
+                depths[key] = 1
+                try:
+                    yield
+                finally:
+                    depths.pop(key, None)
+                return
+            else:
+                # A provisioned profile can safely host the shared flock.  The
+                # routing layer may create only this credential-owned child;
+                # it must never create or re-permission the profile itself.
+                _create_private_directory_if_missing(lock_dir)
             identity_digest = hashlib.sha256(
                 json.dumps([profile, str(open_id)], separators=(",", ":")).encode("utf-8")
             ).hexdigest()
@@ -603,16 +629,12 @@ def _clear_reauth_markers_if_uat_recovered_locked(
             recovered_mtime = max(recovered_mtime or 0.0, vault_mtime)
 
     recovery_markers = (
-        (
-            shared_home
-            / "profiles"
-            / marker_profile
-            / "feishu_uat"
-            / f"{open_id}.needs_reauth",
-            shared_home / "feishu_uat" / f"{open_id}.needs_reauth",
-        )
-        if marker_profile
-        else tuple(_iter_reauth_markers_for_open_id(shared_home, open_id))
+        shared_home
+        / "profiles"
+        / marker_profile
+        / "feishu_uat"
+        / f"{open_id}.needs_reauth",
+        shared_home / "feishu_uat" / f"{open_id}.needs_reauth",
     )
 
     if recovered_mtime is None:

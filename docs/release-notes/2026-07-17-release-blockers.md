@@ -77,6 +77,8 @@ Status: local ftask candidate only. Nothing was pushed or deployed and productio
 - Device exchange is not the last fallible OAuth hop. User-info lookup and credential-lock wait can cross the original session deadline, so persistence must receive and enforce that absolute deadline itself.
 - A pre-write deadline check is not enough when SQLite can wait for a writer. Recheck after the write statement acquires the transaction and roll back before commit when the absolute deadline has passed.
 - Never trust Feishu TTL fields as scheduling input. Reject non-positive, invalid, or over-limit values and recheck the device deadline after the network exchange before persisting its result.
+- A routing write must not provision or re-permission an unprovisioned profile just to acquire a credential fence. It may create the private `feishu_uat` lock directory only under an already-provisioned profile, must leave the profile mode unchanged, and must time out visibly instead of waiting forever.
+- Retaining a one-time OAuth payload for a retry also creates a secret-lifecycle owner. Expired abandoned sessions must be swept without racing an active poll, and error/pending responses must not validate success-only TTL fields.
 - A slash inside a WebUI `model` field does not prove that the value already contains its provider. When `provider` is present, preserve that boundary and only treat an exact same-provider prefix as already assembled.
 - CardKit `card.settings` does not accept `streaming_mode` at the top level. Keep it under `config` for both reopen and close; a successful settings call is required before the one same-frame retry.
 
@@ -86,13 +88,14 @@ Status: local ftask candidate only. Nothing was pushed or deployed and productio
 - Lifecycle-focused credential, hook, broker, ingest and streaming-card selection: 315 passed in 2.04s.
 - Final Feishu UAT-auth + renewal files: 114 passed. The latest reviewer selection had 14 failures before these fixes and 14 passes afterward (unlink/read-only, newer sibling, wrong safe profile, route swap, exchange deadline, and invalid/negative/huge TTL cases).
 - Adjacent credential/cron/WebUI-auth focused set: 144 passed.
-- Repository TEST gate on the current working tree: 2465 passed, 1 skipped, 3 deselected in 78.48s.
+- Repository TEST gate on the current working tree: 2478 passed, 1 skipped, 3 deselected in 76.36s.
 - Python compile checks and `git diff --check`: passed.
 - Real aiohttp regressions cover billing/store failure, materialization failure with changed-secret retry, concurrent mismatch, timeout, interactive and non-interactive pre-admission cancellation, post-mark outer cancellation, shared/stable/job task-factory failure, first-step cancellation, running job cancellation, deferred Feishu completion, and capacity reuse.
 - Independent review found the original four lifecycle/fail-closed gaps plus three Feishu completion ownership races. Every finding now has a failing-without-the-fix regression; two independent read-only rechecks replayed the original races and returned PASS. Refreshed ftask SIM and LEAK remain release gates.
 - A later formal review caught the stale-refresh/concurrent-reauthorization marker race. Thread-barrier, same-thread re-entry, profile-path validation, persistent lock-location, and real cross-process `flock` regressions now cover that finding; a fresh non-failing formal review is still required before release.
 - Focused K3/CardKit regression: 67 passed.
 - Manual-review P1 repairs: deterministic deadline/route-mutation barriers, vault rollback, permission hardening and strict doctor coverage passed; the final focused selection passed 29 tests. Routing, sync, WebUI UAT auth and credential renewal adjacent coverage previously passed 210 tests; three user auto-provision call paths also passed.
+- Fresh Opus review confirmed duplicate billing/device-token exchange is closed, then found route-lock provisioning/unbounded wait plus abandoned-token and pending-TTL lifecycle gaps. The repairs now have 225 adjacent routing/renewal/sync/WebUI-auth passes: no unprovisioned profile creation or existing-profile chmod, a five-second typed route-lock timeout, capped route-generation retries, expired-session secret eviction, success-only TTL validation, and terminal-state preservation for competing polls.
 - The existing SIM predates this final working tree. It must be recaptured and rechecked after `ftask save` so evidence binds the final committed code hash.
 
 No production service, database, model setting, Feishu credential, or user session was changed while collecting this evidence.

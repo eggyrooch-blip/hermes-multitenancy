@@ -165,6 +165,25 @@ def _deadline_reached(expires_at: int) -> bool:
     return time.time() >= float(expires_at)
 
 
+def _evict_expired_sessions() -> None:
+    """Drop abandoned expired sessions without racing an active poll."""
+    now = time.time()
+    for session_id, session in tuple(_sessions.items()):
+        if now < float(session.expires_at):
+            continue
+        if not session._poll_lock.acquire(blocking=False):
+            continue
+        try:
+            if (
+                _sessions.get(session_id) is session
+                and now >= float(session.expires_at)
+            ):
+                session._pending_token_payload = None
+                _sessions.pop(session_id, None)
+        finally:
+            session._poll_lock.release()
+
+
 def _stabilize_protocol_error(
     session: FeishuAuthSession,
     exc: FeishuUatAuthProtocolError,
@@ -591,6 +610,7 @@ def start_session(
     scope: str | None = None,
     shared_home: Optional[Path] = None,
 ) -> dict[str, Any]:
+    _evict_expired_sessions()
     shared = shared_home or resolve_shared_home()
     _load_shared_env(shared)
     _assert_route(shared, profile_name, open_id)
@@ -632,6 +652,7 @@ def find_active_session(
     session already started by ``/feishu_auth`` (or a prior ``/auth``) so the
     two cards/pollers don't race two device codes for the same user.
     """
+    _evict_expired_sessions()
     now = int(time.time())
     for session in _sessions.values():
         if session.profile_name != profile_name or session.open_id != open_id:
@@ -658,8 +679,8 @@ def poll_session(
         raise FeishuUatAuthError("authorization session does not belong to this user", status=403)
     if not session._poll_lock.acquire(blocking=False):
         pending = _session_public(session)
-        pending["status"] = "pending"
-        pending.pop("error", None)
+        if pending["status"] == "pending":
+            pending.pop("error", None)
         return pending
     try:
         _assert_route(shared, profile_name, open_id)
@@ -1424,8 +1445,22 @@ def _poll_device_token_local(device_code: str, client_id: str, client_secret: st
             "device_code": device_code,
         },
     )
+    error = str(data.get("error") or data.get("error_code") or "").strip() or None
+    access_token = str(data.get("access_token", "")).strip() or None
+    if error or not access_token:
+        return {
+            "access_token": None,
+            "refresh_token": None,
+            "open_id": str(data.get("open_id", "")).strip() or None,
+            "expires_in": None,
+            "refresh_expires_in": None,
+            "token_type": str(data.get("token_type", "Bearer")).strip(),
+            "scope": str(data.get("scope", "")).strip(),
+            "error": error,
+            "error_description": str(data.get("error_description") or "").strip() or None,
+        }
     return {
-        "access_token": str(data.get("access_token", "")).strip() or None,
+        "access_token": access_token,
         "refresh_token": str(data.get("refresh_token", "")).strip() or None,
         "open_id": str(data.get("open_id", "")).strip() or None,
         "expires_in": _bounded_ttl_seconds(
@@ -1437,7 +1472,7 @@ def _poll_device_token_local(device_code: str, client_id: str, client_secret: st
         "refresh_expires_in": _refresh_token_expires_in(data),
         "token_type": str(data.get("token_type", "Bearer")).strip(),
         "scope": str(data.get("scope", "")).strip(),
-        "error": str(data.get("error") or data.get("error_code") or "").strip() or None,
+        "error": None,
         "error_description": str(data.get("error_description") or "").strip() or None,
     }
 
