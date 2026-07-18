@@ -1455,6 +1455,7 @@ def test_poll_session_retries_transient_user_info_without_reexchange(
             raise feishu_uat_auth.FeishuUatAuthError(
                 "temporary user-info failure",
                 status=503,
+                retryable=True,
             )
         return {"open_id": "ou_owner"}
 
@@ -1491,6 +1492,255 @@ def test_poll_session_retries_transient_user_info_without_reexchange(
     assert exchange_calls == ["device-transient-user-info"]
     assert user_info_calls == ["one-time-access", "one-time-access"]
     assert len(stored_payloads) == 1
+    assert session._pending_exchange_result is None
+    assert session._pending_token_payload is None
+
+
+@pytest.mark.parametrize(
+    ("transport", "retryable"),
+    [
+        ("timeout", True),
+        (400, False),
+        (401, False),
+        (403, False),
+        (408, True),
+        (429, True),
+        (500, True),
+        (502, True),
+        (503, True),
+    ],
+)
+def test_poll_session_classifies_user_info_by_real_http_status(
+    tmp_path,
+    monkeypatch,
+    transport,
+    retryable,
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=f"user-info-http-{transport}",
+        device_code=f"device-user-info-http-{transport}",
+    )
+    exchange_calls: list[str] = []
+    legacy_calls: list[str] = []
+
+    def poll_token(device_code, _client_id, _client_secret):
+        exchange_calls.append(device_code)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "one-time-refresh",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def fail_user_info(_request, timeout):
+        assert timeout == 15
+        if transport == "timeout":
+            raise TimeoutError("user_info timed out")
+        raise urllib.error.HTTPError(
+            "https://open.feishu.cn/open-apis/authen/v1/user_info",
+            transport,
+            "upstream error",
+            {},
+            io.BytesIO(b'{"msg":"transport failure"}'),
+        )
+
+    legacy_helper = type(sys)("hermes_cli.feishu_auth")
+
+    def legacy_fetch_user_info(access_token):
+        legacy_calls.append(access_token)
+        raise AssertionError("MT must not delegate user-info classification")
+
+    legacy_helper.fetch_user_info = legacy_fetch_user_info
+    monkeypatch.setitem(sys.modules, "hermes_cli.feishu_auth", legacy_helper)
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth.urllib.request, "urlopen", fail_user_info)
+
+    with pytest.raises(feishu_uat_auth.FeishuUatAuthError) as raised:
+        feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+
+    assert exchange_calls == [f"device-user-info-http-{transport}"]
+    assert legacy_calls == []
+    assert (session._pending_exchange_result is not None) is retryable
+    assert session._pending_token_payload is None
+    assert session.status == ("pending" if retryable else "error")
+    assert raised.value.status == (503 if retryable else transport)
+
+
+@pytest.mark.parametrize("http_status", [200, 503])
+def test_poll_session_stabilizes_token_invalid_user_info(
+    tmp_path,
+    monkeypatch,
+    http_status,
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="user-info-token-invalid",
+        device_code="device-user-info-token-invalid",
+    )
+    exchange_calls: list[str] = []
+    user_info_calls = 0
+
+    def poll_token(device_code, _client_id, _client_secret):
+        exchange_calls.append(device_code)
+        return {
+            "access_token": "invalid-access",
+            "refresh_token": "one-time-refresh",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def fail_user_info(_request, timeout):
+        nonlocal user_info_calls
+        user_info_calls += 1
+        assert timeout == 15
+        body = b'{"code":99991668,"msg":"token invalid"}'
+        if http_status == 200:
+            response = io.BytesIO(body)
+            response.status = 200
+            return response
+        raise urllib.error.HTTPError(
+            "https://open.feishu.cn/open-apis/authen/v1/user_info",
+            http_status,
+            "Service Unavailable",
+            {},
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth.urllib.request, "urlopen", fail_user_info)
+
+    with pytest.raises(feishu_uat_auth.FeishuUatAuthError, match="99991668") as raised:
+        feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert second["status"] == "error"
+    assert "99991668" in second["error"]
+    assert raised.value.status == (502 if http_status == 200 else http_status)
+    assert exchange_calls == ["device-user-info-token-invalid"]
+    assert user_info_calls == 1
+    assert session._pending_exchange_result is None
+    assert session._pending_token_payload is None
+
+
+@pytest.mark.parametrize("user_info", [None, []], ids=["none", "list"])
+def test_poll_session_stabilizes_non_mapping_user_info(
+    tmp_path,
+    monkeypatch,
+    user_info,
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=f"malformed-user-info-{type(user_info).__name__}",
+        device_code="device-malformed-user-info",
+    )
+    exchange_calls: list[str] = []
+    user_info_calls = 0
+
+    def poll_token(device_code, _client_id, _client_secret):
+        exchange_calls.append(device_code)
+        return {
+            "access_token": "one-time-access",
+            "refresh_token": "one-time-refresh",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+
+    def fetch_user_info(_access_token):
+        nonlocal user_info_calls
+        user_info_calls += 1
+        return user_info
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", fetch_user_info)
+
+    with pytest.raises(feishu_uat_auth.FeishuUatAuthProtocolError, match="not an object"):
+        feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert second["status"] == "error"
+    assert exchange_calls == ["device-malformed-user-info"]
+    assert user_info_calls == 1
+    assert session._pending_exchange_result is None
+    assert session._pending_token_payload is None
+
+
+def test_poll_session_stabilizes_route_revocation_and_clears_cached_exchange(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_multitenancy import feishu_uat_auth
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id="route-revoked-cached-exchange",
+        device_code="device-route-revoked",
+    )
+    session._pending_exchange_result = {
+        "access_token": "unverified-access",
+        "refresh_token": "unverified-refresh",
+    }
+    with sqlite3.connect(shared / "multitenancy.db") as conn:
+        conn.execute(
+            "UPDATE multitenancy_routing SET active = 0 WHERE user_id = ?",
+            ("owner",),
+        )
+
+    with pytest.raises(feishu_uat_auth.FeishuUatAuthError) as raised:
+        feishu_uat_auth.poll_session(
+            session_id=session.session_id,
+            profile_name="owner",
+            open_id="ou_owner",
+            shared_home=shared,
+        )
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert raised.value.status == 403
+    assert second["status"] == "error"
+    assert second["error"] == raised.value.message
     assert session._pending_exchange_result is None
     assert session._pending_token_payload is None
 
@@ -2072,7 +2322,7 @@ def test_feishu_uat_auth_has_local_device_flow_fallback_when_hermes_helper_missi
     monkeypatch.setitem(sys.modules, "hermes_cli.feishu_auth", None)
     calls = []
 
-    def fake_http_json(method, url, *, payload=None, headers=None):
+    def fake_http_json(method, url, *, payload=None, headers=None, include_status=False):
         calls.append((method, url, dict(payload or {}), dict(headers or {})))
         if url.endswith("/oauth/v1/device_authorization"):
             return {
@@ -2093,7 +2343,7 @@ def test_feishu_uat_auth_has_local_device_flow_fallback_when_hermes_helper_missi
                 "scope": "offline_access",
             }
         if url.endswith("/open-apis/authen/v1/user_info"):
-            return {
+            result = {
                 "code": 0,
                 "data": {
                     "open_id": "ou_owner",
@@ -2102,6 +2352,7 @@ def test_feishu_uat_auth_has_local_device_flow_fallback_when_hermes_helper_missi
                     "name": "owner",
                 },
             }
+            return (result, 200) if include_status else result
         raise AssertionError((method, url))
 
     monkeypatch.setattr(feishu_uat_auth, "_http_json", fake_http_json)

@@ -44,6 +44,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from .. import cron_worker as _cw
 from ..credential_renewal_common import (
     clear_needs_reauth_marker,
+    clear_non_actionable_reauth_marker,
     clear_reauth_markers_if_uat_recovered,
     find_marker_for_open_id,
     marker_requires_reauth,
@@ -78,6 +79,14 @@ def _l4_check_needs_reauth_and_defer(
             return None
         if _cw._clear_stale_reauth_markers_if_uat_recovered(shared_home, owner_open_id, marker):
             return None
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            # Recovery may remove a stale trigger while returning false because
+            # an active-profile authoritative sibling still survives.
+            continue
+        except OSError:
+            return None
         marker_body = _cw.read_needs_reauth_marker(marker) or {}
         reason = str(marker_body.get("reason") or "unknown")
         if _cw.marker_requires_reauth(marker_body):
@@ -86,15 +95,12 @@ def _l4_check_needs_reauth_and_defer(
         for non_actionable_marker in _cw._iter_reauth_markers_for_open_id(shared_home, owner_open_id):
             body = _cw.read_needs_reauth_marker(non_actionable_marker) or {}
             if not _cw.marker_requires_reauth(body):
-                _cw.preserve_reauth_marker_as_refresh_diagnostic(
+                if _cw.clear_non_actionable_reauth_marker(
+                    shared_home,
+                    owner_open_id,
                     non_actionable_marker,
-                    body,
                     source="cron_worker_l4",
-                )
-                # Only count progress if the marker was ACTUALLY removed — a
-                # silently-failed unlink (root-owned marker / read-only FS) must
-                # NOT keep the while-loop alive re-finding the same marker. HIGH-2.
-                if _cw.clear_needs_reauth_marker(non_actionable_marker):
+                ):
                     cleared = True
         logger.warning(
             "[multitenancy] L4 ignored non-authoritative reauth marker owner=%s reason=%s",
@@ -102,6 +108,19 @@ def _l4_check_needs_reauth_and_defer(
             reason,
         )
         if not cleared:
+            # A safe clear returns false when the inspected non-actionable
+            # generation was replaced. Re-read once before using the existing
+            # fail-open/no-spin fallback: the replacement may now be an
+            # authoritative rejection that must defer this very dispatch.
+            current_marker = _cw.find_marker_for_open_id(shared_home, owner_open_id)
+            if current_marker is None:
+                return None
+            current_body = _cw.read_needs_reauth_marker(current_marker) or {}
+            if _cw.marker_requires_reauth(current_body):
+                marker = current_marker
+                marker_body = current_body
+                reason = str(current_body.get("reason") or "unknown")
+                break
             return None
 
     job_id = str(job.get("id") or "")

@@ -41,11 +41,19 @@ logger = logging.getLogger(__name__)
 
 
 class FeishuUatAuthError(Exception):
-    def __init__(self, message: str, *, status: int = 400, refresh_class: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 400,
+        refresh_class: str | None = None,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status = status
         self.refresh_class = refresh_class
+        self.retryable = retryable
 
 
 class FeishuUatAuthProtocolError(FeishuUatAuthError):
@@ -690,10 +698,17 @@ def poll_session(
             pending.pop("error", None)
         return pending
     try:
-        _assert_route(shared, profile_name, open_id)
         if session.status in {"success", "error", "expired"}:
             _clear_pending_token_state(session)
             return _session_public(session)
+        try:
+            _assert_route(shared, profile_name, open_id)
+        except FeishuUatAuthError as exc:
+            if exc.status == 403:
+                _clear_pending_token_state(session)
+                session.status = "error"
+                session.error = exc.message
+            raise
         if _deadline_reached(session.expires_at):
             return _expire_session(session)
 
@@ -729,8 +744,19 @@ def poll_session(
             if not token_open_id:
                 try:
                     user_info = _fetch_user_info(str(result.get("access_token") or ""))
+                    if not isinstance(user_info, dict):
+                        raise FeishuUatAuthProtocolError(
+                            "Feishu user_info response is not an object",
+                            status=502,
+                        )
+                    token_open_id = str(user_info.get("open_id") or "").strip()
+                    if not token_open_id:
+                        raise FeishuUatAuthProtocolError(
+                            "Feishu user_info response is missing open_id",
+                            status=502,
+                        )
                 except FeishuUatAuthError as exc:
-                    if exc.status >= 500:
+                    if exc.retryable and not isinstance(exc, FeishuUatAuthProtocolError):
                         raise
                     _clear_pending_token_state(session)
                     session.status = "error"
@@ -743,7 +769,6 @@ def poll_session(
                     session.status = "error"
                     session.error = "authorization identity verification failed; please authorize again"
                     raise
-                token_open_id = str(user_info.get("open_id") or "").strip()
             # Known gotcha: user-info is a second network hop and can finish
             # after the device-flow deadline even when token exchange did not.
             if _deadline_reached(session.expires_at):
@@ -1331,13 +1356,6 @@ def _normalise_refresh_response(data: dict[str, Any], *, require_refresh_token: 
 
 
 def _fetch_user_info(access_token: str) -> dict[str, Any]:
-    try:
-        from hermes_cli.feishu_auth import fetch_user_info
-
-        return fetch_user_info(access_token)
-    except ModuleNotFoundError as exc:
-        if not _is_missing_legacy_feishu_auth(exc):
-            raise
     return _fetch_user_info_local(access_token)
 
 
@@ -1529,13 +1547,45 @@ def _poll_device_token_local(device_code: str, client_id: str, client_secret: st
 def _fetch_user_info_local(access_token: str) -> dict[str, Any]:
     url = f"{FEISHU_OPEN_BASE_URL}/open-apis/authen/v1/user_info"
     try:
-        body = _http_json("GET", url, headers={"Authorization": f"Bearer {access_token}"})
+        body, http_status = _http_json(
+            "GET",
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            include_status=True,
+        )
     except OSError as exc:
-        raise FeishuUatAuthError(f"Network error calling {url}: {exc}", status=503) from exc
-    data = (body or {}).get("data") or {}
-    if (body or {}).get("code") != 0 or not data:
         raise FeishuUatAuthError(
-            f"user_info failed: code={(body or {}).get('code')} msg={(body or {}).get('msg') or 'unknown'}",
+            f"Network error calling {url}: {exc}",
+            status=503,
+            retryable=True,
+        ) from exc
+    if isinstance(body, dict):
+        code = body.get("code")
+        if code is not None and code != 0:
+            raise FeishuUatAuthError(
+                f"user_info failed: code={code} msg={body.get('msg') or 'unknown'}",
+                status=http_status if 400 <= http_status <= 599 else 502,
+            )
+    if http_status in {408, 429} or 500 <= http_status <= 599:
+        raise FeishuUatAuthError(
+            f"user_info temporarily unavailable: HTTP {http_status}",
+            status=503,
+            retryable=True,
+        )
+    if not isinstance(body, dict):
+        raise FeishuUatAuthProtocolError(
+            "Feishu user_info response is not an object",
+            status=502,
+        )
+    if http_status >= 400:
+        raise FeishuUatAuthError(
+            f"user_info failed: HTTP {http_status} msg={body.get('msg') or 'unknown'}",
+            status=http_status,
+        )
+    data = body.get("data")
+    if body.get("code") != 0 or not isinstance(data, dict) or not data:
+        raise FeishuUatAuthProtocolError(
+            "Feishu user_info response is malformed",
             status=502,
         )
     return {
@@ -1552,6 +1602,7 @@ def _http_json(
     *,
     payload: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    include_status: bool = False,
 ) -> Any:
     body = None
     request_headers = dict(headers or {})
@@ -1559,13 +1610,22 @@ def _http_json(
         body = json.dumps(payload).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=body, method=method, headers=request_headers)
+    http_status = 200
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
+            http_status = int(getattr(response, "status", 200) or 200)
             raw = response.read()
     except urllib.error.HTTPError as exc:
+        http_status = int(exc.code)
         raw = exc.read()
     try:
-        return json.loads(raw.decode("utf-8"))
+        parsed = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         preview = raw[:200].decode("utf-8", errors="replace") if raw else ""
-        raise FeishuUatAuthError(f"Non-JSON response from {url}: {preview}", status=502) from exc
+        retryable = http_status in {408, 429} or 500 <= http_status <= 599
+        raise FeishuUatAuthError(
+            f"Non-JSON response from {url}: {preview}",
+            status=503 if retryable else http_status if 400 <= http_status <= 499 else 502,
+            retryable=retryable,
+        ) from exc
+    return (parsed, http_status) if include_status else parsed

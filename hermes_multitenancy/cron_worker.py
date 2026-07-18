@@ -72,6 +72,7 @@ except ImportError:  # pragma: no cover - non-Windows
 
 from .credential_renewal_common import (
     clear_needs_reauth_marker,
+    clear_non_actionable_reauth_marker,
     clear_reauth_markers_if_uat_recovered,
     find_marker_for_open_id,
     marker_requires_reauth,

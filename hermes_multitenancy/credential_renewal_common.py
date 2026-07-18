@@ -360,6 +360,40 @@ def marker_paths_for_open_id(parent_dir: Path, open_id: str) -> tuple[Path, Path
     )
 
 
+@dataclass(frozen=True)
+class _ReauthMarkerSnapshot:
+    device: int
+    inode: int
+    mtime_ns: int
+    size: int
+
+
+def _reauth_marker_snapshot(marker_path: Path) -> _ReauthMarkerSnapshot:
+    stat = marker_path.lstat()
+    return _ReauthMarkerSnapshot(
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        mtime_ns=stat.st_mtime_ns,
+        size=stat.st_size,
+    )
+
+
+def _clear_needs_reauth_marker_if_unchanged(
+    marker_path: Path,
+    expected: _ReauthMarkerSnapshot,
+) -> bool:
+    """Delete only the exact marker generation that recovery inspected."""
+    try:
+        current = _reauth_marker_snapshot(marker_path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if current != expected:
+        return False
+    return clear_needs_reauth_marker(marker_path)
+
+
 def refresh_diagnostic_path_for_open_id(parent_dir: Path, open_id: str) -> Path:
     """Compute the non-user-facing refresh diagnostic sidecar path."""
     return parent_dir / f"{open_id}.refresh_diagnostic"
@@ -605,46 +639,58 @@ def _clear_reauth_markers_if_uat_recovered_locked(
     marker_profile: str,
 ) -> bool:
     try:
-        marker_stat = marker_path.stat()
+        marker_snapshot = _reauth_marker_snapshot(marker_path)
     except OSError:
         return False
-    marker_mtime = marker_stat.st_mtime
 
-    recovered_mtime: float | None = None
+    recovered_mtime_ns: int | None = None
     for loc in iter_uat_locations(shared_home):
         if loc.open_id != open_id:
             continue
         if marker_profile and not loc.legacy and loc.profile_name != marker_profile:
             continue
         try:
-            uat_mtime = loc.path.stat().st_mtime
-            if uat_mtime <= marker_mtime:
+            uat_mtime_ns = loc.path.stat().st_mtime_ns
+            if uat_mtime_ns <= marker_snapshot.mtime_ns:
                 continue
             payload = json.loads(loc.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(payload, dict) and payload_is_currently_usable(payload):
-            recovered_mtime = max(recovered_mtime or 0.0, uat_mtime)
+            recovered_mtime_ns = max(recovered_mtime_ns or 0, uat_mtime_ns)
 
     if marker_profile:
-        vault_mtime = _newer_usable_vault_uat_mtime(
+        vault_mtime_ns = _newer_usable_vault_uat_mtime(
             shared_home,
             marker_profile,
             open_id,
-            marker_stat.st_mtime_ns,
+            marker_snapshot.mtime_ns,
         )
-        if vault_mtime is not None:
-            recovered_mtime = max(recovered_mtime or 0.0, vault_mtime)
+        if vault_mtime_ns is not None:
+            recovered_mtime_ns = max(recovered_mtime_ns or 0, vault_mtime_ns)
 
-    recovery_markers = (
-        *marker_paths_for_open_id(
-            shared_home / "profiles" / marker_profile / "feishu_uat",
+    profile_markers = marker_paths_for_open_id(
+        shared_home / "profiles" / marker_profile / "feishu_uat",
+        open_id,
+    )
+    legacy_markers = marker_paths_for_open_id(shared_home / "feishu_uat", open_id)
+    active_profile = _unique_active_user_profile_for_open_id(shared_home, open_id)
+    active_profile_markers = (
+        marker_paths_for_open_id(
+            shared_home / "profiles" / active_profile / "feishu_uat",
             open_id,
-        ),
-        *marker_paths_for_open_id(shared_home / "feishu_uat", open_id),
+        )
+        if active_profile and active_profile != marker_profile
+        else ()
+    )
+    recovery_markers = (*profile_markers, *legacy_markers, *active_profile_markers)
+    deletable_markers = (
+        (*profile_markers, *legacy_markers)
+        if active_profile == marker_profile
+        else profile_markers
     )
 
-    if recovered_mtime is None:
+    if recovered_mtime_ns is None:
         # The mtime rule alone can deadlock: a startup L5 audit (re)writes the
         # marker AFTER the operative token's last refresh, so the marker stays
         # forever "newer" than the valid UAT and recovery never fires
@@ -652,25 +698,40 @@ def _clear_reauth_markers_if_uat_recovered_locked(
         # wrote the marker 10:09 → every cron for the owner falsely deferred).
         # A LOCAL-STRUCTURAL marker is refuted by ANY currently-usable UAT.
         body = read_needs_reauth_marker(marker_path) or {}
+        try:
+            if _reauth_marker_snapshot(marker_path) != marker_snapshot:
+                return False
+        except OSError:
+            return False
         reason = str(body.get("reason") or "")
         if reason not in LOCAL_STRUCTURAL_REAUTH_REASONS:
             return False
         if not current_valid_uat_exists(shared_home, open_id):
             return False
-        for stale_marker in recovery_markers:
+        for stale_marker in deletable_markers:
+            try:
+                stale_snapshot = _reauth_marker_snapshot(stale_marker)
+            except OSError:
+                continue
             stale_body = read_needs_reauth_marker(stale_marker) or {}
+            try:
+                if _reauth_marker_snapshot(stale_marker) != stale_snapshot:
+                    continue
+            except OSError:
+                continue
             # Only clear structural markers; an authoritative refresh_rejected
             # marker for the same open_id must survive this fallback.
             if str(stale_body.get("reason") or "") in LOCAL_STRUCTURAL_REAUTH_REASONS:
-                clear_needs_reauth_marker(stale_marker)
+                _clear_needs_reauth_marker_if_unchanged(stale_marker, stale_snapshot)
         return _all_markers_absent(recovery_markers)
 
-    for stale_marker in recovery_markers:
+    for stale_marker in deletable_markers:
         try:
-            if stale_marker.stat().st_mtime <= recovered_mtime:
-                clear_needs_reauth_marker(stale_marker)
+            stale_snapshot = _reauth_marker_snapshot(stale_marker)
         except OSError:
             continue
+        if stale_snapshot.mtime_ns <= recovered_mtime_ns:
+            _clear_needs_reauth_marker_if_unchanged(stale_marker, stale_snapshot)
     return _all_markers_absent(recovery_markers)
 
 
@@ -678,7 +739,7 @@ def _all_markers_absent(marker_paths: Iterable[Path]) -> bool:
     """Return True only when every exact marker is observably absent."""
     for marker_path in marker_paths:
         try:
-            marker_path.stat()
+            marker_path.lstat()
         except FileNotFoundError:
             continue
         except OSError:
@@ -768,7 +829,7 @@ def _newer_usable_vault_uat_mtime(
     profile_name: str,
     open_id: str,
     marker_mtime_ns: int,
-) -> float | None:
+) -> int | None:
     db_path = shared_home / "multitenancy.db"
     if not db_path.is_file():
         return None
@@ -794,7 +855,7 @@ def _newer_usable_vault_uat_mtime(
         return None
     if not payload_is_currently_usable(payload):
         return None
-    return updated_at / 1000.0
+    return updated_at * 1_000_000
 
 
 def marker_requires_reauth(marker_body: dict[str, Any]) -> bool:
@@ -808,6 +869,54 @@ def marker_requires_reauth(marker_body: dict[str, Any]) -> bool:
     if reason != REASON_REFRESH_REJECTED:
         return True
     return marker_body.get("authoritative") is True and str(marker_body.get("refresh_class") or "") == "invalid"
+
+
+def clear_non_actionable_reauth_marker(
+    shared_home: Path,
+    open_id: str,
+    marker_path: Path,
+    *,
+    source: str,
+    lock_timeout_seconds: float = 0.05,
+) -> bool:
+    """Preserve and delete one non-actionable marker under its identity lock.
+
+    Returns true only when the exact inspected generation is now absent. A
+    replacement authoritative marker, route change, or busy identity is kept.
+    """
+    marker_profile = _profile_name_for_reauth_marker(shared_home, marker_path, open_id)
+    if marker_profile is None:
+        return False
+    try:
+        with credential_identity_lock(
+            shared_home,
+            marker_profile,
+            open_id,
+            create_missing=False,
+            timeout_seconds=lock_timeout_seconds,
+        ):
+            if _profile_name_for_reauth_marker(shared_home, marker_path, open_id) != marker_profile:
+                return False
+            try:
+                snapshot = _reauth_marker_snapshot(marker_path)
+            except OSError:
+                return False
+            body = read_needs_reauth_marker(marker_path) or {}
+            try:
+                if _reauth_marker_snapshot(marker_path) != snapshot:
+                    return False
+            except OSError:
+                return False
+            if marker_requires_reauth(body):
+                return False
+            preserve_reauth_marker_as_refresh_diagnostic(
+                marker_path,
+                body,
+                source=source,
+            )
+            return _clear_needs_reauth_marker_if_unchanged(marker_path, snapshot)
+    except (CredentialIdentityLockTimeout, ValueError, OSError):
+        return False
 
 
 def find_marker_for_open_id(shared_home: Path, open_id: str) -> Optional[Path]:

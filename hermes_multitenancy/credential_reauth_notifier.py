@@ -12,12 +12,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .credential_renewal_common import (
-    clear_needs_reauth_marker,
+    clear_non_actionable_reauth_marker,
     clear_reauth_markers_if_uat_recovered,
     current_valid_uat_exists,
     is_fixture_path,
     marker_requires_reauth,
-    preserve_reauth_marker_as_refresh_diagnostic,
     read_needs_reauth_marker,
 )
 
@@ -79,12 +78,13 @@ def _scan_once(shared_home: Path, seen: dict[str, dict[str, Any]]) -> bool:
             )
             continue
         if not marker_requires_reauth(body):
-            preserve_reauth_marker_as_refresh_diagnostic(
+            if not clear_non_actionable_reauth_marker(
+                shared_home,
+                open_id,
                 marker,
-                body,
                 source="credential_reauth_maintenance",
-            )
-            clear_needs_reauth_marker(marker)
+            ):
+                continue
             changed = True
             if current_valid_uat_exists(shared_home, open_id):
                 logger.info(

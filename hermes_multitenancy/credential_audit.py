@@ -20,8 +20,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .credential_renewal_common import (
+    CredentialIdentityLockTimeout,
+    _unique_active_user_profile_for_open_id,
     classify_uat_payload,
-    find_marker_for_open_id,
+    credential_identity_lock,
+    current_valid_uat_exists,
     iter_uat_locations,
     is_fixture_path,
     marker_path_for_open_id,
@@ -30,6 +33,8 @@ from .credential_renewal_common import (
 )
 
 logger = logging.getLogger(__name__)
+
+_AUDIT_IDENTITY_LOCK_TIMEOUT_SECONDS = 0.05
 
 
 @dataclass
@@ -101,6 +106,7 @@ def _audit_uat_files(shared_home: Path, report: AuditReport) -> None:
             continue
         report.needs_reauth += 1
         _maybe_write_marker(
+            shared_home,
             loc.path.parent,
             loc.open_id,
             reason=reason,
@@ -164,6 +170,7 @@ def _load_payload(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _maybe_write_marker(
+    shared_home: Path,
     parent: Path,
     open_id: str,
     *,
@@ -177,14 +184,64 @@ def _maybe_write_marker(
     L5 is idempotent — if a marker is already on disk with the same reason, we
     do nothing (avoid bumping mtime and re-triggering L3 every gateway restart).
     """
-    marker = marker_path_for_open_id(parent, open_id)
-    existing = read_needs_reauth_marker(marker) if marker.is_file() else None
-    if existing and existing.get("reason") == reason:
+    def write_if_changed() -> None:
+        # Classification happened before the identity lock. A successful OAuth
+        # write may have repaired this identity while L5 was waiting.
+        current_route = _unique_active_user_profile_for_open_id(shared_home, open_id)
+        if profile and current_route and current_route != profile:
+            return
+        if current_valid_uat_exists(shared_home, open_id):
+            return
+        marker = marker_path_for_open_id(parent, open_id)
+        existing = read_needs_reauth_marker(marker) if marker.is_file() else None
+        if existing and existing.get("reason") == reason:
+            return
+        write_needs_reauth_marker(
+            marker,
+            reason=reason,
+            detail=detail,
+            extra={"layer": "L5", "profile": profile},
+        )
+        report.fresh_markers += 1
+
+    active_profile = _unique_active_user_profile_for_open_id(shared_home, open_id)
+    if profile and active_profile and profile != active_profile:
+        logger.info(
+            "[credential_audit] stale profile UAT ignored after route move "
+            "profile=%s active_profile=%s open_id=%s",
+            profile,
+            active_profile,
+            open_id,
+        )
         return
-    write_needs_reauth_marker(
-        marker,
-        reason=reason,
-        detail=detail,
-        extra={"layer": "L5", "profile": profile},
-    )
-    report.fresh_markers += 1
+    lock_profile = active_profile or profile
+    if not lock_profile:
+        write_if_changed()
+        return
+    try:
+        with credential_identity_lock(
+            shared_home,
+            lock_profile,
+            open_id,
+            create_missing=False,
+            timeout_seconds=_AUDIT_IDENTITY_LOCK_TIMEOUT_SECONDS,
+        ):
+            write_if_changed()
+    except CredentialIdentityLockTimeout:
+        logger.warning(
+            "[credential_audit] identity busy; marker audit skipped "
+            "profile=%s open_id=%s",
+            lock_profile,
+            open_id,
+        )
+    except ValueError:
+        # A malformed leftover profile/UAT filename must not abort gateway
+        # startup. Recovery rejects the same unsafe identity, so preserving the
+        # audit's historical unlocked write is fail-closed for that artifact.
+        logger.warning(
+            "[credential_audit] unsafe marker identity cannot use shared lock "
+            "profile=%r open_id=%r",
+            lock_profile,
+            open_id,
+        )
+        write_if_changed()

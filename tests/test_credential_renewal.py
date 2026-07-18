@@ -747,6 +747,82 @@ def test_l5_audit_is_idempotent_same_reason(tmp_path: Path):
     assert second.fresh_markers == 0  # same reason, marker not rewritten
 
 
+def test_l5_unsafe_leftover_profile_does_not_abort_startup_audit(tmp_path: Path):
+    profile_name = "bad..profile"
+    open_id = "ou_unsafe_audit"
+    bad = _valid_payload(open_id)
+    bad["refresh_token"] = ""
+    _seed_uat(tmp_path, profile_name, open_id, bad)
+
+    report = credential_audit.run_startup_audit(tmp_path)
+
+    assert report.scanned == 1
+    assert report.needs_reauth == 1
+    assert report.fresh_markers == 1
+    assert (
+        tmp_path
+        / "profiles"
+        / profile_name
+        / "feishu_uat"
+        / f"{open_id}.needs_reauth"
+    ).is_file()
+
+
+def test_l5_marker_writer_skips_busy_identity_without_blocking_startup(tmp_path: Path):
+    profile_name = "alice"
+    open_id = "ou_l5_locked"
+    marker_dir = tmp_path / "profiles" / profile_name / "feishu_uat"
+    marker_dir.mkdir(parents=True)
+    report = credential_audit.AuditReport()
+    started = threading.Event()
+    finished = threading.Event()
+
+    def write_marker() -> None:
+        started.set()
+        credential_audit._maybe_write_marker(
+            tmp_path,
+            marker_dir,
+            open_id,
+            reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+            detail="broken token",
+            report=report,
+            profile=profile_name,
+        )
+        finished.set()
+
+    with common.credential_identity_lock(tmp_path, profile_name, open_id):
+        worker = threading.Thread(target=write_marker)
+        worker.start()
+        assert started.wait(timeout=2)
+        assert finished.wait(timeout=1)
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert finished.is_set()
+    assert not (marker_dir / f"{open_id}.needs_reauth").exists()
+    assert report.fresh_markers == 0
+
+
+def test_l5_audit_does_not_mark_stale_profile_after_route_move(tmp_path: Path):
+    open_id = "ou_audit_route_moved"
+    broken = _valid_payload(open_id)
+    broken["refresh_token"] = ""
+    _seed_uat(tmp_path, "alice", open_id, broken)
+    _seed_active_route(tmp_path, "bob", open_id)
+
+    report = credential_audit.run_startup_audit(tmp_path)
+
+    assert report.needs_reauth == 1
+    assert report.fresh_markers == 0
+    assert not (
+        tmp_path
+        / "profiles"
+        / "alice"
+        / "feishu_uat"
+        / f"{open_id}.needs_reauth"
+    ).exists()
+
+
 def test_l5_skips_fixtures_dir(tmp_path: Path):
     fixtures = tmp_path / "feishu_uat.fixtures.bak"
     fixtures.mkdir()
@@ -918,6 +994,200 @@ def test_recovery_returns_false_when_newer_authoritative_sibling_survives(tmp_pa
     assert common.marker_requires_reauth(
         common.read_needs_reauth_marker(legacy_marker) or {}
     )
+
+
+@pytest.mark.parametrize("historical_legacy", [False, True])
+def test_recovery_stale_profile_cannot_delete_active_route_legacy_marker(
+    tmp_path: Path,
+    historical_legacy: bool,
+):
+    open_id = "ou_route_moved"
+    _seed_active_route(tmp_path, "bob", open_id)
+    (tmp_path / "profiles" / "bob").mkdir(parents=True, exist_ok=True)
+    alice_marker = (
+        tmp_path / "profiles" / "alice" / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    legacy_name = (
+        f"{open_id}.json.needs_reauth"
+        if historical_legacy
+        else f"{open_id}.needs_reauth"
+    )
+    legacy_marker = tmp_path / "feishu_uat" / legacy_name
+    common.write_needs_reauth_marker(
+        alice_marker,
+        reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+        extra={"profile": "alice"},
+    )
+    common.write_needs_reauth_marker(
+        legacy_marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="active profile rejected token",
+        extra={
+            "profile": "bob",
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    old = time.time() - 120
+    os.utime(alice_marker, (old, old))
+    os.utime(legacy_marker, (old, old))
+    _seed_uat(tmp_path, "alice", open_id, _valid_payload(open_id))
+
+    assert common.clear_reauth_markers_if_uat_recovered(
+        tmp_path, open_id, alice_marker
+    ) is False
+    assert not alice_marker.exists()
+    assert common.read_needs_reauth_marker(legacy_marker)["detail"] == (
+        "active profile rejected token"
+    )
+
+
+def test_recovery_observes_active_profile_marker_after_route_move(tmp_path: Path):
+    open_id = "ou_route_profile_marker"
+    _seed_active_route(tmp_path, "bob", open_id)
+    alice_marker = (
+        tmp_path / "profiles" / "alice" / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    bob_marker = (
+        tmp_path / "profiles" / "bob" / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    common.write_needs_reauth_marker(
+        alice_marker,
+        reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+        extra={"profile": "alice"},
+    )
+    common.write_needs_reauth_marker(
+        bob_marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="active route rejected token",
+        extra={
+            "profile": "bob",
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    old = time.time() - 120
+    os.utime(alice_marker, (old, old))
+    os.utime(bob_marker, (old, old))
+    _seed_uat(tmp_path, "alice", open_id, _valid_payload(open_id))
+
+    assert common.clear_reauth_markers_if_uat_recovered(
+        tmp_path, open_id, alice_marker
+    ) is False
+    assert not alice_marker.exists()
+    assert common.read_needs_reauth_marker(bob_marker)["detail"] == (
+        "active route rejected token"
+    )
+
+
+def test_recovery_preserves_marker_replaced_after_eligibility_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_snapshot_swap"
+    _seed_active_route(tmp_path, profile_name, open_id)
+    marker = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="old rejected token",
+        extra={
+            "profile": profile_name,
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    old = time.time() - 120
+    os.utime(marker, (old, old))
+    _seed_uat(tmp_path, profile_name, open_id, _valid_payload(open_id))
+    real_clear = common._clear_needs_reauth_marker_if_unchanged
+    replaced = False
+
+    def replace_then_compare(path: Path, expected) -> bool:
+        nonlocal replaced
+        if path == marker and not replaced:
+            replaced = True
+            common.write_needs_reauth_marker(
+                marker,
+                reason=common.REASON_REFRESH_REJECTED,
+                detail="new rejected token",
+                extra={
+                    "profile": profile_name,
+                    "authoritative": True,
+                    "refresh_class": "invalid",
+                },
+            )
+            future = time.time() + 60
+            os.utime(marker, (future, future))
+        return real_clear(path, expected)
+
+    monkeypatch.setattr(
+        common,
+        "_clear_needs_reauth_marker_if_unchanged",
+        replace_then_compare,
+    )
+
+    assert common.clear_reauth_markers_if_uat_recovered(
+        tmp_path, open_id, marker
+    ) is False
+    assert replaced is True
+    assert common.read_needs_reauth_marker(marker)["detail"] == "new rejected token"
+
+
+def test_non_actionable_cleanup_preserves_authoritative_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile_name = "alice"
+    open_id = "ou_non_actionable_swap"
+    _seed_active_route(tmp_path, profile_name, open_id)
+    marker = (
+        tmp_path / "profiles" / profile_name / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    common.write_needs_reauth_marker(
+        marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="transient infrastructure failure",
+        extra={"profile": profile_name, "layer": "L2"},
+    )
+    real_clear = common._clear_needs_reauth_marker_if_unchanged
+    replaced = False
+
+    def replace_then_compare(path: Path, expected) -> bool:
+        nonlocal replaced
+        if path == marker and not replaced:
+            replaced = True
+            common.write_needs_reauth_marker(
+                marker,
+                reason=common.REASON_REFRESH_REJECTED,
+                detail="Feishu rejected the replacement token",
+                extra={
+                    "profile": profile_name,
+                    "authoritative": True,
+                    "refresh_class": "invalid",
+                },
+            )
+        return real_clear(path, expected)
+
+    monkeypatch.setattr(
+        common,
+        "_clear_needs_reauth_marker_if_unchanged",
+        replace_then_compare,
+    )
+
+    assert common.clear_non_actionable_reauth_marker(
+        tmp_path,
+        open_id,
+        marker,
+        source="test",
+    ) is False
+    assert replaced is True
+    body = common.read_needs_reauth_marker(marker) or {}
+    assert common.marker_requires_reauth(body) is True
+    assert body["detail"] == "Feishu rejected the replacement token"
 
 
 def test_recovery_rejects_legacy_marker_profile_that_disagrees_with_active_route(
@@ -1490,6 +1760,59 @@ def test_l4_rechecks_older_actionable_marker_after_clearing_non_authoritative_ne
     assert diagnostic["detail"] == "RuntimeError: credential encryption key is required"
     assert diagnostic["profile"] == profile_name
     assert diagnostic["layer"] == "L2"
+
+
+def test_l4_rechecks_active_route_marker_after_stale_profile_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from hermes_multitenancy import cron_worker
+
+    open_id = "ou_cron_route_moved"
+    shared = tmp_path
+    bob_home = shared / "profiles" / "bob"
+    bob_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(bob_home))
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    _seed_active_route(shared, "bob", open_id)
+
+    alice_marker = (
+        shared / "profiles" / "alice" / "feishu_uat" / f"{open_id}.needs_reauth"
+    )
+    bob_marker = bob_home / "feishu_uat" / f"{open_id}.needs_reauth"
+    common.write_needs_reauth_marker(
+        alice_marker,
+        reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+        detail="stale profile copy",
+        extra={"profile": "alice"},
+    )
+    common.write_needs_reauth_marker(
+        bob_marker,
+        reason=common.REASON_REFRESH_REJECTED,
+        detail="active route rejected token",
+        extra={
+            "profile": "bob",
+            "authoritative": True,
+            "refresh_class": "invalid",
+        },
+    )
+    now = time.time()
+    os.utime(bob_marker, (now - 300, now - 300))
+    os.utime(alice_marker, (now - 120, now - 120))
+    alice_uat = _seed_uat(shared, "alice", open_id, _valid_payload(open_id))
+    os.utime(alice_uat, (now - 60, now - 60))
+
+    result = cron_worker._l4_check_needs_reauth_and_defer(
+        {"id": "JOB-ROUTE-MOVED", "name": "route moved", "owner_open_id": open_id}
+    )
+
+    assert result is not None
+    success, output, _final_response, error = result
+    assert success is False
+    assert common.REASON_REFRESH_REJECTED in output
+    assert common.REASON_REFRESH_REJECTED in (error or "")
+    assert not alice_marker.exists()
+    assert bob_marker.exists()
 
 
 def test_l4_skips_jobs_without_owner_open_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
