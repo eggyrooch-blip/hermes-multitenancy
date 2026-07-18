@@ -19,13 +19,16 @@ Read/write contract (per design D6 in review v2 + group-profile extension):
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from uuid import uuid4
+
+from .credential_renewal_common import credential_identity_lock
 
 logger = logging.getLogger(__name__)
 
@@ -376,6 +379,32 @@ class RoutingTable:
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
+
+    def _active_user_identity(self, user_id: str) -> tuple[str, str] | None:
+        row = self._conn.execute(
+            "SELECT profile_name, open_id FROM multitenancy_routing "
+            "WHERE user_id = ? AND active = 1 AND kind = 'user' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if row is None or not row["open_id"]:
+            return None
+        return str(row["profile_name"]), str(row["open_id"])
+
+    @contextlib.contextmanager
+    def _credential_identity_locks(
+        self,
+        identities: set[tuple[str, str]],
+    ) -> Iterator[None]:
+        if self.db_path == ":memory:":
+            yield
+            return
+        shared_home = Path(self.db_path).parent
+        with contextlib.ExitStack() as stack:
+            for profile_name, open_id in sorted(identities):
+                stack.enter_context(
+                    credential_identity_lock(shared_home, profile_name, open_id)
+                )
+            yield
 
     def _migrate(self) -> None:
         """Bring an older DB up to the current schema. Safe to call repeatedly."""
@@ -760,28 +789,54 @@ class RoutingTable:
         provenance: str = "auto",
     ) -> None:
         """Insert or refresh a USER route. Bumps version, sets synced_at to now."""
-        now = _now()
-        self._conn.execute(
-            """
-            INSERT INTO multitenancy_routing
-                (user_id, profile_name, open_id, union_id, active,
-                 synced_at, version, created_at, updated_at, kind, provenance)
-            VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?, 'user', ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                profile_name = excluded.profile_name,
-                open_id      = excluded.open_id,
-                union_id     = excluded.union_id,
-                active       = 1,
-                deleted_at   = NULL,
-                synced_at    = excluded.synced_at,
-                version      = version + 1,
-                updated_at   = excluded.updated_at,
-                kind         = 'user',
-                provenance   = excluded.provenance
-            """,
-            (user_id, profile_name, open_id, union_id, now, now, now, provenance),
-        )
-        self._conn.commit()
+        while True:
+            previous_identity = self._active_user_identity(user_id)
+            # Known gotcha: _store_uat's in-lock route check is a TOCTOU unless
+            # route writers hold the same old/new credential identity lock(s).
+            lock_identities = {(profile_name, open_id)}
+            if previous_identity is not None:
+                lock_identities.add(previous_identity)
+            with self._credential_identity_locks(lock_identities):
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._active_user_identity(user_id) != previous_identity:
+                        self._conn.rollback()
+                        continue
+                    now = _now()
+                    self._conn.execute(
+                        """
+                        INSERT INTO multitenancy_routing
+                            (user_id, profile_name, open_id, union_id, active,
+                             synced_at, version, created_at, updated_at, kind, provenance)
+                        VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?, 'user', ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            profile_name = excluded.profile_name,
+                            open_id      = excluded.open_id,
+                            union_id     = excluded.union_id,
+                            active       = 1,
+                            deleted_at   = NULL,
+                            synced_at    = excluded.synced_at,
+                            version      = version + 1,
+                            updated_at   = excluded.updated_at,
+                            kind         = 'user',
+                            provenance   = excluded.provenance
+                        """,
+                        (
+                            user_id,
+                            profile_name,
+                            open_id,
+                            union_id,
+                            now,
+                            now,
+                            now,
+                            provenance,
+                        ),
+                    )
+                    self._conn.commit()
+                    return
+                except Exception:
+                    self._conn.rollback()
+                    raise
 
     def upsert_group(
         self,
@@ -1574,17 +1629,29 @@ class RoutingTable:
 
     def soft_delete(self, user_id: str) -> bool:
         """Mark a route as inactive (kind-agnostic). Returns True on update."""
-        now = _now()
-        cur = self._conn.execute(
-            """
-            UPDATE multitenancy_routing
-            SET active = 0, deleted_at = ?, updated_at = ?, version = version + 1
-            WHERE user_id = ? AND active = 1
-            """,
-            (now, now, user_id),
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        while True:
+            previous_identity = self._active_user_identity(user_id)
+            lock_identities = {previous_identity} if previous_identity else set()
+            with self._credential_identity_locks(lock_identities):
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._active_user_identity(user_id) != previous_identity:
+                        self._conn.rollback()
+                        continue
+                    now = _now()
+                    cur = self._conn.execute(
+                        """
+                        UPDATE multitenancy_routing
+                        SET active = 0, deleted_at = ?, updated_at = ?, version = version + 1
+                        WHERE user_id = ? AND active = 1
+                        """,
+                        (now, now, user_id),
+                    )
+                    self._conn.commit()
+                    return cur.rowcount > 0
+                except Exception:
+                    self._conn.rollback()
+                    raise
 
     def soft_delete_group(self, chat_id: str) -> bool:
         """Soft-delete a group row by chat_id. Returns True if a row was updated."""

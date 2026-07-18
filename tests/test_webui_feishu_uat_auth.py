@@ -145,7 +145,7 @@ def test_feishu_uat_status_uses_profile_json_without_vault_key(tmp_path, monkeyp
     monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
     now_ms = int(time.time() * 1000)
     profile_uat = shared / "profiles" / "owner" / "feishu_uat"
-    profile_uat.mkdir(parents=True)
+    profile_uat.mkdir(parents=True, exist_ok=True)
     (profile_uat / "ou_owner.json").write_text(
         json.dumps(
             {
@@ -207,7 +207,7 @@ def test_feishu_uat_status_prefers_runtime_profile_json_over_keyless_vault_metad
         store.close()
 
     profile_uat = shared / "profiles" / "owner" / "feishu_uat"
-    profile_uat.mkdir(parents=True)
+    profile_uat.mkdir(parents=True, exist_ok=True)
     (profile_uat / "ou_owner.json").write_text(
         json.dumps(
             {
@@ -259,7 +259,7 @@ def test_feishu_uat_status_does_not_mark_reauth_when_keyless_refresh_needs_app_c
         store.close()
 
     profile_uat = shared / "profiles" / "owner" / "feishu_uat"
-    profile_uat.mkdir(parents=True)
+    profile_uat.mkdir(parents=True, exist_ok=True)
     (profile_uat / "ou_owner.json").write_text(
         json.dumps(
             {
@@ -325,7 +325,7 @@ def test_feishu_uat_status_prefers_valid_runtime_vault_over_fresher_scope_missin
         store.close()
 
     profile_uat = shared / "profiles" / "owner" / "feishu_uat"
-    profile_uat.mkdir(parents=True)
+    profile_uat.mkdir(parents=True, exist_ok=True)
     (profile_uat / "ou_owner.json").write_text(
         json.dumps(
             {
@@ -1019,6 +1019,108 @@ def test_poll_session_revalidates_route_after_waiting_for_identity_lock(
         store.close()
 
 
+@pytest.mark.parametrize("mutation", ["upsert", "soft_delete"])
+def test_store_uat_serializes_route_mutation_after_in_lock_validation(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    (shared / "profiles" / "replacement").mkdir(parents=True)
+    route_checked = threading.Event()
+    release_store = threading.Event()
+    route_started = threading.Event()
+    route_finished = threading.Event()
+    store_errors: list[BaseException] = []
+    route_errors: list[BaseException] = []
+    real_assert_route = feishu_uat_auth._assert_route
+
+    def pause_after_route_check(*args, **kwargs):
+        real_assert_route(*args, **kwargs)
+        route_checked.set()
+        if not release_store.wait(timeout=2):
+            raise TimeoutError("timed out waiting to release credential store")
+
+    monkeypatch.setattr(feishu_uat_auth, "_assert_route", pause_after_route_check)
+    payload = {
+        "app_id": "cli_test",
+        "user_open_id": "ou_owner",
+        "access_token": "serialized-access",
+        "refresh_token": "serialized-refresh",
+        "expires_at": int(time.time() * 1000) + 3600_000,
+        "refresh_expires_at": int(time.time() * 1000) + 30 * 24 * 3600_000,
+        "scope": "wiki:wiki:readonly offline_access",
+        "granted_at": int(time.time() * 1000),
+    }
+
+    def store_uat() -> None:
+        try:
+            feishu_uat_auth._store_uat(shared, "owner", "ou_owner", payload)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            store_errors.append(exc)
+
+    table = RoutingTable(shared / "multitenancy.db")
+
+    def mutate_route() -> None:
+        route_started.set()
+        try:
+            if mutation == "upsert":
+                table.upsert(
+                    user_id="owner",
+                    profile_name="replacement",
+                    open_id="ou_owner",
+                    provenance="sync",
+                )
+            else:
+                table.soft_delete("owner")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            route_errors.append(exc)
+        finally:
+            route_finished.set()
+
+    store_worker = threading.Thread(target=store_uat)
+    route_worker = threading.Thread(target=mutate_route)
+    store_worker.start()
+    assert route_checked.wait(timeout=2)
+    route_worker.start()
+    try:
+        assert route_started.wait(timeout=2)
+        assert not route_finished.wait(timeout=0.2)
+    finally:
+        release_store.set()
+        store_worker.join(timeout=2)
+        route_worker.join(timeout=2)
+
+    try:
+        assert not store_worker.is_alive()
+        assert not route_worker.is_alive()
+        assert store_errors == []
+        assert route_errors == []
+        if mutation == "upsert":
+            assert table.lookup_by_open_id("ou_owner").profile_name == "replacement"
+        else:
+            assert table.lookup_by_open_id("ou_owner") is None
+    finally:
+        table.close()
+
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        assert store.get_secret_for_runtime(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+        )["access_token"] == "serialized-access"
+    finally:
+        store.close()
+    assert (
+        shared / "profiles" / "owner" / "feishu_uat" / "ou_owner.json"
+    ).is_file()
+
+
 def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeypatch):
     from hermes_multitenancy import feishu_uat_auth
 
@@ -1304,6 +1406,109 @@ def test_poll_session_expires_if_device_exchange_crosses_deadline(tmp_path, monk
     assert session._pending_token_payload is None
     assert poll_calls == ["device-expires-during-exchange"]
     assert store_calls == 0
+
+
+@pytest.mark.parametrize("expiry_stage", ["user_info", "persistence", "vault_commit"])
+def test_poll_session_rechecks_deadline_before_persisting(
+    tmp_path,
+    monkeypatch,
+    expiry_stage,
+):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.credentials import CredentialStore
+
+    shared = _prepare_shared_home(tmp_path, monkeypatch)
+    session = _add_pending_auth_session(
+        feishu_uat_auth,
+        session_id=f"expires-during-{expiry_stage}",
+        device_code=f"device-expires-during-{expiry_stage}",
+    )
+    clock = {"now": 100.0}
+    session.expires_at = 101
+    poll_calls: list[str] = []
+    user_info_calls: list[str] = []
+    route_check_calls = 0
+    real_assert_route = feishu_uat_auth._assert_route
+
+    monkeypatch.setattr(feishu_uat_auth.time, "time", lambda: clock["now"])
+
+    def poll_token(device_code, _client_id, _client_secret):
+        poll_calls.append(device_code)
+        result = {
+            "access_token": "late-access",
+            "refresh_token": "late-refresh",
+            "expires_in": 7200,
+            "refresh_expires_in": 30 * 24 * 3600,
+            "scope": "wiki:wiki:readonly offline_access",
+        }
+        if expiry_stage in {"persistence", "vault_commit"}:
+            result["open_id"] = "ou_owner"
+        return result
+
+    def fetch_user_info(access_token):
+        user_info_calls.append(access_token)
+        clock["now"] = 102.0
+        return {"open_id": "ou_owner"}
+
+    monkeypatch.setattr(feishu_uat_auth, "_poll_device_token", poll_token)
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", fetch_user_info)
+
+    def expire_after_store_route_check(*args, **kwargs):
+        nonlocal route_check_calls
+        real_assert_route(*args, **kwargs)
+        route_check_calls += 1
+        if expiry_stage == "persistence" and route_check_calls == 2:
+            clock["now"] = 102.0
+
+    monkeypatch.setattr(
+        feishu_uat_auth,
+        "_assert_route",
+        expire_after_store_route_check,
+    )
+    real_put_credential = CredentialStore.put_credential
+
+    def expire_before_vault_commit(self, **kwargs):
+        clock["now"] = 102.0
+        return real_put_credential(self, **kwargs)
+
+    if expiry_stage == "vault_commit":
+        monkeypatch.setattr(
+            CredentialStore,
+            "put_credential",
+            expire_before_vault_commit,
+        )
+
+    first = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+    second = feishu_uat_auth.poll_session(
+        session_id=session.session_id,
+        profile_name="owner",
+        open_id="ou_owner",
+        shared_home=shared,
+    )
+
+    assert first["status"] == "expired"
+    assert first["error"] == "authorization session expired"
+    assert second == first
+    assert session._pending_token_payload is None
+    assert poll_calls == [f"device-expires-during-{expiry_stage}"]
+    assert user_info_calls == (["late-access"] if expiry_stage == "user_info" else [])
+    assert not (
+        shared / "profiles" / "owner" / "feishu_uat" / "ou_owner.json"
+    ).exists()
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        assert store.get_status(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+        )["status"] == "missing"
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("ttl", ["not-an-int", -1, 10**15], ids=["invalid", "negative", "huge"])

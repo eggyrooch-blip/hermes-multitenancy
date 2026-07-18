@@ -161,6 +161,10 @@ def _expire_session(session: FeishuAuthSession) -> dict[str, Any]:
     return _session_public(session)
 
 
+def _deadline_reached(expires_at: int) -> bool:
+    return time.time() >= float(expires_at)
+
+
 def _stabilize_protocol_error(
     session: FeishuAuthSession,
     exc: FeishuUatAuthProtocolError,
@@ -661,7 +665,7 @@ def poll_session(
         _assert_route(shared, profile_name, open_id)
         if session.status in {"success", "error", "expired"}:
             return _session_public(session)
-        if int(time.time()) >= session.expires_at:
+        if _deadline_reached(session.expires_at):
             return _expire_session(session)
 
         payload = session._pending_token_payload
@@ -675,7 +679,7 @@ def poll_session(
             except FeishuUatAuthProtocolError as exc:
                 _stabilize_protocol_error(session, exc)
                 raise
-            if int(time.time()) >= session.expires_at:
+            if _deadline_reached(session.expires_at):
                 return _expire_session(session)
             error = str(result.get("error") or "").strip()
             if error in {"authorization_pending", "slow_down"} or (not error and not result.get("access_token")):
@@ -689,6 +693,10 @@ def poll_session(
             if not token_open_id:
                 user_info = _fetch_user_info(str(result.get("access_token") or ""))
                 token_open_id = str(user_info.get("open_id") or "").strip()
+            # Known gotcha: user-info is a second network hop and can finish
+            # after the device-flow deadline even when token exchange did not.
+            if _deadline_reached(session.expires_at):
+                return _expire_session(session)
             if token_open_id != open_id:
                 session.status = "error"
                 session.error = f"authorized account does not match requesting Feishu user ({token_open_id} does not match {open_id})"
@@ -705,18 +713,25 @@ def poll_session(
                 _stabilize_protocol_error(session, exc)
                 raise
             session._pending_token_payload = payload
+        if _deadline_reached(session.expires_at):
+            return _expire_session(session)
         try:
-            _store_uat(
+            stored = _store_uat(
                 shared,
                 profile_name,
                 open_id,
                 payload,
                 lock_timeout_seconds=_POLL_STORE_LOCK_TIMEOUT_SECONDS,
+                not_after_epoch_seconds=session.expires_at,
             )
         except CredentialIdentityLockTimeout:
+            if _deadline_reached(session.expires_at):
+                return _expire_session(session)
             return _session_public(session)
         except Exception as exc:
             if _is_transient_uat_store_error(exc):
+                if _deadline_reached(session.expires_at):
+                    return _expire_session(session)
                 return _session_public(session)
             session._pending_token_payload = None
             session.status = "error"
@@ -726,6 +741,8 @@ def poll_session(
                 else "authorization credential storage failed; please authorize again"
             )
             raise
+        if stored is False:
+            return _expire_session(session)
         session._pending_token_payload = None
         session.status = "success"
         return _session_public(session)
@@ -880,7 +897,8 @@ def _store_uat(
     payload: dict[str, Any],
     *,
     lock_timeout_seconds: float | None = None,
-) -> None:
+    not_after_epoch_seconds: int | None = None,
+) -> bool:
     """Persist a UAT after L1 write-time validation.
 
     Refuses to overwrite a known-good UAT with a degraded one. Two ways a UAT
@@ -897,6 +915,11 @@ def _store_uat(
         open_id,
         timeout_seconds=lock_timeout_seconds,
     ):
+        if (
+            not_after_epoch_seconds is not None
+            and _deadline_reached(not_after_epoch_seconds)
+        ):
+            return False
         _assert_route(shared_home, profile_name, open_id)
         rejection = _l1_validate_uat(payload)
         if rejection is not None:
@@ -908,7 +931,12 @@ def _store_uat(
         scopes = parse_scopes(payload.get("scope"))
         store = CredentialStore(shared_home / "multitenancy.db")
         try:
-            store.put_credential(
+            if (
+                not_after_epoch_seconds is not None
+                and _deadline_reached(not_after_epoch_seconds)
+            ):
+                return False
+            stored = store.put_credential(
                 profile_name=profile_name,
                 subject_id=open_id,
                 provider="feishu",
@@ -916,7 +944,14 @@ def _store_uat(
                 payload=payload,
                 scopes=scopes,
                 expires_at=int(payload["expires_at"]) if payload.get("expires_at") else None,
+                commit_if=(
+                    None
+                    if not_after_epoch_seconds is None
+                    else lambda: not _deadline_reached(not_after_epoch_seconds)
+                ),
             )
+            if not stored:
+                return False
         finally:
             store.close()
         target = shared_home / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
@@ -934,6 +969,7 @@ def _store_uat(
                 "Feishu UAT was stored, but its reauthorization marker could not be cleared; retry authorization",
                 status=500,
             )
+        return True
 
 
 def _l1_validate_uat(payload: dict[str, Any]) -> Optional[dict[str, str]]:

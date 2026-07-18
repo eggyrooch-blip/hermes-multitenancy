@@ -7,6 +7,30 @@ import time
 import pytest
 
 
+def test_credential_store_commit_guard_rolls_back(tmp_path):
+    from hermes_multitenancy.credentials import CredentialStore
+
+    store = CredentialStore(tmp_path / "multitenancy.db", encryption_key="test-key")
+    try:
+        stored = store.put_credential(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+            secret_kind="uat",
+            payload={"access_token": "too-late"},
+            commit_if=lambda: False,
+        )
+
+        assert stored is False
+        assert store.get_status(
+            profile_name="owner",
+            subject_id="ou_owner",
+            provider="feishu",
+        )["status"] == "missing"
+    finally:
+        store.close()
+
+
 def test_credential_store_status_is_profile_scoped_and_redacted(tmp_path):
     from hermes_multitenancy.credentials import CredentialStore
 

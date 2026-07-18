@@ -161,8 +161,11 @@ def credential_identity_lock(
             # A lock under shared_home itself would be a private bwrap inode (or be
             # denied by the macOS profile) and would not provide cross-process
             # exclusion for direct refresh callers inside those sandboxes.
-            lock_dir = canonical_home / "profiles" / profile / "feishu_uat"
+            profiles_dir = canonical_home / "profiles"
+            profile_dir = profiles_dir / profile
+            lock_dir = profile_dir / "feishu_uat"
             lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(profile_dir, 0o700)
             os.chmod(lock_dir, 0o700)
             identity_digest = hashlib.sha256(
                 json.dumps([profile, str(open_id)], separators=(",", ":")).encode("utf-8")

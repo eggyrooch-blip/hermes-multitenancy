@@ -368,6 +368,22 @@ def test_identity_lock_is_reentrant_when_refresh_stores_uat(
     ).is_file()
 
 
+def test_identity_lock_hardens_created_profile_directories(tmp_path: Path):
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir(mode=0o755)
+    profiles_dir.chmod(0o755)
+
+    with common.credential_identity_lock(tmp_path, "alice", "ou_permissions"):
+        pass
+
+    for path in (
+        tmp_path / "profiles" / "alice",
+        tmp_path / "profiles" / "alice" / "feishu_uat",
+    ):
+        assert path.stat().st_mode & 0o777 == 0o700
+    assert profiles_dir.stat().st_mode & 0o777 == 0o755
+
+
 @pytest.mark.parametrize("profile_name", ["", ".", "..", "../bob", "/tmp/bob", " alice"])
 def test_identity_lock_rejects_profile_path_traversal(tmp_path: Path, profile_name: str):
     with pytest.raises(ValueError, match="profile_name"):

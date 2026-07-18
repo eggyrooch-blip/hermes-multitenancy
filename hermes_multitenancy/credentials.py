@@ -17,7 +17,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 _SCHEMA = """
@@ -71,7 +71,8 @@ class CredentialStore:
         payload: dict[str, Any],
         scopes: Iterable[str] | None = None,
         expires_at: int | None = None,
-    ) -> None:
+        commit_if: Callable[[], bool] | None = None,
+    ) -> bool:
         profile_name = _clean_id("profile_name", profile_name)
         subject_id = _clean_id("subject_id", subject_id)
         provider = _clean_id("provider", provider)
@@ -79,34 +80,42 @@ class CredentialStore:
         scopes_list = _normalize_scopes(scopes)
         now = _now_ms()
         sealed = _seal_json(payload, _require_key(self._key))
-        self._conn.execute(
-            """
-            INSERT INTO multitenancy_credentials
-                (profile_name, subject_id, provider, secret_kind, scopes_json,
-                 scope_hash, expires_at, encrypted_payload, active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(profile_name, subject_id, provider, secret_kind) DO UPDATE SET
-                scopes_json       = excluded.scopes_json,
-                scope_hash        = excluded.scope_hash,
-                expires_at        = excluded.expires_at,
-                encrypted_payload = excluded.encrypted_payload,
-                active            = 1,
-                updated_at        = excluded.updated_at
-            """,
-            (
-                profile_name,
-                subject_id,
-                provider,
-                secret_kind,
-                json.dumps(scopes_list, ensure_ascii=False, sort_keys=True),
-                _scope_hash(scopes_list),
-                expires_at,
-                sealed,
-                now,
-                now,
-            ),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO multitenancy_credentials
+                    (profile_name, subject_id, provider, secret_kind, scopes_json,
+                     scope_hash, expires_at, encrypted_payload, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(profile_name, subject_id, provider, secret_kind) DO UPDATE SET
+                    scopes_json       = excluded.scopes_json,
+                    scope_hash        = excluded.scope_hash,
+                    expires_at        = excluded.expires_at,
+                    encrypted_payload = excluded.encrypted_payload,
+                    active            = 1,
+                    updated_at        = excluded.updated_at
+                """,
+                (
+                    profile_name,
+                    subject_id,
+                    provider,
+                    secret_kind,
+                    json.dumps(scopes_list, ensure_ascii=False, sort_keys=True),
+                    _scope_hash(scopes_list),
+                    expires_at,
+                    sealed,
+                    now,
+                    now,
+                ),
+            )
+            if commit_if is not None and not commit_if():
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def get_status(
         self,
