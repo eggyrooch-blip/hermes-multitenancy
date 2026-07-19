@@ -18,10 +18,17 @@ def test_normalize_prepends_provider_to_bare_default():
     assert _split_model_spec(cfg["model"]["default"]) == ("custom:litellm-sre", "tencent-sonnet-4-6")
 
 
-def test_split_model_spec_removes_custom_transport_context_label_only():
-    assert _split_model_spec("custom:litellm-sre/kimi/k3[1m]") == (
+def test_split_model_spec_removes_custom_transport_context_label_only_for_chat():
+    assert _split_model_spec(
+        "custom:litellm-sre/kimi/k3[1m]",
+        strip_custom_context_suffix=True,
+    ) == (
         "custom:litellm-sre",
         "kimi/k3",
+    )
+    assert _split_model_spec("custom:litellm-sre/kimi/k3[1m]") == (
+        "custom:litellm-sre",
+        "kimi/k3[1m]",
     )
     assert _split_model_spec("openrouter/vendor/model[1m]") == (
         "openrouter",

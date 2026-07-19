@@ -57,7 +57,10 @@ def _run_with_aiagent(
     primary = _model_spec_for_event(str(primary), event)
     fallback_models = config.get("fallback") or []
 
-    provider, model_only = _split_model_spec(primary)
+    provider, model_only = _split_model_spec(
+        primary,
+        strip_custom_context_suffix=True,
+    )
     api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
     if not api_key:
         raise RuntimeError(f"no API key for primary provider {provider!r}")

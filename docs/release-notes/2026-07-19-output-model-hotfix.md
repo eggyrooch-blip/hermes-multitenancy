@@ -10,8 +10,8 @@ Status: local ftask candidate only. Production is still running `hermes-multiten
 
 ## Candidate contract
 
-- Preserve `[1m]` in configuration and UI selection, but strip a trailing numeric `k`/`m` context label only when resolving a `custom:` provider's upstream model name.
-- Remove only `[System: Empty message content sanitised to satisfy protocol]` from assistant `content` and `done` results before parent mirroring and delivery. Mixed normal text is preserved; other System text is untouched.
+- Preserve `[1m]` in configuration and UI selection, but strip a trailing numeric `k`/`m` context label only when resolving a `custom:` chat provider's upstream model name; shared media parsing is unchanged.
+- Remove only `[System: Empty message content sanitised to satisfy protocol]` from assistant `content` and `done` results before parent mirroring and delivery, including when the marker crosses stream chunks. Mixed normal text is preserved; other System text is untouched.
 - Keep ordinary provider/model specs, thinking, tool, approval, and clarification events unchanged.
 
 ## Known gotchas
@@ -24,8 +24,8 @@ Status: local ftask candidate only. Production is still running `hermes-multiten
 
 - Red tests reproduced both failures before implementation.
 - Focused normalization/output tests: 9 passed.
-- AIAgent subprocess plus focused tests under the canonical Hermes venv: 197 passed.
-- Official `uv run --extra test pytest -q`: 2509 passed, 1 skipped, 3 deselected.
+- AIAgent subprocess plus focused tests: 199 passed.
+- Official `uv run --extra test pytest -q`: 2511 passed, 1 skipped, 3 deselected.
 - System Python is not a valid full-suite environment for this repository because it lacks Hermes `tools`/`agent` packages and pytest-asyncio; the canonical Hermes venv is the required test runtime.
 
 ## Production acceptance after explicit authorization

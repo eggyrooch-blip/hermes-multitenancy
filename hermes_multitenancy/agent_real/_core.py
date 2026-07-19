@@ -251,7 +251,7 @@ async def stream_run_agent(  # type: ignore[override]
                     yield "content", text
                 continue
             yield kind, payload
-        content_text = "".join(content_parts)
+        content_text = _strip_empty_message_protocol_placeholder("".join(content_parts))
         if final_text and not content_text.strip():
             yield "content", final_text
             content_text = final_text
@@ -424,7 +424,10 @@ async def _legacy_real_run_agent(
         if not model_spec:
             continue
         try:
-            provider, model_name = _split_model_spec(model_spec)
+            provider, model_name = _split_model_spec(
+                model_spec,
+                strip_custom_context_suffix=True,
+            )
         except ValueError as exc:
             logger.debug("real_run_agent: bad model spec %r: %s", model_spec, exc)
             continue
@@ -466,14 +469,18 @@ async def _legacy_real_run_agent(
 # -- helpers ---------------------------------------------------------------
 
 
-def _split_model_spec(spec: str) -> tuple[str, str]:
+def _split_model_spec(
+    spec: str,
+    *,
+    strip_custom_context_suffix: bool = False,
+) -> tuple[str, str]:
     """Split ``provider/model_name`` into its parts."""
     if "/" not in spec:
         raise ValueError(f"model spec missing provider prefix: {spec!r}")
     provider, name = spec.split("/", 1)
     provider = provider.strip().lower()
     name = name.strip()
-    if provider.startswith("custom:"):
+    if strip_custom_context_suffix and provider.startswith("custom:"):
         name = _CUSTOM_MODEL_CONTEXT_SUFFIX_RE.sub("", name)
     return provider, name
 

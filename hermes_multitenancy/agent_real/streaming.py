@@ -21,6 +21,34 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 
+class _ProtocolPlaceholderStreamSanitizer:
+    """Remove the empty-message marker even when it crosses stream chunks."""
+
+    def __init__(self) -> None:
+        self._pending = ""
+
+    def feed(self, value: Any) -> str:
+        text = (self._pending + str(value or "")).replace(
+            _EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER,
+            "",
+        )
+        self._pending = ""
+        max_overlap = min(
+            len(text),
+            len(_EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER) - 1,
+        )
+        for size in range(max_overlap, 0, -1):
+            if text.endswith(_EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER[:size]):
+                self._pending = text[-size:]
+                return text[:-size]
+        return text
+
+    def finish(self) -> str:
+        pending = self._pending
+        self._pending = ""
+        return pending
+
+
 async def _stream_loop(
     event: Any,
     profile_home: Path,
@@ -88,7 +116,10 @@ async def _stream_loop(
         if not model_spec:
             continue
         try:
-            provider, model_name = _split_model_spec(model_spec)
+            provider, model_name = _split_model_spec(
+                model_spec,
+                strip_custom_context_suffix=True,
+            )
         except ValueError:
             continue
         api_key = _resolve_api_key(provider, env_overrides, auth)
@@ -570,6 +601,7 @@ async def _stream_aiagent_subprocess(
         first_heartbeat_s = float(os.getenv("HERMES_AIAGENT_FIRST_EVENT_HEARTBEAT_SECONDS", "1"))
         heartbeat_s = float(os.getenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "15"))
         heartbeat_count = 0
+        content_sanitizer = _ProtocolPlaceholderStreamSanitizer()
         while True:
             read_started = time.monotonic()
             read_task = asyncio.create_task(read_line())
@@ -655,6 +687,15 @@ async def _stream_aiagent_subprocess(
                     time.monotonic() - started_at,
                     len(str(data.get("result") or "")),
                 )
+                raw_done_text = _redact_ingest_runtime_text(data.get("result"), event)
+                pending_text = content_sanitizer.finish()
+                if (
+                    pending_text
+                    and _EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER
+                    not in pending_text + raw_done_text
+                ):
+                    _mirror.upsert_assistant(pending_text, "")
+                    yield "content", pending_text
                 # Seal any trailing assistant chunk, retag source to feishu,
                 # and dedupe against whatever Hermes core's own end-of-run
                 # write inserted.
@@ -662,12 +703,10 @@ async def _stream_aiagent_subprocess(
                 _mirror.retag_source()
                 _mirror.dedupe()
                 _write_token_ledger_from_child(event, profile_home, data.get("usage"))
-                yield "done", _strip_empty_message_protocol_placeholder(
-                    _redact_ingest_runtime_text(data.get("result"), event)
-                )
+                yield "done", _strip_empty_message_protocol_placeholder(raw_done_text)
                 continue
             if event_name == "content":
-                content_text = _strip_empty_message_protocol_placeholder(
+                content_text = content_sanitizer.feed(
                     _redact_ingest_runtime_text(data.get("text"), event)
                 )
                 if content_text:
@@ -690,6 +729,10 @@ async def _stream_aiagent_subprocess(
                     event,
                 )
                 if event_name == "tool_started":
+                    pending_text = content_sanitizer.finish()
+                    if pending_text:
+                        _mirror.upsert_assistant(pending_text, "")
+                        yield "content", pending_text
                     # Seal any pre-tool assistant text into its own row, then
                     # mirror the tool invocation. First tool-start is also
                     # the safest moment to retag — Hermes core has had time
