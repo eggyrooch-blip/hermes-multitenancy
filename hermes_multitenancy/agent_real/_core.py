@@ -174,6 +174,14 @@ _AGENT_SHARED_ROLES = frozenset({"viewer", "editor", "manager"})
 _AGENT_SHARE_CONTEXT_METADATA_KEY = "agent_share_context"
 _CREDENTIAL_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _STREAM_STATUS_ANIMATION_MARKERS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+_CUSTOM_MODEL_CONTEXT_SUFFIX_RE = re.compile(r"\[\d+[kKmM]\]$")
+_EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER = (
+    "[System: Empty message content sanitised to satisfy protocol]"
+)
+
+
+def _strip_empty_message_protocol_placeholder(text: Any) -> str:
+    return str(text or "").replace(_EMPTY_MESSAGE_PROTOCOL_PLACEHOLDER, "")
 
 
 def _animated_stream_status(phase: str, tick: int) -> str:
@@ -463,7 +471,11 @@ def _split_model_spec(spec: str) -> tuple[str, str]:
     if "/" not in spec:
         raise ValueError(f"model spec missing provider prefix: {spec!r}")
     provider, name = spec.split("/", 1)
-    return provider.strip().lower(), name.strip()
+    provider = provider.strip().lower()
+    name = name.strip()
+    if provider.startswith("custom:"):
+        name = _CUSTOM_MODEL_CONTEXT_SUFFIX_RE.sub("", name)
+    return provider, name
 
 
 def _event_metadata(event: Any) -> dict[str, Any]:
@@ -3956,13 +3968,15 @@ def _finalize_aiagent_result(result: Optional[dict], *, redact: Any | None = Non
     res = result or {}
     final_response = res.get("final_response")
     err = redact_text(res.get("error") or "")
-    text = final_response if isinstance(final_response, str) else ""
+    text = _strip_empty_message_protocol_placeholder(
+        final_response if isinstance(final_response, str) else ""
+    )
     is_truncation = _is_output_truncation_error(err)
 
     # Genuine success (incl. a legitimately empty turn): final_response present,
-    # no failure/partial/error flags. Return it verbatim ("" stays "").
+    # no failure/partial/error flags. Return protocol-sanitized text ("" stays "").
     if final_response is not None and not res.get("failed") and not res.get("partial") and not err:
-        return final_response or ""
+        return text
 
     # CONTENT-PRESERVING FIRST: if the turn produced ANY answer text, never drop
     # it — not even when ``failed``/``partial`` is set alongside it (a

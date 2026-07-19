@@ -18,6 +18,21 @@ def test_normalize_prepends_provider_to_bare_default():
     assert _split_model_spec(cfg["model"]["default"]) == ("custom:litellm-sre", "tencent-sonnet-4-6")
 
 
+def test_split_model_spec_removes_custom_transport_context_label_only():
+    assert _split_model_spec("custom:litellm-sre/kimi/k3[1m]") == (
+        "custom:litellm-sre",
+        "kimi/k3",
+    )
+    assert _split_model_spec("openrouter/vendor/model[1m]") == (
+        "openrouter",
+        "vendor/model[1m]",
+    )
+    assert _split_model_spec("custom:proxy/vendor/model[preview]") == (
+        "custom:proxy",
+        "vendor/model[preview]",
+    )
+
+
 def test_normalize_noop_when_already_prefixed():
     cfg = {"model": {"default": "custom:litellm-sre/tencent-sonnet-4-6", "provider": "custom:litellm-sre"}}
     _normalize_model_spec_inplace(cfg)

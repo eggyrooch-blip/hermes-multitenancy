@@ -264,6 +264,10 @@ python /opt/hermes-multitenancy/scripts/lark_cli_canary_preflight.py \
 
 已知 gotcha：2026-06-23 生产曾因本地凭证加密 key 缺失，把一批仍有可用 Feishu UAT 的用户写成新鲜 `refresh_rejected` marker。根因是 proactive refresh worker 曾把所有刷新异常都当作用户可操作的重授权状态。守卫规则是：后台 marker 扫描永不发送飞书私信；只有真实任务被阻断时，才在任务结果里被动提示 `/feishu_auth`；未知 code 或基础设施错误必须只进入 diagnostic。
 
+已知 gotcha：自定义模型 selector 可能带 `[1m]` 这类仅用于展示的上下文标签；若把后缀原样作为上游模型 ID，LiteLLM 会拒绝本来有效的模型，因此自定义传输只剥离尾部数字 `k`/`m` 标签。
+
+已知 gotcha：Hermes core 可能为空助手信封生成 `[System: Empty message content sanitised to satisfy protocol]`；共享助手事件边界必须在会话镜像和用户投递前移除这个精确占位符。
+
 ### 4. 同步 profile 和路由
 
 有飞书 Contact 读 scope 时用组织同步（先 dry-run）：

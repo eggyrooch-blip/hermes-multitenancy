@@ -662,12 +662,17 @@ async def _stream_aiagent_subprocess(
                 _mirror.retag_source()
                 _mirror.dedupe()
                 _write_token_ledger_from_child(event, profile_home, data.get("usage"))
-                yield "done", _redact_ingest_runtime_text(data.get("result"), event)
+                yield "done", _strip_empty_message_protocol_placeholder(
+                    _redact_ingest_runtime_text(data.get("result"), event)
+                )
                 continue
             if event_name == "content":
-                content_text = _redact_ingest_runtime_text(data.get("text"), event)
-                _mirror.upsert_assistant(content_text, "")
-                yield "content", content_text
+                content_text = _strip_empty_message_protocol_placeholder(
+                    _redact_ingest_runtime_text(data.get("text"), event)
+                )
+                if content_text:
+                    _mirror.upsert_assistant(content_text, "")
+                    yield "content", content_text
             elif event_name == "thinking":
                 thinking_text = _redact_ingest_runtime_text(data.get("text"), event)
                 _mirror.upsert_assistant("", thinking_text)

@@ -267,6 +267,10 @@ Known gotcha: a 2026-06-23 production incident produced fresh `refresh_rejected`
 
 Known gotcha: Feishu automatically closes CardKit streaming mode after a long-running reply; later updates return `200850` or `300309`. Treating those codes as a generic card failure makes the conversation appear to stop when the user leaves the chat. The compat controller now re-enables streaming and retries that frame exactly once with a monotonic sequence; an unrecoverable provider failure preserves partial content and ends in an Error card, never a false Completed footer or a duplicate provider run.
 
+Known gotcha: a custom model selector may carry a display-only context label such as `[1m]`; forwarding that suffix as part of the upstream model ID can make LiteLLM reject an otherwise valid model, so custom transports strip only a trailing numeric `k`/`m` label.
+
+Known gotcha: Hermes core may emit `[System: Empty message content sanitised to satisfy protocol]` for an empty assistant envelope; the shared assistant event boundary must remove that exact placeholder before session mirroring or user delivery.
+
 ### 4. Sync profiles and routes
 
 With Feishu Contact read scopes, use org sync (dry-run first):
