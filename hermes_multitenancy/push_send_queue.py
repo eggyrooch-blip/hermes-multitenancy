@@ -428,10 +428,28 @@ def _loads(raw: Any) -> Any:
 _queue: Optional[PushSendQueue] = None
 
 
+def _quiet_hour_env(name: str, default: int) -> int:
+    """Quiet-hours bound from env (policy, not code). ``HERMES_PUSH_CARD_QUIET_START
+    == HERMES_PUSH_CARD_QUIET_END`` disables quiet hours entirely (never quiet)."""
+    import os
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        h = int(raw)
+    except ValueError:
+        return default
+    return h if 0 <= h <= 23 else default
+
+
 def get_send_queue() -> PushSendQueue:
     global _queue
     if _queue is None:
-        _queue = PushSendQueue(_reg.get_registry_store())
+        _queue = PushSendQueue(
+            _reg.get_registry_store(),
+            quiet_start_hour=_quiet_hour_env("HERMES_PUSH_CARD_QUIET_START", 21),
+            quiet_end_hour=_quiet_hour_env("HERMES_PUSH_CARD_QUIET_END", 9),
+        )
     return _queue
 
 
