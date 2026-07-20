@@ -17,13 +17,28 @@ one scene does not justify a package split.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Field risk levels. "high" fields (money / date / person) must NOT be silently
 # pre-filled — low-confidence stays empty and is asked (design §2.4, P0-4).
 RISK_LOW = "low"
 RISK_HIGH = "high"
+
+# Scene routing mode (how a matched reply is handled):
+#   card — the SAFE default: framework drives the form闭环 (merge → clarify /
+#          confirm card → button confirm → deterministic backend write). The
+#          agent is short-circuited so it can never freelance the write.
+#   yolo — the framework only ROUTES the reply into the scene's ``skill`` and
+#          gets out of the way; the business skill self-drives compute → 请确认
+#          → execute/写库 in its own agent turn. No framework form, no confirm
+#          callback write.
+MODE_CARD = "card"
+MODE_YOLO = "yolo"
+_VALID_MODES = frozenset({MODE_CARD, MODE_YOLO})
 
 
 @dataclass(frozen=True)
@@ -88,6 +103,19 @@ class SceneDefinition:
     callback: Optional[CallbackConfig] = None
     #: default submit behavior for this scene; a push may override per-card.
     behaviors: SubmitBehaviors = SubmitBehaviors()
+    #: routing mode — ``card`` (safe framework-driven form loop) or ``yolo``
+    #: (route the reply into ``skill``; the skill self-drives). An invalid value
+    #: falls back to ``card`` + logs, so a config typo can never crash plugin
+    #: load or silently unlock the放权 path.
+    mode: str = MODE_CARD
+
+    def __post_init__(self) -> None:
+        if self.mode not in _VALID_MODES:
+            logger.warning(
+                "[push_scenes] scene %r has invalid mode %r; falling back to %r",
+                self.scene, self.mode, MODE_CARD,
+            )
+            object.__setattr__(self, "mode", MODE_CARD)  # frozen dataclass
 
     def field(self, key: str) -> Optional[SceneField]:
         for f in self.fields:
@@ -116,9 +144,26 @@ DEV_ACCEPTANCE_CLAIM = SceneDefinition(
     deterministic_marker="[PAI-ACC-{registry_id}]",
 )
 
-SCENE_ORDER: tuple[str, ...] = (DEV_ACCEPTANCE_CLAIM.scene,)
+# A dev-only YOLO scene (design: card + yolo双模式). It exists purely to prove
+# the "route the reply into the scene's skill" mechanism end to end — no real
+# business logic, no framework form. ``skill`` names a simple echo/确认 skill;
+# ``fields`` is empty because a yolo scene never renders a framework form (the
+# skill owns compute/confirm/execute). Reply to the pushed card (a quote or an
+# on-topic reply) and the framework injects ``/push-yolo-echo <你的原话>`` and
+# hands the turn to the agent.
+DEV_YOLO_ECHO = SceneDefinition(
+    scene="dev-yolo-echo",
+    name="开发验收·YOLO 回显",
+    skill="push-yolo-echo",
+    writer="",  # yolo: no framework writer — the skill self-drives写库.
+    fields=(),
+    mode=MODE_YOLO,
+)
+
+SCENE_ORDER: tuple[str, ...] = (DEV_ACCEPTANCE_CLAIM.scene, DEV_YOLO_ECHO.scene)
 BUILTIN_SCENES: dict[str, SceneDefinition] = {
     DEV_ACCEPTANCE_CLAIM.scene: DEV_ACCEPTANCE_CLAIM,
+    DEV_YOLO_ECHO.scene: DEV_YOLO_ECHO,
 }
 
 

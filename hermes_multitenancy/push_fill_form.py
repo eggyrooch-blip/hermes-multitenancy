@@ -38,7 +38,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .push_scenes import RISK_HIGH, SceneDefinition, SceneField
+from .push_scenes import MODE_YOLO, RISK_HIGH, SceneDefinition, SceneField
 
 # --- confidence policy ---------------------------------------------------
 
@@ -531,14 +531,23 @@ def build_fill_step(
 
 def default_scene_card(scene: SceneDefinition) -> dict[str, Any]:
     """A minimal push card for when the notify-card caller omits ``card`` — the
-    scene title plus a one-line prompt telling the user to reply to fill it
-    (finding no-default-card-when-omitted). Without this a ``card=None`` row
-    would serialize to ``"null"`` and fail the Feishu send."""
+    scene title plus a one-line prompt telling the user to reply (finding
+    no-default-card-when-omitted). Without this a ``card=None`` row would
+    serialize to ``"null"`` and fail the Feishu send.
+
+    The prompt differs by mode: a card scene invites填表, a yolo scene invites the
+    user to state their rule/需求 (no framework form — the skill computes and asks
+    for confirmation)."""
+    prompt = (
+        "直接回复你的规则或需求，我来计算并请你确认。"
+        if scene.mode == MODE_YOLO
+        else "直接回复此卡即可填写，我会帮你把内容整理成表单。"
+    )
     return {
         "schema": "2.0",
         "header": {"title": {"tag": "plain_text", "content": scene.name}, "template": "blue"},
         "body": {"elements": [
             {"tag": "markdown", "content": f"**{scene.name}**"},
-            {"tag": "markdown", "content": "直接回复此卡即可填写，我会帮你把内容整理成表单。"},
+            {"tag": "markdown", "content": prompt},
         ]},
     }

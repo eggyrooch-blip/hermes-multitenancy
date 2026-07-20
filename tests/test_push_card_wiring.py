@@ -374,3 +374,61 @@ def test_send_push_card_via_adapter_targets_open_id(store):
     assert seen["chat_id"] == "ou_direct"   # open_id is the receive target
     assert seen["reply_to"] is None          # → triggers the open_id (not reply) path
     assert seen["msg_type"] == "interactive"
+
+
+# ===================== yolo mode: route into skill, no form =====================
+
+YOLO_SCENE = "dev-yolo-echo"
+YOLO_SKILL = "push-yolo-echo"
+
+
+def _pending_yolo_row(store, *, open_id="ou_alice", mid="om_ycard"):
+    rid = store.create(scene=YOLO_SCENE, skill=YOLO_SKILL, target_open_id=open_id,
+                       profile_name=f"{open_id}-profile",
+                       business_key=f"{YOLO_SCENE}:{open_id}:2026-07-20").row["registry_id"]
+    store.mark_sent(rid, message_id=mid)  # → pending, message_id set
+    return rid
+
+
+def test_yolo_reply_injects_skill_slash_and_passes_through(store):
+    """A quoted reply to a yolo-mode card rewrites event.text to ``/{skill}
+    <reply>`` and PASSES THROUGH (no form card, no short-circuit) so the normal
+    agent turn runs the business skill — the skill self-drives compute/确认/
+    execute. The row advances pending→clarifying so a multi-turn yolo
+    conversation keeps matching."""
+    A = _fresh_adapter_cls()
+    matcher._patch_dispatch(A)
+    adapter = A()
+    rid = _pending_yolo_row(store)
+
+    ev = SimpleNamespace(sender_open_id="ou_alice",
+                         text="1-10日2.3元 其他1.9元", reply_to_message_id="om_ycard")
+    asyncio.run(adapter._dispatch_inbound_event(ev))
+
+    # NO framework form card was sent — yolo never renders a form
+    assert adapter.sent == []
+    # the message was NOT consumed — it flows on to the normal agent turn
+    assert adapter.original_called is True
+    # event.text was rewritten to the scene's business-skill slash
+    assert ev.text == "/push-yolo-echo 1-10日2.3元 其他1.9元"
+    # the row stays open (advanced to clarifying) so the next reply keeps routing
+    assert store.get(rid)["status"] == reg.STATUS_CLARIFYING
+    assert metrics.snapshot().get(metrics.YOLO_ROUTED) == 1
+
+
+def test_yolo_multi_turn_keeps_routing(store):
+    """A second yolo reply (row already clarifying) still injects the skill —
+    the whole rules→计算→「覆盖」→execute conversation routes every turn."""
+    A = _fresh_adapter_cls()
+    matcher._patch_dispatch(A)
+    adapter = A()
+    _pending_yolo_row(store)
+
+    asyncio.run(adapter._dispatch_inbound_event(
+        SimpleNamespace(sender_open_id="ou_alice", text="规则如上", reply_to_message_id="om_ycard")))
+    ev2 = SimpleNamespace(sender_open_id="ou_alice", text="覆盖", reply_to_message_id="om_ycard")
+    asyncio.run(adapter._dispatch_inbound_event(ev2))
+
+    assert adapter.sent == []                       # never a form
+    assert ev2.text == "/push-yolo-echo 覆盖"        # "覆盖" confirm still routes to skill
+    assert adapter.original_called is True

@@ -37,7 +37,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from . import push_card_metrics as _metrics
 from . import push_registry as _reg
-from .push_scenes import SceneDefinition, get_scene
+from .push_scenes import MODE_CARD, MODE_YOLO, SceneDefinition, get_scene
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,9 @@ class MatchDecision:
     row: Optional[dict[str, Any]] = None
     scene: Optional[str] = None
     skill: Optional[str] = None
+    #: routing mode of the matched scene — decides ROUTE handling downstream
+    #: (``card`` = drive the form loop, ``yolo`` = inject skill + passthrough).
+    mode: str = MODE_CARD
     slash_content: Optional[str] = None
     context: dict[str, Any] = field(default_factory=dict)
     reply_text: Optional[str] = None
@@ -264,6 +267,8 @@ class PushCardMatcher:
     def _route(self, row: dict[str, Any], text: str, *, quoted: bool) -> MatchDecision:
         scene = row["scene"]
         skill = row["skill"]
+        scene_def = self.scene_lookup(scene)
+        mode = scene_def.mode if scene_def is not None else MODE_CARD
         slash_content = f"/{str(skill).lstrip('/')} {text}".rstrip()
         context = {
             "registry_id": row["registry_id"],
@@ -275,15 +280,15 @@ class PushCardMatcher:
             "submission": _loads(row.get("submission_json")),
             "quoted": quoted,
         }
+        context["mode"] = mode
         # 逃生门 hint on first engagement so the fill skill can surface it.
         if row["status"] == _reg.STATUS_PENDING:
-            scene_def = self.scene_lookup(scene)
             what = scene_def.name if scene_def is not None else "这张卡"
             context["escape_hint"] = f"如果你不是在填「{what}」，回复『不是』即可正常对话。"
         _metrics.incr(_metrics.MATCH_HIT)
         return MatchDecision(
             ROUTE, registry_id=row["registry_id"], row=row, scene=scene, skill=skill,
-            slash_content=slash_content, context=context,
+            mode=mode, slash_content=slash_content, context=context,
             reason="quoted_hit" if quoted else "intent_yes",
         )
 
@@ -346,6 +351,11 @@ _DISPATCH_FLAG = "_hermes_multitenancy_push_card_matcher_dispatch_patched"
 _RECALL_FLAG = "_hermes_multitenancy_push_card_recall_patched"
 _REGISTRY_CTX_ATTR = "_mt_push_registry_context"
 _NOTICE_ATTR = "_mt_push_card_notice"
+#: set on the event once a yolo match has rewritten its text into a /skill slash
+#: — guards against a double-inject if both the router and dispatch-patch seams
+#: reach the same event. Unlike the two above, a yolo event PASSES THROUGH, so a
+#: re-entry must return False (passthrough), not True (short-circuit).
+_YOLO_ROUTED_ATTR = "_mt_push_yolo_routed"
 
 
 def _read(obj: Any, name: str) -> Any:
@@ -467,6 +477,46 @@ async def _drive_fill_step(adapter: Any, decision: MatchDecision, text: str) -> 
     return True
 
 
+def _route_yolo_to_skill(event: Any, decision: MatchDecision) -> bool:
+    """yolo ROUTE handling: keep the row OPEN and inject the scene's business
+    skill slash into the event text so the passed-through message runs the skill
+    in the normal agent turn (design: card + yolo双模式).
+
+    Unlike ``_drive_fill_step`` this does NOT send a card, NOT touch a form, and
+    NOT write a confirm callback — the skill owns compute/confirm/execute. It
+    only (1) advances pending→clarifying (via CAS) so the row stays in
+    ``OPEN_STATUSES`` — a multi-turn yolo conversation (rules → 计算 → 「覆盖」→
+    execute) keeps matching, and expiry still closes an abandoned row — and
+    (2) rewrites ``event.text`` to ``/{skill} <reply>``.
+
+    Returns True when the slash was injected. On a raced/closed row it returns
+    False and leaves the event untouched (fail-open passthrough)."""
+    slash = decision.slash_content or ""
+    if not slash:
+        return False
+    store = _reg.get_registry_store()
+    registry_id = decision.registry_id
+    row = store.get(registry_id) if registry_id else None
+    if row is None:
+        return False
+    status = row["status"]
+    if status == _reg.STATUS_PENDING:
+        # CAS pending→clarifying; a racing send/expire that lost the row means we
+        # must not inject (the card is no longer open).
+        if not store.advance_status(
+            registry_id, expect=_reg.STATUS_PENDING, to=_reg.STATUS_CLARIFYING
+        ):
+            return False
+    elif status != _reg.STATUS_CLARIFYING:
+        return False  # confirmed/committed/expired/failed — not routable
+    setattr(event, "text", slash)
+    setattr(event, _YOLO_ROUTED_ATTR, decision.context)
+    _metrics.incr(_metrics.YOLO_ROUTED)
+    logger.info("[push_card] yolo routed reply into skill (registry=%s skill=%s)",
+                registry_id, decision.skill)
+    return True
+
+
 async def _send_notice(adapter: Any, open_id: str, text: str) -> bool:
     """Deliver an EXPIRED_EXIT / DISAMBIGUATE canned notice straight through the
     adapter and short-circuit the original dispatch — the text used to be only
@@ -499,6 +549,8 @@ async def try_route_push_card_reply(adapter: Any, event: Any) -> bool:
     Fail-open — any error → ``False`` (untouched delivery)."""
     if adapter is None:
         return False
+    if getattr(event, _YOLO_ROUTED_ATTR, None) is not None:
+        return False  # already yolo-routed (text rewritten) — passthrough, don't re-inject
     if (getattr(event, _REGISTRY_CTX_ATTR, None) is not None
             or getattr(event, _NOTICE_ATTR, None) is not None):
         return True  # already routed by the sibling path — short-circuit, don't re-drive
@@ -539,8 +591,19 @@ async def try_route_push_card_reply(adapter: Any, event: Any) -> bool:
             open_id, (text or "")[:24], quoted, getattr(decision, "action", None),
         )
         if decision.action == ROUTE:
-            # Load-bearing path: run the fill loop and send the clarify/confirm
-            # card. The reply is CONSUMED by the form loop, so short-circuit.
+            if decision.mode == MODE_YOLO:
+                # yolo放权: do NOT drive the framework form. Inject the scene's
+                # business-skill slash into the event text and PASS THROUGH so
+                # handle_async runs it as a normal agent turn — the skill
+                # self-drives compute → 请确认 → execute/写库. Returning False is
+                # deliberate: the message is NOT consumed here, it flows on with
+                # rewritten text. The row stays open (expiry still applies) so a
+                # multi-turn yolo conversation keeps routing each reply in.
+                _route_yolo_to_skill(event, decision)
+                return False
+            # Load-bearing path (card mode): run the fill loop and send the
+            # clarify/confirm card. The reply is CONSUMED by the form loop, so
+            # short-circuit.
             if await _drive_fill_step(adapter, decision, text):
                 setattr(event, _REGISTRY_CTX_ATTR, decision.context)
                 return True

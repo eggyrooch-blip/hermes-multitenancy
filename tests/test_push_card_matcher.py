@@ -362,3 +362,26 @@ def test_reconcile_noop_without_backend_seam(store):
     future = reg._now() + workers.RECONCILE_AFTER_S + 10
     counters = asyncio.run(workers.run_reconcile_sweep(store, now=future))
     assert counters == {"checked": 0, "committed": 0, "still_missing": 0}
+
+
+def test_yolo_scene_route_decision_carries_yolo_mode(store):
+    """A quoted reply to a yolo-mode card decides ROUTE with mode=yolo and the
+    business-skill slash content (card mode drives a form; yolo injects a skill)."""
+    from hermes_multitenancy import push_scenes as scenes
+    rid = store.create(scene="dev-yolo-echo", skill="push-yolo-echo",
+                       target_open_id="ou_alice", profile_name="alice-profile",
+                       business_key="dev-yolo-echo:ou_alice:2026-07-20").row["registry_id"]
+    store.mark_sent(rid, message_id="om_y")
+    d = _matcher(store).match(open_id="ou_alice", text="1-10日2.3元", quoted_message_id="om_y")
+    assert d.action == m.ROUTE
+    assert d.mode == scenes.MODE_YOLO
+    assert d.slash_content == "/push-yolo-echo 1-10日2.3元"
+
+
+def test_card_scene_route_decision_stays_card_mode(store):
+    """Regression: a card-mode scene still decides mode=card (form loop)."""
+    from hermes_multitenancy import push_scenes as scenes
+    row = _deliver(store, _create(store), mid="om_c")
+    d = _matcher(store).match(open_id="ou_alice", text="打车花了58", quoted_message_id="om_c")
+    assert d.action == m.ROUTE
+    assert d.mode == scenes.MODE_CARD

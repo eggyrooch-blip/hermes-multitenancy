@@ -154,6 +154,14 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             from ..push_card_matcher import try_route_push_card_reply
             if await try_route_push_card_reply(_m._get_feishu_adapter(gateway), event):
                 return
+            # A yolo-scene match passes through (returns False) but rewrites
+            # event.text to inject the business-skill slash (/skill <reply>). Re-
+            # sync the local text snapshot so the agent turn below runs the
+            # injected skill. A non-yolo passthrough leaves event.text unchanged,
+            # so this is a no-op there. cmd_pair stays None (it was parsed from
+            # the pre-injection text) → the /skill lands as agent content, not a
+            # router command, which is exactly the "由 agent 跑 skill" contract.
+            text = getattr(event, "text", text) or text
 
         if cmd_pair is not None:
             if fixed_context is not None and not expert_bot_route.is_fixed_expert_slash_allowed(cmd_pair[0]):
