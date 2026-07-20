@@ -1,8 +1,10 @@
 """POST/GET /api/run-broker/notify-card seam tests (SPEC push-card-fill-loop P2).
 
 Covers fail-closed Bearer auth, the per-key ``allowed_scenes`` whitelist, the
-no-``skill`` input contract, 202 async accept, idempotency-key replay, in-flight
-business_key 409, unknown-scene and unregistered-target 4xx, and the status query.
+inline self-serve scene contract (``skill``/``mode``/``fields`` gated by
+``allowed_skills`` + ``allowed_callback_domains``), 202 async accept,
+idempotency-key replay, in-flight business_key 409, unknown-scene and
+unregistered-target 4xx, and the status query.
 Delivery is stubbed via the send-dispatch seam so the endpoint stays deterministic
 (the queue itself is tested in test_push_card_registry.py).
 """
@@ -131,12 +133,14 @@ def test_explicit_card_is_preserved(_isolate):
     assert "CUSTOM" in json.dumps(card, ensure_ascii=False)
 
 
-def test_skill_in_body_is_ignored():
-    body = {**_GOOD, "skill": "evil-skill"}
+def test_inline_skill_not_in_allowed_skills_403():
+    # Route A: a ``skill`` in the body now DESCRIBES an inline scene (self-serve)
+    # — it is no longer ignored. A leaked key's blast radius is bounded by the
+    # ``allowed_skills`` allowlist, so a skill the key was not granted → 403.
+    body = {"open_id": "ou_alice", "skill": "evil-skill", "mode": "yolo"}
     status, data = _call("POST", "/api/run-broker/notify-card", body=body)
-    assert status == 202
-    row = reg.get_registry_store().get(data["registry_id"])
-    assert row["skill"] == "push-fill-form"  # never the caller-supplied skill
+    assert status == 403
+    assert "not authorized" in data["error"]
 
 
 def test_unknown_scene_4xx():

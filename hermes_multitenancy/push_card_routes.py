@@ -20,6 +20,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 from . import push_registry as _reg
 from . import push_scenes as _scenes
@@ -99,6 +100,32 @@ def _default_business_key(scene: str, open_id: str) -> str:
     return f"{scene}:{open_id}:{datetime.now().strftime('%Y-%m-%d')}"
 
 
+def _callback_domain_allowed(binding: dict[str, Any], callback: Any) -> Optional[str]:
+    """Fail-closed check that an inline push's 落库 callback host is allowlisted
+    for this key. ``callback`` is a ``CallbackConfig | None``; ``None`` = no
+    endpoint to vet → allowed. Returns an error string to 403 with, else None."""
+    if callback is None:
+        return None
+    host = (urlparse(callback.url).hostname or "").lower()
+    if not host:
+        return "callback url has no host"
+    for raw in binding.get("allowed_callback_domains") or []:
+        d = str(raw).strip().lower().lstrip(".")
+        # ponytail: exact host or subdomain-suffix match; widen to scheme/port
+        # scoping only if a caller ever needs it.
+        if d and (host == d or host.endswith("." + d)):
+            return None
+    return f"callback domain not authorized for this key: {host}"
+
+
+def _binding_allows_row(binding: dict[str, Any], row: dict[str, Any]) -> bool:
+    """Status-read authorization: an inline row (carries ``scene_spec_json``) is
+    gated by ``allowed_skills``; a named-scene row by ``allowed_scenes``."""
+    if row.get("scene_spec_json"):
+        return str(row.get("skill") or "") in (binding.get("allowed_skills") or [])
+    return str(row.get("scene") or "") in (binding.get("allowed_scenes") or [])
+
+
 def _public_row(row: dict[str, Any]) -> dict[str, Any]:
     """Caller-facing projection of a registry row — no nonce, no internal marker."""
     return {
@@ -136,21 +163,47 @@ def register_push_card_routes(app: Any) -> None:
                 {"ok": False, "error": "body must be a JSON object"}, status=400
             )
 
-        scene = str(payload.get("scene") or "").strip()
-        if not scene:
-            return web.json_response({"ok": False, "error": "scene is required"}, status=400)
-        scene_def = _scenes.get_scene(scene)
-        if scene_def is None:
-            return web.json_response(
-                {"ok": False, "error": f"unknown scene: {scene}"}, status=400
-            )
-        allowed = binding.get("allowed_scenes") or []
-        if scene not in allowed:
-            # fail-closed: a key may only push scenes explicitly granted to it.
-            return web.json_response(
-                {"ok": False, "error": f"scene not authorized for this key: {scene}"},
-                status=403,
-            )
+        # A scene may be DESCRIBED inline (a ``skill`` is present → self-serve,
+        # no server-side registration) or NAMED (look up a pre-registered scene).
+        # Inline wins when a skill is given; else fall back to the named registry
+        # (backward compatible). 二者取其一.
+        inline = bool(str(payload.get("skill") or "").strip())
+        if inline:
+            try:
+                scene_def = _scenes.scene_from_payload(payload)
+            except ValueError as exc:
+                return web.json_response(
+                    {"ok": False, "error": f"invalid scene spec: {exc}"}, status=400
+                )
+            # fail-closed: the key must be granted this skill, and any inline 落库
+            # callback must target an allowlisted domain (P0-1 blast radius).
+            if scene_def.skill not in (binding.get("allowed_skills") or []):
+                return web.json_response(
+                    {"ok": False,
+                     "error": f"skill not authorized for this key: {scene_def.skill}"},
+                    status=403,
+                )
+            cb_err = _callback_domain_allowed(binding, scene_def.callback)
+            if cb_err is not None:
+                return web.json_response({"ok": False, "error": cb_err}, status=403)
+            scene = scene_def.scene
+        else:
+            scene = str(payload.get("scene") or "").strip()
+            if not scene:
+                return web.json_response(
+                    {"ok": False, "error": "scene (or inline skill) is required"}, status=400
+                )
+            scene_def = _scenes.get_scene(scene)
+            if scene_def is None:
+                return web.json_response(
+                    {"ok": False, "error": f"unknown scene: {scene}"}, status=400
+                )
+            if scene not in (binding.get("allowed_scenes") or []):
+                # fail-closed: a key may only push scenes explicitly granted to it.
+                return web.json_response(
+                    {"ok": False, "error": f"scene not authorized for this key: {scene}"},
+                    status=403,
+                )
 
         open_id = str(payload.get("open_id") or "").strip()
         union_id = str(payload.get("union_id") or "").strip()
@@ -220,6 +273,10 @@ def register_push_card_routes(app: Any) -> None:
             expires_at=expires_at,
             callback_json=_scenes.callback_to_json(callback_cfg) if callback_cfg else None,
             behaviors_json=_scenes.behaviors_to_json(behaviors_cfg) if behaviors_cfg else None,
+            # Inline scenes carry their full spec on the row so reply/confirm
+            # resolve it without a name lookup; named scenes resolve fresh via
+            # the registry (scene_spec_json stays NULL).
+            scene_spec_json=_scenes.scene_to_spec_json(scene_def) if inline else None,
         )
 
         if result.conflict == "idempotent":
@@ -253,8 +310,7 @@ def register_push_card_routes(app: Any) -> None:
         row = _reg.get_registry_store().get(registry_id)
         if row is None:
             return web.json_response({"ok": False, "error": "not found"}, status=404)
-        allowed = binding.get("allowed_scenes") or []
-        if row["scene"] not in allowed:
+        if not _binding_allows_row(binding, row):
             return web.json_response({"ok": False, "error": "not found"}, status=404)
         return web.json_response({"ok": True, **_public_row(row)}, status=200)
 
