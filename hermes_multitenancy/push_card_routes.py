@@ -35,14 +35,14 @@ def _default_target_resolver(*, open_id: str, union_id: str) -> Optional[dict[st
     """Resolve a push target to its sending profile via the routing table.
 
     A target not present (never onboarded / off-boarded) → None → 4xx."""
-    from .routing import RoutingStore
+    from .routing import RoutingTable
 
-    store = RoutingStore()
+    table = RoutingTable()
     row = None
     if open_id:
-        row = store.lookup_by_open_id(open_id)
+        row = table.lookup_by_open_id(open_id)
     if row is None and union_id:
-        row = store.lookup_by_union_id(union_id)
+        row = table.lookup_by_union_id(union_id)
     if row is None:
         return None
     return {

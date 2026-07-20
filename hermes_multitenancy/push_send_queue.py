@@ -275,10 +275,13 @@ class PushSendQueue:
                     card=card,
                     payload=payload,
                 )
-            except PushCardSenderNotReady:
-                # Adapter not captured yet — DEFER (leave row 'sending'), the
-                # re-drive sweep retries once the gateway stashes the adapter.
-                # Never burn retries or mark failed on a startup-timing race.
+            except PushCardSenderUnavailable:
+                # No usable sender in THIS process — DEFER (leave row 'sending').
+                # Covers both PushCardSenderNotReady (adapter not captured yet) and
+                # the base case where notify-card dispatched the send from the
+                # run-broker process, which owns no live Feishu adapter at all: the
+                # gateway's re-drive sweep is the only place that can actually send.
+                # Never burn retries or mark failed on this cross-process/startup race.
                 return QueueOutcome(
                     status="deferred", reason="sender_not_ready",
                     retry_at=int(time.time()) + 30,
