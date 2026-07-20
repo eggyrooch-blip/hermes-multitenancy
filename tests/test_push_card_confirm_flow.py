@@ -9,6 +9,8 @@ branch. All pure — an in-memory store + a mock writer, no Feishu SDK.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from hermes_multitenancy import push_card_confirm as confirm
@@ -47,18 +49,26 @@ def _form_value(**over):
 
 # ===================== P4: extraction discipline =========================
 
-def test_money_is_never_silently_prefilled():
+def test_money_prefilled_only_when_confident():
+    # 代填 discipline (sunke's product call, overriding the P0-4 default): a
+    # HIGH-confidence money extraction IS pre-filled into the input (marked
+    # ai=True → renders "AI 提取，请核对") so the user reviews-and-confirms in one
+    # click, while still echoed for二次回显 and no longer counted as missing.
     sub = fill.merge(SCENE, None, "今天打车去客户现场花了58")
-    # amount (high-risk, rule 不预填) stays empty — no盲预填 of money.
     amt = sub.get("amount")
-    assert amt is None or not amt.has_value()
-    # but it IS echoed for二次回显, and category (low-risk) IS prefilled.
+    assert amt is not None and amt.has_value() and amt.value == 58
+    assert amt.ai is True  # still flagged as an AI suggestion to core
     assert fill._echo_of(sub, "amount") == 58
     assert sub["category"].value == "打车"
-    assert fill.money_echo(SCENE, sub) is not None
-    assert "58" in fill.money_echo(SCENE, sub)
-    # amount is still a required-missing field so the skill asks for it.
-    assert any(f.key == "amount" for f in fill.missing_fields(SCENE, sub))
+    assert "58" in (fill.money_echo(SCENE, sub) or "")
+    assert not any(f.key == "amount" for f in fill.missing_fields(SCENE, sub))
+
+    # A LOW-confidence number (no money context) is NOT ridden in — it stays
+    # empty and is asked, so a weak guess never pre-fills money.
+    low = fill.merge(SCENE, None, "编号 58")
+    lo_amt = low.get("amount")
+    assert lo_amt is None or not lo_amt.has_value()
+    assert any(f.key == "amount" for f in fill.missing_fields(SCENE, low))
 
 
 def test_replace_updates_money_echo():
@@ -111,13 +121,16 @@ def test_confirm_card_single_form_and_submit_value():
     assert "op123" in btn["name"]
 
 
-def test_confirm_card_high_risk_amount_input_is_empty():
+def test_confirm_card_high_risk_amount_prefilled_and_flagged():
     sub = fill.merge(SCENE, None, "打车 上周五 去客户现场 花了58")
     card = fill.build_confirm_card(SCENE, sub, registry_id="r", nonce="n", operation_id="o")
     form = next(e for e in card["body"]["elements"] if e.get("tag") == "form")
     controls = {e.get("name"): e for e in form["elements"] if e.get("name") in {"amount", "category", "date"}}
-    # money input carries NO default_value — user must actively enter it.
-    assert "default_value" not in controls["amount"]
+    # 代填: high-confidence money IS pre-filled into the input (review-and-confirm).
+    assert controls["amount"].get("default_value") == "58"
+    # and the input is annotated "AI 提取，请核对" so the user knows to double-check.
+    labels = [e.get("content", "") for e in form["elements"] if e.get("tag") == "markdown"]
+    assert any("金额" in t and "AI 提取，请核对" in t for t in labels)
     # low-risk enum is prefilled as an initial_option.
     assert controls["category"].get("initial_option") == "打车"
 
@@ -494,3 +507,125 @@ def test_http_writer_deduped_response_is_ok(monkeypatch):
     )
     assert res.ok is True
     assert res.backend_id == "7"
+
+
+# ===== router card.action.trigger path (form submit drops button value) =====
+#
+# The live bug: under the multitenancy router the confirm click reached
+# _on_card_action_trigger, but a Feishu FORM submit delivers the submit button's
+# value stripped (action.value empty) — only action.form_value (inputs) and
+# action.name (push_confirm_submit_<op>) survive. The old wrapper keyed detection
+# purely on action.value.hermes_action, so it delegated to the core handler,
+# which synthesized a "/card ..." message → the "命令调度器" reply and zero write.
+# These drive the real wrapper (_patch_card_action) to prove the form submit is
+# claimed, routed to handle_confirm, written exactly once, and never falls
+# through to the core "/card" path — while non-push_confirm actions still delegate.
+
+
+def _make_form_submit(*, open_id="ou_alice", op="op1", form=None, value=None,
+                      message_id="om_confirm_new", name=None):
+    action = SimpleNamespace(
+        tag="button",
+        name=name if name is not None else f"push_confirm_submit_{op}",
+        value=value,  # None → Feishu stripped the button value on a form submit
+        form_value=form if form is not None else _form_value(),
+    )
+    event = SimpleNamespace(
+        action=action,
+        operator=SimpleNamespace(open_id=open_id, union_id=None, user_id=None),
+        context=SimpleNamespace(open_message_id=message_id),
+    )
+    return SimpleNamespace(event=event)
+
+
+def _install_confirm_wrapper():
+    """Patch a fresh throwaway adapter class with the real confirm card-action
+    wrapper and return (class, calls) where calls['original'] counts delegations
+    to the core handler (the "/card" path)."""
+    calls = {"original": 0}
+
+    class FakeFeishuAdapter:
+        def _on_card_action_trigger(self, data):  # stands in for the core chain
+            calls["original"] += 1
+            return {"kind": "delegated"}
+
+    assert confirm._patch_card_action(FakeFeishuAdapter) is True
+    return FakeFeishuAdapter, calls
+
+
+def test_router_form_submit_confirm_writes_once_and_no_card_command(store, monkeypatch):
+    rid, _nonce = _clarifying(store, open_id="ou_alice")
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    writer = confirm.MockKepPreClaimWriter()
+    confirm.override_writer(SCENE.writer, writer)
+    try:
+        Adapter, calls = _install_confirm_wrapper()
+        adapter = Adapter()
+
+        resp = adapter._on_card_action_trigger(
+            _make_form_submit(open_id="ou_alice", form=_form_value(amount=58)))
+
+        # claimed here (handle_confirm), never delegated to the core "/card" path
+        assert calls["original"] == 0
+        assert resp is not None
+        # exactly one backend record, row committed, recovered value written
+        assert writer.write_calls == 1
+        assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+        assert rid in writer.records
+        assert writer.records[rid]["amount"] == 58
+
+        # second click is idempotent — no double write, still no "/card" delegate
+        adapter._on_card_action_trigger(
+            _make_form_submit(open_id="ou_alice", form=_form_value(amount=58)))
+        assert writer.write_calls == 1
+        assert calls["original"] == 0
+    finally:
+        confirm.override_writer(SCENE.writer, None)
+
+
+def test_router_plain_button_uses_value_routing(store, monkeypatch):
+    # A plain (non-form) button — retry / reauth — carries its routing value
+    # intact; the wrapper routes on it directly, no open-row recovery needed.
+    rid, nonce = _clarifying(store, open_id="ou_alice")
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    writer = confirm.MockKepPreClaimWriter()
+    confirm.override_writer(SCENE.writer, writer)
+    try:
+        Adapter, calls = _install_confirm_wrapper()
+        adapter = Adapter()
+        action = SimpleNamespace(
+            tag="button", name="push_confirm_retry", form_value=_form_value(amount=58),
+            value={"hermes_action": "push_confirm", "registry_id": rid,
+                   "nonce": nonce, "operation_id": "op9"},
+        )
+        event = SimpleNamespace(
+            action=action,
+            operator=SimpleNamespace(open_id="ou_alice", union_id=None, user_id=None),
+            context=SimpleNamespace(open_message_id="om_card_1"),
+        )
+        adapter._on_card_action_trigger(SimpleNamespace(event=event))
+        assert calls["original"] == 0
+        assert writer.write_calls == 1
+        assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+    finally:
+        confirm.override_writer(SCENE.writer, None)
+
+
+def test_router_non_push_confirm_still_delegates(store, monkeypatch):
+    # Regression guard: a sibling card action (cred_auth) must pass through
+    # unchanged — the confirm wrapper must never吞 the other four hooks.
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    Adapter, calls = _install_confirm_wrapper()
+    adapter = Adapter()
+    action = SimpleNamespace(
+        tag="button", name="cred_auth_btn", form_value=None,
+        value={"hermes_action": "cred_auth", "cred": "kep-cli-pre"},
+    )
+    event = SimpleNamespace(
+        action=action,
+        operator=SimpleNamespace(open_id="ou_bob", union_id=None, user_id=None),
+        context=SimpleNamespace(open_message_id="om_x"),
+    )
+    resp = adapter._on_card_action_trigger(SimpleNamespace(event=event))
+    assert calls["original"] == 1
+    assert resp == {"kind": "delegated"}

@@ -361,11 +361,19 @@ def _event_open_id(event: Any) -> str:
         val = getattr(event, attr, None)
         if val:
             return str(val)
-    sender = getattr(event, "sender", None) or getattr(event, "sender_id", None)
-    if sender is not None:
-        val = getattr(sender, "open_id", None)
-        if val:
-            return str(val)
+    # The live router event carries the sender under ``event.source`` (an
+    # EventSource with .open_id/.user_id), NOT ``event.sender`` — the router's
+    # own _resolve_sender_for_routing reads source.open_id. Without this the
+    # open_id came back '' on the handle_async path and try_route bailed before
+    # matching a perfectly-quoted reply. Check source first, then the legacy
+    # sender/sender_id shapes used by the _dispatch_inbound_event path.
+    for holder_attr in ("source", "sender", "sender_id"):
+        holder = getattr(event, holder_attr, None)
+        if holder is not None:
+            for id_attr in ("open_id", "user_id"):
+                val = getattr(holder, id_attr, None)
+                if val:
+                    return str(val)
     return ""
 
 
@@ -498,14 +506,37 @@ async def try_route_push_card_reply(adapter: Any, event: Any) -> bool:
         from . import push_send_queue as _sendq
         _sendq.note_live_adapter(adapter)  # capture adapter for proactive sends
         open_id = _event_open_id(event)
+        # The router event's source usually carries a user_id-namespace id, but
+        # push cards are keyed by open_id (target_open_id, e.g. ``ou_...``). Resolve
+        # to the canonical open_id via the routing table so the matcher's
+        # ``target_open_id == open_id`` guard sees the same namespace — otherwise a
+        # correctly-quoted reply is rejected as a namespace mismatch.
+        if open_id and not str(open_id).startswith("ou_"):
+            try:
+                from .routing import RoutingTable
+                _ctx = RoutingTable().resolve_context(open_id, alt_id=open_id)
+                if _ctx is not None and getattr(_ctx, "open_id", None):
+                    open_id = str(_ctx.open_id)
+            except Exception:
+                logger.debug("[push_card] open_id resolve failed", exc_info=True)
         text = _event_text(event)
+        quoted0 = str(getattr(event, "reply_to_message_id", "") or "")
+        logger.warning(
+            "PCDEBUG try_route ENTRY open_id=%r text=%r quoted=%r ev_attrs=%s",
+            open_id, (text or "")[:24], quoted0,
+            [a for a in ("reply_to_message_id","parent_id","message","source") if hasattr(event, a)],
+        )
         if not (open_id and text):
             return False
-        quoted = str(getattr(event, "reply_to_message_id", "") or "")
+        quoted = quoted0
         import asyncio
         decision = await get_matcher().match_with_grace(
             open_id=open_id, text=text, quoted_message_id=quoted,
             sleep_fn=asyncio.sleep,
+        )
+        logger.warning(
+            "PCDEBUG try_route open_id=%s text=%r quoted=%r decision=%s",
+            open_id, (text or "")[:24], quoted, getattr(decision, "action", None),
         )
         if decision.action == ROUTE:
             # Load-bearing path: run the fill loop and send the clarify/confirm

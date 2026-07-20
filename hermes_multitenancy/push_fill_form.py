@@ -218,10 +218,17 @@ def merge(
             # Never let AI clobber a value the user typed themselves.
             continue
         if _no_prefill(f):
-            # Money: keep only as an echo suggestion; the input stays empty so
-            # the user actively re-enters what they see (design §2.4 "不预填").
-            sub.pop(f.key, None)
+            # Money (二次回显): keep the echo hint ("AI 听到 X") AND — per sunke's
+            # 代填 product call, overriding the original P0-4 "不预填" default —
+            # pre-fill the input with the extracted value when confidence is high,
+            # marked ``ai=True`` so it still renders "AI 提取，请核对". The user
+            # reviews-and-confirms in one click instead of re-typing. Below the
+            # bar, leave empty and ask, so a low-confidence guess never rides in.
             _set_echo(sub, f.key, value)
+            if conf >= HIGH_RISK_PREFILL_CONF:
+                sub[f.key] = FieldState(value=value, confidence=conf, ai=True)
+            else:
+                sub.pop(f.key, None)
             continue
         bar = HIGH_RISK_PREFILL_CONF if f.risk == RISK_HIGH else LOW_RISK_PREFILL_CONF
         if conf >= bar:

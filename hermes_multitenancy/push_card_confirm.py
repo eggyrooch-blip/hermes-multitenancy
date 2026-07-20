@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 _HOOK_INSTALLED = False
 _CARD_ACTION_FLAG = "_hermes_multitenancy_push_confirm_card_action_patched"
 
+#: env-gated live diagnostic (PCDEBUG). The gateway sets HERMES_PUSH_CARD_DEBUG
+#: before importing the plugin; these warnings dump the raw card-action shape so
+#: the confirm path can be verified in gateway.error.log. Temp — cleared on ship.
+_DEBUG = bool(os.environ.get("HERMES_PUSH_CARD_DEBUG"))
+
 
 # --- writer contract -----------------------------------------------------
 
@@ -554,10 +559,18 @@ def _patch_card_action(FeishuAdapter: Any) -> bool:
             event = _read(data, "event")
             action = _read(event, "action")
             value = _read_action_value(_read(action, "value"))
+            form_value = _read(action, "form_value")
+            if _DEBUG:
+                logger.warning(
+                    "PCDEBUG confirm wrapper tag=%r name=%r value=%r form_value=%r",
+                    _read(action, "tag"), _read(action, "name"), value, form_value,
+                )
             # undefined放行: not ours → delegate unchanged (never吞 the other 4).
-            if not isinstance(value, dict) or value.get("hermes_action") != "push_confirm":
+            if not _is_push_confirm_action(value, form_value, action):
                 return original(self, data)
-            return _dispatch_confirm(self, event, action, value)
+            return _dispatch_confirm(
+                self, event, action, value if isinstance(value, dict) else {}, form_value
+            )
         except Exception:
             logger.debug("[push_card] confirm card action failed; delegating to original", exc_info=True)
             return original(self, data)
@@ -569,15 +582,92 @@ def _patch_card_action(FeishuAdapter: Any) -> bool:
     return True
 
 
-def _dispatch_confirm(adapter: Any, event: Any, action: Any, value: dict[str, Any]) -> Any:
-    registry_id = str(value.get("registry_id") or "")
-    nonce = str(value.get("nonce") or "")
-    form_value = _read(action, "form_value")
+def _is_push_confirm_action(value: Any, form_value: Any, action: Any) -> bool:
+    """True when a card action is a push-confirm submit.
+
+    A plain-button click (retry / reauth) carries its routing dict in
+    ``action.value`` — the cred_auth sibling proves that path works. But a FORM
+    submit is delivered differently: Feishu drops the submit button's ``value``,
+    so ``action.value`` comes back empty and only ``action.form_value`` (the user
+    inputs) + ``action.name`` (``push_confirm_submit_<op>``) survive. Detect all
+    three shapes so the form submit is claimed here instead of falling through to
+    the core handler, which would synthesize a ``/card`` message (root cause of
+    the "命令调度器" reply)."""
+    if isinstance(value, dict) and value.get("hermes_action") == "push_confirm":
+        return True
+    fv = _read_action_value(form_value)
+    if isinstance(fv, dict) and fv.get("hermes_action") == "push_confirm":
+        return True
+    name = _read(action, "name")
+    return isinstance(name, str) and name.startswith("push_confirm_submit_")
+
+
+def _routing_ids(value: Any, form_value: Any) -> tuple[str, str]:
+    """(registry_id, nonce) from wherever Feishu delivered the button value —
+    ``action.value`` for a plain button, or merged into ``action.form_value`` on
+    some form-submit shapes. Empty when the value was stripped entirely."""
+    fv = _read_action_value(form_value)
+    for src in (value, fv):
+        if isinstance(src, dict) and src.get("registry_id"):
+            return str(src.get("registry_id") or ""), str(src.get("nonce") or "")
+    return "", ""
+
+
+def _recover_open_row(store: _reg.PushRegistryStore, operator_open_ids: set[str]) -> Optional[dict[str, Any]]:
+    """Recover the clicker's open fill-form row when the form submit lost its
+    routing value. Only a ``clarifying`` row renders a submit form, so restrict
+    to those (a plain-button retry runs on a ``confirmed`` row but keeps its
+    value, so it never needs this). Newest-first on ties.
+
+    ponytail: picks the most-recent clarifying row per user — the one-active-card
+    norm the rate limiter enforces. Persist the operation_id on the row to
+    disambiguate if concurrent cards per user ever ship."""
+    best: Optional[dict[str, Any]] = None
+    for open_id in operator_open_ids:
+        try:
+            rows = store.list_open_for_user(open_id)
+        except Exception:
+            logger.debug("[push_card] open-row recovery lookup failed", exc_info=True)
+            continue
+        for row in rows:
+            if row.get("status") != _reg.STATUS_CLARIFYING:
+                continue
+            if best is None or int(row.get("created_at") or 0) >= int(best.get("created_at") or 0):
+                best = row
+    return best
+
+
+def _dispatch_confirm(
+    adapter: Any, event: Any, action: Any, value: dict[str, Any], form_value: Any = None
+) -> Any:
+    store = _reg.get_registry_store()
+    if form_value is None:
+        form_value = _read(action, "form_value")
+    registry_id, nonce = _routing_ids(value, form_value)
     operator_ids = _resolve_operator_open_ids(event)
+    # Form submit stripped the routing value → recover it from the user's open
+    # clarifying row. registry_id + nonce taken from the SAME row stay
+    # self-consistent, so handle_confirm's nonce guard still passes; the CAS +
+    # write_idempotency_key(=registry_id) remain the real exactly-once defences.
+    if not (registry_id and nonce):
+        recovered = _recover_open_row(store, operator_ids)
+        if recovered is not None:
+            registry_id = str(recovered.get("registry_id") or "")
+            nonce = str(recovered.get("nonce") or "")
+    if _DEBUG:
+        logger.warning(
+            "PCDEBUG confirm dispatch registry_id=%r nonce=%r operators=%r form_value=%r",
+            registry_id, nonce, sorted(operator_ids), form_value,
+        )
     result = handle_confirm(
         registry_id=registry_id, nonce=nonce, operator_open_ids=operator_ids,
-        form_value=form_value, store=_reg.get_registry_store(),
+        form_value=form_value, store=store,
     )
+    if _DEBUG:
+        logger.warning(
+            "PCDEBUG confirm result kind=%s written=%s registry=%s",
+            result.kind, result.written, result.registry_id,
+        )
     if result.card is not None:
         return _card_response(result.card)
     return _toast_response(result.toast or _toast("已处理。"))
