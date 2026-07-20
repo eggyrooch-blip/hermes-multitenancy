@@ -170,6 +170,13 @@ def register_push_card_routes(app: Any) -> None:
                 {"ok": False, "error": "payload must be an object"}, status=400
             )
         card = payload.get("card") if isinstance(payload.get("card"), dict) else None
+        if card is None:
+            # No card supplied → build a default one (title + scene name + a
+            # "reply to fill" prompt). A None card would serialize to "null" and
+            # fail the Feishu send (finding no-default-card-when-omitted).
+            from . import push_fill_form as _fill
+
+            card = _fill.default_scene_card(scene_def)
         idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
         business_key = str(payload.get("business_key") or "").strip() or _default_business_key(
             scene, resolved_open_id

@@ -130,6 +130,17 @@ def register(ctx) -> None:
             # four. Fail-open like its siblings — never block the broker below.
             logger.exception("[push_card] confirm patch install failed; continuing without confirm handling")
         try:
+            # Bind the proactive card sender (notify-card dispatch has no inbound
+            # event to carry the adapter) and start the sweep worker — without
+            # these the live sender never fires and the expiry/re-drive/reconcile
+            # sweeps are dead code.
+            from .push_send_queue import install_live_push_card_sender
+            install_live_push_card_sender()
+            from .push_card_workers import ensure_push_card_sweeps_started
+            ensure_push_card_sweeps_started()
+        except Exception:
+            logger.exception("[push_card] send-sender / sweep wiring failed; continuing")
+        try:
             from .feishu_message_trace import install_message_trace_filter
             install_message_trace_filter()
         except Exception:

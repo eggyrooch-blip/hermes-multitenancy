@@ -296,19 +296,40 @@ def handle_confirm(
             expect_nonce=nonce, submission=values,
         )
         if not claimed:
-            # Lost the race — re-read to report the real outcome.
+            # Lost the CAS → a concurrent clicker already claimed this row. The
+            # loser must NEVER call the writer (finding
+            # lost-cas-falls-through-to-write — a double-click otherwise double-
+            # writes). Re-read row state to decide what card to show:
             fresh = store.get(registry_id) or row
             if fresh["status"] == _reg.STATUS_COMMITTED:
                 return ConfirmResult("noop", toast=_toast("已录入 ✅，请勿重复提交。"), registry_id=registry_id)
-            # Someone else advanced it to confirmed — fall through to write
-            # (idempotent) so a concurrent double-tap still commits exactly once.
+            if fresh["status"] == _reg.STATUS_CONFIRMED:
+                # The winner owns the (idempotent) write. Offer a retry card so a
+                # failed winner-write can still be re-driven — but do NOT write
+                # here.
+                return ConfirmResult(
+                    "retry",
+                    card=_result_card(scene, "正在处理你的提交，如未完成可点「重试」。", ok=False,
+                                      retryable=True, registry_id=registry_id, nonce=nonce,
+                                      values=_stored_submission_values(fresh) or values),
+                    registry_id=registry_id, written=False,
+                )
+            return ConfirmResult("reject", toast=_toast("该操作已失效，请在最新的卡片上确认。", "error"),
+                                 registry_id=registry_id)
 
-    # 2. Idempotent backend write (write_idempotency_key = registry_id).
+    # 2. Idempotent backend write (write_idempotency_key = registry_id). A writer
+    #    exception is caught and routed to the SAME failed-retry card as a clean
+    #    result.ok=False — never swallowed leaving the row stuck confirmed with no
+    #    visible failure (finding writer-exception-leaves-confirmed-silent).
     started = now_ms()
-    result = writer.write(
-        scene=scene, values=values, registry_id=registry_id,
-        write_idempotency_key=registry_id, profile_name=str(row.get("profile_name") or ""),
-    )
+    try:
+        result = writer.write(
+            scene=scene, values=values, registry_id=registry_id,
+            write_idempotency_key=registry_id, profile_name=str(row.get("profile_name") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[push_card] writer raised (registry=%s): %s", registry_id, exc, exc_info=True)
+        result = WriteResult(ok=False, error=f"{type(exc).__name__}: {exc}")
 
     if result.credential_expired:
         # fail-loud: guide re-auth, no state change, row stays writable → retry.
@@ -326,11 +347,29 @@ def handle_confirm(
                                                nonce=nonce, values=values),
                              registry_id=registry_id, written=False)
 
-    # 3. Success → commit + clear nonce (single-use核销 on terminal success).
-    store.advance_status(
+    # 3. Success → commit + clear nonce (single-use核销 on terminal success). The
+    #    commit CAS result is authoritative: if it fails, another actor
+    #    (reconcile / concurrent) already moved the row, so never report a false
+    #    green "written" card (finding commit-cas-result-ignored).
+    committed = store.advance_status(
         registry_id, expect=_reg.STATUS_CONFIRMED, to=_reg.STATUS_COMMITTED,
         clear_nonce=True, submission=values,
     )
+    if not committed:
+        fresh = store.get(registry_id) or row
+        if fresh["status"] == _reg.STATUS_COMMITTED:
+            # Already committed by reconcile / a concurrent winner — backend holds
+            # exactly one record; report success but do not claim WE wrote it.
+            return ConfirmResult("noop", toast=_toast("已录入 ✅，请勿重复提交。"),
+                                 registry_id=registry_id, written=False)
+        # Not committed and not ours to finalize → leave it for the reconcile
+        # worker and offer a retry; never a false green.
+        return ConfirmResult(
+            "retry",
+            card=_result_card(scene, "录入结果确认中，如未完成可点「重试」。", ok=False,
+                              retryable=True, registry_id=registry_id, nonce=nonce, values=values),
+            registry_id=registry_id, written=False,
+        )
     _metrics.incr(_metrics.RECONCILE_COMMITTED)
     _metrics.observe_commit_latency_ms(max(0, now_ms() - started))
     return ConfirmResult("committed",
@@ -425,6 +464,8 @@ def _patch_card_action(FeishuAdapter: Any) -> bool:
     @functools.wraps(original)
     def wrapped(self: Any, data: Any) -> Any:
         try:
+            from . import push_send_queue as _sendq
+            _sendq.note_live_adapter(self)  # capture adapter for proactive sends
             event = _read(data, "event")
             action = _read(event, "action")
             value = _read_action_value(_read(action, "value"))

@@ -195,6 +195,21 @@ def test_count_pushes_today_ignores_failed(store):
     assert store.count_pushes_today("ou_alice", day_start=day_start) == 1
 
 
+def test_count_pushes_today_excludes_undelivered_sending(store):
+    # Undelivered 'sending' rows must NOT count against the cap — otherwise a
+    # user whose cards are all parked in 'sending' (quiet-hours / cap deferral)
+    # counts themselves over the cap and never sends any (finding
+    # daily-cap-self-starvation). Three sending rows → count is 0, not 3.
+    day_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    for i in range(3):
+        _create(store, business_key=f"send-{i}")  # left in 'sending'
+    assert store.count_pushes_today("ou_alice", day_start=day_start) == 0
+    # once one is actually delivered it counts.
+    delivered = _create(store, business_key="delivered").row
+    store.mark_sent(delivered["registry_id"], message_id="m")
+    assert store.count_pushes_today("ou_alice", day_start=day_start) == 1
+
+
 # --- send queue ----------------------------------------------------------
 
 class _FakeClock:

@@ -34,6 +34,7 @@ extractor via the ``extractor`` seam.
 from __future__ import annotations
 
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -454,3 +455,83 @@ def submission_values(scene: SceneDefinition, sub: Submission) -> dict[str, Any]
         if st is not None and st.has_value():
             out[f.key] = st.value
     return out
+
+
+def submission_from_values(scene: SceneDefinition, values: Any) -> Submission:
+    """Rebuild a Submission from the persisted plain ``{key: value}`` in
+    ``submission_json``. Restored values are treated as user-established
+    (``ai=False``) so a later, lower-confidence AI extraction never clobbers a
+    value already captured and shown — the same discipline ``merge`` enforces
+    for typed values."""
+    sub: Submission = {}
+    src = values if isinstance(values, dict) else {}
+    for f in scene.fields:
+        raw = src.get(f.key)
+        if raw is not None and str(raw).strip():
+            sub[f.key] = FieldState(value=_coerce(f, raw), confidence=1.0, ai=False)
+    return sub
+
+
+# --- inbound fill-step driver (pure) -------------------------------------
+
+@dataclass
+class FillStep:
+    """One inbound reply advanced onto the row: the clarify/confirm card to
+    (re)send, the plain values to persist, and the still-missing required
+    fields (empty → the card asks / shows an empty required input)."""
+
+    card: dict[str, Any]
+    values: dict[str, Any]
+    missing: list[SceneField]
+    operation_id: str
+    delivery: str  # DELIVER_UPDATE | DELIVER_NEW
+
+
+def build_fill_step(
+    scene: SceneDefinition,
+    *,
+    prior_values: Any,
+    text: str,
+    registry_id: str,
+    nonce: str,
+    row: Optional[dict[str, Any]] = None,
+    escape_hint: Optional[str] = None,
+    extractor: Extractor = default_extractor,
+) -> FillStep:
+    """Merge one reply onto the prior submission and render the fill card.
+
+    This is the deterministic match→clarify→form loop the matcher patch drives
+    on ROUTE (design §2.3/§2.4). The single-form confirm card serves both roles:
+    missing required fields render as empty inputs (the "澄清追问"), all-present
+    fields render prefilled/echoed for the final confirm — and the confirm
+    handler re-checks completeness, so an early submit of an incomplete form is
+    safely rejected, never mis-written."""
+    prior = submission_from_values(scene, prior_values)
+    sub = merge(scene, prior, text, extractor=extractor)
+    op_id = secrets.token_hex(6)
+    card = build_confirm_card(
+        scene, sub, registry_id=registry_id, nonce=nonce, operation_id=op_id,
+        escape_hint=escape_hint,
+    )
+    return FillStep(
+        card=card,
+        values=submission_values(scene, sub),
+        missing=missing_fields(scene, sub),
+        operation_id=op_id,
+        delivery=delivery_mode(row or {}),
+    )
+
+
+def default_scene_card(scene: SceneDefinition) -> dict[str, Any]:
+    """A minimal push card for when the notify-card caller omits ``card`` — the
+    scene title plus a one-line prompt telling the user to reply to fill it
+    (finding no-default-card-when-omitted). Without this a ``card=None`` row
+    would serialize to ``"null"`` and fail the Feishu send."""
+    return {
+        "schema": "2.0",
+        "header": {"title": {"tag": "plain_text", "content": scene.name}, "template": "blue"},
+        "body": {"elements": [
+            {"tag": "markdown", "content": f"**{scene.name}**"},
+            {"tag": "markdown", "content": "直接回复此卡即可填写，我会帮你把内容整理成表单。"},
+        ]},
+    }

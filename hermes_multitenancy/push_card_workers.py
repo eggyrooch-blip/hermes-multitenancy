@@ -26,7 +26,9 @@ early can only count zeros, never corrupt state.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -174,3 +176,75 @@ async def run_reconcile_sweep(
             counters["checked"], counters["committed"], counters["still_missing"],
         )
     return counters
+
+
+# --- scheduler (the sweeps are inert until something runs them) ----------
+
+async def run_all_sweeps(
+    store: _reg.PushRegistryStore,
+    *,
+    queue: Optional["_sendq.PushSendQueue"] = None,
+    card_updater: Optional[CardUpdater] = None,
+    backend_lookup: Optional[BackendLookup] = None,
+    now: Optional[int] = None,
+) -> dict[str, dict[str, int]]:
+    """One tick of all three sweeps. Order: expiry (reap over-due) → send
+    re-drive (resume deferred sends) → reconcile (backfill committed)."""
+    return {
+        "expiry": await run_expiry_sweep(store, card_updater=card_updater, now=now),
+        "redrive": await run_send_redrive_sweep(store, queue=queue, now=now),
+        "reconcile": await run_reconcile_sweep(store, backend_lookup=backend_lookup, now=now),
+    }
+
+
+#: Default cadence for the sweep worker thread.
+SWEEP_INTERVAL_S = 60
+
+_sweep_lock = threading.Lock()
+_sweep_thread: Optional[threading.Thread] = None
+_sweep_stop: Optional[threading.Event] = None
+
+
+def _sweep_loop(interval: int, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            asyncio.run(run_all_sweeps(_reg.get_registry_store()))
+        except Exception:
+            logger.exception("[push_card] sweep tick failed")
+        stop_event.wait(timeout=interval)
+    logger.info("[push_card] sweep worker stopped")
+
+
+def ensure_push_card_sweeps_started(*, interval: int = SWEEP_INTERVAL_S) -> None:
+    """Start the push-card sweep worker once, at gateway startup.
+
+    Nothing else re-invokes the send queue for a deferred row, re-renders an
+    expired card, or reconciles a crashed commit — without this thread all three
+    sweeps are dead code (finding sweeps-never-scheduled). Self-contained daemon
+    thread (mirrors ``credential_renewal_worker``); each tick opens a fresh event
+    loop via ``asyncio.run`` for the async sweep bodies."""
+    global _sweep_thread, _sweep_stop
+    with _sweep_lock:
+        if _sweep_thread is not None and _sweep_thread.is_alive():
+            return
+        _sweep_stop = threading.Event()
+        _sweep_thread = threading.Thread(
+            target=_sweep_loop, args=(int(interval), _sweep_stop),
+            daemon=True, name="push-card-sweeps",
+        )
+        _sweep_thread.start()
+        logger.info("[push_card] sweep worker started (interval=%ds)", interval)
+
+
+def stop_push_card_sweeps() -> None:
+    """Signal the sweep worker to stop (test/shutdown hook)."""
+    global _sweep_thread, _sweep_stop
+    with _sweep_lock:
+        if _sweep_stop is not None:
+            _sweep_stop.set()
+        thread = _sweep_thread
+    if thread is not None:
+        thread.join(timeout=2.0)
+    with _sweep_lock:
+        _sweep_thread = None
+        _sweep_stop = None

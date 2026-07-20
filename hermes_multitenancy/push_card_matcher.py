@@ -343,8 +343,17 @@ def override_matcher(matcher: Optional[PushCardMatcher]) -> None:
 
 _HOOK_INSTALLED = False
 _DISPATCH_FLAG = "_hermes_multitenancy_push_card_matcher_dispatch_patched"
+_RECALL_FLAG = "_hermes_multitenancy_push_card_recall_patched"
 _REGISTRY_CTX_ATTR = "_mt_push_registry_context"
 _NOTICE_ATTR = "_mt_push_card_notice"
+
+
+def _read(obj: Any, name: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
 
 
 def _event_open_id(event: Any) -> str:
@@ -369,8 +378,9 @@ def _event_text(event: Any) -> str:
 
 
 def install_feishu_push_card_matcher_patch() -> None:
-    """Idempotently hook inbound dispatch so a matched reply is slash-rewritten
-    into its scene's fill skill. Fail-open: any error → untouched delivery."""
+    """Idempotently hook inbound dispatch so a matched reply drives its scene's
+    fill loop (extract → clarify/confirm card) and a recall event recomputes the
+    submission. Fail-open: any error → untouched delivery."""
     global _HOOK_INSTALLED
     if _HOOK_INSTALLED:
         return
@@ -387,7 +397,73 @@ def install_feishu_push_card_matcher_patch() -> None:
             logger.debug("[push_card] matcher patch deferred", exc_info=True)
         return
     _patch_dispatch(FeishuAdapter)
+    _patch_recall(FeishuAdapter)
     _HOOK_INSTALLED = True
+
+
+# --- fill-loop runtime driver (the match→clarify→form loop, wired) -------
+
+async def _drive_fill_step(adapter: Any, decision: MatchDecision, text: str) -> bool:
+    """Run one deterministic fill step for a ROUTE decision and send the card.
+
+    This is the load-bearing wiring the review flagged as missing: the matcher
+    used to only rewrite ``event.text`` into a ``/skill`` string and hand it to
+    the agent — nothing ran ``merge`` / ``build_confirm_card``, so no clarify /
+    confirm card was ever produced (finding end-to-end-loop-unwired). Here the
+    reply is merged onto the row's prior submission, the updated submission is
+    persisted, and the clarify/confirm card is sent to the user's DM."""
+    from . import push_fill_form as _form
+    from . import push_send_queue as _sendq
+
+    store = _reg.get_registry_store()
+    registry_id = decision.registry_id
+    row = store.get(registry_id) if registry_id else None
+    if row is None:
+        return False
+    scene = get_scene(row.get("scene"))
+    if scene is None:
+        return False
+    prior_values = _loads(row.get("submission_json")) or {}
+    nonce = str(row.get("nonce") or "")
+    step = _form.build_fill_step(
+        scene, prior_values=prior_values, text=text, registry_id=registry_id,
+        nonce=nonce, row=row, escape_hint=decision.context.get("escape_hint"),
+    )
+    status = row["status"]
+    # Persist the merged submission and advance pending→clarifying (or stay
+    # clarifying). CAS-guarded so a racing send/expire can't be clobbered.
+    if status == _reg.STATUS_PENDING:
+        moved = store.advance_status(
+            registry_id, expect=_reg.STATUS_PENDING, to=_reg.STATUS_CLARIFYING,
+            submission=step.values,
+        )
+    elif status == _reg.STATUS_CLARIFYING:
+        moved = store.advance_status(
+            registry_id, expect=_reg.STATUS_CLARIFYING, to=_reg.STATUS_CLARIFYING,
+            submission=step.values,
+        )
+    else:
+        return False
+    if not moved:
+        return False
+    await _sendq.send_push_card_via_adapter(adapter, open_id=row["target_open_id"], card=step.card)
+    _metrics.incr(_metrics.FILL_RENDERED)
+    logger.info("[push_card] fill card sent (registry=%s, missing=%d)",
+                registry_id, len(step.missing))
+    return True
+
+
+async def _send_notice(adapter: Any, open_id: str, text: str) -> bool:
+    """Deliver an EXPIRED_EXIT / DISAMBIGUATE canned notice straight through the
+    adapter and short-circuit the original dispatch — the text used to be only
+    ``setattr`` on the event with no reader, so the user never saw it (finding
+    expired-disambiguate-notice-undelivered)."""
+    from . import push_send_queue as _sendq
+
+    card = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": text}]}}
+    await _sendq.send_push_card_via_adapter(adapter, open_id=open_id, card=card)
+    _metrics.incr(_metrics.NOTICE_SENT)
+    return True
 
 
 def _patch_dispatch(FeishuAdapter: Any) -> None:
@@ -398,6 +474,8 @@ def _patch_dispatch(FeishuAdapter: Any) -> None:
     @functools.wraps(original)
     async def wrapped(self: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
         try:
+            from . import push_send_queue as _sendq
+            _sendq.note_live_adapter(self)  # capture adapter for proactive sends
             open_id = _event_open_id(event)
             text = _event_text(event)
             quoted = str(getattr(event, "reply_to_message_id", "") or "")
@@ -407,23 +485,20 @@ def _patch_dispatch(FeishuAdapter: Any) -> None:
                     open_id=open_id, text=text, quoted_message_id=quoted,
                     sleep_fn=asyncio.sleep,
                 )
-                if decision.action == ROUTE and decision.slash_content:
-                    # Load-bearing path: rewrite content to the slash command the
-                    # broker's native rewriter expands, and hand the fill skill
-                    # the registry context.
-                    for attr in ("text", "content"):
-                        if isinstance(getattr(event, attr, None), str):
-                            setattr(event, attr, decision.slash_content)
-                    setattr(event, _REGISTRY_CTX_ATTR, decision.context)
-                    logger.info(
-                        "[push_card] routed reply → %s (registry=%s)",
-                        decision.skill, decision.registry_id,
-                    )
+                if decision.action == ROUTE:
+                    # Load-bearing path: run the fill loop and send the
+                    # clarify/confirm card. The reply is CONSUMED by the form
+                    # loop, so short-circuit — it must not also become a
+                    # free-form agent chat turn (design §2.3).
+                    if await _drive_fill_step(self, decision, text):
+                        setattr(event, _REGISTRY_CTX_ATTR, decision.context)
+                        return None
                 elif decision.action in (EXPIRED_EXIT, DISAMBIGUATE) and decision.reply_text:
-                    # ponytail: canned-notice delivery rides P4's card-send; for
-                    # now stage the text on the event and let core reply. The
-                    # decision itself (and its metric) is already recorded.
-                    setattr(event, _NOTICE_ATTR, decision.reply_text)
+                    # Deliver the已过期/请引用 notice and short-circuit — the text
+                    # must never fall through to the agent unhandled.
+                    if await _send_notice(self, open_id, decision.reply_text):
+                        setattr(event, _NOTICE_ATTR, decision.reply_text)
+                        return None
         except Exception:
             logger.debug("[push_card] inbound matcher failed; passthrough", exc_info=True)
         return await original(self, event, *args, **kwargs)
@@ -431,3 +506,32 @@ def _patch_dispatch(FeishuAdapter: Any) -> None:
     setattr(wrapped, _DISPATCH_FLAG, True)
     FeishuAdapter._dispatch_inbound_event = wrapped
     logger.info("[push_card] installed inbound matcher on FeishuAdapter")
+
+
+def _patch_recall(FeishuAdapter: Any) -> None:
+    """Hook ``_on_message_recalled`` so a recalled reply recomputes the user's
+    open row's submission (replay, not pure-accumulate — design §2.3 P1-4). The
+    core handler is a log-only stub; without this patch the recall event has no
+    effect at all (finding recall-event-not-wired)."""
+    original = getattr(FeishuAdapter, "_on_message_recalled", None)
+    if original is None or getattr(original, _RECALL_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def wrapped(self: Any, data: Any) -> Any:
+        try:
+            event = _read(data, "event")
+            operator = _read(event, "operator_id") or _read(event, "operator")
+            open_id = str(_read(operator, "open_id") or "")
+            message_id = str(_read(event, "message_id") or "")
+            if open_id and message_id:
+                handle_message_recall(
+                    _reg.get_registry_store(), open_id=open_id, recalled_message_id=message_id
+                )
+        except Exception:
+            logger.debug("[push_card] recall hook failed; delegating", exc_info=True)
+        return original(self, data)
+
+    setattr(wrapped, _RECALL_FLAG, True)
+    FeishuAdapter._on_message_recalled = wrapped
+    logger.info("[push_card] installed message-recall hook on FeishuAdapter")

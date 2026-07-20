@@ -265,14 +265,23 @@ class PushRegistryStore:
         return [dict(r) for r in cur.fetchall()]
 
     def count_pushes_today(self, target_open_id: str, *, day_start: int) -> int:
-        """Rows created since ``day_start`` that count against the per-user daily
-        cap. A ``failed`` send does not consume the cap (nothing reached them);
-        ``expired`` likewise. Everything else (delivered or in-flight) does."""
+        """Rows *actually delivered* to the user since ``day_start`` — the
+        per-user daily-cap denominator.
+
+        Only cards that reached the user (status past ``sending``:
+        pending/clarifying/confirmed/committed) count. A ``failed`` send never
+        reached them; ``expired`` likewise; and — critically — a still-``sending``
+        row has NOT been delivered yet, so it must not count against the cap.
+        Counting ``sending`` rows self-starves the queue: a user whose cards are
+        all parked in ``sending`` by a quiet-hours / cap deferral would count
+        themselves over the cap and never send any of them (finding
+        daily-cap-self-starvation). The re-drive sweep re-picks the parked rows;
+        this counter just stops them from blocking themselves."""
         row = self._conn.execute(
             "SELECT COUNT(*) FROM push_registry"
             " WHERE target_open_id = ? AND created_at >= ?"
-            " AND status NOT IN (?, ?)",
-            (target_open_id, day_start, STATUS_FAILED, STATUS_EXPIRED),
+            " AND status NOT IN (?, ?, ?)",
+            (target_open_id, day_start, STATUS_SENDING, STATUS_FAILED, STATUS_EXPIRED),
         ).fetchone()
         return int(row[0])
 

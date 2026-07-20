@@ -27,6 +27,8 @@ _counter: "Counter[str]" = Counter()
 # Canonical metric names (kept as constants so callers can't typo a label into
 # a silent new series).
 MATCH_HIT = "push_card.match.hit"
+FILL_RENDERED = "push_card.fill.rendered"  # a matched reply → clarify/confirm card sent
+NOTICE_SENT = "push_card.notice.sent"  # expired/disambiguate canned notice delivered
 MATCH_PASSTHROUGH = "push_card.match.passthrough"
 MATCH_EXPIRED_EXIT = "push_card.match.expired_exit"
 MATCH_DISAMBIGUATE = "push_card.match.disambiguate"

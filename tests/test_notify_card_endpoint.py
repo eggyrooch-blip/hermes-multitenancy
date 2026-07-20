@@ -107,6 +107,30 @@ def test_happy_path_returns_202_and_registry_id(_isolate):
     assert _isolate["dispatched"] == [data["registry_id"]]
 
 
+def test_default_card_built_when_omitted(_isolate):
+    # No `card` in the body → the row must carry a non-null default card so the
+    # send does not serialize card=None → "null" and fail (finding
+    # no-default-card-when-omitted).
+    assert "card" not in _GOOD
+    status, data = _call("POST", "/api/run-broker/notify-card", body=_GOOD)
+    assert status == 202
+    row = reg.get_registry_store().get(data["registry_id"])
+    assert row["card_json"], "a default card must be stored when card is omitted"
+    card = json.loads(row["card_json"])
+    assert isinstance(card, dict) and card.get("body")  # a real card, not null
+    dumped = json.dumps(card, ensure_ascii=False)
+    assert "开发验收·测试报销单" in dumped  # scene name
+    assert "直接回复此卡即可填写" in dumped  # reply-to-fill prompt
+
+
+def test_explicit_card_is_preserved(_isolate):
+    body = {**_GOOD, "card": {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "CUSTOM"}]}}}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body)
+    assert status == 202
+    card = json.loads(reg.get_registry_store().get(data["registry_id"])["card_json"])
+    assert "CUSTOM" in json.dumps(card, ensure_ascii=False)
+
+
 def test_skill_in_body_is_ignored():
     body = {**_GOOD, "skill": "evil-skill"}
     status, data = _call("POST", "/api/run-broker/notify-card", body=body)

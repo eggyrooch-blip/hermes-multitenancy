@@ -35,6 +35,14 @@ class PushCardSenderUnavailable(RuntimeError):
     """No live card sender is wired (or the adapter cannot send)."""
 
 
+class PushCardSenderNotReady(PushCardSenderUnavailable):
+    """The live Feishu adapter has not been captured yet — a *transient*
+    condition (the gateway is mid-startup, or no inbound event has arrived to
+    stash the adapter). ``process`` treats it as a DEFER (leave the row
+    ``sending`` for the re-drive sweep), never a ``failed`` — distinct from a
+    genuine send failure."""
+
+
 @dataclass
 class SendResult:
     message_id: Optional[str]
@@ -59,6 +67,50 @@ def register_push_card_sender(fn: Optional[Callable[..., Awaitable[SendResult]]]
     """Wire (or in tests, unwire with ``None``) the live card sender."""
     global _card_sender
     _card_sender = fn
+
+
+# --- live Feishu adapter capture (proactive-send binding) ----------------
+#
+# The notify-card endpoint's send dispatch is PROACTIVE — there is no inbound
+# event carrying the adapter, so the queue needs its own reference to the live
+# ``FeishuAdapter``. The matcher/confirm patches call ``note_live_adapter(self)``
+# on every inbound event/callback, and ``install_live_push_card_sender`` binds a
+# sender that uses whatever adapter was last stashed. Before the first inbound
+# event the adapter is None → the sender raises ``PushCardSenderNotReady`` and
+# ``process`` defers to the re-drive sweep (never a false ``failed``). This is
+# what makes the live sender actually fire — nothing registered it before
+# (finding live-sender-never-wired).
+
+_live_adapter: Any = None
+
+
+def note_live_adapter(adapter: Any) -> None:
+    """Stash the live FeishuAdapter instance for proactive push sends."""
+    global _live_adapter
+    if adapter is not None:
+        _live_adapter = adapter
+
+
+def get_live_adapter() -> Any:
+    return _live_adapter
+
+
+async def _live_adapter_sender(
+    *, profile_name: str, open_id: str, card: Any, payload: Any
+) -> SendResult:
+    adapter = _live_adapter
+    if adapter is None:
+        raise PushCardSenderNotReady("no live Feishu adapter captured yet")
+    return await send_push_card_via_adapter(adapter, open_id=open_id, card=card, metadata=payload)
+
+
+def install_live_push_card_sender() -> None:
+    """Register the live-adapter-backed sender as the queue's card sender.
+
+    Called once at gateway startup (plugin ``register``). Idempotent — re-binding
+    the same closure is harmless."""
+    register_push_card_sender(_live_adapter_sender)
+    logger.info("[push_card] live push-card sender registered")
 
 
 async def _default_sender(*, profile_name: str, open_id: str, card: Any, payload: Any) -> SendResult:
@@ -222,6 +274,14 @@ class PushSendQueue:
                     open_id=row["target_open_id"],
                     card=card,
                     payload=payload,
+                )
+            except PushCardSenderNotReady:
+                # Adapter not captured yet — DEFER (leave row 'sending'), the
+                # re-drive sweep retries once the gateway stashes the adapter.
+                # Never burn retries or mark failed on a startup-timing race.
+                return QueueOutcome(
+                    status="deferred", reason="sender_not_ready",
+                    retry_at=int(time.time()) + 30,
                 )
             except Exception as exc:  # transient send failure — retry with backoff
                 last_error = f"{type(exc).__name__}: {exc}"

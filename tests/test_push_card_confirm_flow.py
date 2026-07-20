@@ -302,6 +302,80 @@ def test_write_failure_retry_without_form_value_commits(store):
     assert len(writer.records) == 1
 
 
+# ===================== P5: concurrency / failure invariants ==============
+
+def test_lost_clarify_cas_never_writes(store):
+    # A concurrent second click that loses the clarifying→confirmed CAS must NOT
+    # call the writer (finding lost-cas-falls-through-to-write — otherwise a
+    # double-click double-writes). Simulate the race: the CAS returns False while
+    # a "winner" has already moved the row to confirmed.
+    rid, nonce = _clarifying(store)
+    writer = confirm.MockKepPreClaimWriter()
+    real_advance = store.advance_status
+
+    def racing_advance(registry_id, *, expect, to, **kw):
+        if expect == reg.STATUS_CLARIFYING and to == reg.STATUS_CONFIRMED:
+            real_advance(registry_id, expect=expect, to=to, **kw)  # the winner claims it
+            return False  # ...but THIS caller lost the CAS
+        return real_advance(registry_id, expect=expect, to=to, **kw)
+
+    store.advance_status = racing_advance
+    try:
+        res = _confirm(store, rid, nonce, writer)
+    finally:
+        store.advance_status = real_advance
+
+    assert res.kind == "retry"
+    assert res.written is False
+    assert writer.write_calls == 0  # the loser NEVER wrote
+    assert store.get(rid)["status"] == reg.STATUS_CONFIRMED  # winner's claim stands
+
+
+def test_writer_exception_becomes_visible_failed_card(store):
+    # writer.write raising must not be swallowed leaving the row stuck confirmed
+    # with no failure card (finding writer-exception-leaves-confirmed-silent).
+    rid, nonce = _clarifying(store)
+
+    class _BoomWriter(confirm.MockKepPreClaimWriter):
+        def write(self, **kw):
+            raise RuntimeError("kep exploded")
+
+    res = _confirm(store, rid, nonce, _BoomWriter())
+    assert res.kind == "failed"
+    assert res.written is False
+    # a retry button is offered and the failure is recorded — never silent
+    assert any(e.get("tag") == "button" for e in res.card["body"]["elements"])
+    row = store.get(rid)
+    assert row["status"] == reg.STATUS_CONFIRMED
+    assert row["last_error"]
+
+
+def test_commit_cas_loss_reports_noop_not_false_green(store):
+    # If the confirmed→committed CAS loses (reconcile already committed), we must
+    # NOT report a green written=True card (finding commit-cas-result-ignored).
+    rid, nonce = _clarifying(store)
+    writer = confirm.MockKepPreClaimWriter()
+    real_advance = store.advance_status
+
+    def racing_advance(registry_id, *, expect, to, **kw):
+        if expect == reg.STATUS_CONFIRMED and to == reg.STATUS_COMMITTED:
+            passthrough = {k: v for k, v in kw.items() if k in ("clear_nonce", "submission")}
+            real_advance(registry_id, expect=expect, to=to, **passthrough)  # winner commits
+            return False  # ...but THIS caller's commit CAS lost
+        return real_advance(registry_id, expect=expect, to=to, **kw)
+
+    store.advance_status = racing_advance
+    try:
+        res = _confirm(store, rid, nonce, writer)
+    finally:
+        store.advance_status = real_advance
+
+    assert res.kind == "noop"  # committed by another actor — not a false green
+    assert res.written is False
+    assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+    assert len(writer.records) == 1  # backend still恰好一条
+
+
 # ===================== P5: kep-cli argv discipline =======================
 
 def test_kep_cli_args_are_a_list_shell_injection_inert():
