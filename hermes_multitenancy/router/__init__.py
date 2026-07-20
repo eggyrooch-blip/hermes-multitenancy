@@ -1225,6 +1225,22 @@ def _register_session_guard_for_dispatch(event: Any, gateway: Any, task: Any) ->
         logger.debug("multitenancy: session guard registration failed: %s", exc)
 
 
+def _rearm_push_card_adapter_patches(gateway: Any) -> None:
+    """Ensure the push-card matcher/confirm patches are armed against the live
+    Feishu adapter. register() installs them once, but if the runtime adapter
+    class was not importable then, the install deferred with no retry — so re-arm
+    here (idempotent, cheap once armed) where the first dispatch always carries a
+    fully-built live adapter. Fail-open — never break dispatch."""
+    try:
+        adapter = _get_feishu_adapter(gateway)
+        if adapter is None:
+            return
+        from ..push_send_queue import ensure_push_card_adapter_patches_armed
+        ensure_push_card_adapter_patches_armed(adapter)
+    except Exception:
+        logger.debug("multitenancy: push-card adapter re-arm failed", exc_info=True)
+
+
 def on_pre_gateway_dispatch(*, event: Any, gateway: Any, session_store: Any = None, **_kwargs) -> dict:
     """Sync hook callback (registered to ``pre_gateway_dispatch``).
 
@@ -1232,6 +1248,7 @@ def on_pre_gateway_dispatch(*, event: Any, gateway: Any, session_store: Any = No
     with ``action: skip`` so the gateway main flow halts for this event.
     """
     try:
+        _rearm_push_card_adapter_patches(gateway)
         if _should_defer_gateway_processing_complete(event):
             _defer_gateway_processing_complete(event, gateway)
         loop = asyncio.get_running_loop()

@@ -176,6 +176,35 @@ def install_gateway_push_card_adapter_capture() -> None:
         logger.info("[push_card] installed gateway Feishu adapter capture")
 
 
+def ensure_push_card_adapter_patches_armed(adapter: Any) -> None:
+    """Re-arm the inbound matcher / confirm patches against the LIVE adapter and
+    stash it for proactive sends. Called on every gateway dispatch (cheap once
+    armed — each install returns immediately on its ``_HOOK_INSTALLED`` guard).
+
+    register() installs these once, but if the runtime FeishuAdapter class was
+    not importable at that moment (``load_feishu_adapter`` deferred) the install
+    returned WITHOUT arming and never retried — the patches would stay
+    permanently uninstalled (inbound replies never reach the fill loop; proactive
+    cards stay parked in 'sending'). The FIRST dispatch carries a fully-built live
+    adapter, so we arm the patches against ``type(adapter)`` — the exact class the
+    gateway runs, no reliance on ``load_feishu_adapter`` resolving the same class.
+    Fail-open: any error must never break dispatch."""
+    if adapter is None:
+        return
+    note_live_adapter(adapter)  # keep the freshest instance for proactive sends
+    FeishuAdapter = type(adapter)
+    try:
+        from .push_card_matcher import install_feishu_push_card_matcher_patch
+        install_feishu_push_card_matcher_patch(FeishuAdapter)
+    except Exception:
+        logger.debug("[push_card] matcher re-arm on dispatch failed", exc_info=True)
+    try:
+        from .push_card_confirm import install_feishu_push_card_confirm_patch
+        install_feishu_push_card_confirm_patch(FeishuAdapter)
+    except Exception:
+        logger.debug("[push_card] confirm re-arm on dispatch failed", exc_info=True)
+
+
 async def _default_sender(*, profile_name: str, open_id: str, card: Any, payload: Any) -> SendResult:
     if _card_sender is None:
         raise PushCardSenderUnavailable("no live push-card sender registered")

@@ -515,22 +515,29 @@ def _summary_md(scene: SceneDefinition, values: dict[str, Any]) -> str:
 
 # --- live FeishuAdapter patch (5th card.action.trigger, undefined放行) ----
 
-def install_feishu_push_card_confirm_patch() -> None:
+def install_feishu_push_card_confirm_patch(FeishuAdapter: Any = None) -> None:
+    """Install the push-confirm card-action patch (5th card.action.trigger hook).
+
+    ``FeishuAdapter`` may be passed explicitly (the live adapter's runtime class,
+    supplied by the on-dispatch re-arm in ``push_send_queue`` when the register-
+    time install deferred because the class was not yet importable). When omitted
+    it is resolved via ``load_feishu_adapter`` (register-time path)."""
     global _HOOK_INSTALLED
     if _HOOK_INSTALLED:
         return
-    try:
-        from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
-        FeishuAdapter = load_feishu_adapter()
-    except Exception as exc:  # noqa: BLE001
+    if FeishuAdapter is None:
         try:
-            from .feishu_adapter_compat import log_feishu_adapter_load_error
-            log_feishu_adapter_load_error(
-                logger, "[push_card] FeishuAdapter not importable yet; confirm patch deferred", exc
-            )
-        except Exception:
-            logger.debug("[push_card] confirm patch deferred", exc_info=True)
-        return
+            from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
+            FeishuAdapter = load_feishu_adapter()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                from .feishu_adapter_compat import log_feishu_adapter_load_error
+                log_feishu_adapter_load_error(
+                    logger, "[push_card] FeishuAdapter not importable yet; confirm patch deferred", exc
+                )
+            except Exception:
+                logger.debug("[push_card] confirm patch deferred", exc_info=True)
+            return
     _HOOK_INSTALLED = _patch_card_action(FeishuAdapter)
 
 

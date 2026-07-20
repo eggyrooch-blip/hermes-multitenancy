@@ -377,25 +377,31 @@ def _event_text(event: Any) -> str:
     return ""
 
 
-def install_feishu_push_card_matcher_patch() -> None:
+def install_feishu_push_card_matcher_patch(FeishuAdapter: Any = None) -> None:
     """Idempotently hook inbound dispatch so a matched reply drives its scene's
     fill loop (extract → clarify/confirm card) and a recall event recomputes the
-    submission. Fail-open: any error → untouched delivery."""
+    submission. Fail-open: any error → untouched delivery.
+
+    ``FeishuAdapter`` may be passed explicitly (the live adapter's runtime class,
+    supplied by the on-dispatch re-arm in ``push_send_queue`` when the register-
+    time install deferred because the class was not yet importable). When omitted
+    it is resolved via ``load_feishu_adapter`` (register-time path)."""
     global _HOOK_INSTALLED
     if _HOOK_INSTALLED:
         return
-    try:
-        from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
-        FeishuAdapter = load_feishu_adapter()
-    except Exception as exc:  # noqa: BLE001
+    if FeishuAdapter is None:
         try:
-            from .feishu_adapter_compat import log_feishu_adapter_load_error
-            log_feishu_adapter_load_error(
-                logger, "[push_card] FeishuAdapter not importable yet; matcher patch deferred", exc
-            )
-        except Exception:
-            logger.debug("[push_card] matcher patch deferred", exc_info=True)
-        return
+            from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
+            FeishuAdapter = load_feishu_adapter()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                from .feishu_adapter_compat import log_feishu_adapter_load_error
+                log_feishu_adapter_load_error(
+                    logger, "[push_card] FeishuAdapter not importable yet; matcher patch deferred", exc
+                )
+            except Exception:
+                logger.debug("[push_card] matcher patch deferred", exc_info=True)
+            return
     _patch_dispatch(FeishuAdapter)
     _patch_recall(FeishuAdapter)
     _HOOK_INSTALLED = True
