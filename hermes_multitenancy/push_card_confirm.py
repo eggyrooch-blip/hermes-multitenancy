@@ -57,6 +57,26 @@ _HOOK_INSTALLED = False
 _CARD_ACTION_FLAG = "_hermes_multitenancy_push_confirm_card_action_patched"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow HTTP redirects. An allow-listed callback host that answers
+    302 → ``http://169.254.169.254/`` (cloud metadata) or any internal address is
+    an SSRF escape; returning None aborts the redirect so the 3xx surfaces as a
+    clean HTTPError instead of being silently followed (design §2.5 SSRF guard)."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+#: Opener carrying the no-redirect handler so EVERY confirm-write POST is
+#: redirect-proof. Module-level so a test can monkeypatch ``_urlopen`` (the seam
+#: the fake ``urlopen`` swaps in) while production stays redirect-blocked.
+_http_opener = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _urlopen(req: Any, *, timeout: float) -> Any:
+    return _http_opener.open(req, timeout=timeout)
+
+
 # --- writer contract -----------------------------------------------------
 
 @dataclass
@@ -174,7 +194,9 @@ class HttpKepPreClaimWriter(ClaimWriter):
     ``write_idempotency_key`` (a ``deduped: true`` response is still a success).
     Any non-2xx / timeout / connection failure is a clean ``WriteResult(ok=False)``
     that routes to the existing failed-retry card path (design §2.5); it never
-    raises out of ``write``.
+    raises out of ``write``. A 401/403 maps to ``credential_expired`` → the re-auth
+    card. Redirects are NOT followed (``_NoRedirectHandler``) so an allow-listed
+    host that 302s to an internal address cannot be used for SSRF.
 
     Auth is never a plaintext secret: ``auth_header`` names the header and
     ``auth_token_env`` names the env var whose value is sent — read here, never
@@ -226,9 +248,17 @@ class HttpKepPreClaimWriter(ClaimWriter):
             self.url, data=payload, headers=headers, method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as exc:  # non-2xx
+        except urllib.error.HTTPError as exc:  # non-2xx (a blocked 3xx redirect included)
+            if exc.code in (401, 403):
+                # A dead kep credential must route to the RE-AUTH card (design §2.5
+                # 凭证分支), not a generic failure — otherwise the employee is stuck
+                # retrying a dead token with no /auth guidance.
+                return WriteResult(
+                    ok=False, credential_expired=True,
+                    error=f"kep-pre credential expired (HTTP {exc.code})",
+                )
             return WriteResult(ok=False, error=f"kep-pre HTTP {exc.code}: {exc.reason}")
         except (urllib.error.URLError, OSError) as exc:  # timeout / conn refused / DNS
             return WriteResult(ok=False, error=f"kep-pre unreachable: {type(exc).__name__}: {exc}")

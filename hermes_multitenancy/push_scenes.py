@@ -20,6 +20,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,13 @@ def callback_from_payload(raw: Any) -> Optional[CallbackConfig]:
     url = str(raw.get("url") or "").strip()
     if not url:
         raise ValueError("callback.url is required")
+    # https-only (an SSRF/eavesdrop guard): a callback carries employee data, so
+    # plaintext http is refused except to loopback (dev/fake-kep on 127.0.0.1).
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if not (scheme == "https" or (scheme == "http" and host in ("127.0.0.1", "::1", "localhost"))):
+        raise ValueError("callback.url must use https (http allowed only for loopback)")
     timeout = raw.get("timeout_s")
     auth_header = raw.get("auth_header")
     auth_token_env = raw.get("auth_token_env")

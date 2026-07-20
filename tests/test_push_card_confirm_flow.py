@@ -455,7 +455,7 @@ def test_http_writer_success_posts_json_with_idempotency_key(monkeypatch):
         captured["body"] = _json.loads(req.data.decode("utf-8"))
         return _FakeResp(_json.dumps({"ok": True, "deduped": False, "record": {"seq": 1}}))
 
-    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
 
     # The writer is constructed with its resolved endpoint (get_writer now hands
     # back an endpoint-less shell that _bind_endpoint fills in; this asserts the
@@ -482,7 +482,7 @@ def test_http_writer_failure_is_visible_via_retry_card(monkeypatch, store):
     def fake_urlopen(req, timeout=None):
         raise _uerr.HTTPError(req.full_url, 500, "Internal Server Error", {}, None)
 
-    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
     writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
 
     rid, nonce = _clarifying(store)
@@ -503,7 +503,7 @@ def test_http_writer_deduped_response_is_ok(monkeypatch):
         return _FakeResp(_json.dumps(
             {"ok": True, "deduped": True, "record": {"seq": 7, "write_idempotency_key": "pcr_9"}}))
 
-    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
     writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
     res = writer.write(
         scene=SCENE, values={"amount": 1, "reason": "x"},
@@ -511,6 +511,73 @@ def test_http_writer_deduped_response_is_ok(monkeypatch):
     )
     assert res.ok is True
     assert res.backend_id == "7"
+
+
+# ===================== P5: credential expiry mapping (401/403) ============
+
+def test_http_writer_401_maps_to_credential_expired_reauth(monkeypatch, store):
+    # A dead kep token → 401. The writer must flag credential_expired so
+    # handle_confirm shows the RE-AUTH card (/auth guidance), not a generic retry
+    # loop on a dead credential (finding http-writer-401-not-mapped).
+    def fake_urlopen(req, timeout=None):
+        raise _uerr.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
+    writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
+    rid, nonce = _clarifying(store)
+    res = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=_form_value(), store=store, writer_lookup=lambda n: writer)
+    assert res.kind == "reauth"
+    actions = [e.get("value", {}).get("hermes_action") for e in res.card["body"]["elements"]
+               if e.get("tag") == "button"]
+    assert "cred_auth" in actions  # /auth guidance on the card
+    assert store.get(rid)["status"] == reg.STATUS_CONFIRMED  # writable → retry after auth
+
+
+def test_http_writer_403_direct_write_flags_credential_expired(monkeypatch):
+    def fake_urlopen(req, timeout=None):
+        raise _uerr.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
+    writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
+    res = writer.write(scene=SCENE, values={"amount": 1, "reason": "x"},
+                       registry_id="pcr_1", write_idempotency_key="pcr_1", profile_name="p")
+    assert res.ok is False and res.credential_expired is True
+
+
+# ===================== P5: no-redirect SSRF guard ========================
+
+def test_no_redirect_handler_blocks_ssrf():
+    # An allow-listed host that 302s to 169.254.169.254 must NOT be followed —
+    # redirect_request returns None so urllib aborts the redirect and the 3xx
+    # surfaces as an error instead of fetching the internal metadata address.
+    handler = confirm._NoRedirectHandler()
+    assert handler.redirect_request(
+        SimpleNamespace(full_url="https://acme.example/api"), None, 302,
+        "Found", {}, "http://169.254.169.254/latest/meta-data/") is None
+
+
+def test_http_writer_blocked_redirect_is_visible_failure(monkeypatch):
+    # A 3xx (redirect blocked) is a clean ok=False — NOT credential_expired and
+    # NOT a silent success.
+    def fake_urlopen(req, timeout=None):
+        raise _uerr.HTTPError(req.full_url, 302, "Found", {}, None)
+
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
+    writer = confirm.HttpKepPreClaimWriter("https://acme.example/api")
+    res = writer.write(scene=SCENE, values={"amount": 1, "reason": "x"},
+                       registry_id="pcr_r", write_idempotency_key="pcr_r", profile_name="p")
+    assert res.ok is False and res.credential_expired is False
+    assert "302" in (res.error or "")
+
+
+def test_callback_from_payload_requires_https():
+    # employee data must not ride plaintext http (except loopback for dev/fake-kep).
+    with pytest.raises(ValueError):
+        scenes.callback_from_payload({"url": "http://evil.test/save"})
+    assert scenes.callback_from_payload({"url": "http://127.0.0.1:9/api"}).url == "http://127.0.0.1:9/api"
+    assert scenes.callback_from_payload({"url": "https://acme.example/api"}).url == "https://acme.example/api"
 
 
 # ===== router card.action.trigger path (form submit drops button value) =====
@@ -863,7 +930,7 @@ def test_push_callback_override_writes_to_that_endpoint(store, monkeypatch):
         captured["body"] = _json.loads(req.data.decode("utf-8"))
         return _FakeResp(_json.dumps({"ok": True, "record": {"seq": 5}}))
 
-    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
     rid, nonce = _clarifying_row(store, callback_json=_PUSH_CB, biz="cb")
     res = confirm.handle_confirm(
         registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
@@ -882,7 +949,7 @@ def test_scene_callback_used_when_no_push_override(store, monkeypatch):
         captured["url"] = req.full_url
         return _FakeResp(_json.dumps({"ok": True, "record": {"seq": 1}}))
 
-    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
     scene_cb = _dc.replace(SCENE, callback=scenes.CallbackConfig(url="http://127.0.0.1:9/scene/api"))
     rid, nonce = _clarifying(store)
     res = confirm.handle_confirm(
@@ -900,7 +967,7 @@ def test_http_writer_auth_header_from_env_never_plaintext(monkeypatch):
         captured["auth"] = req.headers.get("Authorization")
         return _FakeResp(_json.dumps({"ok": True, "record": {"seq": 1}}))
 
-    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    monkeypatch.setattr(confirm, "_urlopen", fake_urlopen)
     writer = confirm.HttpKepPreClaimWriter(
         "http://x/api", auth_header="Authorization", auth_token_env="MY_KEP_TOKEN")
     writer.write(scene=SCENE, values={"amount": 1, "reason": "x"},
