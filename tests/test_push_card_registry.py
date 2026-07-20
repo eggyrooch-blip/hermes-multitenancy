@@ -159,6 +159,24 @@ def test_expire_due_sweeps_inflight(store):
     assert store.get(r["registry_id"])["status"] == reg.STATUS_EXPIRED
 
 
+def test_expire_due_does_not_reap_confirmed(store):
+    # A confirmed-but-not-committed row past expires_at is the reconcile worker's
+    # job — the expiry sweep must NOT reap it (finding expiry-reaps-confirmed).
+    # Silently expiring it would discard a submission the user already confirmed
+    # and drop it out of the reconcile net (list_stale_confirmed scans confirmed).
+    rid = _create(store, expires_at=100).row["registry_id"]
+    store.mark_sent(rid, message_id="m")
+    store.advance_status(rid, expect=reg.STATUS_PENDING, to=reg.STATUS_CLARIFYING)
+    store.advance_status(rid, expect=reg.STATUS_CLARIFYING, to=reg.STATUS_CONFIRMED,
+                         submission={"amount": 68})
+    assert store.expire_due(now=10_000) == 0                     # not swept
+    assert store.get(rid)["status"] == reg.STATUS_CONFIRMED
+    assert rid not in {x["registry_id"] for x in store.list_due_open(now=10_000)}
+    # still reconcilable — the reconcile worker can backfill committed
+    stale = {x["registry_id"] for x in store.list_stale_confirmed(older_than=reg._now() + 10)}
+    assert rid in stale
+
+
 def test_archive_finished_moves_to_cold_table(store):
     r = _create(store).row
     store.mark_send_failed(r["registry_id"], error="x")

@@ -48,6 +48,12 @@ STATUS_EXPIRED = "expired"
 OPEN_STATUSES = (STATUS_PENDING, STATUS_CLARIFYING)
 #: In-flight for business-key collision purposes (not yet a terminal outcome).
 INFLIGHT_STATUSES = (STATUS_SENDING, STATUS_PENDING, STATUS_CLARIFYING, STATUS_CONFIRMED)
+#: Expiry-eligible states — deliberately EXCLUDES ``confirmed``: a user who
+#: confirmed has met the deadline, and a confirmed-but-not-committed row (write
+#: still in flight / crash before commit) is the reconcile worker's job, never
+#: the expiry sweep's. Reaping it would silently discard a confirmed submission
+#: and drop it out of the reconcile net (finding expiry-reaps-confirmed).
+EXPIRABLE_STATUSES = (STATUS_SENDING, STATUS_PENDING, STATUS_CLARIFYING)
 #: Terminal states — archivable to the cold table.
 FINISHED_STATUSES = (STATUS_COMMITTED, STATUS_FAILED, STATUS_EXPIRED)
 
@@ -301,16 +307,18 @@ class PushRegistryStore:
         return dict(row) if row is not None else None
 
     def list_due_open(self, *, now: Optional[int] = None) -> list[dict[str, Any]]:
-        """Not-finished rows past ``expires_at`` — the expiry worker's work list
-        (design §2.6). It re-renders each card before flipping to ``expired``."""
+        """Expirable rows (sending/pending/clarifying, NOT confirmed) past
+        ``expires_at`` — the expiry worker's work list (design §2.6). It
+        re-renders each card before flipping to ``expired``. ``confirmed`` is
+        excluded on purpose (finding expiry-reaps-confirmed)."""
         now = _now() if now is None else now
-        inflight = ", ".join("?" * len(INFLIGHT_STATUSES))
+        expirable = ", ".join("?" * len(EXPIRABLE_STATUSES))
         cur = self._conn.execute(
             "SELECT * FROM push_registry"
-            f" WHERE status IN ({inflight})"
+            f" WHERE status IN ({expirable})"
             " AND expires_at IS NOT NULL AND expires_at <= ?"
             " ORDER BY expires_at ASC",
-            (*INFLIGHT_STATUSES, now),
+            (*EXPIRABLE_STATUSES, now),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -326,6 +334,21 @@ class PushRegistryStore:
             " WHERE status = ? AND updated_at <= ?"
             " ORDER BY updated_at ASC",
             (STATUS_CONFIRMED, older_than),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_sending_stale(self, *, older_than: int) -> list[dict[str, Any]]:
+        """``sending`` rows last touched at/before ``older_than`` — the send
+        re-drive worker's work list. A quiet-hours / daily-cap deferral parks a
+        row in ``sending`` with no live re-invocation of the queue; this sweep
+        re-runs ``process()`` so the deferral actually resumes (finding
+        deferred-never-resumes). ``updated_at`` gates out a just-created row that
+        the fire-and-forget dispatch is still handling, avoiding a double send."""
+        cur = self._conn.execute(
+            "SELECT * FROM push_registry"
+            " WHERE status = ? AND updated_at <= ?"
+            " ORDER BY updated_at ASC",
+            (STATUS_SENDING, older_than),
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -438,18 +461,20 @@ class PushRegistryStore:
             return cur.rowcount > 0
 
     def expire_due(self, *, now: Optional[int] = None) -> int:
-        """Sweep not-finished rows past ``expires_at`` into ``expired``.
+        """Sweep expirable rows (sending/pending/clarifying, NOT confirmed) past
+        ``expires_at`` into ``expired``.
 
         The full worker (with card re-render) is P6; this is the DB primitive it
-        and the read-time guard share."""
+        and the read-time guard share. ``confirmed`` is excluded so a confirmed
+        submission is never silently reaped (finding expiry-reaps-confirmed)."""
         now = _now() if now is None else now
-        open_list = ", ".join("?" * len(INFLIGHT_STATUSES))
+        open_list = ", ".join("?" * len(EXPIRABLE_STATUSES))
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE push_registry SET status = ?, updated_at = ?"
                 f" WHERE status IN ({open_list})"
                 " AND expires_at IS NOT NULL AND expires_at <= ?",
-                (STATUS_EXPIRED, now, *INFLIGHT_STATUSES, now),
+                (STATUS_EXPIRED, now, *EXPIRABLE_STATUSES, now),
             )
             self._conn.commit()
             return cur.rowcount

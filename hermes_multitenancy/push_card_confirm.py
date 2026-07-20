@@ -31,6 +31,7 @@ the card then guides re-auth and the row stays writable for a retry — kep gets
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import secrets
 import time
@@ -195,6 +196,23 @@ def _toast(content: str, level: str = "info") -> dict[str, Any]:
     return {"toast": {"type": level, "content": content}}
 
 
+def _stored_submission_values(row: dict[str, Any]) -> dict[str, Any]:
+    """The ``{key: value}`` submission persisted at the clarifying→confirmed CAS.
+    A retry button is a plain button (no form), so the write path recovers the
+    already-confirmed values from here rather than from an empty form_value
+    (finding retry-card-has-no-form)."""
+    raw = row.get("submission_json")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
 def handle_confirm(
     *,
     registry_id: str,
@@ -247,12 +265,21 @@ def handle_confirm(
 
     # Final payload = the controls the user SAW and submitted (design §2.4 P1-5).
     final = _form.submission_from_form(scene, form_value)
-    missing = _form.missing_fields(scene, final)
+    values = _form.submission_values(scene, final)
+    # Retry / reauth cards are PLAIN buttons (not inside a form), so a real retry
+    # click carries no form_value → `values` is empty. Recover the payload
+    # persisted at the clarifying→confirmed CAS so the credential-expiry /
+    # write-failure retry can actually commit (finding retry-card-has-no-form;
+    # design §2.5 凭证分支 retry). Only when already `confirmed` — a clarifying row
+    # with an empty form is a genuine "请填写完整".
+    if not values and status == _reg.STATUS_CONFIRMED:
+        values = _stored_submission_values(row)
+    missing = [f for f in scene.fields
+               if f.required and not str(values.get(f.key, "") or "").strip()]
     if missing:
         labels = "、".join(f.label for f in missing)
         return ConfirmResult("reject", toast=_toast(f"请填写完整：{labels}。", "error"),
                              registry_id=registry_id)
-    values = _form.submission_values(scene, final)
 
     writer = writer_lookup(scene.writer)
     if writer is None:

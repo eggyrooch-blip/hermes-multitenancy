@@ -246,6 +246,62 @@ def test_expired_credential_guides_reauth_then_retry_succeeds(store):
     assert len(writer.records) == 1
 
 
+def test_reauth_retry_without_form_value_still_commits(store):
+    # The reauth/retry cards are PLAIN buttons (not inside a form), so a real
+    # retry click carries NO form_value. The handler must recover the confirmed
+    # payload from submission_json and commit — not reject as "请填写完整"
+    # (finding retry-card-has-no-form).
+    rid, nonce = _clarifying(store)
+    writer = confirm.MockKepPreClaimWriter()
+    writer.credential_expired = True
+    res = _confirm(store, rid, nonce, writer)  # first click: full form, expired
+    assert res.kind == "reauth"
+    assert store.get(rid)["status"] == reg.STATUS_CONFIRMED
+    assert store.get(rid)["submission_json"] is not None  # payload persisted at CAS
+
+    # re-auth done, click 重试 — that button submits NO form_value
+    writer.credential_expired = False
+    res2 = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=None, store=store, writer_lookup=lambda n: writer,
+    )
+    assert res2.kind == "committed" and res2.written is True
+    assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+    assert len(writer.records) == 1
+    assert writer.records[rid]["amount"] == 68  # recovered the confirmed value
+
+
+def test_write_failure_retry_without_form_value_commits(store):
+    # A transient write failure leaves the row `confirmed` + a 重试 button (a
+    # plain button, no form). Retrying with NO form_value must recover the
+    # confirmed payload and commit (finding retry-card-has-no-form).
+    rid, nonce = _clarifying(store)
+
+    class _FlakyWriter(confirm.MockKepPreClaimWriter):
+        def __init__(self):
+            super().__init__()
+            self.fail_next = True
+
+        def write(self, **kw):
+            if self.fail_next:
+                self.fail_next = False
+                self.write_calls += 1
+                return confirm.WriteResult(ok=False, error="transient")
+            return super().write(**kw)
+
+    writer = _FlakyWriter()
+    res = _confirm(store, rid, nonce, writer)  # full form, write fails
+    assert res.kind == "failed"
+    assert store.get(rid)["status"] == reg.STATUS_CONFIRMED
+
+    res2 = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=None, store=store, writer_lookup=lambda n: writer,
+    )
+    assert res2.kind == "committed"
+    assert len(writer.records) == 1
+
+
 # ===================== P5: kep-cli argv discipline =======================
 
 def test_kep_cli_args_are_a_list_shell_injection_inert():

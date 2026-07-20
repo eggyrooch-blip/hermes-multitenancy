@@ -1,6 +1,10 @@
 """Background workers for the push-card fill loop (SPEC P6, design §2.6/§2.5).
 
-Two sweeps, both idempotent and both safe to run on a timer:
+Three sweeps, all idempotent and all safe to run on a timer:
+
+* ``run_send_redrive_sweep`` — re-runs the send queue for ``sending`` rows a
+  quiet-hours / daily-cap deferral parked (nothing else re-invokes the queue, so
+  without it a deferred card never sends — finding deferred-never-resumes).
 
 * ``run_expiry_sweep`` — flips not-finished rows past ``expires_at`` to
   ``expired`` and re-renders their card to "已过期". Card re-render failure is
@@ -28,12 +32,18 @@ from typing import Any, Awaitable, Callable, Optional
 
 from . import push_card_metrics as _metrics
 from . import push_registry as _reg
+from . import push_send_queue as _sendq
 
 logger = logging.getLogger(__name__)
 
 #: Default reconcile window — a confirmed row older than this with no commit is
 #: eligible for a backend check (design §2.5 step 3).
 RECONCILE_AFTER_S = 5 * 60
+
+#: Default send re-drive grace — a ``sending`` row parked longer than this is
+#: re-run through the queue. Also keeps the re-drive off a just-created row the
+#: fire-and-forget dispatch is still handling.
+SEND_REDRIVE_AFTER_S = 60
 
 # Seam types.
 #: Re-render + push the "已过期" card for a row → returns True on success.
@@ -78,6 +88,46 @@ async def run_expiry_sweep(
         logger.info(
             "[push_card] expiry sweep: due=%d expired=%d card_failed=%d",
             counters["due"], counters["expired"], counters["card_failed"],
+        )
+    return counters
+
+
+async def run_send_redrive_sweep(
+    store: _reg.PushRegistryStore,
+    *,
+    queue: Optional["_sendq.PushSendQueue"] = None,
+    redrive_after_s: int = SEND_REDRIVE_AFTER_S,
+    now: Optional[int] = None,
+) -> dict[str, int]:
+    """Re-run the send queue for ``sending`` rows parked past ``redrive_after_s``.
+
+    A quiet-hours顺延 / daily-cap deferral leaves a row ``sending`` but nothing
+    re-invokes the queue, so without this sweep the card never sends — it sits
+    until the expiry worker reaps it (finding deferred-never-resumes). ``process``
+    is idempotent and re-checks the deferral window, so each parked row either
+    sends now or re-defers; a row already advanced is a ``skipped`` no-op.
+    """
+    now = _reg._now() if now is None else now
+    queue = _sendq.get_send_queue() if queue is None else queue
+    counters = {"redriven": 0, "sent": 0, "deferred": 0, "failed": 0, "skipped": 0}
+    older_than = now - int(redrive_after_s)
+    for row in store.list_sending_stale(older_than=older_than):
+        counters["redriven"] += 1
+        try:
+            outcome = await queue.process(row["registry_id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[push_card] send re-drive raised (registry=%s): %s — leaving sending",
+                row["registry_id"], exc,
+            )
+            continue
+        counters[outcome.status] = counters.get(outcome.status, 0) + 1
+    if counters["redriven"]:
+        logger.info(
+            "[push_card] send re-drive sweep: redriven=%d sent=%d deferred=%d "
+            "failed=%d skipped=%d",
+            counters["redriven"], counters["sent"], counters["deferred"],
+            counters["failed"], counters["skipped"],
         )
     return counters
 
