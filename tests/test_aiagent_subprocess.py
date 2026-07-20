@@ -8069,6 +8069,81 @@ def test_wrap_linux_bwrap_rejects_profile_symlink_directly_to_external_skill(mon
     assert ("--ro-bind", str(external_skill), str(shared / "skills" / "rogue-lark")) not in triples
 
 
+def test_wrap_linux_bwrap_binds_managed_skillhub_release_targets(monkeypatch, tmp_path: Path):
+    """AiDock SkillHub releases under _managed/ must resolve inside bwrap.
+
+    Regression: atom-member-commission 2026-07-20 — profile symlinks to
+    _managed/aidock-skillhub/<skill>/<ver>/<skill> dangled in-sandbox, so
+    SKILL.md loaded (prompt-injected) but scripts/ attachments were unreadable.
+    """
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    release = shared / "_managed" / "aidock-skillhub" / "atom-member-commission" / "1.0.0"
+    skill_source = release / "atom-member-commission"
+    (skill_source / "scripts").mkdir(parents=True)
+    (skill_source / "SKILL.md").write_text("# 会员佣金填写\n", encoding="utf-8")
+    (skill_source / "_meta.json").write_text("{}", encoding="utf-8")
+    (skill_source / "scripts" / "commission.py").write_text("print('ok')\n", encoding="utf-8")
+    skill_link = profile / "skills" / "atom-member-commission"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+    assert ("--ro-bind", str(shared / "_managed"), str(shared / "_managed")) not in triples
+
+
+def test_wrap_linux_bwrap_skips_managed_skillhub_target_without_skill_md(monkeypatch, tmp_path: Path):
+    """The SKILL.md existence gate applies to _managed/ targets like any other root."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    skill_source = shared / "_managed" / "aidock-skillhub" / "broken-skill" / "1.0.0" / "broken-skill"
+    (skill_source / "scripts").mkdir(parents=True)
+    (skill_source / "scripts" / "tool.py").write_text("print('ok')\n", encoding="utf-8")
+    skill_link = profile / "skills" / "broken-skill"
+    skill_link.parent.mkdir(parents=True)
+    skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert ("--ro-bind", str(skill_source), str(skill_source)) not in triples
+
+
 def test_wrap_linux_bwrap_skips_secret_like_shared_skill_targets(monkeypatch, tmp_path: Path):
     """A shared skill symlink is not mounted if its target later gains secrets."""
     import os as _os

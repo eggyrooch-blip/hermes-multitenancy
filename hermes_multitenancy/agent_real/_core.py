@@ -3120,6 +3120,11 @@ def _shared_skill_symlink_bwrap_args(profile_home: Path, shared_home: Path) -> l
     allowed_roots = [
         _absolute_path_without_following_final_symlink(shared / "skills"),
         _absolute_path_without_following_final_symlink(shared / "skill-releases"),
+        # AiDock SkillHub canonical releases (skillhub_installer materializes
+        # under _managed/<_SKILL_DISTRIBUTION_ORIGIN> and symlinks profile
+        # skills there); without this root those links dangle in-sandbox and
+        # skill attachments (scripts/) are unreadable.
+        _absolute_path_without_following_final_symlink(shared / "_managed" / "aidock-skillhub"),
     ]
     bindings: set[tuple[Path, Path]] = set()
 
