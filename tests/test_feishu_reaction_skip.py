@@ -130,5 +130,7 @@ def test_handle_async_keeps_regular_text_on_dispatch_path():
         ):
             asyncio.run(router_mod.handle_async(event=event, gateway=SimpleNamespace()))
 
-    assert adapter_seen == [True]
+    # Two adapter resolutions: the push-card fill-loop probe (returns None here
+    # → immediate passthrough, no card) then the normal dispatch path's own.
+    assert adapter_seen == [True, True]
     assert run_request_seen == [True]

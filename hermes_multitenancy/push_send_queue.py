@@ -232,11 +232,22 @@ async def send_push_card_via_adapter(
         reply_to=None,
         metadata=metadata,
     )
+    # The live SDK response carries message_id on ``response.data.message_id``
+    # (a CreateMessageResponseBody object), NOT on ``response.message_id`` — the
+    # earlier object-branch missed ``.data`` and always saw None, so every real
+    # send raised "no message_id" and parked the card in ``sending`` forever.
+    # Mirror cron's proven ``_feishu_response_message_id``: check ``.data`` first,
+    # then the top-level, in both object and dict shapes.
     message_id = None
-    if isinstance(response, dict):
-        message_id = response.get("message_id") or (response.get("data") or {}).get("message_id")
-    else:
-        message_id = getattr(response, "message_id", None)
+    for source in (getattr(response, "data", None), response):
+        if source is None:
+            continue
+        if isinstance(source, dict):
+            message_id = source.get("message_id") or (source.get("message") or {}).get("message_id")
+        else:
+            message_id = getattr(source, "message_id", None)
+        if message_id:
+            break
     if not message_id:
         raise PushCardSenderUnavailable("card send returned no message_id")
     return SendResult(message_id=str(message_id))
@@ -367,7 +378,13 @@ class PushSendQueue:
                     card=card,
                     payload=payload,
                 )
-            except PushCardSenderUnavailable:
+            except PushCardSenderUnavailable as _pcexc:
+                import sys as _sys
+                logger.warning(
+                    "PCDEBUG send DEFERRED registry=%s exc=%r card_sender_set=%s live_adapter_set=%s module_id=%s",
+                    registry_id, _pcexc, _card_sender is not None, _live_adapter is not None,
+                    id(_sys.modules.get(__name__)),
+                )
                 # No usable sender in THIS process — DEFER (leave row 'sending').
                 # Covers both PushCardSenderNotReady (adapter not captured yet) and
                 # the base case where notify-card dispatched the send from the

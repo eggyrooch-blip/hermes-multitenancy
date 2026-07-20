@@ -127,6 +127,20 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         # ``@bot /feishu_auth`` is recognised as a slash command.
         command_source_text = _m._strip_leading_at_mentions(text) if is_group_chat else text
         cmd_pair = parse_command(command_source_text)
+
+        # Push-card fill loop (LIVE inbound path). The multitenancy router owns
+        # inbound via pre_gateway_dispatch → handle_async and NEVER calls
+        # FeishuAdapter._dispatch_inbound_event, so the matcher patch installed
+        # on that method can't fire here. Route a DM reply that hits one of this
+        # user's open push cards into the fill loop BEFORE it becomes a normal
+        # agent turn, then short-circuit. Slash commands (cmd_pair) and reactions
+        # (already returned above) never reach this; a non-push-card message
+        # matches nothing and continues untouched (zero impact on normal chat).
+        if cmd_pair is None and not is_group_chat:
+            from ..push_card_matcher import try_route_push_card_reply
+            if await try_route_push_card_reply(_m._get_feishu_adapter(gateway), event):
+                return
+
         if cmd_pair is not None:
             if fixed_context is not None and not expert_bot_route.is_fixed_expert_slash_allowed(cmd_pair[0]):
                 adapter = _m._get_feishu_adapter(gateway)

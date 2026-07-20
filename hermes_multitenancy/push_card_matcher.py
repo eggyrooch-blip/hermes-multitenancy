@@ -472,6 +472,58 @@ async def _send_notice(adapter: Any, open_id: str, text: str) -> bool:
     return True
 
 
+async def try_route_push_card_reply(adapter: Any, event: Any) -> bool:
+    """Run the inbound matcher against ``event`` and, on a routing decision, drive
+    the fill loop (or deliver the canned expired/disambiguate notice) and return
+    ``True`` so the caller SHORT-CIRCUITS — the reply is CONSUMED by the push-card
+    loop and must not also become a free-form agent turn (design §2.3). Returns
+    ``False`` for any passthrough (no open card, off-topic, escape phrase, error):
+    the message continues to the normal agent, untouched.
+
+    Two callers share this body:
+      * the ``_dispatch_inbound_event`` patch below — covers non-router adapters.
+      * the multitenancy router's ``handle_async`` — the LIVE path. The router
+        owns inbound via ``pre_gateway_dispatch`` → ``handle_async`` and NEVER
+        invokes ``_dispatch_inbound_event``, so without this entry a quoted reply
+        to a pending card fell straight through to the streaming agent.
+    Idempotent per event (``_REGISTRY_CTX_ATTR``/``_NOTICE_ATTR`` guard) so a
+    message that somehow reaches both paths can't drive the loop or send twice.
+    Fail-open — any error → ``False`` (untouched delivery)."""
+    if adapter is None:
+        return False
+    if (getattr(event, _REGISTRY_CTX_ATTR, None) is not None
+            or getattr(event, _NOTICE_ATTR, None) is not None):
+        return True  # already routed by the sibling path — short-circuit, don't re-drive
+    try:
+        from . import push_send_queue as _sendq
+        _sendq.note_live_adapter(adapter)  # capture adapter for proactive sends
+        open_id = _event_open_id(event)
+        text = _event_text(event)
+        if not (open_id and text):
+            return False
+        quoted = str(getattr(event, "reply_to_message_id", "") or "")
+        import asyncio
+        decision = await get_matcher().match_with_grace(
+            open_id=open_id, text=text, quoted_message_id=quoted,
+            sleep_fn=asyncio.sleep,
+        )
+        if decision.action == ROUTE:
+            # Load-bearing path: run the fill loop and send the clarify/confirm
+            # card. The reply is CONSUMED by the form loop, so short-circuit.
+            if await _drive_fill_step(adapter, decision, text):
+                setattr(event, _REGISTRY_CTX_ATTR, decision.context)
+                return True
+        elif decision.action in (EXPIRED_EXIT, DISAMBIGUATE) and decision.reply_text:
+            # Deliver the已过期/请引用 notice and short-circuit — the text must
+            # never fall through to the agent unhandled.
+            if await _send_notice(adapter, open_id, decision.reply_text):
+                setattr(event, _NOTICE_ATTR, decision.reply_text)
+                return True
+    except Exception:
+        logger.debug("[push_card] inbound matcher failed; passthrough", exc_info=True)
+    return False
+
+
 def _patch_dispatch(FeishuAdapter: Any) -> None:
     original = getattr(FeishuAdapter, "_dispatch_inbound_event", None)
     if original is None or getattr(original, _DISPATCH_FLAG, False):
@@ -479,34 +531,8 @@ def _patch_dispatch(FeishuAdapter: Any) -> None:
 
     @functools.wraps(original)
     async def wrapped(self: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            from . import push_send_queue as _sendq
-            _sendq.note_live_adapter(self)  # capture adapter for proactive sends
-            open_id = _event_open_id(event)
-            text = _event_text(event)
-            quoted = str(getattr(event, "reply_to_message_id", "") or "")
-            if open_id and text:
-                import asyncio
-                decision = await get_matcher().match_with_grace(
-                    open_id=open_id, text=text, quoted_message_id=quoted,
-                    sleep_fn=asyncio.sleep,
-                )
-                if decision.action == ROUTE:
-                    # Load-bearing path: run the fill loop and send the
-                    # clarify/confirm card. The reply is CONSUMED by the form
-                    # loop, so short-circuit — it must not also become a
-                    # free-form agent chat turn (design §2.3).
-                    if await _drive_fill_step(self, decision, text):
-                        setattr(event, _REGISTRY_CTX_ATTR, decision.context)
-                        return None
-                elif decision.action in (EXPIRED_EXIT, DISAMBIGUATE) and decision.reply_text:
-                    # Deliver the已过期/请引用 notice and short-circuit — the text
-                    # must never fall through to the agent unhandled.
-                    if await _send_notice(self, open_id, decision.reply_text):
-                        setattr(event, _NOTICE_ATTR, decision.reply_text)
-                        return None
-        except Exception:
-            logger.debug("[push_card] inbound matcher failed; passthrough", exc_info=True)
+        if await try_route_push_card_reply(self, event):
+            return None
         return await original(self, event, *args, **kwargs)
 
     setattr(wrapped, _DISPATCH_FLAG, True)
