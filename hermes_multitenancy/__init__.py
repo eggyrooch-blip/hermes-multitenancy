@@ -134,8 +134,15 @@ def register(ctx) -> None:
             # event to carry the adapter) and start the sweep worker — without
             # these the live sender never fires and the expiry/re-drive/reconcile
             # sweeps are dead code.
-            from .push_send_queue import install_live_push_card_sender
+            from .push_send_queue import (
+                install_gateway_push_card_adapter_capture,
+                install_live_push_card_sender,
+            )
             install_live_push_card_sender()
+            # Capture the live Feishu adapter at gateway startup so the FIRST
+            # proactive push works without the user messaging the bot first
+            # (cold-start; the inbound stash is only a fallback).
+            install_gateway_push_card_adapter_capture()
             from .push_card_workers import ensure_push_card_sweeps_started
             ensure_push_card_sweeps_started()
         except Exception:

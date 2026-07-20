@@ -19,6 +19,7 @@ async sender, a fake clock, and a no-op sleep.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -111,6 +112,68 @@ def install_live_push_card_sender() -> None:
     the same closure is harmless."""
     register_push_card_sender(_live_adapter_sender)
     logger.info("[push_card] live push-card sender registered")
+
+
+# --- eager cold-start adapter capture ------------------------------------
+#
+# The inbound matcher/confirm patches only ``note_live_adapter`` when an event
+# arrives — so a freshly (re)started gateway could NOT push to a user until that
+# user spoke first. That breaks this product's whole premise (the system pushes
+# cards proactively every day; users must not have to message the bot first).
+# Hook ``GatewayRunner._create_adapter`` — the same seam the cron startup watcher
+# uses to reach the live gateway — and stash the Feishu adapter the moment the
+# gateway builds it, before any inbound. Keying on ``_create_adapter`` also means
+# a reconnect (which rebuilds the adapter) re-captures the fresh instance for
+# free. The first-inbound stash stays as a belt-and-braces fallback.
+
+_gateway_adapter_capture_installed = False
+
+
+def _patch_gateway_create_adapter(GatewayRunner: Any) -> bool:
+    """Wrap ``_create_adapter`` so any Feishu adapter it returns is captured.
+
+    Split out (like the matcher's ``_patch_dispatch``) so the behaviour is
+    unit-testable against a fake runner without the live gateway. Idempotent via
+    a per-function marker; returns True when the class carries the patch."""
+    original = getattr(GatewayRunner, "_create_adapter", None)
+    if original is None:
+        return False
+    if getattr(original, "_hermes_push_card_capture_patched", False):
+        return True
+
+    @functools.wraps(original)
+    def wrapped_create_adapter(self: Any, *args: Any, **kwargs: Any) -> Any:
+        adapter = original(self, *args, **kwargs)
+        try:
+            # ``_feishu_send_with_retry`` uniquely identifies the Feishu adapter
+            # AND is exactly the capability the proactive sender needs, so this
+            # duck-type is both the filter and the contract check.
+            if adapter is not None and callable(getattr(adapter, "_feishu_send_with_retry", None)):
+                note_live_adapter(adapter)
+                logger.info("[push_card] captured live Feishu adapter at gateway startup")
+        except Exception:
+            logger.debug("[push_card] gateway adapter capture failed", exc_info=True)
+        return adapter
+
+    setattr(wrapped_create_adapter, "_hermes_push_card_capture_patched", True)
+    GatewayRunner._create_adapter = wrapped_create_adapter
+    return True
+
+
+def install_gateway_push_card_adapter_capture() -> None:
+    """Eagerly capture the live Feishu adapter at gateway startup (cold-start
+    proactive push). Router-runtime only; fail-open like its sibling installs."""
+    global _gateway_adapter_capture_installed
+    if _gateway_adapter_capture_installed:
+        return
+    try:
+        from gateway.run import GatewayRunner
+    except Exception:
+        logger.exception("[push_card] gateway adapter capture install failed")
+        return
+    if _patch_gateway_create_adapter(GatewayRunner):
+        _gateway_adapter_capture_installed = True
+        logger.info("[push_card] installed gateway Feishu adapter capture")
 
 
 async def _default_sender(*, profile_name: str, open_id: str, card: Any, payload: Any) -> SendResult:

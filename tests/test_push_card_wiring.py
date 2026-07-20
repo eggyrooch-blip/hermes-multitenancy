@@ -25,6 +25,7 @@ import pytest
 
 from hermes_multitenancy import push_card_matcher as matcher
 from hermes_multitenancy import push_card_metrics as metrics
+from hermes_multitenancy import push_card_routes as routes
 from hermes_multitenancy import push_card_workers as workers
 from hermes_multitenancy import push_registry as reg
 from hermes_multitenancy import push_send_queue as sendq
@@ -259,3 +260,117 @@ def test_sweep_worker_starts_alive_and_is_idempotent(store):
     finally:
         workers.stop_push_card_sweeps()
     assert workers._sweep_thread is None
+
+
+# ===== #1 cold-start: capture the Feishu adapter WITHOUT any inbound =====
+
+def test_gateway_capture_grabs_feishu_adapter_without_inbound(store):
+    """The system pushes proactively before the user ever messages the bot —
+    the adapter must be captured at gateway startup, not on first inbound."""
+    A = _fresh_adapter_cls()
+    captured = A()  # has _feishu_send_with_retry → is a Feishu adapter
+
+    class FakeRunner:
+        def _create_adapter(self, platform, config):
+            return captured
+
+    assert sendq._patch_gateway_create_adapter(FakeRunner) is True
+    assert sendq.get_live_adapter() is None  # nothing spoke to the bot yet
+
+    # gateway builds the Feishu adapter at startup — NO inbound event
+    out = FakeRunner()._create_adapter("feishu", object())
+    assert out is captured
+    assert sendq.get_live_adapter() is captured
+
+
+def test_gateway_capture_ignores_non_feishu_adapter(store):
+    class FakeRunner:
+        def _create_adapter(self, platform, config):
+            return object()  # telegram/slack: no _feishu_send_with_retry
+
+    sendq._patch_gateway_create_adapter(FakeRunner)
+    FakeRunner()._create_adapter("telegram", object())
+    assert sendq.get_live_adapter() is None
+
+
+def test_gateway_capture_patch_is_idempotent(store):
+    class FakeRunner:
+        def _create_adapter(self, platform, config):
+            return None
+
+    first = sendq._patch_gateway_create_adapter(FakeRunner)
+    wrapped = FakeRunner._create_adapter
+    assert first is True
+    assert sendq._patch_gateway_create_adapter(FakeRunner) is True
+    assert FakeRunner._create_adapter is wrapped  # not re-wrapped
+
+
+# ===== target resolver uses RoutingTable (guards RoutingStore ImportError) =====
+
+def test_default_target_resolver_resolves_profile(monkeypatch, tmp_path):
+    """_default_target_resolver must construct the real RoutingTable and resolve
+    a seeded user → profile_name. Guards the RoutingStore ImportError regression
+    (the class is RoutingTable, not RoutingStore)."""
+    from hermes_multitenancy import routing
+
+    db = tmp_path / "multitenancy.db"
+    monkeypatch.setattr(routing, "DEFAULT_DB_PATH", db)  # resolver builds RoutingTable()
+    seed = routing.RoutingTable(db)
+    seed.upsert(user_id="u_x", profile_name="feishu_x", open_id="ou_x",
+                union_id="on_x", provenance="sync")
+    seed.close()
+
+    target = routes._default_target_resolver(open_id="ou_x", union_id="")
+    assert target is not None
+    assert target["profile_name"] == "feishu_x"
+    assert target["open_id"] == "ou_x"
+
+    # union_id-only fallback path also resolves
+    by_union = routes._default_target_resolver(open_id="", union_id="on_x")
+    assert by_union is not None and by_union["profile_name"] == "feishu_x"
+
+    # unknown target → None → the endpoint 4xx's
+    assert routes._default_target_resolver(open_id="ou_ghost", union_id="") is None
+
+
+# ===== run-broker process: no live sender → DEFER, never failed =====
+
+def test_process_defers_when_no_sender_in_process(store):
+    """notify-card can dispatch the send from the run-broker process, which owns
+    NO live Feishu adapter — _default_sender raises the BASE
+    PushCardSenderUnavailable (not the NotReady subclass). process() must DEFER
+    (row stays 'sending'), never 'failed'. Regression for 8af5237."""
+    from datetime import datetime
+
+    sendq.register_push_card_sender(None)  # no sender in this process
+    rid = store.create(scene=SCENE, skill=SKILL, target_open_id="ou_rb",
+                       profile_name="p", business_key=f"{SCENE}:ou_rb:rb").row["registry_id"]
+
+    # default sender (_default_sender) → base PushCardSenderUnavailable
+    q = sendq.PushSendQueue(store, clock=lambda: datetime(2026, 7, 20, 10, 0, 0),
+                            sleep_fn=lambda _s: asyncio.sleep(0))
+    out = asyncio.run(q.process(rid))
+    assert out.status == "deferred" and out.reason == "sender_not_ready"
+    assert store.get(rid)["status"] == reg.STATUS_SENDING  # NOT failed
+
+
+# ===== #2 open_id direct-send path (feeds cron's _patch_feishu_open_id_send) =====
+
+def test_send_push_card_via_adapter_targets_open_id(store):
+    """The proactive send hands the ou_ open_id as the receive target with
+    reply_to=None — exactly what cron's _patch_feishu_open_id_send keys on to
+    route a DM via im.v1.message.create('open_id', ...)."""
+    seen: dict = {}
+
+    class Rec:
+        async def _feishu_send_with_retry(self, *, chat_id, msg_type, payload,
+                                          reply_to=None, metadata=None):
+            seen.update(chat_id=chat_id, msg_type=msg_type, reply_to=reply_to)
+            return {"message_id": "om_direct_1"}
+
+    card = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "hi"}]}}
+    res = asyncio.run(sendq.send_push_card_via_adapter(Rec(), open_id="ou_direct", card=card))
+    assert res.message_id == "om_direct_1"
+    assert seen["chat_id"] == "ou_direct"   # open_id is the receive target
+    assert seen["reply_to"] is None          # → triggers the open_id (not reply) path
+    assert seen["msg_type"] == "interactive"
