@@ -580,6 +580,30 @@ def test_callback_from_payload_requires_https():
     assert scenes.callback_from_payload({"url": "https://acme.example/api"}).url == "https://acme.example/api"
 
 
+def test_multi_clarifying_stripped_submit_does_not_bind(store, monkeypatch):
+    # Two open clarifying scenes for the same operator + a form submit whose value
+    # was stripped → recovery is ambiguous, so NO row is bound and NO write happens
+    # (a wrong bind would write scene A's data under scene B's nonce/backend).
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    rid1, _ = _clarifying(store, open_id="ou_alice")
+    r2 = store.create(scene="dev-acceptance-claim", skill="push-fill-form",
+                      target_open_id="ou_alice", profile_name="alice-profile",
+                      business_key="dev-acceptance-claim:ou_alice:second").row
+    store.mark_sent(r2["registry_id"], message_id="om_card_2")
+    store.advance_status(r2["registry_id"], expect=reg.STATUS_PENDING, to=reg.STATUS_CLARIFYING)
+
+    assert confirm._recover_open_row(store, {"ou_alice"}) is None  # ambiguous → decline
+
+    action = SimpleNamespace(name="push_confirm_submit_op", value=None, form_value=_form_value())
+    event = SimpleNamespace(action=action,
+                            operator=SimpleNamespace(open_id="ou_alice", union_id=None, user_id=None))
+    result = confirm._compute_confirm_result(event, action, {}, _form_value())
+    assert result.kind == "invalid"  # nothing confirmed
+    assert "最新" in _json.dumps(result.toast, ensure_ascii=False)  # 请使用最新的卡片
+    assert store.get(rid1)["status"] == reg.STATUS_CLARIFYING  # both rows untouched
+    assert store.get(r2["registry_id"])["status"] == reg.STATUS_CLARIFYING
+
+
 # ===== router card.action.trigger path (form submit drops button value) =====
 #
 # The live bug: under the multitenancy router the confirm click reached

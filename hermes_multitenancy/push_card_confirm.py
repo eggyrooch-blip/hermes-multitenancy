@@ -798,12 +798,19 @@ def _recover_open_row(store: _reg.PushRegistryStore, operator_open_ids: set[str]
     """Recover the clicker's open fill-form row when the form submit lost its
     routing value. Only a ``clarifying`` row renders a submit form, so restrict
     to those (a plain-button retry runs on a ``confirmed`` row but keeps its
-    value, so it never needs this). Newest-first on ties.
+    value, so it never needs this).
 
-    ponytail: picks the most-recent clarifying row per user — the one-active-card
-    norm the rate limiter enforces. Persist the operation_id on the row to
-    disambiguate if concurrent cards per user ever ship."""
-    best: Optional[dict[str, Any]] = None
+    Recovers ONLY when the clicker has EXACTLY ONE open clarifying row. With two
+    concurrent scenes open, a value-stripped submit is genuinely ambiguous — the
+    old "newest wins" heuristic could bind scene A's submission to scene B's nonce
+    and write the wrong schema to the wrong backend (finding
+    multi-clarifying-ambiguous-recovery). On ambiguity we return None; the caller
+    then shows a "请使用最新的卡片" toast and confirms nothing.
+
+    ponytail: exactly-one is the one-active-card norm the rate limiter enforces.
+    If concurrent cards per user ever ship, persist the operation_id on the row
+    and match on it here instead of declining."""
+    seen: dict[str, dict[str, Any]] = {}
     for open_id in operator_open_ids:
         try:
             rows = store.list_open_for_user(open_id)
@@ -811,11 +818,11 @@ def _recover_open_row(store: _reg.PushRegistryStore, operator_open_ids: set[str]
             logger.debug("[push_card] open-row recovery lookup failed", exc_info=True)
             continue
         for row in rows:
-            if row.get("status") != _reg.STATUS_CLARIFYING:
-                continue
-            if best is None or int(row.get("created_at") or 0) >= int(best.get("created_at") or 0):
-                best = row
-    return best
+            if row.get("status") == _reg.STATUS_CLARIFYING:
+                seen[str(row.get("registry_id"))] = row
+    if len(seen) != 1:
+        return None
+    return next(iter(seen.values()))
 
 
 def _compute_confirm_result(
