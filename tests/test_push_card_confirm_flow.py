@@ -629,3 +629,163 @@ def test_router_non_push_confirm_still_delegates(store, monkeypatch):
     resp = adapter._on_card_action_trigger(SimpleNamespace(event=event))
     assert calls["original"] == 1
     assert resp == {"kind": "delegated"}
+
+
+# ===== LIVE gateway: card button routed as a synthetic /card COMMAND event =====
+#
+# The REAL live root cause (main-agent live gateway evidence): the multitenancy
+# Feishu adapter routes a card BUTTON click as a synthetic "/card ..." COMMAND
+# event (_handle_card_action_event → handle_message → pre_gateway_dispatch →
+# router handle_async). It NEVER re-enters _on_card_action_trigger, so the 5th-
+# hook wrapper (tested above) can't fire on this gateway — the confirm fell to
+# parse_command → the "命令但无调度器" reply (zero write, re-clickable button).
+# The original card-action `data` survives on the synthetic event's raw_message;
+# these prove try_route_push_confirm_synthetic detects it there and drives
+# handle_confirm before parse_command, exactly once, and consumes the event.
+
+import asyncio as _asyncio  # noqa: E402
+
+
+class _FakeAdapter:
+    """Captures both delivery channels so a test can assert the confirm result
+    goes out as a CARD (via _feishu_send_with_retry) and NOT as a plain command
+    reply (via .send — what the "/card 命令但无调度器" fallback would use)."""
+
+    def __init__(self):
+        self.card_sends = []  # (chat_id, msg_type, payload) — confirm result cards
+        self.sends = []       # (chat_id, text) — plain command replies (must be empty)
+
+    async def _feishu_send_with_retry(self, *, chat_id, msg_type, payload,
+                                      reply_to=None, metadata=None):
+        self.card_sends.append((chat_id, msg_type, payload))
+        return SimpleNamespace(data=SimpleNamespace(message_id="om_confirm_result"))
+
+    async def send(self, chat_id, text, *a, **k):
+        self.sends.append((chat_id, text))
+        return SimpleNamespace(data=SimpleNamespace(message_id="om_sent"))
+
+
+def _make_synthetic_command(*, open_id="ou_alice", op="op1", form=None, value=None,
+                            text="/card button", name=None, chat_type="dm"):
+    """Mirror the synthetic COMMAND event the core adapter builds for a card click:
+    text="/card <tag> [value]", message_type COMMAND, and raw_message = the raw
+    card-action `data` (event.action/operator/context)."""
+    action = SimpleNamespace(
+        tag="button",
+        name=name if name is not None else f"push_confirm_submit_{op}",
+        value=value,  # None → Feishu stripped the button value on a form submit
+        form_value=form if form is not None else _form_value(),
+    )
+    card_data = SimpleNamespace(
+        event=SimpleNamespace(
+            action=action,
+            operator=SimpleNamespace(open_id=open_id, union_id=None, user_id=None),
+            context=SimpleNamespace(open_message_id="om_card_1", open_chat_id="oc_dm"),
+        )
+    )
+    return SimpleNamespace(
+        text=text,
+        message_type=SimpleNamespace(name="COMMAND"),
+        message_id="om_synth",
+        source=SimpleNamespace(
+            chat_id="oc_dm", user_id=open_id, user_id_alt=None,
+            chat_type=chat_type, platform=SimpleNamespace(value="feishu"),
+            message_id="om_synth",
+        ),
+        media_urls=None, media_types=None, raw_event=None,
+        raw_message=card_data,
+    )
+
+
+def test_synthetic_command_confirm_writes_once_and_consumes(store, monkeypatch):
+    rid, _nonce = _clarifying(store, open_id="ou_alice")
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    writer = confirm.MockKepPreClaimWriter()
+    confirm.override_writer(SCENE.writer, writer)
+    try:
+        fake = _FakeAdapter()
+        monkeypatch.setattr("hermes_multitenancy.router._get_feishu_adapter", lambda gw: fake)
+
+        ev = _make_synthetic_command(open_id="ou_alice", form=_form_value(amount=58))
+        consumed = _asyncio.run(
+            confirm.try_route_push_confirm_synthetic(SimpleNamespace(), ev))
+
+        # CONSUMED (caller returns → never reaches parse_command dispatch)
+        assert consumed is True
+        # form submit dropped the button value → registry_id/nonce recovered from
+        # the clicker's open clarifying row, then written exactly once + committed
+        assert writer.write_calls == 1
+        assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+        assert writer.records[rid]["amount"] == 58
+        # confirm result delivered as a CARD, not a plain "/card" command reply
+        assert len(fake.card_sends) == 1
+        assert fake.card_sends[0][1] == "interactive"
+        assert fake.sends == []
+
+        # second click is idempotent — no double write, still consumed
+        consumed2 = _asyncio.run(confirm.try_route_push_confirm_synthetic(
+            SimpleNamespace(),
+            _make_synthetic_command(open_id="ou_alice", form=_form_value(amount=58))))
+        assert consumed2 is True
+        assert writer.write_calls == 1
+    finally:
+        confirm.override_writer(SCENE.writer, None)
+
+
+def test_synthetic_non_confirm_passes_through_without_adapter(store, monkeypatch):
+    # A normal text message and a sibling card action (cred_auth) must BOTH
+    # passthrough (False) — and resolve NO adapter, so normal-chat dispatch is
+    # untouched (the confirm probe adds zero adapter cost on the common path).
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    adapter_calls = {"n": 0}
+
+    def _adapter(gw):
+        adapter_calls["n"] += 1
+        return _FakeAdapter()
+
+    monkeypatch.setattr("hermes_multitenancy.router._get_feishu_adapter", _adapter)
+
+    plain = SimpleNamespace(text="hello bot", raw_message=None)
+    assert _asyncio.run(
+        confirm.try_route_push_confirm_synthetic(SimpleNamespace(), plain)) is False
+
+    sibling = _make_synthetic_command(
+        value={"hermes_action": "cred_auth", "cred": "kep-cli-pre"},
+        form=None, name="cred_auth_btn")
+    assert _asyncio.run(
+        confirm.try_route_push_confirm_synthetic(SimpleNamespace(), sibling)) is False
+
+    assert adapter_calls["n"] == 0
+
+
+def test_handle_async_routes_synthetic_confirm_before_parse_command(store, monkeypatch):
+    # Full router integration: a synthetic "/card button" confirm must reach
+    # handle_confirm and short-circuit BEFORE parse_command's command dispatch —
+    # otherwise "/card" falls to the "命令但无调度器" reply (zero write).
+    from hermes_multitenancy import router as router_mod
+
+    rid, _nonce = _clarifying(store, open_id="ou_alice")
+    monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    writer = confirm.MockKepPreClaimWriter()
+    confirm.override_writer(SCENE.writer, writer)
+    try:
+        fake = _FakeAdapter()
+        monkeypatch.setattr(router_mod, "_get_feishu_adapter", lambda gw: fake)
+
+        def _boom_cmd(*a, **k):
+            raise AssertionError("push-confirm must not reach command dispatch (/card)")
+
+        monkeypatch.setattr(router_mod, "_handle_command", _boom_cmd, raising=False)
+        monkeypatch.setattr(router_mod, "_dispatch_gateway_command", _boom_cmd, raising=False)
+
+        ev = _make_synthetic_command(open_id="ou_alice", form=_form_value(amount=58))
+        _asyncio.run(router_mod.handle_async(event=ev, gateway=SimpleNamespace()))
+
+        # handle_confirm ran (exactly one write + committed), the /card command
+        # path never ran (no plain reply), and the result card was delivered.
+        assert writer.write_calls == 1
+        assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+        assert fake.sends == []
+        assert len(fake.card_sends) == 1
+    finally:
+        confirm.override_writer(SCENE.writer, None)

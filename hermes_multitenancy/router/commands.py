@@ -128,6 +128,20 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         command_source_text = _m._strip_leading_at_mentions(text) if is_group_chat else text
         cmd_pair = parse_command(command_source_text)
 
+        # Push-card confirm (LIVE synthetic-command path). This gateway routes a
+        # card BUTTON click as a synthetic "/card <tag> [value]" COMMAND event
+        # (adapter._handle_card_action_event → handle_message →
+        # pre_gateway_dispatch → handle_async), so a confirm click lands HERE, not
+        # on _on_card_action_trigger — cmd_pair is ("card", …), which would fall
+        # through to the "命令但无调度器" reply (zero write, re-clickable button).
+        # Detect the push-confirm submit inside the synthetic event's raw_message
+        # and drive handle_confirm before parse_command dispatch, then short-
+        # circuit. A non-confirm event fast-returns False with no adapter cost
+        # (zero impact on normal chat / other card actions).
+        from ..push_card_confirm import try_route_push_confirm_synthetic
+        if await try_route_push_confirm_synthetic(gateway, event):
+            return
+
         # Push-card fill loop (LIVE inbound path). The multitenancy router owns
         # inbound via pre_gateway_dispatch → handle_async and NEVER calls
         # FeishuAdapter._dispatch_inbound_event, so the matcher patch installed

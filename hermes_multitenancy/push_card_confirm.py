@@ -637,9 +637,15 @@ def _recover_open_row(store: _reg.PushRegistryStore, operator_open_ids: set[str]
     return best
 
 
-def _dispatch_confirm(
-    adapter: Any, event: Any, action: Any, value: dict[str, Any], form_value: Any = None
-) -> Any:
+def _compute_confirm_result(
+    event: Any, action: Any, value: dict[str, Any], form_value: Any = None
+) -> ConfirmResult:
+    """Pure decision half of a confirm click, shared by BOTH live seams: the
+    ``_on_card_action_trigger`` wrapper (adapter path) and
+    ``try_route_push_confirm_synthetic`` (this gateway's synthetic-/card path).
+    Recovers registry_id+nonce (value → form_value → the clicker's open
+    clarifying row) and runs the idempotent ``handle_confirm``. No Feishu SDK /
+    no send — the caller decides how to render the result."""
     store = _reg.get_registry_store()
     if form_value is None:
         form_value = _read(action, "form_value")
@@ -668,9 +674,110 @@ def _dispatch_confirm(
             "PCDEBUG confirm result kind=%s written=%s registry=%s",
             result.kind, result.written, result.registry_id,
         )
+    return result
+
+
+def _dispatch_confirm(
+    adapter: Any, event: Any, action: Any, value: dict[str, Any], form_value: Any = None
+) -> Any:
+    """SDK-response half (used by the ``_on_card_action_trigger`` wrapper): render
+    the ConfirmResult as an inline card/toast callback response."""
+    result = _compute_confirm_result(event, action, value, form_value)
     if result.card is not None:
         return _card_response(result.card)
     return _toast_response(result.toast or _toast("已处理。"))
+
+
+def _synthetic_confirm_parts(event: Any) -> Optional[tuple[Any, Any, dict[str, Any], Any]]:
+    """Cheap, adapter-free detector for a push-confirm delivered as a synthetic
+    ``/card`` COMMAND event. Returns ``(card_event, action, value, form_value)``
+    when the event's ``raw_message`` (the original card-action ``data``) is a
+    push-confirm submit, else ``None``. No side effects, no adapter — so a normal
+    message costs one attribute walk and adds ZERO adapter resolutions."""
+    data = getattr(event, "raw_message", None)
+    card_event = _read(data, "event")
+    action = _read(card_event, "action")
+    if action is None:
+        return None
+    value = _read_action_value(_read(action, "value"))
+    form_value = _read(action, "form_value")
+    if _DEBUG:
+        logger.warning(
+            "PCDEBUG synthetic-confirm probe text=%r tag=%r name=%r value=%r form_value=%r",
+            getattr(event, "text", None), _read(action, "tag"),
+            _read(action, "name"), value, form_value,
+        )
+    if not _is_push_confirm_action(value, form_value, action):
+        return None
+    return card_event, action, value if isinstance(value, dict) else {}, form_value
+
+
+def _confirm_reply_open_id(card_event: Any, result: ConfirmResult) -> str:
+    """DM target for the confirm result card on the synthetic-command path: the
+    registry row's ``target_open_id`` (where the original card went), else the
+    signed operator's ou_ open_id. We read the RAW operator (``card_event``), not
+    the synthetic event's ``source`` — the latter carries a user_id-namespace id,
+    while ``send_push_card_via_adapter`` targets an open_id DM."""
+    if result.registry_id:
+        try:
+            row = _reg.get_registry_store().get(result.registry_id)
+        except Exception:
+            row = None
+        if row and row.get("target_open_id"):
+            return str(row["target_open_id"])
+    ids = _resolve_operator_open_ids(card_event)
+    for oid in sorted(ids):
+        if str(oid).startswith("ou_"):
+            return str(oid)
+    return next(iter(sorted(ids)), "")
+
+
+async def try_route_push_confirm_synthetic(gateway: Any, event: Any) -> bool:
+    """LIVE gateway seam. The multitenancy Feishu adapter routes a card BUTTON
+    click as a synthetic ``/card`` COMMAND event (``_handle_card_action_event`` →
+    ``handle_message`` → ``pre_gateway_dispatch`` → router ``handle_async``); it
+    NEVER re-enters ``_on_card_action_trigger``, so the 5th-hook wrapper above
+    cannot fire on this gateway (live log: ``Routing card action 'button' … as
+    synthetic command``). The original card-action ``data`` survives on the
+    synthetic event's ``raw_message``, so detect a push-confirm submit there and
+    drive ``handle_confirm`` HERE — short-circuiting BEFORE ``parse_command``
+    turns the ``/card`` text into the "命令但无调度器" reply (zero write,
+    re-clickable button).
+
+    Returns True when the event was a push-confirm and is now CONSUMED (caller
+    must return without command dispatch). False = passthrough (not ours / any
+    error). Idempotent: ``handle_confirm``'s CAS + write_idempotency_key make a
+    double-click exactly one write, so this and the ``_on_card_action_trigger``
+    wrapper can never double-write even if both fire. Adapter is resolved lazily
+    (only on a real confirm) to keep normal-message dispatch untouched."""
+    try:
+        parts = _synthetic_confirm_parts(event)
+        if parts is None:
+            return False
+        card_event, action, value, form_value = parts
+        from . import push_send_queue as _sendq
+        from .router import _get_feishu_adapter
+        adapter = _get_feishu_adapter(gateway)
+        if adapter is not None:
+            _sendq.note_live_adapter(adapter)
+        result = _compute_confirm_result(card_event, action, value, form_value)
+        card = result.card
+        if card is None and result.toast is not None:
+            content = (result.toast.get("toast") or {}).get("content") or "已处理。"
+            card = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": content}]}}
+        open_id = _confirm_reply_open_id(card_event, result)
+        if adapter is not None and card is not None and open_id:
+            try:
+                await _sendq.send_push_card_via_adapter(adapter, open_id=open_id, card=card)
+            except Exception:
+                logger.warning(
+                    "[push_card] confirm result card send failed (registry=%s)",
+                    result.registry_id, exc_info=True,
+                )
+        return True
+    except Exception:
+        logger.debug("[push_card] synthetic confirm route failed; passthrough", exc_info=True)
+        return False
 
 
 def _resolve_operator_open_ids(event: Any) -> set[str]:
