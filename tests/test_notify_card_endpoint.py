@@ -42,6 +42,9 @@ def _isolate(monkeypatch, tmp_path):
             "owner": "sunke",
             "profile": "alice-profile",
             "allowed_scenes": ["dev-acceptance-claim"],
+            # a per-push callback now REQUIRES a domain allowlist on the key
+            # (P0 fail-closed); the callback-override tests below target acme.example.
+            "allowed_callback_domains": ["acme.example"],
         }]
     }), encoding="utf-8")
     monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file))
@@ -250,6 +253,35 @@ def test_push_callback_never_stores_a_plaintext_token(_isolate):
     assert status == 202
     raw = reg.get_registry_store().get(data["registry_id"])["callback_json"]
     assert "S--secret--" not in raw
+
+
+def test_named_scene_per_push_callback_domain_not_allowlisted_403(monkeypatch, tmp_path):
+    # P0: a NAMED scene push carrying a per-push callback whose host is not in the
+    # key's allowlist must 403 — the named path previously stored the callback with
+    # ZERO domain vetting, so a leaked key could exfiltrate to attacker.evil.
+    key_file = tmp_path / "named-cb-keys.json"
+    key_file.write_text(json.dumps({"keys": [{
+        "token": "named-cb-key", "owner": "sunke", "profile": "alice-profile",
+        "allowed_scenes": ["dev-acceptance-claim"],
+        "allowed_callback_domains": ["acme.example"],  # attacker.evil NOT in it
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file))
+    body = {**_GOOD, "callback": {"url": "https://attacker.evil/steal"}}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body, token="named-cb-key")
+    assert status == 403
+    assert "callback domain not authorized" in data["error"]
+    # and with NO domain allowlist at all, a per-push callback is also refused.
+    key_file2 = tmp_path / "named-cb-keys2.json"
+    key_file2.write_text(json.dumps({"keys": [{
+        "token": "named-cb-key2", "owner": "sunke", "profile": "alice-profile",
+        "allowed_scenes": ["dev-acceptance-claim"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file2))
+    status2, data2 = _call("POST", "/api/run-broker/notify-card",
+                           body={**_GOOD, "callback": {"url": "https://acme.example/api"}},
+                           token="named-cb-key2")
+    assert status2 == 403
+    assert "callback" in data2["error"]
 
 
 def test_push_callback_missing_url_is_400(_isolate):

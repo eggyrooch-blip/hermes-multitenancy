@@ -101,15 +101,21 @@ def _default_business_key(scene: str, open_id: str) -> str:
 
 
 def _callback_domain_allowed(binding: dict[str, Any], callback: Any) -> Optional[str]:
-    """Fail-closed check that an inline push's 落库 callback host is allowlisted
-    for this key. ``callback`` is a ``CallbackConfig | None``; ``None`` = no
-    endpoint to vet → allowed. Returns an error string to 403 with, else None."""
+    """Fail-closed check that a per-push 落库 callback host is allowlisted for this
+    key. ``callback`` is a ``CallbackConfig | None``; ``None`` = no endpoint to vet
+    → allowed. A callback that IS present REQUIRES a non-empty
+    ``allowed_callback_domains`` on the key — a leaked key with no domain grant
+    must never exfiltrate employee data to an arbitrary host (P0). Returns an
+    error string to 403 with, else None."""
     if callback is None:
         return None
+    allowed = binding.get("allowed_callback_domains") or []
+    if not allowed:
+        return "per-push callback requires a callback-domain allowlist on this key"
     host = (urlparse(callback.url).hostname or "").lower()
     if not host:
         return "callback url has no host"
-    for raw in binding.get("allowed_callback_domains") or []:
+    for raw in allowed:
         d = str(raw).strip().lower().lstrip(".")
         # ponytail: exact host or subdomain-suffix match; widen to scheme/port
         # scoping only if a caller ever needs it.
@@ -175,17 +181,15 @@ def register_push_card_routes(app: Any) -> None:
                 return web.json_response(
                     {"ok": False, "error": f"invalid scene spec: {exc}"}, status=400
                 )
-            # fail-closed: the key must be granted this skill, and any inline 落库
-            # callback must target an allowlisted domain (P0-1 blast radius).
+            # fail-closed: the key must be granted this skill (P0-1 blast radius).
+            # The per-push callback domain is vetted below on the UNIFIED path so
+            # both inline and named scenes share one fail-closed check.
             if scene_def.skill not in (binding.get("allowed_skills") or []):
                 return web.json_response(
                     {"ok": False,
                      "error": f"skill not authorized for this key: {scene_def.skill}"},
                     status=403,
                 )
-            cb_err = _callback_domain_allowed(binding, scene_def.callback)
-            if cb_err is not None:
-                return web.json_response({"ok": False, "error": cb_err}, status=403)
             scene = scene_def.scene
         else:
             scene = str(payload.get("scene") or "").strip()
@@ -253,6 +257,14 @@ def register_push_card_routes(app: Any) -> None:
             callback_cfg = _scenes.callback_from_payload(payload.get("callback"))
         except ValueError as exc:
             return web.json_response({"ok": False, "error": f"invalid callback: {exc}"}, status=400)
+        # UNIFIED fail-closed domain check on the per-push callback for BOTH the
+        # inline and named-scene paths. The named path previously stored this
+        # callback with ZERO domain vetting → a leaked key could set
+        # callback.url=https://attacker.evil and exfiltrate employee data on
+        # confirm (push-override beats scene/env). One check, both paths (P0).
+        cb_err = _callback_domain_allowed(binding, callback_cfg)
+        if cb_err is not None:
+            return web.json_response({"ok": False, "error": cb_err}, status=403)
         try:
             behaviors_cfg = _scenes.behaviors_from_payload(payload.get("behaviors"))
         except ValueError as exc:
