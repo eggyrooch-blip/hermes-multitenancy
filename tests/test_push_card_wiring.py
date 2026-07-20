@@ -119,6 +119,41 @@ def test_matched_reply_drives_fill_card_and_short_circuits(store):
     assert metrics.snapshot().get(metrics.FILL_RENDERED) == 1
 
 
+def test_inline_card_row_drives_fill_loop_via_scene_spec(store):
+    """An INLINE card row (scene name NOT registered; full spec carried on
+    ``scene_spec_json``) drives the same merge → confirm-card → send loop —
+    routing reconstructs the scene from the row via ``scene_def_for_row``, not a
+    named registry lookup. This is the 路线A self-serve闭环 (非命名查)."""
+    from hermes_multitenancy import push_scenes as scenes
+    A = _fresh_adapter_cls()
+    matcher._patch_dispatch(A)
+    adapter = A()
+    spec = scenes.scene_to_spec_json(scenes.scene_from_payload({
+        "skill": "atom-claim", "mode": "card",
+        "fields": [
+            {"key": "amount", "label": "金额", "type": "number", "required": True, "risk": "high"},
+            {"key": "category", "label": "类目", "type": "enum", "options": ["打车", "餐饮"]},
+        ],
+    }))
+    assert scenes.get_scene("inline:atom-claim") is None  # unregistered scene
+    rid = store.create(scene="inline:atom-claim", skill="atom-claim",
+                       target_open_id="ou_alice", profile_name="ou_alice-profile",
+                       business_key="inline:atom-claim:ou_alice:2026-07-20",
+                       scene_spec_json=spec).row["registry_id"]
+    store.mark_sent(rid, message_id="om_inline_card")
+
+    asyncio.run(adapter._dispatch_inbound_event(SimpleNamespace(
+        sender_open_id="ou_alice", text="打车花了58", reply_to_message_id="")))
+
+    assert len(adapter.sent) == 1
+    _, card = adapter.sent[0]
+    assert any(e.get("tag") == "form" for e in card["body"]["elements"])  # confirm form rendered
+    assert adapter.original_called is False  # reply consumed, not an agent turn
+    row = store.get(rid)
+    assert row["status"] == reg.STATUS_CLARIFYING
+    assert json.loads(row["submission_json"]).get("category") == "打车"
+
+
 def test_second_reply_updates_submission_in_place(store):
     A = _fresh_adapter_cls()
     matcher._patch_dispatch(A)

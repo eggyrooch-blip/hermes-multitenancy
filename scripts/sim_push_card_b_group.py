@@ -401,7 +401,8 @@ def main() -> int:
     # Shared in-memory registry singleton for the endpoint/queue-driven phases.
     reg.override_registry_store(":memory:")
     # Every push target resolves to a sending profile (no real routing table).
-    routes.override_target_resolver(lambda *, open_id, union_id: {
+    # Accept user_id too — the endpoint resolves by open_id | union_id | user_id.
+    routes.override_target_resolver(lambda *, open_id, union_id, user_id="": {
         "open_id": open_id or "ou_from_union", "union_id": union_id,
         "profile_name": f"{open_id or 'x'}-profile", "chat_id": None,
     })

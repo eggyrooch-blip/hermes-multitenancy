@@ -385,3 +385,22 @@ def test_card_scene_route_decision_stays_card_mode(store):
     d = _matcher(store).match(open_id="ou_alice", text="打车花了58", quoted_message_id="om_c")
     assert d.action == m.ROUTE
     assert d.mode == scenes.MODE_CARD
+
+
+def test_inline_row_routes_via_scene_spec_not_named_lookup(store):
+    """An INLINE row's scene name is not in the builtin registry; routing must
+    reconstruct the scene from ``scene_spec_json`` (scene_def_for_row). The yolo
+    mode reaching the decision is the proof — a named ``get_scene`` would miss
+    and fall back to card."""
+    from hermes_multitenancy import push_scenes as scenes
+    spec = scenes.scene_to_spec_json(scenes.scene_from_payload(
+        {"skill": "quote-bot", "mode": "yolo"}))
+    assert scenes.get_scene("inline:quote-bot") is None  # not a registered name
+    row = _create(store, scene="inline:quote-bot", skill="quote-bot",
+                  business_key="inline:quote-bot:ou_alice:2026-07-20",
+                  scene_spec_json=spec)
+    _deliver(store, row, mid="om_inline")
+    d = _matcher(store).match(open_id="ou_alice", text="按规则算给我", quoted_message_id="om_inline")
+    assert d.action == m.ROUTE
+    assert d.mode == scenes.MODE_YOLO  # only scene_def_for_row could supply this
+    assert d.slash_content == "/quote-bot 按规则算给我"

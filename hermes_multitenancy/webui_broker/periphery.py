@@ -623,22 +623,27 @@ def _ingest_file_bindings() -> list[dict[str, str]]:
         profile = str(entry.get("profile") or "").strip()
         if not token or (not owner and not profile):
             continue
-        # allowed_scenes binds a key to the push-card scenes it may target
-        # (fail-closed whitelist, design §2.1). Absent → no scenes → notify-card
-        # refuses; the ingest path never reads this field.
-        raw_scenes = entry.get("allowed_scenes")
-        allowed_scenes = (
-            [str(s).strip() for s in raw_scenes if str(s).strip()]
-            if isinstance(raw_scenes, list)
-            else []
-        )
+        # allowed_scenes binds a key to the NAMED push-card scenes it may target;
+        # allowed_skills / allowed_callback_domains bind it for the INLINE
+        # self-serve path (skill described in the notify-card body, 落库 endpoint
+        # supplied per push). All three are fail-closed whitelists (design §2.1):
+        # absent → empty → notify-card refuses. The ingest path never reads them.
+        def _str_list(raw: Any) -> list[str]:
+            return (
+                [str(s).strip() for s in raw if str(s).strip()]
+                if isinstance(raw, list)
+                else []
+            )
+
         binding = {
             "owner": owner,
             "profile": profile,
             "agent": str(entry.get("agent") or entry.get("agent_id") or "").strip(),
             "name": str(entry.get("name") or entry.get("display_label") or "").strip(),
             "source": "file",
-            "allowed_scenes": allowed_scenes,
+            "allowed_scenes": _str_list(entry.get("allowed_scenes")),
+            "allowed_skills": _str_list(entry.get("allowed_skills")),
+            "allowed_callback_domains": _str_list(entry.get("allowed_callback_domains")),
         }
         bindings.append({"token": token, **binding})
     return bindings
@@ -652,9 +657,11 @@ def _legacy_ingest_binding() -> dict[str, str]:
         "agent": "",
         "name": "",
         "source": "legacy",
-        # Legacy/master keys carry no scene grant → notify-card is fail-closed
-        # for them; scene-scoped pushes must use an explicit file-bound key.
+        # Legacy/master keys carry no scene/skill grant → notify-card is
+        # fail-closed for them; scoped pushes must use an explicit file-bound key.
         "allowed_scenes": [],
+        "allowed_skills": [],
+        "allowed_callback_domains": [],
     }
 
 

@@ -273,3 +273,88 @@ def test_no_override_leaves_callback_and_behaviors_null(_isolate):
     assert status == 202
     row = reg.get_registry_store().get(data["registry_id"])
     assert row["callback_json"] is None and row["behaviors_json"] is None
+    # a named-scene push does NOT carry an inline spec on the row.
+    assert row["scene_spec_json"] is None
+
+
+# --- inline self-serve scene (route A) -----------------------------------
+
+def _inline_key_file(tmp_path, *, skills, domains=()):
+    kf = tmp_path / "inline-keys.json"
+    kf.write_text(json.dumps({"keys": [{
+        "token": "inline-key", "owner": "sunke", "profile": "alice-profile",
+        "allowed_skills": list(skills),
+        "allowed_callback_domains": list(domains),
+    }]}), encoding="utf-8")
+    return kf
+
+
+def test_inline_card_push_stores_scene_spec_on_row(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE",
+                       str(_inline_key_file(tmp_path, skills=["atom-member-commission"])))
+    body = {
+        "user_id": "sunke", "skill": "atom-member-commission", "mode": "card",
+        "fields": [
+            {"key": "amount", "label": "金额", "type": "number", "required": True, "risk": "high"},
+            {"key": "note", "label": "备注", "type": "text"},
+        ],
+    }
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body, token="inline-key")
+    assert status == 202
+    row = reg.get_registry_store().get(data["registry_id"])
+    assert row["skill"] == "atom-member-commission"  # the inline skill, on the row
+    assert row["scene_spec_json"], "an inline push must carry its full spec on the row"
+    spec = json.loads(row["scene_spec_json"])
+    assert spec["mode"] == "card" and spec["skill"] == "atom-member-commission"
+    assert [f["key"] for f in spec["fields"]] == ["amount", "note"]
+
+
+def test_inline_yolo_push_needs_no_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE",
+                       str(_inline_key_file(tmp_path, skills=["quote-bot"])))
+    body = {"user_id": "sunke", "skill": "quote-bot", "mode": "yolo"}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body, token="inline-key")
+    assert status == 202
+    spec = json.loads(reg.get_registry_store().get(data["registry_id"])["scene_spec_json"])
+    assert spec["mode"] == "yolo" and spec["fields"] == []
+
+
+def test_inline_card_without_fields_is_400(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE",
+                       str(_inline_key_file(tmp_path, skills=["x"])))
+    body = {"user_id": "sunke", "skill": "x", "mode": "card"}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body, token="inline-key")
+    assert status == 400
+    assert "invalid scene spec" in data["error"]
+
+
+def test_inline_callback_domain_not_allowlisted_403(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(_inline_key_file(
+        tmp_path, skills=["quote-bot"], domains=["acme.example"])))
+    body = {"user_id": "sunke", "skill": "quote-bot", "mode": "yolo",
+            "callback": {"url": "https://evil.test/save"}}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body, token="inline-key")
+    assert status == 403
+    assert "callback domain not authorized" in data["error"]
+
+
+def test_inline_callback_domain_allowlisted_subdomain_202(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(_inline_key_file(
+        tmp_path, skills=["quote-bot"], domains=["acme.example"])))
+    body = {"user_id": "sunke", "skill": "quote-bot", "mode": "yolo",
+            "callback": {"url": "https://api.acme.example/save"}}  # subdomain allowed
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body, token="inline-key")
+    assert status == 202
+    stored = json.loads(reg.get_registry_store().get(data["registry_id"])["callback_json"])
+    assert stored["url"] == "https://api.acme.example/save"
+
+
+def test_inline_status_query_authorized_by_skill(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_INGEST_KEYS_FILE",
+                       str(_inline_key_file(tmp_path, skills=["quote-bot"])))
+    _, created = _call("POST", "/api/run-broker/notify-card",
+                       body={"user_id": "sunke", "skill": "quote-bot", "mode": "yolo"},
+                       token="inline-key")
+    rid = created["registry_id"]
+    status, data = _call("GET", f"/api/run-broker/notify-card/{rid}", token="inline-key")
+    assert status == 200 and data["registry_id"] == rid
