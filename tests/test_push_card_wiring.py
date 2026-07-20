@@ -58,7 +58,17 @@ def _fresh_adapter_cls():
         def __init__(self):
             self.original_called = False
             self.sent: list[tuple[str, dict]] = []
+            self.patched: list[tuple[str, dict]] = []  # in-place card.update calls
             self.recall_original_called = False
+            parent = self
+
+            class _Msg:
+                def patch(self, request):
+                    parent.patched.append(
+                        (request.message_id, json.loads(request.request_body.content)))
+                    return {"code": 0}
+
+            self._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_Msg())))
 
         async def _dispatch_inbound_event(self, event):
             self.original_called = True
@@ -101,16 +111,20 @@ def test_matched_reply_drives_fill_card_and_short_circuits(store):
                          text="打车 上周五 去客户现场花了58", reply_to_message_id="")
     asyncio.run(adapter._dispatch_inbound_event(ev))
 
-    # a clarify/confirm card was SENT to the user's DM (loop actually ran)
-    assert len(adapter.sent) == 1
-    chat_id, card = adapter.sent[0]
-    assert chat_id == "ou_alice"
+    # the pushed card (message_id present) is UPDATED IN PLACE into the confirm
+    # form — not a second card (finding confirm-card-no-in-place-update).
+    assert adapter.sent == []
+    assert len(adapter.patched) == 1
+    patched_mid, card = adapter.patched[0]
+    assert patched_mid == "om_card"  # patched the original card by its message_id
     assert any(e.get("tag") == "form" for e in card["body"]["elements"])
     # the reply was CONSUMED — it did NOT also become an agent chat turn
     assert adapter.original_called is False
-    # row advanced to clarifying with the merged submission persisted
+    # row advanced to clarifying with the merged submission persisted; message_id
+    # unchanged (in-place update keeps the same card).
     row = store.get(rid)
     assert row["status"] == reg.STATUS_CLARIFYING
+    assert row["message_id"] == "om_card"
     assert row["submission_json"]
     persisted = json.loads(row["submission_json"])
     assert persisted.get("category") == "打车"  # low-risk field captured
@@ -145,8 +159,9 @@ def test_inline_card_row_drives_fill_loop_via_scene_spec(store):
     asyncio.run(adapter._dispatch_inbound_event(SimpleNamespace(
         sender_open_id="ou_alice", text="打车花了58", reply_to_message_id="")))
 
-    assert len(adapter.sent) == 1
-    _, card = adapter.sent[0]
+    assert adapter.sent == []
+    assert len(adapter.patched) == 1  # inline card row updated in place too
+    _, card = adapter.patched[0]
     assert any(e.get("tag") == "form" for e in card["body"]["elements"])  # confirm form rendered
     assert adapter.original_called is False  # reply consumed, not an agent turn
     row = store.get(rid)
@@ -164,10 +179,36 @@ def test_second_reply_updates_submission_in_place(store):
         SimpleNamespace(sender_open_id="ou_alice", text="打车 去客户现场", reply_to_message_id="")))
     asyncio.run(adapter._dispatch_inbound_event(
         SimpleNamespace(sender_open_id="ou_alice", text="发生日期 上周五", reply_to_message_id="")))
-    # two fill cards sent, second card carries the accumulated date
-    assert len(adapter.sent) == 2
-    dumped = json.dumps(adapter.sent[1][1], ensure_ascii=False)
+    # the SAME card is updated in place twice (no stacking); second carries the date
+    assert adapter.sent == []
+    assert len(adapter.patched) == 2
+    assert adapter.patched[0][0] == adapter.patched[1][0] == "om_card"  # same card
+    dumped = json.dumps(adapter.patched[1][1], ensure_ascii=False)
     assert "上周五" in dumped
+
+
+def test_fill_step_falls_back_to_new_card_and_repoints_message_id(store):
+    # When the in-place card.update fails, the loop sends a NEW card and CAS-points
+    # registry.message_id at it so a quoted reply follows the latest form card.
+    A = _fresh_adapter_cls()
+    adapter = A()
+
+    def _failing_patch(request):
+        raise RuntimeError("patch boom")
+
+    adapter._client.im.v1.message.patch = _failing_patch
+    matcher._patch_dispatch(A)
+    rid = _pending_row(store)
+
+    asyncio.run(adapter._dispatch_inbound_event(
+        SimpleNamespace(sender_open_id="ou_alice", text="打车花了58", reply_to_message_id="")))
+
+    assert len(adapter.sent) == 1  # fell back to a new card
+    _, card = adapter.sent[0]
+    assert any(e.get("tag") == "form" for e in card["body"]["elements"])
+    row = store.get(rid)
+    assert row["message_id"] == "om_out_1"  # re-pointed to the new form card
+    assert row["status"] == reg.STATUS_CLARIFYING
 
 
 def test_unmatched_reply_passes_through_to_agent(store):

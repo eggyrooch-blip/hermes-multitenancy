@@ -470,10 +470,34 @@ async def _drive_fill_step(adapter: Any, decision: MatchDecision, text: str) -> 
         return False
     if not moved:
         return False
-    await _sendq.send_push_card_via_adapter(adapter, open_id=row["target_open_id"], card=step.card)
+    # Prefer an in-place card.update (DELIVER_UPDATE) so replying twice re-renders
+    # the SAME confirm card instead of stacking N cards with stale "确认" buttons
+    # (finding confirm-card-no-in-place-update). A failed patch falls back to a new
+    # card; either way registry.message_id is CAS-pointed at the card the user is
+    # now looking at so a later quoted reply routes to the latest form.
+    mid = str(row.get("message_id") or "")
+    delivered = False
+    if step.delivery == _form.DELIVER_UPDATE and mid:
+        try:
+            delivered = await _sendq.update_push_card_via_adapter(
+                adapter, message_id=mid, card=step.card
+            )
+        except Exception:
+            logger.debug("[push_card] in-place card update failed; sending new", exc_info=True)
+            delivered = False
+    if not delivered:
+        result = await _sendq.send_push_card_via_adapter(
+            adapter, open_id=row["target_open_id"], card=step.card
+        )
+        new_mid = getattr(result, "message_id", None)
+        if new_mid and str(new_mid) != mid:
+            store.advance_status(
+                registry_id, expect=_reg.STATUS_CLARIFYING, to=_reg.STATUS_CLARIFYING,
+                message_id=str(new_mid),
+            )
     _metrics.incr(_metrics.FILL_RENDERED)
-    logger.info("[push_card] fill card sent (registry=%s, missing=%d)",
-                registry_id, len(step.missing))
+    logger.info("[push_card] fill card rendered (registry=%s, missing=%d, in_place=%s)",
+                registry_id, len(step.missing), delivered)
     return True
 
 

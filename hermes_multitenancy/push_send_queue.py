@@ -253,6 +253,23 @@ async def send_push_card_via_adapter(
     return SendResult(message_id=str(message_id))
 
 
+async def update_push_card_via_adapter(
+    adapter: Any, *, message_id: str, card: dict[str, Any]
+) -> bool:
+    """Patch an already-sent interactive card IN PLACE (原地改卡) by message_id.
+
+    The fill loop uses this to re-render the SAME confirm card on each reply
+    instead of stacking a new card per reply (finding
+    confirm-card-no-in-place-update). Returns True on success; a failure (or a
+    missing message_id / adapter) returns False so the caller falls back to
+    sending a NEW card and re-points ``registry.message_id`` at it."""
+    mid = str(message_id or "").strip()
+    if adapter is None or not mid:
+        return False
+    from .card.cardkit_client import _patch_interactive_message
+    return bool(await _patch_interactive_message(adapter, mid, card))
+
+
 # --- token bucket --------------------------------------------------------
 
 class TokenBucket:
