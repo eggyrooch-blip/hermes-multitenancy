@@ -29,6 +29,11 @@ from .webui_broker import periphery as _periphery
 
 logger = logging.getLogger(__name__)
 
+#: Hard upper bound on a caller-supplied ``expires_at`` — 30 days ahead. An
+#: unbounded value (``2**40`` = "never expires") would pin a row open forever and
+#: a value in the past would expire it instantly; both are refused (P1).
+MAX_EXPIRES_AHEAD_S = 30 * 24 * 3600
+
 
 # --- target resolution seam (default reuses the routing table) -----------
 
@@ -246,8 +251,25 @@ def register_push_card_routes(app: Any) -> None:
         business_key = str(payload.get("business_key") or "").strip() or _default_business_key(
             scene, resolved_open_id
         )
-        expires_at = payload.get("expires_at")
-        expires_at = int(expires_at) if isinstance(expires_at, (int, float)) else _next_working_day_eod()
+        raw_expires = payload.get("expires_at")
+        if raw_expires is None:
+            expires_at = _next_working_day_eod()
+        elif isinstance(raw_expires, bool) or not isinstance(raw_expires, int):
+            # A float/string/etc is refused — only an integer unix timestamp is
+            # accepted so a 2**40 "never expires" or a bogus value can't slip in.
+            return web.json_response(
+                {"ok": False, "error": "expires_at must be an integer unix timestamp"},
+                status=400,
+            )
+        else:
+            now_ts = int(time.time())
+            if not (now_ts < raw_expires <= now_ts + MAX_EXPIRES_AHEAD_S):
+                return web.json_response(
+                    {"ok": False,
+                     "error": "expires_at must be in the future and within 30 days"},
+                    status=400,
+                )
+            expires_at = raw_expires
 
         # Per-push overrides for this card's 回调地址 (落库 endpoint) and submit
         # behavior. Both are capabilities the caller/scene configures — not

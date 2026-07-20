@@ -200,6 +200,32 @@ def test_business_key_inflight_returns_409():
     assert d2["registry_id"] == d1["registry_id"]
 
 
+def test_expires_at_within_bounds_is_stored(_isolate):
+    import time as _t
+    good = int(_t.time()) + 3600  # 1h ahead, well within 30d
+    status, data = _call("POST", "/api/run-broker/notify-card", body={**_GOOD, "expires_at": good})
+    assert status == 202
+    assert reg.get_registry_store().get(data["registry_id"])["expires_at"] == good
+
+
+def test_expires_at_too_far_ahead_is_400(_isolate):
+    status, data = _call("POST", "/api/run-broker/notify-card", body={**_GOOD, "expires_at": 2 ** 40})
+    assert status == 400
+    assert "expires_at" in data["error"]
+
+
+def test_expires_at_in_the_past_is_400(_isolate):
+    status, data = _call("POST", "/api/run-broker/notify-card", body={**_GOOD, "expires_at": 1})
+    assert status == 400
+    assert "expires_at" in data["error"]
+
+
+def test_expires_at_non_int_is_400(_isolate):
+    status, data = _call("POST", "/api/run-broker/notify-card", body={**_GOOD, "expires_at": "soon"})
+    assert status == 400
+    assert "expires_at" in data["error"]
+
+
 def test_status_query_returns_public_row():
     _, created = _call("POST", "/api/run-broker/notify-card", body=_GOOD)
     rid = created["registry_id"]
