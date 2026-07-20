@@ -33,8 +33,11 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 import secrets
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -155,20 +158,95 @@ class MockKepPreClaimWriter(ClaimWriter):
         return [r for r in self.records.values() if r.get("_marker") == marker]
 
 
+class HttpKepPreClaimWriter(ClaimWriter):
+    """Env-gated HTTP writer → an external kep-pre / fake-kep backend.
+
+    Activated when ``HERMES_PUSH_CARD_WRITER_URL`` is set (see ``get_writer``).
+    Same idempotency contract as the mock: the backend dedupes on
+    ``write_idempotency_key`` (a ``deduped: true`` response is still a success —
+    idempotent semantics). Any non-2xx / timeout / connection failure is a clean
+    ``WriteResult(ok=False)`` that routes to the existing failed-retry card path
+    (design §2.5); it never raises out of ``write``.
+
+    ponytail: stdlib ``urllib.request`` (POST, JSON body, array-nothing — the
+    payload is JSON, never a shell string), matching the repo's sync-HTTP idiom
+    (token_usage_uploader). aiohttp is a dep but async-only; the confirm write
+    path is synchronous, so spinning an event loop here would be the wrong tool.
+    """
+
+    def __init__(self, url: str, *, timeout: float = 10.0) -> None:
+        self.url = url
+        self.timeout = timeout
+
+    def write(
+        self,
+        *,
+        scene: SceneDefinition,
+        values: dict[str, Any],
+        registry_id: str,
+        write_idempotency_key: str,
+        profile_name: str,
+    ) -> WriteResult:
+        marker = scene.deterministic_marker.format(registry_id=registry_id)
+        reason = f"{values.get('reason', '')} {marker}".strip()
+        body = dict(values)
+        body["reason"] = reason
+        body["write_idempotency_key"] = str(write_idempotency_key)
+        body["registry_id"] = str(registry_id)
+        body["profile_name"] = str(profile_name)
+        body["scene"] = scene.scene
+        payload = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            self.url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:  # non-2xx
+            return WriteResult(ok=False, error=f"kep-pre HTTP {exc.code}: {exc.reason}")
+        except (urllib.error.URLError, OSError) as exc:  # timeout / conn refused / DNS
+            return WriteResult(ok=False, error=f"kep-pre unreachable: {type(exc).__name__}: {exc}")
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return WriteResult(ok=False, error=f"kep-pre bad response: {raw[:200]!r}")
+        # 2xx + parseable → ok (deduped: true is still a successful idempotent write).
+        rec = data.get("record") if isinstance(data.get("record"), dict) else {}
+        backend_id = str(
+            rec.get("_backend_id") or rec.get("backend_id") or rec.get("seq")
+            or data.get("backend_id") or write_idempotency_key
+        )
+        return WriteResult(ok=True, backend_id=backend_id)
+
+
 # --- writer registry -----------------------------------------------------
 
+# Explicit overrides only (override_writer). The auto-created mock lives in
+# _default_mock so the env-gated HTTP writer can win over it (a cached auto-mock
+# in this dict would otherwise shadow the env check on every later call).
 _writers: dict[str, ClaimWriter] = {}
+_default_mock: Optional[MockKepPreClaimWriter] = None
 
 
 def get_writer(name: str) -> Optional[ClaimWriter]:
-    writer = _writers.get(name)
-    if writer is None and name == "kep-pre-claim-writer":
+    override = _writers.get(name)
+    if override is not None:
+        return override
+    if name == "kep-pre-claim-writer":
+        url = os.environ.get("HERMES_PUSH_CARD_WRITER_URL", "").strip()
+        if url:
+            # env-gated: write to the external kep-pre / fake-kep backend. Not
+            # cached — stateless (the backend owns dedup) and toggles with env.
+            return HttpKepPreClaimWriter(url)
         # ponytail: default to the mock until sunke gives the real kep pre
         # endpoint (design §6 前置条件). Same interface → hot-swap via
-        # override_writer, no handler change.
-        writer = MockKepPreClaimWriter()
-        _writers[name] = writer
-    return writer
+        # override_writer / the env var, no handler change.
+        global _default_mock
+        if _default_mock is None:
+            _default_mock = MockKepPreClaimWriter()
+        return _default_mock
+    return None
 
 
 def override_writer(name: str, writer: Optional[ClaimWriter]) -> None:

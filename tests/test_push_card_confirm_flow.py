@@ -401,3 +401,96 @@ def test_default_writer_is_mock_until_real_endpoint_given():
     w = confirm.get_writer("kep-pre-claim-writer")
     assert isinstance(w, confirm.MockKepPreClaimWriter)
     assert confirm.get_writer("no-such-writer") is None
+
+
+# ===================== P5: env-gated HTTP writer =========================
+
+import json as _json  # noqa: E402
+import urllib.error as _uerr  # noqa: E402
+import urllib.request as _ureq  # noqa: E402
+
+
+class _FakeResp:
+    """Minimal stand-in for the urlopen() context manager (a 2xx response)."""
+
+    def __init__(self, body: str):
+        self._body = body.encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_http_writer_success_posts_json_with_idempotency_key(monkeypatch):
+    # HERMES_PUSH_CARD_WRITER_URL set → get_writer hands back the HTTP writer,
+    # which POSTs a JSON body (submitted fields + write_idempotency_key) and
+    # treats a 2xx parseable response as ok. No real network — urlopen faked.
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["ctype"] = req.headers.get("Content-type")
+        captured["body"] = _json.loads(req.data.decode("utf-8"))
+        return _FakeResp(_json.dumps({"ok": True, "deduped": False, "record": {"seq": 1}}))
+
+    monkeypatch.setenv("HERMES_PUSH_CARD_WRITER_URL", "http://127.0.0.1:8971/api/claims")
+    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+
+    writer = confirm.get_writer("kep-pre-claim-writer")
+    assert isinstance(writer, confirm.HttpKepPreClaimWriter)
+    res = writer.write(
+        scene=SCENE,
+        values={"amount": 68, "date": "2026-07-20", "category": "打车", "reason": "去客户现场"},
+        registry_id="pcr_1", write_idempotency_key="pcr_1", profile_name="alice",
+    )
+    assert res.ok is True
+    assert res.backend_id == "1"
+    assert captured["url"] == "http://127.0.0.1:8971/api/claims"
+    assert captured["timeout"] == 10.0
+    assert captured["ctype"] == "application/json"
+    assert captured["body"]["write_idempotency_key"] == "pcr_1"
+    # deterministic marker threaded into reason so the backend can verify 恰好一条
+    assert "[PAI-ACC-pcr_1]" in captured["body"]["reason"]
+
+
+def test_http_writer_failure_is_visible_via_retry_card(monkeypatch, store):
+    # A non-2xx from the backend → WriteResult(ok=False) → the SAME failed-retry
+    # card path (never swallowed). Routed through handle_confirm to prove 可见.
+    def fake_urlopen(req, timeout=None):
+        raise _uerr.HTTPError(req.full_url, 500, "Internal Server Error", {}, None)
+
+    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
+
+    rid, nonce = _clarifying(store)
+    res = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=_form_value(), store=store, writer_lookup=lambda n: writer,
+    )
+    assert res.kind == "failed"
+    assert res.written is False
+    assert any(e.get("tag") == "button" for e in res.card["body"]["elements"])  # 重试按钮
+    assert "500" in store.get(rid)["last_error"]
+
+
+def test_http_writer_deduped_response_is_ok(monkeypatch):
+    # deduped: true (idempotent replay hit on the backend) is still ok — the
+    # write succeeded, the backend just held the first record.
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(_json.dumps(
+            {"ok": True, "deduped": True, "record": {"seq": 7, "write_idempotency_key": "pcr_9"}}))
+
+    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
+    res = writer.write(
+        scene=SCENE, values={"amount": 1, "reason": "x"},
+        registry_id="pcr_9", write_idempotency_key="pcr_9", profile_name="p",
+    )
+    assert res.ok is True
+    assert res.backend_id == "7"
