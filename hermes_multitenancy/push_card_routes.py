@@ -31,9 +31,13 @@ logger = logging.getLogger(__name__)
 
 # --- target resolution seam (default reuses the routing table) -----------
 
-def _default_target_resolver(*, open_id: str, union_id: str) -> Optional[dict[str, Any]]:
+def _default_target_resolver(
+    *, open_id: str, union_id: str, user_id: str = ""
+) -> Optional[dict[str, Any]]:
     """Resolve a push target to its sending profile via the routing table.
 
+    Caller may identify the target by ANY one of open_id / union_id / user_id
+    (e.g. ``user_id="sunke"``) — whichever the external system already holds.
     A target not present (never onboarded / off-boarded) → None → 4xx."""
     from .routing import RoutingTable
 
@@ -43,6 +47,8 @@ def _default_target_resolver(*, open_id: str, union_id: str) -> Optional[dict[st
         row = table.lookup_by_open_id(open_id)
     if row is None and union_id:
         row = table.lookup_by_union_id(union_id)
+    if row is None and user_id:
+        row = table.lookup_by_user_id(user_id)
     if row is None:
         return None
     return {
@@ -148,11 +154,13 @@ def register_push_card_routes(app: Any) -> None:
 
         open_id = str(payload.get("open_id") or "").strip()
         union_id = str(payload.get("union_id") or "").strip()
-        if not open_id and not union_id:
+        user_id = str(payload.get("user_id") or "").strip()
+        if not (open_id or union_id or user_id):
             return web.json_response(
-                {"ok": False, "error": "open_id or union_id is required"}, status=400
+                {"ok": False, "error": "one of open_id / union_id / user_id is required"},
+                status=400,
             )
-        target = _target_resolver(open_id=open_id, union_id=union_id)
+        target = _target_resolver(open_id=open_id, union_id=union_id, user_id=user_id)
         if target is None:
             return web.json_response(
                 {"ok": False, "error": "target not registered"}, status=404

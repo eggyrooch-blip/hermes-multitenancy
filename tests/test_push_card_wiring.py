@@ -329,6 +329,11 @@ def test_default_target_resolver_resolves_profile(monkeypatch, tmp_path):
     by_union = routes._default_target_resolver(open_id="", union_id="on_x")
     assert by_union is not None and by_union["profile_name"] == "feishu_x"
 
+    # user_id path resolves too (e.g. caller holds "sunke", not an ou_ open_id)
+    by_user = routes._default_target_resolver(open_id="", union_id="", user_id="u_x")
+    assert by_user is not None and by_user["profile_name"] == "feishu_x"
+    assert by_user["open_id"] == "ou_x"
+
     # unknown target → None → the endpoint 4xx's
     assert routes._default_target_resolver(open_id="ou_ghost", union_id="") is None
 

@@ -25,7 +25,7 @@ def _isolate(monkeypatch, tmp_path):
     routes.override_send_dispatch(lambda registry_id: dispatched.append(registry_id))
     # every open_id resolves to a sending profile unless the test says otherwise
     routes.override_target_resolver(
-        lambda *, open_id, union_id: {
+        lambda *, open_id, union_id, user_id="": {
             "open_id": open_id or "ou_from_union",
             "union_id": union_id,
             "profile_name": "alice-profile",
@@ -160,7 +160,7 @@ def test_scene_not_in_key_whitelist_403(monkeypatch, tmp_path):
 
 
 def test_target_not_registered_4xx():
-    routes.override_target_resolver(lambda *, open_id, union_id: None)
+    routes.override_target_resolver(lambda *, open_id, union_id, user_id="": None)
     status, data = _call("POST", "/api/run-broker/notify-card", body=_GOOD)
     assert status == 404
     assert "target not registered" in data["error"]
