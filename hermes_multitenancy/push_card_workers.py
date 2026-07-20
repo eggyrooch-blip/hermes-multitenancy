@@ -178,7 +178,7 @@ async def run_reconcile_sweep(
     return counters
 
 
-# --- scheduler (the sweeps are inert until something runs them) ----------
+# --- one tick: run all three sweeps -------------------------------------
 
 async def run_all_sweeps(
     store: _reg.PushRegistryStore,
@@ -197,6 +197,109 @@ async def run_all_sweeps(
     }
 
 
+# --- live seams (bound at the gateway install path) ----------------------
+#
+# ``run_all_sweeps`` defaults both seams to None (inert). At the live install
+# path they MUST be the real callables below, or reconcile stays a permanent
+# no-op and an over-due card never re-renders to "已过期" (finding
+# reconcile-expiry-seams-unwired).
+
+def _expired_card(scene: Any) -> dict[str, Any]:
+    name = getattr(scene, "name", None) or "该卡片"
+    return {
+        "schema": "2.0",
+        "header": {"title": {"tag": "plain_text", "content": str(name)}, "template": "grey"},
+        "body": {"elements": [
+            {"tag": "markdown", "content": "⚠️ 该卡片已过期，如需继续请重新发起。"},
+        ]},
+    }
+
+
+async def live_expiry_card_updater(row: dict[str, Any]) -> bool:
+    """Re-render an expiring card to a "已过期" notice IN PLACE via the live Feishu
+    adapter + the row's ``message_id`` (design §2.6). Returns False (alerted, never
+    blocks the expiry flip) when no adapter/message_id is available yet."""
+    adapter = _sendq.get_live_adapter()
+    mid = str(row.get("message_id") or "")
+    if adapter is None or not mid:
+        return False
+    from .push_scenes import scene_def_for_row
+    try:
+        return await _sendq.update_push_card_via_adapter(
+            adapter, message_id=mid, card=_expired_card(scene_def_for_row(row))
+        )
+    except Exception:
+        logger.debug("[push_card] expiry card re-render failed", exc_info=True)
+        return False
+
+
+def _probe_backend_record(cb: Any, registry_id: str) -> Optional[dict[str, Any]]:
+    """Blocking GET probe of the 落库 backend for a record keyed by
+    ``write_idempotency_key=registry_id`` — a READ, never a re-write. Any error /
+    non-record response → None. ponytail: the backend must expose a read-by-key;
+    absent it this returns None and reconcile relies on the user-retry path — no
+    correctness risk, just slower crash-recovery."""
+    import json as _json
+    import os
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from . import push_card_confirm as _confirm
+
+    sep = "&" if urllib.parse.urlparse(cb.url).query else "?"
+    url = f"{cb.url}{sep}write_idempotency_key={urllib.parse.quote(str(registry_id))}"
+    headers = {"Accept": "application/json"}
+    if cb.auth_header and cb.auth_token_env:
+        token = os.environ.get(cb.auth_token_env, "").strip()
+        if token:
+            headers[cb.auth_header] = token
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with _confirm._urlopen(req, timeout=float(cb.timeout_s)) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        return None
+    try:
+        data = _json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        rec = data.get("record")
+        if isinstance(rec, dict) and rec:
+            return rec
+        if data.get("found") or data.get("write_idempotency_key"):
+            return data
+    return None
+
+
+async def live_reconcile_backend_lookup(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Ask the row's resolved 落库 backend whether its write已落库 (keyed by
+    ``write_idempotency_key=registry_id``). A READ probe — the reconcile sweep must
+    never re-issue the write. Returns the record dict when found, else None (leave
+    the row confirmed for the next sweep / a user retry)."""
+    from . import push_card_confirm as _confirm
+    from .push_scenes import scene_def_for_row
+
+    cb = _confirm.resolve_callback(scene_def_for_row(row), row)
+    rid = str(row.get("registry_id") or "")
+    if cb is None or not rid:
+        return None
+    return await asyncio.to_thread(_probe_backend_record, cb, rid)
+
+
+def _default_sweep_seams(
+    card_updater: Optional[CardUpdater], backend_lookup: Optional[BackendLookup]
+) -> tuple[CardUpdater, BackendLookup]:
+    """Default the sweep seams to the LIVE callables. The gateway install path
+    passes neither, so without this the sweeps run with None seams — reconcile
+    no-ops and expiry never re-renders (finding reconcile-expiry-seams-unwired)."""
+    return (card_updater or live_expiry_card_updater,
+            backend_lookup or live_reconcile_backend_lookup)
+
+
+# --- scheduler (the sweeps are inert until something runs them) ----------
+
 #: Default cadence for the sweep worker thread.
 SWEEP_INTERVAL_S = 60
 
@@ -205,31 +308,47 @@ _sweep_thread: Optional[threading.Thread] = None
 _sweep_stop: Optional[threading.Event] = None
 
 
-def _sweep_loop(interval: int, stop_event: threading.Event) -> None:
+def _sweep_loop(
+    interval: int,
+    stop_event: threading.Event,
+    card_updater: Optional[CardUpdater] = None,
+    backend_lookup: Optional[BackendLookup] = None,
+) -> None:
     while not stop_event.is_set():
         try:
-            asyncio.run(run_all_sweeps(_reg.get_registry_store()))
+            asyncio.run(run_all_sweeps(
+                _reg.get_registry_store(),
+                card_updater=card_updater, backend_lookup=backend_lookup,
+            ))
         except Exception:
             logger.exception("[push_card] sweep tick failed")
         stop_event.wait(timeout=interval)
     logger.info("[push_card] sweep worker stopped")
 
 
-def ensure_push_card_sweeps_started(*, interval: int = SWEEP_INTERVAL_S) -> None:
+def ensure_push_card_sweeps_started(
+    *,
+    interval: int = SWEEP_INTERVAL_S,
+    card_updater: Optional[CardUpdater] = None,
+    backend_lookup: Optional[BackendLookup] = None,
+) -> None:
     """Start the push-card sweep worker once, at gateway startup.
 
     Nothing else re-invokes the send queue for a deferred row, re-renders an
     expired card, or reconciles a crashed commit — without this thread all three
-    sweeps are dead code (finding sweeps-never-scheduled). Self-contained daemon
-    thread (mirrors ``credential_renewal_worker``); each tick opens a fresh event
-    loop via ``asyncio.run`` for the async sweep bodies."""
+    sweeps are dead code (finding sweeps-never-scheduled). The expiry/reconcile
+    seams default to the LIVE callables so they are not None no-ops (finding
+    reconcile-expiry-seams-unwired). Self-contained daemon thread (mirrors
+    ``credential_renewal_worker``); each tick opens a fresh event loop via
+    ``asyncio.run`` for the async sweep bodies."""
     global _sweep_thread, _sweep_stop
+    card_updater, backend_lookup = _default_sweep_seams(card_updater, backend_lookup)
     with _sweep_lock:
         if _sweep_thread is not None and _sweep_thread.is_alive():
             return
         _sweep_stop = threading.Event()
         _sweep_thread = threading.Thread(
-            target=_sweep_loop, args=(int(interval), _sweep_stop),
+            target=_sweep_loop, args=(int(interval), _sweep_stop, card_updater, backend_lookup),
             daemon=True, name="push-card-sweeps",
         )
         _sweep_thread.start()

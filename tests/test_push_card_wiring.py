@@ -326,6 +326,46 @@ def test_run_all_sweeps_runs_three_and_expires_due(store):
     assert store.get(rid)["status"] == reg.STATUS_EXPIRED
 
 
+def test_sweep_default_seams_are_live_and_non_none():
+    # The live install path (ensure_push_card_sweeps_started with no seams) must
+    # wire the REAL expiry updater + reconcile lookup, not the None no-ops that
+    # left reconcile inert and expiry unable to re-render "已过期".
+    cu, bl = workers._default_sweep_seams(None, None)
+    assert cu is workers.live_expiry_card_updater
+    assert bl is workers.live_reconcile_backend_lookup
+    assert callable(cu) and callable(bl)
+
+
+def test_live_expiry_card_updater_patches_in_place(store):
+    A = _fresh_adapter_cls()
+    adapter = A()
+    sendq.note_live_adapter(adapter)
+    rid = store.create(scene=SCENE, skill=SKILL, target_open_id="ou_alice",
+                       profile_name="p", business_key=f"{SCENE}:ou_alice:exp2").row["registry_id"]
+    store.mark_sent(rid, message_id="om_expcard")
+    ok = asyncio.run(workers.live_expiry_card_updater(store.get(rid)))
+    assert ok is True
+    assert adapter.patched and adapter.patched[0][0] == "om_expcard"
+    assert "过期" in json.dumps(adapter.patched[0][1], ensure_ascii=False)
+
+
+def test_live_expiry_card_updater_no_adapter_returns_false(store):
+    sendq._live_adapter = None  # no adapter captured
+    rid = store.create(scene=SCENE, skill=SKILL, target_open_id="ou_alice",
+                       profile_name="p", business_key=f"{SCENE}:ou_alice:exp3").row["registry_id"]
+    store.mark_sent(rid, message_id="om_x")
+    assert asyncio.run(workers.live_expiry_card_updater(store.get(rid))) is False
+
+
+def test_live_reconcile_lookup_none_without_callback(store, monkeypatch):
+    # No resolvable callback endpoint → the lookup returns None (leave the row
+    # confirmed for the next sweep / a user retry), never raises.
+    monkeypatch.delenv("HERMES_PUSH_CARD_WRITER_URL", raising=False)
+    rid = store.create(scene=SCENE, skill=SKILL, target_open_id="ou_alice",
+                       profile_name="p", business_key=f"{SCENE}:ou_alice:rec").row["registry_id"]
+    assert asyncio.run(workers.live_reconcile_backend_lookup(store.get(rid))) is None
+
+
 def test_sweep_worker_starts_alive_and_is_idempotent(store):
     try:
         workers.ensure_push_card_sweeps_started(interval=3600)
