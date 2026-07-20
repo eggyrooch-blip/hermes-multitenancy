@@ -887,7 +887,7 @@ def test_scene_callback_used_when_no_push_override(store, monkeypatch):
     rid, nonce = _clarifying(store)
     res = confirm.handle_confirm(
         registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
-        form_value=_form_value(), store=store, scene_lookup=lambda s: scene_cb)
+        form_value=_form_value(), store=store, scene_lookup=lambda row: scene_cb)
     assert res.kind == "committed"
     assert captured["url"] == "http://127.0.0.1:9/scene/api"
 

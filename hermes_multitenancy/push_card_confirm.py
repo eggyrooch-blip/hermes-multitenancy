@@ -45,7 +45,7 @@ from . import push_card_metrics as _metrics
 from . import push_fill_form as _form
 from . import push_registry as _reg
 from . import push_scenes as _scenes
-from .push_scenes import CallbackConfig, SceneDefinition, SubmitBehaviors, get_scene
+from .push_scenes import CallbackConfig, SceneDefinition, SubmitBehaviors, scene_def_for_row
 
 #: Shown when a click lands on a card whose registry row is gone / already
 #: committed / expired (an old card), distinct from a genuinely malformed submit.
@@ -378,7 +378,7 @@ def handle_confirm(
     form_value: Any,
     store: _reg.PushRegistryStore,
     writer_lookup: Callable[[str], Optional[ClaimWriter]] = get_writer,
-    scene_lookup: Callable[[str], Optional[SceneDefinition]] = get_scene,
+    scene_lookup: Callable[[Optional[dict[str, Any]]], Optional[SceneDefinition]] = scene_def_for_row,
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
 ) -> ConfirmResult:
     """Process one confirm click. Pure: registry reads/writes + an injected
@@ -395,7 +395,7 @@ def handle_confirm(
     if row is None:
         return ConfirmResult("invalid", toast=_toast(_STALE_CARD_MSG, "error"), registry_id=registry_id)
 
-    scene = scene_lookup(row["scene"])
+    scene = scene_lookup(row)
     behaviors = resolve_behaviors(scene, row)
     status = row["status"]
 

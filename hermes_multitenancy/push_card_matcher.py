@@ -37,7 +37,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from . import push_card_metrics as _metrics
 from . import push_registry as _reg
-from .push_scenes import MODE_CARD, MODE_YOLO, SceneDefinition, get_scene
+from .push_scenes import MODE_CARD, MODE_YOLO, SceneDefinition, scene_def_for_row
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ class PushCardMatcher:
         self,
         store: _reg.PushRegistryStore,
         *,
-        scene_lookup: Callable[[str], Optional[SceneDefinition]] = get_scene,
+        scene_lookup: Callable[[Optional[dict[str, Any]]], Optional[SceneDefinition]] = scene_def_for_row,
         heuristic: Callable[[str, Optional[SceneDefinition]], str] = default_heuristic_intent,
         llm_intent: Optional[Callable[[str, SceneDefinition, dict[str, Any]], bool]] = None,
     ) -> None:
@@ -228,7 +228,7 @@ class PushCardMatcher:
     # -- internals --------------------------------------------------------
 
     def _gate_single(self, row: dict[str, Any], text: str) -> MatchDecision:
-        scene = self.scene_lookup(row["scene"])
+        scene = self.scene_lookup(row)
         verdict = self.heuristic(text, scene)
         if verdict == "maybe" and self.llm_intent is not None and scene is not None:
             try:
@@ -254,7 +254,7 @@ class PushCardMatcher:
     def _disambiguate(self, open_rows: list[dict[str, Any]], text: str) -> MatchDecision:
         hits = [
             r for r in open_rows
-            if _scene_signal_count(text, self.scene_lookup(r["scene"])) >= 1
+            if _scene_signal_count(text, self.scene_lookup(r)) >= 1
         ]
         if len(hits) == 1:
             return self._route(hits[0], text, quoted=False)
@@ -267,7 +267,7 @@ class PushCardMatcher:
     def _route(self, row: dict[str, Any], text: str, *, quoted: bool) -> MatchDecision:
         scene = row["scene"]
         skill = row["skill"]
-        scene_def = self.scene_lookup(scene)
+        scene_def = self.scene_lookup(row)
         mode = scene_def.mode if scene_def is not None else MODE_CARD
         slash_content = f"/{str(skill).lstrip('/')} {text}".rstrip()
         context = {
@@ -444,7 +444,7 @@ async def _drive_fill_step(adapter: Any, decision: MatchDecision, text: str) -> 
     row = store.get(registry_id) if registry_id else None
     if row is None:
         return False
-    scene = get_scene(row.get("scene"))
+    scene = scene_def_for_row(row)
     if scene is None:
         return False
     prior_values = _loads(row.get("submission_json")) or {}

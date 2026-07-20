@@ -282,3 +282,154 @@ def behaviors_from_json(raw: Any) -> Optional[SubmitBehaviors]:
         return behaviors_from_payload(data)
     except ValueError:
         return None
+
+
+# --- inline / row-carried scene spec --------------------------------------
+#
+# A ``notify-card`` push may DESCRIBE its scene inline (skill/mode/fields/
+# callback) instead of naming a pre-registered one — self-serve, no server-side
+# registration (design route A). That EffectiveScene is serialized onto the
+# registry row (``scene_spec_json``) so every later step — matcher, fill form,
+# confirm — reconstructs the exact spec from the ROW via ``scene_def_for_row``
+# instead of a name lookup that would miss for an unregistered inline scene.
+
+def _fields_from_raw(raw_fields: Any) -> tuple[SceneField, ...]:
+    """Parse a ``fields`` list (untrusted or stored) into ``SceneField`` tuple.
+    Fail-loud on a malformed entry (missing key / not a list)."""
+    if raw_fields is None:
+        return ()
+    if not isinstance(raw_fields, list):
+        raise ValueError("fields must be a list")
+    out: list[SceneField] = []
+    for i, f in enumerate(raw_fields):
+        if not isinstance(f, dict):
+            raise ValueError(f"fields[{i}] must be an object")
+        key = str(f.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"fields[{i}].key is required")
+        raw_opts = f.get("options")
+        options = tuple(str(o) for o in raw_opts) if isinstance(raw_opts, list) else ()
+        risk = RISK_HIGH if str(f.get("risk") or "").strip() == RISK_HIGH else RISK_LOW
+        out.append(SceneField(
+            key=key,
+            label=str(f.get("label") or key),
+            type=str(f.get("type") or "text").strip() or "text",
+            required=bool(f.get("required", False)),
+            risk=risk,
+            options=options,
+            rule=str(f.get("rule") or ""),
+        ))
+    return tuple(out)
+
+
+def scene_from_payload(payload: Any) -> SceneDefinition:
+    """Build an EffectiveScene from an INLINE notify-card description (skill/mode/
+    fields/callback/behaviors) — self-serve, no server-side registration. Raises
+    ``ValueError`` on a malformed description so the endpoint fail-louds (400).
+
+    The write target is data: a card scene writes to its (per-push) ``callback``
+    via the generic HTTP writer; a yolo scene has no framework writer (the skill
+    self-drives). Reuses ``callback_from_payload`` / ``behaviors_from_payload``."""
+    if not isinstance(payload, dict):
+        raise ValueError("scene payload must be an object")
+    skill = str(payload.get("skill") or "").strip()
+    if not skill:
+        raise ValueError("skill is required for an inline scene")
+    mode = str(payload.get("mode") or MODE_CARD).strip() or MODE_CARD
+    if mode not in _VALID_MODES:
+        raise ValueError(f"mode must be one of {sorted(_VALID_MODES)}")
+    fields = _fields_from_raw(payload.get("fields"))
+    if mode == MODE_CARD and not fields:
+        raise ValueError("a card-mode scene requires at least one field")
+    callback = callback_from_payload(payload.get("callback"))
+    behaviors = behaviors_from_payload(payload.get("behaviors")) or SubmitBehaviors()
+    scene_name = str(payload.get("scene") or "").strip() or f"inline:{skill}"
+    name = str(payload.get("name") or "").strip() or scene_name
+    return SceneDefinition(
+        scene=scene_name,
+        name=name,
+        skill=skill,
+        writer="" if mode == MODE_YOLO else "kep-pre-claim-writer",
+        fields=fields,
+        deterministic_marker=str(payload.get("deterministic_marker") or ""),
+        callback=callback,
+        behaviors=behaviors,
+        mode=mode,
+    )
+
+
+def scene_to_spec_json(scene: SceneDefinition) -> str:
+    """Serialize an EffectiveScene for the registry ``scene_spec_json`` column.
+    Whitelisted fields only (callback via ``callback_to_json`` → never a plaintext
+    secret). ``scene_from_spec_json`` is the exact inverse."""
+    return json.dumps(
+        {
+            "scene": scene.scene,
+            "name": scene.name,
+            "skill": scene.skill,
+            "writer": scene.writer,
+            "mode": scene.mode,
+            "deterministic_marker": scene.deterministic_marker,
+            "fields": [
+                {
+                    "key": f.key, "label": f.label, "type": f.type,
+                    "required": f.required, "risk": f.risk,
+                    "options": list(f.options), "rule": f.rule,
+                }
+                for f in scene.fields
+            ],
+            "callback": json.loads(callback_to_json(scene.callback)) if scene.callback else None,
+            "behaviors": json.loads(behaviors_to_json(scene.behaviors)),
+        },
+        ensure_ascii=False,
+    )
+
+
+def scene_from_spec_json(raw: Any) -> Optional[SceneDefinition]:
+    """Reconstruct an EffectiveScene stored on a registry row. Tolerant read:
+    ``None`` on empty/malformed so the caller falls back to the named registry."""
+    if not raw:
+        return None
+    data = raw if isinstance(raw, dict) else None
+    if data is None:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        skill = str(data.get("skill") or "").strip()
+        if not skill:
+            return None
+        fields = _fields_from_raw(data.get("fields"))
+        scene_name = str(data.get("scene") or "").strip() or f"inline:{skill}"
+        return SceneDefinition(
+            scene=scene_name,
+            name=str(data.get("name") or scene_name),
+            skill=skill,
+            writer=str(data.get("writer") or ""),
+            fields=fields,
+            deterministic_marker=str(data.get("deterministic_marker") or ""),
+            callback=callback_from_json(data.get("callback")),
+            behaviors=behaviors_from_json(data.get("behaviors")) or SubmitBehaviors(),
+            # SceneDefinition.__post_init__ normalizes an invalid mode → card.
+            mode=str(data.get("mode") or MODE_CARD).strip() or MODE_CARD,
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def scene_def_for_row(row: Optional[dict[str, Any]]) -> Optional[SceneDefinition]:
+    """The effective scene for a registry row. An inline row carries its full
+    spec in ``scene_spec_json`` (self-serve, unregistered) → reconstruct it;
+    otherwise fall back to the named builtin registry (backward compatible).
+
+    Every reply/confirm-time scene resolution routes through here instead of
+    ``get_scene(name)`` so an inline scene (no registered name) still resolves."""
+    if not row:
+        return None
+    spec = scene_from_spec_json(row.get("scene_spec_json"))
+    if spec is not None:
+        return spec
+    return get_scene(row.get("scene") or "")

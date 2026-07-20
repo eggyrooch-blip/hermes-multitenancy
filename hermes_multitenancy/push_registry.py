@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS push_registry (
     submission_json TEXT,
     callback_json   TEXT,
     behaviors_json  TEXT,
+    scene_spec_json TEXT,
     status          TEXT NOT NULL,
     business_key    TEXT NOT NULL,
     idempotency_key TEXT,
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS push_registry_archive (
     submission_json TEXT,
     callback_json   TEXT,
     behaviors_json  TEXT,
+    scene_spec_json TEXT,
     status          TEXT NOT NULL,
     business_key    TEXT NOT NULL,
     idempotency_key TEXT,
@@ -129,8 +131,8 @@ CREATE TABLE IF NOT EXISTS push_registry_archive (
 _COLUMNS = (
     "registry_id", "scene", "skill", "target_open_id", "target_union_id",
     "profile_name", "chat_id", "message_id", "payload_json", "card_json",
-    "submission_json", "callback_json", "behaviors_json", "status",
-    "business_key", "idempotency_key", "nonce",
+    "submission_json", "callback_json", "behaviors_json", "scene_spec_json",
+    "status", "business_key", "idempotency_key", "nonce",
     "send_attempts", "write_attempts", "last_error", "expires_at",
     "created_at", "updated_at",
 )
@@ -171,7 +173,7 @@ class PushRegistryStore:
         for table in ("push_registry", "push_registry_archive"):
             cur = self._conn.execute(f"PRAGMA table_info({table})")
             existing = {row["name"] for row in cur.fetchall()}
-            for col in ("callback_json", "behaviors_json"):
+            for col in ("callback_json", "behaviors_json", "scene_spec_json"):
                 if col not in existing:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
@@ -194,6 +196,7 @@ class PushRegistryStore:
         nonce: Optional[str] = None,
         callback_json: Optional[str] = None,
         behaviors_json: Optional[str] = None,
+        scene_spec_json: Optional[str] = None,
     ) -> CreateResult:
         """Insert a new ``sending`` row, or return the colliding one.
 
@@ -226,16 +229,16 @@ class PushRegistryStore:
                 "INSERT INTO push_registry"
                 " (registry_id, scene, skill, target_open_id, target_union_id,"
                 "  profile_name, chat_id, message_id, payload_json, card_json,"
-                "  submission_json, callback_json, behaviors_json, status,"
-                "  business_key, idempotency_key, nonce,"
+                "  submission_json, callback_json, behaviors_json, scene_spec_json,"
+                "  status, business_key, idempotency_key, nonce,"
                 "  send_attempts, write_attempts, last_error, expires_at,"
                 "  created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?,"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?,"
                 "         0, 0, NULL, ?, ?, ?)",
                 (
                     registry_id, scene, skill, target_open_id, target_union_id,
                     profile_name, chat_id, payload_json, card_json,
-                    callback_json, behaviors_json,
+                    callback_json, behaviors_json, scene_spec_json,
                     STATUS_SENDING, business_key, idempotency_key, nonce,
                     expires_at, now, now,
                 ),
