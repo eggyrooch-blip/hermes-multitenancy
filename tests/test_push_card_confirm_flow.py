@@ -410,9 +410,12 @@ def test_kep_cli_args_are_a_list_shell_injection_inert():
 
 # ===================== P5: writer registry default =======================
 
-def test_default_writer_is_mock_until_real_endpoint_given():
+def test_default_writer_is_http_shell_endpoint_bound_later():
+    # No override → an endpoint-LESS HTTP shell; the real 回调地址 is resolved and
+    # bound per push at confirm time (push > scene > env). Unknown writer → None.
     w = confirm.get_writer("kep-pre-claim-writer")
-    assert isinstance(w, confirm.MockKepPreClaimWriter)
+    assert isinstance(w, confirm.HttpKepPreClaimWriter)
+    assert w.url == ""  # shell — bound in _bind_endpoint
     assert confirm.get_writer("no-such-writer") is None
 
 
@@ -452,11 +455,12 @@ def test_http_writer_success_posts_json_with_idempotency_key(monkeypatch):
         captured["body"] = _json.loads(req.data.decode("utf-8"))
         return _FakeResp(_json.dumps({"ok": True, "deduped": False, "record": {"seq": 1}}))
 
-    monkeypatch.setenv("HERMES_PUSH_CARD_WRITER_URL", "http://127.0.0.1:8971/api/claims")
     monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
 
-    writer = confirm.get_writer("kep-pre-claim-writer")
-    assert isinstance(writer, confirm.HttpKepPreClaimWriter)
+    # The writer is constructed with its resolved endpoint (get_writer now hands
+    # back an endpoint-less shell that _bind_endpoint fills in; this asserts the
+    # POST shape once a url is bound).
+    writer = confirm.HttpKepPreClaimWriter("http://127.0.0.1:8971/api/claims")
     res = writer.write(
         scene=SCENE,
         values={"amount": 68, "date": "2026-07-20", "category": "打车", "reason": "去客户现场"},
@@ -789,3 +793,186 @@ def test_handle_async_routes_synthetic_confirm_before_parse_command(store, monke
         assert len(fake.card_sends) == 1
     finally:
         confirm.override_writer(SCENE.writer, None)
+
+
+# ===== callback endpoint: 3-level priority (push > scene > env) + fail-loud =====
+
+import dataclasses as _dc  # noqa: E402
+
+_PUSH_CB = scenes.callback_to_json(scenes.CallbackConfig(url="http://127.0.0.1:9/push/api"))
+
+
+def _clarifying_row(store, *, callback_json=None, behaviors_json=None,
+                    open_id="ou_alice", biz="x"):
+    res = store.create(
+        scene="dev-acceptance-claim", skill="push-fill-form",
+        target_open_id=open_id, profile_name="alice-profile",
+        business_key=f"dev-acceptance-claim:{open_id}:{biz}",
+        callback_json=callback_json, behaviors_json=behaviors_json,
+    )
+    rid = res.row["registry_id"]
+    store.mark_sent(rid, message_id=f"om_{biz}")
+    store.advance_status(rid, expect=reg.STATUS_PENDING, to=reg.STATUS_CLARIFYING)
+    return rid, store.get(rid)["nonce"]
+
+
+def test_resolve_callback_push_override_wins(monkeypatch):
+    monkeypatch.setenv("HERMES_PUSH_CARD_WRITER_URL", "http://env/api")
+    scene_cb = _dc.replace(SCENE, callback=scenes.CallbackConfig(url="http://scene/api"))
+    row = {"callback_json": _PUSH_CB}
+    cb = confirm.resolve_callback(scene_cb, row)
+    assert cb.url == "http://127.0.0.1:9/push/api"  # push override beats scene + env
+
+
+def test_resolve_callback_scene_beats_env(monkeypatch):
+    monkeypatch.setenv("HERMES_PUSH_CARD_WRITER_URL", "http://env/api")
+    scene_cb = _dc.replace(SCENE, callback=scenes.CallbackConfig(url="http://scene/api"))
+    assert confirm.resolve_callback(scene_cb, {"callback_json": None}).url == "http://scene/api"
+
+
+def test_resolve_callback_env_dev_fallback(monkeypatch):
+    monkeypatch.setenv("HERMES_PUSH_CARD_WRITER_URL", "http://env/api")
+    # SCENE.callback is None, no push override → dev env fallback.
+    assert confirm.resolve_callback(SCENE, {"callback_json": None}).url == "http://env/api"
+
+
+def test_resolve_callback_none_when_all_empty(monkeypatch):
+    monkeypatch.delenv("HERMES_PUSH_CARD_WRITER_URL", raising=False)
+    assert confirm.resolve_callback(SCENE, {"callback_json": None}) is None
+
+
+def test_confirm_fail_loud_when_no_callback_configured(store, monkeypatch):
+    # default writer_lookup=get_writer → HTTP shell; scene.callback=None, env unset,
+    # no push override → fail-loud改卡, ZERO write, row untouched (bind precedes CAS).
+    monkeypatch.delenv("HERMES_PUSH_CARD_WRITER_URL", raising=False)
+    rid, nonce = _clarifying(store)
+    res = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=_form_value(), store=store)
+    assert res.kind == "failed" and res.written is False
+    assert "未配置回调地址" in _json.dumps(res.card, ensure_ascii=False)
+    assert store.get(rid)["status"] == reg.STATUS_CLARIFYING
+
+
+def test_push_callback_override_writes_to_that_endpoint(store, monkeypatch):
+    monkeypatch.delenv("HERMES_PUSH_CARD_WRITER_URL", raising=False)
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["body"] = _json.loads(req.data.decode("utf-8"))
+        return _FakeResp(_json.dumps({"ok": True, "record": {"seq": 5}}))
+
+    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    rid, nonce = _clarifying_row(store, callback_json=_PUSH_CB, biz="cb")
+    res = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=_form_value(), store=store)  # default writer_lookup → HTTP shell → bound
+    assert res.kind == "committed"
+    assert captured["url"] == "http://127.0.0.1:9/push/api"  # wrote to the PUSH endpoint
+    assert captured["body"]["write_idempotency_key"] == rid
+    assert store.get(rid)["status"] == reg.STATUS_COMMITTED
+
+
+def test_scene_callback_used_when_no_push_override(store, monkeypatch):
+    monkeypatch.delenv("HERMES_PUSH_CARD_WRITER_URL", raising=False)
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _FakeResp(_json.dumps({"ok": True, "record": {"seq": 1}}))
+
+    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    scene_cb = _dc.replace(SCENE, callback=scenes.CallbackConfig(url="http://127.0.0.1:9/scene/api"))
+    rid, nonce = _clarifying(store)
+    res = confirm.handle_confirm(
+        registry_id=rid, nonce=nonce, operator_open_ids={"ou_alice"},
+        form_value=_form_value(), store=store, scene_lookup=lambda s: scene_cb)
+    assert res.kind == "committed"
+    assert captured["url"] == "http://127.0.0.1:9/scene/api"
+
+
+def test_http_writer_auth_header_from_env_never_plaintext(monkeypatch):
+    monkeypatch.setenv("MY_KEP_TOKEN", "secret-abc")
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["auth"] = req.headers.get("Authorization")
+        return _FakeResp(_json.dumps({"ok": True, "record": {"seq": 1}}))
+
+    monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
+    writer = confirm.HttpKepPreClaimWriter(
+        "http://x/api", auth_header="Authorization", auth_token_env="MY_KEP_TOKEN")
+    writer.write(scene=SCENE, values={"amount": 1, "reason": "x"},
+                 registry_id="pcr_1", write_idempotency_key="pcr_1", profile_name="p")
+    assert captured["auth"] == "secret-abc"  # resolved from env at request time
+
+
+# ===== submit behaviors: submit_once / max_submits / allow_resubmit_before_commit =====
+
+def test_submit_once_default_committed_reclick_noops(store):
+    rid, nonce = _clarifying(store)
+    writer = confirm.MockKepPreClaimWriter()
+    first = _confirm(store, rid, nonce, writer)
+    assert first.kind == "committed"
+    # default submit_once=True: terminal card has no button, re-click no-ops.
+    assert not any(e.get("tag") == "button" for e in first.card["body"]["elements"])
+    res = _confirm(store, rid, nonce, writer)
+    assert res.kind == "noop"
+    assert writer.write_calls == 1
+
+
+def test_submit_once_false_allows_resubmit_amend(store):
+    b = scenes.SubmitBehaviors(submit_once=False)
+    rid, nonce = _clarifying_row(store, behaviors_json=scenes.behaviors_to_json(b), biz="beh")
+    writer = confirm.MockKepPreClaimWriter()
+    res = _confirm(store, rid, nonce, writer)
+    assert res.kind == "committed"
+    assert writer.write_calls == 1
+    # nonce kept (not cleared) → the committed card keeps a 重新提交 button.
+    assert store.get(rid)["nonce"] == nonce
+    btns = [e for e in res.card["body"]["elements"] if e.get("tag") == "button"]
+    assert btns and btns[0]["value"]["hermes_action"] == "push_confirm"
+    # a re-click re-drives the idempotent write (改单): committed again, one record.
+    res2 = _confirm(store, rid, nonce, writer)
+    assert res2.kind == "committed"
+    assert writer.write_calls == 2
+    assert len(writer.records) == 1
+
+
+def test_max_submits_caps_resubmits(store):
+    b = scenes.SubmitBehaviors(submit_once=False, max_submits=2)
+    rid, nonce = _clarifying_row(store, behaviors_json=scenes.behaviors_to_json(b), biz="cap")
+    writer = confirm.MockKepPreClaimWriter()
+    assert _confirm(store, rid, nonce, writer).kind == "committed"  # write_attempts=1
+    assert _confirm(store, rid, nonce, writer).kind == "committed"  # write_attempts=2
+    res = _confirm(store, rid, nonce, writer)                       # 2>=2 → capped
+    assert res.kind == "reject"
+    assert "最大提交次数" in _json.dumps(res.toast, ensure_ascii=False)
+    assert writer.write_calls == 2  # third refused before writing
+
+
+def test_allow_resubmit_before_commit_false_locks_confirmed_edit(store):
+    b = scenes.SubmitBehaviors(allow_resubmit_before_commit=False)
+    rid, nonce = _clarifying_row(store, behaviors_json=scenes.behaviors_to_json(b), biz="lock")
+    # move to confirmed (write in-flight) WITHOUT committing
+    store.advance_status(rid, expect=reg.STATUS_CLARIFYING, to=reg.STATUS_CONFIRMED,
+                         expect_nonce=nonce, submission=_form_value())
+    writer = confirm.MockKepPreClaimWriter()
+    res = _confirm(store, rid, nonce, writer, form=_form_value(amount=99))
+    assert res.kind == "reject"
+    assert "锁定" in _json.dumps(res.toast, ensure_ascii=False)
+    assert writer.write_calls == 0
+
+
+# ===== old/stale card UX =====
+
+def test_stale_card_click_clear_message_no_write(store):
+    # a click whose registry row is gone → clear "已失效或已录入" text, no write/500.
+    writer = confirm.MockKepPreClaimWriter()
+    res = confirm.handle_confirm(
+        registry_id="pcr_gone", nonce="whatever", operator_open_ids={"ou_alice"},
+        form_value=_form_value(), store=store, writer_lookup=lambda n: writer)
+    assert res.kind == "invalid"
+    assert "已失效或已录入" in _json.dumps(res.toast, ensure_ascii=False)
+    assert writer.write_calls == 0

@@ -44,7 +44,12 @@ from typing import Any, Callable, Optional
 from . import push_card_metrics as _metrics
 from . import push_fill_form as _form
 from . import push_registry as _reg
-from .push_scenes import SceneDefinition, get_scene
+from . import push_scenes as _scenes
+from .push_scenes import CallbackConfig, SceneDefinition, SubmitBehaviors, get_scene
+
+#: Shown when a click lands on a card whose registry row is gone / already
+#: committed / expired (an old card), distinct from a genuinely malformed submit.
+_STALE_CARD_MSG = "该卡片已失效或已录入，请使用最新的卡片。"
 
 logger = logging.getLogger(__name__)
 
@@ -164,14 +169,21 @@ class MockKepPreClaimWriter(ClaimWriter):
 
 
 class HttpKepPreClaimWriter(ClaimWriter):
-    """Env-gated HTTP writer → an external kep-pre / fake-kep backend.
+    """HTTP writer → the resolved 回调地址 (kep-pre / fake-kep / any 落库 backend).
 
-    Activated when ``HERMES_PUSH_CARD_WRITER_URL`` is set (see ``get_writer``).
-    Same idempotency contract as the mock: the backend dedupes on
-    ``write_idempotency_key`` (a ``deduped: true`` response is still a success —
-    idempotent semantics). Any non-2xx / timeout / connection failure is a clean
-    ``WriteResult(ok=False)`` that routes to the existing failed-retry card path
-    (design §2.5); it never raises out of ``write``.
+    The endpoint (url + optional auth + timeout) is resolved per push at confirm
+    time — push override > scene default > env dev-fallback (see
+    ``resolve_callback`` / ``_bind_endpoint``). A shell instance (empty ``url``)
+    returned by ``get_writer`` is bound to the resolved ``CallbackConfig`` before
+    any write. Same idempotency contract as the mock: the backend dedupes on
+    ``write_idempotency_key`` (a ``deduped: true`` response is still a success).
+    Any non-2xx / timeout / connection failure is a clean ``WriteResult(ok=False)``
+    that routes to the existing failed-retry card path (design §2.5); it never
+    raises out of ``write``.
+
+    Auth is never a plaintext secret: ``auth_header`` names the header and
+    ``auth_token_env`` names the env var whose value is sent — read here, never
+    logged.
 
     ponytail: stdlib ``urllib.request`` (POST, JSON body, array-nothing — the
     payload is JSON, never a shell string), matching the repo's sync-HTTP idiom
@@ -179,9 +191,18 @@ class HttpKepPreClaimWriter(ClaimWriter):
     path is synchronous, so spinning an event loop here would be the wrong tool.
     """
 
-    def __init__(self, url: str, *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout: float = 10.0,
+        auth_header: Optional[str] = None,
+        auth_token_env: Optional[str] = None,
+    ) -> None:
         self.url = url
         self.timeout = timeout
+        self.auth_header = auth_header
+        self.auth_token_env = auth_token_env
 
     def write(
         self,
@@ -201,9 +222,13 @@ class HttpKepPreClaimWriter(ClaimWriter):
         body["profile_name"] = str(profile_name)
         body["scene"] = scene.scene
         payload = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.auth_header and self.auth_token_env:
+            token = os.environ.get(self.auth_token_env, "").strip()
+            if token:
+                headers[self.auth_header] = token
         req = urllib.request.Request(
-            self.url, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
+            self.url, data=payload, headers=headers, method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -227,11 +252,12 @@ class HttpKepPreClaimWriter(ClaimWriter):
 
 # --- writer registry -----------------------------------------------------
 
-# Explicit overrides only (override_writer). The auto-created mock lives in
-# _default_mock so the env-gated HTTP writer can win over it (a cached auto-mock
-# in this dict would otherwise shadow the env check on every later call).
+# Explicit overrides only (override_writer / a test's injected lookup). Absent an
+# override, the kep-pre writer is an endpoint-LESS HTTP shell — the real 回调地址
+# is resolved per push (push override > scene default > env) and bound in
+# _bind_endpoint just before the write. Keeping the endpoint OUT of get_writer is
+# what lets a per-push callback win over env (design §config priority).
 _writers: dict[str, ClaimWriter] = {}
-_default_mock: Optional[MockKepPreClaimWriter] = None
 
 
 def get_writer(name: str) -> Optional[ClaimWriter]:
@@ -239,18 +265,9 @@ def get_writer(name: str) -> Optional[ClaimWriter]:
     if override is not None:
         return override
     if name == "kep-pre-claim-writer":
-        url = os.environ.get("HERMES_PUSH_CARD_WRITER_URL", "").strip()
-        if url:
-            # env-gated: write to the external kep-pre / fake-kep backend. Not
-            # cached — stateless (the backend owns dedup) and toggles with env.
-            return HttpKepPreClaimWriter(url)
-        # ponytail: default to the mock until sunke gives the real kep pre
-        # endpoint (design §6 前置条件). Same interface → hot-swap via
-        # override_writer / the env var, no handler change.
-        global _default_mock
-        if _default_mock is None:
-            _default_mock = MockKepPreClaimWriter()
-        return _default_mock
+        # ponytail: an endpoint-less shell; _bind_endpoint fills in the resolved
+        # CallbackConfig (or fail-louds "未配置回调地址") before it is ever used.
+        return HttpKepPreClaimWriter("")
     return None
 
 
@@ -259,6 +276,63 @@ def override_writer(name: str, writer: Optional[ClaimWriter]) -> None:
         _writers.pop(name, None)
     else:
         _writers[name] = writer
+
+
+# --- per-push endpoint / behavior resolution -----------------------------
+
+def resolve_callback(
+    scene: Optional[SceneDefinition], row: Optional[dict[str, Any]]
+) -> Optional[CallbackConfig]:
+    """The 回调地址 (落库 endpoint) for this confirm, by priority (design §config):
+
+    1. per-push override — ``registry.callback_json`` (set by notify-card),
+    2. scene default — ``scene.callback`` (registered with the scene),
+    3. dev fallback — env ``HERMES_PUSH_CARD_WRITER_URL`` (kept only as a dev
+       shortcut).
+
+    ``None`` when nothing is configured → the caller fail-louds改卡"未配置回调地址"."""
+    pushed = _scenes.callback_from_json(row.get("callback_json") if row else None)
+    if pushed is not None:
+        return pushed
+    if scene is not None and scene.callback is not None:
+        return scene.callback
+    url = os.environ.get("HERMES_PUSH_CARD_WRITER_URL", "").strip()
+    if url:
+        return CallbackConfig(url=url)
+    return None
+
+
+def resolve_behaviors(
+    scene: Optional[SceneDefinition], row: Optional[dict[str, Any]]
+) -> SubmitBehaviors:
+    """Submit behavior for this confirm: per-push override > scene default >
+    framework default (design §config). Never env-driven."""
+    pushed = _scenes.behaviors_from_json(row.get("behaviors_json") if row else None)
+    if pushed is not None:
+        return pushed
+    if scene is not None:
+        return scene.behaviors
+    return SubmitBehaviors()
+
+
+def _bind_endpoint(
+    writer: Optional[ClaimWriter],
+    scene: Optional[SceneDefinition],
+    row: Optional[dict[str, Any]],
+) -> tuple[Optional[ClaimWriter], Optional[str]]:
+    """Bind the resolved 回调地址 to the real HTTP writer. A non-HTTP writer (mock
+    / injected test writer) or an HTTP writer already carrying a url (explicitly
+    constructed) is used as-is. Returns ``(writer, error)``; ``error`` non-None
+    means no endpoint was configured → fail-loud."""
+    if not isinstance(writer, HttpKepPreClaimWriter) or writer.url:
+        return writer, None
+    cb = resolve_callback(scene, row)
+    if cb is None:
+        return None, "未配置回调地址，请为该场景配置落库接口后重试。"
+    return HttpKepPreClaimWriter(
+        cb.url, timeout=float(cb.timeout_s),
+        auth_header=cb.auth_header, auth_token_env=cb.auth_token_env,
+    ), None
 
 
 # --- pure confirm core (fully unit-testable) -----------------------------
@@ -313,20 +387,26 @@ def handle_confirm(
     registry_id = str(registry_id or "").strip()
     nonce = str(nonce or "").strip()
     if not registry_id or not nonce:
-        return ConfirmResult("invalid", toast=_toast("提交无效，请重新操作。", "error"))
+        # No routing survived recovery → an old card whose row is gone, not a
+        # live param error (finding stale-card-generic-toast).
+        return ConfirmResult("invalid", toast=_toast(_STALE_CARD_MSG, "error"))
 
     row = store.get(registry_id)
     if row is None:
-        return ConfirmResult("invalid", toast=_toast("该卡片已失效。", "error"), registry_id=registry_id)
+        return ConfirmResult("invalid", toast=_toast(_STALE_CARD_MSG, "error"), registry_id=registry_id)
 
+    scene = scene_lookup(row["scene"])
+    behaviors = resolve_behaviors(scene, row)
     status = row["status"]
-    if status == _reg.STATUS_COMMITTED:
-        # Idempotent success — a replay / double-tap after commit.
+
+    if status == _reg.STATUS_COMMITTED and behaviors.submit_once:
+        # Terminal (submit_once): a replay / double-tap after commit no-ops.
         return ConfirmResult("noop", toast=_toast("已录入 ✅，请勿重复提交。"), registry_id=registry_id)
     if status == _reg.STATUS_EXPIRED:
         return ConfirmResult("reject", toast=_toast("该卡片已过期，请重新发起。", "error"), registry_id=registry_id)
-    if status not in (_reg.STATUS_CLARIFYING, _reg.STATUS_CONFIRMED):
+    if status not in (_reg.STATUS_CLARIFYING, _reg.STATUS_CONFIRMED, _reg.STATUS_COMMITTED):
         return ConfirmResult("reject", toast=_toast("该卡片当前不可提交。", "error"), registry_id=registry_id)
+    # A COMMITTED row only reaches here when submit_once=False → 改单 is allowed.
 
     # Owner check — only target_open_id本人 (signed operator, never button payload).
     target = str(row.get("target_open_id") or "")
@@ -342,21 +422,30 @@ def handle_confirm(
         return ConfirmResult("reject", toast=_toast("该操作已失效，请在最新的卡片上确认。", "error"),
                              registry_id=registry_id)
 
-    scene = scene_lookup(row["scene"])
     if scene is None:
         return ConfirmResult("invalid", toast=_toast("场景配置缺失。", "error"), registry_id=registry_id)
 
     # Final payload = the controls the user SAW and submitted (design §2.4 P1-5).
     final = _form.submission_from_form(scene, form_value)
-    values = _form.submission_values(scene, final)
+    form_values = _form.submission_values(scene, final)
+    values = form_values
     # Retry / reauth cards are PLAIN buttons (not inside a form), so a real retry
     # click carries no form_value → `values` is empty. Recover the payload
     # persisted at the clarifying→confirmed CAS so the credential-expiry /
-    # write-failure retry can actually commit (finding retry-card-has-no-form;
-    # design §2.5 凭证分支 retry). Only when already `confirmed` — a clarifying row
-    # with an empty form is a genuine "请填写完整".
-    if not values and status == _reg.STATUS_CONFIRMED:
+    # write-failure retry (or a submit_once=False 改单 re-click) can actually
+    # commit (finding retry-card-has-no-form; design §2.5 凭证分支 retry). Only when
+    # already confirmed/committed — a clarifying row with an empty form is a
+    # genuine "请填写完整".
+    if not values and status in (_reg.STATUS_CONFIRMED, _reg.STATUS_COMMITTED):
         values = _stored_submission_values(row)
+
+    # allow_resubmit_before_commit: a NEW form editing a still-pre-commit
+    # (confirmed) row is refused when the scene/push locks edits after confirm.
+    if (status == _reg.STATUS_CONFIRMED and form_values
+            and not behaviors.allow_resubmit_before_commit):
+        return ConfirmResult("reject", toast=_toast("提交已锁定，请勿在确认后修改。", "error"),
+                             registry_id=registry_id)
+
     missing = [f for f in scene.fields
                if f.required and not str(values.get(f.key, "") or "").strip()]
     if missing:
@@ -364,13 +453,26 @@ def handle_confirm(
         return ConfirmResult("reject", toast=_toast(f"请填写完整：{labels}。", "error"),
                              registry_id=registry_id)
 
-    writer = writer_lookup(scene.writer)
+    # Resolve the writer and bind its 回调地址 (push override > scene > env). A
+    # non-configured endpoint fail-louds改卡 (never a silent no-write).
+    writer, cb_error = _bind_endpoint(writer_lookup(scene.writer), scene, row)
+    if cb_error is not None:
+        return ConfirmResult("failed",
+                             card=_result_card(scene, cb_error, ok=False, retryable=False,
+                                               registry_id=registry_id, nonce=nonce, values=values),
+                             registry_id=registry_id)
     if writer is None:
         return ConfirmResult("failed",
                              card=_result_card(scene, "写入器未就绪，请稍后重试。", ok=False,
                                                retryable=True, registry_id=registry_id,
                                                nonce=nonce, values=values),
                              registry_id=registry_id)
+
+    # submit_once=False 改单: the row is already committed — re-drive the
+    # idempotent write (capped by max_submits) and stay committed.
+    if status == _reg.STATUS_COMMITTED:
+        return _resubmit_committed(scene, row, behaviors, values, writer, store,
+                                   registry_id=registry_id, nonce=nonce, now_ms=now_ms)
 
     # 1. Atomic CAS claim (nonce-gated). Kept-nonce so a retry can re-drive.
     if status == _reg.STATUS_CLARIFYING:
@@ -434,9 +536,11 @@ def handle_confirm(
     #    commit CAS result is authoritative: if it fails, another actor
     #    (reconcile / concurrent) already moved the row, so never report a false
     #    green "written" card (finding commit-cas-result-ignored).
+    # clear_nonce only when submit_once (terminal card, no re-click); when 改单
+    # is allowed the nonce is kept so the 重新提交 button can re-drive the write.
     committed = store.advance_status(
         registry_id, expect=_reg.STATUS_CONFIRMED, to=_reg.STATUS_COMMITTED,
-        clear_nonce=True, submission=values,
+        clear_nonce=behaviors.submit_once, submission=values, bump_write_attempts=True,
     )
     if not committed:
         fresh = store.get(registry_id) or row
@@ -457,6 +561,56 @@ def handle_confirm(
     _metrics.observe_commit_latency_ms(max(0, now_ms() - started))
     return ConfirmResult("committed",
                          card=_result_card(scene, "已录入 ✅", ok=True, retryable=False,
+                                           resubmit=not behaviors.submit_once,
+                                           registry_id=registry_id, nonce=nonce, values=values),
+                         registry_id=registry_id, written=True)
+
+
+def _resubmit_committed(
+    scene: SceneDefinition,
+    row: dict[str, Any],
+    behaviors: SubmitBehaviors,
+    values: dict[str, Any],
+    writer: ClaimWriter,
+    store: _reg.PushRegistryStore,
+    *,
+    registry_id: str,
+    nonce: str,
+    now_ms: Callable[[], int],
+) -> ConfirmResult:
+    """submit_once=False 改单: re-run the idempotent write on an already-committed
+    row, capped by ``max_submits``. Idempotent on ``registry_id`` → still one
+    backend record (a true multi-record amend is out of M1 scope).
+    ponytail: rotate write_idempotency_key per amend if multi-record amends land."""
+    submits = int(row.get("write_attempts") or 0)
+    if behaviors.max_submits is not None and submits >= behaviors.max_submits:
+        return ConfirmResult("reject",
+                             toast=_toast(f"已达最大提交次数（{behaviors.max_submits}），无法再次修改。", "error"),
+                             registry_id=registry_id)
+    started = now_ms()
+    try:
+        result = writer.write(
+            scene=scene, values=values, registry_id=registry_id,
+            write_idempotency_key=registry_id, profile_name=str(row.get("profile_name") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[push_card] resubmit writer raised (registry=%s): %s", registry_id, exc, exc_info=True)
+        result = WriteResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+    if result.credential_expired:
+        return ConfirmResult("reauth",
+                             card=_reauth_card(scene, registry_id=registry_id, nonce=nonce, values=values),
+                             registry_id=registry_id)
+    if not result.ok:
+        return ConfirmResult("failed",
+                             card=_result_card(scene, f"更新失败：{result.error or '未知错误'}，请重试。",
+                                               ok=False, retryable=True, resubmit=True,
+                                               registry_id=registry_id, nonce=nonce, values=values),
+                             registry_id=registry_id, written=False)
+    store.advance_status(registry_id, expect=_reg.STATUS_COMMITTED, to=_reg.STATUS_COMMITTED,
+                         submission=values, bump_write_attempts=True)
+    _metrics.observe_commit_latency_ms(max(0, now_ms() - started))
+    return ConfirmResult("committed",
+                         card=_result_card(scene, "已更新 ✅", ok=True, retryable=False, resubmit=True,
                                            registry_id=registry_id, nonce=nonce, values=values),
                          registry_id=registry_id, written=True)
 
@@ -465,7 +619,7 @@ def handle_confirm(
 
 def _result_card(
     scene: SceneDefinition, message: str, *, ok: bool, retryable: bool,
-    registry_id: str, nonce: str, values: dict[str, Any],
+    registry_id: str, nonce: str, values: dict[str, Any], resubmit: bool = False,
 ) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": f"**{scene.name}**"},
@@ -477,6 +631,13 @@ def _result_card(
         # writable); pressing it re-drives the idempotent write.
         elements.append({"tag": "button", "name": "push_confirm_retry",
                          "text": {"tag": "plain_text", "content": "重试"}, "type": "primary",
+                         "value": {"hermes_action": "push_confirm", "registry_id": registry_id,
+                                   "nonce": nonce, "operation_id": secrets.token_hex(6)}})
+    elif resubmit:
+        # submit_once=False: a committed card keeps a 重新提交 button so the user
+        # can 改单 (the nonce was NOT cleared on commit for this scene/push).
+        elements.append({"tag": "button", "name": "push_confirm_resubmit",
+                         "text": {"tag": "plain_text", "content": "重新提交"},
                          "value": {"hermes_action": "push_confirm", "registry_id": registry_id,
                                    "nonce": nonce, "operation_id": secrets.token_hex(6)}})
     return {

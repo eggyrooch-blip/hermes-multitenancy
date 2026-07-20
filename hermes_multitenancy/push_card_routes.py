@@ -184,6 +184,19 @@ def register_push_card_routes(app: Any) -> None:
         expires_at = payload.get("expires_at")
         expires_at = int(expires_at) if isinstance(expires_at, (int, float)) else _next_working_day_eod()
 
+        # Per-push overrides for this card's 回调地址 (落库 endpoint) and submit
+        # behavior. Both are capabilities the caller/scene configures — not
+        # framework-hardcoded. Stored on the row; resolved at confirm time with
+        # push-override > scene default > env priority (design §config).
+        try:
+            callback_cfg = _scenes.callback_from_payload(payload.get("callback"))
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": f"invalid callback: {exc}"}, status=400)
+        try:
+            behaviors_cfg = _scenes.behaviors_from_payload(payload.get("behaviors"))
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": f"invalid behaviors: {exc}"}, status=400)
+
         store = _reg.get_registry_store()
         result = store.create(
             scene=scene,
@@ -197,6 +210,8 @@ def register_push_card_routes(app: Any) -> None:
             card=card,
             idempotency_key=idempotency_key,
             expires_at=expires_at,
+            callback_json=_scenes.callback_to_json(callback_cfg) if callback_cfg else None,
+            behaviors_json=_scenes.behaviors_to_json(behaviors_cfg) if behaviors_cfg else None,
         )
 
         if result.conflict == "idempotent":

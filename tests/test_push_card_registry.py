@@ -51,6 +51,12 @@ def test_scene_registry_has_dev_acceptance_claim():
     assert "{registry_id}" in sc.deterministic_marker
     assert scenes.scene_exists("dev-acceptance-claim")
     assert not scenes.scene_exists("no-such-scene")
+    # config capabilities: the dev scene ships NO hardcoded 回调地址 (dev靠env兜底),
+    # and behaviors default to the original submit-once semantics.
+    assert sc.callback is None
+    assert sc.behaviors.submit_once is True
+    assert sc.behaviors.allow_resubmit_before_commit is True
+    assert sc.behaviors.max_submits is None
 
 
 # --- create / idempotency / business key ---------------------------------
@@ -337,3 +343,64 @@ def test_token_bucket_paces_after_burst():
     assert 0.4 < wait <= 0.5
     t["v"] += 1.0                 # 1s later, 2 tokens refilled
     assert bucket.take() == 0.0
+
+
+# --- callback / behaviors columns + migration ----------------------------
+
+def test_create_stores_callback_and_behaviors_json(store):
+    res = store.create(
+        scene="dev-acceptance-claim", skill="push-fill-form", target_open_id="ou_a",
+        profile_name="p", business_key="dev-acceptance-claim:ou_a:r",
+        callback_json='{"url":"http://x/api","timeout_s":9}',
+        behaviors_json='{"submit_once":false,"max_submits":2}',
+    )
+    row = store.get(res.row["registry_id"])
+    assert row["callback_json"] == '{"url":"http://x/api","timeout_s":9}'
+    assert row["behaviors_json"] == '{"submit_once":false,"max_submits":2}'
+
+
+# columns of the ORIGINAL push_registry (pre callback/behaviors), to simulate
+# an older DB that _migrate must bring forward without data loss.
+_OLD_COLUMNS = (
+    "registry_id TEXT PRIMARY KEY", "scene TEXT NOT NULL", "skill TEXT NOT NULL",
+    "target_open_id TEXT NOT NULL", "target_union_id TEXT", "profile_name TEXT NOT NULL",
+    "chat_id TEXT", "message_id TEXT", "payload_json TEXT", "card_json TEXT",
+    "submission_json TEXT", "status TEXT NOT NULL", "business_key TEXT NOT NULL",
+    "idempotency_key TEXT", "nonce TEXT", "send_attempts INTEGER NOT NULL DEFAULT 0",
+    "write_attempts INTEGER NOT NULL DEFAULT 0", "last_error TEXT", "expires_at INTEGER",
+    "created_at INTEGER NOT NULL", "updated_at INTEGER NOT NULL",
+)
+
+
+def test_migration_adds_callback_and_behaviors_columns(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.execute(f"CREATE TABLE push_registry ({', '.join(_OLD_COLUMNS)})")
+    con.execute(
+        "INSERT INTO push_registry (registry_id, scene, skill, target_open_id,"
+        " profile_name, status, business_key, created_at, updated_at)"
+        " VALUES ('pcr_old','dev-acceptance-claim','push-fill-form','ou_x','p',"
+        " 'committed','bk', 1, 1)"
+    )
+    con.commit()
+    con.close()
+
+    store = reg.PushRegistryStore(str(db))
+    try:
+        cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(push_registry)")}
+        assert {"callback_json", "behaviors_json"} <= cols  # migrated in
+        legacy = store.get("pcr_old")  # legacy row survives, new cols default NULL
+        assert legacy is not None and legacy["callback_json"] is None
+        # a fresh create with the new overrides works on the migrated DB
+        res = store.create(
+            scene="dev-acceptance-claim", skill="push-fill-form", target_open_id="ou_y",
+            profile_name="p", business_key="dev-acceptance-claim:ou_y:m",
+            callback_json='{"url":"http://x/api"}', behaviors_json='{"submit_once":false}',
+        )
+        got = store.get(res.row["registry_id"])
+        assert got["callback_json"] == '{"url":"http://x/api"}'
+        assert got["behaviors_json"] == '{"submit_once":false}'
+    finally:
+        store.close()

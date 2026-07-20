@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS push_registry (
     payload_json    TEXT,
     card_json       TEXT,
     submission_json TEXT,
+    callback_json   TEXT,
+    behaviors_json  TEXT,
     status          TEXT NOT NULL,
     business_key    TEXT NOT NULL,
     idempotency_key TEXT,
@@ -108,6 +110,8 @@ CREATE TABLE IF NOT EXISTS push_registry_archive (
     payload_json    TEXT,
     card_json       TEXT,
     submission_json TEXT,
+    callback_json   TEXT,
+    behaviors_json  TEXT,
     status          TEXT NOT NULL,
     business_key    TEXT NOT NULL,
     idempotency_key TEXT,
@@ -125,7 +129,8 @@ CREATE TABLE IF NOT EXISTS push_registry_archive (
 _COLUMNS = (
     "registry_id", "scene", "skill", "target_open_id", "target_union_id",
     "profile_name", "chat_id", "message_id", "payload_json", "card_json",
-    "submission_json", "status", "business_key", "idempotency_key", "nonce",
+    "submission_json", "callback_json", "behaviors_json", "status",
+    "business_key", "idempotency_key", "nonce",
     "send_attempts", "write_attempts", "last_error", "expires_at",
     "created_at", "updated_at",
 )
@@ -155,7 +160,20 @@ class PushRegistryStore:
         self._conn.executescript("PRAGMA journal_mode=WAL;")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive column migration for an older DB (callback/behaviors are
+        per-push data added after the first ship). Probe pragma_table_info —
+        SQLite has no ``ADD COLUMN IF NOT EXISTS`` — and ALTER what's missing.
+        Safe to call repeatedly."""
+        for table in ("push_registry", "push_registry_archive"):
+            cur = self._conn.execute(f"PRAGMA table_info({table})")
+            existing = {row["name"] for row in cur.fetchall()}
+            for col in ("callback_json", "behaviors_json"):
+                if col not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
     # --- create -----------------------------------------------------------
 
@@ -174,6 +192,8 @@ class PushRegistryStore:
         chat_id: Optional[str] = None,
         expires_at: Optional[int] = None,
         nonce: Optional[str] = None,
+        callback_json: Optional[str] = None,
+        behaviors_json: Optional[str] = None,
     ) -> CreateResult:
         """Insert a new ``sending`` row, or return the colliding one.
 
@@ -206,14 +226,16 @@ class PushRegistryStore:
                 "INSERT INTO push_registry"
                 " (registry_id, scene, skill, target_open_id, target_union_id,"
                 "  profile_name, chat_id, message_id, payload_json, card_json,"
-                "  submission_json, status, business_key, idempotency_key, nonce,"
+                "  submission_json, callback_json, behaviors_json, status,"
+                "  business_key, idempotency_key, nonce,"
                 "  send_attempts, write_attempts, last_error, expires_at,"
                 "  created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?,"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?,"
                 "         0, 0, NULL, ?, ?, ?)",
                 (
                     registry_id, scene, skill, target_open_id, target_union_id,
                     profile_name, chat_id, payload_json, card_json,
+                    callback_json, behaviors_json,
                     STATUS_SENDING, business_key, idempotency_key, nonce,
                     expires_at, now, now,
                 ),
@@ -437,12 +459,14 @@ class PushRegistryStore:
         submission: Any = None,
         message_id: Optional[str] = None,
         last_error: Optional[str] = None,
+        bump_write_attempts: bool = False,
     ) -> bool:
         """Generic optimistic CAS used by later phases (clarify/confirm/commit).
 
         Returns True iff a row in state ``expect`` (and matching ``expect_nonce``
         when given) was moved to ``to``. This is the atomic confirm-time guard
-        the write path stands on (design §2.5 P0-2)."""
+        the write path stands on (design §2.5 P0-2). ``bump_write_attempts``
+        increments the accepted-submit counter (the ``max_submits`` denominator)."""
         now = _now()
         sets = ["status = ?", "updated_at = ?"]
         params: list[Any] = [to, now]
@@ -457,6 +481,8 @@ class PushRegistryStore:
             params.append(str(last_error)[:2000])
         if clear_nonce:
             sets.append("nonce = NULL")
+        if bump_write_attempts:
+            sets.append("write_attempts = write_attempts + 1")
         where = "registry_id = ? AND status = ?"
         params.extend([registry_id, expect])
         if expect_nonce is not None:

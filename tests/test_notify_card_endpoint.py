@@ -221,3 +221,51 @@ def test_status_query_hides_scene_outside_key_whitelist(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_INGEST_KEYS_FILE", str(key_file))
     status, _ = _call("GET", f"/api/run-broker/notify-card/{rid}", token="push-key-3")
     assert status == 404
+
+
+# --- per-push callback / behaviors overrides -----------------------------
+
+def test_push_callback_override_is_stored_on_row(_isolate):
+    body = {**_GOOD, "callback": {
+        "url": "https://acme.example/api/claims",
+        "auth_header": "Authorization", "auth_token_env": "ACME_TOKEN", "timeout_s": 7,
+    }}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body)
+    assert status == 202
+    stored = json.loads(reg.get_registry_store().get(data["registry_id"])["callback_json"])
+    assert stored["url"] == "https://acme.example/api/claims"
+    assert stored["auth_header"] == "Authorization"
+    assert stored["auth_token_env"] == "ACME_TOKEN"  # env NAME, not a plaintext token
+    assert stored["timeout_s"] == 7
+
+
+def test_push_callback_never_stores_a_plaintext_token(_isolate):
+    # A stray plaintext token field is NOT whitelisted → never persisted.
+    body = {**_GOOD, "callback": {"url": "https://acme.example/api", "token": "S--secret--"}}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body)
+    assert status == 202
+    raw = reg.get_registry_store().get(data["registry_id"])["callback_json"]
+    assert "S--secret--" not in raw
+
+
+def test_push_callback_missing_url_is_400(_isolate):
+    body = {**_GOOD, "callback": {"auth_header": "Authorization"}}  # no url
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body)
+    assert status == 400
+    assert "callback" in data["error"]
+
+
+def test_push_behaviors_override_is_stored_on_row(_isolate):
+    body = {**_GOOD, "behaviors": {"submit_once": False, "max_submits": 3}}
+    status, data = _call("POST", "/api/run-broker/notify-card", body=body)
+    assert status == 202
+    stored = json.loads(reg.get_registry_store().get(data["registry_id"])["behaviors_json"])
+    assert stored["submit_once"] is False
+    assert stored["max_submits"] == 3
+
+
+def test_no_override_leaves_callback_and_behaviors_null(_isolate):
+    status, data = _call("POST", "/api/run-broker/notify-card", body=_GOOD)
+    assert status == 202
+    row = reg.get_registry_store().get(data["registry_id"])
+    assert row["callback_json"] is None and row["behaviors_json"] is None
