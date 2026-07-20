@@ -3238,4 +3238,9 @@ def create_run_broker_app(
     from . import console_api as _console_api
 
     _console_api.register_console_routes(app)
+    # push-card fill loop (SPEC push-card-fill-loop): notify-card ingress +
+    # status query live in their own module (god-file split rule).
+    from . import push_card_routes as _push_card_routes
+
+    _push_card_routes.register_push_card_routes(app)
     return app

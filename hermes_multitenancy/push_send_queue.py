@@ -1,0 +1,274 @@
+"""Rate-limited send queue for push cards (SPEC push-card-fill-loop P2).
+
+A thin封装 over the live gateway's bare card-send (the same
+``adapter._feishu_send_with_retry`` path ``send_auth_card`` uses). The value
+this module adds over calling the adapter directly is the pacing the 1259-user
+early-morning burst needs (design §2.1 P0-3):
+
+* **token-bucket** pacing to stay under the Feishu single-app QPS quota;
+* **exponential backoff retry** on transient send failure, then a *visible*
+  ``failed`` (never a silent drop, design §2.2);
+* **per-user daily cap** (default 3) and **quiet-hours顺延** 21:00–09:00
+  (design §2.6) — both DEFER (leave the row ``sending`` for a later sweep), they
+  never fabricate a ``failed``.
+
+The actual live-adapter binding is a seam (``register_push_card_sender``) filled
+by the gateway process — this module is fully unit-testable with an injected
+async sender, a fake clock, and a no-op sleep.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Awaitable, Callable, Optional
+
+from . import push_registry as _reg
+
+logger = logging.getLogger(__name__)
+
+
+class PushCardSenderUnavailable(RuntimeError):
+    """No live card sender is wired (or the adapter cannot send)."""
+
+
+@dataclass
+class SendResult:
+    message_id: Optional[str]
+    chat_id: Optional[str] = None
+
+
+@dataclass
+class QueueOutcome:
+    status: str  # 'sent' | 'failed' | 'deferred' | 'skipped'
+    message_id: Optional[str] = None
+    reason: Optional[str] = None
+    retry_at: Optional[int] = None
+
+
+# --- live-adapter seam ---------------------------------------------------
+
+#: Async callable ``(profile_name, open_id, card, payload) -> SendResult``.
+_card_sender: Optional[Callable[..., Awaitable[SendResult]]] = None
+
+
+def register_push_card_sender(fn: Optional[Callable[..., Awaitable[SendResult]]]) -> None:
+    """Wire (or in tests, unwire with ``None``) the live card sender."""
+    global _card_sender
+    _card_sender = fn
+
+
+async def _default_sender(*, profile_name: str, open_id: str, card: Any, payload: Any) -> SendResult:
+    if _card_sender is None:
+        raise PushCardSenderUnavailable("no live push-card sender registered")
+    return await _card_sender(
+        profile_name=profile_name, open_id=open_id, card=card, payload=payload
+    )
+
+
+async def send_push_card_via_adapter(
+    adapter: Any, *, open_id: str, card: dict[str, Any], metadata: Any = None
+) -> SendResult:
+    """Reference bare-send wrapper the gateway registers as the live sender.
+
+    Mirrors ``feishu_auth_cards.send_auth_card`` but targets a DM by ``open_id``
+    (the gateway's ``_patch_feishu_open_id_send`` makes ``_feishu_send_with_retry``
+    accept an open_id as the receive target). Kept here so the wiring builder has
+    exactly one call to make; not exercised by P2 unit tests (no live adapter)."""
+    sender = getattr(adapter, "_feishu_send_with_retry", None)
+    if not callable(sender):
+        raise PushCardSenderUnavailable("adapter lacks _feishu_send_with_retry")
+    response = await sender(
+        chat_id=open_id,
+        msg_type="interactive",
+        payload=json.dumps(card, ensure_ascii=False),
+        reply_to=None,
+        metadata=metadata,
+    )
+    message_id = None
+    if isinstance(response, dict):
+        message_id = response.get("message_id") or (response.get("data") or {}).get("message_id")
+    else:
+        message_id = getattr(response, "message_id", None)
+    if not message_id:
+        raise PushCardSenderUnavailable("card send returned no message_id")
+    return SendResult(message_id=str(message_id))
+
+
+# --- token bucket --------------------------------------------------------
+
+class TokenBucket:
+    """Classic token bucket. ``take()`` returns the seconds to wait (0 if a token
+    is available now) and consumes one token."""
+
+    def __init__(
+        self,
+        rate_per_sec: float,
+        capacity: float,
+        *,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.rate = max(float(rate_per_sec), 1e-6)
+        self.capacity = max(float(capacity), 1.0)
+        self._tokens = self.capacity
+        self._now = monotonic_fn
+        self._last = self._now()
+
+    def _refill(self) -> None:
+        now = self._now()
+        elapsed = max(0.0, now - self._last)
+        self._last = now
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+
+    def take(self) -> float:
+        self._refill()
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return 0.0
+        wait = (1.0 - self._tokens) / self.rate
+        self._tokens = 0.0
+        return wait
+
+
+# --- queue ---------------------------------------------------------------
+
+def _in_quiet_hours(dt: datetime, start_hour: int, end_hour: int) -> bool:
+    """Quiet window may wrap midnight (21:00–09:00)."""
+    h = dt.hour
+    if start_hour <= end_hour:
+        return start_hour <= h < end_hour
+    return h >= start_hour or h < end_hour
+
+
+def _next_active_dt(dt: datetime, start_hour: int, end_hour: int) -> datetime:
+    """The next instant outside the quiet window (its trailing edge)."""
+    candidate = dt.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+    if candidate <= dt:
+        candidate = candidate + timedelta(days=1)
+    return candidate
+
+
+class PushSendQueue:
+    def __init__(
+        self,
+        store: _reg.PushRegistryStore,
+        sender: Callable[..., Awaitable[SendResult]] = _default_sender,
+        *,
+        rate_per_sec: float = 5.0,
+        burst: float = 10.0,
+        daily_cap: int = 3,
+        quiet_start_hour: int = 21,
+        quiet_end_hour: int = 9,
+        max_retries: int = 4,
+        base_backoff: float = 0.5,
+        clock: Callable[[], datetime] = datetime.now,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self.store = store
+        self.sender = sender
+        self.daily_cap = int(daily_cap)
+        self.quiet_start_hour = int(quiet_start_hour)
+        self.quiet_end_hour = int(quiet_end_hour)
+        self.max_retries = int(max_retries)
+        self.base_backoff = float(base_backoff)
+        self.clock = clock
+        self.sleep = sleep_fn
+        self._bucket = TokenBucket(rate_per_sec, burst, monotonic_fn=monotonic_fn)
+
+    async def process(self, registry_id: str) -> QueueOutcome:
+        """Attempt one delivery. Idempotent: a row already past ``sending`` is a
+        no-op ``skipped`` (never a double send)."""
+        row = self.store.get(registry_id)
+        if row is None:
+            return QueueOutcome(status="failed", reason="not_found")
+        if row["status"] != _reg.STATUS_SENDING:
+            return QueueOutcome(status="skipped", reason=f"status={row['status']}")
+
+        now_dt = self.clock()
+
+        # Quiet hours顺延 — defer, do not send, leave row 'sending'.
+        if _in_quiet_hours(now_dt, self.quiet_start_hour, self.quiet_end_hour):
+            retry_dt = _next_active_dt(now_dt, self.quiet_start_hour, self.quiet_end_hour)
+            return QueueOutcome(
+                status="deferred", reason="quiet_hours", retry_at=int(retry_dt.timestamp())
+            )
+
+        # Per-user daily cap — defer to next local midnight.
+        day_start = int(
+            now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        )
+        if self.store.count_pushes_today(row["target_open_id"], day_start=day_start) >= self.daily_cap:
+            next_day = now_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            return QueueOutcome(
+                status="deferred", reason="daily_cap", retry_at=int(next_day.timestamp())
+            )
+
+        # Pace against the app QPS quota.
+        wait = self._bucket.take()
+        if wait > 0:
+            await self.sleep(wait)
+
+        card = _loads(row.get("card_json"))
+        payload = _loads(row.get("payload_json"))
+        last_error = "send failed"
+        for attempt in range(self.max_retries):
+            try:
+                result = await self.sender(
+                    profile_name=row["profile_name"],
+                    open_id=row["target_open_id"],
+                    card=card,
+                    payload=payload,
+                )
+            except Exception as exc:  # transient send failure — retry with backoff
+                last_error = f"{type(exc).__name__}: {exc}"
+                self.store.note_send_attempt(registry_id, error=last_error)
+                if attempt < self.max_retries - 1:
+                    await self.sleep(self.base_backoff * (2 ** attempt))
+                continue
+            if not getattr(result, "message_id", None):
+                last_error = "send returned no message_id"
+                self.store.note_send_attempt(registry_id, error=last_error)
+                if attempt < self.max_retries - 1:
+                    await self.sleep(self.base_backoff * (2 ** attempt))
+                continue
+            if self.store.mark_sent(
+                registry_id, message_id=result.message_id, chat_id=getattr(result, "chat_id", None)
+            ):
+                return QueueOutcome(status="sent", message_id=result.message_id)
+            # Lost the CAS (already advanced by someone else) — not our send to own.
+            return QueueOutcome(status="skipped", reason="cas_lost")
+
+        self.store.mark_send_failed(registry_id, error=last_error)
+        return QueueOutcome(status="failed", reason=last_error)
+
+
+def _loads(raw: Any) -> Any:
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+# --- module-level singleton ---------------------------------------------
+
+_queue: Optional[PushSendQueue] = None
+
+
+def get_send_queue() -> PushSendQueue:
+    global _queue
+    if _queue is None:
+        _queue = PushSendQueue(_reg.get_registry_store())
+    return _queue
+
+
+def override_send_queue(queue: Optional[PushSendQueue]) -> None:
+    global _queue
+    _queue = queue
