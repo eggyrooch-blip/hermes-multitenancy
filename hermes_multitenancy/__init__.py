@@ -123,6 +123,13 @@ def register(ctx) -> None:
             # must never block the broker/credential subsystems started below.
             logger.exception("[push_card] matcher install failed; continuing without inbound matching")
         try:
+            from .push_card_confirm import install_feishu_push_card_confirm_patch
+            install_feishu_push_card_confirm_patch()
+        except Exception:
+            # 5th card.action.trigger patch; undefined放行 delegates to the other
+            # four. Fail-open like its siblings — never block the broker below.
+            logger.exception("[push_card] confirm patch install failed; continuing without confirm handling")
+        try:
             from .feishu_message_trace import install_message_trace_filter
             install_message_trace_filter()
         except Exception:
