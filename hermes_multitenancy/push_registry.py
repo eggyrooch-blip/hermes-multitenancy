@@ -270,6 +270,79 @@ class PushRegistryStore:
         ).fetchone()
         return int(row[0])
 
+    def get_by_message_id(self, message_id: str) -> Optional[dict[str, Any]]:
+        """Exact ``parent_id/root_id`` hit lookup for the matcher (design §2.3-1).
+
+        Includes ``expired`` rows on purpose — a quoted reply to an expired card
+        must reach the explicit "已过期" exit, not fall through to passthrough."""
+        mid = str(message_id or "")
+        if not mid:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM push_registry WHERE message_id = ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (mid,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_fresh_sending(
+        self, target_open_id: str, *, since: int
+    ) -> Optional[dict[str, Any]]:
+        """A row still in ``sending`` with no ``message_id`` yet, created since
+        ``since``. Feeds the matcher's grace retry for the "员工秒回早于
+        message_id 回填" window (design §2.2 P1-2)."""
+        row = self._conn.execute(
+            "SELECT * FROM push_registry"
+            " WHERE target_open_id = ? AND status = ?"
+            " AND message_id IS NULL AND created_at >= ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (target_open_id, STATUS_SENDING, since),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_due_open(self, *, now: Optional[int] = None) -> list[dict[str, Any]]:
+        """Not-finished rows past ``expires_at`` — the expiry worker's work list
+        (design §2.6). It re-renders each card before flipping to ``expired``."""
+        now = _now() if now is None else now
+        inflight = ", ".join("?" * len(INFLIGHT_STATUSES))
+        cur = self._conn.execute(
+            "SELECT * FROM push_registry"
+            f" WHERE status IN ({inflight})"
+            " AND expires_at IS NOT NULL AND expires_at <= ?"
+            " ORDER BY expires_at ASC",
+            (*INFLIGHT_STATUSES, now),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_stale_confirmed(
+        self, *, older_than: int
+    ) -> list[dict[str, Any]]:
+        """``confirmed`` rows whose write has not reached ``committed`` within
+        the reconcile window. The reconcile worker checks the backend by
+        idempotency key and backfills — it never blindly re-writes (design
+        §2.5 P0-2 step 3)."""
+        cur = self._conn.execute(
+            "SELECT * FROM push_registry"
+            " WHERE status = ? AND updated_at <= ?"
+            " ORDER BY updated_at ASC",
+            (STATUS_CONFIRMED, older_than),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def reset_submission(self, registry_id: str) -> bool:
+        """Clear the extracted ``submission_json`` so the fill skill re-extracts
+        from the surviving messages after a recall (design §2.3 P1-4 — replay,
+        not pure-accumulate). Status is untouched."""
+        now = _now()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE push_registry SET submission_json = NULL, updated_at = ?"
+                f" WHERE registry_id = ? AND status IN ({', '.join('?' * len(OPEN_STATUSES))})",
+                (now, registry_id, *OPEN_STATUSES),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM push_registry").fetchone()[0])
 

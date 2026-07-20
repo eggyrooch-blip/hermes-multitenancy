@@ -116,6 +116,13 @@ def register(ctx) -> None:
         from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
         install_feishu_clarify_card_action_patch()
         try:
+            from .push_card_matcher import install_feishu_push_card_matcher_patch
+            install_feishu_push_card_matcher_patch()
+        except Exception:
+            # Matcher wiring is fail-open by design; a deferred/failed install
+            # must never block the broker/credential subsystems started below.
+            logger.exception("[push_card] matcher install failed; continuing without inbound matching")
+        try:
             from .feishu_message_trace import install_message_trace_filter
             install_message_trace_filter()
         except Exception:
