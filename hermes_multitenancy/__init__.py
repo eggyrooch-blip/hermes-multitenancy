@@ -103,18 +103,6 @@ def register(ctx) -> None:
     from .skills_dir_dynamic import install_dynamic_skills_dir_patch
     install_dynamic_skills_dir_patch()
     install_profile_native_cron_guard()
-    # ponytail: temp live-diagnostic seam (env-gated, no-op unless HERMES_PUSH_CARD_DEBUG
-    # set). Surfaces push-card INFO/DEBUG to stderr because the gateway filters
-    # hermes_multitenancy.* below WARNING. Remove before ship.
-    if __import__("os").environ.get("HERMES_PUSH_CARD_DEBUG"):
-        import logging as _lg
-        _pc = _lg.getLogger("hermes_multitenancy")
-        _pc.setLevel(_lg.DEBUG)
-        _h = _lg.StreamHandler()
-        _h.setLevel(_lg.DEBUG)
-        _h.setFormatter(_lg.Formatter("PCDEBUG %(name)s %(levelname)s %(message)s"))
-        _pc.addHandler(_h)
-        _pc.warning("PCDEBUG push-card debug logging enabled; is_router=%s", is_router_profile_runtime())
     if may_own_cron_runtime():
         install_cron_runtime_patches()
         install_gateway_startup_watcher()

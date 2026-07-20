@@ -572,23 +572,13 @@ async def try_route_push_card_reply(adapter: Any, event: Any) -> bool:
             except Exception:
                 logger.debug("[push_card] open_id resolve failed", exc_info=True)
         text = _event_text(event)
-        quoted0 = str(getattr(event, "reply_to_message_id", "") or "")
-        logger.warning(
-            "PCDEBUG try_route ENTRY open_id=%r text=%r quoted=%r ev_attrs=%s",
-            open_id, (text or "")[:24], quoted0,
-            [a for a in ("reply_to_message_id","parent_id","message","source") if hasattr(event, a)],
-        )
+        quoted = str(getattr(event, "reply_to_message_id", "") or "")
         if not (open_id and text):
             return False
-        quoted = quoted0
         import asyncio
         decision = await get_matcher().match_with_grace(
             open_id=open_id, text=text, quoted_message_id=quoted,
             sleep_fn=asyncio.sleep,
-        )
-        logger.warning(
-            "PCDEBUG try_route open_id=%s text=%r quoted=%r decision=%s",
-            open_id, (text or "")[:24], quoted, getattr(decision, "action", None),
         )
         if decision.action == ROUTE:
             if decision.mode == MODE_YOLO:

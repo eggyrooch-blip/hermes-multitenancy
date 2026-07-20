@@ -378,13 +378,7 @@ class PushSendQueue:
                     card=card,
                     payload=payload,
                 )
-            except PushCardSenderUnavailable as _pcexc:
-                import sys as _sys
-                logger.warning(
-                    "PCDEBUG send DEFERRED registry=%s exc=%r card_sender_set=%s live_adapter_set=%s module_id=%s",
-                    registry_id, _pcexc, _card_sender is not None, _live_adapter is not None,
-                    id(_sys.modules.get(__name__)),
-                )
+            except PushCardSenderUnavailable:
                 # No usable sender in THIS process — DEFER (leave row 'sending').
                 # Covers both PushCardSenderNotReady (adapter not captured yet) and
                 # the base case where notify-card dispatched the send from the

@@ -56,11 +56,6 @@ logger = logging.getLogger(__name__)
 _HOOK_INSTALLED = False
 _CARD_ACTION_FLAG = "_hermes_multitenancy_push_confirm_card_action_patched"
 
-#: env-gated live diagnostic (PCDEBUG). The gateway sets HERMES_PUSH_CARD_DEBUG
-#: before importing the plugin; these warnings dump the raw card-action shape so
-#: the confirm path can be verified in gateway.error.log. Temp — cleared on ship.
-_DEBUG = bool(os.environ.get("HERMES_PUSH_CARD_DEBUG"))
-
 
 # --- writer contract -----------------------------------------------------
 
@@ -721,11 +716,6 @@ def _patch_card_action(FeishuAdapter: Any) -> bool:
             action = _read(event, "action")
             value = _read_action_value(_read(action, "value"))
             form_value = _read(action, "form_value")
-            if _DEBUG:
-                logger.warning(
-                    "PCDEBUG confirm wrapper tag=%r name=%r value=%r form_value=%r",
-                    _read(action, "tag"), _read(action, "name"), value, form_value,
-                )
             # undefined放行: not ours → delegate unchanged (never吞 the other 4).
             if not _is_push_confirm_action(value, form_value, action):
                 return original(self, data)
@@ -821,20 +811,10 @@ def _compute_confirm_result(
         if recovered is not None:
             registry_id = str(recovered.get("registry_id") or "")
             nonce = str(recovered.get("nonce") or "")
-    if _DEBUG:
-        logger.warning(
-            "PCDEBUG confirm dispatch registry_id=%r nonce=%r operators=%r form_value=%r",
-            registry_id, nonce, sorted(operator_ids), form_value,
-        )
     result = handle_confirm(
         registry_id=registry_id, nonce=nonce, operator_open_ids=operator_ids,
         form_value=form_value, store=store,
     )
-    if _DEBUG:
-        logger.warning(
-            "PCDEBUG confirm result kind=%s written=%s registry=%s",
-            result.kind, result.written, result.registry_id,
-        )
     return result
 
 
@@ -862,12 +842,6 @@ def _synthetic_confirm_parts(event: Any) -> Optional[tuple[Any, Any, dict[str, A
         return None
     value = _read_action_value(_read(action, "value"))
     form_value = _read(action, "form_value")
-    if _DEBUG:
-        logger.warning(
-            "PCDEBUG synthetic-confirm probe text=%r tag=%r name=%r value=%r form_value=%r",
-            getattr(event, "text", None), _read(action, "tag"),
-            _read(action, "name"), value, form_value,
-        )
     if not _is_push_confirm_action(value, form_value, action):
         return None
     return card_event, action, value if isinstance(value, dict) else {}, form_value
