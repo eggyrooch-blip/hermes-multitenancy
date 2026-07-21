@@ -153,6 +153,27 @@ def build_auth_identity_mismatch_card() -> dict[str, Any]:
     )
 
 
+def _card_has_form(card: Any) -> bool:
+    """True if the card contains an interactive ``form`` element anywhere.
+
+    CardKit v1 ``card.create`` rejects schema-2.0 ``form`` components with
+    ``code=11310 form's name is required`` — misleading, because it fails even
+    when the form carries a non-empty ``name`` (verified: the confirm/fill card's
+    form is built with ``name="push_fill_form"`` yet still rejected). Static form
+    cards must go over the raw interactive transport, which renders them
+    correctly; CardKit's streaming is only useful for text-streaming cards, not
+    a one-shot confirm/fill form. So we skip the guaranteed-to-fail CardKit
+    attempt for any form-bearing card and send raw directly.
+    """
+    if isinstance(card, dict):
+        if card.get("tag") == "form":
+            return True
+        return any(_card_has_form(v) for v in card.values())
+    if isinstance(card, list):
+        return any(_card_has_form(v) for v in card)
+    return False
+
+
 async def send_auth_card(
     *,
     adapter: Any,
@@ -166,7 +187,7 @@ async def send_auth_card(
         _can_use_cardkit(adapter),
         callable(getattr(adapter, "_feishu_send_with_retry", None)),
     )
-    if _can_use_cardkit(adapter):
+    if _can_use_cardkit(adapter) and not _card_has_form(card):
         try:
             card_id = await _create_cardkit_card(adapter, card)
             if card_id:
