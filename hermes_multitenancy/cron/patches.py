@@ -281,12 +281,16 @@ def _patch_cron_run_broker() -> None:
         return
 
     @functools.wraps(original)
-    def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+    def run_job(job: dict, *args: Any, **kwargs: Any) -> tuple[bool, str, str, Optional[str]]:
+        # Forward every argument the core scheduler passes (e.g. the parallel
+        # pool's keyword-only `defer_agent_teardown` list). Hard-coding the
+        # signature here silently breaks every cron tick the moment the core
+        # run_job grows a parameter — see tests/test_cron_runjob_signature_passthrough.py.
         deferred = _cw._l4_check_needs_reauth_and_defer(job)
         if deferred is not None:
             return deferred
         if not _cw._cron_run_broker_enabled():
-            return original(job)
+            return original(job, *args, **kwargs)
         return _cw._run_job_through_broker(job, scheduler)
 
     setattr(run_job, "_hermes_multitenancy_patched", True)
