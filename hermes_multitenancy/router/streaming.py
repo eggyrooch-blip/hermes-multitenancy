@@ -796,6 +796,13 @@ async def _stream_into_feishu_shared_consumer(
                             _m._clear_pending_approval(delta)
                         continue
 
+                    if kind == "clarify_resolved":
+                        # Bridge event carries {clarify_id, session_key, response,
+                        # timed_out}; swallow it. Without this branch it falls through
+                        # to `piece = str(delta)` below and the raw dict leaks into the
+                        # user-visible reply (symmetric to approval_resolved above).
+                        continue
+
                     if kind == "done":
                         continue
 
@@ -1200,6 +1207,11 @@ async def _stream_into_feishu(
                     elif kind == "approval_resolved":
                         if isinstance(delta, dict):
                             _m._clear_pending_approval(delta)
+                        continue
+                    elif kind == "clarify_resolved":
+                        # Swallow the resolved bridge event so its payload dict never
+                        # reaches the str(delta) fallthrough and leaks into the reply
+                        # text (see the shared-consumer path for the same guard).
                         continue
                     elif kind == "status":
                         status_text = str(delta or "").strip()

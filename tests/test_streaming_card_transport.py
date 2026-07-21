@@ -271,6 +271,64 @@ def test_streaming_clarify_event_sends_cardkit_form(monkeypatch, tmp_path):
     assert any(update["content"] == "等待你的选择" for update in adapter.status_updates)
 
 
+def test_streaming_clarify_resolved_event_not_leaked_into_reply(monkeypatch, tmp_path):
+    """Regression: a ``clarify_resolved`` bridge event must be swallowed, never
+    serialized into the visible reply.
+
+    Before the fix the feishu streaming router had no ``clarify_resolved`` branch
+    (only ``clarify_required`` + ``approval_resolved``), so the resolved event's
+    payload dict fell through to ``piece = str(delta)`` and polluted the message
+    body with ``{'clarify_id': ..., 'timed_out': True}`` — exactly what a user saw
+    on a timed-out clarify. Fixed at both dispatch sites in router/streaming.py.
+    """
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import feishu_clarify_cards
+
+    adapter = _CardCapableAdapter()
+
+    async def fake_stream(*_args, **_kwargs):
+        yield "clarify_required", {
+            "clarify_id": "clarify_0123456789abcdef0123456789abcdef",
+            "question": "选择城市",
+            "choices": ["北京", "上海"],
+        }
+        # The exact payload shape emitted by _core.py:_clarify_callback on timeout.
+        yield "clarify_resolved", {
+            "clarify_id": "clarify_0123456789abcdef0123456789abcdef",
+            "session_key": "multitenancy:feishu:feishu_x:oc_y:ou_z",
+            "response": (
+                "The user did not provide a response within 300s. "
+                "Use your best judgement to make the choice and proceed."
+            ),
+            "timed_out": True,
+        }
+        yield "content", "北京明天多云"
+        yield "done", "北京明天多云"
+
+    async def fake_send(*, adapter, chat_id, card):
+        return {"message_id": "om_clarify"}
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(feishu_clarify_cards, "send_auth_card", fake_send)
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None)
+
+    result = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "oc_test",
+            "profile",
+            tmp_path,
+            SimpleNamespace(source=SimpleNamespace(chat_type="dm")),
+        )
+    )
+
+    assert result == "北京明天多云"
+    assert "clarify_id" not in result
+    assert "timed_out" not in result
+    assert "best judgement" not in result
+
+
 class _DeferredLifecycleCardAdapter(_CardCapableAdapter):
     def __init__(self):
         super().__init__()
