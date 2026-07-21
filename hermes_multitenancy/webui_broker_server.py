@@ -3243,4 +3243,9 @@ def create_run_broker_app(
     from . import push_card_routes as _push_card_routes
 
     _push_card_routes.register_push_card_routes(app)
+    # push-custom-message (SPEC push-custom-message): POST /api/run-broker/push —
+    # a pure Feishu send bypass (no agent run), in its own module (god-file split).
+    from . import push_message_routes as _push_message_routes
+
+    _push_message_routes.register_push_message_routes(app)
     return app
