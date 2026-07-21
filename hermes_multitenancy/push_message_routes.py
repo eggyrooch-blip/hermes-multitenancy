@@ -13,6 +13,11 @@ block the shared asyncio loop and stall every user's chat (gateway-deadlock
 前科). So the blocking mint+send is offloaded to a thread via
 ``run_in_executor`` and capped by an explicit ``asyncio.wait_for`` — the loop
 never blocks.
+
+Deploy contract (hard ship steps, SPEC §部署契约): the public Caddy proxy is
+single-path — add an explicit route for ``/api/run-broker/push`` or it 404s
+externally; any new broker env must live in the systemd drop-in or the next
+restart silently drops it.
 """
 from __future__ import annotations
 
@@ -242,6 +247,11 @@ def register_push_message_routes(app: Any) -> None:
         if not isinstance(content, dict):
             return web.json_response(
                 {"ok": False, "error": "content must be a JSON object"}, status=400
+            )
+        if msg_type == "text" and not isinstance(content.get("text"), str):
+            return web.json_response(
+                {"ok": False, "error": 'text content must be {"text": "<string>"}'},
+                status=400,
             )
 
         # receive_id_type: explicit wins; else oc_ → chat_id, otherwise user_id.

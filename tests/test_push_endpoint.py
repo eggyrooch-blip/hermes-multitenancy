@@ -317,3 +317,18 @@ def test_push_feishu_missing_message_id_is_not_200(monkeypatch):
     app = _app(monkeypatch)
     status, _ = _post(app, _TEXT_BODY, headers=_AUTH)
     assert status == 502
+
+
+def test_push_text_content_missing_text_key_is_400(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pmr, "_feishu_sender", _recording_sender(calls))
+    monkeypatch.setattr(pmr, "_bot_credentials_resolver", _dummy_resolver)
+
+    app = _app(monkeypatch)
+    status, text = _post(
+        app,
+        {"target": "on_u", "msg_type": "text", "content": {"foo": "bar"}},
+        headers=_AUTH,
+    )
+    assert status == 400
+    assert not calls  # rejected before any Feishu call
