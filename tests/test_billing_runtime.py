@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import types
 
 import pytest
 
@@ -207,3 +208,100 @@ def test_billing_key_is_redacted_from_child_diagnostics():
     assert key not in redacted
     assert key[:12] not in redacted
     assert "[REDACTED:" in redacted
+
+
+def test_auxiliary_tasks_force_employee_key_and_restore_after_run():
+    from hermes_multitenancy.agent_real.billing_auxiliary import (
+        install_billing_auxiliary_runtime,
+    )
+
+    seen = {}
+    evicted = []
+
+    def task_resolver(*_args, **_kwargs):
+        return "openrouter", "task-model", "https://other/v1", "other-key", None
+
+    def provider_resolver(
+        provider,
+        model=None,
+        *,
+        explicit_base_url=None,
+        explicit_api_key=None,
+        api_mode=None,
+    ):
+        seen.update(
+            provider=provider,
+            model=model,
+            base_url=explicit_base_url,
+            api_key=explicit_api_key,
+            api_mode=api_mode,
+        )
+        return object(), model
+
+    fake = SimpleNamespace(
+        _resolve_task_provider_model=task_resolver,
+        resolve_provider_client=provider_resolver,
+        _evict_cached_clients=evicted.append,
+    )
+    cleanup = install_billing_auxiliary_runtime(
+        fake,
+        model="main-model",
+        base_url="https://litellm.example/v1",
+        api_key="employee-key",
+        api_mode="chat_completions",
+    )
+
+    assert fake._resolve_task_provider_model("compression") == (
+        "custom",
+        "task-model",
+        "https://litellm.example/v1",
+        "employee-key",
+        "chat_completions",
+    )
+    fake.resolve_provider_client("openrouter", "title-model")
+    assert seen == {
+        "provider": "custom",
+        "model": "title-model",
+        "base_url": "https://litellm.example/v1",
+        "api_key": "employee-key",
+        "api_mode": "chat_completions",
+    }
+
+    cleanup()
+    assert fake._resolve_task_provider_model is task_resolver
+    assert fake.resolve_provider_client is provider_resolver
+    assert evicted == ["custom"]
+
+
+def test_billing_delegation_guard_allows_model_only_and_rejects_credentials(
+    monkeypatch,
+):
+    from hermes_multitenancy.agent_real.run import _install_billing_delegation_guard
+
+    delegate = types.ModuleType("tools.delegate_tool")
+
+    def resolve(config, _parent):
+        return {
+            "model": config.get("model"),
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    delegate._resolve_delegation_credentials = resolve
+    tools_module = types.ModuleType("tools")
+    tools_module.delegate_tool = delegate
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
+    monkeypatch.setitem(sys.modules, "tools.delegate_tool", delegate)
+
+    cleanup = _install_billing_delegation_guard(True)
+    assert delegate._resolve_delegation_credentials(
+        {"model": "another-model"}, object()
+    )["model"] == "another-model"
+    with pytest.raises(ValueError, match="cannot override"):
+        delegate._resolve_delegation_credentials(
+            {"model": "another-model", "provider": "openrouter"}, object()
+        )
+    cleanup()
+    assert delegate._resolve_delegation_credentials is resolve

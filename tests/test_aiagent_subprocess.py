@@ -4570,6 +4570,14 @@ def test_run_with_aiagent_forces_employee_key_across_main_and_aux(monkeypatch, t
     fake_aux = ModuleType("agent.auxiliary_client")
     fake_aux.set_runtime_main = set_runtime_main
     fake_aux.clear_runtime_main = clear_runtime_main
+    fake_aux._resolve_task_provider_model = lambda *_args, **_kwargs: (
+        "auto", "aux-model", None, None, None
+    )
+    fake_aux.resolve_provider_client = lambda provider, model=None, **_kwargs: (
+        provider,
+        model,
+    )
+    fake_aux._evict_cached_clients = lambda _provider: None
     fake_agent_pkg = ModuleType("agent")
     fake_agent_pkg.auxiliary_client = fake_aux
     monkeypatch.setitem(sys.modules, "agent", fake_agent_pkg)
