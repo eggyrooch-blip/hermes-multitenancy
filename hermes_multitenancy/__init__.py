@@ -77,6 +77,18 @@ def _build_runtime_pool(runtime_factory):
 
 
 def register(ctx) -> None:
+    """Register the production isolation boundary or terminate startup."""
+    try:
+        _register(ctx)
+    except Exception as exc:
+        # The host treats plugin registration errors as optional.  Converting a
+        # multitenancy failure to SystemExit keeps production fail-closed
+        # without changing hermes-agent.
+        logger.critical("[multitenancy] required plugin registration failed: %s", type(exc).__name__)
+        raise SystemExit(1) from exc
+
+
+def _register(ctx) -> None:
     """Hermes plugin entry point — wires the multitenancy router to pre_gateway_dispatch.
 
     Called by Hermes plugin loader once at startup. ``ctx`` is a PluginContext

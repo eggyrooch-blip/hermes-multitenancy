@@ -75,6 +75,21 @@ def test_register_calls_register_hook_once():
     assert callable(cb)
 
 
+def test_register_terminates_when_required_boundary_fails(monkeypatch):
+    import hermes_multitenancy
+
+    monkeypatch.setattr(
+        hermes_multitenancy,
+        "_register",
+        lambda _ctx: (_ for _ in ()).throw(PermissionError("unreadable plugin file")),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        hermes_multitenancy.register(object())
+
+    assert exc.value.code == 1
+
+
 def test_register_adds_tencent_vod_image_provider_when_supported():
     """Newer Hermes plugin contexts expose register_image_gen_provider."""
     from hermes_multitenancy import register

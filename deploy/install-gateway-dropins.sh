@@ -9,6 +9,8 @@
 # rebuild) so the multitenancy drop-ins come back without forking the core.
 #
 # Currently installs:
+#   05-multitenancy-required.conf — fail startup when tenant isolation or the
+#       authenticated Run Broker is unavailable.
 #   45-meegle-bin.conf — pin a FAST meegle binary for the feishu-project connector
 #       reader (avoids the ~11s `npx -y` path that tripped the Connectors panel
 #       fail-safe). See deploy/README-meegle.md.
@@ -19,7 +21,20 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DROPIN_DIR="${HOME}/.config/systemd/user/hermes-gateway.service.d"
+HERMES_PYTHON="${HERMES_PYTHON:-${HOME}/.hermes/hermes-agent/venv/bin/python}"
 mkdir -p "$DROPIN_DIR"
+
+if [ ! -x "$HERMES_PYTHON" ]; then
+  echo "install-gateway-dropins: Hermes Python is not executable" >&2
+  exit 1
+fi
+
+# --- 05-multitenancy-required.conf -----------------------------------------
+sed "s#@PYTHON@#${HERMES_PYTHON}#g" \
+  "$REPO/deploy/hermes-gateway-multitenancy-required.conf" \
+  > "$DROPIN_DIR/05-multitenancy-required.conf"
+chmod 0644 "$DROPIN_DIR/05-multitenancy-required.conf"
+echo "install-gateway-dropins: wrote ${DROPIN_DIR}/05-multitenancy-required.conf"
 
 # --- 45-meegle-bin.conf (@REPO@ -> this checkout) ---------------------------
 sed "s#@REPO@#${REPO}#g" "$REPO/deploy/hermes-gateway-meegle.conf" \
