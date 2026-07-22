@@ -149,8 +149,9 @@ class BillingGatewayClient:
             if not isinstance(error, dict):
                 raise _GatewayError(int(exc.code), "invalid_error_envelope") from exc
             code = str(error.get("code") or "").strip()
+            message = str(error.get("message") or "").strip()
             retryable = error.get("retryable")
-            if not code or not isinstance(retryable, bool):
+            if not code or not message or not isinstance(retryable, bool):
                 raise _GatewayError(int(exc.code), "invalid_error_envelope") from exc
             raise _GatewayError(int(exc.code), code, retryable) from exc
         except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -232,6 +233,8 @@ class BillingCredentialManager:
             payload = self._finish_pending(payer, payload)
             if payload is not None:
                 binding = _binding_from_payload(payload)
+                if payload.pop("_probe_fallback", False):
+                    return binding
                 now = self._now_ms()
                 reason = force_reason or (
                     "invalid_401" if payload.get("invalid") else ""
@@ -329,10 +332,18 @@ class BillingCredentialManager:
                 self._probe(str(payload["api_key"]))
             except Exception:
                 previous = payload.get("previous_credential")
-                if isinstance(previous, dict):
+                if (
+                    isinstance(previous, dict)
+                    and not previous.get("invalid")
+                    and int(previous.get("expires_at") or 0) > self._now_ms()
+                ):
+                    self._validate_local_payload(previous, payer=payer)
                     self._save_payload(
                         payer.profile_name, payer.employee_user_id, previous
                     )
+                    fallback = dict(previous)
+                    fallback["_probe_fallback"] = True
+                    return fallback
                 else:
                     self._delete_payload(payer.profile_name, payer.employee_user_id)
                 raise RunRejected("billing credential validation failed")
@@ -620,6 +631,19 @@ def _allowed_billing_endpoint(left: str, right: str) -> bool:
         return False
     if configured.scheme not in {"http", "https"} or destination.scheme != configured.scheme:
         return False
+    if any(
+        (
+            configured.username,
+            configured.password,
+            configured.query,
+            configured.fragment,
+            destination.username,
+            destination.password,
+            destination.query,
+            destination.fragment,
+        )
+    ):
+        return False
     if not configured.netloc or configured.netloc.lower() != destination.netloc.lower():
         return False
     allowed = {
@@ -631,5 +655,3 @@ def _allowed_billing_endpoint(left: str, right: str) -> bool:
     }
     path = destination.path.rstrip("/") or "/"
     return any(path == prefix or path.startswith(prefix + "/") for prefix in allowed)
-
-
