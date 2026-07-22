@@ -132,13 +132,44 @@ def test_non_feishu_entrypoints_bill_profile_owner(
         profile_name="actor",
         user_key="untrusted-caller",
         content="hello",
-        chat_id="external",
-        metadata={},
+        # Non-Feishu metadata is caller-controlled and must not spoof the
+        # canonical owner of an existing Feishu group.
+        chat_id="oc_group",
+        metadata={"chat_type": "group", "sender_open_id": "ou_member"},
     )
 
     prepared = _identity_preparer(tmp_path).prepare(request)
 
     assert prepared.metadata["litellm_billing_employee_user_id"] == "actor"
+
+
+def test_auto_provisioned_non_sync_route_cannot_become_a_billing_payer(
+    tmp_path, monkeypatch
+):
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+    from hermes_multitenancy.run_broker import RunRejected
+
+    class UntrustedRouting(_Routing):
+        def resolve_owner_root(self, _open_id):
+            return None
+
+        def lookup_by_open_id(self, _open_id):
+            return SimpleNamespace(user_id="looks-real", profile_name="actor")
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    credentials = _FakeCredentials()
+    preparer = BillingIdentityPreparer(
+        routing=UntrustedRouting(),
+        store=BillingIdentityStore(tmp_path / "multitenancy.db"),
+        credentials=credentials,
+    )
+
+    with pytest.raises(RunRejected, match="could not be resolved"):
+        preparer.prepare(_request())
+    assert credentials.calls == []
 
 
 def test_enforced_state_never_reverts_when_global_switch_turns_off(tmp_path, monkeypatch):

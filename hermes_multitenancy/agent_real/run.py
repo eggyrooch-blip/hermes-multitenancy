@@ -440,37 +440,46 @@ def _run_with_aiagent(
         if _role_override:
             agent_kwargs["ephemeral_system_prompt"] = _role_override
 
-        approval_cleanup = _configure_gateway_approval_bridge(
-            event_sink,
-            str(gateway_session_key),
-        )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
-            profile_home,
-            blocked_env_names=(
-                _MODEL_ENV_ALLOWLIST if billing_enforced else frozenset()
-            ),
-        )
-        # Skill scope (能力随专家私有, sunke 2026-06-26): hide every NON-active
-        # expert skill (ALL of them on a non-expert run → byte-identical catalog)
-        # AND expose the active expert's private dirs. Hiding is a
-        # get_disabled_skill_names monkeypatch that works on UPSTREAM/prod core
-        # (which ignores HERMES_DISABLED_SKILLS_EXTRA); both patches are
-        # subprocess-local (fresh create_subprocess_exec child).
-        expert_skill_scope_cleanup = _pkg._apply_expert_skill_scope_for_aiagent(event, profile_home)
-        vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
-        delegation_guard_cleanup = _install_billing_delegation_guard(billing_enforced)
-        aux_runtime_cleanup = _sync_auxiliary_runtime_main_for_aiagent(
-            provider=provider,
-            model=model_only,
-            base_url=base_url,
-            api_key=api_key,
-            api_mode=str(runtime_kwargs.get("api_mode") or ""),
-            request_overrides={},
-            request_overrides_base_url="",
-            enforce_credentials=billing_enforced,
-        )
+        approval_cleanup = lambda: None
+        runtime_env_cleanup = lambda: None
+        expert_skill_scope_cleanup = lambda: None
+        vod_image_override_cleanup = lambda: None
+        delegation_guard_cleanup = lambda: None
+        aux_runtime_cleanup = lambda: None
         agent = None
         try:
+            approval_cleanup = _configure_gateway_approval_bridge(
+                event_sink,
+                str(gateway_session_key),
+            )
+            runtime_env_cleanup = _apply_runtime_env_for_aiagent(
+                profile_home,
+                blocked_env_names=(
+                    _MODEL_ENV_ALLOWLIST if billing_enforced else frozenset()
+                ),
+            )
+            # Skill scope (能力随专家私有, sunke 2026-06-26): hide every
+            # NON-active expert skill and expose the active expert's private
+            # dirs. These patches are subprocess-local.
+            expert_skill_scope_cleanup = (
+                _pkg._apply_expert_skill_scope_for_aiagent(event, profile_home)
+            )
+            vod_image_override_cleanup = (
+                _apply_vod_image_model_override_for_aiagent(user_text)
+            )
+            delegation_guard_cleanup = _install_billing_delegation_guard(
+                billing_enforced
+            )
+            aux_runtime_cleanup = _sync_auxiliary_runtime_main_for_aiagent(
+                provider=provider,
+                model=model_only,
+                base_url=base_url,
+                api_key=api_key,
+                api_mode=str(runtime_kwargs.get("api_mode") or ""),
+                request_overrides={},
+                request_overrides_base_url="",
+                enforce_credentials=billing_enforced,
+            )
             _register_aiagent_process_image_gen_providers()
             try:
                 agent = AIAgent(**agent_kwargs)

@@ -232,13 +232,17 @@ class BillingIdentityPreparer:
     def _payer(
         self, request: RunRequest, metadata: dict[str, Any]
     ) -> _ResolvedPayer | None:
+        # Only the Feishu adapter owns trusted chat topology.  WebUI/ingest
+        # callers can submit arbitrary metadata, so they must never be able to
+        # impersonate a group by supplying ``chat_type=group`` + ``chat_id``.
+        is_feishu = request.channel == "feishu"
         with self._routing_lock:
             owner_open_id = self._resolve_owner({
-                "chat_type": metadata.get("chat_type"),
-                "chat_id": request.chat_id,
+                "chat_type": metadata.get("chat_type") if is_feishu else "",
+                "chat_id": request.chat_id if is_feishu else "",
                 "sender_open_id": (
                     metadata.get("sender_open_id")
-                    if request.channel == "feishu"
+                    if is_feishu
                     else ""
                 ),
                 "profile": request.profile_name,
@@ -270,12 +274,14 @@ class BillingIdentityPreparer:
     def _employee_row(self, owner_open_id: Optional[str]) -> Any:
         if not owner_open_id:
             return None
-        for getter_name in ("resolve_owner_root", "lookup_by_open_id"):
-            getter = getattr(self._routing, getter_name, None)
-            row = getter(owner_open_id) if callable(getter) else None
-            user_id = str(getattr(row, "user_id", "") or "").strip() if row else ""
-            if _EMPLOYEE_ID_RE.fullmatch(user_id) and not user_id.startswith("ou_"):
-                return row
+        # Billing accepts only the org-sync-owned root.  Falling back to an
+        # arbitrary active route can turn a synthetic/auto-provisioned row into
+        # a real LiteLLM account, which violates the canonical payer boundary.
+        getter = getattr(self._routing, "resolve_owner_root", None)
+        row = getter(owner_open_id) if callable(getter) else None
+        user_id = str(getattr(row, "user_id", "") or "").strip() if row else ""
+        if _EMPLOYEE_ID_RE.fullmatch(user_id) and not user_id.startswith("ou_"):
+            return row
         return None
 
 

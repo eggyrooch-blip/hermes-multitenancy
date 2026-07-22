@@ -182,6 +182,11 @@ class BillingCredentialManager:
         self._probe = probe or self._probe_key
         self._locks_guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
+        # CredentialStore owns one check_same_thread=False SQLite connection.
+        # Per-payer locks do not protect two different employees running in
+        # parallel, so serialize the short vault transactions on that shared
+        # connection while keeping Gateway/model I/O concurrent by payer.
+        self._vault_lock = threading.RLock()
 
     def ensure_available(
         self,
@@ -483,20 +488,21 @@ class BillingCredentialManager:
 
     def _load_payload(self, profile_name: str, employee_id: str) -> dict[str, Any] | None:
         try:
-            status = self._vault.get_status(
-                profile_name=profile_name,
-                subject_id=employee_id,
-                provider=_PROVIDER,
-                secret_kind=_SECRET_KIND,
-            )
-            if status.get("status") == "missing":
-                return None
-            payload = self._vault.get_secret_for_runtime(
-                profile_name=profile_name,
-                subject_id=employee_id,
-                provider=_PROVIDER,
-                secret_kind=_SECRET_KIND,
-            )
+            with self._vault_lock:
+                status = self._vault.get_status(
+                    profile_name=profile_name,
+                    subject_id=employee_id,
+                    provider=_PROVIDER,
+                    secret_kind=_SECRET_KIND,
+                )
+                if status.get("status") == "missing":
+                    return None
+                payload = self._vault.get_secret_for_runtime(
+                    profile_name=profile_name,
+                    subject_id=employee_id,
+                    provider=_PROVIDER,
+                    secret_kind=_SECRET_KIND,
+                )
         except Exception as exc:
             raise RunRejected("billing credential vault is unavailable") from exc
         if not isinstance(payload, dict):
@@ -507,25 +513,27 @@ class BillingCredentialManager:
         self, profile_name: str, employee_id: str, payload: dict[str, Any]
     ) -> None:
         try:
-            self._vault.put_credential(
-                profile_name=profile_name,
-                subject_id=employee_id,
-                provider=_PROVIDER,
-                secret_kind=_SECRET_KIND,
-                payload=payload,
-                expires_at=int(payload["expires_at"]),
-            )
+            with self._vault_lock:
+                self._vault.put_credential(
+                    profile_name=profile_name,
+                    subject_id=employee_id,
+                    provider=_PROVIDER,
+                    secret_kind=_SECRET_KIND,
+                    payload=payload,
+                    expires_at=int(payload["expires_at"]),
+                )
         except Exception as exc:
             raise RunRejected("billing credential vault is unavailable") from exc
 
     def _delete_payload(self, profile_name: str, employee_id: str) -> None:
         try:
-            self._vault.delete_credential(
-                profile_name=profile_name,
-                subject_id=employee_id,
-                provider=_PROVIDER,
-                secret_kind=_SECRET_KIND,
-            )
+            with self._vault_lock:
+                self._vault.delete_credential(
+                    profile_name=profile_name,
+                    subject_id=employee_id,
+                    provider=_PROVIDER,
+                    secret_kind=_SECRET_KIND,
+                )
         except Exception as exc:
             raise RunRejected("billing credential vault is unavailable") from exc
 
