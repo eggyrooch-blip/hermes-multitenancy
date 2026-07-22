@@ -349,75 +349,45 @@ If sync goes wrong: stop the timer, inspect `pull-feishu --dry-run` and the late
 
 ### Optional LiteLLM employee billing layer
 
-The billing layer keeps one server-side LiteLLM key for Hermes while charging
-each run to a trusted employee identity. Multitenancy resolves the payer once
-at the Run Broker boundary, stores only the employee-to-LiteLLM user mapping,
-and forwards `X-Hermes-User-Id` only to approved protocol paths on the configured
-LiteLLM origin (`/v1` and `/anthropic` by default).
-Main agents, delegated agents, auxiliary model calls, Feishu groups, WebUI/SSE
-and ingest runs, cron jobs, and Kanban runs therefore inherit the same payer
-without per-profile API keys.
-Once a run is billing-bound, main fallback, delegated agents, and auxiliary
-calls fail closed if they try to leave that approved endpoint; headers are
-never silently removed while an unbilled model call continues.
-The optional `moa` toolset is disabled for billing-bound runs because its
-reference/aggregate calls currently connect to OpenRouter directly; it can be
-re-enabled only after those calls use the trusted billing transport.
+Billing-bound employees use a dedicated Hermes Key owned by their existing
+LiteLLM `user_id + team_id` membership. Multitenancy resolves the canonical
+payer before Run Broker admission, stores the one-time key response in the
+existing encrypted `CredentialStore`, and forces that key across main,
+title/compression, vision/media, warm-worker and delegated-agent model calls.
+It never holds a LiteLLM management key, calls LiteLLM admin APIs, injects
+billing headers, or installs a LiteLLM callback.
 
-Enable the identity path only after the LiteLLM management credential and the
-callback in `deploy/litellm/` are ready. Multitenancy queries/creates the user
-directly; AI-Gateway is not a runtime dependency:
+AI Gateway is the sole account/key control plane. Configure its private TLS
+broker endpoint and a dedicated service Bearer in the gateway systemd
+`EnvironmentFile` (mode `0600`), not in profile files:
 
 ```bash
 export HERMES_LITELLM_BILLING_ENABLED=true
+export HERMES_LITELLM_BILLING_PAYER_IDS="<employee-id-1>,<employee-id-2>"
 export HERMES_LITELLM_BILLING_BASE_URL="https://<litellm-host>/v1"
 export HERMES_LITELLM_BILLING_ALLOWED_PATHS="/v1,/anthropic"
-export HERMES_LITELLM_ADMIN_BASE_URL="https://<litellm-host>"
-export HERMES_LITELLM_ADMIN_KEY="<management-key>"
-export HERMES_LITELLM_DEFAULT_TEAM_ID="<fallback-team-id>"
-export HERMES_LITELLM_DEFAULT_TEAM_ALIAS="FD"
+export HERMES_AI_GATEWAY_BROKER_URL="https://<ai-gateway-private-host>"
+export HERMES_AI_GATEWAY_BROKER_TOKEN="<dedicated-hermes-service-bearer>"
+export HERMES_AI_GATEWAY_BROKER_TIMEOUT="5"
 export HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN="keep.com"
 export HERMES_ORG_SNAPSHOT_DIR="$HERMES_HOME/org-snapshots"
 ```
 
-On a missing local identity mapping, Multitenancy first queries `/user/list`
-with LiteLLM's tested maximum `page_size=100` until the exact email is found.
-Only a missing user triggers department-to-Team resolution from the trusted
-Feishu snapshot, `/team/list` (and `/team/new` when the alias is absent), then
-`/user/new` with `teams=[team_id]` and `auto_create_key=false`. Existing local
-mappings never call the management API. The management key stays server-side
-and is never copied into a Profile or model request. Before writing the Hermes
-active marker, `/user/info` supplies the complete existing metadata so SCIM and
-other fields are preserved.
+The first selected run calls versioned AI Gateway `ensure`, atomically saves the
+returned key, validates it with zero-consumption `GET /v1/models`, and ACKs the
+credential generation. Valid cached keys do not call AI Gateway. ACK loss is
+retried idempotently; renewal starts 23–30 days before expiry with stable payer
+jitter. A new/missing/expired payer fails closed when the broker is unavailable,
+while another payer with an unexpired cached key continues normally.
 
-Once loaded in LiteLLM, the callback is always active for model requests; it
-has no second enable flag that can drift from Multitenancy's
-`HERMES_LITELLM_BILLING_ENABLED`. The callback uses the existing spend log as
-the ledger and requires
-the proxy's shared Redis for cross-pod atomic reservations. Configure the one
-Hermes shared-key hash, employee email domain, and monthly budget in the
-LiteLLM deployment; do not set the shared key itself to the per-employee cap.
-Before enabling the callback on PostgreSQL, apply
-`deploy/litellm/migrations/001_employee_budget_spendlogs_index.sql` outside a
-transaction; it prevents each per-employee monthly reconciliation from scanning
-the full SpendLogs month. Each request then reconciles Redis upward from the
-current month's SpendLogs before reserving and uses a server-generated
-reservation id, which also replaces the request's SpendLog id for exact
-reconciliation. Known response costs settle immediately. An unknown failure or
-missing response cost remains pending until its request-correlated SpendLog row
-appears (or the billing period expires); this fails closed without converting
-the estimate into permanent "ghost" consumption or opening a timed bypass.
-Personal keys without a valid employee user are rejected by default. Intentional
-service-only keys must be audited and explicitly allowlisted by LiteLLM key hash
-in `HERMES_LITELLM_NON_EMPLOYEE_KEY_HASHES`. Shared-key rows receive
-`spend_logs_metadata.source=hermes`;
-prompt and response bodies remain disabled in spend logs.
-If Redis, pricing, employee identity, or account state cannot be verified, the
-managed employee request fails before a provider call. LiteLLM management/UI
-routes remain available after the model budget is reached. The Multitenancy
-account ensure operation clears legacy native user `max_budget` fields and marks the
-account `hermes_billing_active`; SCIM `scim_active=false` or an explicit false
-Hermes marker disables shared-key use for only that employee.
+Feishu DM bills the trusted sender; group/topic bills the group Agent owner;
+WebUI, cron, Kanban and shared Agents bill the routed profile/Agent owner.
+State moves only `legacy → enforced`: disabling the rollout flag stops new
+migrations but never sends an enforced payer back to the shared key. A 401 is
+repaired and retried once only before answer/tool side effects. Monthly-budget
+429 and ordinary rate-limit 429 are reported separately and never rotate keys.
+Credential overrides in delegated/auxiliary calls and the direct-OpenRouter
+`moa` toolset are blocked for enforced runs.
 
 Give every employee's Hermes consumption a place on the company AI leaderboard — one person's many agents (including group chats where the bot was `@`-mentioned) all roll up to them.
 
