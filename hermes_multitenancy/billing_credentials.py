@@ -27,6 +27,8 @@ _SECRET_KIND = "hermes_api_key"
 _DAY_MS = 24 * 60 * 60 * 1000
 _RENEW_WINDOW_MS = 30 * _DAY_MS
 _RENEW_JITTER_MS = 7 * _DAY_MS
+_ACK_RETRY_BACKOFF_MS = 5 * 60 * 1000
+_RENEW_RETRY_BACKOFF_MS = 6 * 60 * 60 * 1000
 
 @dataclass(frozen=True)
 class BillingIdentity:
@@ -126,7 +128,15 @@ class BillingGatewayClient:
         idempotency_key: str,
     ) -> dict[str, Any]:
         parsed = urlparse(self.base_url)
-        if parsed.scheme != "https" or not parsed.netloc or not self.token:
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or not self.token
+        ):
             raise _GatewayError(503, "broker_not_configured", True)
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -248,6 +258,8 @@ class BillingCredentialManager:
                     jitter = _renew_jitter_ms(payer.employee_user_id)
                     if int(payload["expires_at"]) - now > _RENEW_WINDOW_MS - jitter:
                         return binding
+                    if int(payload.get("renew_retry_after") or 0) > now:
+                        return binding
                     reason = "renewal"
                 elif not reason:
                     reason = "renewal"
@@ -278,6 +290,12 @@ class BillingCredentialManager:
                 and not current.get("invalid")
                 and int(current["expires_at"]) > self._now_ms()
             ):
+                current["renew_retry_after"] = (
+                    self._now_ms() + _RENEW_RETRY_BACKOFF_MS
+                )
+                self._save_payload(
+                    payer.profile_name, payer.employee_user_id, current
+                )
                 return _binding_from_payload(current)
             raise _gateway_rejection(exc) from exc
 
@@ -298,6 +316,10 @@ class BillingCredentialManager:
                 raise RunRejected("AI Gateway returned credential drift")
             self._validate_response_matches_local(common, current)
             current["invalid"] = False
+            if reason == "renewal":
+                current["renew_retry_after"] = (
+                    self._now_ms() + _RENEW_RETRY_BACKOFF_MS
+                )
             self._save_payload(payer.profile_name, payer.employee_user_id, current)
             return _binding_from_payload(current)
 
@@ -343,6 +365,9 @@ class BillingCredentialManager:
                     and int(previous.get("expires_at") or 0) > self._now_ms()
                 ):
                     self._validate_local_payload(previous, payer=payer)
+                    previous["renew_retry_after"] = (
+                        self._now_ms() + _RENEW_RETRY_BACKOFF_MS
+                    )
                     self._save_payload(
                         payer.profile_name, payer.employee_user_id, previous
                     )
@@ -357,6 +382,8 @@ class BillingCredentialManager:
             self._save_payload(payer.profile_name, payer.employee_user_id, payload)
         if not payload.get("ack_pending"):
             return payload
+        if int(payload.get("ack_retry_after") or 0) > self._now_ms():
+            return payload
         try:
             response = self._gateway.ack(payload)
         except _GatewayError as exc:
@@ -364,6 +391,12 @@ class BillingCredentialManager:
                 self._delete_payload(payer.profile_name, payer.employee_user_id)
                 return None
             if exc.retryable:
+                payload["ack_retry_after"] = (
+                    self._now_ms() + _ACK_RETRY_BACKOFF_MS
+                )
+                self._save_payload(
+                    payer.profile_name, payer.employee_user_id, payload
+                )
                 return payload
             raise _gateway_rejection(exc) from exc
         if (
@@ -377,6 +410,7 @@ class BillingCredentialManager:
         ):
             raise RunRejected("AI Gateway returned an invalid ACK")
         payload["ack_pending"] = False
+        payload.pop("ack_retry_after", None)
         self._save_payload(payer.profile_name, payer.employee_user_id, payload)
         return payload
 

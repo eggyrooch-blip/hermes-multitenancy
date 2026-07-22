@@ -284,9 +284,12 @@ def test_renewal_gateway_outage_keeps_unexpired_key(tmp_path):
     binding = manager.ensure_available(_payer(), None)
 
     reused = manager.ensure_available(_payer(), binding)
+    reused_again = manager.ensure_available(_payer(), binding)
 
     assert reused.key_id == binding.key_id
+    assert reused_again.key_id == binding.key_id
     assert gateway.ensure_calls[-1]["reason"] == "renewal"
+    assert len(gateway.ensure_calls) == 2
 
 
 def test_renewal_probe_failure_restores_unexpired_previous_key(tmp_path):
@@ -305,10 +308,28 @@ def test_renewal_probe_failure_restores_unexpired_previous_key(tmp_path):
     previous = manager.ensure_available(_payer(), None)
 
     reused = manager.ensure_available(_payer(), previous)
+    reused_again = manager.ensure_available(_payer(), previous)
 
     assert reused.key_id == previous.key_id
+    assert reused_again.key_id == previous.key_id
     assert len(gateway.ensure_calls) == 2
     assert manager.runtime_api_key(_metadata(reused)) == issued["api_key"]
+
+
+def test_ack_retryable_failure_uses_key_and_backs_off(tmp_path):
+    from hermes_multitenancy.billing_identity import _GatewayError
+
+    gateway = _FakeGateway(
+        [FIXTURE["ensure_issued_response"]],
+        ack_response=_GatewayError(503, "broker_unavailable", True),
+    )
+    manager = _manager(tmp_path, gateway)
+
+    binding = manager.ensure_available(_payer(), None)
+    reused = manager.ensure_available(_payer(), binding)
+
+    assert reused == binding
+    assert len(gateway.ack_calls) == 1
 
 
 def test_missing_gateway_outage_fails_only_that_payer(tmp_path):
@@ -498,6 +519,28 @@ def test_gateway_rejects_unknown_major_and_error_envelope():
         )
     assert caught.value.code == "identity_conflict"
     assert caught.value.retryable is False
+
+
+def test_gateway_rejects_credential_or_query_in_control_plane_url():
+    from hermes_multitenancy.billing_identity import BillingGatewayClient, _GatewayError
+
+    for base_url in (
+        "https://user:password@gateway.example",
+        "https://gateway.example?target=other",
+        "http://gateway.example",
+    ):
+        client = BillingGatewayClient(
+            base_url,
+            "token",
+            opener=lambda *_args, **_kwargs: pytest.fail("invalid URL must not open"),
+        )
+        with pytest.raises(_GatewayError, match="broker_not_configured"):
+            client.ensure(
+                employee_id="alice",
+                enterprise_email="alice@keep.com",
+                department_alias="FD",
+                reason="missing",
+            )
 
 
 def test_gateway_rejects_error_envelope_without_message():

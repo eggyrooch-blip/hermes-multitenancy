@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from types import SimpleNamespace
 import time
 
@@ -11,6 +12,7 @@ def test_credential_store_commit_guard_rolls_back(tmp_path):
     from hermes_multitenancy.credentials import CredentialStore
 
     store = CredentialStore(tmp_path / "multitenancy.db", encryption_key="test-key")
+    assert stat.S_IMODE((tmp_path / "multitenancy.db").stat().st_mode) == 0o600
     try:
         stored = store.put_credential(
             profile_name="owner",

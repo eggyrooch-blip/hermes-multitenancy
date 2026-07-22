@@ -60,6 +60,9 @@ class CredentialStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # This database contains encrypted credential payloads and must not
+        # inherit a service account's permissive umask when first created.
+        Path(self.db_path).chmod(0o600)
 
     def put_credential(
         self,
