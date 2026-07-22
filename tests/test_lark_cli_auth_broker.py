@@ -81,21 +81,23 @@ def _headers(key: str, **overrides: str) -> dict[str, str]:
     return headers
 
 
-def _store_uat(shared: Path, *, payload_user_open_id: str = "ou_alice") -> None:
+def _store_uat(shared: Path, *, payload_user_open_id: str | None = "ou_alice") -> None:
     from hermes_multitenancy.credentials import CredentialStore
 
     store = CredentialStore(shared / "multitenancy.db", encryption_key="test-key")
     try:
+        payload = {
+            "access_token": "uat-secret",
+            "refresh_token": "refresh-secret",
+        }
+        if payload_user_open_id is not None:
+            payload["user_open_id"] = payload_user_open_id
         store.put_credential(
             profile_name="alice",
             subject_id="ou_alice",
             provider="feishu",
             secret_kind="uat",
-            payload={
-                "user_open_id": payload_user_open_id,
-                "access_token": "uat-secret",
-                "refresh_token": "refresh-secret",
-            },
+            payload=payload,
         )
     finally:
         store.close()
@@ -775,6 +777,80 @@ def test_broker_rejects_uat_when_payload_user_open_id_does_not_match_context(
     _store_uat(shared, payload_user_open_id="ou_other")
     forwarded: list[object] = []
 
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=lambda *args: forwarded.append(args),
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 503
+    assert response.body == b"credential identity verification failed\n"
+    assert forwarded == []
+
+
+def test_broker_accepts_missing_payload_user_open_id_when_live_actor_matches(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_uat(shared, payload_user_open_id=None)
+    forwarded: list[object] = []
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=lambda *args: forwarded.append(args) or BrokerResponse(status=200, body=b"{}"),
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 200
+    assert len(forwarded) == 1
+
+
+def test_broker_rejects_missing_payload_user_open_id_when_live_actor_mismatches(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", lambda _token: {"open_id": "ou_other"})
+    shared = tmp_path / ".hermes"
+    _store_uat(shared, payload_user_open_id=None)
+    forwarded: list[object] = []
     broker = LarkCliAuthBroker(
         LarkCliAuthBrokerContext(
             shared_home=shared,

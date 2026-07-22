@@ -206,18 +206,24 @@ def _start_credential_renewal_subsystem() -> None:
 
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
-    if is_router_profile_runtime():
-        webui_broker_server.ensure_run_broker_server_started()
-        if not webui_broker_server.run_broker_server_ready():
-            logger.error("[multitenancy] run broker is not ready; dropping routed gateway event")
-            return {"action": "skip", "reason": "multitenancy run broker unavailable"}
-    gateway = kwargs.get("gateway")
-    if gateway is not None and may_own_cron_runtime():
-        try:
-            ensure_cron_worker_started(gateway)
-        except Exception:
-            logger.exception("[multitenancy] cron worker lazy-start failed")
-    return on_pre_gateway_dispatch(**kwargs)
+    try:
+        if is_router_profile_runtime():
+            webui_broker_server.ensure_run_broker_server_started()
+            if not webui_broker_server.run_broker_server_ready():
+                logger.error("[multitenancy] run broker is not ready; dropping routed gateway event")
+                return {"action": "skip", "reason": "multitenancy run broker unavailable"}
+        gateway = kwargs.get("gateway")
+        if gateway is not None and may_own_cron_runtime():
+            try:
+                ensure_cron_worker_started(gateway)
+            except Exception:
+                logger.exception("[multitenancy] cron worker lazy-start failed")
+        return on_pre_gateway_dispatch(**kwargs)
+    except Exception:
+        # Known-gotcha: Hermes treats a hook exception as no decision and falls
+        # through to the core agent, so this ownership boundary must return skip.
+        logger.exception("[multitenancy] pre_gateway_dispatch boundary failed; dropping event")
+        return {"action": "skip", "reason": "multitenancy router hook failed closed"}
 
 
 __all__ = ["register", "on_pre_gateway_dispatch", "_build_runtime_pool"]

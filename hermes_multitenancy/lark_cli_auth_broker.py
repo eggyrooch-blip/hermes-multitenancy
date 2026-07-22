@@ -431,7 +431,7 @@ def _first_token(payload: Mapping[str, object], keys: tuple[str, ...]) -> str:
 def _validate_user_payload_identity(payload: Mapping[str, object], expected_open_id: str) -> None:
     actual_open_id = str(payload.get("user_open_id") or "").strip()
     expected_open_id = str(expected_open_id or "").strip()
-    if not expected_open_id or actual_open_id != expected_open_id:
+    if not expected_open_id or (actual_open_id and actual_open_id != expected_open_id):
         raise CredentialIdentityVerificationError("credential identity mismatch")
 
 

@@ -188,6 +188,49 @@ def test_router_dispatch_fails_closed_before_core_when_run_broker_is_not_ready(m
     assert calls == ["ensure"]
 
 
+def test_router_dispatch_fails_closed_when_run_broker_ensure_raises(monkeypatch):
+    import hermes_multitenancy
+
+    calls: list[str] = []
+    monkeypatch.setattr(hermes_multitenancy, "is_router_profile_runtime", lambda: True)
+
+    def fail_ensure():
+        calls.append("ensure")
+        raise RuntimeError("broker startup failed")
+
+    monkeypatch.setattr(
+        hermes_multitenancy.webui_broker_server,
+        "ensure_run_broker_server_started",
+        fail_ensure,
+    )
+    monkeypatch.setattr(
+        hermes_multitenancy,
+        "on_pre_gateway_dispatch",
+        lambda **_kwargs: calls.append("dispatch") or {"action": "skip"},
+    )
+
+    result = hermes_multitenancy._dispatch_with_worker_init(event=object(), gateway=object())
+
+    assert result == {"action": "skip", "reason": "multitenancy router hook failed closed"}
+    assert calls == ["ensure"]
+
+
+def test_router_dispatch_fails_closed_when_route_hook_raises(monkeypatch):
+    import hermes_multitenancy
+
+    monkeypatch.setattr(hermes_multitenancy, "is_router_profile_runtime", lambda: False)
+    monkeypatch.setattr(hermes_multitenancy, "may_own_cron_runtime", lambda: False)
+    monkeypatch.setattr(
+        hermes_multitenancy,
+        "on_pre_gateway_dispatch",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("route hook failed")),
+    )
+
+    result = hermes_multitenancy._dispatch_with_worker_init(event=object(), gateway=object())
+
+    assert result == {"action": "skip", "reason": "multitenancy router hook failed closed"}
+
+
 def test_hook_callback_is_sync_def():
     """Critical: invoke_hook (plugins.py:954) calls cb(**kwargs) synchronously.
 

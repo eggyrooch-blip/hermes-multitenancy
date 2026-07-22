@@ -377,6 +377,9 @@ def test_readonly_lark_cli_denies_unlisted_gets_fail_closed(
     monkeypatch.setenv("HERMES_PROFILE", str(profile_home))
     monkeypatch.setenv("WORKSPACE", str(workspace))
     monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_user")
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
 
     for argv in (
         ["GET", "/open-apis/admin/v1/dangerous-read"],
@@ -425,6 +428,9 @@ def test_readonly_lark_cli_allows_get_read_query(
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setenv("HERMES_PROFILE", str(profile_home))
     monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
 
     out = _tool_json(
         lark_cli_tool._handle_lark_cli_execute(
@@ -462,6 +468,9 @@ def test_readonly_lark_cli_allows_bitable_read_prefix(
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
     monkeypatch.setenv("HERMES_PROFILE", str(profile_home))
     monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
 
     out = _tool_json(
         lark_cli_tool._handle_lark_cli_execute(

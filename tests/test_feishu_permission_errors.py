@@ -203,6 +203,8 @@ def _run_handler_with(monkeypatch, tmp_path, *, returncode: int, stdout: str, st
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("WORKSPACE", str(workspace))
     monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
     monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_test123")
 
     class Completed:

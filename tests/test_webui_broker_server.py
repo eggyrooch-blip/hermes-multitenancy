@@ -4780,14 +4780,17 @@ def test_start_run_broker_server_starts_with_key(monkeypatch):
     asyncio.run(runner())
 
 
-def test_ensure_run_broker_server_started_keeps_failed_task_not_ready(monkeypatch):
+def test_ensure_run_broker_server_started_clears_failed_task_and_retries(monkeypatch):
     import hermes_multitenancy.webui_broker_server as broker_mod
     from hermes_multitenancy.webui_broker import periphery
 
     monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
     monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
 
+    attempts: list[str] = []
+
     async def fail_start():
+        attempts.append("start")
         raise OSError("bind failed")
 
     monkeypatch.setattr(periphery, "start_run_broker_server", fail_start)
@@ -4795,15 +4798,58 @@ def test_ensure_run_broker_server_started_keeps_failed_task_not_ready(monkeypatc
     async def runner():
         await broker_mod.stop_run_broker_server()
         broker_mod.ensure_run_broker_server_started()
+        first_task = broker_mod._server_task
         await asyncio.sleep(0)
-        failed_task = broker_mod._server_task
-        assert failed_task is not None
-        assert failed_task.done()
+        await asyncio.sleep(0)
+        assert first_task is not None
+        assert first_task.done()
+        assert attempts == ["start"]
+        assert broker_mod._server_task is None
         assert broker_mod.run_broker_server_ready() is False
 
         broker_mod.ensure_run_broker_server_started()
-        assert broker_mod._server_task is failed_task
+        second_task = broker_mod._server_task
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert second_task is not None
+        assert second_task is not first_task
+        assert second_task.done()
+        assert attempts == ["start", "start"]
+        assert broker_mod._server_task is None
         await broker_mod.stop_run_broker_server()
+
+    asyncio.run(runner())
+
+
+def test_failed_run_broker_callback_does_not_clear_newer_task(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker import periphery
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+
+        async def fail_start():
+            raise OSError("old bind failed")
+
+        old_task = asyncio.create_task(fail_start())
+        try:
+            await old_task
+        except OSError:
+            pass
+        newer_task = asyncio.create_task(asyncio.sleep(60))
+        broker_mod._server_task = newer_task
+
+        periphery._log_run_broker_start_failure(old_task)
+
+        assert broker_mod._server_task is newer_task
+        newer_task.cancel()
+        try:
+            await newer_task
+        except asyncio.CancelledError:
+            pass
+        broker_mod._server_task = None
 
     asyncio.run(runner())
 

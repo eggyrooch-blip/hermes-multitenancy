@@ -2357,15 +2357,20 @@ def run_broker_server_ready() -> bool:
 
 
 def _log_run_broker_start_failure(task: asyncio.Task) -> None:
+    global _server_task
     try:
         error = task.exception()
     except asyncio.CancelledError:
+        if _server_task is task:
+            _server_task = None
         return
     if error is not None:
         logger.critical(
             "[multitenancy] WebUI run broker failed to start",
             exc_info=(type(error), error, error.__traceback__),
         )
+        if _server_task is task:
+            _server_task = None
 
 
 def ensure_run_broker_server_started() -> None:
