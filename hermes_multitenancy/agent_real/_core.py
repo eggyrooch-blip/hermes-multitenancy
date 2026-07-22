@@ -274,6 +274,40 @@ async def stream_run_agent(  # type: ignore[override]
         if final_text or content_parts:
             return
     except Exception as exc:
+        kind = _billing_failure_kind(event, exc)
+        retry_safe = (
+            getattr(exc, "billing_retry_safe", False) is True
+            and not content_parts
+            and tool_started_count == 0
+        )
+        if kind == "invalid_credential":
+            if retry_safe and not getattr(event, "_hermes_billing_retry", False):
+                try:
+                    _repair_billing_event(event)
+                except Exception as repair_exc:
+                    raise RuntimeError(
+                        _billing_failure_message(kind, retry_safe=True)
+                    ) from repair_exc
+                retry_stream = stream_run_agent(
+                    event,
+                    profile_home,
+                    messages=messages,
+                )
+                async for retry_kind, retry_payload in retry_stream:
+                    yield retry_kind, retry_payload
+                return
+            _mark_billing_event_invalid(event)
+            message = _billing_failure_message(kind, retry_safe=retry_safe)
+            if content_parts:
+                yield "content", f"\n\n{message}"
+                return
+            raise RuntimeError(message) from exc
+        if kind in {"budget_exceeded", "rate_limit"}:
+            message = _billing_failure_message(kind, retry_safe=retry_safe)
+            if content_parts:
+                yield "content", f"\n\n{message}"
+                return
+            raise RuntimeError(message) from exc
         logger.warning(
             "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
             exc, exc_info=True,
@@ -293,7 +327,7 @@ async def stream_run_agent(  # type: ignore[override]
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
             return
-        if _event_metadata(event).get("litellm_billing_user_id"):
+        if _event_metadata(event).get("litellm_billing_enforced") is True:
             raise RuntimeError(
                 "Billing-bound run cannot fall back to the unmetered legacy stream"
             ) from exc

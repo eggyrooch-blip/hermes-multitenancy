@@ -230,7 +230,9 @@ async def _stream_aiagent_subprocess(
     # continuation turn we reuse it. Appending ``:epoch:<ts>`` to the
     # canonical id yields a new session row in state.db after each ``/new``
     # while preserving session continuity within a chat-history run.
-    _is_session_start = messages is None or len(messages) <= 1
+    _is_session_start = (
+        messages is None or len(messages) <= 1
+    ) and not getattr(event, "_hermes_billing_retry", False)
     _chat_id_for_epoch = ""
     _source_for_epoch = getattr(event, "source", None)
     if _source_for_epoch is not None:
@@ -664,7 +666,7 @@ async def _stream_aiagent_subprocess(
             except json.JSONDecodeError:
                 logger.debug(
                     "[multitenancy] ignoring non-json child stream line: %r",
-                    _redact_ingest_runtime_text(text, event)[-500:],
+                    _redact_billing_runtime_text(text, event, env)[-500:],
                 )
                 continue
             event_name = data.get("event")
@@ -678,16 +680,19 @@ async def _stream_aiagent_subprocess(
             if event_name == "done":
                 saw_done = True
                 if data.get("error"):
-                    raise RuntimeError(
+                    raise _subprocess_failure(
                         "AIAgent subprocess failed: "
-                        f"{_redact_ingest_runtime_text(data['error'], event)}"
+                        f"{_redact_billing_runtime_text(data['error'], event, env)}",
+                        retry_safe=data.get("billing_retry_safe") is True,
                     )
                 logger.info(
                     "[multitenancy] AIAgent subprocess done elapsed=%.3fs result_len=%s",
                     time.monotonic() - started_at,
                     len(str(data.get("result") or "")),
                 )
-                raw_done_text = _redact_ingest_runtime_text(data.get("result"), event)
+                raw_done_text = _redact_billing_runtime_text(
+                    data.get("result"), event, env
+                )
                 pending_text = content_sanitizer.finish()
                 if (
                     pending_text
@@ -707,13 +712,15 @@ async def _stream_aiagent_subprocess(
                 continue
             if event_name == "content":
                 content_text = content_sanitizer.feed(
-                    _redact_ingest_runtime_text(data.get("text"), event)
+                    _redact_billing_runtime_text(data.get("text"), event, env)
                 )
                 if content_text:
                     _mirror.upsert_assistant(content_text, "")
                     yield "content", content_text
             elif event_name == "thinking":
-                thinking_text = _redact_ingest_runtime_text(data.get("text"), event)
+                thinking_text = _redact_billing_runtime_text(
+                    data.get("text"), event, env
+                )
                 _mirror.upsert_assistant("", thinking_text)
                 yield "thinking", thinking_text
             elif event_name in {
@@ -755,7 +762,9 @@ async def _stream_aiagent_subprocess(
         if not using_warm_worker:
             returncode = await asyncio.wait_for(proc.wait(), timeout=5)
             stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
-            redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
+            redacted_stderr_text = _redact_billing_runtime_text(
+                stderr_text, event, env
+            )
             if stderr_text:
                 logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
             logger.info(
