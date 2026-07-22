@@ -56,6 +56,10 @@ class CredentialExpiredError(PermissionError):
     """Terminal: stored UAT present but expired — re-auth required, never retry."""
 
 
+class CredentialIdentityVerificationError(PermissionError):
+    """Terminal: a UAT cannot be proven to belong to the routed Feishu actor."""
+
+
 @dataclass(frozen=True)
 class BrokerResponse:
     status: int
@@ -101,6 +105,8 @@ class LarkCliAuthBroker:
     ) -> None:
         self.context = context
         self.forwarder = forwarder or _urllib_forwarder
+        self._validated_user_token_fingerprints: set[bytes] = set()
+        self._user_identity_validation_lock = threading.Lock()
 
     def handle(
         self,
@@ -194,6 +200,8 @@ class LarkCliAuthBroker:
             try:
                 token = self._resolve_token(identity)
                 break
+            except CredentialIdentityVerificationError:
+                return _error(503, "credential identity verification failed")
             except CredentialExpiredError:
                 self._signal_credential_expiry()
                 return _error(503, "credential expired")
@@ -245,13 +253,13 @@ class LarkCliAuthBroker:
             store = CredentialStore(self.context.shared_home / "multitenancy.db")
         except Exception:
             if identity == "user" and json_payload:
-                return _first_token(json_payload, ("access_token", "user_access_token", "token"))
+                return self._validated_user_token(json_payload)
             raise PermissionError("credential unavailable")
 
         try:
             if identity == "user":
                 payload = self._resolve_user_payload(store, json_payload=json_payload)
-                return _first_token(payload, ("access_token", "user_access_token", "token"))
+                return self._validated_user_token(payload)
             payload = store.get_secret_for_runtime(
                 profile_name="__global__",
                 subject_id="feishu_app",
@@ -264,6 +272,28 @@ class LarkCliAuthBroker:
                 return _mint_tenant_access_token(payload, timeout=self.context.request_timeout_seconds)
         finally:
             store.close()
+
+    def _validated_user_token(self, payload: Mapping[str, object]) -> str:
+        _validate_user_payload_identity(payload, self.context.user_open_id)
+        token = _first_token(payload, ("access_token", "user_access_token", "token"))
+        fingerprint = hashlib.sha256(token.encode("utf-8")).digest()
+        with self._user_identity_validation_lock:
+            if fingerprint in self._validated_user_token_fingerprints:
+                return token
+            try:
+                from .feishu_uat_auth import _fetch_user_info
+
+                user_info = _fetch_user_info(token)
+            except Exception as exc:
+                raise CredentialIdentityVerificationError(
+                    "credential identity verification unavailable"
+                ) from exc
+            actual_open_id = str(user_info.get("open_id") or "").strip()
+            expected_open_id = str(self.context.user_open_id or "").strip()
+            if not expected_open_id or actual_open_id != expected_open_id:
+                raise CredentialIdentityVerificationError("credential identity mismatch")
+            self._validated_user_token_fingerprints.add(fingerprint)
+        return token
 
     def _resolve_user_payload(self, store: object, *, json_payload: dict | None = None) -> dict:
         from .credential_broker import BrokerClientError, fetch_via_broker, running_as_broker_child
@@ -396,6 +426,13 @@ def _first_token(payload: Mapping[str, object], keys: tuple[str, ...]) -> str:
         if value:
             return value
     raise PermissionError("credential payload does not contain a usable token")
+
+
+def _validate_user_payload_identity(payload: Mapping[str, object], expected_open_id: str) -> None:
+    actual_open_id = str(payload.get("user_open_id") or "").strip()
+    expected_open_id = str(expected_open_id or "").strip()
+    if not expected_open_id or actual_open_id != expected_open_id:
+        raise CredentialIdentityVerificationError("credential identity mismatch")
 
 
 _IM_READ_PATH_PREFIXES = (

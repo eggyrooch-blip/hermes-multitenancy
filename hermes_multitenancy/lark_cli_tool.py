@@ -423,6 +423,7 @@ def _broker_proxy_configured(env: dict[str, str]) -> bool:
     return bool(
         str(env.get("LARKSUITE_CLI_AUTH_PROXY") or "").strip()
         and str(env.get("LARKSUITE_CLI_PROXY_KEY") or "").strip()
+        and str(env.get("LARKSUITE_CLI_APP_ID") or "").strip()
     )
 
 
@@ -606,6 +607,8 @@ def _profile_runtime_error(env: dict[str, str]) -> str | None:
         return "lark-cli must run inside a routed profile runtime sandbox"
     if not workspace.is_relative_to(profile_home):
         return "lark-cli workspace must stay inside the current profile"
+    if not _broker_proxy_configured(env):
+        return "lark-cli auth broker is unavailable in the current profile runtime"
     return None
 
 

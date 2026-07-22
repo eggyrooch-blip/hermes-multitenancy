@@ -4773,8 +4773,37 @@ def test_start_run_broker_server_starts_with_key(monkeypatch):
             await broker_mod.start_run_broker_server()
             assert broker_mod._runner is not None
             assert broker_mod._site is not None
+            assert broker_mod.run_broker_server_ready() is True
         finally:
             await broker_mod.stop_run_broker_server()
+
+    asyncio.run(runner())
+
+
+def test_ensure_run_broker_server_started_keeps_failed_task_not_ready(monkeypatch):
+    import hermes_multitenancy.webui_broker_server as broker_mod
+    from hermes_multitenancy.webui_broker import periphery
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+
+    async def fail_start():
+        raise OSError("bind failed")
+
+    monkeypatch.setattr(periphery, "start_run_broker_server", fail_start)
+
+    async def runner():
+        await broker_mod.stop_run_broker_server()
+        broker_mod.ensure_run_broker_server_started()
+        await asyncio.sleep(0)
+        failed_task = broker_mod._server_task
+        assert failed_task is not None
+        assert failed_task.done()
+        assert broker_mod.run_broker_server_ready() is False
+
+        broker_mod.ensure_run_broker_server_started()
+        assert broker_mod._server_task is failed_task
+        await broker_mod.stop_run_broker_server()
 
     asyncio.run(runner())
 
@@ -4792,6 +4821,7 @@ def test_ensure_run_broker_server_started_is_noop_when_disabled(monkeypatch):
         assert broker_mod._server_task is None
         assert broker_mod._runner is None
         assert broker_mod._site is None
+        assert broker_mod.run_broker_server_ready() is False
 
     asyncio.run(runner())
 

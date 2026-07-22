@@ -208,6 +208,9 @@ def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
     if is_router_profile_runtime():
         webui_broker_server.ensure_run_broker_server_started()
+        if not webui_broker_server.run_broker_server_ready():
+            logger.error("[multitenancy] run broker is not ready; dropping routed gateway event")
+            return {"action": "skip", "reason": "multitenancy run broker unavailable"}
     gateway = kwargs.get("gateway")
     if gateway is not None and may_own_cron_runtime():
         try:

@@ -192,6 +192,9 @@ def test_lark_cli_tool_strict_mode_copies_run_token_into_authorized_env(monkeypa
     monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(shim_dir / "lark-cli"))
     monkeypatch.setenv(HERMES_LARK_CLI_REAL_BIN, str(real_binary))
     monkeypatch.setenv(HERMES_LARK_CLI_RUN_TOKEN, "run-token-secret")
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
 
     raw = lark_cli_tool._handle_lark_cli_execute(
         {
@@ -205,3 +208,36 @@ def test_lark_cli_tool_strict_mode_copies_run_token_into_authorized_env(monkeypa
 
     assert result["ok"] is True
     assert "TOOL:doctor" in result["stdout"]
+
+
+def test_lark_cli_tool_rejects_missing_auth_broker_even_when_strict_context_is_off(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_multitenancy import lark_cli_tool
+    from hermes_multitenancy.lark_cli_guard import HERMES_LARK_CLI_RUN_TOKEN
+
+    profile_home = tmp_path / "profile"
+    workspace = profile_home / "workspace"
+    workspace.mkdir(parents=True)
+    real_binary = _make_real_binary(tmp_path / "bin" / "real-lark-cli", sentinel="MUST_NOT_RUN")
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(real_binary))
+    monkeypatch.setenv(HERMES_LARK_CLI_RUN_TOKEN, "run-token-secret")
+    monkeypatch.delenv("LARKSUITE_CLI_AUTH_PROXY", raising=False)
+    monkeypatch.delenv("LARKSUITE_CLI_PROXY_KEY", raising=False)
+    monkeypatch.delenv("LARKSUITE_CLI_APP_ID", raising=False)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": ["doctor"],
+            "risk": "read",
+            "reason": "smoke",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["error"] == "lark-cli auth broker is unavailable in the current profile runtime"

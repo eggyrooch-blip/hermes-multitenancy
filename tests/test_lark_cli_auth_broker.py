@@ -11,6 +11,13 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stub_live_user_identity(monkeypatch):
+    from hermes_multitenancy import feishu_uat_auth
+
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", lambda _token: {"open_id": "ou_alice"})
+
+
 def _body_sha(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
@@ -74,7 +81,7 @@ def _headers(key: str, **overrides: str) -> dict[str, str]:
     return headers
 
 
-def _store_uat(shared: Path) -> None:
+def _store_uat(shared: Path, *, payload_user_open_id: str = "ou_alice") -> None:
     from hermes_multitenancy.credentials import CredentialStore
 
     store = CredentialStore(shared / "multitenancy.db", encryption_key="test-key")
@@ -84,7 +91,11 @@ def _store_uat(shared: Path) -> None:
             subject_id="ou_alice",
             provider="feishu",
             secret_kind="uat",
-            payload={"access_token": "uat-secret", "refresh_token": "refresh-secret"},
+            payload={
+                "user_open_id": payload_user_open_id,
+                "access_token": "uat-secret",
+                "refresh_token": "refresh-secret",
+            },
         )
     finally:
         store.close()
@@ -748,6 +759,168 @@ def test_broker_injects_user_uat_and_strips_client_auth_headers(monkeypatch, tmp
     assert forwarded_headers["Authorization"] == "Bearer uat-secret"
     assert "X-Lark-MCP-UAT" not in forwarded_headers
     assert "X-Lark-Proxy-Signature" not in forwarded_headers
+
+
+def test_broker_rejects_uat_when_payload_user_open_id_does_not_match_context(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    _store_uat(shared, payload_user_open_id="ou_other")
+    forwarded: list[object] = []
+
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=lambda *args: forwarded.append(args),
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 503
+    assert response.body == b"credential identity verification failed\n"
+    assert forwarded == []
+
+
+def test_broker_rejects_uat_when_live_user_info_actor_does_not_match_context(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", lambda _token: {"open_id": "ou_other"})
+    shared = tmp_path / ".hermes"
+    _store_uat(shared)
+    forwarded: list[object] = []
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=lambda *args: forwarded.append(args),
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 503
+    assert response.body == b"credential identity verification failed\n"
+    assert forwarded == []
+
+
+def test_broker_rejects_uat_when_live_user_info_is_unavailable(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+
+    def unavailable(_token):
+        raise OSError("user_info unavailable")
+
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", unavailable)
+    shared = tmp_path / ".hermes"
+    _store_uat(shared)
+    forwarded: list[object] = []
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=lambda *args: forwarded.append(args),
+    )
+
+    response = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert response.status == 503
+    assert response.body == b"credential identity verification failed\n"
+    assert forwarded == []
+
+
+def test_broker_caches_live_user_info_validation_for_same_token(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import feishu_uat_auth
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        BrokerResponse,
+        LarkCliAuthBroker,
+        LarkCliAuthBrokerContext,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    probes: list[str] = []
+
+    def fetch_user_info(token):
+        probes.append(token)
+        return {"open_id": "ou_alice"}
+
+    monkeypatch.setattr(feishu_uat_auth, "_fetch_user_info", fetch_user_info)
+    shared = tmp_path / ".hermes"
+    _store_uat(shared)
+    forwarded: list[object] = []
+    broker = LarkCliAuthBroker(
+        LarkCliAuthBrokerContext(
+            shared_home=shared,
+            profile_name="alice",
+            user_open_id="ou_alice",
+            hmac_key="proxy-key",
+            allowed_identities=frozenset({"user"}),
+        ),
+        forwarder=lambda *args: forwarded.append(args) or BrokerResponse(status=200, body=b"{}"),
+    )
+
+    first = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+    second = broker.handle(
+        method="GET",
+        path_and_query="/open-apis/authen/v1/user_info",
+        headers=_headers("proxy-key"),
+        body=b"",
+    )
+
+    assert first.status == second.status == 200
+    assert probes == ["uat-secret"]
+    assert len(forwarded) == 2
 
 
 def test_broker_rejects_bad_hmac_before_forwarding(monkeypatch, tmp_path: Path):

@@ -2332,8 +2332,9 @@ async def start_run_broker_server() -> None:
     app = _m.create_run_broker_app()
     _runner = web.AppRunner(app)
     await _runner.setup()
-    _site = web.TCPSite(_runner, _m._run_broker_host(), _run_broker_port())
-    await _site.start()
+    site = web.TCPSite(_runner, _m._run_broker_host(), _run_broker_port())
+    await site.start()
+    _site = site
     logger.info(
         "[multitenancy] WebUI run broker listening on http://%s:%s/api/run-broker/runs",
         _m._run_broker_host(),
@@ -2341,12 +2342,38 @@ async def start_run_broker_server() -> None:
     )
 
 
+def run_broker_server_ready() -> bool:
+    """Return true only after the enabled broker completed a successful bind."""
+    if not _truthy_env("HERMES_MULTITENANCY_RUN_BROKER_SERVER"):
+        return False
+    task = _server_task
+    if task is not None and task.done():
+        try:
+            if task.exception() is not None:
+                return False
+        except asyncio.CancelledError:
+            return False
+    return _runner is not None and _site is not None
+
+
+def _log_run_broker_start_failure(task: asyncio.Task) -> None:
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is not None:
+        logger.critical(
+            "[multitenancy] WebUI run broker failed to start",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+
 def ensure_run_broker_server_started() -> None:
     """Schedule the optional WebUI run broker sidecar when enabled."""
     global _server_task
     if not _truthy_env("HERMES_MULTITENANCY_RUN_BROKER_SERVER"):
         return
-    if _server_task is not None and not _server_task.done():
+    if run_broker_server_ready() or _server_task is not None:
         return
     try:
         loop = asyncio.get_running_loop()
@@ -2354,6 +2381,7 @@ def ensure_run_broker_server_started() -> None:
         logger.debug("[multitenancy] no running loop; WebUI run broker sidecar not started")
         return
     _server_task = loop.create_task(start_run_broker_server())
+    _server_task.add_done_callback(_log_run_broker_start_failure)
 
 
 async def stop_run_broker_server() -> None:

@@ -6,6 +6,13 @@ import types
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _broker_env(monkeypatch):
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
+
+
 def test_lark_cli_tool_registers_with_hermes_registry_when_available(monkeypatch):
     calls = []
 
@@ -681,7 +688,7 @@ def test_lark_cli_tool_refuses_personal_bot_im_send_when_broker_proxy_absent(
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result.get("ok") is not True
-    assert "limited to owner mapped group chats" in (result.get("error") or "")
+    assert result.get("error") == "lark-cli auth broker is unavailable in the current profile runtime"
 
 
 def test_lark_cli_tool_refuses_personal_bot_im_send_no_broker_even_when_risk_read(
@@ -727,7 +734,7 @@ def test_lark_cli_tool_refuses_personal_bot_im_send_no_broker_even_when_risk_rea
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result.get("ok") is not True
-    assert "limited to owner mapped group chats" in (result.get("error") or "")
+    assert result.get("error") == "lark-cli auth broker is unavailable in the current profile runtime"
 
 
 def test_lark_cli_tool_keeps_user_coerced_read_when_requested_identity_is_bot(
