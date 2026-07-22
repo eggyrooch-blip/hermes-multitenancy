@@ -2916,13 +2916,19 @@ def _sync_auxiliary_runtime_main_for_aiagent(
     if enforce_credentials:
         from .billing_auxiliary import install_billing_auxiliary_runtime
 
-        billing_cleanup = install_billing_auxiliary_runtime(
-            auxiliary_client,
-            model=model,
-            base_url=base_url or "",
-            api_key=api_key if isinstance(api_key, str) else "",
-            api_mode=api_mode or "",
-        )
+        try:
+            billing_cleanup = install_billing_auxiliary_runtime(
+                auxiliary_client,
+                model=model,
+                base_url=base_url or "",
+                api_key=api_key if isinstance(api_key, str) else "",
+                api_mode=api_mode or "",
+            )
+        except Exception:
+            clear = getattr(auxiliary_client, "clear_runtime_main", None)
+            if callable(clear):
+                clear()
+            raise
 
     clear_runtime_main = getattr(auxiliary_client, "clear_runtime_main", None)
 

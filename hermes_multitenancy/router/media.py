@@ -1024,6 +1024,7 @@ def _install_auxiliary_main_runtime_patch(
     api_mode = runtime.get("api_mode", "")
     billing_enforced = (billing_metadata or {}).get("litellm_billing_enforced") is True
     if billing_enforced:
+        from ..agent_real.billing_auxiliary import install_billing_auxiliary_runtime
         from ..billing_identity import (
             billing_endpoint_allowed,
             billing_runtime_for_image_prep,
@@ -1036,10 +1037,21 @@ def _install_auxiliary_main_runtime_patch(
                 "Billing-bound image preprocessing cannot use an unapproved endpoint"
             )
         api_key = billed["api_key"]
+        try:
+            billing_cleanup = install_billing_auxiliary_runtime(
+                auxiliary_client,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                api_mode=api_mode,
+            )
+        except Exception as exc:
+            raise RunRejected(
+                "Billing-bound image preprocessing runtime is unavailable"
+            ) from exc
+        saved["__billing_cleanup__"] = (True, billing_cleanup)
 
     set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
-    if billing_enforced and (not callable(set_runtime_main) or not api_key):
-        raise RunRejected("Billing-bound image preprocessing runtime is unavailable")
     if callable(set_runtime_main) and api_key:
         try:
             set_runtime_main(
@@ -1051,29 +1063,15 @@ def _install_auxiliary_main_runtime_patch(
                 request_overrides={},
                 request_overrides_base_url="",
             )
-        except TypeError as exc:
-            if billing_enforced:
-                raise RunRejected(
-                    "Billing-bound image preprocessing runtime is unavailable"
-                ) from exc
+        except TypeError:
             try:
-                set_runtime_main(
-                    provider,
-                    model,
-                    base_url=base_url,
-                    api_key=api_key,
-                    api_mode=api_mode,
-                )
+                set_runtime_main(provider, model)
             except Exception as fallback_exc:
                 _m.logger.debug(
                     "multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)",
                     fallback_exc,
                 )
         except Exception as exc:
-            if billing_enforced:
-                raise RunRejected(
-                    "Billing-bound image preprocessing runtime is unavailable"
-                ) from exc
             _m.logger.debug("multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)", exc)
 
     setattr(auxiliary_client, "_read_main_provider", lambda: provider)
@@ -1184,6 +1182,9 @@ def _install_vision_task_endpoint_override(runtime: Optional[dict[str, str]]) ->
 def _restore_auxiliary_main_runtime_patch(auxiliary_client: Optional[Any], saved: dict[str, tuple[bool, Any]]) -> None:
     if auxiliary_client is None:
         return
+    cleanup_entry = saved.pop("__billing_cleanup__", None)
+    if cleanup_entry is not None and callable(cleanup_entry[1]):
+        cleanup_entry[1]()
     for name, (had_attr, value) in saved.items():
         try:
             if had_attr:

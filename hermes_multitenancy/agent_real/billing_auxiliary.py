@@ -67,6 +67,9 @@ def install_billing_auxiliary_runtime(
             auxiliary_client.resolve_provider_client = provider_resolver
         evict = getattr(auxiliary_client, "_evict_cached_clients", None)
         if callable(evict):
-            evict("custom")
+            try:
+                evict("custom")
+            except Exception:
+                pass
 
     return cleanup
