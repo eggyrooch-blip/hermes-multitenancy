@@ -97,31 +97,40 @@ def _run_payload(
         messages = None
 
     event_stream = os.getenv("HERMES_AIAGENT_EVENT_STREAM") == "1"
+    billing_retry_safe = True
 
     def emit(event: str, **payload) -> None:
         protocol_stdout.write(json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n")
         protocol_stdout.flush()
 
+    def track(event_name: str, **event_payload) -> None:
+        nonlocal billing_retry_safe
+        if event_name in {"content", "tool_started", "tool_completed"}:
+            billing_retry_safe = False
+        if event_stream:
+            emit(event_name, **event_payload)
+
     try:
         sys.stdout = sys.stderr
         usage: dict = {}
+        if messages is None:
+            result = _run_with_aiagent(
+                event,
+                profile_home,
+                event_sink=track,
+                usage_sink=usage,
+            )
+        else:
+            result = _run_with_aiagent(
+                event,
+                profile_home,
+                messages=messages,
+                event_sink=track,
+                usage_sink=usage,
+            )
         if event_stream:
-            if messages is None:
-                result = _run_with_aiagent(event, profile_home, event_sink=emit, usage_sink=usage)
-            else:
-                result = _run_with_aiagent(
-                    event,
-                    profile_home,
-                    messages=messages,
-                    event_sink=emit,
-                    usage_sink=usage,
-                )
             out = {"event": "done", "result": result or "", "error": None}
         else:
-            if messages is None:
-                result = _run_with_aiagent(event, profile_home, usage_sink=usage)
-            else:
-                result = _run_with_aiagent(event, profile_home, messages=messages, usage_sink=usage)
             out = {"result": result or "", "error": None}
         if usage:
             out["usage"] = usage
@@ -131,11 +140,13 @@ def _run_payload(
                 "event": "done",
                 "result": "",
                 "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                "billing_retry_safe": billing_retry_safe,
             }
         else:
             out = {
                 "result": "",
                 "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                "billing_retry_safe": billing_retry_safe,
             }
     finally:
         sys.stdout = protocol_stdout

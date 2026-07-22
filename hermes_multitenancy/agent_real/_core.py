@@ -345,19 +345,44 @@ async def real_run_agent(
     fallback path still answers the user — without tools, but at least with
     a coherent reply.
     """
-    try:
-        if messages is not None:
-            return await _run_aiagent_subprocess(event, profile_home, messages=messages)
-        return await _run_aiagent_subprocess(event, profile_home)
-    except Exception as exc:
-        logger.warning(
-            "[multitenancy] AIAgent path failed (%s); falling back to legacy spike",
-            exc, exc_info=True,
-        )
-        if _event_metadata(event).get("litellm_billing_user_id"):
-            raise RuntimeError(
-                "Billing-bound run cannot fall back to the unmetered legacy runner"
-            ) from exc
+    billing_retried = False
+    while True:
+        try:
+            if messages is not None:
+                return await _run_aiagent_subprocess(
+                    event, profile_home, messages=messages
+                )
+            return await _run_aiagent_subprocess(event, profile_home)
+        except Exception as exc:
+            kind = _billing_failure_kind(event, exc)
+            retry_safe = getattr(exc, "billing_retry_safe", False) is True
+            if kind == "invalid_credential":
+                if retry_safe and not billing_retried:
+                    try:
+                        _repair_billing_event(event)
+                    except Exception as repair_exc:
+                        raise RuntimeError(
+                            _billing_failure_message(kind, retry_safe=True)
+                        ) from repair_exc
+                    billing_retried = True
+                    continue
+                _mark_billing_event_invalid(event)
+                raise RuntimeError(
+                    _billing_failure_message(kind, retry_safe=retry_safe)
+                ) from exc
+            if kind in {"budget_exceeded", "rate_limit"}:
+                raise RuntimeError(
+                    _billing_failure_message(kind, retry_safe=retry_safe)
+                ) from exc
+            logger.warning(
+                "[multitenancy] AIAgent path failed (%s); falling back to legacy spike",
+                exc, exc_info=True,
+            )
+            if _event_metadata(event).get("litellm_billing_enforced") is True:
+                raise RuntimeError(
+                    "Billing-bound run cannot fall back to the unmetered legacy runner"
+                ) from exc
+            break
     # Legacy / fallback path — no tool-loop, but still answers.
     return await _legacy_real_run_agent(event, profile_home, messages=messages)
 
@@ -491,6 +516,61 @@ def _event_metadata(event: Any) -> dict[str, Any]:
         return {}
     metadata = raw_event.get("metadata")
     return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _billing_failure_kind(event: Any, error: Any) -> str:
+    metadata = _event_metadata(event)
+    if metadata.get("litellm_billing_enforced") is not True:
+        return ""
+    from ..billing_identity import classify_litellm_error
+
+    return classify_litellm_error(error)
+
+
+def _repair_billing_event(event: Any) -> None:
+    from ..billing_identity import repair_billing_metadata
+
+    raw_event = getattr(event, "raw_event", None)
+    raw = dict(raw_event) if isinstance(raw_event, dict) else {}
+    raw["metadata"] = repair_billing_metadata(_event_metadata(event))
+    event.raw_event = raw
+    # A streaming retry must reuse the session epoch created by the first
+    # attempt instead of looking like another fresh conversation.
+    event._hermes_billing_retry = True
+
+
+def _mark_billing_event_invalid(event: Any) -> None:
+    from ..billing_identity import mark_billing_credential_invalid
+
+    mark_billing_credential_invalid(_event_metadata(event))
+
+
+def _billing_failure_message(kind: str, *, retry_safe: bool) -> str:
+    if kind == "budget_exceeded":
+        return "该员工本月 LiteLLM 额度已用尽，请联系管理员调整额度或等待下月重置。"
+    if kind == "rate_limit":
+        return "LiteLLM 当前请求过于频繁，请稍后再试。"
+    if kind == "invalid_credential" and not retry_safe:
+        return "员工计费凭证已失效；为避免重复执行工具，本次未自动重试，请重新发送请求。"
+    return "员工计费凭证暂不可用，请稍后重试。"
+
+
+def _subprocess_failure(message: str, *, retry_safe: bool = False) -> RuntimeError:
+    error = RuntimeError(message)
+    error.billing_retry_safe = bool(retry_safe)  # type: ignore[attr-defined]
+    return error
+
+
+def _redact_billing_runtime_text(value: Any, event: Any, env: Mapping[str, str]) -> str:
+    text = _redact_ingest_runtime_text(value, event)
+    secret = str(env.get("HERMES_LITELLM_RUNTIME_API_KEY") or "")
+    if secret:
+        text = text.replace(secret, "[REDACTED:litellm_billing_key]")
+        if len(secret) >= 16:
+            text = text.replace(
+                secret[:12], "[REDACTED:litellm_billing_key:prefix]"
+            )
+    return text
 
 
 def _expert_id_for_event(event: Any) -> str:
@@ -3534,8 +3614,8 @@ async def _run_aiagent_subprocess(
 
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     stdout_text = stdout.decode("utf-8", errors="replace").strip()
-    redacted_stderr_text = _redact_ingest_runtime_text(stderr_text, event)
-    redacted_stdout_text = _redact_ingest_runtime_text(stdout_text, event)
+    redacted_stderr_text = _redact_billing_runtime_text(stderr_text, event, env)
+    redacted_stdout_text = _redact_billing_runtime_text(stdout_text, event, env)
     if stderr_text:
         logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
 
@@ -3548,40 +3628,18 @@ async def _run_aiagent_subprocess(
         ) from exc
 
     if proc.returncode != 0:
-        child_error = _redact_ingest_runtime_text(data.get("error") or "", event)
-        raise RuntimeError(
+        child_error = _redact_billing_runtime_text(data.get("error") or "", event, env)
+        raise _subprocess_failure(
             f"AIAgent subprocess exited {proc.returncode}: "
-            f"{child_error or redacted_stderr_text or redacted_stdout_text}"
+            f"{child_error or redacted_stderr_text or redacted_stdout_text}",
+            retry_safe=data.get("billing_retry_safe") is True,
         )
     if data.get("error"):
-        # A stale/expired LiteLLM key may be repaired once before surfacing the
-        # failure. Budget exhaustion is deliberately never retried or routed to
-        # an ambient/shared key (fail-closed).
-        from ..billing_identity import classify_litellm_error, repair_billing_metadata
         error_text = str(data.get("error") or "")
-        error_kind = classify_litellm_error(error_text)
-        metadata = dict(_event_metadata(event))
-        if (
-            error_kind == "invalid_credential"
-            and metadata.get("litellm_billing_enforced") is True
-            and not metadata.get("_hermes_billing_repaired")
-        ):
-            try:
-                repaired = repair_billing_metadata(metadata)
-                repaired["_hermes_billing_repaired"] = True
-                import copy
-                retry_event = copy.copy(event)
-                retry_event.metadata = repaired
-                return await _run_aiagent_subprocess(
-                    retry_event, profile_home, messages=messages
-                )
-            except Exception:
-                logger.warning("[multitenancy] billing key repair failed", exc_info=True)
-        if error_kind == "budget_exceeded" and metadata.get("litellm_billing_enforced") is True:
-            raise RuntimeError("LiteLLM monthly budget exhausted; billing run blocked")
-        raise RuntimeError(
+        raise _subprocess_failure(
             "AIAgent subprocess failed: "
-            f"{_redact_ingest_runtime_text(error_text, event)}"
+            f"{_redact_billing_runtime_text(error_text, event, env)}",
+            retry_safe=data.get("billing_retry_safe") is True,
         )
     _write_token_ledger_from_child(event, profile_home, data.get("usage"))
     return str(data.get("result") or "")
