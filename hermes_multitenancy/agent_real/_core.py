@@ -2816,7 +2816,12 @@ def _install_ingest_secret_env_passthrough(env: Optional[Mapping[str, str]] = No
         logger.debug("[multitenancy] ingest secret env passthrough skipped", exc_info=True)
 
 
-def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[str, str]] = None):
+def _apply_runtime_env_for_aiagent(
+    profile_home: Path,
+    extra_env: Optional[dict[str, str]] = None,
+    *,
+    blocked_env_names: frozenset[str] = frozenset(),
+):
     """Temporarily expose profile/credential env for in-process AIAgent runs."""
     runtime_env = _profile_env_for_aiagent(profile_home)
     profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
@@ -2832,6 +2837,8 @@ def _apply_runtime_env_for_aiagent(profile_home: Path, extra_env: Optional[dict[
     runtime_env.update(_force_env_for_terminal_passthrough(credential_env))
     runtime_env.update(_browser_env_for_aiagent(profile_home))
     runtime_env.update({str(k): str(v) for k, v in (extra_env or {}).items() if str(k).strip()})
+    for name in blocked_env_names:
+        runtime_env.pop(name, None)
     if not runtime_env:
         return lambda: None
     old_env = {key: os.environ.get(key) for key in runtime_env}

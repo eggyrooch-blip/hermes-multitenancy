@@ -112,6 +112,11 @@ def _run_with_aiagent(
                 "Billing-bound run cannot use an unapproved LiteLLM endpoint"
             )
         api_key = billing_runtime["api_key"]
+        # Ambient/profile provider keys remain useful for legacy runs, but an
+        # enforced child must not discover or fall back to them. The warm
+        # worker's outer environment scope restores the next run wholesale.
+        for env_name in _MODEL_ENV_ALLOWLIST:
+            os.environ.pop(env_name, None)
     if not api_key:
         raise RuntimeError(f"no API key for primary provider {provider!r}")
 
@@ -439,7 +444,12 @@ def _run_with_aiagent(
             event_sink,
             str(gateway_session_key),
         )
-        runtime_env_cleanup = _apply_runtime_env_for_aiagent(profile_home)
+        runtime_env_cleanup = _apply_runtime_env_for_aiagent(
+            profile_home,
+            blocked_env_names=(
+                _MODEL_ENV_ALLOWLIST if billing_enforced else frozenset()
+            ),
+        )
         # Skill scope (能力随专家私有, sunke 2026-06-26): hide every NON-active
         # expert skill (ALL of them on a non-expert run → byte-identical catalog)
         # AND expose the active expert's private dirs. Hiding is a
