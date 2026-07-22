@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import asyncio
+import io
 import json
+from pathlib import Path
+import threading
 from types import SimpleNamespace
+import urllib.error
 
 import pytest
 
 
-class _Store:
-    def __init__(self):
-        self.values = {}
-
-    def get(self, employee_user_id):
-        return self.values.get(employee_user_id)
-
-    def put(self, identity):
-        self.values[identity.employee_user_id] = identity
+FIXTURE = json.loads(
+    (Path(__file__).parent / "contract_fixtures/hermes_credentials_v1.json").read_text()
+)
+NOW_MS = 1_800_000_000_000
+VAULT_KEY = "billing-test-vault-key"
 
 
 class _Routing:
@@ -23,20 +22,20 @@ class _Routing:
         self.group_owner = "ou_owner"
         self.profile_owner = "ou_actor"
         self.users = {
-            "ou_actor": "actor",
-            "ou_owner": "owner",
-            "ou_member": "member",
+            "ou_actor": ("actor", "actor"),
+            "ou_owner": ("owner", "owner"),
+            "ou_member": ("member", "member"),
         }
 
     def lookup_by_chat_id(self, chat_id):
         return SimpleNamespace(owner_open_id=self.group_owner) if chat_id == "oc_group" else None
 
-    def lookup_by_profile_name(self, profile_name):
+    def lookup_by_profile_name(self, _profile_name):
         return SimpleNamespace(owner_open_id=self.profile_owner, open_id=self.profile_owner)
 
     def resolve_owner_root(self, open_id):
-        user_id = self.users.get(open_id)
-        return SimpleNamespace(user_id=user_id) if user_id else None
+        value = self.users.get(open_id)
+        return SimpleNamespace(user_id=value[0], profile_name=value[1]) if value else None
 
     def lookup_by_open_id(self, open_id):
         return self.resolve_owner_root(open_id)
@@ -55,386 +54,403 @@ def _request(*, chat_type="p2p", sender="ou_actor", chat_id="oc_dm"):
     )
 
 
-def _preparer(routing=None):
-    from hermes_multitenancy.billing_identity import BillingIdentityPreparer
+class _FakeCredentials:
+    def __init__(self):
+        self.calls = []
 
-    calls = []
+    def ensure_available(self, payer, existing, *, force_reason=""):
+        from hermes_multitenancy.billing_identity import BillingIdentity
 
-    def ensure(employee_user_id):
-        calls.append(employee_user_id)
-        return {
-            "user_id": employee_user_id,
-            "email": f"{employee_user_id}@keep.com",
-            "litellm_user_id": f"llm-{employee_user_id}",
-            "created": True,
-        }
+        self.calls.append((payer, existing, force_reason))
+        return BillingIdentity(
+            employee_user_id=payer.employee_user_id,
+            profile_name=payer.profile_name,
+            email=payer.email,
+            litellm_user_id=f"llm-{payer.employee_user_id}",
+            team_id="team-fd",
+            team_alias="FD",
+            key_id=f"key-{payer.employee_user_id}",
+            credential_version=1,
+            expires_at=FIXTURE["ensure_issued_response"]["expires_at"],
+            migration_state="enforced",
+        )
+
+
+def _identity_preparer(tmp_path, credentials=None):
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
 
     return BillingIdentityPreparer(
-        routing=routing or _Routing(),
-        store=_Store(),
-        ensure_user=ensure,
-        billing_base_url="https://litellm.example/v1",
-    ), calls
-
-
-def test_dm_identity_is_created_once_then_reused():
-    preparer, calls = _preparer()
-
-    first = preparer.prepare(_request())
-    second = preparer.prepare(_request())
-
-    assert calls == ["actor"]
-    assert first.metadata["litellm_billing_user_id"] == "llm-actor"
-    assert second.metadata["litellm_billing_email"] == "actor@keep.com"
-
-
-def test_existing_mapping_survives_management_api_outage_and_new_user_fails():
-    from hermes_multitenancy.billing_identity import (
-        BillingIdentity,
-        BillingIdentityPreparer,
-    )
-    from hermes_multitenancy.run_broker import RunRejected
-
-    store = _Store()
-    store.put(BillingIdentity("actor", "actor@keep.com", "llm-actor"))
-
-    def unavailable(_employee_user_id):
-        raise RunRejected("LiteLLM management API is unavailable")
-
-    preparer = BillingIdentityPreparer(
         routing=_Routing(),
-        store=store,
-        ensure_user=unavailable,
-        billing_base_url="https://litellm.example/v1",
+        store=BillingIdentityStore(tmp_path / "multitenancy.db"),
+        credentials=credentials or _FakeCredentials(),
     )
 
-    existing = preparer.prepare(_request())
-    assert existing.metadata["litellm_billing_user_id"] == "llm-actor"
 
-    routing = _Routing()
-    routing.users["ou_actor"] = "new-actor"
-    new_preparer = BillingIdentityPreparer(
-        routing=routing,
-        store=store,
-        ensure_user=unavailable,
-        billing_base_url="https://litellm.example/v1",
-    )
-    with pytest.raises(RunRejected, match="management API is unavailable"):
-        new_preparer.prepare(_request())
+def test_legacy_payer_remains_shared_until_selected(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_LITELLM_BILLING_ENABLED", raising=False)
+    credentials = _FakeCredentials()
+    prepared = _identity_preparer(tmp_path, credentials).prepare(_request())
+
+    assert credentials.calls == []
+    assert "litellm_billing_enforced" not in prepared.metadata
 
 
-def test_direct_litellm_ensure_creates_user_in_department_team(tmp_path, monkeypatch):
-    from hermes_multitenancy.billing_identity import _ensure_user_over_http
+def test_selected_dm_is_enforced_and_group_uses_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor,owner")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_BASE_URL", "https://litellm.example/v1")
+    credentials = _FakeCredentials()
+    preparer = _identity_preparer(tmp_path, credentials)
 
-    snapshot_dir = tmp_path / "org-snapshots"
-    snapshot_dir.mkdir()
-    (snapshot_dir / "org-latest.json").write_text(
-        json.dumps(
-            {
-                "departments": [
-                    {"dept_id": "od_tech", "name": "技术平台部", "parent_id": "0"},
-                    {"dept_id": "od_it", "name": "IT组", "parent_id": "od_tech"},
-                ],
-                "employees": {
-                    "actor": {"user_id": "actor", "dept_id": "od_it"},
-                },
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_ORG_SNAPSHOT_DIR", str(snapshot_dir))
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
-    monkeypatch.setenv("HERMES_LITELLM_DEFAULT_TEAM_ID", "team-fd")
-    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
-
-    requests = []
-
-    class Response:
-        def __init__(self, payload):
-            self.raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _limit):
-            return self.raw
-
-    def urlopen(request, *, timeout):
-        requests.append((request, timeout))
-        path = request.full_url.removeprefix("https://litellm.example")
-        if path.startswith("/user/list?"):
-            return Response({"users": []})
-        if path == "/team/list":
-            return Response([
-                {"team_id": "team-tech", "team_alias": "技术平台部"},
-            ])
-        if path == "/user/new":
-            body = json.loads(request.data)
-            assert body["teams"] == ["team-tech"]
-            assert body["auto_create_key"] is False
-            return Response({
-                "user_id": "llm-actor",
-                "user_email": "actor@keep.com",
-                "metadata": {"scim_active": True},
-            })
-        if path == "/user/info?user_id=llm-actor":
-            return Response({
-                "user_info": {
-                    "user_id": "llm-actor",
-                    "metadata": {"scim_active": True},
-                },
-            })
-        if path == "/user/update":
-            body = json.loads(request.data)
-            assert body["max_budget"] is None
-            assert body["budget_duration"] is None
-            assert body["metadata"] == {
-                "scim_active": True,
-                "hermes_billing_active": True,
-            }
-            return Response({"user_id": "llm-actor"})
-        raise AssertionError(path)
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-
-    result = _ensure_user_over_http("actor", db_path=str(tmp_path / "multitenancy.db"))
-
-    assert result == {
-        "user_id": "actor",
-        "email": "actor@keep.com",
-        "litellm_user_id": "llm-actor",
-        "created": True,
-    }
-    assert [request.method for request, _timeout in requests] == [
-        "GET",
-        "GET",
-        "POST",
-        "GET",
-        "POST",
-    ]
-
-
-def test_direct_litellm_ensure_reuses_existing_user_without_team_lookup(monkeypatch):
-    from hermes_multitenancy.billing_identity import _ensure_user_over_http
-
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
-    seen_paths = []
-
-    class Response:
-        def __init__(self, payload):
-            self.raw = json.dumps(payload).encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _limit):
-            return self.raw
-
-    def urlopen(request, *, timeout):
-        assert timeout == 5
-        path = request.full_url.removeprefix("https://litellm.example")
-        seen_paths.append(path)
-        if path.startswith("/user/list?"):
-            return Response({
-                "users": [{
-                    "user_id": "llm-actor",
-                    "user_email": "actor@keep.com",
-                    "metadata": {},
-                }],
-            })
-        if path == "/user/info?user_id=llm-actor":
-            return Response({
-                "user_info": {
-                    "user_id": "llm-actor",
-                    "metadata": {"existing": "kept"},
-                },
-            })
-        if path == "/user/update":
-            assert json.loads(request.data)["metadata"] == {
-                "existing": "kept",
-                "hermes_billing_active": True,
-            }
-            return Response({"user_id": "llm-actor"})
-        raise AssertionError(path)
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-
-    result = _ensure_user_over_http("actor")
-
-    assert result["litellm_user_id"] == "llm-actor"
-    assert result["created"] is False
-    assert seen_paths == [
-        "/user/list?user_email=actor%40keep.com&page=1&page_size=100",
-        "/user/info?user_id=llm-actor",
-        "/user/update",
-    ]
-
-
-def test_direct_litellm_user_lookup_reads_later_pages(monkeypatch):
-    from hermes_multitenancy.billing_identity import _find_user_by_email
-
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
-    paths = []
-
-    class Response:
-        def __init__(self, payload):
-            self.raw = json.dumps(payload).encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _limit):
-            return self.raw
-
-    def urlopen(request, *, timeout):
-        paths.append(request.full_url.removeprefix("https://litellm.example"))
-        if "&page=1&" in request.full_url:
-            return Response({
-                "users": [
-                    {"user_id": f"other-{index}", "user_email": f"other-{index}@keep.com"}
-                    for index in range(100)
-                ],
-                "total_pages": 2,
-            })
-        return Response({
-            "users": [{
-                "user_id": "llm-actor",
-                "user_email": "actor@keep.com",
-            }],
-            "total_pages": 2,
-        })
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-
-    assert _find_user_by_email("actor@keep.com")["user_id"] == "llm-actor"
-    assert paths == [
-        "/user/list?user_email=actor%40keep.com&page=1&page_size=100",
-        "/user/list?user_email=actor%40keep.com&page=2&page_size=100",
-    ]
-
-
-def test_department_team_management_failure_does_not_use_default_team(tmp_path, monkeypatch):
-    from hermes_multitenancy.billing_identity import _ensure_user_over_http
-    from hermes_multitenancy.run_broker import RunRejected
-
-    snapshot_dir = tmp_path / "org-snapshots"
-    snapshot_dir.mkdir()
-    (snapshot_dir / "org-latest.json").write_text(
-        json.dumps({
-            "departments": [
-                {"dept_id": "od_tech", "name": "技术平台部", "parent_id": "0"},
-            ],
-            "employees": {"actor": {"user_id": "actor", "dept_id": "od_tech"}},
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_ORG_SNAPSHOT_DIR", str(snapshot_dir))
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_BASE_URL", "https://litellm.example")
-    monkeypatch.setenv("HERMES_LITELLM_ADMIN_KEY", "admin-secret")
-    monkeypatch.setenv("HERMES_LITELLM_DEFAULT_TEAM_ID", "team-fd")
-
-    class Response:
-        def __init__(self, payload):
-            self.raw = json.dumps(payload).encode("utf-8")
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _limit):
-            return self.raw
-
-    def urlopen(request, *, timeout):
-        path = request.full_url.removeprefix("https://litellm.example")
-        if path.startswith("/user/list?"):
-            return Response({"users": []})
-        if path == "/team/list":
-            raise OSError("team service unavailable")
-        raise AssertionError(f"must not create a user in the default team: {path}")
-
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
-
-    with pytest.raises(RunRejected, match="management API is unavailable"):
-        _ensure_user_over_http("actor", db_path=str(tmp_path / "multitenancy.db"))
-
-
-def test_group_is_billed_to_group_owner_not_sender():
-    preparer, calls = _preparer()
-
-    prepared = preparer.prepare(
+    dm = preparer.prepare(_request())
+    group = preparer.prepare(
         _request(chat_type="group", sender="ou_member", chat_id="oc_group")
     )
 
-    assert calls == ["owner"]
-    assert prepared.metadata["litellm_billing_employee_user_id"] == "owner"
+    assert dm.metadata["litellm_billing_employee_user_id"] == "actor"
+    assert group.metadata["litellm_billing_employee_user_id"] == "owner"
+    assert "api_key" not in json.dumps(dm.metadata)
+    assert [call[0].employee_user_id for call in credentials.calls] == ["actor", "owner"]
 
 
-def test_unresolved_employee_fails_before_model_dispatch():
-    routing = _Routing()
-    routing.profile_owner = "ou_unknown"
-    preparer, _calls = _preparer(routing)
+def test_enforced_state_never_reverts_when_global_switch_turns_off(tmp_path, monkeypatch):
+    from hermes_multitenancy.billing_identity import BillingIdentity, BillingIdentityStore
 
+    db_path = tmp_path / "multitenancy.db"
+    store = BillingIdentityStore(db_path)
+    store.put(BillingIdentity("actor", "actor", "actor@keep.com", "llm-actor"))
+    store.put(BillingIdentity(
+        "actor", "actor", "actor@keep.com", "llm-actor", "team-fd", "FD",
+        "key-1", 1, FIXTURE["ensure_issued_response"]["expires_at"], "enforced",
+    ))
+    store.put(BillingIdentity("actor", "actor", "actor@keep.com", "llm-other"))
+    monkeypatch.delenv("HERMES_LITELLM_BILLING_ENABLED", raising=False)
+    credentials = _FakeCredentials()
+    preparer = __import__(
+        "hermes_multitenancy.billing_identity", fromlist=["BillingIdentityPreparer"]
+    ).BillingIdentityPreparer(routing=_Routing(), store=store, credentials=credentials)
+
+    prepared = preparer.prepare(_request())
+
+    assert prepared.metadata["litellm_billing_enforced"] is True
+    assert store.get("actor").migration_state == "enforced"
+
+
+class _FakeGateway:
+    def __init__(self, ensure_responses, ack_response=None):
+        self.ensure_responses = list(ensure_responses)
+        self.ack_response = ack_response
+        self.ensure_calls = []
+        self.ack_calls = []
+
+    def ensure(self, **kwargs):
+        self.ensure_calls.append(kwargs)
+        value = self.ensure_responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return dict(value)
+
+    def ack(self, payload):
+        self.ack_calls.append(dict(payload))
+        value = self.ack_response or {
+            **FIXTURE["ack_activated_response"],
+            "key_id": payload["key_id"],
+            "credential_version": payload["credential_version"],
+        }
+        if isinstance(value, BaseException):
+            raise value
+        return dict(value)
+
+
+def _manager(tmp_path, gateway, *, probe=None):
+    from hermes_multitenancy.billing_identity import BillingCredentialManager
+    from hermes_multitenancy.credentials import CredentialStore
+
+    return BillingCredentialManager(
+        vault=CredentialStore(tmp_path / "vault.db", encryption_key=VAULT_KEY),
+        gateway=gateway,
+        model_base_url="https://litellm.example/v1",
+        now_ms=lambda: NOW_MS,
+        probe=probe or (lambda _key: None),
+    )
+
+
+def _payer():
+    from hermes_multitenancy.billing_identity import _ResolvedPayer
+
+    return _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+
+
+def _metadata(binding):
+    from hermes_multitenancy.billing_identity import _metadata_for_binding
+
+    return _metadata_for_binding(binding, "https://litellm.example/v1")
+
+
+def test_first_issue_is_probed_saved_and_acked(tmp_path):
+    gateway = _FakeGateway([FIXTURE["ensure_issued_response"]])
+    probes = []
+    manager = _manager(tmp_path, gateway, probe=probes.append)
+
+    binding = manager.ensure_available(_payer(), None)
+
+    assert probes == ["sk-test-hermes-v1-alice"]
+    assert binding.key_id == "tok_fixture_alice_g1"
+    assert gateway.ensure_calls[0]["reason"] == "missing"
+    assert gateway.ack_calls[0]["api_key"] == "sk-test-hermes-v1-alice"
+    assert manager.runtime_api_key(_metadata(binding)) == "sk-test-hermes-v1-alice"
+
+
+def test_valid_vault_hit_never_calls_gateway(tmp_path):
+    gateway = _FakeGateway([FIXTURE["ensure_issued_response"]])
+    manager = _manager(tmp_path, gateway)
+    binding = manager.ensure_available(_payer(), None)
+    gateway.ensure_calls.clear()
+    gateway.ack_calls.clear()
+
+    reused = manager.ensure_available(_payer(), binding)
+
+    assert reused == binding
+    assert gateway.ensure_calls == []
+    assert gateway.ack_calls == []
+
+
+def test_renewal_gateway_outage_keeps_unexpired_key(tmp_path):
+    from hermes_multitenancy.billing_identity import _GatewayError
+
+    issued = dict(FIXTURE["ensure_issued_response"])
+    issued["expires_at"] = NOW_MS + 20 * 24 * 60 * 60 * 1000
+    gateway = _FakeGateway([issued, _GatewayError(503, "broker_disabled", True)])
+    manager = _manager(tmp_path, gateway)
+    binding = manager.ensure_available(_payer(), None)
+
+    reused = manager.ensure_available(_payer(), binding)
+
+    assert reused.key_id == binding.key_id
+    assert gateway.ensure_calls[-1]["reason"] == "renewal"
+
+
+def test_missing_gateway_outage_fails_only_that_payer(tmp_path):
+    from hermes_multitenancy.billing_identity import _GatewayError
     from hermes_multitenancy.run_broker import RunRejected
 
-    with pytest.raises(RunRejected, match="could not be resolved"):
-        preparer.prepare(_request(sender="ou_unknown"))
+    manager = _manager(
+        tmp_path,
+        _FakeGateway([_GatewayError(503, "broker_disabled", True)]),
+    )
+
+    with pytest.raises(RunRejected, match="temporarily unavailable"):
+        manager.ensure_available(_payer(), None)
 
 
-def test_disabled_billing_strips_spoofed_reserved_metadata(monkeypatch):
-    from hermes_multitenancy.billing_identity import prepare_billing_request
+def test_unchanged_requires_exact_local_pair(tmp_path):
+    from hermes_multitenancy.run_broker import RunRejected
 
+    manager = _manager(
+        tmp_path,
+        _FakeGateway([FIXTURE["ensure_unchanged_response"]]),
+    )
+
+    with pytest.raises(RunRejected, match="invalid credential state"):
+        manager.ensure_available(_payer(), None)
+
+
+def test_ack_credential_gone_discards_generation_and_reissues(tmp_path):
+    from hermes_multitenancy.billing_identity import _GatewayError
+
+    gateway = _FakeGateway(
+        [FIXTURE["ensure_issued_response"], FIXTURE["ensure_rotated_response"]],
+        ack_response=_GatewayError(410, "credential_gone", False),
+    )
+    manager = _manager(tmp_path, gateway)
+    ack_count = 0
+
+    def ack_then_ok(payload):
+        nonlocal ack_count
+        gateway.ack_calls.append(dict(payload))
+        ack_count += 1
+        if ack_count == 1:
+            raise _GatewayError(410, "credential_gone", False)
+        return {
+            **FIXTURE["ack_activated_response"],
+            "key_id": "tok_fixture_alice_g2",
+            "credential_version": 2,
+        }
+
+    gateway.ack = ack_then_ok
+    binding = manager.ensure_available(_payer(), None)
+
+    assert binding.key_id == "tok_fixture_alice_g2"
+    assert [call["reason"] for call in gateway.ensure_calls] == ["missing", "missing"]
+
+
+def test_invalid_credential_is_rotated_and_not_served_from_cache(tmp_path):
+    gateway = _FakeGateway([
+        FIXTURE["ensure_issued_response"], FIXTURE["ensure_rotated_response"],
+    ])
+    manager = _manager(tmp_path, gateway)
+    binding = manager.ensure_available(_payer(), None)
+    manager.mark_invalid(_metadata(binding))
+
+    rotated = manager.ensure_available(_payer(), binding)
+
+    assert rotated.credential_version == 2
+    assert gateway.ensure_calls[-1]["reason"] == "invalid_401"
+
+
+def test_per_payer_single_flight_creates_one_generation(tmp_path):
+    response = FIXTURE["ensure_issued_response"]
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowGateway(_FakeGateway):
+        def ensure(self, **kwargs):
+            self.ensure_calls.append(kwargs)
+            entered.set()
+            assert release.wait(2)
+            return dict(response)
+
+    gateway = SlowGateway([])
+    manager = _manager(tmp_path, gateway)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(manager.ensure_available(_payer(), None)))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(2)
+    release.set()
+    for thread in threads:
+        thread.join(2)
+
+    assert len(gateway.ensure_calls) == 1
+    assert [item.key_id for item in results] == [
+        "tok_fixture_alice_g1", "tok_fixture_alice_g1",
+    ]
+
+
+class _Response:
+    def __init__(self, payload):
+        self.raw = json.dumps(payload).encode()
+        self.status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, _limit):
+        return self.raw
+
+
+def test_gateway_client_matches_shared_fixture_and_ack_hash():
+    from hermes_multitenancy.billing_identity import BillingGatewayClient
+
+    requests = []
+
+    def opener(request, *, timeout):
+        requests.append((request, timeout))
+        if request.full_url.endswith("/ensure"):
+            assert json.loads(request.data) == FIXTURE["ensure_request"]
+            return _Response(FIXTURE["ensure_issued_response"])
+        assert json.loads(request.data) == FIXTURE["ack_request"]
+        return _Response(FIXTURE["ack_activated_response"])
+
+    client = BillingGatewayClient(
+        "https://gateway.example",
+        "fixture-service-token",
+        opener=opener,
+    )
+    issued = client.ensure(**{
+        "employee_id": "alice",
+        "enterprise_email": "alice@keep.com",
+        "department_alias": "FD",
+        "reason": "missing",
+    })
+    client.ack({
+        **issued,
+        "profile_name": "alice",
+    })
+
+    assert all(request.headers["Authorization"] == "Bearer fixture-service-token" for request, _ in requests)
+    assert all(request.headers["Idempotency-key"] for request, _ in requests)
+    assert FIXTURE["ack_request"]["key_sha256"] == (
+        "da436b21a9e13a68408292fb08b6a8887b06c619de274b961f32960239ba9ed8"
+    )
+
+
+def test_gateway_rejects_unknown_major_and_error_envelope():
+    from hermes_multitenancy.billing_identity import BillingGatewayClient, _GatewayError
+
+    def bad_major(_request, *, timeout):
+        return _Response({"contract_version": "2.0"})
+
+    client = BillingGatewayClient("https://gateway.example", "token", opener=bad_major)
+    with pytest.raises(_GatewayError, match="unsupported_contract_version"):
+        client.ensure(
+            employee_id="alice",
+            enterprise_email="alice@keep.com",
+            department_alias="FD",
+            reason="missing",
+        )
+
+    conflict = FIXTURE["identity_conflict"]
+
+    def http_conflict(request, *, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            conflict["status"],
+            "conflict",
+            {},
+            io.BytesIO(json.dumps(conflict["body"]).encode()),
+        )
+
+    client = BillingGatewayClient("https://gateway.example", "token", opener=http_conflict)
+    with pytest.raises(_GatewayError) as caught:
+        client.ensure(
+            employee_id="alice",
+            enterprise_email="alice@keep.com",
+            department_alias="FD",
+            reason="missing",
+        )
+    assert caught.value.code == "identity_conflict"
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("AuthenticationError Error code: 401", "invalid_credential"),
+        ("HTTP 429 budget_exceeded", "budget_exceeded"),
+        ("status_code=429 rate limit", "rate_limit"),
+        ("HTTP 500 upstream", ""),
+    ],
+)
+def test_litellm_error_classification(message, expected):
+    from hermes_multitenancy.billing_identity import classify_litellm_error
+
+    assert classify_litellm_error(message) == expected
+
+
+def test_disabled_path_strips_every_spoofable_field(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_LITELLM_BILLING_ENABLED", raising=False)
     request = _request()
-    request = request.__class__(
-        **{
-            **request.__dict__,
-            "metadata": {
-                **request.metadata,
-                "litellm_billing_user_id": "spoofed",
-                "litellm_billing_base_url": "https://evil.example/v1",
-            },
-        }
-    )
+    request = request.__class__(**{
+        **request.__dict__,
+        "metadata": {
+            **request.metadata,
+            "litellm_billing_enforced": True,
+            "litellm_billing_user_id": "spoofed",
+            "litellm_billing_key_id": "spoofed",
+        },
+    })
 
-    prepared = asyncio.run(prepare_billing_request(request))
+    prepared = _identity_preparer(tmp_path).prepare(request)
 
-    assert "litellm_billing_user_id" not in prepared.metadata
-    assert "litellm_billing_base_url" not in prepared.metadata
-
-
-def test_headers_require_allowed_path_on_exact_billing_origin(monkeypatch):
-    from hermes_multitenancy.billing_identity import request_overrides_for_endpoint
-
-    metadata = {
-        "litellm_billing_user_id": "llm-actor",
-        "litellm_billing_base_url": "https://litellm.example/v1",
-    }
-
-    same = request_overrides_for_endpoint(metadata, "https://litellm.example/v1/")
-    anthropic = request_overrides_for_endpoint(
-        metadata, "https://litellm.example/anthropic"
-    )
-    other = request_overrides_for_endpoint(metadata, "https://api.external.example/v1")
-    unapproved = request_overrides_for_endpoint(
-        metadata, "https://litellm.example/admin"
-    )
-
-    assert same["extra_headers"]["X-Hermes-User-Id"] == "llm-actor"
-    assert anthropic["extra_headers"]["X-Hermes-User-Id"] == "llm-actor"
-    assert other == {}
-    assert unapproved == {}
+    assert "litellm_billing_enforced" not in prepared.metadata
+    assert "litellm_billing_key_id" not in prepared.metadata

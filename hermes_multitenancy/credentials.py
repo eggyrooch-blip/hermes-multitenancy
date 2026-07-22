@@ -171,6 +171,10 @@ class CredentialStore:
                 refresh_expires_at = int(payload.get("refresh_expires_at"))
                 if refresh_expires_at > 0:
                     result["refresh_expires_at"] = refresh_expires_at
+                if payload.get("credential_version"):
+                    result["credential_version"] = str(payload["credential_version"])
+                if payload.get("status"):
+                    result["credential_status"] = str(payload["status"])
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
 
@@ -217,6 +221,36 @@ class CredentialStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    def delete_credential(
+        self,
+        *,
+        profile_name: str,
+        subject_id: str,
+        provider: str,
+        secret_kind: str,
+    ) -> bool:
+        """Delete exactly one credential after its upstream generation is gone."""
+        values = (
+            _clean_id("profile_name", profile_name),
+            _clean_id("subject_id", subject_id),
+            _clean_id("provider", provider),
+            _clean_id("secret_kind", secret_kind),
+        )
+        try:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM multitenancy_credentials
+                WHERE profile_name = ? AND subject_id = ?
+                  AND provider = ? AND secret_kind = ?
+                """,
+                values,
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def _get_row(
         self,

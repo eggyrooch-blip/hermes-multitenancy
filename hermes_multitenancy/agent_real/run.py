@@ -21,6 +21,39 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 
+def _install_billing_delegation_guard(enabled: bool):
+    """Keep child agents on the parent's billed provider/key tuple."""
+    if not enabled:
+        return lambda: None
+    try:
+        from tools import delegate_tool
+
+        original = delegate_tool._resolve_delegation_credentials
+    except Exception:
+        return lambda: None
+
+    def guarded(config, parent_agent):
+        forbidden = ("provider", "base_url", "api_key", "api_mode", "command", "args")
+        if any(config.get(key) for key in forbidden):
+            raise ValueError(
+                "Billing-bound delegation cannot override provider credentials"
+            )
+        resolved = original(config, parent_agent)
+        if any(resolved.get(key) for key in forbidden):
+            raise ValueError(
+                "Billing-bound delegation cannot override provider credentials"
+            )
+        return resolved
+
+    delegate_tool._resolve_delegation_credentials = guarded
+
+    def cleanup() -> None:
+        if delegate_tool._resolve_delegation_credentials is guarded:
+            delegate_tool._resolve_delegation_credentials = original
+
+    return cleanup
+
+
 def _run_with_aiagent(
     event: Any,
     profile_home: Path,
@@ -62,10 +95,25 @@ def _run_with_aiagent(
         strip_custom_context_suffix=True,
     )
     api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
+    base_url = _resolve_base_url(provider, True, config, env_overrides)
+    event_metadata = _event_metadata(event)
+    from ..billing_identity import (
+        billing_endpoint_allowed,
+        billing_runtime_from_environment,
+    )
+
+    billing_runtime = billing_runtime_from_environment()
+    billing_enforced = event_metadata.get("litellm_billing_enforced") is True
+    if billing_enforced != bool(billing_runtime):
+        raise RuntimeError("Billing runtime credential is unavailable")
+    if billing_runtime:
+        if not billing_endpoint_allowed(billing_runtime["base_url"], base_url or ""):
+            raise RuntimeError(
+                "Billing-bound run cannot use an unapproved LiteLLM endpoint"
+            )
+        api_key = billing_runtime["api_key"]
     if not api_key:
         raise RuntimeError(f"no API key for primary provider {provider!r}")
-
-    base_url = _resolve_base_url(provider, True, config, env_overrides)
 
     # 3) Lazy-import hermes core (only when this code path is hit).
     _install_credential_env_passthrough(profile_home)
@@ -160,7 +208,12 @@ def _run_with_aiagent(
         # Anthropic-compatible providers like Tencent TokenHub.
         runtime_kwargs["provider"] = provider
 
-    fallback_model = fallback_models[0] if fallback_models else None
+    # A profile fallback may resolve another ambient provider credential.  The
+    # billed key is itself the availability boundary, so enforced runs do not
+    # cross providers on failure.
+    fallback_model = None if billing_enforced else (
+        fallback_models[0] if fallback_models else None
+    )
 
     # 7) Wrap the agent run in sender_open_id_scope so legacy Feishu tools
     #    pick up the right token from the profile-local UAT directory.
@@ -346,22 +399,7 @@ def _run_with_aiagent(
             "clarify_callback": clarify_callback,
             "tool_gen_callback": _tool_gen_event_callback if event_sink is not None else None,
         }
-        from ..billing_identity import request_overrides_for_endpoint
-
-        billing_request_overrides = request_overrides_for_endpoint(
-            event_metadata,
-            base_url or "",
-        )
-        if event_metadata.get("litellm_billing_user_id") and not billing_request_overrides:
-            raise RuntimeError(
-                "Billing-bound run cannot use an unapproved LiteLLM endpoint"
-            )
-        if billing_request_overrides:
-            agent_kwargs["request_overrides"] = billing_request_overrides
-            # Bind the headers to the actual approved protocol path. A later
-            # provider/transport switch must fail closed instead of silently
-            # running without an employee identity.
-            agent_kwargs["request_overrides_base_url"] = str(base_url or "")
+        if billing_enforced:
             # Hermes' MoA tool calls OpenRouter directly for its reference and
             # aggregate models. Until it supports the trusted billing runtime,
             # remove the whole toolset so tool-internal calls cannot escape the
@@ -410,16 +448,15 @@ def _run_with_aiagent(
         # subprocess-local (fresh create_subprocess_exec child).
         expert_skill_scope_cleanup = _pkg._apply_expert_skill_scope_for_aiagent(event, profile_home)
         vod_image_override_cleanup = _apply_vod_image_model_override_for_aiagent(user_text)
+        delegation_guard_cleanup = _install_billing_delegation_guard(billing_enforced)
         aux_runtime_cleanup = _sync_auxiliary_runtime_main_for_aiagent(
             provider=provider,
             model=model_only,
             base_url=base_url,
             api_key=api_key,
             api_mode=str(runtime_kwargs.get("api_mode") or ""),
-            request_overrides=billing_request_overrides,
-            request_overrides_base_url=str(base_url or "")
-            if billing_request_overrides
-            else "",
+            request_overrides={},
+            request_overrides_base_url="",
         )
         agent = None
         try:
@@ -475,6 +512,7 @@ def _run_with_aiagent(
             _retag_source_now("finally-pre-close")
             approval_cleanup()
             aux_runtime_cleanup()
+            delegation_guard_cleanup()
             vod_image_override_cleanup()
             expert_skill_scope_cleanup()
             runtime_env_cleanup()

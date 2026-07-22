@@ -2193,6 +2193,11 @@ def _aiagent_subprocess_env_scope(
     sender_open_id = _resolve_subprocess_sender_open_id(event)
     merged_extra = dict(extra or {})
     merged_extra.update(_ingest_secret_env_from_event(event))
+    from ..billing_identity import runtime_env_for_billing_metadata
+
+    # The plaintext employee key exists only in this per-run child env.  The
+    # warm worker replaces its entire environment for every run.
+    merged_extra.update(runtime_env_for_billing_metadata(_event_metadata(event)))
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
     share_context = _agent_share_context_from_event(event)
@@ -3549,9 +3554,34 @@ async def _run_aiagent_subprocess(
             f"{child_error or redacted_stderr_text or redacted_stdout_text}"
         )
     if data.get("error"):
+        # A stale/expired LiteLLM key may be repaired once before surfacing the
+        # failure. Budget exhaustion is deliberately never retried or routed to
+        # an ambient/shared key (fail-closed).
+        from ..billing_identity import classify_litellm_error, repair_billing_metadata
+        error_text = str(data.get("error") or "")
+        error_kind = classify_litellm_error(error_text)
+        metadata = dict(_event_metadata(event))
+        if (
+            error_kind == "invalid_credential"
+            and metadata.get("litellm_billing_enforced") is True
+            and not metadata.get("_hermes_billing_repaired")
+        ):
+            try:
+                repaired = repair_billing_metadata(metadata)
+                repaired["_hermes_billing_repaired"] = True
+                import copy
+                retry_event = copy.copy(event)
+                retry_event.metadata = repaired
+                return await _run_aiagent_subprocess(
+                    retry_event, profile_home, messages=messages
+                )
+            except Exception:
+                logger.warning("[multitenancy] billing key repair failed", exc_info=True)
+        if error_kind == "budget_exceeded" and metadata.get("litellm_billing_enforced") is True:
+            raise RuntimeError("LiteLLM monthly budget exhausted; billing run blocked")
         raise RuntimeError(
             "AIAgent subprocess failed: "
-            f"{_redact_ingest_runtime_text(data['error'], event)}"
+            f"{_redact_ingest_runtime_text(error_text, event)}"
         )
     _write_token_ledger_from_child(event, profile_home, data.get("usage"))
     return str(data.get("result") or "")

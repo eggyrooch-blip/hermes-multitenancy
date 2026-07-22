@@ -1022,22 +1022,23 @@ def _install_auxiliary_main_runtime_patch(
     base_url = runtime.get("base_url", "")
     api_key = runtime.get("api_key", "")
     api_mode = runtime.get("api_mode", "")
-    request_overrides: dict[str, Any] = {}
-    if (billing_metadata or {}).get("litellm_billing_user_id"):
-        from ..billing_identity import request_overrides_for_endpoint
+    billing_enforced = (billing_metadata or {}).get("litellm_billing_enforced") is True
+    if billing_enforced:
+        from ..billing_identity import (
+            billing_endpoint_allowed,
+            billing_runtime_for_image_prep,
+        )
         from ..run_broker import RunRejected
 
-        request_overrides = request_overrides_for_endpoint(
-            billing_metadata or {},
-            base_url,
-        )
-        if not request_overrides:
+        billed = billing_runtime_for_image_prep(billing_metadata or {})
+        if not billing_endpoint_allowed(billed.get("base_url", ""), base_url):
             raise RunRejected(
                 "Billing-bound image preprocessing cannot use an unapproved endpoint"
             )
+        api_key = billed["api_key"]
 
     set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
-    if request_overrides and (not callable(set_runtime_main) or not api_key):
+    if billing_enforced and (not callable(set_runtime_main) or not api_key):
         raise RunRejected("Billing-bound image preprocessing runtime is unavailable")
     if callable(set_runtime_main) and api_key:
         try:
@@ -1047,11 +1048,11 @@ def _install_auxiliary_main_runtime_patch(
                 base_url=base_url,
                 api_key=api_key,
                 api_mode=api_mode,
-                request_overrides=request_overrides,
-                request_overrides_base_url=base_url if request_overrides else "",
+                request_overrides={},
+                request_overrides_base_url="",
             )
         except TypeError as exc:
-            if request_overrides:
+            if billing_enforced:
                 raise RunRejected(
                     "Billing-bound image preprocessing runtime is unavailable"
                 ) from exc
@@ -1069,7 +1070,7 @@ def _install_auxiliary_main_runtime_patch(
                     fallback_exc,
                 )
         except Exception as exc:
-            if request_overrides:
+            if billing_enforced:
                 raise RunRejected(
                     "Billing-bound image preprocessing runtime is unavailable"
                 ) from exc
@@ -1207,7 +1208,7 @@ async def _profile_image_prep_runtime(
 
     profile_home = Path(profile_home)
     runtime = _m._profile_main_runtime_for_image_prep(profile_home)
-    if (billing_metadata or {}).get("litellm_billing_user_id") and runtime is None:
+    if (billing_metadata or {}).get("litellm_billing_enforced") is True and runtime is None:
         from ..run_broker import RunRejected
 
         raise RunRejected("Billing-bound image preprocessing runtime is unavailable")

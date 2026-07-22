@@ -4516,7 +4516,7 @@ def test_run_with_aiagent_uses_webui_session_model_metadata(monkeypatch, tmp_pat
     assert captured["api_key"] == "session-key"
 
 
-def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, tmp_path: Path):
+def test_run_with_aiagent_forces_employee_key_across_main_and_aux(monkeypatch, tmp_path: Path):
     from types import ModuleType
 
     from hermes_multitenancy import agent_real
@@ -4587,22 +4587,24 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
     event = _event()
     event.raw_event = {
         "metadata": {
+            "litellm_billing_enforced": True,
             "litellm_billing_user_id": "litellm-user-1",
             "litellm_billing_base_url": "https://litellm.example/v1",
         }
     }
+    monkeypatch.setenv("HERMES_LITELLM_RUNTIME_API_KEY", "employee-key")
+    monkeypatch.setenv(
+        "HERMES_LITELLM_RUNTIME_BASE_URL", "https://litellm.example/v1"
+    )
+    monkeypatch.setenv("HERMES_LITELLM_RUNTIME_EMPLOYEE_ID", "alice")
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
 
     assert captured["model"] == "tencent-sonnet-4-6"
     assert captured["provider"] == "custom:litellm-sre"
     assert captured["base_url"] == "https://litellm.example/v1"
-    assert captured["request_overrides"] == {
-        "extra_headers": {
-            "X-Hermes-User-Id": "litellm-user-1",
-            "X-Hermes-Source": "hermes",
-        }
-    }
-    assert captured["request_overrides_base_url"] == "https://litellm.example/v1"
+    assert captured["api_key"] == "employee-key"
+    assert "request_overrides" not in captured
+    assert "request_overrides_base_url" not in captured
     assert captured["enabled_toolsets"] == ["terminal"]
     assert "moa" in captured["disabled_toolsets"]
     assert captured["runtime_at_run"] == [
@@ -4612,15 +4614,10 @@ def test_run_with_aiagent_syncs_custom_provider_aux_runtime_model(monkeypatch, t
                 "provider": "custom:litellm-sre",
                 "model": "tencent-sonnet-4-6",
                 "base_url": "https://litellm.example/v1",
-                "api_key": "test-key",
+                "api_key": "employee-key",
                 "api_mode": "",
-                "request_overrides": {
-                    "extra_headers": {
-                        "X-Hermes-User-Id": "litellm-user-1",
-                        "X-Hermes-Source": "hermes",
-                    }
-                },
-                "request_overrides_base_url": "https://litellm.example/v1",
+                "request_overrides": {},
+                "request_overrides_base_url": "",
             },
         )
     ]
