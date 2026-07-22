@@ -305,3 +305,20 @@ def test_billing_delegation_guard_allows_model_only_and_rejects_credentials(
         )
     cleanup()
     assert delegate._resolve_delegation_credentials is resolve
+
+
+def test_profile_env_cannot_inject_ai_gateway_service_bearer(tmp_path: Path):
+    from hermes_multitenancy.agent_real import _core
+
+    profile = tmp_path / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text(
+        "HERMES_AI_GATEWAY_BROKER_TOKEN=must-not-enter-child\n"
+        "OPENAI_API_KEY=legacy-model-key\n",
+        encoding="utf-8",
+    )
+
+    loaded = _core._profile_env_for_aiagent(profile)
+
+    assert "HERMES_AI_GATEWAY_BROKER_TOKEN" not in loaded
+    assert loaded["OPENAI_API_KEY"] == "legacy-model-key"

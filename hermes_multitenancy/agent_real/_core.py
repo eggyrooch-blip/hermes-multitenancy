@@ -162,6 +162,15 @@ _AIAGENT_TOOL_ENV_ALLOWLIST: frozenset[str] = frozenset({
 _SHARED_AIAGENT_ENV_ALLOWLIST: frozenset[str] = (
     _MODEL_ENV_ALLOWLIST | _AIAGENT_TOOL_ENV_ALLOWLIST
 )
+_BILLING_CONTROL_ENV_NAMES = frozenset({
+    "HERMES_AI_GATEWAY_BROKER_URL",
+    "HERMES_AI_GATEWAY_BROKER_TOKEN",
+    "HERMES_AI_GATEWAY_BROKER_TIMEOUT",
+    "HERMES_LITELLM_BILLING_ENABLED",
+    "HERMES_LITELLM_BILLING_PAYER_IDS",
+    "HERMES_LITELLM_BILLING_BASE_URL",
+    "HERMES_LITELLM_BILLING_ALLOWED_PATHS",
+})
 
 _FEISHU_ENV_BLOCKLIST: frozenset[str] = frozenset({
     "FEISHU_APP_ID",
@@ -2480,6 +2489,8 @@ def _profile_env_for_aiagent(
     except Exception:
         logger.debug("[multitenancy] failed to load profile auth env for subprocess", exc_info=True)
 
+    for name in _BILLING_CONTROL_ENV_NAMES:
+        loaded.pop(name, None)
     return loaded
 
 
