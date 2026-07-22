@@ -116,6 +116,31 @@ def test_selected_dm_is_enforced_and_group_uses_owner(tmp_path, monkeypatch):
     assert [call[0].employee_user_id for call in credentials.calls] == ["actor", "owner"]
 
 
+@pytest.mark.parametrize("channel", ["webui", "cron", "kanban"])
+def test_non_feishu_entrypoints_bill_profile_owner(
+    tmp_path, monkeypatch, channel
+):
+    from hermes_multitenancy.run_models import RunRequest
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor")
+    monkeypatch.setenv(
+        "HERMES_LITELLM_BILLING_BASE_URL", "https://litellm.example/v1"
+    )
+    request = RunRequest(
+        channel=channel,
+        profile_name="actor",
+        user_key="untrusted-caller",
+        content="hello",
+        chat_id="external",
+        metadata={},
+    )
+
+    prepared = _identity_preparer(tmp_path).prepare(request)
+
+    assert prepared.metadata["litellm_billing_employee_user_id"] == "actor"
+
+
 def test_enforced_state_never_reverts_when_global_switch_turns_off(tmp_path, monkeypatch):
     from hermes_multitenancy.billing_identity import BillingIdentity, BillingIdentityStore
 
@@ -231,6 +256,28 @@ def test_renewal_gateway_outage_keeps_unexpired_key(tmp_path):
 
     assert reused.key_id == binding.key_id
     assert gateway.ensure_calls[-1]["reason"] == "renewal"
+
+
+def test_renewal_probe_failure_restores_unexpired_previous_key(tmp_path):
+    issued = dict(FIXTURE["ensure_issued_response"])
+    issued["expires_at"] = NOW_MS + 20 * 24 * 60 * 60 * 1000
+    rotated = dict(FIXTURE["ensure_rotated_response"])
+    probes = []
+
+    def probe(key):
+        probes.append(key)
+        if key == rotated["api_key"]:
+            raise RuntimeError("probe unavailable")
+
+    gateway = _FakeGateway([issued, rotated])
+    manager = _manager(tmp_path, gateway, probe=probe)
+    previous = manager.ensure_available(_payer(), None)
+
+    reused = manager.ensure_available(_payer(), previous)
+
+    assert reused.key_id == previous.key_id
+    assert len(gateway.ensure_calls) == 2
+    assert manager.runtime_api_key(_metadata(reused)) == issued["api_key"]
 
 
 def test_missing_gateway_outage_fails_only_that_payer(tmp_path):
@@ -420,6 +467,35 @@ def test_gateway_rejects_unknown_major_and_error_envelope():
         )
     assert caught.value.code == "identity_conflict"
     assert caught.value.retryable is False
+
+
+def test_gateway_rejects_error_envelope_without_message():
+    from hermes_multitenancy.billing_identity import BillingGatewayClient, _GatewayError
+
+    def bad_error(request, *, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "unavailable",
+            {},
+            io.BytesIO(
+                json.dumps(
+                    {
+                        "contract_version": "1.0",
+                        "error": {"code": "broker_unavailable", "retryable": True},
+                    }
+                ).encode()
+            ),
+        )
+
+    client = BillingGatewayClient("https://gateway.example", "token", opener=bad_error)
+    with pytest.raises(_GatewayError, match="invalid_error_envelope"):
+        client.ensure(
+            employee_id="alice",
+            enterprise_email="alice@keep.com",
+            department_alias="FD",
+            reason="missing",
+        )
 
 
 @pytest.mark.parametrize(
