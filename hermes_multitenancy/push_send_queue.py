@@ -373,7 +373,7 @@ class PushSendQueue:
         day_start = int(
             now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         )
-        if self.store.count_pushes_today(row["target_open_id"], day_start=day_start) >= self.daily_cap:
+        if self.daily_cap > 0 and self.store.count_pushes_today(row["target_open_id"], day_start=day_start) >= self.daily_cap:
             next_day = now_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
             return QueueOutcome(
                 status="deferred", reason="daily_cap", retry_at=int(next_day.timestamp())
@@ -459,11 +459,25 @@ def _quiet_hour_env(name: str, default: int) -> int:
     return h if 0 <= h <= 23 else default
 
 
+def _daily_cap_env(default: int = 3) -> int:
+    """Daily-cap from env (policy, not code). <=0 disables the cap entirely
+    (2026-07-22 sunke: cap is a management act, not an interface behavior)."""
+    import os
+    raw = os.environ.get("HERMES_PUSH_CARD_DAILY_CAP")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def get_send_queue() -> PushSendQueue:
     global _queue
     if _queue is None:
         _queue = PushSendQueue(
             _reg.get_registry_store(),
+            daily_cap=_daily_cap_env(3),
             quiet_start_hour=_quiet_hour_env("HERMES_PUSH_CARD_QUIET_START", 21),
             quiet_end_hour=_quiet_hour_env("HERMES_PUSH_CARD_QUIET_END", 9),
         )

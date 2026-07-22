@@ -315,6 +315,23 @@ def test_queue_defers_on_daily_cap(store):
     assert called["n"] == 0
 
 
+def test_queue_cap_zero_disables_daily_cap(store):
+    # daily_cap<=0 = cap off (policy env HERMES_PUSH_CARD_DAILY_CAP): 3 already
+    # sent today, the 4th still sends immediately.
+    day = datetime(2026, 7, 20, 12, 0, 0)
+    for i in range(3):
+        row = _create(store, business_key=f"bk-{i}").row
+        store.mark_sent(row["registry_id"], message_id=f"m{i}")
+    r = _create(store, business_key="bk-new").row
+
+    async def sender(*, profile_name, open_id, card, payload):
+        return sq.SendResult(message_id="om_uncapped")
+
+    q = _queue(store, sender, clock_dt=day, daily_cap=0)
+    outcome = asyncio.run(q.process(r["registry_id"]))
+    assert outcome.status == "sent" and outcome.message_id == "om_uncapped"
+
+
 def test_queue_skips_already_sent_row(store):
     r = _create(store).row
     store.mark_sent(r["registry_id"], message_id="already")
