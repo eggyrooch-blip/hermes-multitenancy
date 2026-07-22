@@ -327,7 +327,11 @@ async def stream_run_agent(  # type: ignore[override]
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
             return
-        if _event_metadata(event).get("litellm_billing_enforced") is True:
+        metadata = _event_metadata(event)
+        if (
+            metadata.get("litellm_billing_enforced") is True
+            or metadata.get("litellm_billing_user_id")
+        ):
             raise RuntimeError(
                 "Billing-bound run cannot fall back to the unmetered legacy stream"
             ) from exc
@@ -412,7 +416,11 @@ async def real_run_agent(
                 "[multitenancy] AIAgent path failed (%s); falling back to legacy spike",
                 exc, exc_info=True,
             )
-            if _event_metadata(event).get("litellm_billing_enforced") is True:
+            metadata = _event_metadata(event)
+            if (
+                metadata.get("litellm_billing_enforced") is True
+                or metadata.get("litellm_billing_user_id")
+            ):
                 raise RuntimeError(
                     "Billing-bound run cannot fall back to the unmetered legacy runner"
                 ) from exc
@@ -554,7 +562,10 @@ def _event_metadata(event: Any) -> dict[str, Any]:
 
 def _billing_failure_kind(event: Any, error: Any) -> str:
     metadata = _event_metadata(event)
-    if metadata.get("litellm_billing_enforced") is not True:
+    if (
+        metadata.get("litellm_billing_enforced") is not True
+        and not metadata.get("litellm_billing_user_id")
+    ):
         return ""
     from ..billing_identity import classify_litellm_error
 
@@ -2868,41 +2879,60 @@ def _sync_auxiliary_runtime_main_for_aiagent(
     api_mode: str | None = None,
     request_overrides: Optional[dict[str, Any]] = None,
     request_overrides_base_url: str | None = None,
+    enforce_credentials: bool = False,
 ):
     """Tell Hermes core auxiliary calls which live main model this run uses."""
     try:
         from agent import auxiliary_client
-    except Exception:
+    except Exception as exc:
+        if enforce_credentials:
+            raise RuntimeError("Hermes auxiliary billing runtime is unavailable") from exc
         return lambda: None
 
     set_runtime_main = getattr(auxiliary_client, "set_runtime_main", None)
-    if not callable(set_runtime_main):
-        return lambda: None
-    try:
-        set_runtime_main(
-            provider,
-            model,
+    if callable(set_runtime_main):
+        try:
+            set_runtime_main(
+                provider,
+                model,
+                base_url=base_url or "",
+                api_key=api_key if isinstance(api_key, str) else "",
+                api_mode=api_mode or "",
+                request_overrides=request_overrides or {},
+                request_overrides_base_url=request_overrides_base_url or "",
+            )
+        except TypeError:
+            try:
+                set_runtime_main(provider, model)
+            except Exception:
+                logger.debug(
+                    "[multitenancy] auxiliary runtime main sync skipped",
+                    exc_info=True,
+                )
+        except Exception:
+            logger.debug("[multitenancy] auxiliary runtime main sync skipped", exc_info=True)
+
+    billing_cleanup = lambda: None
+    if enforce_credentials:
+        from .billing_auxiliary import install_billing_auxiliary_runtime
+
+        billing_cleanup = install_billing_auxiliary_runtime(
+            auxiliary_client,
+            model=model,
             base_url=base_url or "",
             api_key=api_key if isinstance(api_key, str) else "",
             api_mode=api_mode or "",
-            request_overrides=request_overrides or {},
-            request_overrides_base_url=request_overrides_base_url or "",
         )
-    except TypeError:
-        try:
-            set_runtime_main(provider, model)
-        except Exception:
-            logger.debug("[multitenancy] auxiliary runtime main sync skipped", exc_info=True)
-            return lambda: None
-    except Exception:
-        logger.debug("[multitenancy] auxiliary runtime main sync skipped", exc_info=True)
-        return lambda: None
 
     clear_runtime_main = getattr(auxiliary_client, "clear_runtime_main", None)
-    if callable(clear_runtime_main):
-        return clear_runtime_main
 
     def _cleanup() -> None:
+        billing_cleanup()
+        if callable(clear_runtime_main):
+            clear_runtime_main()
+            return
+        if not callable(set_runtime_main):
+            return
         try:
             set_runtime_main("", "", base_url="", api_key="", api_mode="")
         except TypeError:

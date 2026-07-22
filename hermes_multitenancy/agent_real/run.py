@@ -457,6 +457,7 @@ def _run_with_aiagent(
             api_mode=str(runtime_kwargs.get("api_mode") or ""),
             request_overrides={},
             request_overrides_base_url="",
+            enforce_credentials=billing_enforced,
         )
         agent = None
         try:

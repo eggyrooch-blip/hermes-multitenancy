@@ -2161,6 +2161,8 @@ def test_stream_aiagent_subprocess_reuses_opt_in_warm_worker_and_rotates_run_env
             "HERMES_MULTITENANCY_CRED_BROKER_TOKEN": f"cred-token-{env_count}",
             "HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN": f"search-token-{env_count}",
             "LARKSUITE_CLI_PROXY_KEY": f"lark-key-{env_count}",
+            "HERMES_LITELLM_RUNTIME_API_KEY": f"employee-key-{env_count}",
+            "HERMES_LITELLM_RUNTIME_EMPLOYEE_ID": f"employee-{env_count}",
             **(extra or {}),
         }
 
@@ -2254,6 +2256,10 @@ def test_stream_aiagent_subprocess_reuses_opt_in_warm_worker_and_rotates_run_env
         assert seen_envs[1]["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] == "search-token-2"
         assert seen_envs[0]["LARKSUITE_CLI_PROXY_KEY"] == "lark-key-1"
         assert seen_envs[1]["LARKSUITE_CLI_PROXY_KEY"] == "lark-key-2"
+        assert seen_envs[0]["HERMES_LITELLM_RUNTIME_API_KEY"] == "employee-key-1"
+        assert seen_envs[1]["HERMES_LITELLM_RUNTIME_API_KEY"] == "employee-key-2"
+        assert seen_envs[0]["HERMES_LITELLM_RUNTIME_EMPLOYEE_ID"] == "employee-1"
+        assert seen_envs[1]["HERMES_LITELLM_RUNTIME_EMPLOYEE_ID"] == "employee-2"
         assert seen_envs[0]["HERMES_MULTITENANCY_APPROVAL_DIR"] != seen_envs[1]["HERMES_MULTITENANCY_APPROVAL_DIR"]
         assert created[0].stdin.closed is False
     finally:

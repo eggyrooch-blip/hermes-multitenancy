@@ -18,6 +18,7 @@ The event dict must contain at minimum: text, message_id, source.* fields
 (open_id, user_id, user_name, chat_id, chat_name, chat_type, platform).
 """
 
+import inspect
 import json
 import os
 import sys
@@ -97,7 +98,12 @@ def _run_payload(
         messages = None
 
     event_stream = os.getenv("HERMES_AIAGENT_EVENT_STREAM") == "1"
-    billing_retry_safe = True
+    parameters = inspect.signature(_run_with_aiagent).parameters
+    supports_event_sink = "event_sink" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    billing_retry_safe = supports_event_sink
 
     def emit(event: str, **payload) -> None:
         protocol_stdout.write(json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n")
@@ -113,20 +119,21 @@ def _run_payload(
     try:
         sys.stdout = sys.stderr
         usage: dict = {}
+        run_kwargs = {"usage_sink": usage}
+        if supports_event_sink:
+            run_kwargs["event_sink"] = track
         if messages is None:
             result = _run_with_aiagent(
                 event,
                 profile_home,
-                event_sink=track,
-                usage_sink=usage,
+                **run_kwargs,
             )
         else:
             result = _run_with_aiagent(
                 event,
                 profile_home,
                 messages=messages,
-                event_sink=track,
-                usage_sink=usage,
+                **run_kwargs,
             )
         if event_stream:
             out = {"event": "done", "result": result or "", "error": None}
