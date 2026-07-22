@@ -1065,7 +1065,21 @@ def _install_auxiliary_main_runtime_patch(
             )
         except TypeError:
             try:
-                set_runtime_main(provider, model)
+                set_runtime_main(
+                    provider,
+                    model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    api_mode=api_mode,
+                )
+            except TypeError:
+                try:
+                    set_runtime_main(provider, model)
+                except Exception as fallback_exc:
+                    _m.logger.debug(
+                        "multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)",
+                        fallback_exc,
+                    )
             except Exception as fallback_exc:
                 _m.logger.debug(
                     "multitenancy: agent.auxiliary_client.set_runtime_main failed (%s)",
