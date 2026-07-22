@@ -4590,6 +4590,7 @@ def test_run_with_aiagent_forces_employee_key_across_main_and_aux(monkeypatch, t
 
         def run_conversation(self, user_message, task_id):
             captured["runtime_at_run"] = list(runtime_calls)
+            captured["ambient_openai_key"] = os.environ.get("OPENAI_API_KEY")
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -4611,12 +4612,14 @@ def test_run_with_aiagent_forces_employee_key_across_main_and_aux(monkeypatch, t
         "HERMES_LITELLM_RUNTIME_BASE_URL", "https://litellm.example/v1"
     )
     monkeypatch.setenv("HERMES_LITELLM_RUNTIME_EMPLOYEE_ID", "alice")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-shared-key")
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
 
     assert captured["model"] == "tencent-sonnet-4-6"
     assert captured["provider"] == "custom:litellm-sre"
     assert captured["base_url"] == "https://litellm.example/v1"
     assert captured["api_key"] == "employee-key"
+    assert captured["ambient_openai_key"] is None
     assert "request_overrides" not in captured
     assert "request_overrides_base_url" not in captured
     assert captured["enabled_toolsets"] == ["terminal"]
