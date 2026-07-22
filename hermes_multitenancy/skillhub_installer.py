@@ -20,7 +20,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
+import threading
 from typing import Any, Callable
 
 import yaml
@@ -62,6 +64,12 @@ _FULL_SNAPSHOT_EVENT_TYPES = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+# ponytail: one process-wide serial lane is enough for the observed 293-event
+# burst; shard by plugin only if measured throughput later requires it.
+_DRAIN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="skillhub-drain")
+_DRAIN_LOCK = threading.Lock()
+_DRAIN_STATES: dict[str, dict[str, Any]] = {}
 
 
 class SkillhubInstallError(Exception):
@@ -532,6 +540,45 @@ def _plugin_sticky_profiles(shared_home: Path, plugin_id: str) -> set[str]:
     if not isinstance(raw, list):
         return set()
     return {p for p in (_first_str(v) for v in raw) if p is not None}
+
+
+def _default_plugin_profiles(shared_home: Path, profiles_root: Path) -> set[str]:
+    try:
+        resolved = _resolve_profile_name(shared_home, "sunke")
+    except sqlite3.Error as exc:
+        logger.warning("[skillhub] default profile routing unavailable")
+        raise SkillhubInstallError(
+            "default profile could not be proven", error_code="DEFAULT_PROFILE_UNRESOLVED"
+        ) from exc
+    if resolved != "sunke" or not (profiles_root / "sunke").is_dir():
+        logger.warning("[skillhub] default profile could not be proven")
+        raise SkillhubInstallError(
+            "default profile could not be proven", error_code="DEFAULT_PROFILE_UNRESOLVED"
+        )
+    return {"sunke"}
+
+
+def _plugin_managed_status(shared_home: Path, plugin_id: str) -> str | None:
+    path = plugin_ingest._managed_path(shared_home, plugin_id)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    status = manifest.get("status") if isinstance(manifest, dict) else None
+    return str(status) if status in {"active", "inactive"} else None
+
+
+def _set_plugin_status(shared_home: Path, plugin_id: str, status: str) -> bool:
+    path = plugin_ingest._managed_path(shared_home, plugin_id)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    manifest["status"] = status
+    plugin_ingest._write_managed_manifest(shared_home, manifest, dry_run=False)
+    return True
 
 
 def _best_effort_plugin_uninstall(
@@ -1070,37 +1117,11 @@ def _process_plugin_event(
     if skill_status == "pending":
         return {"action": "skipped_pending", "plugin_id": plugin_id, "item_type": "plugin"}
     if skill_status == "inactive":
-        # STICKY: operator-pinned whitelist survives inactive. Uninstall only the
-        # non-sticky profiles; keep sticky installed + in the manifest.
-        sticky = _plugin_sticky_profiles(shared, plugin_id)
-        current = _plugin_managed_audience_profiles(shared, plugin_id)
-        kept = sorted(current & sticky)
-        if kept:
-            to_remove = sorted(current - sticky)
-            report = (
-                _best_effort_plugin_uninstall(
-                    plugin_id, shared=shared, profiles=profiles, profile_subset=to_remove
-                )
-                if to_remove
-                else None
-            )
-            return {
-                "action": "plugin_uninstall_inactive",
-                "plugin_id": plugin_id,
-                "kept_sticky": kept,
-                "uninstall": report,
-            }
-        uninstall_report = _best_effort_plugin_uninstall(
-            plugin_id,
-            shared=shared,
-            profiles=profiles,
-        )
-        if uninstall_report is None:
-            return {"action": "plugin_uninstall_inactive", "plugin_id": plugin_id, "status": "absent"}
+        changed = _set_plugin_status(shared, plugin_id, "inactive")
         return {
-            "action": "plugin_uninstall_inactive",
+            "action": "plugin_disable",
             "plugin_id": plugin_id,
-            "uninstall": uninstall_report,
+            "status": "inactive" if changed else "absent",
         }
 
     auth_type = _resolve_auth_type(event)
@@ -1156,16 +1177,15 @@ def _process_plugin_event(
     event_type = _first_str(event.get("event_type")) or ""
     full_snapshot = event_type in _FULL_SNAPSHOT_EVENT_TYPES
     incremental = event_type == "skill.permission_approved"
-    if not isinstance(users, list) or not users:
-        if full_snapshot:
-            # Empty authorized list on a full-snapshot event = de-authorize everyone.
-            # Uninstall from ALL currently-installed profiles (diff vs the empty set);
-            # a permission_approved (incremental) with no users stays a no-op.
-            _reconcile_plugin_full_snapshot(
-                plugin_id, shared=shared, profiles=profiles, new_profiles=set()
-            )
-            return {"action": "plugin_shrink", "plugin_id": plugin_id, "new_profiles": []}
-        return {"action": "plugin_no_audience", "plugin_id": plugin_id}
+    retained = (
+        _plugin_managed_audience_profiles(shared, plugin_id)
+        if full_snapshot
+        and skill_status == "active"
+        and _plugin_managed_status(shared, plugin_id) == "inactive"
+        else set()
+    )
+    if not isinstance(users, list):
+        users = []
 
     user_report: dict[str, dict[str, Any]] = {}
     resolved_names: list[str] = []
@@ -1197,7 +1217,8 @@ def _process_plugin_event(
         repo_root, fresh_repo = _materialize_plugin_repo(
             shared, plugin_id, package_bytes, release_key=_plugin_release_key(event)
         )
-        target = set(resolved_names)
+        defaults = _default_plugin_profiles(shared, profiles)
+        target = set(resolved_names) | defaults | retained
         if incremental:
             target |= _plugin_managed_audience_profiles(shared, plugin_id)
         if full_snapshot:
@@ -1208,7 +1229,7 @@ def _process_plugin_event(
                 plugin_id,
                 shared=shared,
                 profiles=profiles,
-                new_profiles=set(resolved_names),
+                new_profiles=set(resolved_names) | defaults | retained,
             )
         if not target:
             return {
@@ -1248,7 +1269,8 @@ def _process_plugin_event(
             "reason": "no download_url and no cached plugin repo",
         }
 
-    target = set(resolved_names)
+    defaults = _default_plugin_profiles(shared, profiles)
+    target = set(resolved_names) | defaults | retained
     if incremental:
         target |= _plugin_managed_audience_profiles(shared, plugin_id)
     if full_snapshot:
@@ -1259,7 +1281,7 @@ def _process_plugin_event(
             plugin_id,
             shared=shared,
             profiles=profiles,
-            new_profiles=set(resolved_names),
+            new_profiles=set(resolved_names) | defaults | retained,
         )
     if not target:
         return {
@@ -1301,19 +1323,25 @@ def process_event(
     failures raise ``SkillhubInstallError`` with a stable error code.
     """
     event_type = _first_str(event.get("event_type")) or ""
+    explicit_skill_status = bool(
+        event.get("skill_status_explicit", "skill_status" in event)
+    )
     skill_status = _first_str(event.get("skill_status")) or "active"
     skill_code = _first_str(event.get("skill_code"))
     item_type = (_first_str(event.get("item_type")) or "skill").strip().lower()
     shared = Path(shared_home).expanduser()
     profiles = (profiles_root or shared / "profiles").expanduser()
     if item_type == "plugin":
-        return _process_plugin_event(
+        result = _process_plugin_event(
             event,
             shared=shared,
             profiles=profiles,
             downloader=downloader,
             allow_create_distribution=allow_create_distribution,
         )
+        if explicit_skill_status and skill_status in {"active", "inactive"}:
+            _set_plugin_status(shared, skill_code or "", skill_status)
+        return result
     if skill_status == "pending":
         # Skill not yet live — never download or install. Idempotent no-op.
         return {"action": "skipped_pending", "skill_code": skill_code}
@@ -1465,6 +1493,17 @@ def _item_type_from_raw_payload(raw_payload: Any) -> str | None:
 
 def _event_from_row(row: dict[str, Any]) -> dict[str, Any]:
     audience = json.loads(row["audience_json"]) if row.get("audience_json") else {}
+    raw_payload = row.get("raw_payload")
+    explicit_skill_status = False
+    try:
+        raw = json.loads(raw_payload) if raw_payload else {}
+        skill = raw.get("skill") if isinstance(raw, dict) and isinstance(raw.get("skill"), dict) else {}
+        explicit_skill_status = bool(
+            isinstance(raw, dict)
+            and ("skill_status" in raw or "status" in skill)
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
     return {
         "event_type": row.get("event_type"),
         "skill_code": row.get("skill_code"),
@@ -1473,6 +1512,7 @@ def _event_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "download_url": row.get("download_url"),
         "checksum_sha256": row.get("checksum_sha256"),
         "skill_status": row.get("skill_status"),
+        "skill_status_explicit": explicit_skill_status,
         "item_type": _item_type_from_raw_payload(row.get("raw_payload")),
         "audience": audience,
     }
@@ -1549,16 +1589,117 @@ def run_worker(
     event_store = store or get_event_store()
     summary = {"processed": 0, "installed": 0, "failed": 0, "skipped": 0}
 
-    for row in event_store.list_queued(limit=limit):
-        summary["processed"] += 1
-        result = _process_row(
-            row,
-            shared=shared,
-            profiles=profiles,
-            event_store=event_store,
-            downloader=downloader,
-        )
-        status = result.get("status")
-        if status in {"installed", "failed", "skipped"}:
-            summary[status] += 1
+    rows = event_store.list_queued(limit=limit)
+    index = 0
+    while index < len(rows):
+        row = rows[index]
+        event = _event_from_row(row)
+        batch = [row]
+        if event.get("item_type") == "plugin" and event.get("event_type") == "skill.permission_approved":
+            key = tuple(row.get(name) for name in (
+                "skill_code", "release_id", "version", "download_url",
+                "checksum_sha256", "skill_status", "auth_type",
+            ))
+            while index + len(batch) < len(rows):
+                candidate = rows[index + len(batch)]
+                candidate_event = _event_from_row(candidate)
+                candidate_key = tuple(candidate.get(name) for name in (
+                    "skill_code", "release_id", "version", "download_url",
+                    "checksum_sha256", "skill_status", "auth_type",
+                ))
+                if (
+                    candidate_event.get("item_type") != "plugin"
+                    or candidate_event.get("event_type") != "skill.permission_approved"
+                    or candidate_key != key
+                ):
+                    break
+                batch.append(candidate)
+
+        if len(batch) == 1:
+            results = [_process_row(
+                row,
+                shared=shared,
+                profiles=profiles,
+                event_store=event_store,
+                downloader=downloader,
+            )]
+        else:
+            merged = event
+            users: list[dict[str, Any]] = []
+            seen_users: set[str] = set()
+            for batch_row in batch:
+                batch_event = _event_from_row(batch_row)
+                audience = batch_event.get("audience") or {}
+                for user in audience.get("users") or []:
+                    marker = json.dumps(user, sort_keys=True, ensure_ascii=False)
+                    if marker not in seen_users:
+                        seen_users.add(marker)
+                        users.append(user)
+            merged["audience"] = {**(merged.get("audience") or {}), "users": users}
+            try:
+                batch_result = process_event(
+                    merged,
+                    shared_home=shared,
+                    profiles_root=profiles,
+                    downloader=downloader,
+                )
+                batch_result = {**batch_result, "batched_events": len(batch)}
+                status = "skipped" if batch_result.get("action") in {
+                    "skipped_pending", "skipped_inactive", "plugin_no_audience", "plugin_no_package"
+                } else "installed"
+                results = []
+                for batch_row in batch:
+                    event_store.mark_installed(str(batch_row["event_id"]), batch_result)
+                    results.append({"status": status, "results": batch_result})
+            except SkillhubInstallError as exc:
+                results = []
+                for batch_row in batch:
+                    event_store.mark_failed(str(batch_row["event_id"]), exc.error_code, str(exc))
+                    results.append({"status": "failed"})
+            except Exception as exc:
+                results = []
+                for batch_row in batch:
+                    event_store.mark_failed(str(batch_row["event_id"]), "INTERNAL_ERROR", str(exc))
+                    results.append({"status": "failed"})
+
+        for result in results:
+            summary["processed"] += 1
+            status = result.get("status")
+            if status in {"installed", "failed", "skipped"}:
+                summary[status] += 1
+        index += len(batch)
     return summary
+
+
+def _drain_queued(shared_home: Path, key: str) -> None:
+    try:
+        while True:
+            while run_worker(shared_home=shared_home, limit=500)["processed"]:
+                pass
+            with _DRAIN_LOCK:
+                state = _DRAIN_STATES.get(key)
+                if state is not None and state["requested"]:
+                    state["requested"] = False
+                    continue
+                _DRAIN_STATES.pop(key, None)
+                return
+    except Exception:
+        logger.exception("[skillhub] queued-event drain failed")
+        with _DRAIN_LOCK:
+            _DRAIN_STATES.pop(key, None)
+
+
+def schedule_drain(shared_home: Path | None = None) -> Future[Any]:
+    """Wake the isolated serial SkillHub lane; repeated wakes collapse safely."""
+    shared = (shared_home or _default_shared_home()).expanduser()
+    key = str(shared.resolve())
+    with _DRAIN_LOCK:
+        state = _DRAIN_STATES.get(key)
+        if state is not None:
+            state["requested"] = True
+            return state["future"]
+        state = {"requested": False, "future": None}
+        _DRAIN_STATES[key] = state
+        future = _DRAIN_EXECUTOR.submit(_drain_queued, shared, key)
+        state["future"] = future
+        return future

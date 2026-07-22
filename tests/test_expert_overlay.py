@@ -214,6 +214,21 @@ def test_ingest_persists_experts_and_repo(tmp_path):
     assert not (shared / "profiles" / "feishu_test" / "SOUL.md").exists()
 
 
+def test_inactive_manifest_hides_and_blocks_expert(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    manifest_path = shared / pi.MANAGED_DIR / "keep-resource-delivery.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "inactive"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile = shared / "profiles" / "feishu_test"
+
+    assert eo.list_experts(profile) == []
+    assert eo.resolve_expert(profile, EXPERT_ID) is None
+
+
 def test_ingest_rejects_local_avatar_with_url_unsafe_plugin_id(tmp_path):
     repo = _plugin_repo(tmp_path / "plug", plugin_id="keep resource delivery")
     shared = _shared_home(tmp_path)

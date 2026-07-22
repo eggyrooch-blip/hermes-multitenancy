@@ -2,7 +2,7 @@
 
 > 这是 Hermes multitenancy 提供给 AiDock SkillHub 的**事件接收接口**。
 > 你（AiDock 侧）审批通过/更新/撤权后，把事件 POST 到这个接口即可。
-> 本期 Hermes 做的是「**收下、校验、去重、入库、回执**」；真正的下载安装/symlink/状态回传是下一期，事件先以 `queued` 落库。
+> Hermes 会「**收下、校验、去重、入库、快速回执**」，随后由与 WebUI 默认线程池隔离的专用串行 drain 完成下载、校验与安装。进程启动会继续消费 queued backlog；同一 plugin 的相邻 permission 事件会安全合批，但每个原始 event_id 仍保留独立账本终态。
 
 ## 1. 接口
 
@@ -46,7 +46,8 @@ Content-Type: application/json
 
 - **必填**：`event_type`、`skill_code`。缺了返回 400。
 - `audience.auth_type=all` → 全员；`auth` → 按 `users[].profile_id`。
-- `skill_status=inactive` 表示技能下线（后续走解除授权）。
+- plugin `skill_status=inactive` 只禁用展示与运行，保留已保存包和 audience；无显式 status 的 permission 事件不得把它重新启用。
+- active plugin 的 profile audience 默认包含经 Hermes routing 与 profile 目录双重证明的 `sunke`；上游 permission 用户增量追加。该默认身份无法证明时事件显式失败，不做无声 no-op。
 - PRD §9.5 的全量嵌套格式（`skill{}`/`release.package{}`/`audience.type`）也兼容，二选一即可。
 
 ### 🙏 希望你补两个字段（强烈建议）
@@ -98,7 +99,9 @@ curl -s -X POST https://hermes.example.com/api/run-broker/skillhub/events \
 2. 你那边的 **callback endpoint**（Hermes 装完回传状态用）地址 + 鉴权，方便我下一期对接。
 3. 鉴权已定：**固定 Bearer key**（专用 key，我私发给你，不用 HMAC）。
 
-## 7. 本期边界
+## 7. 当前实现边界
 
-- ✅ 已交付：接口可收 / 校验 / 去重 / 入库（表 `skillhub_events`）/ 回执，19 个单测 + 真实 curl 通过。
-- ⏭️ 下一期：下载 zip → 校验 checksum → 装进 router 托管库 → 给 profile 建 symlink → 归 kep-cli 凭证 → callback 回传你。
+- ✅ 接口可收 / 校验 / 去重 / 入库（表 `skillhub_events`）/ 快速回执；worker 下载并校验 package，安装到受管 plugin repo 与授权 profile。
+- ✅ Webhook 不执行慢安装；专用单线程 drain 避免授权突发占满 WebUI 默认 executor，并在启动时恢复 queued 事件。
+- ✅ 相邻且发布字段兼容的同 plugin permission 事件合批 ingest，原事件逐条记 installed/failed 结果。
+- ⏭️ Hermes → AiDock 的独立 callback endpoint 与失败重试协议仍需双方确认。

@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 
 import pytest
 
 from hermes_multitenancy import skillhub_events
+from hermes_multitenancy import skillhub_installer as _skillhub_installer
+
+_REAL_SCHEDULE_DRAIN = _skillhub_installer.schedule_drain
 
 
 # 王克杰's actual shipped payload (2026-05-27 飞书).
@@ -60,14 +64,10 @@ def _fresh_event_store(monkeypatch):
     all; tests send TEST_KEY by default via ``_post``.
     """
     from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy import skillhub_installer
 
     monkeypatch.setenv("HERMES_SKILLHUB_WEBHOOK_KEY", TEST_KEY)
-    monkeypatch.setattr(
-        broker_mod,
-        "_run_skillhub_install_in_background",
-        lambda _event_id, _shared_home: None,
-        raising=False,
-    )
+    monkeypatch.setattr(skillhub_installer, "schedule_drain", lambda _shared_home: None)
     skillhub_events.override_event_store(":memory:")
     yield
     skillhub_events.override_event_store(":memory:")
@@ -204,14 +204,14 @@ def test_endpoint_accepts_wangkejie_payload():
 
 
 def test_endpoint_schedules_background_install_for_new_known_event(monkeypatch, tmp_path):
-    from hermes_multitenancy import webui_broker_server as broker_mod
+    from hermes_multitenancy import skillhub_installer
 
     scheduled = []
     monkeypatch.setenv("HERMES_SHARED_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setattr(
-        broker_mod,
-        "_run_skillhub_install_in_background",
-        lambda event_id, shared_home: scheduled.append((event_id, shared_home)),
+        skillhub_installer,
+        "schedule_drain",
+        lambda shared_home: scheduled.append(shared_home),
     )
 
     first_status, first = _post("/api/run-broker/skillhub/events", json_body=WANGKEJIE_PAYLOAD)
@@ -220,7 +220,67 @@ def test_endpoint_schedules_background_install_for_new_known_event(monkeypatch, 
     assert first_status == 200 and second_status == 200
     assert first["status"] == "queued"
     assert second["duplicate"] is True
-    assert scheduled == [(first["event_id"], tmp_path / ".hermes")]
+    # One startup wake per app plus one wake for the newly persisted event;
+    # the duplicate itself does not add another event wake.
+    assert scheduled == [tmp_path / ".hermes"] * 3
+
+
+def test_worker_batches_293_plugin_permissions_and_keeps_each_ledger(monkeypatch, tmp_path):
+    from hermes_multitenancy import skillhub_installer
+
+    store = skillhub_events.SkillhubEventStore(":memory:")
+    for index in range(293):
+        payload = {
+            "event_id": f"evt-{index:03d}",
+            "event_type": "skill.permission_approved",
+            "item_type": "plugin",
+            "skill_code": "keep-sharetemplate",
+            "release_id": "193",
+            "version": "1.0.0",
+            "audience": {"auth_type": "auth", "users": [{"profile_id": f"u-{index:03d}"}]},
+        }
+        raw = json.dumps(payload)
+        event = skillhub_events.normalize_event(payload, raw_body=raw)
+        store.record(event, raw_payload=raw, signature_verified=True)
+
+    calls = []
+
+    def fake_process(event, **_kwargs):
+        calls.append(event)
+        return {"action": "plugin_install", "users": {}}
+
+    monkeypatch.setattr(skillhub_installer, "process_event", fake_process)
+    summary = skillhub_installer.run_worker(
+        store=store,
+        shared_home=tmp_path / ".hermes",
+        limit=500,
+    )
+
+    assert summary == {"processed": 293, "installed": 293, "failed": 0, "skipped": 0}
+    assert len(calls) == 1
+    assert len(calls[0]["audience"]["users"]) == 293
+    rows = store.list_recent(limit=500)
+    assert len(rows) == 293
+    assert {row["status"] for row in rows} == {"installed"}
+    assert {json.loads(row["results_json"])["batched_events"] for row in rows} == {293}
+
+
+def test_schedule_drain_uses_dedicated_serial_thread_and_recovers_queue(monkeypatch, tmp_path):
+    from hermes_multitenancy import skillhub_installer
+
+    calls = []
+
+    def fake_worker(**_kwargs):
+        calls.append(threading.current_thread().name)
+        return {"processed": 1 if len(calls) == 1 else 0}
+
+    monkeypatch.setattr(skillhub_installer, "run_worker", fake_worker)
+    monkeypatch.setattr(skillhub_installer, "schedule_drain", _REAL_SCHEDULE_DRAIN)
+    future = skillhub_installer.schedule_drain(tmp_path / ".hermes")
+    future.result(timeout=5)
+
+    assert len(calls) == 2
+    assert all(name.startswith("skillhub-drain") for name in calls)
 
 
 def test_endpoint_idempotent_on_repost():

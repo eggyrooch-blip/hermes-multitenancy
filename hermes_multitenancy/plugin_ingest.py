@@ -805,6 +805,13 @@ def ingest(
     profiles_root = (profiles_root or shared_home / "profiles").expanduser()
     plugin = load_plugin_manifest(repo)
     aud = resolve_audience(audience, profiles_root=profiles_root)
+    existing_status = "active"
+    try:
+        existing = json.loads(_managed_path(shared_home, plugin["id"]).read_text(encoding="utf-8"))
+        if isinstance(existing, dict) and existing.get("status") in {"active", "inactive"}:
+            existing_status = str(existing["status"])
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
 
     report: dict[str, Any] = {
         "plugin_id": plugin["id"],
@@ -839,6 +846,7 @@ def ingest(
     manifest = {
         "plugin_id": plugin["id"],
         "version": plugin.get("version"),
+        "status": existing_status,
         "schema": SUPPORTED_SCHEMA,
         "ingested_at": int(time.time()),
         "audience": {"mode": aud.mode, "profiles": aud.profiles, "department_ids": aud.department_ids},

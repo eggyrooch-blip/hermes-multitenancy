@@ -21,6 +21,8 @@ PLUGIN_SKILLS = [
 
 
 def _seed_routing_db(shared_home: Path, rows: list[tuple[str, str]]) -> None:
+    if not any(user_id == "sunke" for user_id, _ in rows):
+        rows = [*rows, ("sunke", "sunke")]
     db_path = shared_home / "multitenancy.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
@@ -58,7 +60,7 @@ def _seed_routing_db(shared_home: Path, rows: list[tuple[str, str]]) -> None:
 
 def _make_profile_dirs(shared_home: Path, *names: str) -> Path:
     profiles_root = shared_home / "profiles"
-    for name in names:
+    for name in (*names, "sunke"):
         (profiles_root / name / "skills").mkdir(parents=True, exist_ok=True)
     return profiles_root
 
@@ -177,7 +179,7 @@ def test_plugin_install_approved_installs_for_authorized_profiles_only(tmp_path:
         "bob-ldap": {"status": "resolved", "profile": "bob"},
     }
     managed = _managed_manifest(shared_home)
-    assert managed["audience"]["profiles"] == ["alice", "bob"]
+    assert managed["audience"]["profiles"] == ["alice", "bob", "sunke"]
     assert Path(str(managed["repo"])) == shared_home / "_managed" / "aidock-skillhub-plugin" / PLUGIN_ID / PLUGIN_VERSION
     assert (Path(str(managed["repo"])) / pi.PLUGIN_MANIFEST_REL).is_file()
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
@@ -253,24 +255,23 @@ def test_plugin_pending_skips_without_download(tmp_path: Path) -> None:
     assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
 
 
-def test_plugin_incremental_without_users_is_noop(tmp_path: Path) -> None:
-    # permission_approved (incremental) with no users = genuine no-op. (A full-snapshot
-    # event with no users means "de-authorize everyone" — covered separately below.)
+def test_plugin_without_users_is_stored_for_sunke(tmp_path: Path) -> None:
     from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
-    profiles_root = _make_profile_dirs(shared_home, "alice")
-    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    profiles_root = _make_profile_dirs(shared_home, "alice", "sunke")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("sunke", "sunke")])
 
     result = process_event(
         _plugin_event(event_type="skill.permission_approved", users=[]),
         shared_home=shared_home,
         profiles_root=profiles_root,
-        downloader=lambda _: pytest.fail("empty-audience plugin event must not download"),
+        downloader=lambda _: _plugin_zip(),
     )
 
-    assert result == {"action": "plugin_no_audience", "plugin_id": PLUGIN_ID}
-    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
+    assert result["action"] == "plugin_install"
+    assert _managed_manifest(shared_home)["audience"]["profiles"] == ["sunke"]
+    assert (profiles_root / "sunke" / "skills" / "kep-halo-cli").exists()
 
 
 def test_plugin_full_snapshot_empty_users_uninstalls_everyone(tmp_path: Path) -> None:
@@ -280,8 +281,11 @@ def test_plugin_full_snapshot_empty_users_uninstalls_everyone(tmp_path: Path) ->
     from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
-    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
-    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob", "sunke")
+    _seed_routing_db(
+        shared_home,
+        [("alice-ldap", "alice"), ("bob-ldap", "bob"), ("sunke", "sunke")],
+    )
 
     process_event(
         _plugin_event(users=["alice-ldap", "bob-ldap"]),
@@ -296,13 +300,14 @@ def test_plugin_full_snapshot_empty_users_uninstalls_everyone(tmp_path: Path) ->
         _plugin_event(event_type="skill.status_changed", users=[]),
         shared_home=shared_home,
         profiles_root=profiles_root,
-        downloader=lambda _: pytest.fail("de-authorize-everyone must not download"),
+        downloader=lambda _: _plugin_zip(),
     )
 
-    assert result["action"] == "plugin_shrink"
-    assert result["new_profiles"] == []
+    assert result["action"] == "plugin_install"
     assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert not (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
+    assert (profiles_root / "sunke" / "skills" / "kep-halo-cli").exists()
+    assert _managed_manifest(shared_home)["audience"]["profiles"] == ["sunke"]
 
 
 def test_plugin_download_checksum_mismatch_raises(tmp_path: Path) -> None:
@@ -355,15 +360,15 @@ def test_plugin_profile_then_all_then_inactive_leaves_no_orphan(tmp_path: Path) 
     # alice's stale per-profile copy must be gone (now covered via all-distribution instead)
     assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
 
-    # 3) inactive → distribution stripped, nothing orphaned
+    # 3) inactive → package/distribution retained but disabled at runtime
     process_event(
         _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
         shared_home=shared_home, profiles_root=profiles_root,
         downloader=lambda _: pytest.fail("inactive must not download"),
     )
-    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
+    assert _managed_manifest(shared_home)["status"] == "inactive"
     assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
-    assert _distribution_plugin_entries(shared_home) == []
+    assert _distribution_plugin_entries(shared_home)
 
 
 def test_plugin_all_then_permission_is_noop_no_orphan_on_inactive(tmp_path: Path) -> None:
@@ -392,14 +397,14 @@ def test_plugin_all_then_permission_is_noop_no_orphan_on_inactive(tmp_path: Path
     assert result["action"] == "plugin_noop_already_all"
     assert _managed_manifest(shared_home)["audience"]["mode"] == "all"  # not downgraded
 
-    # inactive still cleanly strips the all-distribution (nothing orphaned)
+    # inactive keeps the package/distribution and disables the manifest
     process_event(
         _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
         shared_home=shared_home, profiles_root=profiles_root,
         downloader=lambda _: pytest.fail("inactive must not download"),
     )
-    assert _distribution_plugin_entries(shared_home) == []
-    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
+    assert _distribution_plugin_entries(shared_home)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
 
 
 def test_plugin_profile_to_all_without_download_reuses_cached_repo(tmp_path: Path) -> None:
@@ -434,7 +439,7 @@ def test_plugin_profile_to_all_without_download_reuses_cached_repo(tmp_path: Pat
     assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()  # stale profile copy cleared
 
 
-def test_plugin_inactive_uninstalls_and_second_call_is_idempotent(tmp_path: Path) -> None:
+def test_plugin_inactive_disables_and_second_call_is_idempotent(tmp_path: Path) -> None:
     from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
@@ -461,24 +466,142 @@ def test_plugin_inactive_uninstalls_and_second_call_is_idempotent(tmp_path: Path
         downloader=lambda _: pytest.fail("inactive plugin event must not download"),
     )
 
-    assert first["action"] == "plugin_uninstall_inactive"
+    assert first["action"] == "plugin_disable"
     assert first["plugin_id"] == PLUGIN_ID
-    assert "uninstall" in first
-    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
-    assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
-    assert second == {
-        "action": "plugin_uninstall_inactive",
+    assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+    assert second == first
+
+    active = process_event(
+        _plugin_event(
+            event_type="skill.status_changed",
+            skill_status="active",
+            users=["alice-ldap"],
+            download_url=None,
+        ),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: pytest.fail("reactivation must reuse the cached package"),
+    )
+    assert active["action"] == "plugin_install"
+    assert _managed_manifest(shared_home)["status"] == "active"
+
+
+def test_plugin_reactivation_with_empty_users_retains_latest_audience(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    process_event(
+        _plugin_event(users=["alice-ldap", "bob-ldap"]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    process_event(
+        _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: pytest.fail("inactive must not download"),
+    )
+
+    process_event(
+        _plugin_event(
+            event_type="skill.status_changed",
+            skill_status="active",
+            users=[],
+            download_url=None,
+        ),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: pytest.fail("reactivation must use cached package"),
+    )
+
+    manifest = _managed_manifest(shared_home)
+    assert manifest["status"] == "active"
+    assert manifest["audience"]["profiles"] == ["alice", "bob", "sunke"]
+
+
+def test_statusless_permission_does_not_reactivate_inactive_plugin(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    process_event(
+        _plugin_event(users=["alice-ldap"]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    process_event(
+        _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: pytest.fail("inactive must not download"),
+    )
+    permission = _plugin_event(
+        event_type="skill.permission_approved", users=["bob-ldap"], download_url=None
+    )
+    permission.pop("skill_status")
+    process_event(
+        permission,
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: pytest.fail("permission must use cached package"),
+    )
+
+    manifest = _managed_manifest(shared_home)
+    assert manifest["status"] == "inactive"
+    assert manifest["audience"]["profiles"] == ["alice", "bob", "sunke"]
+
+
+def test_inactive_unknown_plugin_never_downloads(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    result = process_event(
+        _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
+        shared_home=tmp_path / ".hermes",
+        downloader=lambda _: pytest.fail("inactive must not download"),
+    )
+    assert result == {
+        "action": "plugin_disable",
         "plugin_id": PLUGIN_ID,
         "status": "absent",
     }
+
+
+def test_plugin_install_fails_closed_when_default_profile_is_unproven(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    with sqlite3.connect(shared_home / "multitenancy.db") as conn:
+        conn.execute("DELETE FROM multitenancy_routing WHERE user_id = 'sunke'")
+        conn.commit()
+
+    with pytest.raises(SkillhubInstallError) as exc:
+        process_event(
+            _plugin_event(users=["alice-ldap"]),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(),
+        )
+    assert exc.value.error_code == "DEFAULT_PROFILE_UNRESOLVED"
+    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
 
 
 def test_plugin_permission_approved_uses_cached_repo_and_keeps_existing_audience(tmp_path: Path) -> None:
     from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
-    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
-    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob", "sunke")
+    _seed_routing_db(
+        shared_home,
+        [("alice-ldap", "alice"), ("bob-ldap", "bob"), ("sunke", "sunke")],
+    )
 
     process_event(
         _plugin_event(users=["alice-ldap"]),
@@ -502,7 +625,7 @@ def test_plugin_permission_approved_uses_cached_repo_and_keeps_existing_audience
     assert result["action"] == "plugin_install"
     assert result["mode"] == "from_existing"
     assert result["users"] == {"bob-ldap": {"status": "resolved", "profile": "bob"}}
-    assert set(managed["audience"]["profiles"]) == {"alice", "bob"}
+    assert set(managed["audience"]["profiles"]) == {"alice", "bob", "sunke"}
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
 
@@ -570,7 +693,7 @@ def test_plugin_full_snapshot_shrink_reconciles_removed_profiles(tmp_path: Path)
 
     managed = _managed_manifest(shared_home)
     assert result["action"] == "plugin_install"
-    assert managed["audience"]["profiles"] == ["alice"]
+    assert managed["audience"]["profiles"] == ["alice", "sunke"]
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert not (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
 
@@ -608,7 +731,7 @@ def test_plugin_full_snapshot_shrink_removes_only_dropped_profile(tmp_path: Path
     managed = _managed_manifest(shared_home)
     assert result["action"] == "plugin_install"
     assert set(removed_profiles) == {"bob"}
-    assert managed["audience"]["profiles"] == ["alice"]
+    assert managed["audience"]["profiles"] == ["alice", "sunke"]
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert not (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
 
@@ -647,9 +770,9 @@ def test_plugin_all_audience_installs_global_distribution(tmp_path: Path) -> Non
         downloader=lambda _: pytest.fail("inactive all-audience plugin event must not download"),
     )
 
-    assert inactive["action"] == "plugin_uninstall_inactive"
-    assert _distribution_plugin_entries(shared_home) == []
-    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
+    assert inactive["action"] == "plugin_disable"
+    assert _distribution_plugin_entries(shared_home)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
 
 
 def test_plugin_all_audience_installs_with_download(tmp_path: Path) -> None:
@@ -752,7 +875,7 @@ def test_sticky_survives_full_snapshot_shrink_but_nonsticky_dropped(tmp_path: Pa
     assert "alice" in _managed_manifest(shared_home)["audience"]["profiles"]            # sticky stays in manifest
 
 
-def test_sticky_survives_inactive_but_nonsticky_removed(tmp_path: Path) -> None:
+def test_inactive_preserves_all_installed_profiles(tmp_path: Path) -> None:
     from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
@@ -768,10 +891,10 @@ def test_sticky_survives_inactive_but_nonsticky_removed(tmp_path: Path) -> None:
                            shared_home=shared_home, profiles_root=profiles_root,
                            downloader=lambda _: pytest.fail("inactive must not download"))
 
-    assert result["kept_sticky"] == ["alice"]
+    assert result["action"] == "plugin_disable"
     assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()    # sticky KEPT
-    assert not (profiles_root / "dave" / "skills" / "using-resource-delivery").exists() # non-sticky removed
-    assert (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()                # manifest kept (sticky remains)
+    assert (profiles_root / "dave" / "skills" / "using-resource-delivery").exists()
+    assert _managed_manifest(shared_home)["status"] == "inactive"
 
 
 def test_no_sticky_file_preserves_normal_shrink(tmp_path: Path) -> None:
@@ -830,10 +953,10 @@ def test_sticky_survives_shrink_to_zero(tmp_path: Path) -> None:
     _write_sticky(shared_home, ["alice"])
 
     # full-snapshot with EMPTY users (de-authorize everyone) — sticky must still survive
-    process_event(_plugin_event(event_type="skill.status_changed", users=[]),
+    process_event(_plugin_event(event_type="skill.status_changed", users=[], download_url=None),
                   shared_home=shared_home, profiles_root=profiles_root,
                   downloader=lambda _: pytest.fail("shrink-to-zero must not download"))
 
     assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()    # sticky KEPT
     assert not (profiles_root / "dave" / "skills" / "using-resource-delivery").exists()  # non-sticky gone
-    assert _managed_manifest(shared_home)["audience"]["profiles"] == ["alice"]           # sticky RETAINED in manifest
+    assert _managed_manifest(shared_home)["audience"]["profiles"] == ["alice", "sunke"] # sticky + default retained

@@ -149,6 +149,10 @@ def _iter_managed_manifests(profile_home: Path, *, strict: bool = False):
                 yield data, path
 
 
+def _manifest_is_active(manifest: dict[str, Any]) -> bool:
+    return str(manifest.get("status") or "active").strip().lower() == "active"
+
+
 # ─────────────────────────── agent.md resolution ─────────────────────────────
 
 def _read_agent_md(manifest: dict[str, Any], expert: dict[str, Any]) -> Optional[str]:
@@ -262,6 +266,8 @@ def resolve_expert(
     profile_name = _caller_profile_name(profile_home)
     try:
         for manifest, _path in _iter_managed_manifests(profile_home):
+            if not _manifest_is_active(manifest):
+                continue
             experts = manifest.get("experts")
             if not isinstance(experts, list):
                 continue
@@ -422,6 +428,8 @@ def list_experts(
     profile_name = _caller_profile_name(profile_home)
     try:
         for manifest, _path in _iter_managed_manifests(profile_home):
+            if not _manifest_is_active(manifest):
+                continue
             experts = manifest.get("experts")
             if not isinstance(experts, list):
                 continue

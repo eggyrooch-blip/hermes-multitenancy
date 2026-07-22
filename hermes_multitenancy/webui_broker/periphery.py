@@ -166,15 +166,6 @@ def _shared_home_from_env() -> Path:
     return Path(configured or (Path.home() / ".hermes")).expanduser()
 
 
-def _run_skillhub_install_in_background(event_id: str, shared_home: Path) -> None:
-    try:
-        from .. import skillhub_installer
-
-        skillhub_installer.process_one(event_id=event_id, shared_home=shared_home)
-    except Exception:
-        logger.exception("[multitenancy] SkillHub background install failed event_id=%s", event_id)
-
-
 def _safe_plugin_asset_component(raw: Any) -> str | None:
     value = str(raw or "").strip()
     if not value or "/" in value or "\\" in value or value.startswith("."):

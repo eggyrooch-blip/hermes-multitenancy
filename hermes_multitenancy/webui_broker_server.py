@@ -3041,12 +3041,7 @@ def create_run_broker_app(
                     from . import skillhub_installer
 
                     shared_home = _shared_home_from_env()
-                    event_id = event["event_id"]
-                    loop = asyncio.get_running_loop()
-                    loop.run_in_executor(
-                        None,
-                        lambda: _run_skillhub_install_in_background(event_id, shared_home),
-                    )
+                    skillhub_installer.schedule_drain(shared_home)
                 except Exception:
                     logger.exception("[multitenancy] SkillHub background install schedule failed")
         except Exception:
@@ -3184,6 +3179,12 @@ def create_run_broker_app(
         return web.json_response({"ok": True, "accepted": True})
 
     app = web.Application(client_max_size=_run_broker_client_max_size())
+    async def _start_skillhub_drain(_app):
+        from . import skillhub_installer
+
+        skillhub_installer.schedule_drain(_shared_home_from_env())
+
+    app.on_startup.append(_start_skillhub_drain)
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
