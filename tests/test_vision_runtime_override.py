@@ -11,6 +11,13 @@ from hermes_multitenancy import router
 def _install_fake_aux(monkeypatch, vision_map):
     fake = types.ModuleType("agent.auxiliary_client")
     fake._PROVIDER_VISION_MODELS = dict(vision_map)
+    fake._resolve_task_provider_model = lambda *_args, **_kwargs: (
+        "auto", "aux-model", None, None, None
+    )
+    fake.resolve_provider_client = lambda provider, model=None, **kwargs: (
+        {"provider": provider, "model": model, **kwargs}, model
+    )
+    fake._evict_cached_clients = lambda _provider: None
     parent = sys.modules.get("agent") or types.ModuleType("agent")
     monkeypatch.setitem(sys.modules, "agent", parent)
     monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake)
@@ -111,6 +118,13 @@ def test_image_prep_runtime_uses_employee_key_without_callback_headers(monkeypat
             assert fake._RUNTIME_MAIN["api_key"] == "employee-key"
             assert fake._RUNTIME_MAIN["request_overrides"] == {}
             assert fake._RUNTIME_MAIN["request_overrides_base_url"] == ""
+            assert fake._resolve_task_provider_model("compression") == (
+                "custom",
+                "aux-model",
+                "https://litellm.example/v1",
+                "employee-key",
+                "openai",
+            )
 
     asyncio.run(drive())
 
