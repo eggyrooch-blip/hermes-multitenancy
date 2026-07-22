@@ -8,6 +8,8 @@ kep-cli install is covered by the live UAT probe, not here.
 from __future__ import annotations
 
 import json
+import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -118,9 +120,25 @@ def test_load_manifest_rejects_unsafe_plugin_id(tmp_path):
         pi.load_plugin_manifest(repo)
 
 
+@pytest.mark.parametrize("missing", ["entry", "orchestrator"])
+def test_load_manifest_requires_entry_and_orchestrator(tmp_path, missing):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    mf = repo / pi.PLUGIN_MANIFEST_REL
+    data = json.loads(mf.read_text(encoding="utf-8"))
+    if missing == "entry":
+        data.pop("entry_skill")
+    else:
+        data["skills"]["list"] = [
+            name for name in data["skills"]["list"] if "orchestrat" not in name
+        ]
+    mf.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(pi.PluginIngestError, match=missing):
+        pi.load_plugin_manifest(repo)
+
+
 def test_load_manifest_rejects_unsafe_cli_id(tmp_path):
-    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"],
-                              clis=[{"id": "../evil", "install": "x"}])
+    repo = _write_plugin_repo(tmp_path / "plug", clis=[{"id": "../evil", "install": "x"}])
     with pytest.raises(pi.PluginIngestError, match="unsafe cli id"):
         pi.load_plugin_manifest(repo)
 
@@ -184,15 +202,13 @@ def test_resolve_audience_rejects_traversal_token(tmp_path):
 
 
 def test_load_manifest_rejects_flag_injection_cli_install(tmp_path):
-    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"],
-                              clis=[{"id": "x", "install": "--all"}])
+    repo = _write_plugin_repo(tmp_path / "plug", clis=[{"id": "x", "install": "--all"}])
     with pytest.raises(pi.PluginIngestError, match=r"unsafe clis\[\].install"):
         pi.load_plugin_manifest(repo)
 
 
 def test_governance_failure_leaves_recoverable_manifest(tmp_path):
-    # orchestrator installed but its SKILL.md lacks the gate → governance fails AFTER the
-    # manifest is persisted, so --uninstall can still roll the partial install back.
+    # Governance failure keeps the complete install tracked but never active.
     repo = tmp_path / "plug"
     _write_plugin_repo(repo, skills=["using-resource-delivery", "kep-trevi-delivery-orchestrate"])
     (repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").write_text(
@@ -200,9 +216,252 @@ def test_governance_failure_leaves_recoverable_manifest(tmp_path):
     home = _shared_home(tmp_path)
     with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
         pi.ingest(repo, audience="feishu_test", shared_home=home)
-    assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()  # tracked despite failure
+    managed_path = home / pi.MANAGED_DIR / "test-plugin.json"
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "inactive"
     pi.uninstall("test-plugin", shared_home=home)
-    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+    assert not managed_path.exists()
+
+
+def test_profile_governance_accepts_gates_in_all_owned_declared_skills(tmp_path):
+    skills = [
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+        "kep-halo-cli",
+        "kep-other-cli",
+    ]
+    repo = _write_plugin_repo(tmp_path / "plug", skills=skills)
+    manifest_path = repo / pi.PLUGIN_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["governance"]["approval_required"] = [
+        "gate alpha",
+        "gate beta",
+        "gate gamma",
+        "gate delta",
+        "gate epsilon",
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (repo / "skills" / "kep-halo-cli" / "SKILL.md").write_text(
+        "gate alpha\ngate beta\ngate gamma\n", encoding="utf-8"
+    )
+    (repo / "skills" / "kep-other-cli" / "SKILL.md").write_text(
+        "gate delta\ngate epsilon\n", encoding="utf-8"
+    )
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=_shared_home(tmp_path))
+
+    assert report["profile_governance"][0]["gates_present_in_installed_skills"] == 5
+
+
+def test_profile_governance_rejects_one_missing_gate_and_demotes_active(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    pi.ingest(repo, audience="feishu_test", shared_home=home)
+    manifest_path = repo / pi.PLUGIN_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["governance"]["approval_required"] = ["x approve", "missing gate"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(pi.PluginIngestError, match="1 of 2"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+
+    managed = json.loads((home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8"))
+    assert managed["status"] == "inactive"
+
+
+def test_reingest_demotes_active_before_post_install_governance(tmp_path, monkeypatch):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    managed_path = home / pi.MANAGED_DIR / "test-plugin.json"
+    pi.ingest(repo, audience="feishu_test", shared_home=home)
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "active"
+
+    observed = []
+
+    def reject(*_args):
+        observed.append(json.loads(managed_path.read_text(encoding="utf-8"))["status"])
+        raise pi.PluginIngestError("forced post-install failure")
+
+    monkeypatch.setattr(pi, "assert_profile_governance", reject)
+    with pytest.raises(pi.PluginIngestError, match="forced post-install failure"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+
+    assert observed == ["inactive"]
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "inactive"
+
+
+def test_concurrent_reingests_serialize_activation_and_failed_mutation(tmp_path, monkeypatch):
+    valid_repo = _write_plugin_repo(tmp_path / "valid")
+    invalid_repo = _write_plugin_repo(tmp_path / "invalid")
+    invalid_manifest_path = invalid_repo / pi.PLUGIN_MANIFEST_REL
+    invalid_manifest = json.loads(invalid_manifest_path.read_text(encoding="utf-8"))
+    invalid_manifest["governance"]["approval_required"] = ["missing gate"]
+    invalid_manifest_path.write_text(json.dumps(invalid_manifest), encoding="utf-8")
+    home = _shared_home(tmp_path)
+    managed_path = home / pi.MANAGED_DIR / "test-plugin.json"
+    pi.ingest(valid_repo, audience="feishu_test", shared_home=home)
+
+    first_paused = threading.Event()
+    release_first = threading.Event()
+    second_mutating = threading.Event()
+    release_second = threading.Event()
+    original_assert = pi.assert_profile_governance
+    original_install = pi._install_skills_to_profile
+
+    def pause_first(plugin, *args):
+        result = original_assert(plugin, *args)
+        if Path(plugin["_repo"]) == valid_repo:
+            first_paused.set()
+            assert release_first.wait(2)
+        return result
+
+    def pause_second(plugin, *args, **kwargs):
+        if Path(plugin["_repo"]) == invalid_repo:
+            second_mutating.set()
+            assert release_second.wait(2)
+        return original_install(plugin, *args, **kwargs)
+
+    monkeypatch.setattr(pi, "assert_profile_governance", pause_first)
+    monkeypatch.setattr(pi, "_install_skills_to_profile", pause_second)
+    errors = []
+
+    def run(repo):
+        try:
+            pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+        except Exception as exc:  # captured for assertions after both threads finish
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=(valid_repo,))
+    second = threading.Thread(target=run, args=(invalid_repo,))
+    first.start()
+    assert first_paused.wait(2)
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "inactive"
+    second.start()
+    assert not second_mutating.wait(0.1)
+    release_first.set()
+    assert second_mutating.wait(2)
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "inactive"
+    release_second.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], pi.PluginIngestError)
+    assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "inactive"
+
+
+def test_profile_governance_ignores_foreign_and_undeclared_gate_docs(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    manifest_path = repo / pi.PLUGIN_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["governance"]["approval_required"] = ["foreign gate"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    home = _shared_home(tmp_path)
+    skills = home / "profiles" / "feishu_test" / "skills"
+    foreign = skills / "kep-halo-cli"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text("foreign gate\n", encoding="utf-8")
+    (skills / "undeclared" / "SKILL.md").parent.mkdir()
+    (skills / "undeclared" / "SKILL.md").write_text("foreign gate\n", encoding="utf-8")
+    (skills / ".hermes-personal-installs.json").write_text(
+        json.dumps({"skills": {"kep-halo-cli": {"target": str(tmp_path / "foreign")}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    managed = json.loads((home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8"))
+    assert managed["status"] == "inactive"
+
+
+def test_profile_governance_does_not_join_gate_across_skill_docs(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    manifest_path = repo / pi.PLUGIN_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["governance"]["approval_required"] = ["approve now"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (repo / "skills" / "using-resource-delivery" / "SKILL.md").write_text(
+        "ends with approve", encoding="utf-8"
+    )
+    (repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").write_text(
+        " now starts here", encoding="utf-8"
+    )
+
+    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
+        pi.ingest(repo, audience="feishu_test", shared_home=_shared_home(tmp_path))
+
+
+@pytest.mark.parametrize("audience", ["all", "101"])
+def test_nonprofile_governance_rejects_missing_gate_before_distribution(tmp_path, audience):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    (repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").write_text(
+        "no declared gate", encoding="utf-8"
+    )
+    home = _shared_home(tmp_path)
+    config = home / pi.SKILL_DISTRIBUTION_FILE
+    config.write_text("skills: []\n", encoding="utf-8")
+
+    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
+        pi.ingest(repo, audience=audience, shared_home=home)
+
+    assert yaml.safe_load(config.read_text(encoding="utf-8")) == {"skills": []}
+    managed = json.loads(
+        (home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8")
+    )
+    assert managed["status"] == "inactive"
+    assert managed["repo"] == str(repo)
+    assert managed["skills"] == [
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+        "kep-halo-cli",
+    ]
+    assert managed["audience"]["mode"] == ("all" if audience == "all" else "department_ids")
+
+
+def test_profile_ingest_rejects_shared_source_owned_by_other_plugin(tmp_path):
+    first = _write_plugin_repo(tmp_path / "first")
+    home = _shared_home(tmp_path)
+    pi.ingest(first, audience="feishu_test", shared_home=home)
+    second = _write_plugin_repo(tmp_path / "second")
+    manifest_path = second / pi.PLUGIN_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["id"] = "other-plugin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(pi.PluginIngestError, match="belongs to plugin 'test-plugin'"):
+        pi.ingest(second, audience="feishu_test", shared_home=home)
+
+    assert json.loads(
+        (home / pi.MANAGED_DIR / "other-plugin.json").read_text(encoding="utf-8")
+    )["status"] == "inactive"
+
+
+def test_legacy_shared_source_migration_rejects_multiple_manifest_claims(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    for name in ["using-resource-delivery", "kep-trevi-delivery-orchestrate", "kep-halo-cli"]:
+        shutil.copytree(repo / "skills" / name, home / "skills" / name)
+    managed_dir = home / pi.MANAGED_DIR
+    managed_dir.mkdir(parents=True)
+    skills = ["using-resource-delivery", "kep-trevi-delivery-orchestrate", "kep-halo-cli"]
+    for plugin_id in ["first-plugin", "test-plugin"]:
+        (managed_dir / f"{plugin_id}.json").write_text(
+            json.dumps(
+                {
+                    "plugin_id": plugin_id,
+                    "status": "active",
+                    "skills": skills,
+                    "audience": {"mode": "profile", "profiles": ["feishu_test"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(pi.PluginIngestError, match="ambiguous legacy owners"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+
+    assert json.loads((managed_dir / "first-plugin.json").read_text(encoding="utf-8"))["status"] == "active"
+    assert json.loads((managed_dir / "test-plugin.json").read_text(encoding="utf-8"))["status"] == "inactive"
 
 
 def test_skills_dir_honored(tmp_path):
@@ -232,7 +491,7 @@ def test_skills_dir_honored(tmp_path):
 
 
 def test_load_manifest_rejects_nondict_governance(tmp_path):
-    repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery"])
+    repo = _write_plugin_repo(tmp_path / "plug")
     mf = repo / pi.PLUGIN_MANIFEST_REL
     data = json.loads(mf.read_text()); data["governance"] = "online"
     mf.write_text(json.dumps(data), encoding="utf-8")
@@ -399,7 +658,11 @@ def test_assert_profile_governance_raises_if_orchestrator_absent(tmp_path):
     plugin = pi.load_plugin_manifest(repo)
     empty_profile = home / "profiles" / "feishu_test"  # has empty skills/ dir
     with pytest.raises(pi.PluginIngestError, match="gates cannot be enforced"):
-        pi.assert_profile_governance(plugin, empty_profile)
+        pi.assert_profile_governance(
+            plugin,
+            empty_profile,
+            ["using-resource-delivery", "kep-trevi-delivery-orchestrate"],
+        )
 
 
 def test_ingest_department_mode_refuses_to_create_config(tmp_path):
@@ -459,27 +722,21 @@ def test_ingest_department_mode_writes_distribution_and_strips(tmp_path):
     assert all(it.get("plugin") != "test-plugin" for it in (raw2.get("skills") or []))
 
 
-def test_department_mode_does_not_clobber_other_plugin_same_path(tmp_path):
-    # another plugin already distributes the SAME skill path to a different audience
-    repo = _write_plugin_repo(tmp_path / "plug", skills=["kep-halo-cli"])
+def test_department_mode_rejects_other_plugin_same_source_path(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
     home = _shared_home(tmp_path)
     dist = home / pi.SKILL_DISTRIBUTION_FILE
     other = {"path": "kep-halo-cli", "install_mode": "copy",
              "audience": {"department_ids": ["999"]}, "plugin": "other-plugin"}
     dist.write_text(yaml.safe_dump({"skills": [other]}, allow_unicode=True), encoding="utf-8")
 
-    pi.ingest(repo, audience="101", shared_home=home)
-    entries = yaml.safe_load(dist.read_text())["skills"]
-    # both the other plugin's entry AND ours survive for the same path
-    owners = {(e["path"], e["plugin"]): e for e in entries}
-    assert ("kep-halo-cli", "other-plugin") in owners
-    assert ("kep-halo-cli", "test-plugin") in owners
-    assert owners[("kep-halo-cli", "other-plugin")]["audience"]["department_ids"] == ["999"]
+    with pytest.raises(pi.PluginIngestError, match="source collision"):
+        pi.ingest(repo, audience="101", shared_home=home)
 
-    # uninstall removes only ours; the other plugin's entry is untouched
-    pi.uninstall("test-plugin", shared_home=home)
-    remain = yaml.safe_load(dist.read_text())["skills"]
-    assert [e["plugin"] for e in remain] == ["other-plugin"]
+    assert yaml.safe_load(dist.read_text(encoding="utf-8")) == {"skills": [other]}
+    assert json.loads(
+        (home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8")
+    )["status"] == "inactive"
 
 
 # ─────────────────────────── CLI install (no real kep-cli) ──────────────

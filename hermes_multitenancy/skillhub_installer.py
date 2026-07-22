@@ -568,7 +568,16 @@ def _plugin_managed_status(shared_home: Path, plugin_id: str) -> str | None:
     return str(status) if status in {"active", "inactive"} else None
 
 
-def _set_plugin_status(shared_home: Path, plugin_id: str, status: str) -> bool:
+def _set_plugin_status(
+    shared_home: Path, plugin_id: str, status: str, *, _lock_held: bool = False
+) -> bool:
+    if _lock_held:
+        return _set_plugin_status_locked(shared_home, plugin_id, status)
+    with plugin_ingest._plugin_ingest_lock(shared_home, plugin_id):
+        return _set_plugin_status_locked(shared_home, plugin_id, status)
+
+
+def _set_plugin_status_locked(shared_home: Path, plugin_id: str, status: str) -> bool:
     path = plugin_ingest._managed_path(shared_home, plugin_id)
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -594,6 +603,7 @@ def _best_effort_plugin_uninstall(
             shared_home=shared,
             profiles_root=profiles,
             profiles=profile_subset,
+            _lock_held=True,
         )
     except plugin_ingest.PluginIngestError as exc:
         if "no managed manifest" in str(exc):
@@ -1112,12 +1122,35 @@ def _process_plugin_event(
     plugin_id = _first_str(event.get("skill_code"))
     if not plugin_id:
         raise SkillhubInstallError("plugin event missing skill_code", error_code="PACKAGE_INVALID")
+    with plugin_ingest._plugin_ingest_lock(shared, plugin_id):
+        return _process_plugin_event_locked(
+            event,
+            shared=shared,
+            profiles=profiles,
+            downloader=downloader,
+            allow_create_distribution=allow_create_distribution,
+        )
 
+
+def _process_plugin_event_locked(
+    event: dict[str, Any],
+    *,
+    shared: Path,
+    profiles: Path,
+    downloader: Callable[[str], bytes] | None,
+    allow_create_distribution: bool = False,
+) -> dict[str, Any]:
+    plugin_id = _first_str(event.get("skill_code"))
+    if not plugin_id:
+        raise SkillhubInstallError("plugin event missing skill_code", error_code="PACKAGE_INVALID")
+
+    explicit_skill_status = bool(event.get("skill_status_explicit", "skill_status" in event))
     skill_status = _first_str(event.get("skill_status")) or "active"
+    activate = explicit_skill_status and skill_status == "active"
     if skill_status == "pending":
         return {"action": "skipped_pending", "plugin_id": plugin_id, "item_type": "plugin"}
     if skill_status == "inactive":
-        changed = _set_plugin_status(shared, plugin_id, "inactive")
+        changed = _set_plugin_status(shared, plugin_id, "inactive", _lock_held=True)
         return {
             "action": "plugin_disable",
             "plugin_id": plugin_id,
@@ -1167,6 +1200,8 @@ def _process_plugin_event(
                 # plugin path must match. MED-4, audit 2026-07-03.
                 allow_create_distribution=allow_create_distribution,
                 force=fresh_repo,
+                activate=activate,
+                _lock_held=True,
             )
         except plugin_ingest.PluginIngestError as exc:
             raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
@@ -1204,7 +1239,11 @@ def _process_plugin_event(
         if profile_name not in resolved_names:
             resolved_names.append(profile_name)
 
-    if incremental and _plugin_managed_audience_mode(shared, plugin_id) == "all":
+    if (
+        incremental
+        and _plugin_managed_audience_mode(shared, plugin_id) == "all"
+        and (not activate or _plugin_managed_status(shared, plugin_id) == "active")
+    ):
         # Plugin is already all-audience (org-sync covers everyone) → an incremental grant
         # is redundant. Keep the all-mode manifest intact; a per-profile install here would
         # downgrade the manifest to profile-mode and orphan the all-distribution on a later
@@ -1245,6 +1284,8 @@ def _process_plugin_event(
                 shared_home=shared,
                 profiles_root=profiles,
                 force=fresh_repo,
+                activate=activate,
+                _lock_held=True,
             )
         except plugin_ingest.PluginIngestError as exc:
             raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
@@ -1297,6 +1338,8 @@ def _process_plugin_event(
             audience=",".join(sorted(target)),
             shared_home=shared,
             profiles_root=profiles,
+            activate=activate,
+            _lock_held=True,
         )
     except plugin_ingest.PluginIngestError as exc:
         raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
@@ -1323,9 +1366,6 @@ def process_event(
     failures raise ``SkillhubInstallError`` with a stable error code.
     """
     event_type = _first_str(event.get("event_type")) or ""
-    explicit_skill_status = bool(
-        event.get("skill_status_explicit", "skill_status" in event)
-    )
     skill_status = _first_str(event.get("skill_status")) or "active"
     skill_code = _first_str(event.get("skill_code"))
     item_type = (_first_str(event.get("item_type")) or "skill").strip().lower()
@@ -1339,8 +1379,6 @@ def process_event(
             downloader=downloader,
             allow_create_distribution=allow_create_distribution,
         )
-        if explicit_skill_status and skill_status in {"active", "inactive"}:
-            _set_plugin_status(shared, skill_code or "", skill_status)
         return result
     if skill_status == "pending":
         # Skill not yet live — never download or install. Idempotent no-op.

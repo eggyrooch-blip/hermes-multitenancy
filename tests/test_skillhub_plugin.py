@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -70,7 +71,11 @@ def _plugin_zip(
     plugin_id: str = PLUGIN_ID,
     version: str = PLUGIN_VERSION,
     content_tag: str = "",
+    approval_gates: list[str] | None = None,
+    documented_gates: list[str] | None = None,
 ) -> bytes:
+    approval_gates = approval_gates or ["x approve"]
+    documented_gates = documented_gates or ["x approve"]
     manifest = {
         "schema": pi.SUPPORTED_SCHEMA,
         "id": plugin_id,
@@ -84,7 +89,7 @@ def _plugin_zip(
         "connectors": [{"id": "kep-cli", "required": True}],
         "governance": {
             "env_default": "pre",
-            "approval_required": ["x approve"],
+            "approval_required": approval_gates,
             "online_requires": "explicit_action",
         },
         "persona_policy": "skill_inline",
@@ -100,7 +105,7 @@ def _plugin_zip(
         for name in PLUGIN_SKILLS:
             body = f"---\nname: {name}\n---\n# {name}\n"
             if "orchestrat" in name:
-                body += "Gates: `x approve` requires explicit confirmation.\n"
+                body += "\n".join(f"Gates: `{gate}` requires explicit confirmation." for gate in documented_gates) + "\n"
             if content_tag:
                 body += f"{content_tag}\n"
             archive.writestr(f"keep-rd-plugin/skills/{name}/SKILL.md", body)
@@ -185,6 +190,30 @@ def test_plugin_install_approved_installs_for_authorized_profiles_only(tmp_path:
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
     assert not (profiles_root / "charlie" / "skills" / "kep-halo-cli").exists()
+
+
+def test_plugin_governance_failure_is_auditable_and_inactive(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+
+    with pytest.raises(SkillhubInstallError) as exc:
+        process_event(
+            _plugin_event(users=["alice-ldap"]),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(
+                approval_gates=["x approve", "missing gate"],
+                documented_gates=["x approve"],
+            ),
+        )
+
+    assert exc.value.error_code == "PLUGIN_INGEST_FAILED"
+    manifest = _managed_manifest(shared_home)
+    assert manifest["status"] == "inactive"
+    assert manifest["audience"]["profiles"] == ["alice", "sunke"]
 
 
 def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path) -> None:
@@ -555,6 +584,184 @@ def test_statusless_permission_does_not_reactivate_inactive_plugin(tmp_path: Pat
     manifest = _managed_manifest(shared_home)
     assert manifest["status"] == "inactive"
     assert manifest["audience"]["profiles"] == ["alice", "bob", "sunke"]
+
+
+def test_explicit_active_and_failed_ingest_share_one_plugin_transaction(tmp_path, monkeypatch):
+    from hermes_multitenancy import skillhub_installer as si
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    si.process_event(
+        _plugin_event(users=["alice-ldap"], release_id="valid"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    si.process_event(
+        _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+    )
+
+    first_paused = threading.Event()
+    release_first = threading.Event()
+    second_mutating = threading.Event()
+    release_second = threading.Event()
+    original_assert = pi.assert_profile_governance
+    original_install = pi._install_skills_to_profile
+    original_set_status = si._set_plugin_status
+
+    def pause_first(plugin, *args):
+        result = original_assert(plugin, *args)
+        if threading.current_thread().name == "active-event":
+            first_paused.set()
+            assert release_first.wait(2)
+        return result
+
+    def pause_second(plugin, *args, **kwargs):
+        if threading.current_thread().name == "invalid-event":
+            second_mutating.set()
+            assert release_second.wait(2)
+        return original_install(plugin, *args, **kwargs)
+
+    def reject_out_of_transaction_active(shared, plugin_id, status):
+        assert status != "active"
+        return original_set_status(shared, plugin_id, status)
+
+    monkeypatch.setattr(pi, "assert_profile_governance", pause_first)
+    monkeypatch.setattr(pi, "_install_skills_to_profile", pause_second)
+    monkeypatch.setattr(si, "_set_plugin_status", reject_out_of_transaction_active)
+    errors = []
+
+    def run_active():
+        try:
+            si.process_event(
+                _plugin_event(
+                    event_type="skill.status_changed",
+                    skill_status="active",
+                    users=[],
+                    download_url=None,
+                ),
+                shared_home=shared_home,
+                profiles_root=profiles_root,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    def run_invalid():
+        try:
+            si.process_event(
+                _plugin_event(users=["alice-ldap"], release_id="invalid"),
+                shared_home=shared_home,
+                profiles_root=profiles_root,
+                downloader=lambda _: _plugin_zip(
+                    approval_gates=["missing gate"], documented_gates=["x approve"]
+                ),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run_active, name="active-event")
+    second = threading.Thread(target=run_invalid, name="invalid-event")
+    first.start()
+    assert first_paused.wait(2)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+    second.start()
+    assert not second_mutating.wait(0.1)
+    release_first.set()
+    assert second_mutating.wait(2)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+    release_second.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], si.SkillhubInstallError)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+
+
+def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path, monkeypatch):
+    from hermes_multitenancy import skillhub_installer as si
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    si.process_event(
+        _plugin_event(users=["alice-ldap", "bob-ldap"], release_id="initial"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+
+    reconcile_paused = threading.Event()
+    release_reconcile = threading.Event()
+    invalid_mutating = threading.Event()
+    release_invalid = threading.Event()
+    original_uninstall = pi._uninstall_locked
+    original_install = pi._install_skills_to_profile
+
+    def pause_reconcile(*args, **kwargs):
+        if threading.current_thread().name == "reconcile-event":
+            assert _managed_manifest(shared_home)["status"] == "active"
+            reconcile_paused.set()
+            assert release_reconcile.wait(2)
+        return original_uninstall(*args, **kwargs)
+
+    def pause_invalid(plugin, *args, **kwargs):
+        if threading.current_thread().name == "invalid-event":
+            invalid_mutating.set()
+            assert release_invalid.wait(2)
+        return original_install(plugin, *args, **kwargs)
+
+    monkeypatch.setattr(pi, "_uninstall_locked", pause_reconcile)
+    monkeypatch.setattr(pi, "_install_skills_to_profile", pause_invalid)
+    errors = []
+
+    def run_reconcile():
+        try:
+            si.process_event(
+                _plugin_event(
+                    event_type="skill.status_changed",
+                    users=["alice-ldap"],
+                    release_id="snapshot",
+                ),
+                shared_home=shared_home,
+                profiles_root=profiles_root,
+                downloader=lambda _: _plugin_zip(),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    def run_invalid():
+        try:
+            si.process_event(
+                _plugin_event(users=["alice-ldap"], release_id="invalid"),
+                shared_home=shared_home,
+                profiles_root=profiles_root,
+                downloader=lambda _: _plugin_zip(
+                    approval_gates=["missing gate"], documented_gates=["x approve"]
+                ),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run_reconcile, name="reconcile-event")
+    second = threading.Thread(target=run_invalid, name="invalid-event")
+    first.start()
+    assert reconcile_paused.wait(2)
+    second.start()
+    assert not invalid_mutating.wait(0.1)
+    release_reconcile.set()
+    assert invalid_mutating.wait(2)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+    release_invalid.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], si.SkillhubInstallError)
+    assert _managed_manifest(shared_home)["status"] == "inactive"
 
 
 def test_inactive_unknown_plugin_never_downloads(tmp_path: Path) -> None:
