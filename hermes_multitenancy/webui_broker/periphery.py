@@ -59,6 +59,21 @@ _site: Any = None
 _server_task: Optional[asyncio.Task] = None
 
 
+_server_thread: Optional[threading.Thread] = None
+
+
+_server_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+_server_thread_ready = threading.Event()
+
+
+_server_thread_error: Optional[BaseException] = None
+
+
+_server_thread_lock = threading.Lock()
+
+
 _pending_clarifies: dict[str, dict[str, Any]] = {}
 
 
@@ -2373,9 +2388,32 @@ def _log_run_broker_start_failure(task: asyncio.Task) -> None:
             _server_task = None
 
 
+def _run_broker_server_thread(ready: threading.Event) -> None:
+    global _server_thread, _server_thread_error, _server_thread_loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _server_thread_loop = loop
+    try:
+        loop.run_until_complete(start_run_broker_server())
+    except BaseException as exc:
+        _server_thread_error = exc
+        ready.set()
+    else:
+        ready.set()
+        loop.run_forever()
+    finally:
+        if _runner is not None:
+            loop.run_until_complete(_cleanup_run_broker_server())
+        loop.close()
+        with _server_thread_lock:
+            if _server_thread is threading.current_thread():
+                _server_thread = None
+                _server_thread_loop = None
+
+
 def ensure_run_broker_server_started() -> None:
-    """Schedule the optional WebUI run broker sidecar when enabled."""
-    global _server_task
+    """Start the optional broker, including before the gateway loop exists."""
+    global _server_task, _server_thread, _server_thread_error, _server_thread_ready
     if not _truthy_env("HERMES_MULTITENANCY_RUN_BROKER_SERVER"):
         return
     if run_broker_server_ready() or _server_task is not None:
@@ -2383,14 +2421,28 @@ def ensure_run_broker_server_started() -> None:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        logger.debug("[multitenancy] no running loop; WebUI run broker sidecar not started")
+        with _server_thread_lock:
+            if _server_thread is None or not _server_thread.is_alive():
+                _server_thread_error = None
+                _server_thread_ready = threading.Event()
+                _server_thread = threading.Thread(
+                    target=_run_broker_server_thread,
+                    args=(_server_thread_ready,),
+                    name="multitenancy-run-broker",
+                    daemon=True,
+                )
+                _server_thread.start()
+            ready = _server_thread_ready
+        if not ready.wait(timeout=10) or _server_thread_error is not None:
+            raise RuntimeError("multitenancy run broker failed to start") from None
+        if not run_broker_server_ready():
+            raise RuntimeError("multitenancy run broker is not ready")
         return
     _server_task = loop.create_task(start_run_broker_server())
     _server_task.add_done_callback(_log_run_broker_start_failure)
 
 
-async def stop_run_broker_server() -> None:
-    """Test/maintenance helper to stop the sidecar."""
+async def _cleanup_run_broker_server() -> None:
     global _runner, _site, _server_task
     if _server_task is not None and not _server_task.done():
         _server_task.cancel()
@@ -2403,3 +2455,21 @@ async def stop_run_broker_server() -> None:
     if _runner is not None:
         await _runner.cleanup()
     _runner = None
+
+
+async def stop_run_broker_server() -> None:
+    """Test/maintenance helper to stop the sidecar on its owning loop."""
+    global _server_thread, _server_thread_loop
+    owner_loop = _server_thread_loop
+    current_loop = asyncio.get_running_loop()
+    if owner_loop is not None and owner_loop.is_running() and owner_loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(_cleanup_run_broker_server(), owner_loop)
+        await asyncio.to_thread(future.result, 5)
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        thread = _server_thread
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 5)
+        _server_thread = None
+        _server_thread_loop = None
+        return
+    await _cleanup_run_broker_server()

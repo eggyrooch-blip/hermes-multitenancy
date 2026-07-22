@@ -85,7 +85,7 @@ def register(ctx) -> None:
         # multitenancy failure to SystemExit keeps production fail-closed
         # without changing hermes-agent.
         logger.critical("[multitenancy] required plugin registration failed: %s", type(exc).__name__)
-        raise SystemExit(1) from exc
+        raise SystemExit(1) from None
 
 
 def _register(ctx) -> None:

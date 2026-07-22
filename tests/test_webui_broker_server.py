@@ -4780,6 +4780,34 @@ def test_start_run_broker_server_starts_with_key(monkeypatch):
     asyncio.run(runner())
 
 
+def test_ensure_run_broker_server_started_binds_without_dispatch(monkeypatch):
+    import json
+    import socket
+    from urllib.request import Request, urlopen
+
+    import hermes_multitenancy.webui_broker_server as broker_mod
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_PORT", str(port))
+
+    broker_mod.ensure_run_broker_server_started()
+    try:
+        request = Request(
+            f"http://127.0.0.1:{port}/api/run-broker/health",
+            headers={"Authorization": "Bearer broker-secret"},
+        )
+        with urlopen(request, timeout=2) as response:
+            body = json.loads(response.read())
+        assert body == {"ok": True, "service": "hermes-multitenancy-run-broker"}
+        assert broker_mod.run_broker_server_ready() is True
+    finally:
+        asyncio.run(broker_mod.stop_run_broker_server())
+
+
 def test_ensure_run_broker_server_started_clears_failed_task_and_retries(monkeypatch):
     import hermes_multitenancy.webui_broker_server as broker_mod
     from hermes_multitenancy.webui_broker import periphery
