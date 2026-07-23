@@ -49,7 +49,7 @@ and future expiry. Database integrity is `ok`, and all 20,660
 `multitenancy_sessions` rows have non-empty mirrored content. Restart-window
 error markers are zero; Feishu startup is present with no failure marker.
 
-Backup: `/home/hermes/backups/kep-auth-live-status-20260723-172418`.
+A timestamped rollback bundle was created in the production backup directory.
 No employee message was sent. Chrome could not be claimed for screenshot
 evidence, so visual WebUI confirmation remains user-visible rather than
 machine-verified.
