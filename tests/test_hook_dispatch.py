@@ -2440,6 +2440,24 @@ def test_auto_profile_config_does_not_invent_default_model():
     assert normalized["tools"] == ["web"]
 
 
+def test_profile_config_prefixes_provider_for_namespaced_model():
+    from hermes_multitenancy.router import _normalize_profile_config
+
+    normalized = _normalize_profile_config(
+        {
+            "model": {
+                "default": "tencent/claude-sonnet-5",
+                "provider": "custom:litellm-sre",
+            }
+        }
+    )
+
+    assert (
+        normalized["model"]["default"]
+        == "custom:litellm-sre/tencent/claude-sonnet-5"
+    )
+
+
 @pytest.mark.asyncio
 async def test_new_open_id_auto_provisions_before_stale_alt_route(monkeypatch, tmp_path):
     """A new app-scoped Feishu open_id must not be absorbed by an old union route."""

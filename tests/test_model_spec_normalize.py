@@ -96,3 +96,20 @@ def test_load_profile_config_keeps_prefixed_profile(tmp_path: Path):
     _write(prof / "config.yaml", "model:\n  default: custom:litellm-sre/tencent-sonnet-4-6\n  provider: custom:litellm-sre\n")
     cfg = _load_profile_config(prof)
     assert cfg["model"]["default"] == "custom:litellm-sre/tencent-sonnet-4-6"
+
+
+def test_load_profile_config_prefixes_provider_for_namespaced_model(tmp_path: Path):
+    prof = tmp_path / "profiles" / "sonnet5"
+    _write(
+        prof / "config.yaml",
+        "model:\n"
+        "  default: tencent/claude-sonnet-5\n"
+        "  provider: custom:litellm-sre\n",
+    )
+
+    cfg = _load_profile_config(prof)
+
+    assert _split_model_spec(cfg["model"]["default"]) == (
+        "custom:litellm-sre",
+        "tencent/claude-sonnet-5",
+    )

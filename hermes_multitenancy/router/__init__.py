@@ -2085,7 +2085,7 @@ def _normalize_profile_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(model, dict) and model.get("default"):
         default_model = str(model.get("default") or "").strip()
         provider = str(model.get("provider") or "").strip()
-        if default_model and provider and "/" not in default_model:
+        if default_model and provider and not default_model.lower().startswith(f"{provider.lower()}/"):
             model["default"] = f"{provider}/{default_model}"
     return config
 
