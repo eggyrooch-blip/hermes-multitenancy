@@ -35,5 +35,5 @@ status, OAuth polling, the generated CLI shim and its run-scoped wiring, the
 registry contract, and the Feishu expert route. The full suite passes 2773
 tests with 1 skipped and 3 deselected. A read-only production probe found
 online valid for the routed `sunke` identity and pre invalid; no production
-code, service, token, or configuration was changed. Release remains blocked
-until pre is reauthenticated and the independent review closes.
+code, service, token, or configuration was changed. The independent security
+review passed; release remains blocked until pre is reauthenticated.
