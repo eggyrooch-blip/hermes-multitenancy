@@ -30,10 +30,10 @@ out of scope and unchanged.
 
 ## Local evidence
 
-The expanded targeted suite currently passes 142 tests across the shared live
-verifier, credential
-status, OAuth polling, the generated CLI shim and its run-scoped wiring, expert
-overlay wiring, the registry contract, and the Feishu expert route. Full-suite
-and independent security-review evidence must be added
-before release; production requires explicit approval plus a read-only
-online/pre canary.
+The targeted suite passes 315 tests across the shared live verifier, credential
+status, OAuth polling, the generated CLI shim and its run-scoped wiring, the
+registry contract, and the Feishu expert route. The full suite passes 2772
+tests with 1 skipped and 3 deselected. A read-only production probe found
+online valid for the routed `sunke` identity and pre invalid; no production
+code, service, token, or configuration was changed. Release remains blocked
+until pre is reauthenticated and the independent review closes.
