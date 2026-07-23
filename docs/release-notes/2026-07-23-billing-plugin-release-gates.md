@@ -16,3 +16,9 @@ Production verification: the same 12 SPEC-targeted files passed `489/489` with a
 Known gotcha: filesystem cleanup can fail after an inactive callback; the authoritative inactive state must gate every skill discovery path before cleanup is attempted.
 
 Enable blocker: the current AI Gateway snapshot command still needs direct LiteLLM administration environment. Billing must remain off until AI Gateway exposes the equivalent broker URL/token-only readiness client; Multitenancy intentionally fails closed instead of receiving the management key.
+
+Follow-up candidate (not deployed): `deploy/install-gateway-dropins.sh` now installs a versioned
+`55-litellm-billing.conf` that optionally loads `%h/.hermes/litellm-billing.env` into the main Router.
+The environment file stays host-managed and absent is harmless; this change does not create secrets,
+enable billing, choose a cohort, or alter manually active Plugins. Installer/startup/readiness focused
+verification is `34 passed`.

@@ -11,6 +11,8 @@
 # Currently installs:
 #   05-multitenancy-required.conf — fail startup when tenant isolation or the
 #       authenticated Run Broker is unavailable.
+#   55-litellm-billing.conf — load the optional, host-local billing environment;
+#       billing remains off unless that file explicitly enables a finite cohort.
 #   45-meegle-bin.conf — pin a FAST meegle binary for the feishu-project connector
 #       reader (avoids the ~11s `npx -y` path that tripped the Connectors panel
 #       fail-safe). See deploy/README-meegle.md.
@@ -35,6 +37,12 @@ sed "s#@PYTHON@#${HERMES_PYTHON}#g" \
   > "$DROPIN_DIR/05-multitenancy-required.conf"
 chmod 0644 "$DROPIN_DIR/05-multitenancy-required.conf"
 echo "install-gateway-dropins: wrote ${DROPIN_DIR}/05-multitenancy-required.conf"
+
+# --- 55-litellm-billing.conf ------------------------------------------------
+install -m 0644 \
+  "$REPO/deploy/hermes-gateway-litellm-billing.conf" \
+  "$DROPIN_DIR/55-litellm-billing.conf"
+echo "install-gateway-dropins: wrote ${DROPIN_DIR}/55-litellm-billing.conf"
 
 # --- 45-meegle-bin.conf (@REPO@ -> this checkout) ---------------------------
 sed "s#@REPO@#${REPO}#g" "$REPO/deploy/hermes-gateway-meegle.conf" \
