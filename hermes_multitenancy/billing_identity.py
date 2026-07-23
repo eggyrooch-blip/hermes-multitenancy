@@ -119,6 +119,22 @@ class BillingIdentityStore:
             ).fetchone()
         return BillingIdentity(**dict(row)) if row is not None else None
 
+    def get_by_profile(self, profile_name: str) -> Optional[BillingIdentity]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT employee_user_id, profile_name, email, litellm_user_id,
+                       team_id, team_alias, key_id, credential_version,
+                       expires_at, migration_state
+                FROM multitenancy_billing_identities
+                WHERE profile_name = ? AND migration_state = 'enforced'
+                """,
+                (profile_name,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise RunRejected("billing payer profile is ambiguous")
+        return BillingIdentity(**dict(rows[0])) if rows else None
+
     def put(self, identity: BillingIdentity) -> None:
         if identity.migration_state not in {"legacy", "enforced"}:
             raise ValueError("invalid billing migration state")
@@ -187,15 +203,30 @@ class BillingIdentityPreparer:
         metadata = _clean_metadata(request.metadata)
         payer = self._payer(request, metadata)
         if payer is None:
-            if _billing_enabled():
+            is_group = str(metadata.get("chat_type") or "").strip().lower() in {
+                "group",
+                "topic",
+            }
+            profile_binding = self._store.get_by_profile(request.profile_name)
+            if is_group or _billing_enabled() or profile_binding is not None:
                 raise RunRejected("employee billing identity could not be resolved")
-            return request if metadata == request.metadata else replace(request, metadata=metadata)
-        existing = self._store.get(payer.employee_user_id)
+            return request if metadata == request.metadata else replace(
+                request, metadata=metadata
+            )
         selected = _payer_selected(payer.employee_user_id)
+        existing = self._store.get(payer.employee_user_id)
         if not selected and not (
             existing is not None and existing.migration_state == "enforced"
         ):
             return request if metadata == request.metadata else replace(request, metadata=metadata)
+        profile_binding = self._store.get_by_profile(request.profile_name)
+        if (
+            profile_binding is not None
+            and profile_binding.employee_user_id != payer.employee_user_id
+        ):
+            raise RunRejected("billing payer profile drift detected")
+        email, department = _employee_org_fields(payer.employee_user_id)
+        payer = replace(payer, email=email, department_alias=department)
         if existing is not None:
             if existing.profile_name and existing.profile_name != payer.profile_name:
                 raise RunRejected("billing payer profile drift detected")
@@ -236,26 +267,70 @@ class BillingIdentityPreparer:
         # callers can submit arbitrary metadata, so they must never be able to
         # impersonate a group by supplying ``chat_type=group`` + ``chat_id``.
         is_feishu = request.channel == "feishu"
+        is_group = str(metadata.get("chat_type") or "").strip().lower() in {
+            "group",
+            "topic",
+        }
+        sender_open_id = (
+            self._canonical_sender_open_id(metadata.get("sender_open_id"))
+            if is_feishu
+            else ""
+        )
+        if is_feishu and not is_group and not sender_open_id:
+            return None
         with self._routing_lock:
             owner_open_id = self._resolve_owner({
                 "chat_type": metadata.get("chat_type") if is_feishu else "",
                 "chat_id": request.chat_id if is_feishu else "",
-                "sender_open_id": (
-                    metadata.get("sender_open_id")
-                    if is_feishu
-                    else ""
-                ),
+                "sender_open_id": sender_open_id,
                 "profile": request.profile_name,
             })
             row = self._employee_row(owner_open_id)
+            if is_feishu and not is_group:
+                profile_row = self._employee_row(
+                    self._profile_owner(request.profile_name)
+                )
+                if (
+                    row is None
+                    or profile_row is None
+                    or row.user_id != profile_row.user_id
+                ):
+                    return None
         if row is None:
             return None
         employee_id = str(getattr(row, "user_id", "") or "").strip()
         profile_name = str(getattr(row, "profile_name", "") or "").strip()
         if not profile_name:
             profile_name = employee_id
-        email, department = _employee_org_fields(employee_id)
-        return _ResolvedPayer(employee_id, profile_name, email, department)
+        return _ResolvedPayer(employee_id, profile_name, "")
+
+    def _canonical_sender_open_id(self, sender: Any) -> str:
+        """Resolve production Feishu ``user_id`` aliases before billing.
+
+        The adapter may expose an app-scoped ``ou_*`` open_id, while the
+        routed event can contain only the tenant ``user_id``.  The sync-owned
+        routing row is the sole authority for converting that alias; caller
+        metadata and profile display names are never accepted as evidence.
+        """
+        value = str(sender or "").strip()
+        if not value:
+            return ""
+        if value.startswith("ou_"):
+            return value
+        lookup = getattr(self._routing, "lookup_by_user_id", None)
+        try:
+            row = lookup(value) if callable(lookup) else None
+        except Exception:
+            return ""
+        if row is None:
+            return ""
+        if (
+            str(getattr(row, "kind", "") or "") != "user"
+            or str(getattr(row, "provenance", "") or "") != "sync"
+            or not bool(getattr(row, "active", True))
+        ):
+            return ""
+        return str(getattr(row, "open_id", "") or "").strip()
 
     def _group_owner(self, chat_id: str) -> Optional[str]:
         row = self._routing.lookup_by_chat_id(chat_id)
@@ -280,7 +355,13 @@ class BillingIdentityPreparer:
         getter = getattr(self._routing, "resolve_owner_root", None)
         row = getter(owner_open_id) if callable(getter) else None
         user_id = str(getattr(row, "user_id", "") or "").strip() if row else ""
-        if _EMPLOYEE_ID_RE.fullmatch(user_id) and not user_id.startswith("ou_"):
+        if (
+            _EMPLOYEE_ID_RE.fullmatch(user_id)
+            and not user_id.startswith("ou_")
+            and getattr(row, "active", None) in {True, 1}
+            and str(getattr(row, "kind", "") or "") == "user"
+            and str(getattr(row, "provenance", "") or "") == "sync"
+        ):
             return row
         return None
 
@@ -318,8 +399,17 @@ def _default_preparer() -> BillingIdentityPreparer:
 async def prepare_billing_request(request: RunRequest) -> RunRequest:
     """Resolve the payer before idempotency is consumed; never trust caller metadata."""
     import asyncio
+    from . import router
 
-    return await asyncio.to_thread(_default_preparer().prepare, request)
+    preparer = _default_preparer()
+    routing = router._get_routing_table() if request.channel == "feishu" else None
+    if routing is not None and routing is not preparer._routing:
+        preparer = BillingIdentityPreparer(
+            routing=routing,
+            store=preparer._store,
+            credentials=preparer._credentials,
+        )
+    return await asyncio.to_thread(preparer.prepare, request)
 
 
 def runtime_env_for_billing_metadata(metadata: dict[str, Any]) -> dict[str, str]:
@@ -417,9 +507,9 @@ def _payer_selected(employee_id: str) -> bool:
         return False
     raw = os.environ.get("HERMES_LITELLM_BILLING_PAYER_IDS", "").strip()
     if not raw:
-        return True
+        return False
     selected = {item.strip() for item in raw.split(",") if item.strip()}
-    return "*" in selected or employee_id in selected
+    return "*" not in selected and employee_id in selected
 
 
 def _billing_model_base_url() -> str:

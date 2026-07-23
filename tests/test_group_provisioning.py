@@ -804,6 +804,12 @@ async def test_handle_async_routes_group_to_group_profile(isolated_router, monke
     router_mod, tmp_path = isolated_router
 
     # Pre-provision the group route
+    router_mod._get_routing_table().upsert(
+        user_id="inviter",
+        profile_name="inviter",
+        open_id="ou_inviter",
+        provenance="sync",
+    )
     router_mod.register_chat_inviter(
         "oc_g1", "ou_inviter", chat_name="IT 组", inviter_display="owner"
     )

@@ -612,9 +612,24 @@ def _run_request_for_routed_event(
 ):
     from ..run_models import RunRequest
 
-    user_key = _tenant_user_key(sender, sender_alt)
+    canonical_sender = sender
+    if not _is_feishu_open_id(canonical_sender):
+        table = _get_routing_table()
+        lookup = getattr(table, "lookup_by_user_id", None) if table is not None else None
+        try:
+            row = lookup(str(canonical_sender).strip()) if callable(lookup) else None
+        except Exception:
+            row = None
+        if (
+            row is not None
+            and str(getattr(row, "kind", "") or "") == "user"
+            and str(getattr(row, "provenance", "") or "") == "sync"
+            and bool(getattr(row, "active", True))
+        ):
+            canonical_sender = str(getattr(row, "open_id", "") or "").strip() or sender
+    user_key = _tenant_user_key(canonical_sender, sender_alt)
     metadata = {
-        "sender_open_id": sender,
+        "sender_open_id": canonical_sender,
         "chat_type": _extract_chat_type(event),
     }
     if sender_alt:
@@ -717,6 +732,32 @@ def _resolve_sender_for_routing(event: Any, *, fallback: str = "unknown") -> str
         normalized = _normalize_feishu_open_id(candidate)
         if normalized:
             return normalized
+
+    # Feishu Contact v3 may provide only the tenant-local user_id. Resolve
+    # that alias through the active sync-owned routing row before it reaches
+    # session or billing metadata; never treat the alias itself as an open_id.
+    table = _get_routing_table()
+    if table is not None:
+        for candidate in (
+            getattr(source, "user_id", None) if source is not None else None,
+            getattr(source, "user_id_alt", None) if source is not None else None,
+        ):
+            value = str(candidate or "").strip()
+            if not value:
+                continue
+            try:
+                row = table.lookup_by_user_id(value)
+            except Exception:
+                row = None
+            if (
+                row is not None
+                and str(getattr(row, "kind", "") or "") == "user"
+                and str(getattr(row, "provenance", "") or "") == "sync"
+                and bool(getattr(row, "active", True))
+            ):
+                normalized = _normalize_feishu_open_id(getattr(row, "open_id", None))
+                if normalized:
+                    return normalized
 
     raw_candidates = (
         getattr(event, "raw", None),

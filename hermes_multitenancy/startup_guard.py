@@ -44,6 +44,22 @@ def _import_boundaries() -> None:
         importlib.import_module(module)
 
 
+def _validate_billing_cohort(env: Mapping[str, str]) -> None:
+    enabled = str(env.get("HERMES_LITELLM_BILLING_ENABLED", "")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return
+    raw = str(env.get("HERMES_LITELLM_BILLING_PAYER_IDS", "")).strip()
+    selected = {item.strip() for item in raw.split(",") if item.strip()}
+    if not selected or "*" in selected:
+        raise StartupGuardError("billing_canary_cohort_invalid")
+    try:
+        from .billing_readiness import verify_enabled_environment
+
+        verify_enabled_environment(env)
+    except RuntimeError as exc:
+        raise StartupGuardError(str(exc)) from exc
+
+
 def validate_startup(
     *,
     env: Mapping[str, str] | None = None,
@@ -68,6 +84,7 @@ def validate_startup(
         raise StartupGuardError("run_broker_disabled")
     if any(not str(env.get(name, "")).strip() for name in _REQUIRED_ENV):
         raise StartupGuardError("isolation_environment_missing")
+    _validate_billing_cohort(env)
 
     _compile_package(package_dir or Path(__file__).resolve().parent)
     _import_boundaries()

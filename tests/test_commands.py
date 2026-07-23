@@ -1106,11 +1106,26 @@ async def test_group_skill_slash_with_adjacent_url_rewrites_into_agent_prompt(mo
 
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
 
     caplog.set_level("INFO")
     _user_inflight_tasks.clear()
     profile_home = tmp_path / "group"
     profile_home.mkdir()
+    routing = RoutingTable(tmp_path / "routing.db")
+    routing.upsert(
+        user_id="skill-owner",
+        profile_name="skill-owner",
+        open_id="ou_skill",
+        provenance="sync",
+    )
+    routing.upsert_group(
+        chat_id="oc_group",
+        profile_name="group",
+        owner_open_id="ou_skill",
+        upstream_profile="skill-owner",
+    )
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: routing)
 
     async def fake_group_route(*, chat_id, gateway):
         return "group", profile_home
@@ -1178,6 +1193,7 @@ async def test_group_skill_slash_loads_skill_from_routed_profile_after_router_ca
 
     from hermes_multitenancy.router import handle_async, _user_inflight_tasks
     from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
 
     _user_inflight_tasks.clear()
     router_home = tmp_path / "router"
@@ -1193,6 +1209,20 @@ async def test_group_skill_slash_loads_skill_from_routed_profile_after_router_ca
     skill_dir = group_home / "skills" / "Keep" / "kep-prd-analysis"
     skill_dir.parent.mkdir(parents=True)
     skill_dir.symlink_to(shared_skill_dir, target_is_directory=True)
+    routing = RoutingTable(tmp_path / "routing.db")
+    routing.upsert(
+        user_id="skill-owner",
+        profile_name="skill-owner",
+        open_id="ou_skill",
+        provenance="sync",
+    )
+    routing.upsert_group(
+        chat_id="oc_group",
+        profile_name="group",
+        owner_open_id="ou_skill",
+        upstream_profile="skill-owner",
+    )
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: routing)
 
     async def fake_group_route(*, chat_id, gateway):
         return "group", group_home

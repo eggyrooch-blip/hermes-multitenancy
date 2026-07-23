@@ -1428,7 +1428,7 @@ async def test_first_billing_identity_failure_is_visible_and_retryable(monkeypat
     sent = []
     admitted = []
 
-    async def reject(_request):
+    async def reject(_request, **_kwargs):
         raise RunRejected("LiteLLM management API is unavailable")
 
     async def must_not_enrich(*_args, **_kwargs):
@@ -1462,6 +1462,137 @@ async def test_first_billing_identity_failure_is_visible_and_retryable(monkeypat
     clear_spike_routes()
 
 
+def test_incident_replay_dispatches_twelve_noncohort_events_without_billing_error(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import billing_identity
+    from hermes_multitenancy import router as router_mod
+
+    class Routing:
+        def __init__(self):
+            self.rows = {
+                f"employee_{index}": SimpleNamespace(
+                    user_id=f"employee_{index}",
+                    profile_name=f"profile_{index}",
+                    open_id=f"ou_fixture_{index}",
+                    active=True,
+                    kind="user",
+                    provenance="sync",
+                )
+                for index in range(6)
+            }
+
+        def lookup_by_user_id(self, user_id):
+            return self.rows.get(user_id)
+
+        def resolve_owner_root(self, open_id):
+            return next(
+                (row for row in self.rows.values() if row.open_id == open_id),
+                None,
+            )
+
+        def lookup_by_open_id(self, open_id):
+            return self.resolve_owner_root(open_id)
+
+        def lookup_by_profile_name(self, profile_name):
+            row = next(
+                (
+                    value
+                    for value in self.rows.values()
+                    if value.profile_name == profile_name
+                ),
+                None,
+            )
+            return (
+                SimpleNamespace(owner_open_id=row.open_id, open_id=row.open_id)
+                if row
+                else None
+            )
+
+        def lookup_by_chat_id(self, _chat_id):
+            return None
+
+    class Credentials:
+        def __init__(self):
+            self.calls = []
+
+        def ensure_available(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise AssertionError("noncohort request reached AI Gateway")
+
+    routing = Routing()
+    credentials = Credentials()
+    store = billing_identity.BillingIdentityStore(tmp_path / "multitenancy.db")
+    preparer = billing_identity.BillingIdentityPreparer(
+        routing=routing,
+        store=store,
+        credentials=credentials,
+    )
+    homes = {}
+    for index in range(6):
+        home = tmp_path / f"profile_{index}"
+        home.mkdir()
+        homes[f"employee_{index}"] = (f"profile_{index}", home)
+        homes[f"ou_fixture_{index}"] = (f"profile_{index}", home)
+
+    dispatched = []
+    sent = []
+
+    async def enrich(event, _gateway, **_kwargs):
+        return event.text
+
+    async def stream(_adapter, _chat_id, _profile, _home, event, **_kwargs):
+        dispatched.append(event.raw_event.get("metadata", {}))
+        return "ok"
+
+    class Adapter:
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+        async def on_processing_start(self, _event):
+            return None
+
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def edit_message(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv(
+        "HERMES_LITELLM_BILLING_PAYER_IDS",
+        "canary_employee",
+    )
+    monkeypatch.setattr(billing_identity, "_DEFAULT_PREPARER", preparer)
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: routing)
+    monkeypatch.setattr(
+        router_mod,
+        "_resolve_or_auto_provision_route",
+        lambda sender, alt_id=None: homes.get(sender, (None, None)),
+    )
+    monkeypatch.setattr(router_mod, "_call_enrich_via_hermes_pipeline", enrich)
+    monkeypatch.setattr(router_mod, "_stream_into_feishu", stream)
+    monkeypatch.setattr(router_mod, "_is_run_request_seen", lambda _request: False)
+    monkeypatch.setattr(router_mod, "_mark_run_request_seen", lambda _request: True)
+    gateway = SimpleNamespace(adapters={"feishu": Adapter()})
+
+    for index in range(6):
+        for request_index in range(2):
+            event = _build_event(
+                text=f"fixture-{request_index}",
+                chat_id=f"oc_fixture_{index}",
+                user_id=f"employee_{index}",
+            )
+            event.message_id = f"om_fixture_{index}_{request_index}"
+            asyncio.run(router_mod.handle_async(event=event, gateway=gateway))
+
+    assert len(dispatched) == 12
+    assert credentials.calls == []
+    assert all("litellm_billing_enforced" not in metadata for metadata in dispatched)
+    assert sent == []
+
+
 @pytest.mark.asyncio
 async def test_feishu_session_store_mark_failure_is_visible_and_retryable(
     monkeypatch,
@@ -1493,7 +1624,7 @@ async def test_feishu_session_store_mark_failure_is_visible_and_retryable(
     sent = []
     dispatches = []
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         nonlocal prepare_calls
         prepare_calls += 1
         return request
@@ -1561,7 +1692,7 @@ async def test_feishu_duplicate_coalesces_prepare_enrichment_and_admission(
     enrich_started = asyncio.Event()
     release_enrich = asyncio.Event()
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         nonlocal prepare_calls
         prepare_calls += 1
         return replace(request, metadata={"litellm_billing_user_id": "employee-1"})
@@ -1651,7 +1782,7 @@ async def test_feishu_without_message_id_keeps_canonical_key_after_enrichment(
         assert record is not None
         return record[0]
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         nonlocal prepare_calls
         prepare_calls += 1
         return replace(request, metadata={"litellm_billing_user_id": "employee-2"})
@@ -2716,7 +2847,7 @@ async def test_hook_completes_deferred_processing_once_across_admission_outcomes
     enrich_calls = 0
     dispatch_calls = 0
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         nonlocal prepare_calls
         prepare_calls += 1
         if case == "billing_failure":
@@ -2833,7 +2964,7 @@ async def test_hook_leader_cancel_with_live_peer_completes_deferred_processing_o
     marked = []
     dispatches = 0
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         prepare_started.set()
         await release_prepare.wait()
         return request
@@ -2960,7 +3091,7 @@ async def test_hook_late_defer_after_shared_completion_gets_new_completion(
     marked = []
     dispatches = 0
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         return request
 
     async def fake_enrich(_event, _gateway):
@@ -3117,7 +3248,7 @@ async def test_vision_block_send_failure_does_not_mark_and_retry_is_deduped(
     send_started = asyncio.Event()
     release_send = asyncio.Event()
 
-    async def prepare(request):
+    async def prepare(request, **_kwargs):
         nonlocal prepare_calls
         prepare_calls += 1
         return request

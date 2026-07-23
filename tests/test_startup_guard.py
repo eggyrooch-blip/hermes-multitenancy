@@ -74,3 +74,22 @@ def test_authenticated_broker_health_is_required(monkeypatch):
     )
 
     startup_guard.wait_run_broker(env={"HERMES_MULTITENANCY_RUN_BROKER_KEY": "present"})
+
+
+@pytest.mark.parametrize("cohort", ["", "*", "employee_a,*"])
+def test_preflight_rejects_enabled_billing_without_finite_canary(
+    monkeypatch, tmp_path, cohort
+):
+    package, profile, env = _fixture(tmp_path)
+    env.update(
+        {
+            "HERMES_LITELLM_BILLING_ENABLED": "true",
+            "HERMES_LITELLM_BILLING_PAYER_IDS": cohort,
+        }
+    )
+    monkeypatch.setattr(startup_guard, "_import_boundaries", lambda: None)
+
+    with pytest.raises(startup_guard.StartupGuardError, match="billing_canary"):
+        startup_guard.validate_startup(
+            env=env, package_dir=package, profile_home=profile
+        )

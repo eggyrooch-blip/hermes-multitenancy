@@ -35,18 +35,62 @@ class _Routing:
 
     def resolve_owner_root(self, open_id):
         value = self.users.get(open_id)
-        return SimpleNamespace(user_id=value[0], profile_name=value[1]) if value else None
+        return (
+            SimpleNamespace(
+                user_id=value[0],
+                profile_name=value[1],
+                open_id=open_id,
+                active=True,
+                kind="user",
+                provenance="sync",
+            )
+            if value
+            else None
+        )
+
+    def lookup_by_user_id(self, user_id):
+        return next(
+            (
+                self.resolve_owner_root(open_id)
+                for open_id, (employee_id, _profile) in self.users.items()
+                if employee_id == user_id
+            ),
+            None,
+        )
 
     def lookup_by_open_id(self, open_id):
         return self.resolve_owner_root(open_id)
 
 
-def _request(*, chat_type="p2p", sender="ou_actor", chat_id="oc_dm"):
+class _ProductionShapeRouting(_Routing):
+    def lookup_by_user_id(self, user_id):
+        value = {"employee-a": "ou_actor"}.get(user_id)
+        return (
+            SimpleNamespace(
+                user_id=user_id,
+                profile_name="actor",
+                open_id=value,
+                kind="user",
+                provenance="sync",
+                active=True,
+            )
+            if value
+            else None
+        )
+
+
+def _request(
+    *,
+    chat_type="p2p",
+    sender="ou_actor",
+    chat_id="oc_dm",
+    profile_name="actor",
+):
     from hermes_multitenancy.run_models import RunRequest
 
     return RunRequest(
         channel="feishu",
-        profile_name="actor",
+        profile_name=profile_name,
         user_key=sender,
         content="hello",
         chat_id=chat_id,
@@ -107,13 +151,206 @@ def test_selected_dm_is_enforced_and_group_uses_owner(tmp_path, monkeypatch):
 
     dm = preparer.prepare(_request())
     group = preparer.prepare(
-        _request(chat_type="group", sender="ou_member", chat_id="oc_group")
+        _request(
+            chat_type="group",
+            sender="ou_member",
+            chat_id="oc_group",
+            profile_name="owner",
+        )
     )
 
     assert dm.metadata["litellm_billing_employee_user_id"] == "actor"
     assert group.metadata["litellm_billing_employee_user_id"] == "owner"
     assert "api_key" not in json.dumps(dm.metadata)
     assert [call[0].employee_user_id for call in credentials.calls] == ["actor", "owner"]
+
+
+def test_production_user_id_is_resolved_to_sync_open_id_before_billing(
+    tmp_path, monkeypatch
+):
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "someone-else")
+    credentials = _FakeCredentials()
+    preparer = BillingIdentityPreparer(
+        routing=_ProductionShapeRouting(),
+        store=BillingIdentityStore(tmp_path / "multitenancy.db"),
+        credentials=credentials,
+    )
+
+    prepared = preparer.prepare(
+        _request(sender="employee-a")
+    )
+
+    assert prepared.metadata.get("litellm_billing_enforced") is None
+    assert credentials.calls == []
+
+
+def test_incident_replay_keeps_twelve_noncohort_requests_legacy(
+    tmp_path, monkeypatch
+):
+    """Known-gotcha: production Feishu can route with employee user_id, not ou_*.
+
+    The 2026-07-22 incident was twelve requests from six non-canary profiles;
+    replay that exact cardinality without retaining employee data.
+    """
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.router import _run_request_for_routed_event
+    import asyncio
+
+    class ProductionRouting(_Routing):
+        def __init__(self):
+            super().__init__()
+            self.users = {
+                f"ou_fixture_{index}": (f"employee_{index}", f"profile_{index}")
+                for index in range(6)
+            }
+
+        def lookup_by_profile_name(self, profile_name):
+            return next(
+                (
+                    self.resolve_owner_root(open_id)
+                    for open_id, (_employee_id, profile) in self.users.items()
+                    if profile == profile_name
+                ),
+                None,
+            )
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "canary_employee")
+    credentials = _FakeCredentials()
+    preparer = BillingIdentityPreparer(
+        routing=ProductionRouting(),
+        store=BillingIdentityStore(tmp_path / "multitenancy.db"),
+        credentials=credentials,
+    )
+
+    dispatched = []
+    emitted = []
+    broker = RunBroker(
+        dispatch_agent=lambda request: dispatched.append(request) or "ok",
+        emit_event=lambda event: emitted.append(event),
+        prepare_request=preparer.prepare,
+        sandbox_available=lambda: True,
+    )
+    for index in range(6):
+        employee_id = f"employee_{index}"
+        for request_index in range(2):
+            request = _run_request_for_routed_event(
+                event=SimpleNamespace(),
+                profile_name=f"profile_{index}",
+                sender=employee_id,
+                sender_alt=None,
+                chat_id=f"oc_fixture_{index}",
+                text=f"fixture-{request_index}",
+            )
+            result = asyncio.run(broker.run(request))
+            assert result.content == "ok"
+
+    assert len(dispatched) == 12
+    assert credentials.calls == []
+    assert all(
+        "litellm_billing_enforced" not in item.metadata for item in dispatched
+    )
+    assert all(event.kind in {"content", "done"} for event in emitted)
+
+
+def test_noncohort_returns_before_billing_org_initialization(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "owner")
+    monkeypatch.setenv("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "invalid@domain")
+    credentials = _FakeCredentials()
+
+    prepared = _identity_preparer(tmp_path, credentials).prepare(_request())
+
+    assert credentials.calls == []
+    assert "litellm_billing_enforced" not in prepared.metadata
+
+
+def test_routed_request_metadata_never_labels_user_id_as_open_id(monkeypatch):
+    import hermes_multitenancy.router as router
+    from hermes_multitenancy.router import _run_request_for_routed_event
+
+    row = SimpleNamespace(
+        user_id="employee-a",
+        open_id="ou_actor",
+        kind="user",
+        provenance="sync",
+        active=True,
+    )
+    monkeypatch.setattr(
+        router,
+        "_get_routing_table",
+        lambda: SimpleNamespace(lookup_by_user_id=lambda value: row if value == "employee-a" else None),
+    )
+
+    request = _run_request_for_routed_event(
+        event=SimpleNamespace(),
+        profile_name="actor",
+        sender="employee-a",
+        sender_alt=None,
+        chat_id="oc_fixture",
+        text="fixture",
+    )
+
+    assert request.metadata["sender_open_id"] == "ou_actor"
+    assert request.user_key == "ou_actor"
+
+
+def test_selected_production_user_id_resolves_to_sync_root(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor")
+    monkeypatch.setenv(
+        "HERMES_LITELLM_BILLING_BASE_URL", "https://litellm.example/v1"
+    )
+    credentials = _FakeCredentials()
+    request = _request(sender="actor")
+
+    prepared = _identity_preparer(tmp_path, credentials).prepare(request)
+
+    assert prepared.metadata["litellm_billing_employee_user_id"] == "actor"
+    assert [call[0].employee_user_id for call in credentials.calls] == ["actor"]
+
+
+def test_feishu_sender_and_routed_profile_mismatch_fails_closed(
+    tmp_path, monkeypatch
+):
+    from hermes_multitenancy.run_broker import RunRejected
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor")
+    credentials = _FakeCredentials()
+    request = _request(sender="ou_owner")
+
+    with pytest.raises(RunRejected, match="could not be resolved"):
+        _identity_preparer(tmp_path, credentials).prepare(request)
+    assert credentials.calls == []
+
+
+@pytest.mark.parametrize("cohort", ["", "*", "actor,*"])
+def test_empty_or_wildcard_cohort_never_selects_a_new_payer(
+    tmp_path, monkeypatch, cohort
+):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", cohort)
+    credentials = _FakeCredentials()
+
+    prepared = _identity_preparer(tmp_path, credentials).prepare(_request())
+
+    assert credentials.calls == []
+    assert "litellm_billing_enforced" not in prepared.metadata
 
 
 @pytest.mark.parametrize("channel", ["webui", "cron", "kanban"])
@@ -193,6 +430,186 @@ def test_enforced_state_never_reverts_when_global_switch_turns_off(tmp_path, mon
 
     assert prepared.metadata["litellm_billing_enforced"] is True
     assert store.get("actor").migration_state == "enforced"
+
+
+def test_enforced_profile_identity_mismatch_stops_at_run_broker_when_billing_off(
+    tmp_path, monkeypatch
+):
+    import asyncio
+
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentity,
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+    from hermes_multitenancy.run_broker import RunBroker, RunRejected
+
+    monkeypatch.delenv("HERMES_LITELLM_BILLING_ENABLED", raising=False)
+    store = BillingIdentityStore(tmp_path / "multitenancy.db")
+    store.put(BillingIdentity(
+        "actor",
+        "actor",
+        "actor@keep.com",
+        "llm-actor",
+        "team-fd",
+        "FD",
+        "key-actor",
+        1,
+        FIXTURE["ensure_issued_response"]["expires_at"],
+        "enforced",
+    ))
+    preparer = BillingIdentityPreparer(
+        routing=_Routing(),
+        store=store,
+        credentials=_FakeCredentials(),
+    )
+    dispatched = []
+    emitted = []
+    broker = RunBroker(
+        dispatch_agent=lambda request: dispatched.append(request) or "unexpected",
+        emit_event=lambda event: emitted.append(event),
+        prepare_request=preparer.prepare,
+        sandbox_available=lambda: True,
+    )
+
+    with pytest.raises(RunRejected, match="could not be resolved"):
+        asyncio.run(broker.run(_request(sender="ou_owner")))
+
+    assert dispatched == []
+    assert emitted == []
+
+
+def test_enforced_group_missing_owner_route_stops_when_billing_off(
+    tmp_path, monkeypatch
+):
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentity,
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+    from hermes_multitenancy.run_broker import RunRejected
+
+    class MissingGroupOwnerRouting(_Routing):
+        def lookup_by_chat_id(self, _chat_id):
+            return None
+
+        def lookup_by_profile_name(self, _profile_name):
+            return SimpleNamespace(owner_open_id="ou_owner", open_id="ou_owner")
+
+    monkeypatch.delenv("HERMES_LITELLM_BILLING_ENABLED", raising=False)
+    store = BillingIdentityStore(tmp_path / "multitenancy.db")
+    store.put(BillingIdentity(
+        "owner",
+        "owner",
+        "owner@keep.com",
+        "llm-owner",
+        "team-fd",
+        "FD",
+        "key-owner",
+        1,
+        FIXTURE["ensure_issued_response"]["expires_at"],
+        "enforced",
+    ))
+    preparer = BillingIdentityPreparer(
+        routing=MissingGroupOwnerRouting(),
+        store=store,
+        credentials=_FakeCredentials(),
+    )
+
+    with pytest.raises(RunRejected, match="could not be resolved"):
+        preparer.prepare(_request(
+            chat_type="group",
+            sender="ou_member",
+            chat_id="oc_missing",
+            profile_name="group_oc_missing",
+        ))
+
+
+def test_multiple_group_profiles_bill_the_same_trusted_owner(
+    tmp_path, monkeypatch
+):
+    class MultipleGroupsRouting(_Routing):
+        def lookup_by_chat_id(self, chat_id):
+            if chat_id in {"oc_one", "oc_two"}:
+                return SimpleNamespace(owner_open_id="ou_owner")
+            return None
+
+        def lookup_by_profile_name(self, _profile_name):
+            return None
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "owner")
+    credentials = _FakeCredentials()
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    preparer = BillingIdentityPreparer(
+        routing=MultipleGroupsRouting(),
+        store=BillingIdentityStore(tmp_path / "multitenancy.db"),
+        credentials=credentials,
+    )
+    first = preparer.prepare(_request(
+        chat_type="group",
+        sender="ou_member",
+        chat_id="oc_one",
+        profile_name="group_oc_one",
+    ))
+    second = preparer.prepare(_request(
+        chat_type="group",
+        sender="ou_member",
+        chat_id="oc_two",
+        profile_name="group_oc_two",
+    ))
+
+    assert first.metadata["litellm_billing_employee_user_id"] == "owner"
+    assert second.metadata["litellm_billing_employee_user_id"] == "owner"
+    assert [call[0].employee_user_id for call in credentials.calls] == [
+        "owner",
+        "owner",
+    ]
+
+
+def test_noncohort_group_ignores_stale_billing_profile_binding(
+    tmp_path, monkeypatch
+):
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentity,
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "someone-else")
+    store = BillingIdentityStore(tmp_path / "multitenancy.db")
+    store.put(BillingIdentity(
+        "stale-employee",
+        "group_oc_group",
+        "stale@keep.com",
+        "llm-stale",
+        "team-stale",
+        "FD",
+        "key-stale",
+        1,
+        FIXTURE["ensure_issued_response"]["expires_at"],
+        "legacy",
+    ))
+    credentials = _FakeCredentials()
+    preparer = BillingIdentityPreparer(
+        routing=_Routing(),
+        store=store,
+        credentials=credentials,
+    )
+    request = _request(
+        chat_type="group",
+        sender="ou_member",
+        chat_id="oc_group",
+        profile_name="group_oc_group",
+    )
+
+    assert preparer.prepare(request) == request
+    assert credentials.calls == []
 
 
 class _FakeGateway:
