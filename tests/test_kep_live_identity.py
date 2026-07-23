@@ -55,3 +55,22 @@ def test_probe_refuses_redirect_without_forwarding_bearer():
 
     assert result["state"] == "unknown"
     assert seen == []
+
+
+def test_probe_never_authenticates_an_empty_profile_name():
+    from hermes_multitenancy.kep_live_identity import probe_kep_identity
+
+    success = {
+        "errorCode": 0,
+        "ok": True,
+        "data": {"payload": {"name": "", "exp": int(time.time()) + 3600}},
+    }
+    with _server(status=200, body=success) as url:
+        result = probe_kep_identity(
+            "header.payload.signature",
+            profile_name="",
+            env_name="online",
+            identity_urls={"online": url, "pre": url},
+        )
+
+    assert result["state"] == "unknown"

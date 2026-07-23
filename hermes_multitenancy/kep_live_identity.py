@@ -44,6 +44,12 @@ def probe_kep_identity(
     identity_urls: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     urls = _IDENTITY_URLS if identity_urls is None else identity_urls
+    profile_name = str(profile_name or "").strip()
+    token = str(token or "").strip()
+    if not profile_name or env_name not in urls:
+        return {"state": "unknown"}
+    if not token:
+        return {"state": "needs_auth"}
     request = urllib.request.Request(
         urls[env_name],
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
