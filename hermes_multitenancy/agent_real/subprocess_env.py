@@ -20,6 +20,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
+from ..runtime import sandbox_profile_enabled
+
 
 def _build_subprocess_env(
     profile_home: Path,
@@ -82,7 +84,15 @@ def _build_subprocess_env(
     # OpenClaw-compatible token boundary: HOME and /workspace-style variables
     # point into the routed profile so unmodified token skills do not write to
     # the shared service user's home.
-    profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
+    sandboxed_profile = sandbox_profile_enabled(profile_home.name)
+    profile_anchor_env, forced_profile_anchor_env = (
+        _profile_anchor_env_layers_for_aiagent(
+            profile_home,
+            short_parent_tmp=(
+                sandboxed_profile and sys.platform.startswith("linux")
+            ),
+        )
+    )
     env.update(profile_anchor_env)
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
@@ -91,7 +101,7 @@ def _build_subprocess_env(
     # non-secret profile anchors through that boundary so profile-scoped CLIs
     # such as kep-auth/ocean-cli read the same HOME and KEP_PROFILE as the
     # routed AIAgent process.
-    env.update(_force_env_for_terminal_passthrough(profile_anchor_env))
+    env.update(forced_profile_anchor_env)
     lark_cli_env = _lark_cli_sidecar_env_for_aiagent(profile_home)
     env.update(lark_cli_env)
     env.update(_force_env_for_terminal_passthrough(lark_cli_env))
@@ -136,16 +146,17 @@ def _build_subprocess_env(
     # asking the user about `python -c ...` inside it is duplicate friction.
     # The hardline blocklist (rm -rf /, mkfs, dd /dev/sd, shutdown, fork bomb)
     # is checked BEFORE the bypass in approval.py and remains in effect.
-    if os.environ.get("HERMES_USE_SANDBOX") == "1":
-        allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
-        if not allowlist_raw or profile_home.name in {
-            p.strip() for p in allowlist_raw.split(",") if p.strip()
-        }:
-            env["HERMES_SANDBOX_HOST"] = "1"
-            env.setdefault("HERMES_YOLO_MODE", "1")
-
     if extra:
         env.update(extra)
+
+    if sandboxed_profile:
+        env["HERMES_SANDBOX_HOST"] = "1"
+        env.setdefault("HERMES_YOLO_MODE", "1")
+        if sys.platform.startswith("linux"):
+            # bwrap mounts a private tmpfs at /tmp. Keep Hermes' parent RPC
+            # socket short while tool children remain pinned to profile tmp.
+            env["TMPDIR"] = "/tmp"
+            env["_HERMES_FORCE_TMPDIR"] = str(profile_home / "tmp")
 
     # Feishu per-user UAT identity: forward sender open_id so that AIAgent
     # tool-worker threads (which lose ContextVar across ThreadPoolExecutor

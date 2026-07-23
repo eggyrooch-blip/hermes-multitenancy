@@ -504,9 +504,11 @@ def _run_with_aiagent(
             }
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
-            profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
+            profile_anchor_env, forced_profile_anchor_env = (
+                _profile_anchor_env_layers_for_aiagent(profile_home)
+            )
             os.environ.update(profile_anchor_env)
-            os.environ.update(_force_env_for_terminal_passthrough(profile_anchor_env))
+            os.environ.update(forced_profile_anchor_env)
             result = agent.run_conversation(**run_kwargs)
             # 工件1a：捕获本回合 token 用量到 usage_sink，由父进程（非沙箱）写台账。
             # 不能在这里(子进程)直接写 /var/log/hermes —— 沙箱策略不允许该路径，

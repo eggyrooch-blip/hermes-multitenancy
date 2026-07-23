@@ -55,7 +55,11 @@ from ..lark_cli_auth_broker import (
     LarkCliAuthBrokerContext,
     start_lark_cli_auth_broker_server,
 )
-from ..runtime import require_sandbox_enabled, strict_context_enabled
+from ..runtime import (
+    require_sandbox_enabled,
+    sandbox_profile_enabled,
+    strict_context_enabled,
+)
 from ..security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
 from ..security_audit import append_security_event
 from .. import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
@@ -2568,6 +2572,23 @@ def _force_env_for_terminal_passthrough(env: dict[str, str]) -> dict[str, str]:
     return {f"_HERMES_FORCE_{key}": value for key, value in env.items()}
 
 
+def _profile_anchor_env_layers_for_aiagent(
+    profile_home: Path,
+    *,
+    short_parent_tmp: Optional[bool] = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    child_anchors = _profile_anchor_env_for_aiagent(profile_home)
+    parent_anchors = dict(child_anchors)
+    if short_parent_tmp is None:
+        short_parent_tmp = (
+            sys.platform.startswith("linux")
+            and os.environ.get("HERMES_SANDBOX_HOST") == "1"
+        )
+    if short_parent_tmp:
+        parent_anchors["TMPDIR"] = "/tmp"
+    return parent_anchors, _force_env_for_terminal_passthrough(child_anchors)
+
+
 def _forced_profile_anchor_env_from(source_env: Mapping[str, str]) -> dict[str, str]:
     forced: dict[str, str] = {}
     for key in _PROFILE_ANCHOR_ENV_KEYS:
@@ -2835,9 +2856,11 @@ def _apply_runtime_env_for_aiagent(
 ):
     """Temporarily expose profile/credential env for in-process AIAgent runs."""
     runtime_env = _profile_env_for_aiagent(profile_home)
-    profile_anchor_env = _profile_anchor_env_for_aiagent(profile_home)
+    profile_anchor_env, forced_profile_anchor_env = (
+        _profile_anchor_env_layers_for_aiagent(profile_home)
+    )
     runtime_env.update(profile_anchor_env)
-    runtime_env.update(_force_env_for_terminal_passthrough(profile_anchor_env))
+    runtime_env.update(forced_profile_anchor_env)
     try:
         _register_env_passthrough_process_wide(sorted(profile_anchor_env))
     except Exception:
@@ -3130,9 +3153,6 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     file is missing — better to keep the bot working than to fail closed
     in a way that masks the cause.
     """
-    if os.environ.get("HERMES_USE_SANDBOX") != "1":
-        return cmd
-
     # Per-profile gate. If HERMES_SANDBOX_PROFILES is set, the sandbox only
     # wraps subprocesses for profiles named in that comma-separated list.
     # Unset → all profiles are sandboxed (when the master toggle is on).
@@ -3145,14 +3165,13 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     #   HERMES_USE_SANDBOX=1
     #     → every routed profile is sandboxed (final state after pilot).
     allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
-    if allowlist_raw:
-        allowed = {p.strip() for p in allowlist_raw.split(",") if p.strip()}
-        if profile_home.name not in allowed:
+    if not sandbox_profile_enabled(profile_home.name):
+        if os.environ.get("HERMES_USE_SANDBOX") == "1" and allowlist_raw:
             logger.debug(
                 "[multitenancy] sandbox gated: profile=%s not in HERMES_SANDBOX_PROFILES=%s",
                 profile_home.name, allowlist_raw,
             )
-            return cmd
+        return cmd
 
     # Platform dispatch. Each backend owns its own preflight checks and
     # failure semantics (macOS keeps a pilot-era WARNING+fallback; Linux is

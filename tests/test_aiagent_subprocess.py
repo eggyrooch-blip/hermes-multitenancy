@@ -5,14 +5,17 @@ import io
 import json
 import logging
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import asyncio
 import contextvars
 import types
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -3434,6 +3437,73 @@ def test_run_with_aiagent_cleans_expert_skill_scope_on_agent_init_error(monkeypa
     assert cleanup_calls == ["cleaned"]
 
 
+def test_run_with_aiagent_preserves_short_parent_tmp_and_profile_child_tmp(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / (
+        "feishu_group_8ec050fb3255_703fc51f7d272a1f"
+    )
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n  webui:\n  - terminal\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(self, user_message, task_id, conversation_history=None):
+            from tools import code_execution_tool
+
+            cached_tempdir = tempfile.tempdir
+            tempfile.tempdir = None
+            try:
+                socket_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"hermes_rpc_{uuid.uuid4().hex}.sock",
+                )
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    server.bind(socket_path)
+                finally:
+                    server.close()
+                    if os.path.exists(socket_path):
+                        os.unlink(socket_path)
+            finally:
+                tempfile.tempdir = cached_tempdir
+
+            child_env = code_execution_tool._scrub_child_env(dict(os.environ))
+            seen.update(
+                parent_tmp=os.environ["TMPDIR"],
+                parent_socket_bytes=len(os.fsencode(socket_path)),
+                child_tmp=child_env["TMPDIR"],
+            )
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setenv("HERMES_SANDBOX_HOST", "1")
+    monkeypatch.setattr(agent_real.sys, "platform", "linux")
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen["parent_tmp"] == "/tmp"
+    assert seen["parent_socket_bytes"] < 108
+    assert seen["child_tmp"] == str(profile_home / "tmp")
+
+
 def test_run_with_aiagent_registers_vod_provider_in_child_process(monkeypatch, tmp_path: Path):
     """Routed AIAgent subprocesses do not go through the Hermes plugin loader."""
     from agent.image_gen_registry import _reset_for_tests, get_provider
@@ -4155,6 +4225,7 @@ def test_execute_code_child_env_patch_uses_each_source_env_not_lifo_stack(
             "HOME": source_env.get("HOME", ""),
             "KEP_PROFILE": source_env.get("KEP_PROFILE", ""),
             "TERMINAL_HOME_MODE": source_env.get("TERMINAL_HOME_MODE", ""),
+            "TMPDIR": source_env.get("TMPDIR", ""),
         }
 
     fake_code_execution_tool = SimpleNamespace(_scrub_child_env=original_scrub_child_env)
@@ -4169,28 +4240,34 @@ def test_execute_code_child_env_patch_uses_each_source_env_not_lifo_stack(
             "HOME": "/home/hermes",
             "KEP_PROFILE": "alice",
             "TERMINAL_HOME_MODE": "auto",
+            "TMPDIR": "/tmp",
             "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "alice" / "home"),
             "_HERMES_FORCE_KEP_PROFILE": "alice",
             "_HERMES_FORCE_TERMINAL_HOME_MODE": "profile",
+            "_HERMES_FORCE_TMPDIR": str(tmp_path / "profiles" / "alice" / "tmp"),
         }
         bob_env = {
             "HOME": "/home/hermes",
             "KEP_PROFILE": "bob",
             "TERMINAL_HOME_MODE": "auto",
+            "TMPDIR": "/tmp",
             "_HERMES_FORCE_HOME": str(tmp_path / "profiles" / "bob" / "home"),
             "_HERMES_FORCE_KEP_PROFILE": "bob",
             "_HERMES_FORCE_TERMINAL_HOME_MODE": "profile",
+            "_HERMES_FORCE_TMPDIR": str(tmp_path / "profiles" / "bob" / "tmp"),
         }
 
         assert fake_code_execution_tool._scrub_child_env(alice_env) == {
             "HOME": str(tmp_path / "profiles" / "alice" / "home"),
             "KEP_PROFILE": "alice",
             "TERMINAL_HOME_MODE": "profile",
+            "TMPDIR": str(tmp_path / "profiles" / "alice" / "tmp"),
         }
         assert fake_code_execution_tool._scrub_child_env(bob_env) == {
             "HOME": str(tmp_path / "profiles" / "bob" / "home"),
             "KEP_PROFILE": "bob",
             "TERMINAL_HOME_MODE": "profile",
+            "TMPDIR": str(tmp_path / "profiles" / "bob" / "tmp"),
         }
     finally:
         cleanup()
@@ -6586,16 +6663,74 @@ def test_build_subprocess_env_sets_hermes_plumbing(tmp_path: Path):
 def test_build_subprocess_env_auto_approves_inside_sandbox_host(monkeypatch, tmp_path: Path):
     """Sandboxed routed profiles should not pause on duplicate dangerous-command prompts."""
     from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import subprocess_env
 
-    profile = tmp_path / "profiles" / "owner"
+    profile = tmp_path / "profiles" / (
+        "feishu_group_8ec050fb3255_703fc51f7d272a1f"
+    )
     approval_dir = tmp_path / "approval"
     approval_dir.mkdir()
     monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
+    monkeypatch.setattr(subprocess_env, "sys", SimpleNamespace(platform="linux"))
 
-    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    env = agent_real._build_subprocess_env(
+        profile,
+        approval_dir=approval_dir,
+        extra={
+            "HERMES_SANDBOX_HOST": "0",
+            "TMPDIR": "/host/tmp",
+            "_HERMES_FORCE_TMPDIR": "/wrong-profile/tmp",
+        },
+    )
 
     assert env["HERMES_SANDBOX_HOST"] == "1"
     assert env["HERMES_YOLO_MODE"] == "1"
+    assert env["TMPDIR"] == "/tmp"
+    assert env["_HERMES_FORCE_TMPDIR"] == str(profile / "tmp")
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,socket,tempfile,uuid;"
+                "p=os.path.join(tempfile.gettempdir(),f'hermes_rpc_{uuid.uuid4().hex}.sock');"
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
+                "s.bind(p);"
+                "print(len(os.fsencode(p)));"
+                "s.close();"
+                "os.unlink(p)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert int(probe.stdout) < 108
+
+
+def test_build_subprocess_env_keeps_profile_tmp_when_profile_is_not_sandboxed(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import subprocess_env
+
+    profile = tmp_path / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "bob")
+    monkeypatch.setattr(subprocess_env, "sys", SimpleNamespace(platform="linux"))
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+    assert env["TMPDIR"] == str(profile / "tmp")
+    assert env["_HERMES_FORCE_TMPDIR"] == str(profile / "tmp")
+    assert "HERMES_SANDBOX_HOST" not in env
 
 
 def test_build_subprocess_env_prepends_shared_bin_to_path(monkeypatch, tmp_path: Path):

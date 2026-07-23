@@ -65,6 +65,18 @@ def require_sandbox_enabled() -> bool:
     }
 
 
+def sandbox_profile_enabled(profile_name: str) -> bool:
+    """Return whether the current sandbox policy includes ``profile_name``."""
+    if os.environ.get("HERMES_USE_SANDBOX") != "1":
+        return False
+    allowlist = {
+        item.strip()
+        for item in os.environ.get("HERMES_SANDBOX_PROFILES", "").split(",")
+        if item.strip()
+    }
+    return not allowlist or profile_name in allowlist
+
+
 # Serializes os.environ HERMES_HOME mutations across concurrent dispatches.
 # We key locks by event loop because asyncio.Lock binds to the loop on first
 # acquire — pytest spawns a fresh loop per test so a module-level lock would
