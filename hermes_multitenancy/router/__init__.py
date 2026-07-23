@@ -611,23 +611,15 @@ def _run_request_for_routed_event(
     text: str,
 ):
     from ..run_models import RunRequest
+    from ..billing_identity import canonical_sync_open_id
 
     canonical_sender = sender
     if not _is_feishu_open_id(canonical_sender):
-        table = _get_routing_table()
-        lookup = getattr(table, "lookup_by_user_id", None) if table is not None else None
-        try:
-            row = lookup(str(canonical_sender).strip()) if callable(lookup) else None
-        except Exception:
-            row = None
-        if (
-            row is not None
-            and str(getattr(row, "kind", "") or "") == "user"
-            and str(getattr(row, "provenance", "") or "") == "sync"
-            and bool(getattr(row, "active", True))
-        ):
-            canonical_sender = str(getattr(row, "open_id", "") or "").strip() or sender
-    user_key = _tenant_user_key(canonical_sender, sender_alt)
+        canonical_sender = canonical_sync_open_id(
+            _get_routing_table(),
+            canonical_sender,
+        )
+    user_key = _tenant_user_key(canonical_sender or sender, sender_alt)
     metadata = {
         "sender_open_id": canonical_sender,
         "chat_type": _extract_chat_type(event),
@@ -1489,6 +1481,10 @@ def _scope_profile_skill_loader(profile_home: Optional[Path]) -> list[tuple[Any,
         remember(skills_tool, "SKILLS_DIR", profile_home / "skills")
     except Exception as exc:
         logger.debug("multitenancy: profile skill loader scope skipped (%s)", exc)
+
+    from ..plugin_state import scope_active_skill_files
+
+    scope_active_skill_files(profile_home, remember)
 
     try:
         from agent import skill_commands  # type: ignore

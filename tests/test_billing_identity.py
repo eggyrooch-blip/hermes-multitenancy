@@ -227,8 +227,12 @@ def test_incident_replay_keeps_twelve_noncohort_requests_legacy(
     monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "canary_employee")
     credentials = _FakeCredentials()
+    routing = ProductionRouting()
+    import hermes_multitenancy.router as router
+
+    monkeypatch.setattr(router, "_get_routing_table", lambda: routing)
     preparer = BillingIdentityPreparer(
-        routing=ProductionRouting(),
+        routing=routing,
         store=BillingIdentityStore(tmp_path / "multitenancy.db"),
         credentials=credentials,
     )
@@ -305,6 +309,35 @@ def test_routed_request_metadata_never_labels_user_id_as_open_id(monkeypatch):
 
     assert request.metadata["sender_open_id"] == "ou_actor"
     assert request.user_key == "ou_actor"
+
+
+def test_routed_request_rejects_non_open_id_from_sync_lookup(monkeypatch):
+    import hermes_multitenancy.router as router
+    from hermes_multitenancy.router import _run_request_for_routed_event
+
+    row = SimpleNamespace(
+        open_id="employee-b",
+        kind="user",
+        provenance="sync",
+        active=True,
+    )
+    monkeypatch.setattr(
+        router,
+        "_get_routing_table",
+        lambda: SimpleNamespace(lookup_by_user_id=lambda _value: row),
+    )
+
+    request = _run_request_for_routed_event(
+        event=SimpleNamespace(),
+        profile_name="actor",
+        sender="employee-a",
+        sender_alt=None,
+        chat_id="oc_fixture",
+        text="fixture",
+    )
+
+    assert request.metadata["sender_open_id"] == ""
+    assert request.user_key == "employee-a"
 
 
 def test_selected_production_user_id_resolves_to_sync_root(

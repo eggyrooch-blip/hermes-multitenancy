@@ -139,12 +139,17 @@ def list_profile_skill_slash_commands(*, profile_home: Path) -> list[dict[str, A
     skills_root = profile / "skills"
     if not skills_root.is_dir():
         return []
+    from .plugin_state import inactive_skill_paths
+
+    blocked = inactive_skill_paths(profile.parent.parent)
 
     commands: dict[str, dict[str, Any]] = {}
     for skill_md in _iter_skill_files(skills_root):
         try:
             rel = skill_md.parent.relative_to(skills_root)
         except ValueError:
+            continue
+        if rel.parts and rel.parts[0] in blocked:
             continue
         meta = _read_skill_doc_metadata(skill_md)
         name = _slash_command_name(meta.get("name") or rel.name)

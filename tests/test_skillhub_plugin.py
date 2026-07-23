@@ -1161,10 +1161,12 @@ def test_inactive_prunes_existing_org_fanout_and_sync_cannot_reinstall(
     assert not (alice / "skills" / "kep-halo-cli").exists()
 
 
-def test_inactive_cleanup_failure_does_not_claim_inactive(
+def test_inactive_cleanup_failure_still_revokes_execution(
     tmp_path: Path, monkeypatch
 ) -> None:
     from hermes_multitenancy import skillhub_installer as si
+    from hermes_multitenancy.skill_registry import list_profile_skill_slash_commands
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
 
     shared_home = tmp_path / ".hermes"
     profiles_root = _make_profile_dirs(shared_home, "alice")
@@ -1178,6 +1180,7 @@ def test_inactive_cleanup_failure_does_not_claim_inactive(
         profiles_root=profiles_root,
         downloader=lambda _: _plugin_zip(),
     )
+    _sync_default_profile_skills(profiles_root / "alice", shared_home)
     monkeypatch.setattr(
         pi,
         "_prune_plugin_managed_fanout",
@@ -1196,7 +1199,73 @@ def test_inactive_cleanup_failure_does_not_claim_inactive(
             shared_home=shared_home,
             profiles_root=profiles_root,
         )
-    assert _managed_manifest(shared_home)["status"] == "active"
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+    assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
+    assert not any(
+        command["name"] == "kep-halo-cli"
+        for command in list_profile_skill_slash_commands(
+            profile_home=profiles_root / "alice"
+        )
+    )
+    from agent import skill_utils
+    from hermes_multitenancy.router import (
+        _restore_profile_skill_loader,
+        _scope_profile_skill_loader,
+    )
+
+    states = _scope_profile_skill_loader(profiles_root / "alice")
+    try:
+        assert not any(
+            "kep-halo-cli" in path.parts
+            for path in skill_utils.iter_skill_index_files(
+                profiles_root / "alice" / "skills",
+                "SKILL.md",
+            )
+        )
+    finally:
+        _restore_profile_skill_loader(states)
+
+
+def test_inactive_never_deletes_foreign_overwrite(tmp_path: Path) -> None:
+    from hermes_multitenancy import skillhub_installer as si
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text(
+        "skills: []\n", encoding="utf-8"
+    )
+    si.process_event(
+        _plugin_event(auth_type="all", users=[]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    alice = profiles_root / "alice"
+    _sync_default_profile_skills(alice, shared_home)
+    target = alice / "skills" / "kep-halo-cli"
+    if target.is_symlink():
+        target.unlink()
+    else:
+        import shutil
+
+        shutil.rmtree(target)
+    target.mkdir()
+    (target / "SKILL.md").write_text("# employee-owned\n", encoding="utf-8")
+
+    with pytest.raises(si.SkillhubInstallError, match="cannot prune modified"):
+        si.process_event(
+            _plugin_event(
+                event_type="skill.status_changed",
+                skill_status="inactive",
+                users=[],
+            ),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+        )
+    assert _managed_manifest(shared_home)["status"] == "inactive"
+    assert (target / "SKILL.md").read_text(encoding="utf-8") == "# employee-owned\n"
 
 
 def test_no_sticky_file_preserves_normal_shrink(tmp_path: Path) -> None:

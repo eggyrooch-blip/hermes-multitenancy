@@ -52,6 +52,11 @@ from typing import Any, Optional
 import yaml
 
 from .connectors import builtin as connector_builtin
+from .plugin_state import (
+    PluginStateError,
+    inactive_skill_paths as inactive_plugin_skill_paths,
+    mark_inactive as _mark_inactive_state,
+)
 from .skill_registry import (
     install_shared_skill_for_profile,
     uninstall_personal_skill_for_profile,
@@ -499,8 +504,8 @@ def _skill_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _personal_install_target(profile_home: Path, name: str) -> Optional[str]:
-    """The `target` (source path) recorded for a personal skill install, or None."""
+def _personal_install_metadata(profile_home: Path, name: str) -> Optional[dict[str, Any]]:
+    """Return the personal-install record used to prove a plugin-owned target."""
     mf = profile_home / "skills" / ".hermes-personal-installs.json"
     try:
         data = json.loads(mf.read_text(encoding="utf-8"))
@@ -508,7 +513,33 @@ def _personal_install_target(profile_home: Path, name: str) -> Optional[str]:
         return None
     skills = data.get("skills") if isinstance(data, dict) else None
     entry = skills.get(name) if isinstance(skills, dict) else None
-    return entry.get("target") if isinstance(entry, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _personal_install_target(profile_home: Path, name: str) -> Optional[str]:
+    entry = _personal_install_metadata(profile_home, name)
+    return entry.get("target") if entry is not None else None
+
+
+def _personal_install_is_unchanged(
+    profile_home: Path,
+    name: str,
+    entry: dict[str, Any],
+) -> bool:
+    source = Path(str(entry.get("target") or ""))
+    target = profile_home / "skills" / name
+    if not source.is_dir():
+        return False
+    if entry.get("install_mode") == "symlink":
+        try:
+            return target.is_symlink() and target.resolve() == source.resolve()
+        except OSError:
+            return False
+    return (
+        target.is_dir()
+        and not target.is_symlink()
+        and _skill_tree_digest(target) == _skill_tree_digest(source)
+    )
 
 
 def _managed_skill_present(profile_home: Path, name: str) -> bool:
@@ -1183,6 +1214,7 @@ def deactivate(
     _safe_component(plugin_id, kind="plugin id")
     resolved_home = (shared_home or _default_shared_home()).expanduser()
     if _lock_held:
+        _mark_plugin_inactive(resolved_home, plugin_id)
         return _uninstall_locked(
             plugin_id,
             shared_home=resolved_home,
@@ -1190,12 +1222,21 @@ def deactivate(
             retain_status="inactive",
         )
     with _plugin_ingest_lock(resolved_home, plugin_id):
+        _mark_plugin_inactive(resolved_home, plugin_id)
         return _uninstall_locked(
             plugin_id,
             shared_home=resolved_home,
             profiles_root=profiles_root,
             retain_status="inactive",
         )
+
+
+def _mark_plugin_inactive(shared_home: Path, plugin_id: str) -> None:
+    """Persist revocation before best-effort filesystem cleanup begins."""
+    try:
+        _mark_inactive_state(shared_home, plugin_id)
+    except PluginStateError as exc:
+        raise PluginIngestError(str(exc)) from exc
 
 
 def _uninstall_locked(
@@ -1235,9 +1276,24 @@ def _uninstall_locked(
             for name in names:
                 # COEXISTENCE GUARD: if the personal install no longer points at our
                 # source (employee re-installed over it), leave it alone.
-                tgt = _personal_install_target(profile_home, name)
+                entry = _personal_install_metadata(profile_home, name)
+                tgt = entry.get("target") if entry is not None else None
                 my_source = str(shared_home / "skills" / name)
-                if tgt is not None and tgt != my_source:
+                target = profile_home / "skills" / name
+                if (
+                    tgt is not None
+                    and (
+                        tgt != my_source
+                        or (
+                            (target.exists() or target.is_symlink())
+                            and not _personal_install_is_unchanged(
+                                profile_home,
+                                name,
+                                entry,
+                            )
+                        )
+                    )
+                ):
                     report["removed"].append({"profile": profile, "skill": name, "action": "kept-foreign"})
                     continue
                 if dry_run:
@@ -1350,6 +1406,15 @@ def _prune_plugin_managed_fanout(
                 and not feishu_org._is_foreign_origin_skill_entry(entry)
                 and entry.get("source") == str(shared_home / "skills" / name)
             ):
+                target = profile_home / "skills" / name
+                if (
+                    (target.exists() or target.is_symlink())
+                    and feishu_org._profile_skill_target_modified(target, entry)
+                ):
+                    raise PluginIngestError(
+                        f"cannot prune modified managed skill {name!r} "
+                        f"from profile {profile_home.name!r}"
+                    )
                 desired.pop(name, None)
         if desired == previous:
             continue

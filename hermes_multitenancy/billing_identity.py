@@ -54,6 +54,29 @@ _RESERVED_METADATA = frozenset({
 })
 
 
+def canonical_sync_open_id(routing: Any, sender: Any) -> str:
+    """Resolve a Feishu user alias through one active org-sync-owned row."""
+    value = str(sender or "").strip()
+    if not value:
+        return ""
+    if value.startswith("ou_"):
+        return value
+    lookup = getattr(routing, "lookup_by_user_id", None)
+    try:
+        row = lookup(value) if callable(lookup) else None
+    except Exception:
+        return ""
+    open_id = str(getattr(row, "open_id", "") or "").strip() if row else ""
+    if (
+        not open_id.startswith("ou_")
+        or str(getattr(row, "kind", "") or "") != "user"
+        or str(getattr(row, "provenance", "") or "") != "sync"
+        or not bool(getattr(row, "active", True))
+    ):
+        return ""
+    return open_id
+
+
 class BillingIdentityStore:
     """Durable non-secret binding and irreversible migration state."""
 
@@ -312,25 +335,7 @@ class BillingIdentityPreparer:
         routing row is the sole authority for converting that alias; caller
         metadata and profile display names are never accepted as evidence.
         """
-        value = str(sender or "").strip()
-        if not value:
-            return ""
-        if value.startswith("ou_"):
-            return value
-        lookup = getattr(self._routing, "lookup_by_user_id", None)
-        try:
-            row = lookup(value) if callable(lookup) else None
-        except Exception:
-            return ""
-        if row is None:
-            return ""
-        if (
-            str(getattr(row, "kind", "") or "") != "user"
-            or str(getattr(row, "provenance", "") or "") != "sync"
-            or not bool(getattr(row, "active", True))
-        ):
-            return ""
-        return str(getattr(row, "open_id", "") or "").strip()
+        return canonical_sync_open_id(self._routing, sender)
 
     def _group_owner(self, chat_id: str) -> Optional[str]:
         row = self._routing.lookup_by_chat_id(chat_id)

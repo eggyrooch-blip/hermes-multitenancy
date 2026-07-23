@@ -143,7 +143,10 @@ def _environment(tmp_path, monkeypatch) -> tuple[dict[str, str], dict]:
         "HERMES_LITELLM_BILLING_PAYER_IDS": "employee-a",
         "HERMES_LITELLM_BILLING_READINESS_ARTIFACT": str(first),
         "HERMES_LITELLM_BILLING_REPLAY_STORE": str(replay_path),
+        "HERMES_AI_GATEWAY_BROKER_URL": "https://ai-gateway.invalid",
         "HERMES_AI_GATEWAY_BROKER_TOKEN": "secret",
+        "LITELLM_BASE_URL": "https://litellm.invalid",
+        "LITELLM_MASTER_KEY": "must-stay-in-ai-gateway",
         "HERMES_LITELLM_BILLING_POLICY_DIGEST": "policy",
         "HERMES_LITELLM_BILLING_CODE_SHA": "code",
         "HERMES_LITELLM_BILLING_CONTRACT_MAJOR": "1",
@@ -157,6 +160,10 @@ def _environment(tmp_path, monkeypatch) -> tuple[dict[str, str], dict]:
         "UNRELATED_SERVICE_SECRET": "must-not-reach-child",
     }
     monkeypatch.setattr("hermes_multitenancy.billing_readiness.time.time", lambda: 200)
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness._is_root_owned",
+        lambda _value: True,
+    )
     real_is_dir = Path.is_dir
     monkeypatch.setattr(
         Path,
@@ -240,6 +247,9 @@ def test_enabled_environment_binds_local_universe_and_consumes_nonces(
         assert argv[argv.index("--routing-watermark") + 1] == bindings["routing_watermark"]
         assert argv[argv.index("--org-sha") + 1] == bindings["org_sha"]
         assert "UNRELATED_SERVICE_SECRET" not in kwargs["env"]
+        assert kwargs["env"]["HERMES_AI_GATEWAY_BROKER_URL"].startswith("https://")
+        assert "LITELLM_MASTER_KEY" not in kwargs["env"]
+        assert "LITELLM_BASE_URL" not in kwargs["env"]
         with open(output, "w", encoding="utf-8") as handle:
             json.dump(_artifact(bindings, nonce=nonce, issued_at=200), handle)
         os.chmod(output, 0o600)
@@ -343,7 +353,13 @@ def test_live_recheck_noop_cannot_reuse_preexisting_artifact(tmp_path, monkeypat
         verify_enabled_environment(env)
 
 
-def test_nonce_store_is_pinned_and_requires_a_nonwritable_parent(tmp_path):
+def test_nonce_store_is_pinned_and_requires_a_nonwritable_parent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness._is_root_owned",
+        lambda _value: True,
+    )
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir(mode=0o700)
     store = replay_dir / "consumed"
@@ -365,7 +381,11 @@ def test_nonce_store_is_pinned_and_requires_a_nonwritable_parent(tmp_path):
         os.chmod(replay_dir, 0o700)
 
 
-def test_nonce_store_rejects_symlink_leaf(tmp_path):
+def test_nonce_store_rejects_symlink_leaf(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness._is_root_owned",
+        lambda _value: True,
+    )
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir(mode=0o700)
     target = tmp_path / "target"
@@ -382,6 +402,10 @@ def test_nonce_store_rejects_symlink_leaf(tmp_path):
 
 
 def test_nonce_store_parent_blocks_replacement_during_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness._is_root_owned",
+        lambda _value: True,
+    )
     replay_dir = tmp_path / "replay"
     replay_dir.mkdir(mode=0o700)
     store = replay_dir / "consumed"
@@ -405,6 +429,51 @@ def test_nonce_store_parent_blocks_replacement_during_lock(tmp_path, monkeypatch
         assert json.loads(store.read_text().strip())["nonce"] == "nonce-a"
     finally:
         os.chmod(replay_dir, 0o700)
+
+
+def test_nonce_store_rejects_symlinked_ancestor(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness._is_root_owned",
+        lambda _value: True,
+    )
+    real_dir = tmp_path / "real"
+    real_dir.mkdir(mode=0o700)
+    store = real_dir / "consumed"
+    store.touch(mode=0o600)
+    os.chmod(real_dir, 0o500)
+    linked_dir = tmp_path / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    try:
+        with pytest.raises(BillingReadinessError, match="permissions_invalid"):
+            _consume_nonces(str(linked_dir / "consumed"), ("nonce-a",), 100)
+    finally:
+        os.chmod(real_dir, 0o700)
+
+
+def test_nonce_store_rejects_corrupt_content_without_rewrite(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness._is_root_owned",
+        lambda _value: True,
+    )
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir(mode=0o700)
+    store = replay_dir / "consumed"
+    store.write_text("not-json\n", encoding="utf-8")
+    os.chmod(store, 0o600)
+    os.chmod(replay_dir, 0o500)
+    try:
+        with pytest.raises(BillingReadinessError, match="unavailable"):
+            _consume_nonces(str(store), ("nonce-a",), 100)
+        assert store.read_text(encoding="utf-8") == "not-json\n"
+    finally:
+        os.chmod(replay_dir, 0o700)
+
+
+def test_root_owned_check_is_not_service_user_owned() -> None:
+    from hermes_multitenancy.billing_readiness import _is_root_owned
+
+    assert _is_root_owned(SimpleNamespace(st_uid=0))
+    assert not _is_root_owned(SimpleNamespace(st_uid=1000))
 
 
 def test_live_recheck_executes_the_opened_inode_during_path_swap(

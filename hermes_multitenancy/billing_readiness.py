@@ -30,9 +30,8 @@ _ALLOWED_STATUSES = frozenset({
     "DRIFT_OR_CONFLICT",
 })
 _LIVE_RECHECK_ENV = frozenset({
+    "HERMES_AI_GATEWAY_BROKER_URL",
     "HERMES_AI_GATEWAY_BROKER_TOKEN",
-    "LITELLM_BASE_URL",
-    "LITELLM_MASTER_KEY",
     "PATH",
     "LANG",
     "LC_ALL",
@@ -195,18 +194,17 @@ def _consume_nonces(path: str, nonces: tuple[str, ...], now: int) -> None:
     replay_path = Path(path)
     parent_fd = store_fd = None
     try:
-        parent_fd = os.open(
+        parent_fd = _open_trusted_directory(
             replay_path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            error_code="readiness_replay_store_permissions_invalid",
         )
-        parent_stat = os.fstat(parent_fd)
-        if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_mode & 0o222:
+        if os.fstat(parent_fd).st_mode & 0o222:
             raise BillingReadinessError(
                 "readiness_replay_store_permissions_invalid"
             )
         store_fd = os.open(
             replay_path.name,
-            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
         store_stat = os.fstat(store_fd)
@@ -469,36 +467,27 @@ def _run_live_recheck(
 def _open_trusted_cli(cli: Path) -> int:
     """Pin one root-owned CLI after validating every directory in its path."""
     if (
-        not hasattr(os, "O_DIRECTORY")
-        or not hasattr(os, "O_NOFOLLOW")
+        not hasattr(os, "O_NOFOLLOW")
         or not Path("/proc/self/fd").is_dir()
     ):
         raise BillingReadinessError("readiness_live_recheck_command_invalid")
 
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    current_fd: int | None = None
+    parent_fd: int | None = None
     try:
-        before = os.lstat("/")
-        current_fd = os.open("/", flags)
-        after = os.fstat(current_fd)
-        _verify_trusted_path_part(before, after, directory=True)
-        for part in cli.parent.parts[1:]:
-            before = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
-            next_fd = os.open(part, flags, dir_fd=current_fd)
-            try:
-                after = os.fstat(next_fd)
-                _verify_trusted_path_part(before, after, directory=True)
-            except Exception:
-                os.close(next_fd)
-                raise
-            os.close(current_fd)
-            current_fd = next_fd
-
-        before = os.stat(cli.name, dir_fd=current_fd, follow_symlinks=False)
-        cli_fd = os.open(cli.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        parent_fd = _open_trusted_directory(
+            cli.parent,
+            error_code="readiness_live_recheck_command_invalid",
+        )
+        before = os.stat(cli.name, dir_fd=parent_fd, follow_symlinks=False)
+        cli_fd = os.open(cli.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
         try:
             after = os.fstat(cli_fd)
-            _verify_trusted_path_part(before, after, directory=False)
+            _verify_trusted_path_part(
+                before,
+                after,
+                directory=False,
+                error_code="readiness_live_recheck_command_invalid",
+            )
         except Exception:
             os.close(cli_fd)
             raise
@@ -510,6 +499,52 @@ def _open_trusted_cli(cli: Path) -> int:
             "readiness_live_recheck_command_invalid"
         ) from exc
     finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _open_trusted_directory(path: Path, *, error_code: str) -> int:
+    """Open one absolute root-owned directory through a pinned ancestor chain."""
+    if (
+        not path.is_absolute()
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise BillingReadinessError(error_code)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd: int | None = None
+    try:
+        before = os.lstat("/")
+        current_fd = os.open("/", flags)
+        _verify_trusted_path_part(
+            before,
+            os.fstat(current_fd),
+            directory=True,
+            error_code=error_code,
+        )
+        for part in path.parts[1:]:
+            before = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            try:
+                _verify_trusted_path_part(
+                    before,
+                    os.fstat(next_fd),
+                    directory=True,
+                    error_code=error_code,
+                )
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        result = current_fd
+        current_fd = None
+        return result
+    except BillingReadinessError:
+        raise
+    except OSError as exc:
+        raise BillingReadinessError(error_code) from exc
+    finally:
         if current_fd is not None:
             os.close(current_fd)
 
@@ -519,17 +554,22 @@ def _verify_trusted_path_part(
     after: os.stat_result,
     *,
     directory: bool,
+    error_code: str,
 ) -> None:
     expected_type = stat.S_ISDIR if directory else stat.S_ISREG
     if (
         before.st_dev != after.st_dev
         or before.st_ino != after.st_ino
         or not expected_type(after.st_mode)
-        or after.st_uid != 0
+        or not _is_root_owned(after)
         or after.st_mode & 0o022
         or (not directory and not after.st_mode & 0o111)
     ):
-        raise BillingReadinessError("readiness_live_recheck_command_invalid")
+        raise BillingReadinessError(error_code)
+
+
+def _is_root_owned(value: os.stat_result) -> bool:
+    return value.st_uid == 0
 
 
 def verify_enabled_environment(env: Mapping[str, str] | None = None) -> None:

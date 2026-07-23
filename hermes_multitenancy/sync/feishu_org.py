@@ -936,47 +936,13 @@ def _profile_skill_specs(
 
 
 def _inactive_plugin_skill_paths(shared_home: Path) -> set[str]:
-    """Return skill paths whose registered plugin owner is not active."""
-    managed_dir = shared_home / ".hermes-plugin-managed"
-    registry_path = managed_dir / ".locks" / "source-owners.json"
-    try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return set()
-    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
-        raise ValueError("plugin skill ownership registry is unreadable") from exc
-    owners = registry.get("skills") if isinstance(registry, dict) else None
-    if not isinstance(owners, dict):
-        raise ValueError("plugin skill ownership registry is invalid")
+    """Return only skill paths revoked by an explicit inactive plugin event."""
+    from ..plugin_state import PluginStateError, inactive_skill_paths
 
-    blocked: set[str] = set()
-    for path, owner in owners.items():
-        plugin_id = owner.get("plugin_id") if isinstance(owner, dict) else None
-        if (
-            not isinstance(path, str)
-            or not isinstance(plugin_id, str)
-            or not plugin_id
-            or "/" in plugin_id
-            or "\\" in plugin_id
-            or plugin_id.startswith(".")
-            or "\x00" in plugin_id
-        ):
-            raise ValueError("plugin skill ownership registry is invalid")
-        manifest_path = managed_dir / f"{plugin_id}.json"
-        if manifest_path.is_symlink():
-            blocked.add(path)
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
-            blocked.add(path)
-            continue
-        if (
-            not isinstance(manifest, dict)
-            or str(manifest.get("status") or "active").strip().lower() != "active"
-        ):
-            blocked.add(path)
-    return blocked
+    try:
+        return inactive_skill_paths(shared_home)
+    except PluginStateError as exc:
+        raise ValueError("plugin skill state cannot be verified") from exc
 
 
 def _desired_skill_metadata(
