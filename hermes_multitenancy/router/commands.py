@@ -901,6 +901,11 @@ async def _dispatch_synthetic_auth_complete(
             open_id=sender_open_id,
             chat_type=getattr(source, "chat_type", None) if source is not None else None,
             platform=getattr(source, "platform", None) if source is not None else None,
+            thread_id=getattr(source, "thread_id", None) if source is not None else None,
+            chat_topic=getattr(source, "chat_topic", None) if source is not None else None,
+            hermes_group_topic=getattr(source, "hermes_group_topic", False) if source is not None else False,
+            hermes_raw_thread_id=getattr(source, "hermes_raw_thread_id", None) if source is not None else None,
+            hermes_root_id=getattr(source, "hermes_root_id", None) if source is not None else None,
         )
         synthetic_event = SimpleNamespace(
             text=text,
@@ -913,6 +918,8 @@ async def _dispatch_synthetic_auth_complete(
                         "message_id": synthetic_message_id,
                         "chat_id": clean_chat_id,
                         "chat_type": getattr(synthetic_source, "chat_type", None),
+                        "thread_id": getattr(synthetic_source, "thread_id", None),
+                        "root_id": getattr(synthetic_source, "hermes_root_id", None),
                     },
                     "sender": {"sender_id": {"open_id": sender_open_id or sender_id}},
                 }

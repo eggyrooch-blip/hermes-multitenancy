@@ -3841,9 +3841,9 @@ def _resolve_aiagent_session_id(
         if source
         else ""
     )
-    from ..feishu_group_topic_session import is_group_topic_event
+    from ..feishu_group_topic_session import is_shared_group_topic_event
 
-    shared_group_topic = is_group_topic_event(event)
+    shared_group_topic = is_shared_group_topic_event(event)
     user_id = (
         sender_open_id
         or (getattr(source, "user_id", None) if source else "")
