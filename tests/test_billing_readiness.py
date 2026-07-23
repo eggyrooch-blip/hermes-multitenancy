@@ -4,12 +4,16 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_multitenancy.billing_readiness import (
     BillingReadinessError,
+    _consume_nonces,
+    _run_live_recheck,
     cohort_hash,
     verify_artifact,
     verify_enabled_environment,
@@ -129,11 +133,16 @@ def _environment(tmp_path, monkeypatch) -> tuple[dict[str, str], dict]:
     os.chmod(first, 0o600)
     live_dir = tmp_path / "live"
     live_dir.mkdir(mode=0o700)
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir(mode=0o700)
+    replay_path = replay_dir / "consumed"
+    replay_path.touch(mode=0o600)
+    os.chmod(replay_dir, 0o500)
     env = {
         "HERMES_LITELLM_BILLING_ENABLED": "true",
         "HERMES_LITELLM_BILLING_PAYER_IDS": "employee-a",
         "HERMES_LITELLM_BILLING_READINESS_ARTIFACT": str(first),
-        "HERMES_LITELLM_BILLING_REPLAY_STORE": str(tmp_path / "replay.sqlite3"),
+        "HERMES_LITELLM_BILLING_REPLAY_STORE": str(replay_path),
         "HERMES_AI_GATEWAY_BROKER_TOKEN": "secret",
         "HERMES_LITELLM_BILLING_POLICY_DIGEST": "policy",
         "HERMES_LITELLM_BILLING_CODE_SHA": "code",
@@ -324,3 +333,127 @@ def test_live_recheck_noop_cannot_reuse_preexisting_artifact(tmp_path, monkeypat
     )
     with pytest.raises(BillingReadinessError, match="unreadable"):
         verify_enabled_environment(env)
+
+
+def test_nonce_store_is_pinned_and_requires_a_nonwritable_parent(tmp_path):
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir(mode=0o700)
+    store = replay_dir / "consumed"
+    store.touch(mode=0o600)
+
+    with pytest.raises(BillingReadinessError, match="permissions_invalid"):
+        _consume_nonces(str(store), ("nonce-a",), 100)
+
+    os.chmod(replay_dir, 0o500)
+    try:
+        _consume_nonces(str(store), ("nonce-a",), 100)
+        with pytest.raises(BillingReadinessError, match="already_consumed"):
+            _consume_nonces(str(store), ("nonce-a",), 101)
+        assert json.loads(store.read_text().strip()) == {
+            "consumed_at": 100,
+            "nonce": "nonce-a",
+        }
+    finally:
+        os.chmod(replay_dir, 0o700)
+
+
+def test_nonce_store_rejects_symlink_leaf(tmp_path):
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.touch(mode=0o600)
+    link = replay_dir / "consumed"
+    link.symlink_to(target)
+    os.chmod(replay_dir, 0o500)
+    try:
+        with pytest.raises(BillingReadinessError, match="unavailable"):
+            _consume_nonces(str(link), ("nonce-a",), 100)
+        assert target.read_bytes() == b""
+    finally:
+        os.chmod(replay_dir, 0o700)
+
+
+def test_nonce_store_parent_blocks_replacement_during_lock(tmp_path, monkeypatch):
+    replay_dir = tmp_path / "replay"
+    replay_dir.mkdir(mode=0o700)
+    store = replay_dir / "consumed"
+    store.touch(mode=0o600)
+    attacker = replay_dir / "attacker"
+    attacker.write_text('{"nonce":"attacker"}\n', encoding="utf-8")
+    os.chmod(replay_dir, 0o500)
+    real_flock = __import__("fcntl").flock
+
+    def attempt_swap(fd, operation):
+        with pytest.raises(PermissionError):
+            os.replace(attacker, store)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness.fcntl.flock",
+        attempt_swap,
+    )
+    try:
+        _consume_nonces(str(store), ("nonce-a",), 100)
+        assert json.loads(store.read_text().strip())["nonce"] == "nonce-a"
+    finally:
+        os.chmod(replay_dir, 0o700)
+
+
+def test_live_recheck_executes_the_opened_inode_during_path_swap(
+    tmp_path, monkeypatch
+):
+    cli_dir = tmp_path / "cli"
+    cli_dir.mkdir(mode=0o755)
+    cli = cli_dir / "readiness"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(cli, 0o755)
+    employee_input = tmp_path / "employees.json"
+    employee_input.write_text("{}", encoding="utf-8")
+    os.chmod(employee_input, 0o600)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(mode=0o700)
+    env = {
+        "HERMES_AI_GATEWAY_READINESS_CLI": str(cli),
+        "HERMES_LITELLM_BILLING_EMPLOYEE_INPUT": str(employee_input),
+        "HERMES_LITELLM_BILLING_LIVE_RECHECK_DIR": str(output_dir),
+        "HERMES_LITELLM_BILLING_PAYER_IDS": "employee-a",
+        "HERMES_LITELLM_BILLING_POLICY_DIGEST": "policy",
+        "HERMES_LITELLM_BILLING_CODE_SHA": "code",
+        "HERMES_LITELLM_BILLING_CONTRACT_MAJOR": "1",
+    }
+    real_fstat = os.fstat
+
+    def root_owned(fd):
+        value = real_fstat(fd)
+        return SimpleNamespace(st_mode=value.st_mode, st_uid=0)
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness.os.fstat",
+        root_owned,
+    )
+    real_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda self: True
+        if str(self) == "/proc/self/fd"
+        else real_is_dir(self),
+    )
+
+    def swap_path(argv, **kwargs):
+        fd = kwargs["pass_fds"][0]
+        assert argv[0] == f"/proc/self/fd/{fd}"
+        assert os.pread(fd, 64, 0).startswith(b"#!/bin/sh")
+        replacement = cli_dir / "replacement"
+        replacement.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        os.replace(replacement, cli)
+        assert os.pread(fd, 64, 0).startswith(b"#!/bin/sh\nexit 0")
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness.subprocess.run",
+        swap_path,
+    )
+    _run_live_recheck(
+        env,
+        {"routing_watermark": "routing", "org_sha": "org"},
+    )

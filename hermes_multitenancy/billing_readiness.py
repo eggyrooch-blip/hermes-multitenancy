@@ -1,6 +1,7 @@
 """Fail-closed verification of the AI Gateway readiness artifact."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import stat
 import subprocess
 import time
 from typing import Any, Mapping
@@ -191,32 +193,62 @@ def _read_artifact(path: str) -> dict[str, Any]:
 
 def _consume_nonces(path: str, nonces: tuple[str, ...], now: int) -> None:
     replay_path = Path(path)
-    if replay_path.exists() and (
-        replay_path.is_symlink() or replay_path.stat().st_mode & 0o077
-    ):
-        raise BillingReadinessError("readiness_replay_store_permissions_invalid")
+    parent_fd = store_fd = None
     try:
-        connection = sqlite3.connect(replay_path)
-        os.chmod(replay_path, 0o600)
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS consumed_readiness_nonces "
-            "(nonce TEXT PRIMARY KEY NOT NULL, consumed_at INTEGER NOT NULL)"
+        parent_fd = os.open(
+            replay_path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
         )
-        connection.commit()
-        connection.execute("BEGIN IMMEDIATE")
-        for nonce in nonces:
-            connection.execute(
-                "INSERT INTO consumed_readiness_nonces (nonce, consumed_at) VALUES (?, ?)",
-                (nonce, now),
+        parent_stat = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_mode & 0o222:
+            raise BillingReadinessError(
+                "readiness_replay_store_permissions_invalid"
             )
-        connection.commit()
-    except sqlite3.IntegrityError as exc:
-        raise BillingReadinessError("readiness_artifact_already_consumed") from exc
-    except (OSError, sqlite3.Error) as exc:
+        store_fd = os.open(
+            replay_path.name,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        store_stat = os.fstat(store_fd)
+        if (
+            not stat.S_ISREG(store_stat.st_mode)
+            or store_stat.st_uid != os.geteuid()
+            or store_stat.st_mode & 0o077
+        ):
+            raise BillingReadinessError(
+                "readiness_replay_store_permissions_invalid"
+            )
+        with os.fdopen(store_fd, "r+", encoding="utf-8") as handle:
+            store_fd = None
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            content = handle.read(4 * 1024 * 1024 + 1)
+            if len(content) > 4 * 1024 * 1024:
+                raise BillingReadinessError("readiness_replay_store_unavailable")
+            consumed = {
+                str(json.loads(line)["nonce"])
+                for line in content.splitlines()
+                if line.strip()
+            }
+            if consumed.intersection(nonces):
+                raise BillingReadinessError("readiness_artifact_already_consumed")
+            handle.seek(0, os.SEEK_END)
+            for nonce in nonces:
+                handle.write(json.dumps(
+                    {"nonce": nonce, "consumed_at": now},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BillingReadinessError:
+        raise
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise BillingReadinessError("readiness_replay_store_unavailable") from exc
     finally:
-        if "connection" in locals():
-            connection.close()
+        if store_fd is not None:
+            os.close(store_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _sha256_json(value: Any) -> str:
@@ -371,17 +403,8 @@ def _run_live_recheck(
     output_dir = Path(
         str(env.get("HERMES_LITELLM_BILLING_LIVE_RECHECK_DIR", "")).strip()
     )
-    try:
-        cli_stat = cli.stat()
-    except OSError as exc:
-        raise BillingReadinessError("readiness_live_recheck_command_invalid") from exc
     if (
         not cli.is_absolute()
-        or cli.is_symlink()
-        or not cli.is_file()
-        or not os.access(cli, os.X_OK)
-        or cli_stat.st_uid != 0
-        or cli_stat.st_mode & 0o022
         or input_path.is_symlink()
         or not input_path.is_file()
         or input_path.stat().st_mode & 0o077
@@ -390,6 +413,39 @@ def _run_live_recheck(
         or output_dir.stat().st_mode & 0o077
     ):
         raise BillingReadinessError("readiness_live_recheck_command_invalid")
+    cli_parent_fd = cli_fd = None
+    try:
+        cli_parent_fd = os.open(
+            cli.parent,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent_stat = os.fstat(cli_parent_fd)
+        cli_fd = os.open(
+            cli.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=cli_parent_fd,
+        )
+        cli_stat = os.fstat(cli_fd)
+    except OSError as exc:
+        if cli_fd is not None:
+            os.close(cli_fd)
+        if cli_parent_fd is not None:
+            os.close(cli_parent_fd)
+        raise BillingReadinessError(
+            "readiness_live_recheck_command_invalid"
+        ) from exc
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != 0
+        or parent_stat.st_mode & 0o022
+        or not stat.S_ISREG(cli_stat.st_mode)
+        or cli_stat.st_uid != 0
+        or cli_stat.st_mode & 0o022
+        or not cli_stat.st_mode & 0o111
+    ):
+        os.close(cli_fd)
+        os.close(cli_parent_fd)
+        raise BillingReadinessError("readiness_live_recheck_command_invalid")
     challenge = secrets.token_hex(16)
     output_path = output_dir / f"readiness-{challenge}.json"
     if output_path.exists():
@@ -397,8 +453,13 @@ def _run_live_recheck(
     expected_cohort = cohort_hash(
         str(env.get("HERMES_LITELLM_BILLING_PAYER_IDS", ""))
     )
+    pinned_cli = (
+        f"/proc/self/fd/{cli_fd}"
+        if Path("/proc/self/fd").is_dir()
+        else str(cli)
+    )
     argv = [
-        str(cli),
+        pinned_cli,
         "broker-readiness-snapshot",
         "--input",
         str(input_path),
@@ -428,9 +489,13 @@ def _run_live_recheck(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env={key: value for key, value in env.items() if key in _LIVE_RECHECK_ENV},
+            pass_fds=(cli_fd,),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise BillingReadinessError("readiness_live_recheck_failed") from exc
+    finally:
+        os.close(cli_fd)
+        os.close(cli_parent_fd)
     return started, output_path, challenge
 
 
