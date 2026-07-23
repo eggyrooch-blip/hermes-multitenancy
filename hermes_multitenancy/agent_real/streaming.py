@@ -248,10 +248,13 @@ async def _stream_aiagent_subprocess(
             return None
         def _safe(s: str) -> str:
             return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in s)[:80]
+        from ..feishu_group_topic_session import group_topic_epoch_actor
+
+        epoch_actor = group_topic_epoch_actor(event, sender_open_id)
         return (
             profile_home
             / "mirror_epochs"
-            / f"{_safe(_chat_id_for_epoch)}__{_safe(sender_open_id or 'unknown')}.txt"
+            / f"{_safe(_chat_id_for_epoch)}__{_safe(epoch_actor)}.txt"
         )
 
     def _resolve_epoch() -> str:

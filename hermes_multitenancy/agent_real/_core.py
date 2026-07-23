@@ -1596,6 +1596,9 @@ def _event_to_subprocess_payload(
             "guild_id",
             "parent_chat_id",
             "message_id",
+            "hermes_group_topic",
+            "hermes_raw_thread_id",
+            "hermes_root_id",
         ):
             if hasattr(source, key):
                 source_payload[key] = _jsonable(getattr(source, key))
@@ -3838,6 +3841,9 @@ def _resolve_aiagent_session_id(
         if source
         else ""
     )
+    from ..feishu_group_topic_session import is_group_topic_event
+
+    shared_group_topic = is_group_topic_event(event)
     user_id = (
         sender_open_id
         or (getattr(source, "user_id", None) if source else "")
@@ -3861,11 +3867,11 @@ def _resolve_aiagent_session_id(
         parts.extend(["chat", chat_id])
     if thread_id:
         parts.extend(["thread", thread_id])
-    if user_id:
+    if user_id and not shared_group_topic:
         parts.extend(["user", user_id])
-    elif message_id:
+    elif message_id and not shared_group_topic:
         parts.extend(["message", message_id])
-    else:
+    elif not shared_group_topic:
         parts.append("fallback")
 
     session_id = ":".join(_session_part(part) for part in parts)

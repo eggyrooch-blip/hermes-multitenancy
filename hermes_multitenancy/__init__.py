@@ -119,6 +119,8 @@ def _register(ctx) -> None:
         install_cron_runtime_patches()
         install_gateway_startup_watcher()
     if is_router_profile_runtime():
+        from .feishu_group_topic_session import install_feishu_group_topic_session_patch
+        install_feishu_group_topic_session_patch()
         from .group_inviter_hook import install_feishu_bot_added_hook
         install_feishu_bot_added_hook()
         from .feishu_helpdesk_events import install_feishu_helpdesk_events_patch

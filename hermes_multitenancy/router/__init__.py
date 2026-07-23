@@ -302,8 +302,13 @@ def _dispatch_session_scope(
 
     thread_id: Optional[str] = None
     route_version = 0
+    shared_history = False
     if strict_context_enabled():
-        thread_id = _event_thread_id(event)
+        from ..feishu_group_topic_session import group_topic_thread
+
+        canonical_topic = group_topic_thread(event)
+        thread_id = canonical_topic or _event_thread_id(event)
+        shared_history = canonical_topic is not None
         route_version = _route_version_for(sender, sender_alt, chat_id)
     return build_session_scope(
         profile_name=profile_name,
@@ -312,6 +317,7 @@ def _dispatch_session_scope(
         chat_id=chat_id,
         thread_id=thread_id,
         route_version=route_version,
+        shared_history=shared_history,
     )
 
 
@@ -667,6 +673,12 @@ def _build_user_message(event: Any, *, text_override: Optional[str] = None) -> d
     reply_to_text = getattr(event, "reply_to_text", None)
     if reply_to_text:
         text = f"(replying to: {reply_to_text})\n{text}"
+    from ..feishu_group_topic_session import is_group_topic_event
+
+    if is_group_topic_event(event):
+        source = getattr(event, "source", None)
+        sender_name = str(getattr(source, "user_name", "") or "").strip() or "Group member"
+        text = f"[Sender: {sender_name}]\n{text}"
     return {"role": "user", "content": text}
 
 

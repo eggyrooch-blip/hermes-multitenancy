@@ -50,6 +50,7 @@ class SessionScope:
     chat_id: Optional[str] = None
     thread_id: Optional[str] = None
     route_version: int = 0
+    shared_history: bool = False
 
     def __post_init__(self) -> None:
         # Fail-closed: a scope with no channel or no user_key must never be
@@ -68,10 +69,11 @@ class SessionScope:
         threads don't cross. Always a 2-tuple (no store-signature change)."""
         if not strict_context_enabled():
             return (self.profile_name, self.user_key)
+        history_user = "_group_topic" if self.shared_history else self.user_key
         composite = _SEP.join(
             (
                 self.channel,
-                self.user_key,
+                history_user,
                 str(self.chat_id or ""),
                 str(self.thread_id or ""),
                 f"v{int(self.route_version)}",
@@ -102,6 +104,7 @@ def build_session_scope(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     route_version: int = 0,
+    shared_history: bool = False,
 ) -> SessionScope:
     """Construct a SessionScope from already-resolved parts.
 
@@ -118,4 +121,5 @@ def build_session_scope(
         chat_id=(str(chat_id) if chat_id else None),
         thread_id=(str(thread_id) if thread_id else None),
         route_version=int(route_version or 0),
+        shared_history=bool(shared_history),
     )
