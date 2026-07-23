@@ -2,10 +2,10 @@
 
 Wraps Feishu ``im/v1/messages`` as a thin endpoint: **send only, no agent run**.
 Auth reuses the ingest-key体系 (fail-closed, ``_ingest_binding_for_request``) —
-wangkejie uses the same token he already has for ``/ingest``. Two message types:
-``text`` (native plain text) and ``interactive`` (2.0 raw card JSON, passed
-through verbatim;飞书 validates the schema, its error code/msg is surfaced to
-the caller).
+wangkejie uses the same token he already has for ``/ingest``. Three message
+types: ``text`` (native plain text), ``post`` (rich text), and ``interactive``
+(2.0 raw card JSON). Structured content is passed through verbatim;飞书
+validates the schema, its error code/msg is surfaced to the caller.
 
 Event-loop redline (design §Regression guards): this handler runs INSIDE the
 multitenancy_router gateway process. A synchronous Feishu HTTP call here would
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 #: on the serialized ``content`` string (design §边界).
 MAX_CONTENT_BYTES = 30 * 1024
 
-VALID_MSG_TYPES = ("text", "interactive")
+VALID_MSG_TYPES = ("text", "post", "interactive")
 VALID_RECEIVE_ID_TYPES = ("user_id", "open_id", "chat_id")
 VALID_ENVS = ("pre", "online")
 

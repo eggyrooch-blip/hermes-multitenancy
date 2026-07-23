@@ -1,7 +1,7 @@
 """``POST /api/run-broker/push`` — the pure send-bypass seam tests.
 
 Covers the SPEC push-custom-message acceptance + rejection paths: fail-closed
-Bearer auth (401, no token echo), text/interactive dispatch, chat_id
+Bearer auth (401, no token echo), text/post/interactive dispatch, chat_id
 auto-detection, app_id-not-registered / bad msg_type / oversize content / bad
 env → 400, env→message_id mapping + echo, and Feishu-side error passthrough
 (never a false 200). Every Feishu call is mocked via the module send seam.
@@ -139,6 +139,24 @@ def test_push_interactive_success(monkeypatch):
     assert sent["content_str"] == json.dumps(card, ensure_ascii=False)
 
 
+def test_push_post_success(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pmr, "_feishu_sender", _recording_sender(calls))
+    monkeypatch.setattr(pmr, "_bot_credentials_resolver", _dummy_resolver)
+
+    post = {"zh_cn": {"title": "通知", "content": [[{"tag": "text", "text": "hi"}]]}}
+    app = _app(monkeypatch)
+    status, text = _post(
+        app,
+        {"target": "oc_group1", "msg_type": "post", "content": post},
+        headers=_AUTH,
+    )
+    assert status == 200
+    assert json.loads(text)["ok"] is True
+    assert calls[0]["msg_type"] == "post"
+    assert calls[0]["content_str"] == json.dumps(post, ensure_ascii=False)
+
+
 def test_push_chat_id_autodetected_from_oc_prefix(monkeypatch):
     calls = []
     monkeypatch.setattr(pmr, "_feishu_sender", _recording_sender(calls))
@@ -191,7 +209,7 @@ def test_push_invalid_msg_type_is_400(monkeypatch):
     app = _app(monkeypatch)
     status, text = _post(
         app,
-        {"target": "on_u", "msg_type": "post", "content": {"text": "hi"}},
+        {"target": "on_u", "msg_type": "unknown", "content": {"text": "hi"}},
         headers=_AUTH,
     )
     assert status == 400
