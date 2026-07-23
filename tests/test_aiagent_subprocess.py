@@ -6835,6 +6835,7 @@ def test_build_subprocess_env_installs_kep_shims_only_for_existing_bins(monkeypa
     assert (shim_dir / "kep-auth").is_file()
     assert (shim_dir / "kep-dune-cli").is_file()
     assert not (shim_dir / "ocean-cli").exists()
+    assert "EXPECTED_PROFILE = 'alice'" in (shim_dir / "hades-cli").read_text(encoding="utf-8")
 
     assert env["HERMES_LARK_CLI_REAL_BIN"] == str(shared_bin / "lark-cli-authsidecar")
     assert env["HERMES_KEP_CLI_REAL_BIN_HADES_CLI"] == str(shared_bin / "hades-cli")

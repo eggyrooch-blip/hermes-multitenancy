@@ -512,6 +512,7 @@ def test_readonly_kep_shim_denies_writes_and_allows_status(tmp_path: Path) -> No
     [wrapper] = install_kep_cli_shim(
         shim_dir,
         real_bins={"hades-cli": str(real_bin)},
+        expected_profile="alice",
         identity_urls={"online": identity_url, "pre": identity_url},
     )
 

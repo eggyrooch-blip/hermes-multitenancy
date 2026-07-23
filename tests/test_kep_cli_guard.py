@@ -90,6 +90,7 @@ def _verified_shim(tmp_path: Path, *, name: str, real_bin: Path, profile: str):
         [wrapper] = install_kep_cli_shim(
             tmp_path / "shim",
             real_bins={name: str(real_bin)},
+            expected_profile=profile,
             identity_urls={"online": url, "pre": url},
         )
         env = os.environ.copy()
@@ -110,6 +111,7 @@ def test_install_kep_cli_shim_blocks_server_rejected_token_before_real_binary(tm
         [wrapper] = install_kep_cli_shim(
             tmp_path / "shim",
             real_bins={"ocean-cli": str(real_bin)},
+            expected_profile="alice",
             identity_urls={"online": url, "pre": url},
         )
         env = os.environ.copy()
@@ -125,8 +127,16 @@ def test_install_kep_cli_shim_blocks_server_rejected_token_before_real_binary(tm
             env=env,
             check=False,
         )
+        positional_help = subprocess.run(
+            [str(wrapper), "create", "help"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
     assert result.returncode == 77
+    assert positional_help.returncode == 77
     assert not marker.exists()
     assert "需要授权" in result.stderr
     assert "header.payload.signature" not in result.stderr
@@ -144,6 +154,7 @@ def test_install_kep_cli_shim_blocks_when_live_identity_is_unavailable(tmp_path:
     [wrapper] = install_kep_cli_shim(
         tmp_path / "shim",
         real_bins={"ocean-cli": str(real_bin)},
+        expected_profile="alice",
         identity_urls={"online": url, "pre": url},
     )
     env = os.environ.copy()
@@ -225,12 +236,55 @@ def test_install_kep_cli_shim_blocks_profile_override_before_real_binary(tmp_pat
     assert "profile" not in event
 
 
+def test_install_kep_cli_shim_does_not_trust_overridden_profile_env(tmp_path: Path):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "hades-cli")
+    auth_bin = _write_fake_auth_bin(tmp_path / "real-bin" / "kep-auth")
+    marker = tmp_path / "business-executed"
+    body = {
+        "errorCode": 0,
+        "ok": True,
+        "data": {"payload": {"name": "another-person", "exp": int(time.time()) + 3600}},
+    }
+    with _identity_server(body) as url:
+        [wrapper] = install_kep_cli_shim(
+            tmp_path / "shim",
+            real_bins={"hades-cli": str(real_bin)},
+            expected_profile="alice",
+            identity_urls={"online": url, "pre": url},
+        )
+        env = os.environ.copy()
+        env.update({
+            "KEP_PROFILE": "another-person",
+            "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH": str(auth_bin),
+            "FAKE_KEP_MARKER": str(marker),
+        })
+        result = subprocess.run(
+            [str(wrapper), "--profile", "another-person", "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    assert result.returncode == 75
+    assert not marker.exists()
+    assert "身份校验不匹配" in result.stderr
+    assert "another-person" not in result.stderr
+    assert "alice" not in result.stderr
+
+
 def test_install_kep_cli_shim_relays_auth_failure_with_stable_exit_code(tmp_path: Path):
     from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
 
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "kep-auth")
     shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"kep-auth": str(real_bin)})
+    [wrapper] = install_kep_cli_shim(
+        shim_dir,
+        real_bins={"kep-auth": str(real_bin)},
+        expected_profile="alice",
+    )
 
     env = os.environ.copy()
     env["FAKE_KEP_MODE"] = "exit77"
@@ -309,6 +363,7 @@ def test_install_kep_cli_shim_blocks_recursive_real_binary(tmp_path: Path):
     [wrapper] = install_kep_cli_shim(
         shim_dir,
         real_bins={"kep-auth": str(shim_dir / "kep-auth")},
+        expected_profile="alice",
     )
 
     result = subprocess.run(

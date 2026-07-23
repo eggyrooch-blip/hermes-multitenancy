@@ -37,6 +37,7 @@ def _shim_program(
     command_name: str,
     real_binary: Path,
     *,
+    expected_profile: str,
     identity_urls: dict[str, str],
 ) -> str:
     env_key = _real_bin_env_key(command_name)
@@ -67,6 +68,7 @@ def _shim_program(
             )
 
         COMMAND_NAME = {command_name!r}
+        EXPECTED_PROFILE = {expected_profile!r}
         DEFAULT_REAL_BINARY = {str(real_binary)!r}
         REAL_BINARY_ENV_KEY = {env_key!r}
         KEP_AUTH_REAL_BINARY_ENV_KEY = {_real_bin_env_key("kep-auth")!r}
@@ -100,7 +102,11 @@ def _shim_program(
                 "@timestamp": _timestamp_iso(),
                 "event_type": event_type,
             }}
-            profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+            profile = (
+                EXPECTED_PROFILE
+                if profile_fingerprint_only
+                else str(os.environ.get("HERMES_PROFILE") or "").strip()
+            )
             if profile:
                 if profile_fingerprint_only:
                     event["profile_fingerprint"] = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:12]
@@ -127,6 +133,25 @@ def _shim_program(
 
         def _has_explicit_profile(argv) -> bool:
             return "--profile" in argv or any(arg.startswith("--profile=") for arg in argv)
+
+        def _is_help_request(argv) -> bool:
+            skip_next = False
+            first_word = ""
+            for arg in argv:
+                item = str(arg or "").strip().lower()
+                if skip_next:
+                    skip_next = False
+                    continue
+                if item in ("--profile", "--env"):
+                    skip_next = True
+                    continue
+                if item in ("--help", "-h"):
+                    return True
+                if item.startswith("--"):
+                    continue
+                first_word = item
+                break
+            return first_word == "help"
 
         _READONLY_WRITE_WORDS = (
             "add",
@@ -194,7 +219,7 @@ def _shim_program(
         def _readonly_write_reason(argv) -> str:
             if not _readonly_enabled():
                 return ""
-            if any(str(arg or "").strip().lower() in ("--help", "-h", "help") for arg in argv):
+            if _is_help_request(argv):
                 return ""
             words = _readonly_words(argv)
             if not words:
@@ -224,13 +249,11 @@ def _shim_program(
             return ""
 
         def _live_identity_state(argv) -> str:
-            if COMMAND_NAME == "kep-auth" or any(
-                str(arg or "").strip().lower() in ("--help", "-h", "help") for arg in argv
-            ):
+            if COMMAND_NAME == "kep-auth" or _is_help_request(argv):
                 return "authenticated"
-            profile = str(os.environ.get("KEP_PROFILE") or "").strip()
-            if not profile:
-                return "unknown"
+            profile = EXPECTED_PROFILE
+            if str(os.environ.get("KEP_PROFILE") or "").strip() != profile:
+                return "identity_mismatch"
             if _parse_profile(argv) != profile:
                 return "identity_mismatch"
             auth_binary = str(os.environ.get(KEP_AUTH_REAL_BINARY_ENV_KEY) or "").strip()
@@ -347,9 +370,8 @@ def _shim_program(
                 return 127
 
             argv = list(sys.argv[1:])
-            kep_profile = str(os.environ.get("KEP_PROFILE") or "").strip()
-            if kep_profile and not _has_explicit_profile(argv):
-                argv = ["--profile", kep_profile, *argv]
+            if not _has_explicit_profile(argv):
+                argv = ["--profile", EXPECTED_PROFILE, *argv]
             readonly_reason = _readonly_write_reason(argv)
             if readonly_reason:
                 print(readonly_reason, file=sys.stderr)
@@ -447,16 +469,25 @@ def install_kep_cli_shim(
     shim_dir: Path,
     *,
     real_bins: dict[str, str],
+    expected_profile: str,
     identity_urls: dict[str, str] | None = None,
 ) -> list[Path]:
     shim_dir = Path(shim_dir)
     shim_dir.mkdir(parents=True, exist_ok=True)
+    expected_profile = str(expected_profile or "").strip()
+    if not expected_profile:
+        raise ValueError("expected_profile is required")
     urls = dict(_KEP_IDENTITY_URLS if identity_urls is None else identity_urls)
     written: list[Path] = []
     for name, real_path in real_bins.items():
         wrapper = shim_dir / name
         wrapper.write_text(
-            _shim_program(name, Path(real_path).expanduser(), identity_urls=urls),
+            _shim_program(
+                name,
+                Path(real_path).expanduser(),
+                expected_profile=expected_profile,
+                identity_urls=urls,
+            ),
             encoding="utf-8",
         )
         wrapper.chmod(0o755)

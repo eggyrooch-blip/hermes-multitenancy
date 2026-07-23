@@ -131,7 +131,11 @@ def _build_subprocess_env(
             if (shared_bin_dir / name).exists()
         }
         if real_bins:
-            kep_cli_guard.install_kep_cli_shim(shim_dir, real_bins=real_bins)
+            kep_cli_guard.install_kep_cli_shim(
+                shim_dir,
+                real_bins=real_bins,
+                expected_profile=profile_home.name,
+            )
             for name, real_path in real_bins.items():
                 env[f"HERMES_KEP_CLI_REAL_BIN_{name.replace('-', '_').upper()}"] = real_path
         strict_path_parts = [part for part in env["PATH"].split(os.pathsep) if part]

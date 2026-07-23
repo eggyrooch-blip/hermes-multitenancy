@@ -18,6 +18,8 @@ or a business CLI rejects it.
   and identity mismatch as unavailable and fail closed.
 - Reuse that result for credential rows, OAuth completion polling, expert
   status text, and the business KEP CLI preflight.
+- Embed the trusted profile into each run's generated shim so child env/argv
+  overrides cannot select another profile.
 - Keep `HTTP 403` as an authenticated permission failure.
 - Never log tokens or raw live identity data.
 
@@ -26,8 +28,9 @@ out of scope and unchanged.
 
 ## Local evidence
 
-The SPEC-targeted suite currently passes 131 tests across credential status,
-OAuth polling, the generated CLI shim, expert overlay wiring, and the Feishu
-expert route. Full-suite and independent security-review evidence must be added
+The expanded targeted suite currently passes 137 tests across credential
+status, OAuth polling, the generated CLI shim and its run-scoped wiring, expert
+overlay wiring, the registry contract, and the Feishu expert route. Full-suite
+and independent security-review evidence must be added
 before release; production requires explicit approval plus a read-only
 online/pre canary.
