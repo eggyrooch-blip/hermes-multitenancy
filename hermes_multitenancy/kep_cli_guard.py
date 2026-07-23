@@ -138,6 +138,22 @@ def _shim_program(
         def _has_explicit_profile(argv) -> bool:
             return "--profile" in argv or any(arg.startswith("--profile=") for arg in argv)
 
+        def _option_values(argv, name):
+            values = []
+            for idx, arg in enumerate(argv):
+                if arg == name:
+                    values.append(str(argv[idx + 1] or "").strip() if idx + 1 < len(argv) else "")
+                elif arg.startswith(name + "="):
+                    values.append(arg.split("=", 1)[1].strip())
+            return values
+
+        def _scope_args_match(argv) -> bool:
+            profiles = _option_values(argv, "--profile")
+            if profiles and any(value != EXPECTED_PROFILE for value in profiles):
+                return False
+            envs = [value.lower() for value in _option_values(argv, "--env")]
+            return not envs or (len(set(envs)) == 1 and envs[0] in IDENTITY_URLS)
+
         def _is_help_request(argv) -> bool:
             skip_next = False
             first_word = ""
@@ -253,12 +269,12 @@ def _shim_program(
             return ""
 
         def _live_identity_state(argv) -> str:
+            profile = EXPECTED_PROFILE
+            if _parse_profile(argv) != profile or not _scope_args_match(argv):
+                return "identity_mismatch"
             if COMMAND_NAME == "kep-auth" or _is_help_request(argv):
                 return "authenticated"
-            profile = EXPECTED_PROFILE
             if str(os.environ.get("KEP_PROFILE") or "").strip() != profile:
-                return "identity_mismatch"
-            if _parse_profile(argv) != profile:
                 return "identity_mismatch"
             auth_binary = str(os.environ.get(KEP_AUTH_REAL_BINARY_ENV_KEY) or "").strip()
             if not auth_binary:

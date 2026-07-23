@@ -319,6 +319,30 @@ def test_install_kep_cli_shim_blocks_profile_override_before_real_binary(tmp_pat
     assert "profile" not in event
 
 
+def test_install_kep_cli_shim_blocks_conflicting_repeated_scope_flags(tmp_path: Path):
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "hades-cli")
+    marker = tmp_path / "business-executed"
+    with _verified_shim(tmp_path, name="hades-cli", real_bin=real_bin, profile="alice") as (wrapper, env):
+        env["FAKE_KEP_MARKER"] = str(marker)
+        profile_result = subprocess.run(
+            [str(wrapper), "--profile", "alice", "--profile", "bob", "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        env_result = subprocess.run(
+            [str(wrapper), "--env", "online", "--env", "pre", "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    assert profile_result.returncode == env_result.returncode == 75
+    assert not marker.exists()
+
+
 def test_install_kep_cli_shim_does_not_trust_overridden_profile_env(tmp_path: Path):
     from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
 

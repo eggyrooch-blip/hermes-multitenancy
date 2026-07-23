@@ -30,9 +30,9 @@ out of scope and unchanged.
 
 ## Local evidence
 
-The targeted suite passes 315 tests across the shared live verifier, credential
+The targeted suite passes 316 tests across the shared live verifier, credential
 status, OAuth polling, the generated CLI shim and its run-scoped wiring, the
-registry contract, and the Feishu expert route. The full suite passes 2772
+registry contract, and the Feishu expert route. The full suite passes 2773
 tests with 1 skipped and 3 deselected. A read-only production probe found
 online valid for the routed `sunke` identity and pre invalid; no production
 code, service, token, or configuration was changed. Release remains blocked
