@@ -1172,6 +1172,32 @@ def uninstall(
         )
 
 
+def deactivate(
+    plugin_id: str,
+    *,
+    shared_home: Optional[Path] = None,
+    profiles_root: Optional[Path] = None,
+    _lock_held: bool = False,
+) -> dict[str, Any]:
+    """Remove only proven plugin entry points and retain an inactive audit manifest."""
+    _safe_component(plugin_id, kind="plugin id")
+    resolved_home = (shared_home or _default_shared_home()).expanduser()
+    if _lock_held:
+        return _uninstall_locked(
+            plugin_id,
+            shared_home=resolved_home,
+            profiles_root=profiles_root,
+            retain_status="inactive",
+        )
+    with _plugin_ingest_lock(resolved_home, plugin_id):
+        return _uninstall_locked(
+            plugin_id,
+            shared_home=resolved_home,
+            profiles_root=profiles_root,
+            retain_status="inactive",
+        )
+
+
 def _uninstall_locked(
     plugin_id: str,
     *,
@@ -1180,6 +1206,7 @@ def _uninstall_locked(
     dry_run: bool = False,
     purge_clis: bool = False,
     profiles: Optional[list[str]] = None,
+    retain_status: str | None = None,
 ) -> dict[str, Any]:
     _safe_component(plugin_id, kind="plugin id")  # CLI arg → managed-manifest filename
     shared_home = (shared_home or _default_shared_home()).expanduser()
@@ -1240,16 +1267,15 @@ def _uninstall_locked(
             if not dry_run:
                 config_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
             report["removed"].append({"distribution_config": str(config_path), "action": "stripped"})
-        # Department-mode skills materialize into profiles via the org sync, not this
-        # tool. Removing the distribution entry makes them UNDESIRED; the next
-        # `_sync_default_profile_skills` prunes them via `_prune_removed_managed_skills`.
-        # Rollback is therefore entry-removal here + prune-on-next-sync (the same
-        # lifecycle that distributed them) — report it instead of silently leaving copies.
-        report["fanout_rollback"] = (
-            "distribution entries removed; already fanned-out copies are now UNDESIRED and "
-            "are pruned by the managed sync (`_prune_removed_managed_skills`) on its next run "
-            "for each affected profile — run the org skill-sync to complete rollback immediately"
-        )
+        if not dry_run:
+            report["removed"].extend(
+                _prune_plugin_managed_fanout(
+                    plugin_id,
+                    skills=skills,
+                    shared_home=shared_home,
+                    profiles_root=profiles_root,
+                )
+            )
 
     if purge_clis:
         shared_bin = shared_home / "bin"
@@ -1268,9 +1294,69 @@ def _uninstall_locked(
         )
 
     if not dry_run and not manifest_kept:
-        path.unlink()
+        if retain_status is None:
+            path.unlink()
+        else:
+            manifest["status"] = retain_status
+            _write_managed_manifest(shared_home, manifest, dry_run=False)
     report["managed_manifest"] = str(path)
     return report
+
+
+def _prune_plugin_managed_fanout(
+    plugin_id: str,
+    *,
+    skills: list[Any],
+    shared_home: Path,
+    profiles_root: Path,
+) -> list[dict[str, Any]]:
+    """Prune org-managed copies only when the shared source owner proves this plugin."""
+    registry_path = shared_home / MANAGED_DIR / ".locks" / "source-owners.json"
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        raise PluginIngestError(
+            f"cannot prove shared skill ownership for plugin {plugin_id!r}"
+        ) from exc
+    owners = registry.get("skills") if isinstance(registry, dict) else None
+    safe_skills = [_safe_skill_name(name) for name in skills]
+    if not isinstance(owners, dict) or any(
+        not isinstance(owners.get(name), dict)
+        or owners[name].get("plugin_id") != plugin_id
+        for name in safe_skills
+    ):
+        raise PluginIngestError(
+            f"cannot prove shared skill ownership for plugin {plugin_id!r}"
+        )
+
+    from .sync import feishu_org
+
+    removed: list[dict[str, Any]] = []
+    if not profiles_root.is_dir() or profiles_root.is_symlink():
+        raise PluginIngestError("profiles root is unavailable or unsafe")
+    for profile_home in sorted(profiles_root.iterdir()):
+        if profile_home.is_symlink():
+            raise PluginIngestError(
+                f"cannot safely prune symlinked profile {profile_home.name!r}"
+            )
+        if not profile_home.is_dir():
+            continue
+        previous = feishu_org._read_managed_skill_manifest(profile_home)
+        desired = dict(previous)
+        for name in safe_skills:
+            entry = previous.get(name)
+            if (
+                isinstance(entry, dict)
+                and not feishu_org._is_foreign_origin_skill_entry(entry)
+                and entry.get("source") == str(shared_home / "skills" / name)
+            ):
+                desired.pop(name, None)
+        if desired == previous:
+            continue
+        feishu_org._prune_removed_managed_skills(profile_home, desired)
+        feishu_org._write_managed_skill_manifest(profile_home, desired)
+        removed.append({"profile": profile_home.name, "action": "pruned-managed"})
+    return removed
 
 
 # ─────────────────────────── CLI entrypoint ──────────────────────────────

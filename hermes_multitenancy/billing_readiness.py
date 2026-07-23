@@ -413,39 +413,6 @@ def _run_live_recheck(
         or output_dir.stat().st_mode & 0o077
     ):
         raise BillingReadinessError("readiness_live_recheck_command_invalid")
-    cli_parent_fd = cli_fd = None
-    try:
-        cli_parent_fd = os.open(
-            cli.parent,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        )
-        parent_stat = os.fstat(cli_parent_fd)
-        cli_fd = os.open(
-            cli.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=cli_parent_fd,
-        )
-        cli_stat = os.fstat(cli_fd)
-    except OSError as exc:
-        if cli_fd is not None:
-            os.close(cli_fd)
-        if cli_parent_fd is not None:
-            os.close(cli_parent_fd)
-        raise BillingReadinessError(
-            "readiness_live_recheck_command_invalid"
-        ) from exc
-    if (
-        not stat.S_ISDIR(parent_stat.st_mode)
-        or parent_stat.st_uid != 0
-        or parent_stat.st_mode & 0o022
-        or not stat.S_ISREG(cli_stat.st_mode)
-        or cli_stat.st_uid != 0
-        or cli_stat.st_mode & 0o022
-        or not cli_stat.st_mode & 0o111
-    ):
-        os.close(cli_fd)
-        os.close(cli_parent_fd)
-        raise BillingReadinessError("readiness_live_recheck_command_invalid")
     challenge = secrets.token_hex(16)
     output_path = output_dir / f"readiness-{challenge}.json"
     if output_path.exists():
@@ -453,50 +420,116 @@ def _run_live_recheck(
     expected_cohort = cohort_hash(
         str(env.get("HERMES_LITELLM_BILLING_PAYER_IDS", ""))
     )
-    pinned_cli = (
-        f"/proc/self/fd/{cli_fd}"
-        if Path("/proc/self/fd").is_dir()
-        else str(cli)
-    )
-    argv = [
-        pinned_cli,
-        "broker-readiness-snapshot",
-        "--input",
-        str(input_path),
-        "--output",
-        str(output_path),
-        "--cohort-hash",
-        expected_cohort,
-        "--policy-digest",
-        str(env.get("HERMES_LITELLM_BILLING_POLICY_DIGEST", "")).strip(),
-        "--code-sha",
-        str(env.get("HERMES_LITELLM_BILLING_CODE_SHA", "")).strip(),
-        "--nonce",
-        challenge,
-        "--contract-major",
-        str(env.get("HERMES_LITELLM_BILLING_CONTRACT_MAJOR", "")).strip(),
-        "--routing-watermark",
-        str(bindings["routing_watermark"]),
-        "--org-sha",
-        str(bindings["org_sha"]),
-    ]
-    started = int(time.time())
+    cli_fd = _open_trusted_cli(cli)
     try:
-        subprocess.run(
-            argv,
-            check=True,
-            timeout=120,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env={key: value for key, value in env.items() if key in _LIVE_RECHECK_ENV},
-            pass_fds=(cli_fd,),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise BillingReadinessError("readiness_live_recheck_failed") from exc
+        argv = [
+            f"/proc/self/fd/{cli_fd}",
+            "broker-readiness-snapshot",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--cohort-hash",
+            expected_cohort,
+            "--policy-digest",
+            str(env.get("HERMES_LITELLM_BILLING_POLICY_DIGEST", "")).strip(),
+            "--code-sha",
+            str(env.get("HERMES_LITELLM_BILLING_CODE_SHA", "")).strip(),
+            "--nonce",
+            challenge,
+            "--contract-major",
+            str(env.get("HERMES_LITELLM_BILLING_CONTRACT_MAJOR", "")).strip(),
+            "--routing-watermark",
+            str(bindings["routing_watermark"]),
+            "--org-sha",
+            str(bindings["org_sha"]),
+        ]
+        started = int(time.time())
+        try:
+            subprocess.run(
+                argv,
+                check=True,
+                timeout=120,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={
+                    key: value
+                    for key, value in env.items()
+                    if key in _LIVE_RECHECK_ENV
+                },
+                pass_fds=(cli_fd,),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BillingReadinessError("readiness_live_recheck_failed") from exc
+        return started, output_path, challenge
     finally:
         os.close(cli_fd)
-        os.close(cli_parent_fd)
-    return started, output_path, challenge
+
+
+def _open_trusted_cli(cli: Path) -> int:
+    """Pin one root-owned CLI after validating every directory in its path."""
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or not Path("/proc/self/fd").is_dir()
+    ):
+        raise BillingReadinessError("readiness_live_recheck_command_invalid")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd: int | None = None
+    try:
+        before = os.lstat("/")
+        current_fd = os.open("/", flags)
+        after = os.fstat(current_fd)
+        _verify_trusted_path_part(before, after, directory=True)
+        for part in cli.parent.parts[1:]:
+            before = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            try:
+                after = os.fstat(next_fd)
+                _verify_trusted_path_part(before, after, directory=True)
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+
+        before = os.stat(cli.name, dir_fd=current_fd, follow_symlinks=False)
+        cli_fd = os.open(cli.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
+        try:
+            after = os.fstat(cli_fd)
+            _verify_trusted_path_part(before, after, directory=False)
+        except Exception:
+            os.close(cli_fd)
+            raise
+        return cli_fd
+    except (OSError, BillingReadinessError) as exc:
+        if isinstance(exc, BillingReadinessError):
+            raise
+        raise BillingReadinessError(
+            "readiness_live_recheck_command_invalid"
+        ) from exc
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+def _verify_trusted_path_part(
+    before: os.stat_result,
+    after: os.stat_result,
+    *,
+    directory: bool,
+) -> None:
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or not expected_type(after.st_mode)
+        or after.st_uid != 0
+        or after.st_mode & 0o022
+        or (not directory and not after.st_mode & 0o111)
+    ):
+        raise BillingReadinessError("readiness_live_recheck_command_invalid")
 
 
 def verify_enabled_environment(env: Mapping[str, str] | None = None) -> None:

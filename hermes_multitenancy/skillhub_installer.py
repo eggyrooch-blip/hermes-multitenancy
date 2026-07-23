@@ -1150,11 +1150,28 @@ def _process_plugin_event_locked(
     if skill_status == "pending":
         return {"action": "skipped_pending", "plugin_id": plugin_id, "item_type": "plugin"}
     if skill_status == "inactive":
-        changed = _set_plugin_status(shared, plugin_id, "inactive", _lock_held=True)
+        try:
+            report = plugin_ingest.deactivate(
+                plugin_id,
+                shared_home=shared,
+                profiles_root=profiles,
+                _lock_held=True,
+            )
+        except plugin_ingest.PluginIngestError as exc:
+            raise SkillhubInstallError(
+                str(exc), error_code="PLUGIN_INGEST_FAILED"
+            ) from exc
         return {
             "action": "plugin_disable",
             "plugin_id": plugin_id,
-            "status": "inactive" if changed else "absent",
+            "status": "inactive",
+            "uninstall": report,
+        }
+    if not explicit_skill_status and _plugin_managed_status(shared, plugin_id) == "inactive":
+        return {
+            "action": "plugin_skipped_inactive",
+            "plugin_id": plugin_id,
+            "status": "inactive",
         }
 
     auth_type = _resolve_auth_type(event)

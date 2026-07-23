@@ -389,7 +389,7 @@ def test_plugin_profile_then_all_then_inactive_leaves_no_orphan(tmp_path: Path) 
     # alice's stale per-profile copy must be gone (now covered via all-distribution instead)
     assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
 
-    # 3) inactive → package/distribution retained but disabled at runtime
+    # 3) inactive → package retained for audit/reactivation, all execution entries removed
     process_event(
         _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
         shared_home=shared_home, profiles_root=profiles_root,
@@ -397,7 +397,7 @@ def test_plugin_profile_then_all_then_inactive_leaves_no_orphan(tmp_path: Path) 
     )
     assert _managed_manifest(shared_home)["status"] == "inactive"
     assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
-    assert _distribution_plugin_entries(shared_home)
+    assert not _distribution_plugin_entries(shared_home)
 
 
 def test_plugin_all_then_permission_is_noop_no_orphan_on_inactive(tmp_path: Path) -> None:
@@ -426,13 +426,13 @@ def test_plugin_all_then_permission_is_noop_no_orphan_on_inactive(tmp_path: Path
     assert result["action"] == "plugin_noop_already_all"
     assert _managed_manifest(shared_home)["audience"]["mode"] == "all"  # not downgraded
 
-    # inactive keeps the package/distribution and disables the manifest
+    # inactive keeps the package manifest but removes distribution
     process_event(
         _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
         shared_home=shared_home, profiles_root=profiles_root,
         downloader=lambda _: pytest.fail("inactive must not download"),
     )
-    assert _distribution_plugin_entries(shared_home)
+    assert not _distribution_plugin_entries(shared_home)
     assert _managed_manifest(shared_home)["status"] == "inactive"
 
 
@@ -497,9 +497,10 @@ def test_plugin_inactive_disables_and_second_call_is_idempotent(tmp_path: Path) 
 
     assert first["action"] == "plugin_disable"
     assert first["plugin_id"] == PLUGIN_ID
-    assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
+    assert not (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert _managed_manifest(shared_home)["status"] == "inactive"
-    assert second == first
+    assert second["action"] == "plugin_disable"
+    assert second["status"] == "inactive"
 
     active = process_event(
         _plugin_event(
@@ -574,7 +575,7 @@ def test_statusless_permission_does_not_reactivate_inactive_plugin(tmp_path: Pat
         event_type="skill.permission_approved", users=["bob-ldap"], download_url=None
     )
     permission.pop("skill_status")
-    process_event(
+    skipped = process_event(
         permission,
         shared_home=shared_home,
         profiles_root=profiles_root,
@@ -583,7 +584,9 @@ def test_statusless_permission_does_not_reactivate_inactive_plugin(tmp_path: Pat
 
     manifest = _managed_manifest(shared_home)
     assert manifest["status"] == "inactive"
-    assert manifest["audience"]["profiles"] == ["alice", "bob", "sunke"]
+    assert skipped["action"] == "plugin_skipped_inactive"
+    assert manifest["audience"]["profiles"] == ["alice", "sunke"]
+    assert not (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()
 
 
 def test_explicit_active_and_failed_ingest_share_one_plugin_transaction(tmp_path, monkeypatch):
@@ -765,18 +768,18 @@ def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path,
 
 
 def test_inactive_unknown_plugin_never_downloads(tmp_path: Path) -> None:
-    from hermes_multitenancy.skillhub_installer import process_event
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
 
-    result = process_event(
-        _plugin_event(event_type="skill.status_changed", skill_status="inactive", users=[]),
-        shared_home=tmp_path / ".hermes",
-        downloader=lambda _: pytest.fail("inactive must not download"),
-    )
-    assert result == {
-        "action": "plugin_disable",
-        "plugin_id": PLUGIN_ID,
-        "status": "absent",
-    }
+    with pytest.raises(SkillhubInstallError, match="no managed manifest"):
+        process_event(
+            _plugin_event(
+                event_type="skill.status_changed",
+                skill_status="inactive",
+                users=[],
+            ),
+            shared_home=tmp_path / ".hermes",
+            downloader=lambda _: pytest.fail("inactive must not download"),
+        )
 
 
 def test_plugin_install_fails_closed_when_default_profile_is_unproven(tmp_path: Path) -> None:
@@ -978,7 +981,7 @@ def test_plugin_all_audience_installs_global_distribution(tmp_path: Path) -> Non
     )
 
     assert inactive["action"] == "plugin_disable"
-    assert _distribution_plugin_entries(shared_home)
+    assert not _distribution_plugin_entries(shared_home)
     assert _managed_manifest(shared_home)["status"] == "inactive"
 
 
@@ -1082,7 +1085,7 @@ def test_sticky_survives_full_snapshot_shrink_but_nonsticky_dropped(tmp_path: Pa
     assert "alice" in _managed_manifest(shared_home)["audience"]["profiles"]            # sticky stays in manifest
 
 
-def test_inactive_preserves_all_installed_profiles(tmp_path: Path) -> None:
+def test_inactive_revokes_sticky_and_all_installed_profiles(tmp_path: Path) -> None:
     from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
@@ -1099,9 +1102,101 @@ def test_inactive_preserves_all_installed_profiles(tmp_path: Path) -> None:
                            downloader=lambda _: pytest.fail("inactive must not download"))
 
     assert result["action"] == "plugin_disable"
-    assert (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()    # sticky KEPT
-    assert (profiles_root / "dave" / "skills" / "using-resource-delivery").exists()
+    assert not (profiles_root / "alice" / "skills" / "using-resource-delivery").exists()
+    assert not (profiles_root / "dave" / "skills" / "using-resource-delivery").exists()
     assert _managed_manifest(shared_home)["status"] == "inactive"
+
+
+def test_inactive_prunes_existing_org_fanout_and_sync_cannot_reinstall(
+    tmp_path: Path,
+) -> None:
+    from hermes_multitenancy.skillhub_installer import process_event
+    from hermes_multitenancy.skill_registry import list_profile_skill_slash_commands
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text(
+        "skills: []\n", encoding="utf-8"
+    )
+    process_event(
+        _plugin_event(auth_type="all", users=[]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    alice = profiles_root / "alice"
+    manifest_before = (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").read_bytes()
+    distribution_before = (
+        shared_home / pi.SKILL_DISTRIBUTION_FILE
+    ).read_bytes()
+    _sync_default_profile_skills(alice, shared_home)
+    assert (alice / "skills" / "kep-halo-cli").exists()
+    assert _managed_manifest(shared_home)["status"] == "active"
+    assert (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").read_bytes() == manifest_before
+    assert (shared_home / pi.SKILL_DISTRIBUTION_FILE).read_bytes() == distribution_before
+
+    process_event(
+        _plugin_event(
+            event_type="skill.status_changed",
+            skill_status="inactive",
+            users=[],
+        ),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: pytest.fail("inactive must not download"),
+    )
+
+    assert not (alice / "skills" / "kep-halo-cli").exists()
+    assert not any(
+        command["name"] == "kep-halo-cli"
+        for command in list_profile_skill_slash_commands(profile_home=alice)
+    )
+    assert not _distribution_plugin_entries(shared_home)
+    (shared_home / "profile-skill-defaults.yaml").write_text(
+        "skills:\n  - kep-halo-cli\n", encoding="utf-8"
+    )
+    _sync_default_profile_skills(alice, shared_home)
+    assert not (alice / "skills" / "kep-halo-cli").exists()
+
+
+def test_inactive_cleanup_failure_does_not_claim_inactive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_multitenancy import skillhub_installer as si
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text(
+        "skills: []\n", encoding="utf-8"
+    )
+    si.process_event(
+        _plugin_event(auth_type="all", users=[]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    monkeypatch.setattr(
+        pi,
+        "_prune_plugin_managed_fanout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pi.PluginIngestError("injected cleanup failure")
+        ),
+    )
+
+    with pytest.raises(si.SkillhubInstallError, match="injected cleanup failure"):
+        si.process_event(
+            _plugin_event(
+                event_type="skill.status_changed",
+                skill_status="inactive",
+                users=[],
+            ),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+        )
+    assert _managed_manifest(shared_home)["status"] == "active"
 
 
 def test_no_sticky_file_preserves_normal_shrink(tmp_path: Path) -> None:

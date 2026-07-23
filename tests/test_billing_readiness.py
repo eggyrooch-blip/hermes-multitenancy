@@ -157,6 +157,14 @@ def _environment(tmp_path, monkeypatch) -> tuple[dict[str, str], dict]:
         "UNRELATED_SERVICE_SECRET": "must-not-reach-child",
     }
     monkeypatch.setattr("hermes_multitenancy.billing_readiness.time.time", lambda: 200)
+    real_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda self: True
+        if str(self) == "/proc/self/fd"
+        else real_is_dir(self),
+    )
     return env, bindings
 
 
@@ -425,7 +433,12 @@ def test_live_recheck_executes_the_opened_inode_during_path_swap(
 
     def root_owned(fd):
         value = real_fstat(fd)
-        return SimpleNamespace(st_mode=value.st_mode, st_uid=0)
+        return SimpleNamespace(
+            st_mode=value.st_mode,
+            st_uid=0,
+            st_dev=value.st_dev,
+            st_ino=value.st_ino,
+        )
 
     monkeypatch.setattr(
         "hermes_multitenancy.billing_readiness.os.fstat",
@@ -457,3 +470,92 @@ def test_live_recheck_executes_the_opened_inode_during_path_swap(
         env,
         {"routing_watermark": "routing", "org_sha": "org"},
     )
+
+
+def test_live_recheck_without_proc_fd_fails_before_subprocess(
+    tmp_path, monkeypatch
+):
+    cli = tmp_path / "readiness"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(cli, 0o755)
+    employee_input = tmp_path / "employees.json"
+    employee_input.write_text("{}", encoding="utf-8")
+    os.chmod(employee_input, 0o600)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(mode=0o700)
+    real_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda self: False
+        if str(self) == "/proc/self/fd"
+        else real_is_dir(self),
+    )
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("subprocess must not start"),
+    )
+
+    with pytest.raises(BillingReadinessError, match="command_invalid"):
+        _run_live_recheck(
+            {
+                "HERMES_AI_GATEWAY_READINESS_CLI": str(cli),
+                "HERMES_LITELLM_BILLING_EMPLOYEE_INPUT": str(employee_input),
+                "HERMES_LITELLM_BILLING_LIVE_RECHECK_DIR": str(output_dir),
+                "HERMES_LITELLM_BILLING_PAYER_IDS": "employee-a",
+            },
+            {"routing_watermark": "routing", "org_sha": "org"},
+        )
+
+
+def test_live_recheck_rejects_one_writable_cli_ancestor_before_subprocess(
+    tmp_path, monkeypatch
+):
+    bad_dir = tmp_path / "writable"
+    bad_dir.mkdir(mode=0o777)
+    cli = bad_dir / "readiness"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(cli, 0o755)
+    employee_input = tmp_path / "employees.json"
+    employee_input.write_text("{}", encoding="utf-8")
+    os.chmod(employee_input, 0o600)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(mode=0o700)
+    real_is_dir = Path.is_dir
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda self: True
+        if str(self) == "/proc/self/fd"
+        else real_is_dir(self),
+    )
+    real_fstat = os.fstat
+
+    def trust_everything_except_bad(fd):
+        value = real_fstat(fd)
+        return SimpleNamespace(
+            st_mode=value.st_mode | (0o022 if value.st_ino == bad_dir.stat().st_ino else 0),
+            st_uid=0,
+            st_dev=value.st_dev,
+            st_ino=value.st_ino,
+        )
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness.os.fstat",
+        trust_everything_except_bad,
+    )
+    monkeypatch.setattr(
+        "hermes_multitenancy.billing_readiness.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("subprocess must not start"),
+    )
+
+    with pytest.raises(BillingReadinessError, match="command_invalid"):
+        _run_live_recheck(
+            {
+                "HERMES_AI_GATEWAY_READINESS_CLI": str(cli),
+                "HERMES_LITELLM_BILLING_EMPLOYEE_INPUT": str(employee_input),
+                "HERMES_LITELLM_BILLING_LIVE_RECHECK_DIR": str(output_dir),
+                "HERMES_LITELLM_BILLING_PAYER_IDS": "employee-a",
+            },
+            {"routing_watermark": "routing", "org_sha": "org"},
+        )
