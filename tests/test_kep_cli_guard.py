@@ -4,6 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -16,6 +20,9 @@ import os
 import sys
 
 MODE = os.environ.get("FAKE_KEP_MODE", "success")
+marker = os.environ.get("FAKE_KEP_MARKER")
+if marker:
+    open(marker, "w").write("executed")
 if MODE == "argv":
     sys.stdout.write(json.dumps(sys.argv[1:], ensure_ascii=False))
     raise SystemExit(0)
@@ -37,23 +44,138 @@ raise SystemExit(0)
     return path
 
 
-def test_install_kep_cli_shim_inserts_profile_before_subcommand(tmp_path: Path):
+def _write_fake_auth_bin(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nprintf 'header.payload.signature\\n'\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+@contextmanager
+def _identity_server(body: dict):
+    encoded = json.dumps(body).encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/ldap/authjwt"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@contextmanager
+def _verified_shim(tmp_path: Path, *, name: str, real_bin: Path, profile: str):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    auth_bin = _write_fake_auth_bin(tmp_path / "real-bin" / "kep-auth")
+    body = {
+        "errorCode": 0,
+        "ok": True,
+        "data": {"payload": {"name": profile, "exp": int(time.time()) + 3600}},
+    }
+    with _identity_server(body) as url:
+        [wrapper] = install_kep_cli_shim(
+            tmp_path / "shim",
+            real_bins={name: str(real_bin)},
+            identity_urls={"online": url, "pre": url},
+        )
+        env = os.environ.copy()
+        env.update({
+            "KEP_PROFILE": profile,
+            "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH": str(auth_bin),
+        })
+        yield wrapper, env
+
+
+def test_install_kep_cli_shim_blocks_server_rejected_token_before_real_binary(tmp_path: Path):
     from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
 
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
-    shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"ocean-cli": str(real_bin)})
+    auth_bin = _write_fake_auth_bin(tmp_path / "real-bin" / "kep-auth")
+    marker = tmp_path / "business-executed"
+    with _identity_server({"errorCode": 400, "ok": False, "data": None}) as url:
+        [wrapper] = install_kep_cli_shim(
+            tmp_path / "shim",
+            real_bins={"ocean-cli": str(real_bin)},
+            identity_urls={"online": url, "pre": url},
+        )
+        env = os.environ.copy()
+        env.update({
+            "KEP_PROFILE": "alice",
+            "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH": str(auth_bin),
+            "FAKE_KEP_MARKER": str(marker),
+        })
+        result = subprocess.run(
+            [str(wrapper), "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
+    assert result.returncode == 77
+    assert not marker.exists()
+    assert "需要授权" in result.stderr
+    assert "header.payload.signature" not in result.stderr
+
+
+def test_install_kep_cli_shim_blocks_when_live_identity_is_unavailable(tmp_path: Path):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
+    auth_bin = _write_fake_auth_bin(tmp_path / "real-bin" / "kep-auth")
+    marker = tmp_path / "business-executed"
+    closed_server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    url = f"http://127.0.0.1:{closed_server.server_port}/ldap/authjwt"
+    closed_server.server_close()
+    [wrapper] = install_kep_cli_shim(
+        tmp_path / "shim",
+        real_bins={"ocean-cli": str(real_bin)},
+        identity_urls={"online": url, "pre": url},
+    )
     env = os.environ.copy()
-    env["KEP_PROFILE"] = "alice"
-    env["FAKE_KEP_MODE"] = "argv"
+    env.update({
+        "KEP_PROFILE": "alice",
+        "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH": str(auth_bin),
+        "FAKE_KEP_MARKER": str(marker),
+    })
     result = subprocess.run(
-        [str(wrapper), "status", "--env", "pre"],
+        [str(wrapper), "status"],
         text=True,
         capture_output=True,
         env=env,
         check=False,
     )
+
+    assert result.returncode == 75
+    assert not marker.exists()
+    assert "暂时无法验证身份" in result.stderr
+
+
+def test_install_kep_cli_shim_inserts_profile_before_subcommand(tmp_path: Path):
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
+    with _verified_shim(tmp_path, name="ocean-cli", real_bin=real_bin, profile="alice") as (wrapper, env):
+        env["FAKE_KEP_MODE"] = "argv"
+        result = subprocess.run(
+            [str(wrapper), "status", "--env", "pre"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
     assert result.returncode == 0
     assert json.loads(result.stdout) == ["--profile", "alice", "status", "--env", "pre"]
@@ -61,25 +183,46 @@ def test_install_kep_cli_shim_inserts_profile_before_subcommand(tmp_path: Path):
 
 
 def test_install_kep_cli_shim_preserves_explicit_profile(tmp_path: Path):
-    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
-
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "hades-cli")
-    shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"hades-cli": str(real_bin)})
-
-    env = os.environ.copy()
-    env["KEP_PROFILE"] = "alice"
-    env["FAKE_KEP_MODE"] = "argv"
-    result = subprocess.run(
-        [str(wrapper), "--profile", "manual", "status"],
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
+    with _verified_shim(tmp_path, name="hades-cli", real_bin=real_bin, profile="manual") as (wrapper, env):
+        env["FAKE_KEP_MODE"] = "argv"
+        result = subprocess.run(
+            [str(wrapper), "--profile", "manual", "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
     assert result.returncode == 0
     assert json.loads(result.stdout) == ["--profile", "manual", "status"]
+
+
+def test_install_kep_cli_shim_blocks_profile_override_before_real_binary(tmp_path: Path):
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "hades-cli")
+    marker = tmp_path / "business-executed"
+    audit = tmp_path / "security.jsonl"
+    with _verified_shim(tmp_path, name="hades-cli", real_bin=real_bin, profile="alice") as (wrapper, env):
+        env["FAKE_KEP_MARKER"] = str(marker)
+        env["HERMES_PROFILE"] = "employee-sensitive-profile"
+        env["HERMES_MT_SECURITY_AUDIT_PATH"] = str(audit)
+        result = subprocess.run(
+            [str(wrapper), "--profile", "another-person", "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    assert result.returncode == 75
+    assert not marker.exists()
+    assert "身份校验不匹配" in result.stderr
+    assert "another-person" not in result.stderr
+    assert "alice" not in result.stderr
+    event = json.loads(audit.read_text().splitlines()[-1])
+    assert event["reason"] == "identity_mismatch"
+    assert event["profile_fingerprint"]
+    assert "profile" not in event
 
 
 def test_install_kep_cli_shim_relays_auth_failure_with_stable_exit_code(tmp_path: Path):
@@ -104,42 +247,32 @@ def test_install_kep_cli_shim_relays_auth_failure_with_stable_exit_code(tmp_path
 
 
 def test_install_kep_cli_shim_detects_auth_failure_from_output(tmp_path: Path):
-    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
-
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "kep-dune-cli")
-    shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"kep-dune-cli": str(real_bin)})
-
-    env = os.environ.copy()
-    env["FAKE_KEP_MODE"] = "phrase"
-    result = subprocess.run(
-        [str(wrapper), "status"],
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
+    with _verified_shim(tmp_path, name="kep-dune-cli", real_bin=real_bin, profile="alice") as (wrapper, env):
+        env["FAKE_KEP_MODE"] = "phrase"
+        result = subprocess.run(
+            [str(wrapper), "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
     assert result.returncode == 3
     assert "【Hermes】kep-cli online 需要授权" in result.stderr
 
 
 def test_install_kep_cli_shim_relays_forbidden_as_permission_denied(tmp_path: Path):
-    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
-
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
-    shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"ocean-cli": str(real_bin)})
-
-    env = os.environ.copy()
-    env["FAKE_KEP_MODE"] = "forbidden403"
-    result = subprocess.run(
-        [str(wrapper), "--env", "pre", "jd-adjust", "jd-adjust-list"],
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
+    with _verified_shim(tmp_path, name="ocean-cli", real_bin=real_bin, profile="alice") as (wrapper, env):
+        env["FAKE_KEP_MODE"] = "forbidden403"
+        result = subprocess.run(
+            [str(wrapper), "--env", "pre", "jd-adjust", "jd-adjust-list"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
     assert result.returncode == 3
     assert "接口禁止访问 (HTTP 403)" in result.stderr
@@ -149,22 +282,19 @@ def test_install_kep_cli_shim_relays_forbidden_as_permission_denied(tmp_path: Pa
 
 
 def test_install_kep_cli_shim_success_stdout_matches_real_binary(tmp_path: Path):
-    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
-
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "kep-badge-cli")
-    shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"kep-badge-cli": str(real_bin)})
-
     direct = subprocess.run(
         [str(real_bin), "fetch", "--id", "42"],
         capture_output=True,
         check=False,
     )
-    wrapped = subprocess.run(
-        [str(wrapper), "fetch", "--id", "42"],
-        capture_output=True,
-        check=False,
-    )
+    with _verified_shim(tmp_path, name="kep-badge-cli", real_bin=real_bin, profile="alice") as (wrapper, env):
+        wrapped = subprocess.run(
+            [str(wrapper), "fetch", "--id", "42"],
+            capture_output=True,
+            env=env,
+            check=False,
+        )
 
     assert wrapped.returncode == direct.returncode == 0
     assert wrapped.stdout == direct.stdout

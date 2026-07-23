@@ -403,20 +403,20 @@ def start_kep_cli_login(profile_dir: Path, profile_name: str, shared_home: Path,
 
 
 def kep_cli_logged_in(profile_dir: Path, profile_name: str, shared_home: Path, *, env_name: str = "online") -> bool:
-    """Poll: run ``kep-auth status`` → True iff logged in."""
+    """Poll: return true only after the profile's live identity is verified."""
     env_name = _normalize_kep_env_name(env_name)
     bin_path = kep_auth_bin(shared_home)
     if not Path(bin_path).exists():
         return False
-    env = {**_kep_env(profile_dir, profile_name), "KEP_NO_AUTO_LOGIN": "1"}
-    try:
-        proc = subprocess.run(
-            [bin_path, "--profile", profile_name, "--env", env_name, "status"],
-            cwd=str(profile_dir), env=env, capture_output=True, text=True, timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-    out = f"{proc.stdout}\n{proc.stderr}".lower()
-    if re.search(r"not\s*logged\s*in", out):
-        return False
-    return bool(re.search(r"logged\s*in|state:\s*(valid|logged\s*in)", out))
+    from .credential_hub import kep_cli_status
+
+    row = kep_cli_status(
+        profile_dir=profile_dir,
+        home_dir=_profile_home(profile_dir),
+        profile_name=profile_name,
+        shared_home=shared_home,
+        installed=True,
+        target_env=env_name,
+        report_envs=(env_name,),
+    )
+    return row.status == "authenticated"

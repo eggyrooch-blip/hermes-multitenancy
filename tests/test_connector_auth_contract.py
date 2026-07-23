@@ -55,6 +55,25 @@ def _kep_bin(monkeypatch, tmp_path):
     return bin_path
 
 
+def _mock_kep_identity(monkeypatch, *, profile_name: str, expires_at: int):
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return json.dumps({
+                "errorCode": 0,
+                "ok": True,
+                "data": {"payload": {"name": profile_name, "exp": expires_at}},
+            }).encode()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response())
+
+
 def _install_keep_record(home, *, token="tok123", username="owner"):
     """keep-record skill + authenticated keepai env/marker under the profile."""
     skill = home.parent / "skills" / "Keep" / "keep-record"
@@ -185,6 +204,7 @@ def test_kep_cli_expired_jwt_collapses_to_needs_auth_through_registry(monkeypatc
             token_out=_make_jwt(past) + "\n",
         ),
     )
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=past)
 
     rows = credential_hub.collect_credential_statuses(
         profile_name="owner", open_id="ou_owner", shared_home=tmp_path
@@ -228,6 +248,7 @@ def test_kep_cli_environment_statuses_round_trip_through_registry(monkeypatch, t
         raise AssertionError(f"unexpected env in {cmd!r}")
 
     monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
     rows = credential_hub.collect_credential_statuses(
         profile_name="owner", open_id="ou_owner", shared_home=tmp_path
     )

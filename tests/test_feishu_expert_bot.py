@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -499,12 +500,25 @@ def test_readonly_kep_shim_denies_writes_and_allows_status(tmp_path: Path) -> No
         encoding="utf-8",
     )
     real_bin.chmod(0o755)
+    auth_bin = tmp_path / "real" / "kep-auth"
+    auth_bin.write_text("#!/bin/sh\nprintf 'header.payload.signature\\n'\n", encoding="utf-8")
+    auth_bin.chmod(0o755)
+    identity_url = "data:application/json," + urllib.parse.quote(json.dumps({
+        "errorCode": 0,
+        "ok": True,
+        "data": {"payload": {"name": "alice", "exp": 4_102_444_800}},
+    }))
     shim_dir = tmp_path / "shim"
-    [wrapper] = install_kep_cli_shim(shim_dir, real_bins={"hades-cli": str(real_bin)})
+    [wrapper] = install_kep_cli_shim(
+        shim_dir,
+        real_bins={"hades-cli": str(real_bin)},
+        identity_urls={"online": identity_url, "pre": identity_url},
+    )
 
     env = os.environ.copy()
     env["HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY"] = "1"
     env["KEP_PROFILE"] = "alice"
+    env["HERMES_KEP_CLI_REAL_BIN_KEP_AUTH"] = str(auth_bin)
 
     denied = subprocess.run(
         [str(wrapper), "create", "--name", "x"],

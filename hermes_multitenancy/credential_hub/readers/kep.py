@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +26,13 @@ from ..model import (
 )
 
 logger = logging.getLogger("hermes_multitenancy.credential_hub")
+
+_KEP_IDENTITY_URLS = {
+    "online": "https://auth.gotokeep.com/ldap/authjwt",
+    "pre": "https://auth.pre.gotokeep.com/ldap/authjwt",
+}
+_KEP_IDENTITY_TIMEOUT_SECONDS = 3
+_KEP_IDENTITY_MAX_BYTES = 64 * 1024
 
 
 def _kep_auth_bin(shared_home: Path) -> str:
@@ -77,6 +86,63 @@ def _kep_token_exp_ms(
         if exp is not None:
             return exp
     return None
+
+
+def _kep_token_value(
+    bin_path: str, *, profile_name: str, env: dict[str, str], cwd: Path, env_name: str
+) -> Optional[str]:
+    proc = _hub._run(
+        [bin_path, "--profile", profile_name, "--env", env_name, "token"],
+        cwd=cwd,
+        env=env,
+    )
+    if proc is None or proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        token = line.strip()
+        if token.count(".") == 2:
+            return token
+    return None
+
+
+def _probe_kep_identity(token: str, *, profile_name: str, env_name: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        _KEP_IDENTITY_URLS[env_name],
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_KEP_IDENTITY_TIMEOUT_SECONDS) as response:
+            raw = response.read(_KEP_IDENTITY_MAX_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        return {"state": "needs_auth" if 400 <= exc.code < 500 else "unknown"}
+    except (OSError, TimeoutError, urllib.error.URLError):
+        return {"state": "unknown"}
+    if len(raw) > _KEP_IDENTITY_MAX_BYTES:
+        return {"state": "unknown"}
+    try:
+        body = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"state": "unknown"}
+    if not isinstance(body, dict):
+        return {"state": "unknown"}
+    if body.get("errorCode") != 0 or body.get("ok") is not True:
+        return {"state": "needs_auth"}
+    payload = body.get("data", {}).get("payload") if isinstance(body.get("data"), dict) else None
+    if not isinstance(payload, dict):
+        return {"state": "unknown"}
+    if str(payload.get("name") or "").strip() != profile_name:
+        return {"state": "identity_mismatch"}
+    expires_at = _hub._normalize_epoch_ms(payload.get("exp"))
+    if expires_at is None:
+        return {"state": "unknown"}
+    if expires_at <= _hub._now_ms():
+        return {"state": "needs_auth", "expires_at": expires_at}
+    return {
+        "state": "authenticated",
+        "account_hint": profile_name,
+        "expires_at": expires_at,
+    }
 
 
 def _normalize_kep_env_name(value: str) -> str:
@@ -136,36 +202,40 @@ def _kep_env_status(
                 live = "not_logged_in"
 
         if live == "logged_in":
-            expires_at = _hub._kep_token_exp_ms(
+            token = _kep_token_value(
                 bin_path,
                 profile_name=profile_name,
                 env=proc_env,
                 cwd=profile_dir,
                 env_name=env_name,
             )
+            if not token:
+                live = "not_logged_in"
+            else:
+                probe = _probe_kep_identity(
+                    token,
+                    profile_name=profile_name,
+                    env_name=env_name,
+                )
+                live = str(probe["state"])
+                account = probe.get("account_hint")
+                expires_at = probe.get("expires_at")
 
-    if live == "logged_in":
-        if expires_at is not None and expires_at <= _hub._now_ms():
-            status = S_NEEDS_AUTH
-            detail = f"kep-cli {env_name} 登录已过期，请重新认证。"
-        elif expires_at is None:
-            logger.warning(
-                "credential_hub: kep-cli env=%s status=valid but token undecodable for profile %r — "
-                "treating as unknown (fleet-wide occurrence may indicate a token-format change)",
-                env_name,
-                profile_name,
-            )
-            status = S_UNKNOWN
-            detail = f"kep-cli {env_name} 凭证存在，但无法确认有效期，建议重新认证。"
-        else:
-            status = S_AUTHENTICATED
-            detail = f"kep-auth 已验证该 profile 的 {env_name} 登录。"
-    elif live == "not_logged_in":
+    if live == "authenticated":
+        status = S_AUTHENTICATED
+        detail = f"kep-auth 已实时验证该 profile 的 {env_name} 登录。"
+    elif live == "not_logged_in" or live == "needs_auth":
         status = S_NEEDS_AUTH
-        detail = f"kep-auth 报告该 profile 的 {env_name} 未登录。"
+        detail = f"kep-cli {env_name} 登录已失效，请重新认证。"
+    elif live == "identity_mismatch":
+        status = S_UNKNOWN
+        detail = f"kep-cli {env_name} 身份校验不匹配，已停止使用该凭证。"
+    elif live == "unknown":
+        status = S_UNKNOWN
+        detail = f"kep-cli {env_name} 暂时无法实时验证，已停止使用该凭证。"
     elif has_token:
         status = S_UNKNOWN
-        detail = f"kep-cli {env_name} 凭证存在，但无法在线校验有效性。"
+        detail = f"kep-cli {env_name} 凭证存在，但无法实时验证，已停止使用。"
     else:
         status = S_NEEDS_AUTH
         detail = f"kep-cli 需要登录 {env_name}。"

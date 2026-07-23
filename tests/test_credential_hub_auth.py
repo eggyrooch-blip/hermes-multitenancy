@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -89,30 +90,53 @@ def test_run_keep_node_maps_missing_sdk_to_424(monkeypatch, tmp_path):
     assert ei.value.status == 424
 
 
-def test_kep_cli_logged_in_parses_status(monkeypatch, tmp_path):
-    from hermes_multitenancy import credential_hub_auth as cha
+def test_kep_cli_logged_in_requires_live_identity(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
 
     bin_path = tmp_path / "bin" / "kep-auth"
     bin_path.parent.mkdir(parents=True)
     bin_path.write_text("#!/bin/sh\n")
     monkeypatch.setenv("HERMES_KEP_AUTH_BIN", str(bin_path))
 
-    class _Logged:
+    class _Proc:
+        returncode = 0
         stdout = "state: valid\noperator: owner"
         stderr = ""
 
-    class _Not:
-        stdout = "state: not logged in"
-        stderr = ""
+    def fake_run(cmd, *a, **k):
+        if "token" in cmd:
+            proc = _Proc()
+            proc.stdout = "header.payload.signature\n"
+            return proc
+        return _Proc()
 
-    monkeypatch.setattr(cha.subprocess, "run", lambda *a, **k: _Logged())
-    assert cha.kep_cli_logged_in(tmp_path, "p", tmp_path) is True
-    monkeypatch.setattr(cha.subprocess, "run", lambda *a, **k: _Not())
-    assert cha.kep_cli_logged_in(tmp_path, "p", tmp_path) is False
+    reply = {
+        "errorCode": 0,
+        "ok": True,
+        "data": {"payload": {"name": "owner", "exp": int(time.time()) + 3600}},
+    }
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return json.dumps(reply).encode()
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response())
+
+    assert cha.kep_cli_logged_in(tmp_path, "owner", tmp_path) is True
+    reply.update(errorCode=400, ok=False, data=None)
+    assert cha.kep_cli_logged_in(tmp_path, "owner", tmp_path) is False
 
 
 def test_kep_cli_logged_in_checks_requested_env(monkeypatch, tmp_path):
-    from hermes_multitenancy import credential_hub_auth as cha
+    from hermes_multitenancy import credential_hub, credential_hub_auth as cha
 
     bin_path = tmp_path / "bin" / "kep-auth"
     bin_path.parent.mkdir(parents=True)
@@ -122,16 +146,48 @@ def test_kep_cli_logged_in_checks_requested_env(monkeypatch, tmp_path):
     calls = []
 
     class _Logged:
+        returncode = 0
         stdout = "state: valid\noperator: owner"
         stderr = ""
 
     def fake_run(cmd, *a, **k):
         calls.append(cmd)
+        if "token" in cmd:
+            proc = _Logged()
+            proc.stdout = "header.payload.signature\n"
+            return proc
         return _Logged()
 
-    monkeypatch.setattr(cha.subprocess, "run", fake_run)
-    assert cha.kep_cli_logged_in(tmp_path, "p", tmp_path, env_name="pre") is True
-    assert calls[0] == [str(bin_path), "--profile", "p", "--env", "pre", "status"]
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return json.dumps({
+                "errorCode": 0,
+                "ok": True,
+                "data": {"payload": {"name": "owner", "exp": int(time.time()) + 3600}},
+            }).encode()
+
+    monkeypatch.setattr(credential_hub, "_run", fake_run)
+    import urllib.request
+    urls = []
+
+    def fake_urlopen(request, **_kwargs):
+        urls.append(request.full_url)
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    assert cha.kep_cli_logged_in(tmp_path, "owner", tmp_path, env_name="pre") is True
+    assert calls == [
+        [str(bin_path), "--profile", "owner", "--env", "pre", "status"],
+        [str(bin_path), "--profile", "owner", "--env", "pre", "token"],
+    ]
+    assert urls == ["https://auth.pre.gotokeep.com/ldap/authjwt"]
 
 
 def test_start_kep_cli_login_uses_requested_env(monkeypatch, tmp_path):

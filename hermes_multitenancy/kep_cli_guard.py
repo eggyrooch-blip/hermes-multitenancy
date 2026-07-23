@@ -19,6 +19,10 @@ KEP_SHIM_NAMES: tuple[str, ...] = (
     "kep-trevi-cli",
     "kep-auth",
 )
+_KEP_IDENTITY_URLS = {
+    "online": "https://auth.gotokeep.com/ldap/authjwt",
+    "pre": "https://auth.pre.gotokeep.com/ldap/authjwt",
+}
 
 
 def _real_bin_env_key(name: str) -> str:
@@ -29,7 +33,12 @@ def kep_cli_real_bin_env_keys() -> tuple[str, ...]:
     return tuple(_real_bin_env_key(name) for name in KEP_SHIM_NAMES)
 
 
-def _shim_program(command_name: str, real_binary: Path) -> str:
+def _shim_program(
+    command_name: str,
+    real_binary: Path,
+    *,
+    identity_urls: dict[str, str],
+) -> str:
     env_key = _real_bin_env_key(command_name)
     return textwrap.dedent(
         f"""\
@@ -43,6 +52,9 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
         import subprocess
         import sys
         import threading
+        import time
+        import urllib.error
+        import urllib.request
         from datetime import datetime, timedelta, timezone
         from pathlib import Path
 
@@ -57,7 +69,9 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
         COMMAND_NAME = {command_name!r}
         DEFAULT_REAL_BINARY = {str(real_binary)!r}
         REAL_BINARY_ENV_KEY = {env_key!r}
+        KEP_AUTH_REAL_BINARY_ENV_KEY = {_real_bin_env_key("kep-auth")!r}
         DEFAULT_ENV_NAME = {"online"!r}
+        IDENTITY_URLS = {identity_urls!r}
         DEFAULT_AUDIT_PATH = {str(DEFAULT_AUDIT_PATH)!r}
         _SHANGHAI_TZ = timezone(timedelta(hours=8))
         _TAIL_LIMIT = 8192
@@ -75,14 +89,23 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
         def _timestamp_iso() -> str:
             return datetime.now(tz=_SHANGHAI_TZ).isoformat(timespec="seconds")
 
-        def _append_security_event(*, event_type: str, command_name: str, reason: str) -> None:
+        def _append_security_event(
+            *,
+            event_type: str,
+            command_name: str,
+            reason: str,
+            profile_fingerprint_only: bool = False,
+        ) -> None:
             event = {{
                 "@timestamp": _timestamp_iso(),
                 "event_type": event_type,
             }}
             profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
             if profile:
-                event["profile"] = _redact_embedded_ids(profile)
+                if profile_fingerprint_only:
+                    event["profile_fingerprint"] = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:12]
+                else:
+                    event["profile"] = _redact_embedded_ids(profile)
             if command_name:
                 event["command_name"] = command_name
             if reason:
@@ -186,11 +209,109 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
             for idx, arg in enumerate(argv):
                 if arg == "--env" and idx + 1 < len(argv):
                     value = str(argv[idx + 1] or "").strip().lower()
-                    return value or DEFAULT_ENV_NAME
+                    return value if value in IDENTITY_URLS else DEFAULT_ENV_NAME
                 if arg.startswith("--env="):
                     value = arg.split("=", 1)[1].strip().lower()
-                    return value or DEFAULT_ENV_NAME
+                    return value if value in IDENTITY_URLS else DEFAULT_ENV_NAME
             return DEFAULT_ENV_NAME
+
+        def _parse_profile(argv) -> str:
+            for idx, arg in enumerate(argv):
+                if arg == "--profile" and idx + 1 < len(argv):
+                    return str(argv[idx + 1] or "").strip()
+                if arg.startswith("--profile="):
+                    return arg.split("=", 1)[1].strip()
+            return ""
+
+        def _live_identity_state(argv) -> str:
+            if COMMAND_NAME == "kep-auth" or any(
+                str(arg or "").strip().lower() in ("--help", "-h", "help") for arg in argv
+            ):
+                return "authenticated"
+            profile = str(os.environ.get("KEP_PROFILE") or "").strip()
+            if not profile:
+                return "unknown"
+            if _parse_profile(argv) != profile:
+                return "identity_mismatch"
+            auth_binary = str(os.environ.get(KEP_AUTH_REAL_BINARY_ENV_KEY) or "").strip()
+            if not auth_binary:
+                return "unknown"
+            try:
+                token_proc = subprocess.run(
+                    [auth_binary, "--profile", profile, "--env", _parse_env_name(argv), "token"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env=dict(os.environ),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return "unknown"
+            if token_proc.returncode != 0:
+                return "needs_auth"
+            token = next(
+                (line.strip() for line in (token_proc.stdout or "").splitlines() if line.strip().count(".") == 2),
+                "",
+            )
+            if not token:
+                return "needs_auth"
+            request = urllib.request.Request(
+                IDENTITY_URLS[_parse_env_name(argv)],
+                headers={{"Authorization": f"Bearer {{token}}", "Accept": "application/json"}},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    raw = response.read(65537)
+            except urllib.error.HTTPError as exc:
+                return "needs_auth" if 400 <= exc.code < 500 else "unknown"
+            except (OSError, TimeoutError, urllib.error.URLError):
+                return "unknown"
+            if len(raw) > 65536:
+                return "unknown"
+            try:
+                body = json.loads(raw)
+            except (TypeError, ValueError):
+                return "unknown"
+            if not isinstance(body, dict):
+                return "unknown"
+            if body.get("errorCode") != 0 or body.get("ok") is not True:
+                return "needs_auth"
+            data = body.get("data")
+            payload = data.get("payload") if isinstance(data, dict) else None
+            if not isinstance(payload, dict):
+                return "unknown"
+            if str(payload.get("name") or "").strip() != profile:
+                return "identity_mismatch"
+            try:
+                expires_at = float(payload["exp"])
+            except (KeyError, TypeError, ValueError):
+                return "unknown"
+            if expires_at > 10_000_000_000:
+                expires_at /= 1000
+            return "authenticated" if expires_at > time.time() else "needs_auth"
+
+        def _block_unverified_identity(state: str, argv) -> int:
+            env_name = _parse_env_name(argv)
+            if state == "needs_auth":
+                message = (
+                    f'【Hermes】kep-cli {{env_name}} 需要授权：请在 Hermes 连接器面板认证 "kep-cli {{env_name}}"'
+                    "（或 /auth），勿在此自行登录或去掉 --profile。"
+                )
+                exit_code = 77
+            elif state == "identity_mismatch":
+                message = f"【Hermes】kep-cli {{env_name}} 身份校验不匹配，已阻止请求。"
+                exit_code = 75
+            else:
+                message = f"【Hermes】kep-cli {{env_name}} 暂时无法验证身份，已阻止请求。"
+                exit_code = 75
+            print(message, file=sys.stderr)
+            _append_security_event(
+                event_type="kep_cli.live_identity.denied",
+                command_name=COMMAND_NAME,
+                reason=state,
+                profile_fingerprint_only=True,
+            )
+            return exit_code
 
         def _append_tail(buf, chunk):
             if not chunk:
@@ -241,6 +362,10 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
                 except Exception:
                     pass
                 return 126
+
+            identity_state = _live_identity_state(argv)
+            if identity_state != "authenticated":
+                return _block_unverified_identity(identity_state, argv)
 
             proc = subprocess.Popen(
                 [real_binary, *argv],
@@ -318,13 +443,22 @@ def _shim_program(command_name: str, real_binary: Path) -> str:
     )
 
 
-def install_kep_cli_shim(shim_dir: Path, *, real_bins: dict[str, str]) -> list[Path]:
+def install_kep_cli_shim(
+    shim_dir: Path,
+    *,
+    real_bins: dict[str, str],
+    identity_urls: dict[str, str] | None = None,
+) -> list[Path]:
     shim_dir = Path(shim_dir)
     shim_dir.mkdir(parents=True, exist_ok=True)
+    urls = dict(_KEP_IDENTITY_URLS if identity_urls is None else identity_urls)
     written: list[Path] = []
     for name, real_path in real_bins.items():
         wrapper = shim_dir / name
-        wrapper.write_text(_shim_program(name, Path(real_path).expanduser()), encoding="utf-8")
+        wrapper.write_text(
+            _shim_program(name, Path(real_path).expanduser(), identity_urls=urls),
+            encoding="utf-8",
+        )
         wrapper.chmod(0o755)
         written.append(wrapper)
     return written

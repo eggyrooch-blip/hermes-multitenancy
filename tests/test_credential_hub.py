@@ -170,6 +170,38 @@ def _kep_bin(monkeypatch, tmp_path):
     return bin_path
 
 
+def _mock_kep_identity(
+    monkeypatch,
+    *,
+    profile_name: str = "",
+    expires_at: int = 0,
+    body: dict | None = None,
+    error: Exception | None = None,
+):
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return json.dumps(body if body is not None else {
+                "errorCode": 0,
+                "ok": True,
+                "data": {"payload": {"name": profile_name, "exp": expires_at}},
+            }).encode()
+
+    import urllib.request
+
+    def fake_urlopen(*_args, **_kwargs):
+        if error is not None:
+            raise error
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
 def test_decode_jwt_exp_ms():
     from hermes_multitenancy import credential_hub
 
@@ -192,13 +224,105 @@ def test_kep_cli_authenticated_when_token_live(monkeypatch, tmp_path):
         status_out="state: valid\noperator: owner <owner@keep.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
     row = credential_hub.kep_cli_status(
-        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="owner",
         shared_home=tmp_path, installed=True,
     )
     assert row.status == "authenticated"
     assert row.account_hint == "owner"
     assert row.expires_at == future * 1000
+
+
+def test_kep_cli_needs_auth_when_server_rejects_locally_valid_token(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return b'{"errorCode":400,"ok":false,"data":null}'
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response())
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "needs_auth"
+    assert "重新认证" in row.detail
+
+
+def test_kep_cli_unknown_when_live_identity_mismatches_profile(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, profile_name="another-person", expires_at=future)
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "unknown"
+    assert "身份校验不匹配" in row.detail
+    assert "another-person" not in row.detail
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ({"errorCode": 0, "ok": True, "data": {"payload": {"name": "owner"}}}, None),
+        (None, TimeoutError()),
+    ],
+)
+def test_kep_cli_unknown_when_live_identity_cannot_be_proven(
+    monkeypatch, tmp_path, body, error
+):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, body=body, error=error)
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "unknown"
+    assert "已停止使用" in row.detail
 
 
 def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkeypatch, tmp_path):
@@ -224,6 +348,7 @@ def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkey
         raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
 
     monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="dengwenhui", expires_at=future)
     row = credential_hub.kep_cli_status(
         profile_dir=tmp_path,
         home_dir=tmp_path / "home",
@@ -268,6 +393,7 @@ def test_kep_auth_state_line_reports_pre_and_online(monkeypatch, tmp_path):
         raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
 
     monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
 
     line = credential_hub.kep_auth_state_line(
         profile_dir=tmp_path,
@@ -311,16 +437,17 @@ def test_kep_cli_needs_auth_when_token_expired(monkeypatch, tmp_path):
         status_out="state: valid\noperator: owner <owner@keep.com>\n",
         token_out=_make_jwt(past) + "\n",
     ))
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=past)
     row = credential_hub.kep_cli_status(
-        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="owner",
         shared_home=tmp_path, installed=True,
     )
     assert row.status == "needs_auth"
     assert row.expires_at == past * 1000
 
 
-def test_kep_cli_unknown_when_token_undecodable(monkeypatch, tmp_path):
-    """status valid but token can't be fetched/decoded → don't claim authenticated."""
+def test_kep_cli_needs_auth_when_token_cannot_be_fetched(monkeypatch, tmp_path):
+    """status valid but token injection fails → require authentication."""
     from hermes_multitenancy import credential_hub
 
     _kep_bin(monkeypatch, tmp_path)
@@ -332,11 +459,11 @@ def test_kep_cli_unknown_when_token_undecodable(monkeypatch, tmp_path):
         profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
         shared_home=tmp_path, installed=True,
     )
-    assert row.status == "unknown"
+    assert row.status == "needs_auth"
 
 
-def test_kep_cli_token_whitespace_only_no_crash(monkeypatch, tmp_path):
-    """rc=0 but whitespace-only stdout must not raise IndexError → unknown."""
+def test_kep_cli_token_whitespace_only_needs_auth(monkeypatch, tmp_path):
+    """rc=0 but whitespace-only stdout must not raise or claim authenticated."""
     from hermes_multitenancy import credential_hub
 
     _kep_bin(monkeypatch, tmp_path)
@@ -348,7 +475,7 @@ def test_kep_cli_token_whitespace_only_no_crash(monkeypatch, tmp_path):
         profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
         shared_home=tmp_path, installed=True,
     )
-    assert row.status == "unknown"
+    assert row.status == "needs_auth"
 
 
 def test_kep_cli_token_with_banner_lines(monkeypatch, tmp_path):
@@ -361,8 +488,9 @@ def test_kep_cli_token_with_banner_lines(monkeypatch, tmp_path):
         status_out="state: valid\noperator: owner <owner@keep.com>\n",
         token_out=f"WARNING: using cached key\n{_make_jwt(future)}\n",
     ))
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
     row = credential_hub.kep_cli_status(
-        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="p",
+        profile_dir=tmp_path, home_dir=tmp_path / "home", profile_name="owner",
         shared_home=tmp_path, installed=True,
     )
     assert row.status == "authenticated"
@@ -701,6 +829,7 @@ def test_resource_delivery_plain_skills_default_kep_cli_to_pre(monkeypatch, tmp_
         raise AssertionError(f"unexpected env in {cmd!r}")
 
     monkeypatch.setattr(credential_hub, "_run", fake_run)
+    _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
     rows = credential_hub.collect_credential_statuses(
         profile_name="owner",
         open_id="ou_owner",
