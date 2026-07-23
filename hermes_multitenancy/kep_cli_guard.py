@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import textwrap
 from pathlib import Path
 
+from . import kep_live_identity
 from .security_audit import DEFAULT_AUDIT_PATH
 
 KEP_SHIM_NAMES: tuple[str, ...] = (
@@ -41,6 +43,7 @@ def _shim_program(
     identity_urls: dict[str, str],
 ) -> str:
     env_key = _real_bin_env_key(command_name)
+    probe_source = inspect.getsource(kep_live_identity)
     return textwrap.dedent(
         f"""\
         #!/usr/bin/env python3
@@ -53,11 +56,12 @@ def _shim_program(
         import subprocess
         import sys
         import threading
-        import time
-        import urllib.error
-        import urllib.request
         from datetime import datetime, timedelta, timezone
         from pathlib import Path
+
+        _LIVE_IDENTITY_NAMESPACE = {{}}
+        exec({probe_source!r}, _LIVE_IDENTITY_NAMESPACE, _LIVE_IDENTITY_NAMESPACE)
+        probe_kep_identity = _LIVE_IDENTITY_NAMESPACE["probe_kep_identity"]
 
         _EMBEDDED_ID_RE = re.compile(r"(?<![A-Za-z0-9])(ou|oc)_[A-Za-z0-9_-]+")
 
@@ -277,41 +281,12 @@ def _shim_program(
             )
             if not token:
                 return "needs_auth"
-            request = urllib.request.Request(
-                IDENTITY_URLS[_parse_env_name(argv)],
-                headers={{"Authorization": f"Bearer {{token}}", "Accept": "application/json"}},
-                method="GET",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=3) as response:
-                    raw = response.read(65537)
-            except urllib.error.HTTPError as exc:
-                return "needs_auth" if 400 <= exc.code < 500 else "unknown"
-            except (OSError, TimeoutError, urllib.error.URLError):
-                return "unknown"
-            if len(raw) > 65536:
-                return "unknown"
-            try:
-                body = json.loads(raw)
-            except (TypeError, ValueError):
-                return "unknown"
-            if not isinstance(body, dict):
-                return "unknown"
-            if body.get("errorCode") != 0 or body.get("ok") is not True:
-                return "needs_auth"
-            data = body.get("data")
-            payload = data.get("payload") if isinstance(data, dict) else None
-            if not isinstance(payload, dict):
-                return "unknown"
-            if str(payload.get("name") or "").strip() != profile:
-                return "identity_mismatch"
-            try:
-                expires_at = float(payload["exp"])
-            except (KeyError, TypeError, ValueError):
-                return "unknown"
-            if expires_at > 10_000_000_000:
-                expires_at /= 1000
-            return "authenticated" if expires_at > time.time() else "needs_auth"
+            return str(probe_kep_identity(
+                token,
+                profile_name=profile,
+                env_name=_parse_env_name(argv),
+                identity_urls=IDENTITY_URLS,
+            )["state"])
 
         def _block_unverified_identity(state: str, argv) -> int:
             env_name = _parse_env_name(argv)

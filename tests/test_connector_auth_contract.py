@@ -70,8 +70,8 @@ def _mock_kep_identity(monkeypatch, *, profile_name: str, expires_at: int):
                 "data": {"payload": {"name": profile_name, "exp": expires_at}},
             }).encode()
 
-    import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response())
+    from hermes_multitenancy import kep_live_identity
+    monkeypatch.setattr(kep_live_identity, "_urlopen", lambda *_a, **_k: _Response())
 
 
 def _install_keep_record(home, *, token="tok123", username="owner"):

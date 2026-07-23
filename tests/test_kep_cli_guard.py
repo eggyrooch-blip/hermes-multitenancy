@@ -52,13 +52,23 @@ def _write_fake_auth_bin(path: Path) -> Path:
 
 
 @contextmanager
-def _identity_server(body: dict):
+def _identity_server(
+    body: dict,
+    *,
+    status: int = 200,
+    location: str = "",
+    seen_authorization: list[str | None] | None = None,
+):
     encoded = json.dumps(body).encode()
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
+            if seen_authorization is not None:
+                seen_authorization.append(self.headers.get("Authorization"))
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            if location:
+                self.send_header("Location", location)
             self.end_headers()
             self.wfile.write(encoded)
 
@@ -173,6 +183,79 @@ def test_install_kep_cli_shim_blocks_when_live_identity_is_unavailable(tmp_path:
 
     assert result.returncode == 75
     assert not marker.exists()
+    assert "暂时无法验证身份" in result.stderr
+
+
+def test_install_kep_cli_shim_treats_rate_limit_as_unavailable(tmp_path: Path):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
+    auth_bin = _write_fake_auth_bin(tmp_path / "real-bin" / "kep-auth")
+    marker = tmp_path / "business-executed"
+    with _identity_server({}, status=429) as url:
+        [wrapper] = install_kep_cli_shim(
+            tmp_path / "shim",
+            real_bins={"ocean-cli": str(real_bin)},
+            expected_profile="alice",
+            identity_urls={"online": url, "pre": url},
+        )
+        env = os.environ.copy()
+        env.update({
+            "KEP_PROFILE": "alice",
+            "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH": str(auth_bin),
+            "FAKE_KEP_MARKER": str(marker),
+        })
+        result = subprocess.run(
+            [str(wrapper), "status"],
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+
+    assert result.returncode == 75
+    assert not marker.exists()
+    assert "暂时无法验证身份" in result.stderr
+    assert "需要授权" not in result.stderr
+
+
+def test_install_kep_cli_shim_refuses_redirect_without_forwarding_bearer(tmp_path: Path):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "ocean-cli")
+    auth_bin = _write_fake_auth_bin(tmp_path / "real-bin" / "kep-auth")
+    marker = tmp_path / "business-executed"
+    sink_authorization: list[str | None] = []
+    success = {
+        "errorCode": 0,
+        "ok": True,
+        "data": {"payload": {"name": "alice", "exp": int(time.time()) + 3600}},
+    }
+    with _identity_server(success, seen_authorization=sink_authorization) as sink_url:
+        with _identity_server({}, status=302, location=sink_url) as redirect_url:
+            [wrapper] = install_kep_cli_shim(
+                tmp_path / "shim",
+                real_bins={"ocean-cli": str(real_bin)},
+                expected_profile="alice",
+                identity_urls={"online": redirect_url, "pre": redirect_url},
+            )
+            env = os.environ.copy()
+            env.update({
+                "KEP_PROFILE": "alice",
+                "HERMES_KEP_CLI_REAL_BIN_KEP_AUTH": str(auth_bin),
+                "FAKE_KEP_MARKER": str(marker),
+            })
+            result = subprocess.run(
+                [str(wrapper), "status"],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+
+    assert result.returncode == 75
+    assert not marker.exists()
+    assert sink_authorization == []
     assert "暂时无法验证身份" in result.stderr
 
 

@@ -6,14 +6,13 @@ import json
 import logging
 import os
 import re
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_multitenancy import credential_hub as _hub
 
 from ...credential_renewal_common import build_status_subprocess_env
+from ...kep_live_identity import probe_kep_identity
 from .._io import _normalize_epoch_ms, _now_ms, _safe_account
 from ..model import (
     KEP_CLI_ENV_IDS,
@@ -26,14 +25,6 @@ from ..model import (
 )
 
 logger = logging.getLogger("hermes_multitenancy.credential_hub")
-
-_KEP_IDENTITY_URLS = {
-    "online": "https://auth.gotokeep.com/ldap/authjwt",
-    "pre": "https://auth.pre.gotokeep.com/ldap/authjwt",
-}
-_KEP_IDENTITY_TIMEOUT_SECONDS = 3
-_KEP_IDENTITY_MAX_BYTES = 64 * 1024
-
 
 def _kep_auth_bin(shared_home: Path) -> str:
     explicit = os.environ.get("HERMES_KEP_AUTH_BIN", "").strip()
@@ -105,46 +96,6 @@ def _kep_token_value(
     return None
 
 
-def _probe_kep_identity(token: str, *, profile_name: str, env_name: str) -> dict[str, Any]:
-    request = urllib.request.Request(
-        _KEP_IDENTITY_URLS[env_name],
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=_KEP_IDENTITY_TIMEOUT_SECONDS) as response:
-            raw = response.read(_KEP_IDENTITY_MAX_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        return {"state": "needs_auth" if 400 <= exc.code < 500 else "unknown"}
-    except (OSError, TimeoutError, urllib.error.URLError):
-        return {"state": "unknown"}
-    if len(raw) > _KEP_IDENTITY_MAX_BYTES:
-        return {"state": "unknown"}
-    try:
-        body = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {"state": "unknown"}
-    if not isinstance(body, dict):
-        return {"state": "unknown"}
-    if body.get("errorCode") != 0 or body.get("ok") is not True:
-        return {"state": "needs_auth"}
-    payload = body.get("data", {}).get("payload") if isinstance(body.get("data"), dict) else None
-    if not isinstance(payload, dict):
-        return {"state": "unknown"}
-    if str(payload.get("name") or "").strip() != profile_name:
-        return {"state": "identity_mismatch"}
-    expires_at = _hub._normalize_epoch_ms(payload.get("exp"))
-    if expires_at is None:
-        return {"state": "unknown"}
-    if expires_at <= _hub._now_ms():
-        return {"state": "needs_auth", "expires_at": expires_at}
-    return {
-        "state": "authenticated",
-        "account_hint": profile_name,
-        "expires_at": expires_at,
-    }
-
-
 def _normalize_kep_env_name(value: str) -> str:
     env_name = str(value or "").strip().lower()
     return env_name if env_name in {"online", "pre"} else "online"
@@ -212,7 +163,7 @@ def _kep_env_status(
             if not token:
                 live = "not_logged_in"
             else:
-                probe = _probe_kep_identity(
+                probe = probe_kep_identity(
                     token,
                     profile_name=profile_name,
                     env_name=env_name,
@@ -335,12 +286,24 @@ def kep_auth_state_line(
             if env_status.get("status") == S_AUTHENTICATED:
                 account_hint = str(env_status.get("account_hint") or "").strip()
                 return f"已登录: {account_hint}" if account_hint else "已登录"
-            return "未登录"
+            if env_status.get("status") == S_NEEDS_AUTH:
+                return "未登录"
+            return "暂时无法验证"
+
+        pre_status = statuses["pre"].get("status")
+        if pre_status == S_AUTHENTICATED:
+            pre_guidance = "pre 已登录，直接用 ocean-cli --env pre 取数，不要去掉 --profile。"
+        elif pre_status == S_NEEDS_AUTH:
+            pre_guidance = (
+                "pre 未登录，只引导用户在连接器认证 kep-cli pre，"
+                "不要声称 online 也失败、不要去掉 --profile。"
+            )
+        else:
+            pre_guidance = "pre 暂时无法验证，停止调用并如实告知服务暂不可用，不要引导重新认证。"
 
         return (
             f"【系统已核实(勿再自行探活)】kep-cli pre={_segment('pre')}；online={_segment('online')}。"
-            "pre 已登录就直接用 ocean-cli --env pre 取数；pre 未登录就只引导用户在连接器认证 "
-            "kep-cli pre，不要声称 online 也失败、不要去掉 --profile。"
+            f"{pre_guidance}"
             "如果 ocean-cli 返回 HTTP 403 或 接口禁止访问，这是已登录账号没有该接口/数据权限；"
             "如实告知无权限，不要要求用户重新登录。只有 HTTP 401/not logged in 才按认证失效处理。"
         )

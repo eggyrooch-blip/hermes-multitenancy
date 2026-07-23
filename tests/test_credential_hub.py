@@ -192,14 +192,14 @@ def _mock_kep_identity(
                 "data": {"payload": {"name": profile_name, "exp": expires_at}},
             }).encode()
 
-    import urllib.request
+    from hermes_multitenancy import kep_live_identity
 
     def fake_urlopen(*_args, **_kwargs):
         if error is not None:
             raise error
         return _Response()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(kep_live_identity, "_urlopen", fake_urlopen)
 
 
 def test_decode_jwt_exp_ms():
@@ -254,8 +254,8 @@ def test_kep_cli_needs_auth_when_server_rejects_locally_valid_token(monkeypatch,
         def read(self, _limit):
             return b'{"errorCode":400,"ok":false,"data":null}'
 
-    import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response())
+    from hermes_multitenancy import kep_live_identity
+    monkeypatch.setattr(kep_live_identity, "_urlopen", lambda *_a, **_k: _Response())
 
     row = credential_hub.kep_cli_status(
         profile_dir=tmp_path,
@@ -323,6 +323,34 @@ def test_kep_cli_unknown_when_live_identity_cannot_be_proven(
 
     assert row.status == "unknown"
     assert "已停止使用" in row.detail
+
+
+def test_kep_cli_rate_limit_is_unknown_not_needs_auth(monkeypatch, tmp_path):
+    from urllib.error import HTTPError
+
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(
+        monkeypatch,
+        error=HTTPError("https://auth.gotokeep.com/ldap/authjwt", 429, "rate limited", {}, None),
+    )
+
+    row = credential_hub.kep_cli_status(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+        installed=True,
+    )
+
+    assert row.status == "unknown"
+    assert "暂时无法实时验证" in row.detail
 
 
 def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkeypatch, tmp_path):
@@ -409,6 +437,30 @@ def test_kep_auth_state_line_reports_pre_and_online(monkeypatch, tmp_path):
     assert "HTTP 403" in line
     assert "接口禁止访问" in line
     assert "不要要求用户重新登录" in line
+
+
+def test_kep_auth_state_line_preserves_live_unknown(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    _kep_bin(monkeypatch, tmp_path)
+    future = int(credential_hub._now_ms() / 1000) + 3600
+    monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
+        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        token_out=_make_jwt(future) + "\n",
+    ))
+    _mock_kep_identity(monkeypatch, error=TimeoutError())
+
+    line = credential_hub.kep_auth_state_line(
+        profile_dir=tmp_path,
+        home_dir=tmp_path / "home",
+        profile_name="owner",
+        shared_home=tmp_path,
+    )
+
+    assert line is not None
+    assert "pre=暂时无法验证" in line
+    assert "online=暂时无法验证" in line
+    assert "未登录" not in line
 
 
 def test_kep_auth_state_line_returns_none_on_failure(monkeypatch, tmp_path):

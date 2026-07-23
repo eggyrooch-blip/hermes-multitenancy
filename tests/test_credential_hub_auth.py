@@ -127,8 +127,8 @@ def test_kep_cli_logged_in_requires_live_identity(monkeypatch, tmp_path):
             return json.dumps(reply).encode()
 
     monkeypatch.setattr(credential_hub, "_run", fake_run)
-    import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Response())
+    from hermes_multitenancy import kep_live_identity
+    monkeypatch.setattr(kep_live_identity, "_urlopen", lambda *_a, **_k: _Response())
 
     assert cha.kep_cli_logged_in(tmp_path, "owner", tmp_path) is True
     reply.update(errorCode=400, ok=False, data=None)
@@ -173,14 +173,14 @@ def test_kep_cli_logged_in_checks_requested_env(monkeypatch, tmp_path):
             }).encode()
 
     monkeypatch.setattr(credential_hub, "_run", fake_run)
-    import urllib.request
+    from hermes_multitenancy import kep_live_identity
     urls = []
 
     def fake_urlopen(request, **_kwargs):
         urls.append(request.full_url)
         return _Response()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(kep_live_identity, "_urlopen", fake_urlopen)
 
     assert cha.kep_cli_logged_in(tmp_path, "owner", tmp_path, env_name="pre") is True
     assert calls == [
