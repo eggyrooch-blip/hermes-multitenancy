@@ -1167,6 +1167,9 @@ def test_inactive_cleanup_failure_still_revokes_execution(
     from hermes_multitenancy import skillhub_installer as si
     from hermes_multitenancy.skill_registry import list_profile_skill_slash_commands
     from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+    from hermes_multitenancy.run_broker import RunBroker, RunRejected
+    from hermes_multitenancy.run_models import RunRequest
+    import hermes_multitenancy.router as router
 
     shared_home = tmp_path / ".hermes"
     profiles_root = _make_profile_dirs(shared_home, "alice")
@@ -1181,6 +1184,22 @@ def test_inactive_cleanup_failure_still_revokes_execution(
         downloader=lambda _: _plugin_zip(),
     )
     _sync_default_profile_skills(profiles_root / "alice", shared_home)
+    monkeypatch.setattr(
+        router,
+        "_profile_name_to_home",
+        lambda _profile: profiles_root / "alice",
+    )
+    broker = RunBroker(
+        dispatch_agent=lambda _request: pytest.fail("must not dispatch"),
+        sandbox_available=lambda: True,
+    )
+    request = RunRequest(
+        channel="webui",
+        profile_name="alice",
+        user_key="alice",
+        content="hello",
+    )
+    assert broker.check_policy(request) == request
     monkeypatch.setattr(
         pi,
         "_prune_plugin_managed_fanout",
@@ -1201,6 +1220,8 @@ def test_inactive_cleanup_failure_still_revokes_execution(
         )
     assert _managed_manifest(shared_home)["status"] == "inactive"
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
+    with pytest.raises(RunRejected, match="plugin state"):
+        broker.check_policy(request)
     assert not any(
         command["name"] == "kep-halo-cli"
         for command in list_profile_skill_slash_commands(

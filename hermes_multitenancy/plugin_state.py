@@ -89,6 +89,16 @@ def inactive_skill_paths(shared_home: Path) -> set[str]:
     return set(inactive)
 
 
+def assert_no_stale_inactive_skills(profile_home: Path) -> None:
+    blocked = inactive_skill_paths(profile_home.parent.parent)
+    if any(
+        (profile_home / "skills" / name).exists()
+        or (profile_home / "skills" / name).is_symlink()
+        for name in blocked
+    ):
+        raise PluginStateError("inactive plugin cleanup is incomplete")
+
+
 def scope_active_skill_files(
     profile_home: Path,
     remember: Callable[[Any, str, Any], None],

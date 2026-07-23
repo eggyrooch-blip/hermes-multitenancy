@@ -609,6 +609,18 @@ class RunBroker:
 
     def check_policy(self, request: RunRequest) -> RunRequest:
         """Rewrite and validate a request without preparation or idempotency."""
+        from . import router
+        from .plugin_state import (
+            PluginStateError,
+            assert_no_stale_inactive_skills,
+        )
+
+        try:
+            profile_home = router._profile_name_to_home(request.profile_name)
+            if profile_home is not None:
+                assert_no_stale_inactive_skills(profile_home)
+        except PluginStateError as exc:
+            raise RunRejected("profile plugin state is unavailable") from exc
         request = _rewrite_skill_slash_request(request)
         self._assert_policy(request)
         return request

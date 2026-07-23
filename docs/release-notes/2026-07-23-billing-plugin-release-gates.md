@@ -6,7 +6,7 @@ Status: local candidate only; not shipped; production billing remains off.
 - The preprovisioned nonce store remains pinned, owner-only, bounded, locked, append-only and fsynced.
 - Multitenancy passes only the AI Gateway broker token and process/TLS settings to readiness; LiteLLM base URL and management key stay in AI Gateway.
 - Explicit Plugin inactive events now persist revocation before removing ownership-proven profile entries, distribution entries and existing org-managed fanout.
-- If cleanup fails, inactive Plugin skills are still excluded from slash, prompt and tool discovery; modified foreign targets are preserved. Status-less events and org sync cannot reinstall an explicitly inactive Plugin, while missing/invalid state fails the operation instead of silently revoking.
+- If cleanup fails, RunBroker refuses the affected profile before dispatch and inactive Plugin skills are excluded from slash, prompt and tool discovery; modified foreign targets are preserved. Status-less events and org sync cannot reinstall an explicitly inactive Plugin, while missing/invalid state fails the operation instead of silently revoking.
 - Manual active Plugin state is unchanged by org sync, release, startup and billing readiness. No inactive callback or production org sync was triggered by this change.
 
 Verification: SPEC-targeted `489 passed`; full `2805 passed, 1 skipped, 3 deselected`; package compileall and `git diff --check` passed.
