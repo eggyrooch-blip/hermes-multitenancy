@@ -17,8 +17,14 @@ Known gotcha: filesystem cleanup can fail after an inactive callback; the author
 
 Enable blocker: the current AI Gateway snapshot command still needs direct LiteLLM administration environment. Billing must remain off until AI Gateway exposes the equivalent broker URL/token-only readiness client; Multitenancy intentionally fails closed instead of receiving the management key.
 
-Follow-up candidate (not deployed): `deploy/install-gateway-dropins.sh` now installs a versioned
-`55-litellm-billing.conf` that optionally loads `%h/.hermes/litellm-billing.env` into the main Router.
-The environment file stays host-managed and absent is harmless; this change does not create secrets,
-enable billing, choose a cohort, or alter manually active Plugins. Installer/startup/readiness focused
-verification is `34 passed`.
+Follow-up deployed at `ec2e033`: `deploy/install-gateway-dropins.sh` installed the versioned
+`55-litellm-billing.conf`, which optionally loads `%h/.hermes/litellm-billing.env` into the main Router.
+The host-managed file remains `hermes:hermes 0600`, and the restarted Router process reports
+`HERMES_LITELLM_BILLING_ENABLED=false`. AI Gateway readiness CLI wiring and its GET-only producer are
+present; focused production tests passed `32/32` in AI Gateway and `1/1` for the drop-in installer.
+After restart, 8790/Caddy broker, WebUI and profile health were 200, unauthenticated Run Broker was the
+expected 401, SQLite integrity was `ok`, and `multitenancy_sessions` was `20718/20718` non-empty.
+The four Plugin manifests retained the same aggregate fingerprint
+`ac19b2ffc07fac2c2597dcd550deadb34d1288e2f0e07da4a8efb78d009c3742`.
+No billing cohort, employee account, key, invitation, notification, model request or Plugin state was
+changed. Production billing remains off; real shadow and the existing enable blocker still apply.
