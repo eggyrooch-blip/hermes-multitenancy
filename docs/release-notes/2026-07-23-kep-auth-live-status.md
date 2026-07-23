@@ -1,6 +1,6 @@
 # kep-cli live identity status
 
-Status: local candidate only; production unchanged.
+Status: released to production at `2a4fbd1d31e7`.
 
 ## Root cause
 
@@ -36,5 +36,20 @@ registry contract, and the Feishu expert route. The full suite passes 2773
 tests with 1 skipped and 3 deselected. After user-owned pre reauthentication,
 a read-only production probe found both online and pre valid for the routed
 `sunke` identity; no production code, service, or configuration was changed.
-The independent security review passed. The candidate remains unshipped until
-explicit release approval.
+The independent security review passed.
+
+## Production evidence
+
+Production pulled `7342655fe96f..2a4fbd1d31e7` with `--ff-only`, completed
+editable install and `compileall`, and passed 43 focused KEP tests. The router
+and WebUI services are active; ports 8648/8652 and public health return 200,
+while unauthenticated Run Broker health returns the expected 401. The live
+credential row reports both online and pre authenticated with matching account
+and future expiry. Database integrity is `ok`, and all 20,660
+`multitenancy_sessions` rows have non-empty mirrored content. Restart-window
+error markers are zero; Feishu startup is present with no failure marker.
+
+Backup: `/home/hermes/backups/kep-auth-live-status-20260723-172418`.
+No employee message was sent. Chrome could not be claimed for screenshot
+evidence, so visual WebUI confirmation remains user-visible rather than
+machine-verified.
