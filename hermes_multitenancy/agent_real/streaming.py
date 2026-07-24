@@ -489,7 +489,7 @@ async def _stream_aiagent_subprocess(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
-    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "3600"))
+    timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     warm_run = None
     warm_worker_requested = _aiagent_warm_worker_enabled()

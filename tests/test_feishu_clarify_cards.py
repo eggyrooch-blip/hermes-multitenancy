@@ -68,7 +68,11 @@ def test_feishu_clarify_callback_card_submit_writes_webui_protocol(monkeypatch, 
     assert answer == "brief"
     assert sent[0]["schema"] == "2.0"
     assert sent[0]["body"]["elements"][0]["content"] == "Which report style?"
-    assert sent[0]["body"]["elements"][-1]["tag"] == "form"
+    form = sent[0]["body"]["elements"][-1]
+    assert form["tag"] == "form"
+    assert form["name"] == "clarify_form"
+    submit = form["elements"][-1]
+    assert submit["behaviors"] == [{"type": "callback", "value": submit["value"]}]
     response_files = list(_clarify_bridge_dir().glob("clarify_*.json"))
     assert len(response_files) == 1
     assert json.loads(response_files[0].read_text(encoding="utf-8")) == {"response": "brief"}

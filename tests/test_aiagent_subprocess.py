@@ -191,6 +191,75 @@ async def test_stream_run_agent_yields_subprocess_event_stream(monkeypatch, tmp_
     ]
 
 
+@pytest.mark.asyncio
+async def test_stream_run_agent_does_not_replay_after_tool_started(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    legacy_calls = 0
+
+    async def failing_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "close_alert"})
+        raise RuntimeError("tool run failed")
+
+    async def legacy_stream(*_args, **_kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        yield ("content", "replayed")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", failing_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_stream)
+    seen = []
+    with pytest.raises(RuntimeError, match="tool run failed"):
+        async for item in agent_real.stream_run_agent(_event(), tmp_path):
+            seen.append(item)
+    assert seen == [("tool_started", {"name": "close_alert"})]
+    assert legacy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_preserves_post_tool_recovery_events(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    expiry = {"provider": "feishu", "connector_id": "lark-cli"}
+
+    async def failing_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "lark_cli"})
+        yield ("content", "partial")
+        agent_real._CREDENTIAL_EXPIRY_SIGNAL.get().set(expiry)
+        raise RuntimeError("tool run failed")
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", failing_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+    chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+    assert chunks == [
+        ("tool_started", {"name": "lark_cli"}),
+        ("content", "partial"),
+        ("auth_required", expiry),
+        ("content", "\n\n" + agent_real._PARTIAL_FAILURE_NOTICE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_keeps_legacy_fallback_before_tool_started(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    async def failing_stream(*_args, **_kwargs):
+        if False:
+            yield
+        raise RuntimeError("model failed before tools")
+
+    async def legacy_stream(*_args, **_kwargs):
+        yield ("content", "legacy reply")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", failing_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_stream)
+    assert [item async for item in agent_real.stream_run_agent(_event(), tmp_path)] == [
+        ("content", "legacy reply")
+    ]
+
+
 def test_aiagent_subprocess_main_replays_event(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy import aiagent_subprocess
@@ -2129,7 +2198,16 @@ async def test_stream_aiagent_subprocess_idle_timeout_is_runtime_error_not_cance
         created["proc"] = FakeProc()
         return created["proc"]
 
-    monkeypatch.setenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "0.02")
+    real_getenv = os.getenv
+
+    def fast_default_timeout(name, default=None):
+        if name == "HERMES_AIAGENT_SUBPROCESS_TIMEOUT":
+            assert default == "300"
+            return "0.02"
+        return real_getenv(name, default)
+
+    monkeypatch.delenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", raising=False)
+    monkeypatch.setattr(os, "getenv", fast_default_timeout)
     monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 

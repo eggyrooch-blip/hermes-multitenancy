@@ -321,10 +321,6 @@ async def stream_run_agent(  # type: ignore[override]
                 yield "content", f"\n\n{message}"
                 return
             raise RuntimeError(message) from exc
-        logger.warning(
-            "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
-            exc, exc_info=True,
-        )
         # A credential expiry may have been signalled before the stream raised
         # (the sidecar returns a graceful 503, but a later step can still throw).
         # Surface it here too so the re-auth card isn't silently dropped on the
@@ -340,6 +336,12 @@ async def stream_run_agent(  # type: ignore[override]
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
             return
+        if tool_started_count:
+            logger.warning(
+                "[multitenancy] streaming AIAgent path failed after tool start; refusing legacy replay",
+                exc_info=True,
+            )
+            raise
         metadata = _event_metadata(event)
         if (
             metadata.get("litellm_billing_enforced") is True
@@ -348,6 +350,10 @@ async def stream_run_agent(  # type: ignore[override]
             raise RuntimeError(
                 "Billing-bound run cannot fall back to the unmetered legacy stream"
             ) from exc
+        logger.warning(
+            "[multitenancy] streaming AIAgent path failed (%s); falling back to legacy stream",
+            exc, exc_info=True,
+        )
     finally:
         _CREDENTIAL_EXPIRY_SIGNAL.reset(signal_token)
 

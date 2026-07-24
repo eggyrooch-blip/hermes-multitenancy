@@ -93,13 +93,17 @@ def build_clarify_card(*, clarify_id: str, question: Any, choices: Any) -> dict[
         "type": "primary",
         "form_action_type": "submit",
         "value": {"hermes_action": "clarify", "clarify_id": clarify_id},
+        "behaviors": [{
+            "type": "callback",
+            "value": {"hermes_action": "clarify", "clarify_id": clarify_id},
+        }],
     })
     return {
         "schema": "2.0",
         "header": {"title": {"tag": "plain_text", "content": "需要你的选择"}, "template": "blue"},
         "body": {"elements": [
             {"tag": "markdown", "content": str(question or "").strip()[:_MAX_QUESTION_CHARS]},
-            {"tag": "form", "elements": fields},
+            {"tag": "form", "name": "clarify_form", "elements": fields},
         ]},
     }
 

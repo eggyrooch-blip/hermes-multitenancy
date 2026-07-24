@@ -170,8 +170,10 @@ async def test_pool_inflight_timeout_cancels_hung_dispatch():
 
     def factory(name, home):
         async def hang_forever(event, h):
-            await asyncio.sleep(60)  # would block well past timeout
-            return "never"
+            if event.text == "hang":
+                await asyncio.sleep(60)
+                return "never"
+            return "recovered"
         return ProfileRuntime(profile_home=home, run_agent_fn=hang_forever)
 
     pool = RuntimePool(inflight_timeout_seconds=0.05, runtime_factory=factory)
@@ -179,9 +181,12 @@ async def test_pool_inflight_timeout_cancels_hung_dispatch():
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
         with pytest.raises(asyncio.TimeoutError):
-            await pool.dispatch("alice", home, SimpleNamespace(text="a"))
+            await pool.dispatch("alice", home, SimpleNamespace(text="hang"))
         # After timeout, alice should have in_flight back to 0
         assert pool.in_flight_count("alice") == 0
+        assert await pool.dispatch(
+            "alice", home, SimpleNamespace(text="next")
+        ) == "recovered"
 
 
 @pytest.mark.asyncio
