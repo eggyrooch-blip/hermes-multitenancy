@@ -365,13 +365,9 @@ async def stream_run_agent(  # type: ignore[override]
         # failure that raised before any answer token.)
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
-            from ..run_broker import record_current_run_failure
+            from ..run_broker import mark_current_run_output_incomplete
 
-            record_current_run_failure(
-                failure_subsystem="output",
-                error_code="OUTPUT_INCOMPLETE",
-                retryable=False,
-            )
+            mark_current_run_output_incomplete()
             return
         if tool_started_count:
             logger.warning(
@@ -662,9 +658,26 @@ def _billing_failure_message(kind: str, *, retry_safe: bool) -> str:
     return "员工计费凭证暂不可用，请稍后重试。"
 
 
-def _subprocess_failure(message: str, *, retry_safe: bool = False) -> RuntimeError:
+def _subprocess_failure(
+    message: str,
+    *,
+    retry_safe: bool = False,
+    error_code: Any = None,
+    failure_subsystem: Any = None,
+    retryable: Any = None,
+) -> RuntimeError:
+    code = str(error_code or "").strip()
+    subsystem = str(failure_subsystem or "").strip()
+    if code == "EXPERT_UNAVAILABLE" and subsystem == "expert_resolution":
+        return ExpertUnavailableError()
     error = RuntimeError(message)
     error.billing_retry_safe = bool(retry_safe)  # type: ignore[attr-defined]
+    if code:
+        error.error_code = code  # type: ignore[attr-defined]
+    if subsystem:
+        error.failure_subsystem = subsystem  # type: ignore[attr-defined]
+    if isinstance(retryable, bool):
+        error.retryable = retryable  # type: ignore[attr-defined]
     return error
 
 
@@ -3828,6 +3841,9 @@ async def _run_aiagent_subprocess(
             f"AIAgent subprocess exited {proc.returncode}: "
             f"{child_error or redacted_stderr_text or redacted_stdout_text}",
             retry_safe=data.get("billing_retry_safe") is True,
+            error_code=data.get("error_code"),
+            failure_subsystem=data.get("failure_subsystem"),
+            retryable=data.get("retryable"),
         )
     if data.get("error"):
         error_text = str(data.get("error") or "")
@@ -3835,6 +3851,9 @@ async def _run_aiagent_subprocess(
             "AIAgent subprocess failed: "
             f"{_redact_billing_runtime_text(error_text, event, env)}",
             retry_safe=data.get("billing_retry_safe") is True,
+            error_code=data.get("error_code"),
+            failure_subsystem=data.get("failure_subsystem"),
+            retryable=data.get("retryable"),
         )
     _write_token_ledger_from_child(event, profile_home, data.get("usage"))
     return str(data.get("result") or "")

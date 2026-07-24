@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import replace
+import hashlib
 import inspect
 import logging
 import os
@@ -50,6 +51,10 @@ _RUN_FAILURE_FIELDS: ContextVar[tuple[str, str, bool] | None] = ContextVar(
     "hermes_run_failure_fields",
     default=None,
 )
+_RUN_OUTPUT_INCOMPLETE: ContextVar[bool] = ContextVar(
+    "hermes_run_output_incomplete",
+    default=False,
+)
 
 
 def mark_current_run_retried() -> None:
@@ -67,6 +72,24 @@ def record_current_run_failure(
     _RUN_FAILURE_FIELDS.set(
         (str(failure_subsystem), str(error_code), bool(retryable))
     )
+
+
+def mark_current_run_output_incomplete() -> None:
+    _RUN_OUTPUT_INCOMPLETE.set(True)
+
+
+def _execution_terminal_event_id(request: RunRequest) -> str:
+    """Bind one unique terminal id to admission plus a redacted correlation key."""
+    correlation = hashlib.sha256(
+        "|".join(
+            (
+                request.channel,
+                request.profile_name,
+                request.effective_idempotency_key,
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{uuid.uuid4().hex}.{correlation}"
 
 
 def _request_identity(request: RunRequest) -> tuple[str, str, str, str]:
@@ -199,6 +222,7 @@ class AdmittedRun:
         "_claim_lock",
         "_claimed",
         "_internal_metadata",
+        "_terminal_event_id",
         "_proof",
     )
 
@@ -219,6 +243,11 @@ class AdmittedRun:
         return dict(self._internal_metadata)
 
     @property
+    def terminal_event_id(self) -> str:
+        _require_admitted(self)
+        return self._terminal_event_id
+
+    @property
     def duplicate(self) -> bool:
         return False
 
@@ -235,6 +264,11 @@ def _issue_admitted(
     object.__setattr__(admitted, "_claim_lock", threading.Lock())
     object.__setattr__(admitted, "_claimed", False)
     object.__setattr__(admitted, "_internal_metadata", dict(internal_metadata or {}))
+    object.__setattr__(
+        admitted,
+        "_terminal_event_id",
+        _execution_terminal_event_id(request),
+    )
     object.__setattr__(admitted, "_proof", _ADMITTED_RUN_PROOF)
     return admitted
 
@@ -447,9 +481,10 @@ class RunBroker:
             object.__setattr__(admitted, "_claimed", True)
         request = admitted.request
         started = time.monotonic()
-        terminal_event_id = str(uuid.uuid4())
+        terminal_event_id = admitted.terminal_event_id
         retry_token = _RUN_RETRIED.set(False)
         failure_fields_token = _RUN_FAILURE_FIELDS.set(None)
+        output_incomplete_token = _RUN_OUTPUT_INCOMPLETE.set(False)
         expert_id = str((request.metadata or {}).get("expert_id") or "").strip()
         expert_requested = bool(expert_id)
         terminal_status = "completed"
@@ -463,12 +498,12 @@ class RunBroker:
             if content:
                 await self._emit_to(RunEvent(kind="content", text=content), emit_event)
             await self._emit_to(RunEvent(kind="done"), emit_event)
-            classified = _RUN_FAILURE_FIELDS.get()
-            if classified is None:
-                answer_completed = True
-            else:
+            if _RUN_OUTPUT_INCOMPLETE.get():
                 terminal_status = "failed"
-                failure_subsystem, error_code, retryable = classified
+                failure_subsystem = "output"
+                error_code = "OUTPUT_INCOMPLETE"
+            else:
+                answer_completed = True
             return RunResult(content=content, duplicate=False)
         except asyncio.CancelledError:
             terminal_status = "cancelled"
@@ -496,6 +531,7 @@ class RunBroker:
             retried = _RUN_RETRIED.get()
             _RUN_RETRIED.reset(retry_token)
             _RUN_FAILURE_FIELDS.reset(failure_fields_token)
+            _RUN_OUTPUT_INCOMPLETE.reset(output_incomplete_token)
             try:
                 from .conversation_audit import (
                     _FAILURE_SUBSYSTEMS,

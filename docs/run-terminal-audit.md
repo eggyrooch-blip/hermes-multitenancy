@@ -22,6 +22,13 @@ Schema version 1 follows the shared terminal/error contract:
 - content-free execution metadata: terminal id, redacted profile, channel,
   chat type, source, timestamp, and duration
 
+The broker binds `terminal_event_id` once when it issues the admitted execution,
+before dispatch. The id contains a fresh execution UUID plus a truncated SHA-256
+correlation fingerprint derived from the trusted channel, profile, and effective
+idempotency key. The raw values are never written, identical request content
+still receives a distinct execution UUID, and the fingerprint is not accepted
+as identity or authorization evidence.
+
 `answer_completed` means the broker execution generated the complete answer. It
 does not mean a WebUI or Feishu client received it. Analytics deduplicates by
 `terminal_event_id`; legacy `conversation_message` turn reconstruction remains

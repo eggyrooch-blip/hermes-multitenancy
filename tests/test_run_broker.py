@@ -131,6 +131,10 @@ def test_run_broker_terminal_marks_generic_retry_and_uses_unique_execution_ids(
     rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
     assert len(rows) == 2
     assert len({row["terminal_event_id"] for row in rows}) == 2
+    terminal_id_parts = [row["terminal_event_id"].split(".") for row in rows]
+    assert all(len(parts) == 2 for parts in terminal_id_parts)
+    assert terminal_id_parts[0][1] == terminal_id_parts[1][1]
+    assert "owner" not in " ".join(row["terminal_event_id"] for row in rows)
     assert all(row["retried"] is True for row in rows)
     assert all(row["expert_requested"] is False for row in rows)
     assert all(row["expert_id"] is None for row in rows)
@@ -242,6 +246,94 @@ def test_run_broker_consumes_structured_failure_fields_without_text_parsing(
     assert row["failure_subsystem"] == "lark_api"
     assert row["error_code"] == "FEISHU_RATE_LIMITED"
     assert row["retryable"] is True
+
+
+def test_run_broker_does_not_promote_recovered_tool_failure_to_run_failure(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import (
+        RunBroker,
+        record_current_run_failure,
+    )
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+
+    def dispatch(_request):
+        record_current_run_failure(
+            failure_subsystem="lark_api",
+            error_code="FEISHU_RATE_LIMITED",
+            retryable=True,
+        )
+        return "recovered answer"
+
+    result = asyncio.run(
+        RunBroker(dispatch_agent=dispatch).run(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="owner",
+                content="hi",
+            )
+        )
+    )
+
+    row = json.loads(audit_path.read_text("utf-8"))
+    assert result.content == "recovered answer"
+    assert row["terminal_status"] == "completed"
+    assert row["error_code"] is None
+    assert row["failure_subsystem"] is None
+    assert row["answer_completed"] is True
+
+
+def test_run_broker_cancelled_execution_writes_exactly_one_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import RunBroker, _issue_admitted
+    from hermes_multitenancy.run_models import RunRequest
+
+    async def run():
+        audit_path = tmp_path / "audit.jsonl"
+        monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+        monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+        started = asyncio.Event()
+
+        async def dispatch(_request):
+            started.set()
+            await asyncio.Event().wait()
+
+        broker = RunBroker(dispatch_agent=dispatch)
+        request = RunRequest(
+            channel="webui",
+            profile_name="owner",
+            user_key="owner",
+            content="hi",
+        )
+        admitted = _issue_admitted(request, authority=broker)
+        bound_terminal_id = admitted.terminal_event_id
+        task = asyncio.create_task(broker._run_admitted(admitted))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["terminal_event_id"] == bound_terminal_id
+        assert rows[0]["terminal_status"] == "cancelled"
+        assert rows[0]["failure_subsystem"] == "runtime"
+        assert rows[0]["error_code"] == "RUN_CANCELLED"
+        assert rows[0]["answer_completed"] is False
+
+    asyncio.run(run())
 
 
 def test_run_broker_stable_execution_writes_terminal_after_waiter_disconnect(

@@ -687,6 +687,9 @@ async def _stream_aiagent_subprocess(
                         "AIAgent subprocess failed: "
                         f"{_redact_billing_runtime_text(data['error'], event, env)}",
                         retry_safe=data.get("billing_retry_safe") is True,
+                        error_code=data.get("error_code"),
+                        failure_subsystem=data.get("failure_subsystem"),
+                        retryable=data.get("retryable"),
                     )
                 logger.info(
                     "[multitenancy] AIAgent subprocess done elapsed=%.3fs result_len=%s",

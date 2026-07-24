@@ -11,7 +11,8 @@ Cost: ~0.5-1s extra startup per message.
 I/O contract:
   stdin:  JSON {"event": {...}, "profile_home": "/path/to/profile", "messages": [...]}
   stdout: JSON {"result": "...", "error": null}  on success
-          JSON {"result": "", "error": "..."}    on failure
+          JSON {"result": "", "error": "...", "error_code": "...",
+                "failure_subsystem": "...", "retryable": false} on typed failure
   exit:   0 always (errors are reported via JSON)
 
 The event dict must contain at minimum: text, message_id, source.* fields
@@ -116,6 +117,20 @@ def _run_payload(
         if event_stream:
             emit(event_name, **event_payload)
 
+    def typed_failure_fields(exc: Exception) -> dict:
+        code = str(getattr(exc, "error_code", "") or "").strip()
+        subsystem = str(getattr(exc, "failure_subsystem", "") or "").strip()
+        if not code or not subsystem:
+            return {}
+        fields = {
+            "error_code": code,
+            "failure_subsystem": subsystem,
+        }
+        retryable = getattr(exc, "retryable", None)
+        if isinstance(retryable, bool):
+            fields["retryable"] = retryable
+        return fields
+
     try:
         sys.stdout = sys.stderr
         usage: dict = {}
@@ -148,12 +163,14 @@ def _run_payload(
                 "result": "",
                 "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                 "billing_retry_safe": billing_retry_safe,
+                **typed_failure_fields(exc),
             }
         else:
             out = {
                 "result": "",
                 "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                 "billing_retry_safe": billing_retry_safe,
+                **typed_failure_fields(exc),
             }
     finally:
         sys.stdout = protocol_stdout

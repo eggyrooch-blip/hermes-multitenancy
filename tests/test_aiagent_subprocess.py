@@ -341,6 +341,171 @@ def test_aiagent_subprocess_main_streams_ndjson_events(monkeypatch, tmp_path: Pa
     ]
 
 
+@pytest.mark.parametrize("event_stream", [False, True])
+def test_aiagent_subprocess_serializes_typed_failure_fields(
+    monkeypatch,
+    tmp_path: Path,
+    event_stream: bool,
+):
+    from hermes_multitenancy import aiagent_subprocess
+
+    class TypedFailure(RuntimeError):
+        error_code = "EXPERT_UNAVAILABLE"
+        failure_subsystem = "expert_resolution"
+        retryable = False
+
+    def fail(*_args, **_kwargs):
+        raise TypedFailure("closed")
+
+    payload = {
+        "event": {
+            "text": "hello child",
+            "message_id": "om_child",
+            "source": {"platform": "webui", "chat_id": "s1", "user_id": "u1"},
+        },
+        "profile_home": str(tmp_path),
+    }
+    stdout = io.StringIO()
+    if event_stream:
+        monkeypatch.setenv("HERMES_AIAGENT_EVENT_STREAM", "1")
+    else:
+        monkeypatch.delenv("HERMES_AIAGENT_EVENT_STREAM", raising=False)
+
+    aiagent_subprocess._run_payload(payload, fail, stdout)
+
+    data = json.loads(stdout.getvalue())
+    assert data["error_code"] == "EXPERT_UNAVAILABLE"
+    assert data["failure_subsystem"] == "expert_resolution"
+    assert data["retryable"] is False
+    assert data.get("event") == ("done" if event_stream else None)
+
+
+@pytest.mark.asyncio
+async def test_real_child_expert_failure_never_calls_legacy(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Exercise the OS child and parent decoder, not a mocked subprocess wrapper."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=test-key\n",
+        encoding="utf-8",
+    )
+    event = _event()
+    event.raw_event = {"metadata": {"expert_id": "requested"}}
+    child_payload = {
+        "event": {
+            "text": "hello",
+            "message_id": "om_child_boundary",
+            "raw_event": {"metadata": {"expert_id": "requested"}},
+            "broker_role_override": {
+                "expert_id": "different",
+                "block": "**Role Override**",
+            },
+            "source": {
+                "platform": "webui",
+                "chat_id": "session-child-boundary",
+                "chat_type": "dm",
+                "user_id": "ou_child",
+                "user_name": "tester",
+            },
+        },
+        "profile_home": str(profile_home),
+    }
+    legacy_calls = 0
+
+    async def fail_legacy(*_args, **_kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        raise AssertionError("legacy fallback must not run")
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._event_to_subprocess_payload",
+        lambda *_args, **_kwargs: child_payload,
+    )
+    monkeypatch.setattr(agent_real, "_legacy_real_run_agent", fail_legacy)
+
+    with pytest.raises(agent_real.ExpertUnavailableError):
+        await agent_real.real_run_agent(event, profile_home)
+
+    assert legacy_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_real_child_expert_failure_never_calls_legacy(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Exercise the streamed OS-child protocol and fail-closed parent branch."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "owner"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "OPENAI_API_KEY=test-key\n",
+        encoding="utf-8",
+    )
+    event = _event()
+    event.raw_event = {"metadata": {"expert_id": "requested"}}
+    child_payload = {
+        "event": {
+            "text": "hello",
+            "message_id": "om_stream_child_boundary",
+            "raw_event": {"metadata": {"expert_id": "requested"}},
+            "broker_role_override": {
+                "expert_id": "different",
+                "block": "**Role Override**",
+            },
+            "source": {
+                "platform": "webui",
+                "chat_id": "session-stream-child-boundary",
+                "chat_type": "dm",
+                "user_id": "ou_child",
+                "user_name": "tester",
+            },
+        },
+        "profile_home": str(profile_home),
+    }
+    legacy_calls = 0
+
+    async def fail_legacy(*_args, **_kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        raise AssertionError("legacy fallback must not run")
+        yield
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._event_to_subprocess_payload",
+        lambda *_args, **_kwargs: child_payload,
+    )
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    with pytest.raises(agent_real.ExpertUnavailableError):
+        async for _item in agent_real.stream_run_agent(event, profile_home):
+            pass
+
+    assert legacy_calls == 0
+
+
 def test_aiagent_worker_main_reuses_runner_and_rotates_run_env(monkeypatch, tmp_path: Path, capsys):
     from hermes_multitenancy import aiagent_subprocess
 
