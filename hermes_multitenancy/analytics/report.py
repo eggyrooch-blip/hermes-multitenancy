@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -618,6 +619,187 @@ def _skillhub_json_field(blob: Any, key: str) -> Any:
         return None
 
 
+def _skillhub_json_object(blob: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(blob) if isinstance(blob, str) else blob
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _skillhub_first(*values: Any) -> str:
+    for value in values:
+        text = str(value).strip() if value is not None else ""
+        if text:
+            return text
+    return ""
+
+
+def _skillhub_targets(payload: dict[str, Any]) -> list[str]:
+    audience = payload.get("audience") if isinstance(payload.get("audience"), dict) else {}
+    users = audience.get("users") if isinstance(audience.get("users"), list) else []
+    targets: list[str] = []
+    for user in users:
+        if not isinstance(user, dict):
+            continue
+        identity = _skillhub_first(
+            user.get("profile_id"), user.get("employee_id"), user.get("open_id")
+        )
+        if identity:
+            targets.append("profile_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12])
+    return targets or ["audience_all"]
+
+
+def _skillhub_private_values(payload: dict[str, Any]) -> list[str]:
+    audience = payload.get("audience") if isinstance(payload.get("audience"), dict) else {}
+    users = audience.get("users") if isinstance(audience.get("users"), list) else []
+    return sorted(
+        {
+            str(user[key])
+            for user in users
+            if isinstance(user, dict)
+            for key in ("profile_id", "employee_id", "open_id", "name", "display_name")
+            if user.get(key)
+        },
+        key=len,
+        reverse=True,
+    )
+
+
+def _skillhub_public_message(message: Any, payload: dict[str, Any]) -> str | None:
+    if message is None:
+        return None
+    text = redact_text(str(message))
+    for private in _skillhub_private_values(payload):
+        text = text.replace(private, "<profile>")
+    return text
+
+
+def _skillhub_terminal_status(status: str) -> str:
+    if status == "failed":
+        return "failed"
+    if status in {"queued", "queued_unknown_type"}:
+        return "pending"
+    return "completed"
+
+
+def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _skillhub_json_object(row["raw_payload"])
+        result = _skillhub_json_object(row["results_json"])
+        skill = payload.get("skill") if isinstance(payload.get("skill"), dict) else {}
+        release = payload.get("release") if isinstance(payload.get("release"), dict) else {}
+        item = _skillhub_first(row["skill_code"], payload.get("skill_code"), skill.get("skill_code"), "(none)")
+        version = _skillhub_first(row["version"], payload.get("version"), release.get("version"), "(none)")
+        desired = _skillhub_first(
+            payload.get("desired_state"), payload.get("skill_status"), skill.get("status"), "active"
+        ).lower()
+        event_type = _skillhub_first(row["event_type"], payload.get("event_type"), "unknown")
+        trusted_id = _skillhub_first(
+            payload.get("fanout_id"),
+            payload.get("batch_id"),
+            release.get("fanout_id"),
+            release.get("batch_id"),
+            row["release_id"],
+            payload.get("release_id"),
+            release.get("release_id"),
+        )
+        entries.append({
+            "event_id": str(row["event_id"]),
+            "at": int(row["updated_at"] or row["received_at"] or 0),
+            "item": item,
+            "version": version,
+            "desired_state": desired,
+            "event_type": event_type,
+            "status": _skillhub_terminal_status(str(row["status"] or "")),
+            "targets": _skillhub_targets(payload),
+            "trusted_id": trusted_id,
+            "batched_events": result.get("batched_events"),
+        })
+
+    fanout_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    fallback_clusters: dict[tuple[str, str, str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    for entry in sorted(entries, key=lambda item: (item["at"], item["event_id"])):
+        intent = (entry["event_type"], entry["item"], entry["version"], entry["desired_state"])
+        if entry["trusted_id"]:
+            key = "trusted:" + "|".join((*intent, entry["trusted_id"]))
+        elif isinstance(entry["batched_events"], int) and entry["batched_events"] > 1:
+            cluster_key = (*intent, entry["batched_events"])
+            clusters = fallback_clusters[cluster_key]
+            if not clusters or entry["at"] - clusters[-1][-1]["at"] > 600:
+                clusters.append([])
+            clusters[-1].append(entry)
+            key = f"inferred:{cluster_key!r}:{len(clusters) - 1}"
+        else:
+            key = f"event:{entry['event_id']}"
+        fanout_groups[key].append(entry)
+
+    fanout_counts: Counter[str] = Counter()
+    affected_targets = 0
+    raw_failures_in_failed_fanouts = 0
+    for grouped in fanout_groups.values():
+        final: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for entry in grouped:
+            for target in entry["targets"]:
+                target_key = (entry["item"], entry["version"], target, entry["desired_state"])
+                previous = final.get(target_key)
+                if previous is None or (entry["at"], entry["event_id"]) > (
+                    previous["at"], previous["event_id"]
+                ):
+                    final[target_key] = entry
+        statuses = {entry["status"] for entry in final.values()}
+        status = "failed" if "failed" in statuses else "pending" if "pending" in statuses else "completed"
+        fanout_counts[status] += 1
+        if status == "failed":
+            affected_targets += sum(entry["status"] == "failed" for entry in final.values())
+            raw_failures_in_failed_fanouts += sum(entry["status"] == "failed" for entry in grouped)
+
+    target_final: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for entry in entries:
+        for target in entry["targets"]:
+            key = (entry["item"], entry["version"], target, entry["desired_state"])
+            previous = target_final.get(key)
+            if previous is None or (entry["at"], entry["event_id"]) > (
+                previous["at"], previous["event_id"]
+            ):
+                target_final[key] = entry
+    target_counts = Counter(entry["status"] for entry in target_final.values())
+    target_rows = [
+        {
+            "item": key[0],
+            "version": key[1],
+            "anonymous_profile": key[2],
+            "desired_state": key[3],
+            "status": entry["status"],
+        }
+        for key, entry in sorted(target_final.items())
+    ]
+    failed_fanouts = fanout_counts["failed"]
+    return (
+        {
+            "total": len(fanout_groups),
+            "completed": fanout_counts["completed"],
+            "failed": failed_fanouts,
+            "pending": fanout_counts["pending"],
+            "affected_targets": affected_targets,
+            "duplicate_aggregate_failures": 0,
+            "collapsed_raw_failures": max(0, raw_failures_in_failed_fanouts - failed_fanouts),
+            "trusted": sum(key.startswith("trusted:") for key in fanout_groups),
+            "inferred": sum(key.startswith("inferred:") for key in fanout_groups),
+            "single_event": sum(key.startswith("event:") for key in fanout_groups),
+            "aggregation_window_seconds": 600,
+        },
+        {
+            "total": len(target_final),
+            "completed": target_counts["completed"],
+            "failed": target_counts["failed"],
+            "pending": target_counts["pending"],
+            "items": target_rows,
+        },
+    )
+
+
 def _skillhub_item_type(raw_payload: Any) -> str:
     """item_type as the writer's normalize_event resolves it: top-level ``item_type``
     OR nested ``skill.item_type`` (PRD shape), normalized to exactly "plugin" (only when
@@ -683,11 +865,25 @@ def build_skillhub_audit(
         ).fetchone()
         if not exists:
             raise ValueError("table skillhub_events does not exist in this DB")
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(skillhub_events)")
+        }
+        optional = {
+            "event_type": "'unknown'",
+            "release_id": "NULL",
+            "version": "NULL",
+            "updated_at": "received_at",
+        }
+        optional_select = ", ".join(
+            name if name in columns else f"{fallback} AS {name}"
+            for name, fallback in optional.items()
+        )
         cutoff = int(datetime.now().timestamp()) - max(1, days) * 86400
         # newest first so failure samples are the most recent K
         rows = conn.execute(
-            "SELECT skill_code, status, received_at, raw_payload, results_json"
-            " FROM skillhub_events ORDER BY received_at DESC, event_id DESC"
+            "SELECT event_id, skill_code, status, received_at, raw_payload, results_json, "
+            + optional_select
+            + " FROM skillhub_events ORDER BY received_at DESC, event_id DESC"
         ).fetchall()
     except sqlite3.OperationalError as exc:
         # bad/incompatible skillhub_events schema (missing columns etc.) → same friendly
@@ -721,9 +917,12 @@ def build_skillhub_audit(
         code = _skillhub_json_field(r["results_json"], "error_code") or "UNKNOWN"
         err_counts[code] += 1
         if len(err_samples[code]) < sample_limit:
+            payload = _skillhub_json_object(r["raw_payload"])
             err_samples[code].append({
                 "skill_code": r["skill_code"],
-                "message": _skillhub_json_field(r["results_json"], "message"),
+                "message": _skillhub_public_message(
+                    _skillhub_json_field(r["results_json"], "message"), payload
+                ),
                 "time": datetime.fromtimestamp(r["received_at"]).strftime("%Y-%m-%d %H:%M")
                 if r["received_at"] else None,
             })
@@ -734,10 +933,16 @@ def build_skillhub_audit(
         by_item_type[_skillhub_item_type(r["raw_payload"])] += 1
         by_skill[r["skill_code"] or "(none)"] += 1
 
+    fanouts, target_final_states = _skillhub_aggregate(rows)
+    raw_events = _tally(rows)
     audit: dict[str, Any] = {
         "db_path": str(db_path),
         "generated_days_window": days,
-        "all_time": _tally(rows),
+        "all_time": raw_events,
+        "all_time_semantics": "raw_events",
+        "raw_events": raw_events,
+        "fanouts": fanouts,
+        "target_final_states": target_final_states,
         "failures": {
             "by_error_code": dict(err_counts.most_common()),
             "samples": {k: err_samples[k] for k in err_counts},
@@ -757,9 +962,26 @@ def _skillhub_line(label: str, t: dict[str, int]) -> str:
 
 def render_skillhub_markdown(audit: dict[str, Any]) -> str:
     out: list[str] = ["# SkillHub 事件审计", ""]
-    out.append(_skillhub_line("全量", audit["all_time"]))
+    out.append("## 原始事件")
+    out.append(_skillhub_line("全量（兼容字段 all_time）", audit["all_time"]))
     if "last_n_days" in audit:
         out.append(_skillhub_line(f"近 {audit['generated_days_window']} 天", audit["last_n_days"]))
+    out.append("")
+    fanouts = audit["fanouts"]
+    out.append("## 批量结果")
+    out.append(
+        f"批次 {fanouts['total']} · 完成 {fanouts['completed']} · 失败 {fanouts['failed']} · "
+        f"待处理 {fanouts['pending']} · 受影响目标 {fanouts['affected_targets']}"
+    )
+    out.append(
+        f"聚合依据：可信标识 {fanouts['trusted']} · 10 分钟保守推导 {fanouts['inferred']} · "
+        f"单事件回退 {fanouts['single_event']}"
+    )
+    final = audit["target_final_states"]
+    out.append(
+        f"目标最终状态：共 {final['total']} · 完成 {final['completed']} · "
+        f"失败 {final['failed']} · 待处理 {final['pending']}"
+    )
     out.append("")
     errs = audit["failures"]["by_error_code"]
     if errs:

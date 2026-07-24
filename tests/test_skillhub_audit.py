@@ -2,11 +2,66 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import json
 from pathlib import Path
 
 import pytest
 
 from hermes_multitenancy.analytics.report import build_skillhub_audit, render_skillhub_markdown
+
+
+def _full_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE skillhub_events (event_id TEXT PRIMARY KEY, event_type TEXT,"
+        " skill_code TEXT, release_id TEXT, version TEXT, status TEXT,"
+        " received_at INTEGER, updated_at INTEGER, raw_payload TEXT, results_json TEXT)"
+    )
+
+
+def _insert_full(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    profile: str,
+    status: str,
+    at: int,
+    version: str = "1.0.0",
+    release_id: str | None = "193",
+    desired_state: str = "active",
+    batched_events: int | None = None,
+    employee_id: str | None = None,
+) -> None:
+    user = {"profile_id": profile}
+    if employee_id:
+        user["employee_id"] = employee_id
+    payload = {
+        "event_id": event_id,
+        "event_type": "skill.permission_approved",
+        "item_type": "plugin",
+        "skill_code": "keep-sharetemplate",
+        "release_id": release_id,
+        "version": version,
+        "skill_status": desired_state,
+        "audience": {"auth_type": "auth", "users": [user]},
+    }
+    result = {"error_code": "PLUGIN_GOVERNANCE_FAILED", "message": f"failed for {profile}"}
+    if batched_events is not None:
+        result["batched_events"] = batched_events
+    conn.execute(
+        "INSERT INTO skillhub_events VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            event_id,
+            payload["event_type"],
+            payload["skill_code"],
+            release_id,
+            version,
+            status,
+            at,
+            at,
+            json.dumps(payload),
+            json.dumps(result),
+        ),
+    )
 
 
 def _seed(db: Path) -> None:
@@ -154,3 +209,128 @@ def test_build_skillhub_audit_bad_schema_raises_valueerror(tmp_path: Path) -> No
     conn.commit(); conn.close()
     with pytest.raises(ValueError):
         build_skillhub_audit(db)
+
+
+def test_293_row_release_fanout_is_one_failure_without_losing_raw_rows(tmp_path: Path) -> None:
+    db = tmp_path / "multitenancy.db"
+    conn = sqlite3.connect(db)
+    _full_schema(conn)
+    now = int(time.time())
+    for index in range(293):
+        _insert_full(
+            conn,
+            event_id=f"evt-{index:03d}",
+            profile=f"profile-{index:03d}",
+            status="failed",
+            at=now,
+            batched_events=293,
+        )
+    conn.commit()
+    conn.close()
+
+    audit = build_skillhub_audit(db)
+
+    assert audit["all_time"]["failed"] == 293  # legacy field remains raw
+    assert audit["raw_events"]["failed"] == 293
+    assert audit["fanouts"]["total"] == 1
+    assert audit["fanouts"]["failed"] == 1
+    assert audit["fanouts"]["affected_targets"] == 293
+    assert audit["fanouts"]["duplicate_aggregate_failures"] == 0
+    assert audit["fanouts"]["collapsed_raw_failures"] == 292
+    assert audit["target_final_states"]["total"] == 293
+    assert audit["target_final_states"]["failed"] == 293
+
+
+def test_target_final_state_uses_latest_status_and_keeps_version_and_desired_state(tmp_path: Path) -> None:
+    db = tmp_path / "multitenancy.db"
+    conn = sqlite3.connect(db)
+    _full_schema(conn)
+    now = int(time.time())
+    _insert_full(conn, event_id="failed", profile="p-one", status="failed", at=now)
+    _insert_full(conn, event_id="fixed", profile="p-one", status="installed", at=now + 1)
+    _insert_full(
+        conn, event_id="v2", profile="p-one", status="installed", at=now + 2, version="2.0.0"
+    )
+    _insert_full(
+        conn,
+        event_id="inactive",
+        profile="p-one",
+        status="installed",
+        at=now + 3,
+        version="2.0.0",
+        desired_state="inactive",
+    )
+    conn.commit()
+    conn.close()
+
+    audit = build_skillhub_audit(db)
+
+    assert audit["raw_events"]["received"] == 4
+    assert audit["target_final_states"]["total"] == 3
+    assert audit["target_final_states"]["completed"] == 3
+    assert audit["target_final_states"]["failed"] == 0
+    assert {(item["version"], item["desired_state"]) for item in audit["target_final_states"]["items"]} == {
+        ("1.0.0", "active"),
+        ("2.0.0", "active"),
+        ("2.0.0", "inactive"),
+    }
+
+
+def test_inferred_fanout_window_is_inclusive_at_ten_minutes(tmp_path: Path) -> None:
+    db = tmp_path / "multitenancy.db"
+    conn = sqlite3.connect(db)
+    _full_schema(conn)
+    now = int(time.time())
+    for event_id, offset in (("a", 0), ("b", 600), ("c", 1201)):
+        _insert_full(
+            conn,
+            event_id=event_id,
+            profile=f"profile-{event_id}",
+            status="failed",
+            at=now + offset,
+            release_id=None,
+            batched_events=3,
+        )
+    conn.commit()
+    conn.close()
+
+    fanouts = build_skillhub_audit(db)["fanouts"]
+
+    assert fanouts["total"] == 2
+    assert fanouts["failed"] == 2
+    assert fanouts["inferred"] == 2
+
+
+def test_report_anonymizes_skillhub_target_identifiers(tmp_path: Path) -> None:
+    db = tmp_path / "multitenancy.db"
+    conn = sqlite3.connect(db)
+    _full_schema(conn)
+    _insert_full(
+        conn,
+        event_id="private",
+        profile="ou_sensitive_profile",
+        employee_id="employee-12345",
+        status="failed",
+        at=int(time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    audit = build_skillhub_audit(db)
+    rendered = json.dumps(audit, ensure_ascii=False) + render_skillhub_markdown(audit)
+
+    assert "ou_sensitive_profile" not in rendered
+    assert "employee-12345" not in rendered
+    assert audit["target_final_states"]["items"][0]["anonymous_profile"].startswith("profile_")
+
+
+def test_legacy_schema_marks_single_event_fallback_and_markdown_layers(tmp_path: Path) -> None:
+    db = tmp_path / "multitenancy.db"
+    _seed(db)
+
+    audit = build_skillhub_audit(db)
+    markdown = render_skillhub_markdown(audit)
+
+    assert audit["fanouts"]["single_event"] == 7
+    assert "原始事件" in markdown
+    assert "批量结果" in markdown
