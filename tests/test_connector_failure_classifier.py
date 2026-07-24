@@ -93,6 +93,14 @@ def test_lark_cli_success_has_empty_failure_fields():
         "error_code": None,
         "retryable": False,
     }
+    assert taxonomy(
+        exit_code=0,
+        business_payload={"code": 0, "data": {"code": 123456}},
+    ) == {
+        "failure_subsystem": None,
+        "error_code": None,
+        "retryable": False,
+    }
 
 
 # --- terminal HTTP -----------------------------------------------------------

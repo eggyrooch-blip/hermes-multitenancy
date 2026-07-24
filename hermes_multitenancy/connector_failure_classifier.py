@@ -85,7 +85,7 @@ _FEISHU_UNAVAILABLE_RE = re.compile(
     re.IGNORECASE,
 )
 _FEISHU_IDENTITY_MISMATCH_RE = re.compile(
-    r"\b(?:credential )?identity (?:verification failed|mismatch)\b|\bowner mismatch\b",
+    r"\b(?:credential )?identity mismatch\b|\bowner mismatch\b",
     re.IGNORECASE,
 )
 _FEISHU_IDENTITY_UNBOUND_RE = re.compile(
@@ -131,11 +131,7 @@ def _structured_code(node: object, depth: int = 0) -> Optional[int]:
         return code
     if depth >= 2:
         return None
-    for key in ("error", "data"):
-        nested = _structured_code(node.get(key), depth + 1)
-        if nested is not None:
-            return nested
-    return None
+    return _structured_code(node.get("error"), depth + 1)
 
 
 def _feishu_taxonomy(

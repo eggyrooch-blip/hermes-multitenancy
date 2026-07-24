@@ -1316,7 +1316,7 @@ def test_lark_cli_tool_filters_non_business_update_notice(monkeypatch, tmp_path)
         ),
         (
             "",
-            "credential identity verification failed",
+            "credential identity mismatch",
             1,
             ("identity", "FEISHU_IDENTITY_MISMATCH", False),
         ),
