@@ -23,7 +23,7 @@ architect estimate). For end-to-end demo today, this thin runner is enough.
 from __future__ import annotations
 
 import sys as _sys
-_pkg = _sys.modules["hermes_multitenancy.agent_real"]
+_pkg = _sys.modules[__package__]
 
 import json
 import logging

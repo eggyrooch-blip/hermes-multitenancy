@@ -1065,10 +1065,21 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
     states: list = []
     scoped = False
     router = None
+    home_override_token = None
+    reset_home_override = None
     try:
         from . import router  # lazy import: router imports run_broker (avoid cycle)
 
         profile_home = router._profile_name_to_home(request.profile_name)
+        try:
+            from hermes_constants import (
+                reset_hermes_home_override as reset_home_override,
+                set_hermes_home_override,
+            )
+        except ImportError:
+            pass
+        else:
+            home_override_token = set_hermes_home_override(profile_home)
         states = router._scope_profile_skill_loader(profile_home)
         # `_scope_profile_skill_loader` is best-effort and silently skips a failed import,
         # so a non-empty `states` does NOT prove the loader is pointed at this profile.
@@ -1087,6 +1098,8 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
                 router._restore_profile_skill_loader(states)
             except Exception:
                 pass
+        if home_override_token is not None and reset_home_override is not None:
+            reset_home_override(home_override_token)
         # FAIL CLOSED: if we cannot scope the skill loader to THIS profile, we must not
         # run the rewrite against a stale process-global cache — that would resolve the
         # command against whatever profile ran last (the exact cross-profile leak this
@@ -1099,6 +1112,8 @@ def _rewrite_skill_slash_request(request: RunRequest) -> RunRequest:
             router._restore_profile_skill_loader(states)
         except Exception:
             pass
+        if home_override_token is not None and reset_home_override is not None:
+            reset_home_override(home_override_token)
     if not rewritten or rewritten == request.content:
         return request
     return replace(request, content=rewritten)

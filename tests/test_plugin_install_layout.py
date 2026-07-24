@@ -6,10 +6,18 @@ import types
 from pathlib import Path
 
 
-def test_root_directory_plugin_shim_exposes_register():
+def test_root_directory_plugin_shim_registers_hook(monkeypatch, tmp_path):
     """`hermes plugins install owner/repo` loads the repository root."""
     repo_root = Path(__file__).resolve().parents[1]
     module_name = "hermes_plugins_test.multitenancy"
+    saved_top_level = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name == "hermes_multitenancy" or name.startswith("hermes_multitenancy.")
+    }
+    for name in saved_top_level:
+        sys.modules.pop(name, None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "plugin_smoke"))
 
     parent = types.ModuleType("hermes_plugins_test")
     parent.__path__ = []
@@ -30,12 +38,21 @@ def test_root_directory_plugin_shim_exposes_register():
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
-        assert callable(module.register)
+        hooks = []
+
+        class FakeCtx:
+            def register_hook(self, name, callback):
+                hooks.append((name, callback))
+
+        module.register(FakeCtx())
+        assert [name for name, _callback in hooks] == ["pre_gateway_dispatch"]
         assert callable(module.on_pre_gateway_dispatch)
     finally:
         for name in list(sys.modules):
             if name == "hermes_plugins_test" or name.startswith("hermes_plugins_test."):
                 sys.modules.pop(name, None)
+        for name, saved_module in saved_top_level.items():
+            sys.modules[name] = saved_module
 
 
 def test_card_modules_import_when_loaded_under_plugin_package():

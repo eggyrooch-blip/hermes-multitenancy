@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys as _sys
-_pkg = _sys.modules["hermes_multitenancy.agent_real"]
+_pkg = _sys.modules[__package__]
 
 import json
 import logging

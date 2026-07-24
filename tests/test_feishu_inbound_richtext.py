@@ -4,21 +4,17 @@ from dataclasses import asdict
 import inspect
 import json
 from pathlib import Path
-import sys
 from typing import Any
 
 import pytest
 
-CORE_ROOT = "/Users/kite/code/hermes-agent"
-if CORE_ROOT not in sys.path:
-    sys.path.insert(0, CORE_ROOT)
-
-import gateway.platforms.feishu as feishu_core
-
 from hermes_multitenancy import cron_worker
+from hermes_multitenancy.feishu_adapter_compat import load_feishu_module
 from hermes_multitenancy.feishu_inbound_richtext import (
     install_feishu_inbound_richtext_patch,
 )
+
+feishu_core = load_feishu_module()
 
 
 @pytest.fixture(autouse=True)

@@ -60,6 +60,30 @@ def test_alias_resolves_for_owning_profile(two_profiles):
 
 
 @requires_agent
+def test_alias_resolves_with_dynamic_skill_patch_after_other_profile(
+    two_profiles, tmp_path
+):
+    import hermes_constants
+
+    if not hasattr(hermes_constants, "set_hermes_home_override"):
+        pytest.skip("core has no context-local Hermes Home override")
+    from hermes_multitenancy.skills_dir_dynamic import (
+        install_dynamic_skills_dir_patch,
+    )
+
+    stale_home = tmp_path / "stale-profile"
+    token = hermes_constants.set_hermes_home_override(stale_home)
+    try:
+        install_dynamic_skills_dir_patch()
+        out = run_broker._rewrite_skill_slash_request(_req("pA", "/strategy 首页大卡"))
+        assert out.content != "/strategy 首页大卡"
+        assert "kep-trevi-strategy-recommend" in out.content
+        assert hermes_constants.get_hermes_home() == stale_home
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@requires_agent
 def test_alias_does_not_leak_to_other_profile(two_profiles):
     # resolve for A first (populates the global cache), then B must NOT inherit it
     run_broker._rewrite_skill_slash_request(_req("pA", "/strategy x"))

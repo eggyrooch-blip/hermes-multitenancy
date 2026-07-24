@@ -2742,7 +2742,7 @@ def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path
     async def fake_summarize(text, query, meta):
         return text[:80]
 
-    monkeypatch.setattr(session_search_tool, "_summarize_session", fake_summarize)
+    monkeypatch.setattr(session_search_tool, "_summarize_session", fake_summarize, raising=False)
     monkeypatch.setattr(broker, "_profile_home_for_name", lambda _profile_name: profile_home)
 
     token = "shared-search-token"
