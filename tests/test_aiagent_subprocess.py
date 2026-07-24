@@ -8295,7 +8295,17 @@ def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
 
     profile = tmp_path / "profiles" / "alice"
     profile.mkdir(parents=True)
-    cmd = ["/usr/bin/python3", "child.py"]
+    base_python = tmp_path / "base" / "python3"
+    base_python.parent.mkdir()
+    base_python.write_text("#!/bin/sh\n")
+    real_venv = tmp_path / "venvs" / "v019"
+    (real_venv / "bin").mkdir(parents=True)
+    (real_venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (real_venv / "bin" / "python").symlink_to(base_python)
+    linked_venv = tmp_path / "agent-install" / "venv"
+    linked_venv.parent.mkdir()
+    linked_venv.symlink_to(real_venv, target_is_directory=True)
+    cmd = [str(linked_venv / "bin" / "python"), "child.py"]
     wrapped = agent_real._wrap_with_sandbox(cmd, profile)
 
     assert wrapped[0] == str(fake_bin)
@@ -8305,7 +8315,9 @@ def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
     # -- separator before user cmd.
     assert "--" in wrapped
     sep_idx = wrapped.index("--")
-    assert wrapped[sep_idx + 1:] == cmd
+    resolved_launcher = str(real_venv.resolve() / "bin" / "python")
+    assert wrapped[sep_idx + 1:] == [resolved_launcher, "child.py"]
+    assert resolved_launcher != str(base_python.resolve())
 
 
 def test_wrap_linux_bwrap_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):

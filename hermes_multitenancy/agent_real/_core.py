@@ -3263,6 +3263,10 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
             )
         return cmd
 
+    if cmd and cmd[0] and Path(cmd[0]).is_absolute():
+        executable = Path(cmd[0])
+        cmd = [str(executable.parent.resolve() / executable.name), *cmd[1:]]
+
     # Platform dispatch. Each backend owns its own preflight checks and
     # failure semantics (macOS keeps a pilot-era WARNING+fallback; Linux is
     # post-pilot and raises on missing bwrap so systemd surfaces it).
