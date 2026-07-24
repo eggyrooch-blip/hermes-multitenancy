@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from .connector_failure_classifier import classify_connector_failure
+from .feishu_permission_errors import annotate_permission_error
 from .lark_cli_guard import (
     HERMES_LARK_CLI_AUTHORIZED,
     HERMES_LARK_CLI_REAL_BIN,
@@ -26,7 +28,6 @@ from .lark_cli_guard import (
 )
 from .runtime import strict_context_enabled
 from .update_center import sanitize_user_visible_output
-from .feishu_permission_errors import annotate_permission_error
 
 try:
     from tools.registry import registry, tool_error, tool_result
@@ -95,6 +96,32 @@ _SAFE_ENV_NAMES = {
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
 }
+
+
+def _failure_fields(
+    *,
+    exit_code: int | None = None,
+    stderr: str = "",
+    business_payload: dict[str, Any] | None = None,
+    failure_hint: str | None = None,
+    timed_out: bool = False,
+) -> dict[str, str | bool | None]:
+    classified = classify_connector_failure(
+        "lark-cli",
+        exit_code=exit_code,
+        stderr=stderr,
+        business_payload=business_payload,
+        failure_hint=failure_hint,
+        timed_out=timed_out,
+    )
+    return {
+        key: classified[key]
+        for key in ("failure_subsystem", "error_code", "retryable")
+    }
+
+
+def _classified_tool_error(message: str, *, failure_hint: str, **kwargs: Any) -> str:
+    return tool_error(message, **kwargs, **_failure_fields(failure_hint=failure_hint))
 
 
 def _redact(text: str) -> str:
@@ -701,19 +728,31 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     risk = str(args.get("risk") or "read").strip()
     argv_raw = args.get("argv")
     if mode not in {"shortcut", "schema", "api"}:
-        return tool_error("mode must be one of shortcut, schema, api")
+        return _classified_tool_error("mode must be one of shortcut, schema, api", failure_hint="request_invalid")
     if risk not in {"read", "write", "export", "admin"}:
-        return tool_error("risk must be one of read, write, export, admin")
+        return _classified_tool_error(
+            "risk must be one of read, write, export, admin",
+            failure_hint="request_invalid",
+        )
     if not isinstance(argv_raw, list) or not all(isinstance(item, str) and item for item in argv_raw):
-        return tool_error("argv must be a non-empty list of strings")
+        return _classified_tool_error(
+            "argv must be a non-empty list of strings",
+            failure_hint="request_invalid",
+        )
     if any(item == "--" for item in argv_raw):
-        return tool_error("argv must not contain raw -- separators")
+        return _classified_tool_error(
+            "argv must not contain raw -- separators",
+            failure_hint="request_invalid",
+        )
 
     argv = list(argv_raw)
     if mode == "api":
         api_req = _api_request_from_argv(argv)
         if not api_req:
-            return tool_error("api mode requires argv like ['api', '<METHOD>', '<PATH>'] or ['<METHOD>', '<PATH>']")
+            return _classified_tool_error(
+                "api mode requires argv like ['api', '<METHOD>', '<PATH>'] or ['<METHOD>', '<PATH>']",
+                failure_hint="request_invalid",
+            )
         path_for_command = _normalise_openapi_path_with_query(_api_path_arg_from_argv(argv))
         argv = (
             ["api", api_req[0], path_for_command, *argv[3:]]
@@ -721,19 +760,34 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             else ["api", api_req[0], path_for_command, *argv[2:]]
         )
     elif argv and argv[0] == "api":
-        return tool_error("api command must use mode=api")
+        return _classified_tool_error("api command must use mode=api", failure_hint="request_invalid")
 
     readonly_error = _readonly_lark_cli_error(mode, argv, risk)
     if readonly_error:
-        return tool_error(readonly_error, mode=mode, command=argv, risk=risk)
+        return _classified_tool_error(
+            readonly_error,
+            failure_hint="permission_denied",
+            mode=mode,
+            command=argv,
+            risk=risk,
+        )
 
     decision = _policy_decision(mode, argv, risk)
     if not decision.get("allowed"):
-        return tool_error(decision["reason"], mode=mode, command=argv, risk=risk)
+        return _classified_tool_error(
+            decision["reason"],
+            failure_hint="permission_denied",
+            mode=mode,
+            command=argv,
+            risk=risk,
+        )
 
     binary = _resolve_binary()
     if not binary:
-        return tool_error("lark-cli binary not found; set HERMES_LARK_CLI_BIN or install lark-cli")
+        return _classified_tool_error(
+            "lark-cli binary not found; set HERMES_LARK_CLI_BIN or install lark-cli",
+            failure_hint="dependency_unavailable",
+        )
 
     env = _safe_env()
     run_token = str(os.environ.get(HERMES_LARK_CLI_RUN_TOKEN) or "")
@@ -760,17 +814,46 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     timeout = min(int(args.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS)
     runtime_error = _profile_runtime_error(env)
     if runtime_error:
-        return tool_error(runtime_error, mode=mode, command=argv, risk=risk)
+        hint = "dependency_unavailable" if "broker is unavailable" in runtime_error else "identity_unbound"
+        return _classified_tool_error(
+            runtime_error,
+            failure_hint=hint,
+            mode=mode,
+            command=argv,
+            risk=risk,
+        )
     workspace = _workspace_root(env)
     output_paths, output_error = _extract_output_paths(command, workspace)
     if output_error:
-        return tool_error(output_error, mode=mode, command=argv, risk=risk)
+        return _classified_tool_error(
+            output_error,
+            failure_hint="request_invalid",
+            mode=mode,
+            command=argv,
+            risk=risk,
+        )
     identity_error = _personal_user_write_identity_error(env, mode, argv, risk, identity, requested_identity)
     if identity_error:
-        return tool_error(identity_error, mode=mode, command=argv, risk=risk, identity=identity)
+        hint = "identity_unbound" if "requires bound Feishu user identity" in identity_error else "permission_denied"
+        return _classified_tool_error(
+            identity_error,
+            failure_hint=hint,
+            mode=mode,
+            command=argv,
+            risk=risk,
+            identity=identity,
+        )
     im_read_error = _feishu_im_read_identity_error(env, mode, argv, risk, identity)
     if im_read_error:
-        return tool_error(im_read_error, mode=mode, command=argv, risk=risk, identity=identity)
+        hint = "identity_unbound" if im_read_error == _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED else "permission_denied"
+        return _classified_tool_error(
+            im_read_error,
+            failure_hint=hint,
+            mode=mode,
+            command=argv,
+            risk=risk,
+            identity=identity,
+        )
 
     cwd = str(workspace) if workspace is not None and workspace.exists() else None
     try:
@@ -791,10 +874,12 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             risk=risk,
             stdout_redacted=_redact(str(exc.output or "")),
             stderr_redacted=_redact(str(exc.stderr or "")),
+            **_failure_fields(timed_out=True),
         )
     except PermissionError as exc:
-        return tool_error(
+        return _classified_tool_error(
             f"lark-cli failed in profile sandbox: {_redact(str(exc))}",
+            failure_hint="permission_denied",
             mode=mode,
             command=argv,
             risk=risk,
@@ -803,8 +888,13 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     stdout = _strip_non_business_notices(_redact(completed.stdout))
     stderr = _strip_non_business_notices(_redact(completed.stderr))
     parsed = _parse_json_output(stdout)
+    fields = _failure_fields(
+        exit_code=completed.returncode,
+        stderr=stderr,
+        business_payload=parsed if isinstance(parsed, dict) else None,
+    )
     result = {
-        "ok": completed.returncode == 0,
+        "ok": fields["error_code"] is None,
         "approval_required": False,
         "mode": mode,
         "identity": identity,
@@ -814,6 +904,7 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         "stdout": stdout if parsed is None else "",
         "stderr_redacted": stderr,
         "files": _existing_output_files(output_paths),
+        **fields,
     }
     result = annotate_permission_error(result, app_id=env.get("LARKSUITE_CLI_APP_ID"))
     return tool_result(**result)

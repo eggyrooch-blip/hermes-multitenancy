@@ -61,6 +61,38 @@ _TERMINAL_BUSINESS_CODES: dict[str, frozenset[int]] = {
 NEEDS_REAUTH = "needs_reauth"
 TRANSIENT = "transient"
 
+_FEISHU_AUTH_CODES = frozenset({99991668, 20026, 20037, 20064, 20073})
+_FEISHU_PERMISSION_CODES = frozenset({99991672, 99991679})
+_FEISHU_RATE_LIMIT_CODES = frozenset({230020})
+_FEISHU_HINTS = {
+    "identity_unbound": ("identity", "FEISHU_IDENTITY_UNBOUND", False),
+    "identity_mismatch": ("identity", "FEISHU_IDENTITY_MISMATCH", False),
+    "permission_denied": ("permission", "FEISHU_PERMISSION_DENIED", False),
+    "request_invalid": ("lark_api", "FEISHU_REQUEST_INVALID", False),
+    "dependency_unavailable": ("transport", "FEISHU_DEPENDENCY_UNAVAILABLE", False),
+}
+_FEISHU_RATE_LIMIT_RE = re.compile(
+    r"\b(?:http|status|statuscode|code)\b\W{0,4}429\b|\btoo many requests\b|\brate[ _-]?limit(?:ed)?\b",
+    re.IGNORECASE,
+)
+_FEISHU_TIMEOUT_RE = re.compile(
+    r"\b(?:etimedout|timed out|timeout)\b",
+    re.IGNORECASE,
+)
+_FEISHU_UNAVAILABLE_RE = re.compile(
+    r"\b(?:http|status|statuscode|code)\b\W{0,4}5\d\d\b"
+    r"|\b(?:econnreset|connection refused|network unreachable|temporarily unavailable)\b",
+    re.IGNORECASE,
+)
+_FEISHU_IDENTITY_MISMATCH_RE = re.compile(
+    r"\b(?:credential )?identity (?:verification failed|mismatch)\b|\bowner mismatch\b",
+    re.IGNORECASE,
+)
+_FEISHU_IDENTITY_UNBOUND_RE = re.compile(
+    r"\bidentity (?:is )?not bound\b|\bbound feishu user identity\b",
+    re.IGNORECASE,
+)
+
 
 def _stderr_is_terminal(stderr: str) -> bool:
     return bool(stderr and _TERMINAL_STDERR_RE.search(stderr))
@@ -82,15 +114,140 @@ def _extract_body_code(stderr: str) -> Optional[int]:
     return None
 
 
+def _structured_code(node: object, depth: int = 0) -> Optional[int]:
+    if not isinstance(node, dict):
+        return None
+    value = node.get("code")
+    if isinstance(value, int) and not isinstance(value, bool):
+        code = value
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        try:
+            code = int(value.strip())
+        except ValueError:
+            code = None
+    else:
+        code = None
+    if code is not None and code != 0:
+        return code
+    if depth >= 2:
+        return None
+    for key in ("error", "data"):
+        nested = _structured_code(node.get(key), depth + 1)
+        if nested is not None:
+            return nested
+    return None
+
+
+def _feishu_taxonomy(
+    *,
+    http_status: Optional[int],
+    exit_code: Optional[int],
+    stderr: str,
+    business_payload: Optional[dict[str, Any]],
+    failure_hint: Optional[str],
+    timed_out: bool,
+) -> dict[str, str | bool | None]:
+    if failure_hint in _FEISHU_HINTS:
+        subsystem, code, retryable = _FEISHU_HINTS[failure_hint]
+        return {"failure_subsystem": subsystem, "error_code": code, "retryable": retryable}
+    if http_status is not None:
+        status = int(http_status)
+        if status == 401:
+            return {
+                "failure_subsystem": "credential",
+                "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+                "retryable": False,
+            }
+        if status == 403:
+            return {
+                "failure_subsystem": "permission",
+                "error_code": "FEISHU_PERMISSION_DENIED",
+                "retryable": False,
+            }
+        if status == 429:
+            return {"failure_subsystem": "lark_api", "error_code": "FEISHU_RATE_LIMITED", "retryable": True}
+        if status == 408:
+            return {
+                "failure_subsystem": "transport",
+                "error_code": "FEISHU_DEPENDENCY_TIMEOUT",
+                "retryable": True,
+            }
+        if 500 <= status <= 599:
+            return {
+                "failure_subsystem": "transport",
+                "error_code": "FEISHU_DEPENDENCY_UNAVAILABLE",
+                "retryable": True,
+            }
+        if status in {400, 422}:
+            return {"failure_subsystem": "lark_api", "error_code": "FEISHU_REQUEST_INVALID", "retryable": False}
+
+    body_code = _structured_code(business_payload)
+    if body_code in _FEISHU_AUTH_CODES:
+        return {
+            "failure_subsystem": "credential",
+            "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+            "retryable": False,
+        }
+    if body_code in _FEISHU_PERMISSION_CODES:
+        return {
+            "failure_subsystem": "permission",
+            "error_code": "FEISHU_PERMISSION_DENIED",
+            "retryable": False,
+        }
+    if body_code in _FEISHU_RATE_LIMIT_CODES:
+        return {"failure_subsystem": "lark_api", "error_code": "FEISHU_RATE_LIMITED", "retryable": True}
+    if body_code is not None:
+        return {"failure_subsystem": "lark_api", "error_code": "FEISHU_BUSINESS_ERROR", "retryable": False}
+
+    if timed_out or _FEISHU_TIMEOUT_RE.search(stderr):
+        return {
+            "failure_subsystem": "transport",
+            "error_code": "FEISHU_DEPENDENCY_TIMEOUT",
+            "retryable": True,
+        }
+    if _FEISHU_IDENTITY_MISMATCH_RE.search(stderr):
+        return {
+            "failure_subsystem": "identity",
+            "error_code": "FEISHU_IDENTITY_MISMATCH",
+            "retryable": False,
+        }
+    if _FEISHU_IDENTITY_UNBOUND_RE.search(stderr):
+        return {
+            "failure_subsystem": "identity",
+            "error_code": "FEISHU_IDENTITY_UNBOUND",
+            "retryable": False,
+        }
+    if _FEISHU_RATE_LIMIT_RE.search(stderr):
+        return {"failure_subsystem": "lark_api", "error_code": "FEISHU_RATE_LIMITED", "retryable": True}
+    if _FEISHU_UNAVAILABLE_RE.search(stderr):
+        return {
+            "failure_subsystem": "transport",
+            "error_code": "FEISHU_DEPENDENCY_UNAVAILABLE",
+            "retryable": False,
+        }
+    if _stderr_is_terminal(stderr):
+        return {
+            "failure_subsystem": "credential",
+            "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+            "retryable": False,
+        }
+    if exit_code == 0:
+        return {"failure_subsystem": None, "error_code": None, "retryable": False}
+    return {"failure_subsystem": "lark_api", "error_code": "FEISHU_UNKNOWN", "retryable": False}
+
+
 def classify_connector_failure(
     connector_id: str,
     *,
     http_status: Optional[int] = None,
-    exit_code: Optional[int] = None,  # noqa: ARG001 — accepted but DELIBERATELY not trusted
+    exit_code: Optional[int] = None,
     stderr: Optional[str] = None,
     payload: Optional[dict[str, Any]] = None,
     refresh_class: Optional[str] = None,
-) -> dict[str, str]:
+    business_payload: Optional[dict[str, Any]] = None,
+    failure_hint: Optional[str] = None,
+    timed_out: bool = False,
+) -> dict[str, str | bool | None]:
     """Classify a connector failure as ``needs_reauth`` (terminal, user must re-auth
     or the token must be refreshed) or ``transient`` (network / server blip → retry).
 
@@ -103,39 +260,67 @@ def classify_connector_failure(
       4. stderr/body terminal markers (401/unauthorized/token expired/…) → needs_reauth.
       5. otherwise → transient.
     """
+    def finish(result: dict[str, str]) -> dict[str, str | bool | None]:
+        if connector_id != "lark-cli":
+            return result
+        taxonomy = _feishu_taxonomy(
+            http_status=http_status,
+            exit_code=exit_code,
+            stderr=stderr or "",
+            business_payload=business_payload,
+            failure_hint=failure_hint,
+            timed_out=timed_out,
+        )
+        if (
+            taxonomy["error_code"] == "FEISHU_UNKNOWN"
+            and exit_code is None
+            and not stderr
+            and business_payload is None
+        ):
+            taxonomy = (
+                {
+                    "failure_subsystem": "credential",
+                    "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+                    "retryable": False,
+                }
+                if result["class"] == NEEDS_REAUTH
+                else {"failure_subsystem": None, "error_code": None, "retryable": False}
+            )
+        return result | taxonomy
+
     # 0. Feishu authoritative refresh_class (from classify_refresh_error) — the most
     #    precise signal when the worker already got a curated OAuth verdict. 'invalid'
     #    means the refresh_token itself is rejected → terminal; 'retryable'/'ok' → not.
     if refresh_class is not None:
         if refresh_class == "invalid":
-            return {"class": NEEDS_REAUTH, "reason": "refresh_class_invalid"}
+            return finish({"class": NEEDS_REAUTH, "reason": "refresh_class_invalid"})
         if refresh_class in ("retryable", "ok"):
-            return {"class": TRANSIENT, "reason": f"refresh_class_{refresh_class}"}
+            return finish({"class": TRANSIENT, "reason": f"refresh_class_{refresh_class}"})
 
     # 1. Payload-direct (Feishu-UAT-shaped tokens carry expiry).
     if payload is not None:
         if payload_refresh_expired(payload):
-            return {"class": NEEDS_REAUTH, "reason": "refresh_token_expired"}
+            return finish({"class": NEEDS_REAUTH, "reason": "refresh_token_expired"})
         if payload_access_expired(payload):
             # access expired but refresh alive → the renewal worker can refresh it.
-            return {"class": TRANSIENT, "reason": "access_expired_refreshable"}
+            return finish({"class": TRANSIENT, "reason": "access_expired_refreshable"})
 
     # 2. Authoritative HTTP terminal — overrides exit_code (hades 401/exit0 trap).
     if http_status is not None and int(http_status) in TERMINAL_HTTP_STATUSES:
-        return {"class": NEEDS_REAUTH, "reason": f"http_{int(http_status)}"}
+        return finish({"class": NEEDS_REAUTH, "reason": f"http_{int(http_status)}"})
 
     # 3. Per-connector terminal business code surfaced in the body.
     body_code = _extract_body_code(stderr or "")
     if body_code is not None and body_code in _TERMINAL_BUSINESS_CODES.get(connector_id, frozenset()):
-        return {"class": NEEDS_REAUTH, "reason": f"business_{body_code}"}
+        return finish({"class": NEEDS_REAUTH, "reason": f"business_{body_code}"})
 
     # 4. stderr/body terminal markers — again overrides a lying exit_code / local status.
     if _stderr_is_terminal(stderr or ""):
-        return {"class": NEEDS_REAUTH, "reason": "stderr_terminal"}
+        return finish({"class": NEEDS_REAUTH, "reason": "stderr_terminal"})
 
     # 5. Everything else (5xx, timeouts, connection refused, unknown non-zero) → transient.
-    return {"class": TRANSIENT, "reason": "transient_or_unknown"}
+    return finish({"class": TRANSIENT, "reason": "transient_or_unknown"})
 
 
-def is_needs_reauth(result: dict[str, str]) -> bool:
+def is_needs_reauth(result: dict[str, str | bool | None]) -> bool:
     return result.get("class") == NEEDS_REAUTH

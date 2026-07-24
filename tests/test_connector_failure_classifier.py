@@ -14,6 +14,87 @@ def cls(cid, **kw):
     return classify_connector_failure(cid, **kw)["class"]
 
 
+def taxonomy(**kw):
+    result = classify_connector_failure("lark-cli", **kw)
+    return {
+        key: result[key]
+        for key in ("failure_subsystem", "error_code", "retryable")
+    }
+
+
+def test_lark_cli_structured_failure_taxonomy():
+    cases = [
+        (
+            {"business_payload": {"code": 99991668}},
+            ("credential", "FEISHU_AUTH_REAUTH_REQUIRED", False),
+        ),
+        (
+            {"refresh_class": "invalid"},
+            ("credential", "FEISHU_AUTH_REAUTH_REQUIRED", False),
+        ),
+        (
+            {"failure_hint": "identity_unbound"},
+            ("identity", "FEISHU_IDENTITY_UNBOUND", False),
+        ),
+        (
+            {"failure_hint": "identity_mismatch"},
+            ("identity", "FEISHU_IDENTITY_MISMATCH", False),
+        ),
+        (
+            {"business_payload": {"code": 99991672}},
+            ("permission", "FEISHU_PERMISSION_DENIED", False),
+        ),
+        (
+            {"http_status": 429},
+            ("lark_api", "FEISHU_RATE_LIMITED", True),
+        ),
+        (
+            {"timed_out": True},
+            ("transport", "FEISHU_DEPENDENCY_TIMEOUT", True),
+        ),
+        (
+            {"http_status": 503},
+            ("transport", "FEISHU_DEPENDENCY_UNAVAILABLE", True),
+        ),
+        (
+            {"http_status": 400},
+            ("lark_api", "FEISHU_REQUEST_INVALID", False),
+        ),
+        (
+            {"business_payload": {"code": 123456}},
+            ("lark_api", "FEISHU_BUSINESS_ERROR", False),
+        ),
+        (
+            {"exit_code": 1, "stderr": "unrecognized failure"},
+            ("lark_api", "FEISHU_UNKNOWN", False),
+        ),
+    ]
+    for signals, expected in cases:
+        result = taxonomy(**signals)
+        assert tuple(result.values()) == expected
+
+
+def test_lark_cli_taxonomy_prefers_structured_signal_over_exit_and_text():
+    assert taxonomy(
+        http_status=429,
+        exit_code=1,
+        stderr="token expired",
+        business_payload={"code": 99991672},
+    ) == {
+        "failure_subsystem": "lark_api",
+        "error_code": "FEISHU_RATE_LIMITED",
+        "retryable": True,
+    }
+
+
+def test_lark_cli_success_has_empty_failure_fields():
+    assert taxonomy(exit_code=0, business_payload={"code": 0}) == {
+        "failure_subsystem": None,
+        "error_code": None,
+        "retryable": False,
+    }
+
+
 # --- terminal HTTP -----------------------------------------------------------
 def test_http_401_403_422_are_needs_reauth():
     for status in (401, 403, 422):

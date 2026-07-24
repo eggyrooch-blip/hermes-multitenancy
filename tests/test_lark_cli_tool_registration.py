@@ -1279,3 +1279,171 @@ def test_lark_cli_tool_filters_non_business_update_notice(monkeypatch, tmp_path)
     assert "new version" not in rendered
     assert "lark-cli update" not in rendered
     assert "1.0.34" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "returncode", "expected"),
+    [
+        (
+            '{"code":99991668,"msg":"redacted fixture"}',
+            "",
+            0,
+            ("credential", "FEISHU_AUTH_REAUTH_REQUIRED", False),
+        ),
+        (
+            '{"code":99991672,"msg":"redacted fixture"}',
+            "",
+            1,
+            ("permission", "FEISHU_PERMISSION_DENIED", False),
+        ),
+        (
+            '{"code":230020,"msg":"redacted fixture"}',
+            "",
+            1,
+            ("lark_api", "FEISHU_RATE_LIMITED", True),
+        ),
+        (
+            '{"code":123456,"msg":"redacted fixture"}',
+            "",
+            1,
+            ("lark_api", "FEISHU_BUSINESS_ERROR", False),
+        ),
+        (
+            "",
+            "unrecognized failure",
+            1,
+            ("lark_api", "FEISHU_UNKNOWN", False),
+        ),
+        (
+            "",
+            "credential identity verification failed",
+            1,
+            ("identity", "FEISHU_IDENTITY_MISMATCH", False),
+        ),
+    ],
+)
+def test_lark_cli_tool_returns_structured_failure_taxonomy(
+    monkeypatch,
+    tmp_path,
+    stdout,
+    stderr,
+    returncode,
+    expected,
+):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+
+    class Completed:
+        pass
+
+    completed = Completed()
+    completed.returncode = returncode
+    completed.stdout = stdout
+    completed.stderr = stderr
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["GET", "/open-apis/authen/v1/user_info"],
+            "identity": "user",
+            "risk": "read",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is False
+    assert (
+        result["failure_subsystem"],
+        result["error_code"],
+        result["retryable"],
+    ) == expected
+    machine_fields = json.dumps(
+        {
+            "failure_subsystem": result["failure_subsystem"],
+            "error_code": result["error_code"],
+            "retryable": result["retryable"],
+        }
+    )
+    assert "token" not in machine_fields.lower()
+    assert "open_id" not in machine_fields.lower()
+
+
+def test_lark_cli_tool_timeout_has_retryable_transport_taxonomy(monkeypatch, tmp_path):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setattr(
+        lark_cli_tool.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            lark_cli_tool.subprocess.TimeoutExpired("lark-cli", 60)
+        ),
+    )
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["GET", "/open-apis/authen/v1/user_info"],
+            "identity": "user",
+            "risk": "read",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert (
+        result["failure_subsystem"],
+        result["error_code"],
+        result["retryable"],
+    ) == ("transport", "FEISHU_DEPENDENCY_TIMEOUT", True)
+
+
+def test_lark_cli_tool_unbound_profile_is_classified_before_subprocess(monkeypatch, tmp_path):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("WORKSPACE", raising=False)
+    monkeypatch.setattr(
+        lark_cli_tool.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbound profile must fail before spawning lark-cli")
+        ),
+    )
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["GET", "/open-apis/authen/v1/user_info"],
+            "identity": "user",
+            "risk": "read",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert (
+        result["failure_subsystem"],
+        result["error_code"],
+        result["retryable"],
+    ) == ("identity", "FEISHU_IDENTITY_UNBOUND", False)
