@@ -17,8 +17,10 @@ import contextvars
 import types
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -3166,7 +3168,7 @@ def test_run_with_aiagent_sets_gateway_session_context(monkeypatch, tmp_path: Pa
         def __init__(self, **kwargs):
             seen["chat_id_kwarg"] = kwargs.get("chat_id", "")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             from gateway.session_context import get_session_env
 
             seen["session_chat_id"] = get_session_env("HERMES_SESSION_CHAT_ID")
@@ -3214,7 +3216,7 @@ def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_
         def __init__(self, **kwargs):
             seen["toolsets"] = kwargs.get("toolsets")
 
-        def run_conversation(self, user_message, task_id, conversation_history=None):
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
             seen["user_message"] = user_message
             return {"final_response": "ok"}
 
@@ -3227,8 +3229,85 @@ def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_
     event.source.user_id = "ou_clean_upstream_sender"
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
-    assert seen["user_message"] == "hello"
+    assert seen["user_message"].endswith("\nhello")
     assert seen["cleanup"] is True
+
+
+@pytest.mark.parametrize("platform", ["feishu", "webui", "cron"])
+def test_run_with_aiagent_adds_current_time_envelope_without_persisting_it(
+    monkeypatch,
+    tmp_path: Path,
+    platform: str,
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    seen: dict[str, str] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        def run_conversation(
+            self,
+            user_message,
+            task_id,
+            conversation_history=None,
+            persist_user_message=None,
+        ):
+            seen["user_message"] = user_message
+            seen["persist_user_message"] = persist_user_message
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value=platform)
+    before = datetime.now(ZoneInfo("Asia/Shanghai"))
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    after = datetime.now(ZoneInfo("Asia/Shanghai"))
+
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    expected_prefixes = {
+        f"[{weekdays[current.weekday()]} {current.isoformat(timespec='minutes')} Asia/Shanghai]\n"
+        for current in (before, after)
+    }
+    assert any(
+        seen["user_message"].startswith(prefix) for prefix in expected_prefixes
+    )
+    assert seen["user_message"].endswith("\nhello")
+    assert seen["persist_user_message"] == "hello"
+
+
+def test_run_with_aiagent_rejects_invalid_profile_timezone(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "timezone: Mars/Olympus_Mons\nmodel:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=object))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="invalid profile timezone"):
+        agent_real._run_with_aiagent(_event(), profile_home)
 
 
 def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tmp_path: Path):
@@ -3255,7 +3334,7 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
             captured["kwargs"] = dict(kwargs)
             captured["ephemeral_system_prompt"] = ephemeral_system_prompt
 
-        def run_conversation(self, user_message, task_id, conversation_history=None, system_message=None):
+        def run_conversation(self, user_message, task_id, conversation_history=None, system_message=None, persist_user_message=None):
             captured["run_system_message"] = system_message
             return {"final_response": "ok"}
 
@@ -3304,7 +3383,7 @@ def test_run_with_aiagent_falls_back_when_core_lacks_ephemeral_seam(monkeypatch,
                     "__init__() got an unexpected keyword argument 'ephemeral_system_prompt'"
                 )
 
-        def run_conversation(self, user_message, task_id, conversation_history=None):
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -3345,7 +3424,7 @@ def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -3381,7 +3460,7 @@ def test_run_with_aiagent_applies_expert_skill_scope_cleanup(monkeypatch, tmp_pa
         def __init__(self, **kwargs):
             captured["constructed"] = True
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -3459,7 +3538,7 @@ def test_run_with_aiagent_preserves_short_parent_tmp_and_profile_child_tmp(
         def __init__(self, **kwargs):
             pass
 
-        def run_conversation(self, user_message, task_id, conversation_history=None):
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
             from tools import code_execution_tool
 
             cached_tempdir = tempfile.tempdir
@@ -3527,7 +3606,7 @@ def test_run_with_aiagent_registers_vod_provider_in_child_process(monkeypatch, t
             provider = get_provider("tencent-vod")
             seen["provider_name_at_init"] = getattr(provider, "name", None)
 
-        def run_conversation(self, user_message, task_id, conversation_history=None):
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
             provider = get_provider("tencent-vod")
             seen["provider_name_at_run"] = getattr(provider, "name", None)
             return {"final_response": "ok"}
@@ -3568,7 +3647,7 @@ def test_run_with_aiagent_passes_router_history_without_current_user(monkeypatch
         def __init__(self, **kwargs):
             pass
 
-        def run_conversation(self, user_message, task_id, conversation_history=None):
+        def run_conversation(self, user_message, task_id, conversation_history=None, persist_user_message=None):
             seen["user_message"] = user_message
             seen["conversation_history"] = conversation_history
             return {"final_response": "ok"}
@@ -3588,13 +3667,11 @@ def test_run_with_aiagent_passes_router_history_without_current_user(monkeypatch
     ]
 
     assert agent_real._run_with_aiagent(event, profile_home, messages=messages) == "ok"
-    assert seen == {
-        "user_message": "send me the link",
-        "conversation_history": [
-            {"role": "user", "content": "create a doc"},
-            {"role": "assistant", "content": "created doc doxcn123"},
-        ],
-    }
+    assert seen["user_message"].endswith("\nsend me the link")
+    assert seen["conversation_history"] == [
+        {"role": "user", "content": "create a doc"},
+        {"role": "assistant", "content": "created doc doxcn123"},
+    ]
 
 
 def test_aiagent_session_id_is_stable_across_feishu_message_ids(tmp_path: Path):
@@ -3807,7 +3884,7 @@ def test_run_with_aiagent_resolves_toolsets_from_event_platform(monkeypatch, tmp
         def __init__(self, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -3854,7 +3931,7 @@ def test_run_with_aiagent_passes_disabled_toolsets_to_core(monkeypatch, tmp_path
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
             captured["disabled_toolsets"] = kwargs.get("disabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -3895,7 +3972,7 @@ def test_run_with_aiagent_removes_delegation_toolset_for_ingest_runs(monkeypatch
         def __init__(self, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -3935,7 +4012,7 @@ def test_run_with_aiagent_adds_terminal_for_ingest_strict_toolsets(monkeypatch, 
         def __init__(self, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -4024,7 +4101,7 @@ def test_run_with_aiagent_ingest_secret_env_builds_authorization_header(
         def __init__(self, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             env_secret_dir = Path(os.environ["HERMES_INGEST_SECRET_DIR"])
             bearer = (env_secret_dir / "cms_bearer").read_text(encoding="utf-8")
             authorization = f"Bearer {bearer}"
@@ -4085,7 +4162,7 @@ def test_run_with_aiagent_reapplies_profile_home_after_agent_init(
             os.environ["TERMINAL_HOME_MODE"] = "auto"
             os.environ["HOME"] = "/home/hermes"
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             captured["home"] = os.environ.get("HOME")
             captured["mode"] = os.environ.get("TERMINAL_HOME_MODE")
             captured["kep_profile"] = os.environ.get("KEP_PROFILE")
@@ -4144,7 +4221,7 @@ def test_execute_code_child_env_patch_survives_tool_time_env_reset(
         def __init__(self, **kwargs):
             pass
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             os.environ["TERMINAL_HOME_MODE"] = "auto"
             os.environ["HOME"] = "/home/hermes"
             child_env = fake_code_execution_tool._scrub_child_env(os.environ)
@@ -4333,7 +4410,7 @@ def test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs(
         def __init__(self, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -4392,7 +4469,7 @@ def test_run_with_aiagent_redacts_ingest_secret_from_finalize_logs(
         def __init__(self, **kwargs):
             pass
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {
                 "failed": True,
                 "final_response": None,
@@ -4462,7 +4539,7 @@ def test_run_with_aiagent_keeps_delegation_toolset_for_non_ingest_runs(monkeypat
         def __init__(self, **kwargs):
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -4499,7 +4576,7 @@ def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_
         def __init__(self, **kwargs):
             seen["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             seen["user_message"] = user_message
             return {"final_response": "ok"}
 
@@ -4515,7 +4592,7 @@ def test_run_with_aiagent_tolerates_missing_legacy_feishu_oapi(monkeypatch, tmp_
     assert "lark-cli" in (seen["enabled_toolsets"] or [])
     assert "terminal" in (seen["enabled_toolsets"] or [])
     assert "file" in (seen["enabled_toolsets"] or [])
-    assert seen["user_message"] == "hello"
+    assert seen["user_message"].endswith("\nhello")
 
 
 def test_run_with_aiagent_inherits_shared_model_config(monkeypatch, tmp_path: Path):
@@ -4541,7 +4618,7 @@ def test_run_with_aiagent_inherits_shared_model_config(monkeypatch, tmp_path: Pa
             captured["model"] = kwargs.get("model")
             captured["enabled_toolsets"] = kwargs.get("enabled_toolsets")
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -4575,7 +4652,7 @@ def test_run_with_aiagent_uses_webui_session_model_metadata(monkeypatch, tmp_pat
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -4665,7 +4742,7 @@ def test_run_with_aiagent_forces_employee_key_across_main_and_aux(monkeypatch, t
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             captured["runtime_at_run"] = list(runtime_calls)
             captured["ambient_openai_key"] = os.environ.get("OPENAI_API_KEY")
             return {"final_response": "ok"}
@@ -4865,7 +4942,7 @@ def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             self.kwargs["tool_progress_callback"](
                 "tool.started", "feishu_task_tasklist", "rename", {"action": "patch"}
             )
@@ -4928,7 +5005,7 @@ def test_run_with_aiagent_ignores_reasoning_available_preview(monkeypatch, tmp_p
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             self.kwargs["tool_progress_callback"](
                 "reasoning.available",
                 "",
@@ -4995,7 +5072,7 @@ def test_run_with_aiagent_bridges_gateway_approval_to_event_sink(monkeypatch, tm
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             session_key = self.kwargs["gateway_session_key"]
             assert session_key == "multitenancy:feishu:coder:oc_test:ou_test"
             notify = registered[session_key]
@@ -5054,7 +5131,7 @@ def test_run_with_aiagent_bridges_webui_clarify_to_event_sink(monkeypatch, tmp_p
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             answer = self.kwargs["clarify_callback"](
                 "Which report style?",
                 ["brief", "detailed"],
@@ -5115,7 +5192,7 @@ def test_run_with_aiagent_bridges_feishu_clarify_to_event_sink(monkeypatch, tmp_
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": f"picked:{self.kwargs['clarify_callback']('Which?', ['A', 'B'])}"}
 
         def cleanup(self):
@@ -5177,7 +5254,7 @@ def test_run_with_aiagent_marks_webui_session_async_delivery_unsupported(monkeyp
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             from gateway.session_context import async_delivery_supported
 
             observed["async_delivery_supported"] = async_delivery_supported()
@@ -5246,8 +5323,9 @@ def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tm
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             observed["user_message"] = user_message
+            observed["persist_user_message"] = persist_user_message
             return {"final_response": "done"}
 
         def cleanup(self):
@@ -5280,6 +5358,9 @@ def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tm
     assert "WebUI image attachment analysis" in str(observed["user_message"])
     assert "账单详情" in str(observed["user_message"])
     assert "385.00" in str(observed["user_message"])
+    assert str(observed["user_message"]).split("\n", 1)[1] == str(
+        observed["persist_user_message"]
+    )
 
 
 def test_run_with_aiagent_guards_against_inference_when_webui_image_analysis_fails(
@@ -5320,7 +5401,7 @@ def test_run_with_aiagent_guards_against_inference_when_webui_image_analysis_fai
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             observed["user_message"] = user_message
             return {"final_response": "done"}
 
@@ -5417,7 +5498,7 @@ def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeyp
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             observed["user_message"] = user_message
             return {"final_response": "done"}
 
@@ -5484,7 +5565,7 @@ def test_run_with_aiagent_does_not_prefill_webui_image_outside_workspace(monkeyp
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             observed["user_message"] = user_message
             return {"final_response": "done"}
 
@@ -5548,7 +5629,7 @@ def test_run_with_aiagent_only_prefills_webui_images_from_uploads(monkeypatch, t
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             observed["user_message"] = user_message
             return {"final_response": "done"}
 
@@ -5617,7 +5698,7 @@ def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypa
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             observed["user_message"] = user_message
             return {"final_response": "done"}
 
@@ -5679,7 +5760,7 @@ def test_run_with_aiagent_keeps_non_webui_async_delivery_enabled(monkeypatch, tm
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "done"}
 
         def cleanup(self):
@@ -5731,7 +5812,7 @@ def test_run_with_aiagent_warns_when_runtime_rejects_async_delivery_kwarg(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "done"}
 
         def cleanup(self):
@@ -5829,7 +5910,7 @@ def test_run_with_aiagent_closes_real_agent_resources(monkeypatch, tmp_path: Pat
         def __init__(self, **kwargs):
             pass
 
-        def run_conversation(self, user_message, task_id):
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
             return {"final_response": "ok"}
 
         def close(self):

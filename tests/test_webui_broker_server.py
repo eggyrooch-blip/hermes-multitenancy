@@ -1990,7 +1990,7 @@ def test_webui_run_broker_event_exposes_owner_open_id_for_lark_cli_identity():
     assert _resolve_subprocess_sender_open_id(event) == "ou_owner"
 
 
-def test_webui_run_broker_event_injects_current_datetime_instruction():
+def test_webui_run_broker_event_preserves_metadata_without_a_second_time_source():
     from hermes_multitenancy.run_models import RunRequest
     from hermes_multitenancy.webui_broker_server import _build_webui_event
 
@@ -2004,13 +2004,7 @@ def test_webui_run_broker_event_injects_current_datetime_instruction():
     )
 
     event = _build_webui_event(request)
-    instructions = event.raw_event["metadata"]["instructions"]
-
-    assert "existing instructions" in instructions
-    assert "Current date/time:" in instructions
-    assert "Timezone:" in instructions
-    assert "Interpret relative dates" in instructions
-    assert "room attendee declined" in instructions
+    assert event.raw_event["metadata"] == {"instructions": "existing instructions"}
 
 
 def test_run_broker_loads_only_shared_runtime_env(monkeypatch, tmp_path: Path):

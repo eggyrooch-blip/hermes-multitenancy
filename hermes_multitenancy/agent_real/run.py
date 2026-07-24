@@ -17,8 +17,10 @@ import importlib
 import threading
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def _install_billing_delegation_guard(enabled: bool):
@@ -193,6 +195,19 @@ def _run_with_aiagent(
         fallback_base_url=base_url,
         fallback_model=model_only,
         metadata_source=str(event_metadata.get("source") or ""),
+    )
+    persist_user_message = user_text
+    timezone_name = str(config.get("timezone") or "Asia/Shanghai").strip()
+    try:
+        current_time = datetime.now(ZoneInfo(timezone_name))
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(f"invalid profile timezone: {timezone_name!r}") from exc
+    weekday = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[
+        current_time.weekday()
+    ]
+    user_text = (
+        f"[{weekday} {current_time.isoformat(timespec='minutes')} {timezone_name}]\n"
+        f"{user_text}"
     )
     session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
     gateway_session_key = _resolve_multitenant_gateway_session_key(
@@ -501,6 +516,7 @@ def _run_with_aiagent(
             run_kwargs: dict[str, Any] = {
                 "user_message": user_text,
                 "task_id": str(session_id),
+                "persist_user_message": persist_user_message,
             }
             if conversation_history is not None:
                 run_kwargs["conversation_history"] = conversation_history
