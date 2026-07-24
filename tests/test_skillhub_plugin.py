@@ -279,8 +279,14 @@ def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path)
         downloader=lambda _: _plugin_zip(content_tag="RELEASE-168-CONTENT"),
     )
     assert result_b["action"] == "plugin_install"
-    repo_b = Path(str(_managed_manifest(shared_home)["repo"]))
+    upgraded_manifest = _managed_manifest(shared_home)
+    repo_b = Path(str(upgraded_manifest["repo"]))
     assert repo_b.name == "1.0.1-r168"
+    assert upgraded_manifest["release_version"] == "1.0.1"
+    assert upgraded_manifest["release_id"] == "168"
+    assert isinstance(upgraded_manifest["release_installed_at"], int)
+    assert upgraded_manifest["release_installed_at"] > 0
+    installed_at = upgraded_manifest["release_installed_at"]
     skill_md = repo_b / "skills" / "kep-halo-cli" / "SKILL.md"
     assert "RELEASE-168-CONTENT" in skill_md.read_text(encoding="utf-8")
     installed = profiles_root / "alice" / "skills" / "kep-halo-cli" / "SKILL.md"
@@ -294,7 +300,9 @@ def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path)
         downloader=lambda _: _plugin_zip(content_tag="RELEASE-168-CONTENT"),
     )
     assert result_dup["action"] == "plugin_install"
-    assert Path(str(_managed_manifest(shared_home)["repo"])).name == "1.0.1-r168"
+    duplicate_manifest = _managed_manifest(shared_home)
+    assert Path(str(duplicate_manifest["repo"])).name == "1.0.1-r168"
+    assert duplicate_manifest["release_installed_at"] == installed_at
 
 
 def test_failed_plugin_upgrade_keeps_previous_expert_active(

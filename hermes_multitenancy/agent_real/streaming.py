@@ -90,8 +90,8 @@ async def _stream_loop(
     candidates.extend(fallback_models)
 
     soul_text = _load_soul(profile_home)
-    # Expert Role-Override overlay (ephemeral, this run only): override block leads
-    # the single system message, SOUL demoted below it (verdict B). SOUL.md unchanged.
+    # Expert mode (ephemeral, this run only): the Hermes-hosted expert block leads
+    # the single system message. SOUL.md remains unchanged.
     system_text = _compose_system_text(event, profile_home, soul_text)
     user_text = getattr(event, "text", "") or ""
 

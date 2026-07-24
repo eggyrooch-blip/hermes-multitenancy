@@ -436,7 +436,7 @@ def _run_with_aiagent(
         if fallback_model:
             agent_kwargs["fallback_model"] = fallback_model
 
-        # Expert Role-Override overlay (ephemeral, this run only). Rides the
+        # Expert-mode overlay (ephemeral, this run only). Rides the
         # UPSTREAM ``ephemeral_system_prompt`` constructor kwarg: core re-appends
         # it to the system message every turn at API-call time and NEVER writes it
         # to the cached/DB-stored prompt or trajectories (run_agent.py:6208,12746).
@@ -445,12 +445,10 @@ def _run_with_aiagent(
         # all with ZERO hermes-agent change (``ephemeral_system_prompt`` is in
         # NousResearch origin/main, so prod honors it without any core fork).
         #
-        # The block lands BELOW the SOUL/base identity tier (core builds SOUL
-        # first), so precedence is carried by the bookended Role-Override WORDING
-        # (ROLE_OVERRIDE_PREAMBLE/TAIL — explicit disavowal of Hermes/Nous
-        # Research), not by position. The previously-wired ``identity_override``
-        # kwarg required FORKING core and would RAISE on upstream (see SPEC dead
-        # ends); it is gone.
+        # The block keeps Hermes as the trusted host while adding the selected
+        # expert's domain role, skills and write-safety reminder. The previously
+        # wired ``identity_override`` kwarg required FORKING core and would RAISE
+        # on upstream (see SPEC dead ends); it is gone.
         _role_override = _pkg._role_override_block_for_event(event, profile_home)
         if _role_override:
             agent_kwargs["ephemeral_system_prompt"] = _role_override

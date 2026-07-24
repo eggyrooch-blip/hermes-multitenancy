@@ -43,7 +43,7 @@ def test_compose_system_text_no_overlay_is_byte_stable(tmp_path):
     assert out == soul  # normal path: untouched
 
 
-def test_compose_system_text_with_overlay_leads_with_override(tmp_path, monkeypatch):
+def test_compose_system_text_with_overlay_leads_with_expert_mode(tmp_path, monkeypatch):
     repo = _plugin_repo(tmp_path / "plug")
     shared = _shared_home(tmp_path)
     _ingest(repo, shared)
@@ -60,11 +60,12 @@ def test_compose_system_text_with_overlay_leads_with_override(tmp_path, monkeypa
     soul = "你是 Hermes Agent。"
     out = agent_real._compose_system_text(_event(EXPERT_ID), profile_home, soul)
     assert out != soul
-    assert out.startswith("**Role Override")          # override leads (verdict B)
+    assert out.startswith("## Hermes 专家模式")
+    assert "当前专家：资源投放专家" in out
     assert "资源投放领域的执行型专家" in out               # persona present
-    assert "必须严格遵守" in out                          # MUST-OBEY tail present
+    assert "高风险写操作" in out                         # safety gate retained
     assert soul in out                                    # SOUL demoted below, still present
-    assert out.index("**Role Override") < out.index(soul)
+    assert out.index("当前专家：资源投放专家") < out.index(soul)
     # SOUL.md on disk is never written by composition
     assert not (profile_home / "SOUL.md").exists()
 

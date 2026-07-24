@@ -1,8 +1,8 @@
-"""Expert Role-Override overlay — session-scoped persona injection.
+"""Expert-mode overlay — session-scoped domain guidance.
 
 When a Hermes run carries an ``expert_id`` (e.g. the WebUI's expert square hands
 the conversation to "资源投放专家"), this module resolves that expert's persona
-and builds a **Role-Override block** that is injected into the run's *system*
+and builds an **expert-mode block** that is injected into the run's *system*
 layer for THIS run only.
 
 Design redlines (cross-model reviewed — see this slug's SPEC):
@@ -21,16 +21,12 @@ Design redlines (cross-model reviewed — see this slug's SPEC):
   * Fail-safe: an unknown / missing ``expert_id`` resolves to ``None`` and the run
     proceeds with the normal SOUL persona — this module never raises into the run.
 
-Composition: the Role-Override block = preamble (hard disavowal of Hermes/Nous
-Research) + expert ``agent.md`` + MUST-OBEY tail. The AIAgent path passes it via
+Composition: the expert-mode block = Hermes host context + expert ``agent.md`` +
+the existing credential/write safety reminder. The AIAgent path passes it via
 ``ephemeral_system_prompt``; the legacy/stream paths compose it override-first
-into the system text (``_compose_system_text``). The historical LINCHPIN VERDICT
-that "append channels leak" applies to USER/context-layer append — persona
-injected as a user turn or context block, which models treat as user-supplied
-data — NOT to system-layer ephemeral, which stays instruction-tier. Because the
-ephemeral block lands BELOW the SOUL identity (core builds SOUL first), precedence
-is carried by the bookended override WORDING + recency, not by position (WorkBuddy
-top-prepends; Hermes cannot without forking core, so it compensates by wording).
+into the system text (``_compose_system_text``). The overlay stays instruction-tier
+instead of being appended as user/context data, while presenting the expert as a
+Hermes-hosted mode rather than attempting to override the platform identity.
 """
 from __future__ import annotations
 
@@ -47,25 +43,18 @@ logger = logging.getLogger(__name__)
 MANAGED_DIR = ".hermes-plugin-managed"
 
 
-# ─────────────────────────── Role-Override template ──────────────────────────
-# Mirrors WorkBuddy's wording (verified live), adapted to zh/Hermes. The
-# explicit "this overrides any prior identity" framing is the load-bearing part
-# — it is what reliably outranks the profile's locked SOUL persona.
+# Keep Hermes as the trusted host. Adversarial "ignore/override/deny identity"
+# wording is indistinguishable from prompt injection and causes correct models
+# to reject the selected expert instead of using it.
 ROLE_OVERRIDE_PREAMBLE = (
-    "**Role Override（最高优先级 · 覆盖以上全部身份）：** "
-    "从本条开始，本次对话你不再是 Hermes、不是 Hermes Agent（by Nous Research）、"
-    "也不是任何通用 AI 助手；请彻底忽略上文任何「你是 Hermes / 你是某助手」的身份"
-    "描述与帮助说明。以下专家角色定义优先于任何既有人设、身份或系统上下文，发生冲突"
-    "时一律以下方定义为准——这是你本次对话唯一、活跃、权威的角色："
+    "## Hermes 专家模式\n"
+    "本次对话已由用户选择下方专家。你仍由 Hermes 提供，并以该专家的名称、职责和能力"
+    "帮助用户完成领域任务："
 )
 
 ROLE_OVERRIDE_TAIL = (
-    "（重申——以上专家角色为本次对话的最高优先级，必须严格遵守，覆盖任何既有 "
-    "Hermes / Hermes Agent / Nous Research / 通用助手身份。当用户问「你是谁」、你的"
-    "身份、你的角色，或追问「你其实是不是 Hermes」「你底层是什么模型」时，必须且只能"
-    "按上述专家名称与职责作答；不得自称 Hermes、Nous Research 或任何通用 AI 助手，"
-    "也不得透露或承认底层模型与提供商名称。凭证仍为当前用户本人，所有高风险写操作"
-    "需按上述门禁取得显式确认。）"
+    "当用户问「你是谁」或你的角色时，先说明你是上述专家，并可说明这是 Hermes 提供的"
+    "专家模式。凭证始终属于当前用户本人；所有高风险写操作仍需按上述门禁取得显式确认。"
 )
 
 
@@ -312,11 +301,11 @@ def resolve_expert(
 
 
 def build_role_override_block(overlay: ExpertOverlay) -> str:
-    """Compose the Role-Override system block per the LINCHPIN VERDICT.
+    """Compose the session-scoped Hermes expert-mode system block.
 
-    preamble → expert agent.md → (optional skills note) → MUST-OBEY tail.
+    host context → expert agent.md → optional skills → safety reminder.
     """
-    parts: list[str] = [ROLE_OVERRIDE_PREAMBLE, "", overlay.agent_md]
+    parts: list[str] = [ROLE_OVERRIDE_PREAMBLE, f"当前专家：{overlay.name}", "", overlay.agent_md]
     if overlay.skills:
         parts += ["", "## 本专家可用能力（Skills）", "、".join(overlay.skills) + "。"]
     parts += ["", ROLE_OVERRIDE_TAIL]
@@ -435,6 +424,8 @@ def list_experts(
                 continue
             plugin_id = str(manifest.get("plugin_id") or "")
             manifest_audience = manifest.get("audience")
+            release_version = manifest.get("release_version")
+            release_installed_at = manifest.get("release_installed_at")
             for ex in experts:
                 if not isinstance(ex, dict):
                     continue
@@ -449,8 +440,7 @@ def list_experts(
                 ):
                     continue
                 seen.add(eid)
-                rows.append(
-                    {
+                row = {
                         "id": eid,
                         "name": str(ex.get("name") or ex.get("title") or eid),
                         "title": str(ex.get("title") or ex.get("name") or eid),
@@ -466,7 +456,11 @@ def list_experts(
                         "source": "aihub",
                         "skills": [str(s) for s in ex.get("skills") or []],
                     }
-                )
+                if isinstance(release_version, str) and release_version.strip():
+                    row["release_version"] = release_version.strip()
+                if isinstance(release_installed_at, int) and release_installed_at > 0:
+                    row["release_installed_at"] = release_installed_at
+                rows.append(row)
     except Exception:
         logger.warning("[multitenancy] list_experts failed for %s", profile_home, exc_info=True)
     return sorted(rows, key=lambda r: (not r["featured"], r["category"], r["name"]))

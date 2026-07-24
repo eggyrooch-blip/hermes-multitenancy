@@ -921,10 +921,10 @@ def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> se
 def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
     """System-message text for the legacy chat-completions paths.
 
-    When the run carries an expert overlay, lead with the Role-Override block and
-    demote SOUL below it (verdict composition B — cleanest, override-first). With
+    When the run carries an expert overlay, lead with the Hermes-hosted expert
+    mode block before SOUL. With
     no overlay this is exactly ``soul_text`` (byte-stable for the normal path).
-    SOUL.md on disk is never written; the override is in-memory for this run only.
+    SOUL.md on disk is never written; the expert mode is in-memory for this run only.
     """
     block = _role_override_block_for_event(event, profile_home)
     if not block:

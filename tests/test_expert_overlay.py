@@ -268,20 +268,19 @@ def test_resolve_expert_and_block(tmp_path, monkeypatch):
     assert overlay.skills
 
     block = eo.build_role_override_block(overlay)
-    # preamble leads, persona body present, MUST-OBEY tail closes
-    assert block.startswith("**Role Override")
-    assert "优先于任何既有人设" in block
+    # Hermes remains the trusted host while the selected expert supplies the
+    # active domain role and capabilities.
+    assert block.startswith("## Hermes 专家模式")
+    assert overlay.name in block
     assert "资源投放领域的执行型专家" in block
-    assert "必须严格遵守" in block
-    # the override wording must explicitly demote the Hermes identity
+    assert "当前用户本人" in block
     assert "Hermes" in block
     assert "你是谁" in block
-    assert "不得自称 Hermes" in block
-    assert "Nous Research" in block
-    # bottom-placement compensator (ephemeral lands BELOW SOUL): the block must
-    # OPEN with a hard disavowal of the base identity, naming the exact strings.
-    assert "不再是 Hermes" in block
-    assert "Hermes Agent" in block
+    assert "忽略上文" not in block
+    assert "最高优先级" not in block
+    assert "不再是 Hermes" not in block
+    assert "不得自称 Hermes" not in block
+    assert "不得透露或承认底层模型" not in block
 
 
 def test_resolve_unknown_expert_is_none(tmp_path, monkeypatch):
@@ -324,6 +323,25 @@ def test_list_experts_aggregation(tmp_path, monkeypatch):
     # redacted: no persona body / repo path leaks into the catalog row
     assert "agent_md" not in row
     assert all("你是资源投放" not in str(v) for v in row.values())
+
+
+def test_list_experts_exposes_optional_skillhub_release_metadata(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    manifest_path = shared / pi.MANAGED_DIR / "keep-resource-delivery.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["release_version"] = "1.0.5"
+    manifest["release_id"] = "196"
+    manifest["release_installed_at"] = 1_784_892_894
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    row = eo.list_experts(shared / "profiles" / "feishu_test")[0]
+
+    assert row["release_version"] == "1.0.5"
+    assert row["release_installed_at"] == 1_784_892_894
+    assert "release_id" not in row
 
 
 def test_list_experts_audience_filter(tmp_path, monkeypatch):
