@@ -195,7 +195,15 @@ def _feishu_taxonomy(
     if body_code is not None:
         return {"failure_subsystem": "lark_api", "error_code": "FEISHU_BUSINESS_ERROR", "retryable": False}
 
-    if timed_out or _FEISHU_TIMEOUT_RE.search(stderr):
+    if timed_out:
+        return {
+            "failure_subsystem": "transport",
+            "error_code": "FEISHU_DEPENDENCY_TIMEOUT",
+            "retryable": True,
+        }
+    if exit_code == 0:
+        return {"failure_subsystem": None, "error_code": None, "retryable": False}
+    if _FEISHU_TIMEOUT_RE.search(stderr):
         return {
             "failure_subsystem": "transport",
             "error_code": "FEISHU_DEPENDENCY_TIMEOUT",
@@ -227,8 +235,6 @@ def _feishu_taxonomy(
             "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
             "retryable": False,
         }
-    if exit_code == 0:
-        return {"failure_subsystem": None, "error_code": None, "retryable": False}
     return {"failure_subsystem": "lark_api", "error_code": "FEISHU_UNKNOWN", "retryable": False}
 
 

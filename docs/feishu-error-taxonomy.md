@@ -28,8 +28,9 @@ command arguments, or response bodies.
 | failed attempt without a known signal | `lark_api` | `FEISHU_UNKNOWN` | `false` |
 
 Signal priority is deterministic: explicit trusted hint or HTTP status,
-structured Feishu business code, then strict transport/auth text. Process exit
-code only distinguishes otherwise-clean success from an unknown failure.
+structured Feishu business code, clean process success, then strict
+transport/auth text. Historical retry warnings on a clean exit cannot turn a
+successful operation into a retryable failure.
 
 This taxonomy does not change identity selection, authorization, credential
 refresh, retry counts, fallback, or user guidance.

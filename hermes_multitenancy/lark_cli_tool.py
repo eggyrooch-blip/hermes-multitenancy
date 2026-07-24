@@ -814,7 +814,7 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     timeout = min(int(args.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS)
     runtime_error = _profile_runtime_error(env)
     if runtime_error:
-        hint = "dependency_unavailable" if "broker is unavailable" in runtime_error else "identity_unbound"
+        hint = "dependency_unavailable" if "broker is unavailable" in runtime_error else "permission_denied"
         return _classified_tool_error(
             runtime_error,
             failure_hint=hint,
@@ -834,10 +834,9 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         )
     identity_error = _personal_user_write_identity_error(env, mode, argv, risk, identity, requested_identity)
     if identity_error:
-        hint = "identity_unbound" if "requires bound Feishu user identity" in identity_error else "permission_denied"
         return _classified_tool_error(
             identity_error,
-            failure_hint=hint,
+            failure_hint="identity_mismatch",
             mode=mode,
             command=argv,
             risk=risk,

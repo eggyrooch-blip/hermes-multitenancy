@@ -953,6 +953,11 @@ def test_lark_cli_tool_rejects_personal_im_read_without_bound_user_identity(
 
     assert result.get("ok") is not True
     assert "飞书个人消息读取需要先完成本人授权" in result["error"]
+    assert (
+        result["failure_subsystem"],
+        result["error_code"],
+        result["retryable"],
+    ) == ("identity", "FEISHU_IDENTITY_UNBOUND", False)
     assert "/feishu_auth" in result["error"]
     assert "WebUI" in result["error"]
     assert "refusing bot/app fallback" not in result["error"]
@@ -1415,20 +1420,46 @@ def test_lark_cli_tool_timeout_has_retryable_transport_taxonomy(monkeypatch, tmp
     ) == ("transport", "FEISHU_DEPENDENCY_TIMEOUT", True)
 
 
-def test_lark_cli_tool_unbound_profile_is_classified_before_subprocess(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("runtime_setup", "expected"),
+    [
+        ("outside", ("permission", "FEISHU_PERMISSION_DENIED", False)),
+        ("workspace_escape", ("permission", "FEISHU_PERMISSION_DENIED", False)),
+        ("broker_missing", ("transport", "FEISHU_DEPENDENCY_UNAVAILABLE", False)),
+    ],
+)
+def test_lark_cli_tool_classifies_profile_runtime_refusals(
+    monkeypatch,
+    tmp_path,
+    runtime_setup,
+    expected,
+):
     from hermes_multitenancy import lark_cli_tool
 
     binary = tmp_path / "lark-cli-authsidecar"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o755)
     monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-    monkeypatch.delenv("WORKSPACE", raising=False)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    if runtime_setup == "outside":
+        monkeypatch.delenv("HERMES_HOME")
+        monkeypatch.delenv("WORKSPACE")
+    elif runtime_setup == "workspace_escape":
+        escaped = tmp_path / "outside"
+        escaped.mkdir()
+        monkeypatch.setenv("WORKSPACE", str(escaped))
+    else:
+        monkeypatch.delenv("LARKSUITE_CLI_AUTH_PROXY")
+        monkeypatch.delenv("LARKSUITE_CLI_PROXY_KEY")
     monkeypatch.setattr(
         lark_cli_tool.subprocess,
         "run",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unbound profile must fail before spawning lark-cli")
+            AssertionError("runtime refusal must happen before lark-cli")
         ),
     )
 
@@ -1446,4 +1477,121 @@ def test_lark_cli_tool_unbound_profile_is_classified_before_subprocess(monkeypat
         result["failure_subsystem"],
         result["error_code"],
         result["retryable"],
-    ) == ("identity", "FEISHU_IDENTITY_UNBOUND", False)
+    ) == expected
+
+
+def test_lark_cli_bound_profile_wrong_write_identity_is_mismatch(monkeypatch, tmp_path):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_FEISHU_USER_OPEN_ID", "ou_fixture")
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "bot")
+    monkeypatch.setattr(
+        lark_cli_tool.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("identity mismatch must happen before lark-cli")
+        ),
+    )
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["POST", "/open-apis/calendar/v4/calendars"],
+            "identity": "auto",
+            "risk": "write",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert (
+        result["failure_subsystem"],
+        result["error_code"],
+        result["retryable"],
+    ) == ("identity", "FEISHU_IDENTITY_MISMATCH", False)
+
+
+def test_lark_cli_tool_fields_match_classifier_for_same_fixture(monkeypatch, tmp_path):
+    from hermes_multitenancy import lark_cli_tool
+    from hermes_multitenancy.connector_failure_classifier import classify_connector_failure
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+
+    class Completed:
+        returncode = 1
+        stdout = '{"code":230020,"msg":"redacted fixture"}'
+        stderr = ""
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", lambda *_args, **_kwargs: Completed())
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["GET", "/open-apis/authen/v1/user_info"],
+            "identity": "user",
+            "risk": "read",
+        }
+    )
+    tool_fields = raw if isinstance(raw, dict) else json.loads(raw)
+    classified = classify_connector_failure(
+        "lark-cli",
+        exit_code=1,
+        business_payload={"code": 230020, "msg": "redacted fixture"},
+    )
+
+    keys = ("failure_subsystem", "error_code", "retryable")
+    assert {key: tool_fields[key] for key in keys} == {
+        key: classified[key]
+        for key in keys
+    }
+
+
+def test_lark_cli_successful_retry_text_does_not_mark_write_retryable(monkeypatch, tmp_path):
+    from hermes_multitenancy import lark_cli_tool
+
+    binary = tmp_path / "lark-cli-authsidecar"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    profile = tmp_path / "profile"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("LARKSUITE_CLI_DEFAULT_AS", "user")
+
+    class Completed:
+        returncode = 0
+        stdout = '{"code":0,"data":{"calendar_id":"fixture"}}'
+        stderr = "HTTP 429 rate limited; auto-retried and succeeded"
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", lambda *_args, **_kwargs: Completed())
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "api",
+            "argv": ["POST", "/open-apis/calendar/v4/calendars"],
+            "identity": "user",
+            "risk": "write",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["error_code"] is None
+    assert result["failure_subsystem"] is None
+    assert result["retryable"] is False

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from hermes_multitenancy.connector_failure_classifier import (
     NEEDS_REAUTH,
     TRANSIENT,
@@ -97,6 +99,23 @@ def test_lark_cli_success_has_empty_failure_fields():
         exit_code=0,
         business_payload={"code": 0, "data": {"code": 123456}},
     ) == {
+        "failure_subsystem": None,
+        "error_code": None,
+        "retryable": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "request timed out once, auto-retried and succeeded",
+        "HTTP 429 rate limited, retry succeeded",
+        "dependency temporarily unavailable before successful retry",
+        "identity was not bound during the first attempt; succeeded after refresh",
+    ],
+)
+def test_lark_cli_clean_exit_beats_historical_failure_text(stderr):
+    assert taxonomy(exit_code=0, stderr=stderr) == {
         "failure_subsystem": None,
         "error_code": None,
         "retryable": False,
