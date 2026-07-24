@@ -66,6 +66,18 @@ from .. import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cl
 
 logger = logging.getLogger(__name__)
 
+
+class ExpertUnavailableError(RuntimeError):
+    """An explicit expert request could not be proven safe to execute."""
+
+    error_code = "EXPERT_UNAVAILABLE"
+    failure_subsystem = "expert_resolution"
+    retryable = False
+
+    def __init__(self) -> None:
+        super().__init__("EXPERT_UNAVAILABLE")
+
+
 # StreamReader line-buffer cap for the AIAgent subprocess NDJSON protocol. The
 # child writes one JSON event per line; asyncio's default 64 KiB limit makes a
 # single large event line (a big final answer, a large tool arg / thinking block)
@@ -240,6 +252,7 @@ async def stream_run_agent(  # type: ignore[override]
     as ``conversation_history`` and the current event text as the active user
     message.
     """
+    _resolve_explicit_expert_for_execution(event, profile_home)
     signal = _CredentialExpirySignal()
     signal_token = _CREDENTIAL_EXPIRY_SIGNAL.set(signal)
     try:
@@ -257,6 +270,18 @@ async def stream_run_agent(  # type: ignore[override]
                 continue
             if kind == "tool_started":
                 tool_started_count += 1
+            if kind == "tool_completed" and isinstance(payload, dict):
+                failure_subsystem = payload.get("failure_subsystem")
+                error_code = payload.get("error_code")
+                retryable = payload.get("retryable")
+                if failure_subsystem and error_code and isinstance(retryable, bool):
+                    from ..run_broker import record_current_run_failure
+
+                    record_current_run_failure(
+                        failure_subsystem=str(failure_subsystem),
+                        error_code=str(error_code),
+                        retryable=retryable,
+                    )
             if kind == "content":
                 text = str(payload or "")
                 if text:
@@ -287,6 +312,8 @@ async def stream_run_agent(  # type: ignore[override]
         if final_text or content_parts:
             return
     except Exception as exc:
+        if isinstance(exc, ExpertUnavailableError):
+            raise
         kind = _billing_failure_kind(event, exc)
         retry_safe = (
             getattr(exc, "billing_retry_safe", False) is True
@@ -301,6 +328,9 @@ async def stream_run_agent(  # type: ignore[override]
                     raise RuntimeError(
                         _billing_failure_message(kind, retry_safe=True)
                     ) from repair_exc
+                from ..run_broker import mark_current_run_retried
+
+                mark_current_run_retried()
                 retry_stream = stream_run_agent(
                     event,
                     profile_home,
@@ -335,6 +365,13 @@ async def stream_run_agent(  # type: ignore[override]
         # failure that raised before any answer token.)
         if content_parts:
             yield "content", "\n\n" + _PARTIAL_FAILURE_NOTICE
+            from ..run_broker import record_current_run_failure
+
+            record_current_run_failure(
+                failure_subsystem="output",
+                error_code="OUTPUT_INCOMPLETE",
+                retryable=False,
+            )
             return
         if tool_started_count:
             logger.warning(
@@ -402,6 +439,7 @@ async def real_run_agent(
     fallback path still answers the user — without tools, but at least with
     a coherent reply.
     """
+    _resolve_explicit_expert_for_execution(event, profile_home)
     billing_retried = False
     while True:
         try:
@@ -411,6 +449,8 @@ async def real_run_agent(
                 )
             return await _run_aiagent_subprocess(event, profile_home)
         except Exception as exc:
+            if isinstance(exc, ExpertUnavailableError):
+                raise
             kind = _billing_failure_kind(event, exc)
             retry_safe = getattr(exc, "billing_retry_safe", False) is True
             if kind == "invalid_credential":
@@ -421,6 +461,9 @@ async def real_run_agent(
                         raise RuntimeError(
                             _billing_failure_message(kind, retry_safe=True)
                         ) from repair_exc
+                    from ..run_broker import mark_current_run_retried
+
+                    mark_current_run_retried()
                     billing_retried = True
                     continue
                 _mark_billing_event_invalid(event)
@@ -669,28 +712,55 @@ def _broker_role_override_payload_for_event(
                 _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
                 _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
             }
+        raise ExpertUnavailableError()
     try:
-        from ..expert_overlay import role_override_block_for
+        from ..expert_overlay import (
+            build_role_override_block,
+            resolve_caller_departments,
+            resolve_expert,
+        )
 
         try:
             sender_open_id = _resolve_subprocess_sender_open_id(event) or None
         except Exception:
             sender_open_id = None
-        block = role_override_block_for(profile_home, expert_id, open_id=sender_open_id)
+        overlay = resolve_expert(
+            profile_home,
+            expert_id,
+            department_ids=resolve_caller_departments(
+                profile_home,
+                open_id=sender_open_id,
+            ),
+        )
+        if overlay is None:
+            raise ExpertUnavailableError()
+        declared_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
+        readable_skills = {path.name for path in overlay.skill_dirs}
+        if not declared_skills.issubset(readable_skills):
+            raise ExpertUnavailableError()
+        block = build_role_override_block(overlay)
+    except ExpertUnavailableError:
+        raise
     except Exception:
         logger.warning(
-            "[multitenancy] expert overlay parent resolution failed expert_id=%s; "
-            "child will fall back to local resolution",
+            "[multitenancy] expert overlay parent resolution failed expert_id=%s",
             expert_id,
             exc_info=True,
         )
-        return None
+        raise ExpertUnavailableError()
     if not block:
-        return None
+        raise ExpertUnavailableError()
     return {
         _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
         _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
     }
+
+
+def _resolve_explicit_expert_for_execution(event: Any, profile_home: Path) -> None:
+    """Bind an explicit expert before any model/tool subprocess can start."""
+    payload = _broker_role_override_payload_for_event(event, profile_home)
+    if payload is not None:
+        setattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, payload)
 
 
 def _broker_role_override_block_for_event(event: Any, expert_id: str) -> Optional[str]:
@@ -700,20 +770,15 @@ def _broker_role_override_block_for_event(event: Any, expert_id: str) -> Optiona
         return None
     payload_expert_id = str(payload.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or "").strip()
     if payload_expert_id != expert_id:
-        return None
+        raise ExpertUnavailableError()
     block = payload.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
     if isinstance(block, str) and block.strip():
         return block
-    return None
+    raise ExpertUnavailableError()
 
 
 def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[str]:
-    """Resolve the ephemeral Role-Override system block for this run, or None.
-
-    Fail-safe: any resolution problem (unknown id, missing persona, import error)
-    yields None so the run proceeds with the normal SOUL persona — the overlay
-    must never break a run.
-    """
+    """Resolve the ephemeral Role-Override block; explicit experts fail closed."""
     expert_id = _expert_id_for_event(event)
     if not expert_id:
         return None
@@ -736,18 +801,21 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
         except Exception:
             sender_open_id = None
         block = role_override_block_for(profile_home, expert_id, open_id=sender_open_id)
-        if block:
-            logger.info(
-                "[multitenancy] expert overlay active expert_id=%s profile=%s",
-                expert_id, getattr(profile_home, "name", profile_home),
-            )
+        if not block:
+            raise ExpertUnavailableError()
+        logger.info(
+            "[multitenancy] expert overlay active expert_id=%s profile=%s",
+            expert_id, getattr(profile_home, "name", profile_home),
+        )
         return block
+    except ExpertUnavailableError:
+        raise
     except Exception:
         logger.warning(
-            "[multitenancy] expert overlay resolution failed expert_id=%s; running without overlay",
+            "[multitenancy] expert overlay resolution failed expert_id=%s",
             expert_id, exc_info=True,
         )
-        return None
+        raise ExpertUnavailableError()
 
 
 def _installed_profile_skill_names(profile_home: Path) -> set[str]:
@@ -3743,6 +3811,17 @@ async def _run_aiagent_subprocess(
             f"(exit={proc.returncode}, stdout={redacted_stdout_text[-1000:]!r}, stderr={redacted_stderr_text[-1000:]!r})"
         ) from exc
 
+    failure_subsystem = data.get("failure_subsystem")
+    error_code = data.get("error_code")
+    retryable = data.get("retryable")
+    if failure_subsystem and error_code and isinstance(retryable, bool):
+        from ..run_broker import record_current_run_failure
+
+        record_current_run_failure(
+            failure_subsystem=str(failure_subsystem),
+            error_code=str(error_code),
+            retryable=retryable,
+        )
     if proc.returncode != 0:
         child_error = _redact_billing_runtime_text(data.get("error") or "", event, env)
         raise _subprocess_failure(

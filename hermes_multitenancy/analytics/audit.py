@@ -15,6 +15,7 @@ class AuditLoadResult:
     bad_lines: int
     first_timestamp: datetime | None
     last_timestamp: datetime | None
+    terminal_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -81,6 +82,7 @@ def _session_group_key(row: dict[str, Any]) -> str:
 
 def load_audit_rows(path: Path) -> AuditLoadResult:
     rows: list[dict[str, Any]] = []
+    terminal_rows: list[dict[str, Any]] = []
     total = 0
     bad = 0
     first: datetime | None = None
@@ -102,7 +104,19 @@ def load_audit_rows(path: Path) -> AuditLoadResult:
             if not isinstance(row, dict):
                 bad += 1
                 continue
-            if row.get("event_type") != "conversation_message":
+            event_type = row.get("event_type")
+            if event_type == "run_terminal":
+                if row.get("schema_version") != 1:
+                    continue
+                timestamp = parse_timestamp(row.get("@timestamp"))
+                if timestamp is None:
+                    continue
+                row["_dt"] = timestamp
+                terminal_rows.append(row)
+                first = timestamp if first is None or timestamp < first else first
+                last = timestamp if last is None or timestamp > last else last
+                continue
+            if event_type != "conversation_message":
                 continue
             timestamp = parse_timestamp(row.get("@timestamp"))
             if timestamp is None:
@@ -113,7 +127,8 @@ def load_audit_rows(path: Path) -> AuditLoadResult:
             first = timestamp if first is None or timestamp < first else first
             last = timestamp if last is None or timestamp > last else last
     rows.sort(key=_message_sort_key)
-    return AuditLoadResult(rows, total, bad, first, last)
+    terminal_rows.sort(key=lambda row: (row["_dt"], str(row.get("terminal_event_id") or "")))
+    return AuditLoadResult(rows, total, bad, first, last, terminal_rows)
 
 
 def _parse_tool_call(raw: Any) -> dict[str, Any] | None:

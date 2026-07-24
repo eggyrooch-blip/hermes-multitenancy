@@ -118,3 +118,57 @@ def test_build_conversation_audit_context_reads_multitenancy_event() -> None:
         "platform": "feishu",
         "chat_type": "dm",
     }
+
+
+def test_append_run_terminal_event_is_structured_and_redacted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_multitenancy.conversation_audit import append_run_terminal_event
+
+    audit_path = tmp_path / "conversation-audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+
+    append_run_terminal_event(
+        terminal_event_id="run-1",
+        profile_name="feishu_ou_private",
+        platform="webui",
+        chat_type="webui",
+        expert_requested=True,
+        expert_id="resource-delivery",
+        expert_resolution="resolved",
+        terminal_status="completed",
+        error_code=None,
+        failure_subsystem=None,
+        retryable=False,
+        retried=False,
+        answer_completed=True,
+        duration_ms=12,
+    )
+
+    row = json.loads(audit_path.read_text("utf-8"))
+    assert row == {
+        "@timestamp": row["@timestamp"],
+        "event_type": "run_terminal",
+        "schema_version": 1,
+        "terminal_event_id": "run-1",
+        "profile": row["profile"],
+        "platform": "webui",
+        "chat_type": "webui",
+        "source": "run_broker",
+        "expert_requested": True,
+        "expert_id": "resource-delivery",
+        "expert_resolution": "resolved",
+        "terminal_status": "completed",
+        "error_code": None,
+        "failure_subsystem": None,
+        "retryable": False,
+        "retried": False,
+        "answer_completed": True,
+        "duration_ms": 12,
+    }
+    serialized = json.dumps(row, ensure_ascii=False)
+    assert row["profile"].startswith("feishu_ou_")
+    for secret in ("ou_private", "prompt", "token", "open_id", "content", "tool_calls"):
+        assert secret not in serialized

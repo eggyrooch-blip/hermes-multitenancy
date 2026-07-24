@@ -10,8 +10,11 @@ These exercise the injection seams WITHOUT spawning the real AIAgent subprocess:
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from hermes_multitenancy import agent_real
 from hermes_multitenancy import plugin_ingest as pi
@@ -215,6 +218,108 @@ def test_event_payload_carries_broker_resolved_overlay_for_sandboxed_child(tmp_p
     replayed = aiagent_subprocess._ReplayedEvent(payload["event"])
 
     assert agent_real._role_override_block_for_event(replayed, profile_home) == resolved["block"]
+
+
+def test_explicit_unknown_expert_fails_closed_before_subprocess(tmp_path, monkeypatch):
+    subprocess_started = {"value": False}
+
+    async def fake_subprocess(*_args, **_kwargs):
+        subprocess_started["value"] = True
+        return "unexpected"
+
+    monkeypatch.setattr(agent_real, "_run_aiagent_subprocess", fake_subprocess)
+    monkeypatch.setattr(
+        "hermes_multitenancy.expert_overlay.role_override_block_for",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(agent_real.ExpertUnavailableError, match="EXPERT_UNAVAILABLE"):
+        asyncio.run(agent_real.real_run_agent(_event("missing"), tmp_path))
+
+    assert subprocess_started["value"] is False
+
+
+def test_explicit_expert_with_unreadable_skill_scope_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+    (repo / "skills" / "using-resource-delivery" / "SKILL.md").unlink()
+
+    with pytest.raises(agent_real.ExpertUnavailableError, match="EXPERT_UNAVAILABLE"):
+        agent_real._event_to_subprocess_payload(_event(EXPERT_ID), profile_home)
+
+
+def test_explicit_expert_rejection_is_not_swallowed_by_legacy_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    legacy_called = {"real": False, "stream": False}
+
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+
+    async def reject_real(*_args, **_kwargs):
+        raise agent_real.ExpertUnavailableError()
+
+    async def reject_stream(*_args, **_kwargs):
+        if False:
+            yield "content", ""
+        raise agent_real.ExpertUnavailableError()
+
+    async def legacy_real(*_args, **_kwargs):
+        legacy_called["real"] = True
+        return "unexpected"
+
+    async def legacy_stream(*_args, **_kwargs):
+        legacy_called["stream"] = True
+        yield "content", "unexpected"
+
+    monkeypatch.setattr(agent_real, "_run_aiagent_subprocess", reject_real)
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", reject_stream)
+    monkeypatch.setattr(agent_real, "_legacy_real_run_agent", legacy_real)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_stream)
+
+    with pytest.raises(agent_real.ExpertUnavailableError):
+        asyncio.run(agent_real.real_run_agent(_event("expert"), tmp_path))
+
+    async def consume():
+        async for _item in agent_real.stream_run_agent(_event("expert"), tmp_path):
+            pass
+
+    with pytest.raises(agent_real.ExpertUnavailableError):
+        asyncio.run(consume())
+
+    assert legacy_called == {"real": False, "stream": False}
+
+
+def test_partial_stream_failure_keeps_user_recovery_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+
+    async def partial(*_args, **_kwargs):
+        yield "content", "partial"
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", partial)
+
+    async def consume():
+        chunks = []
+        async for item in agent_real.stream_run_agent(_event(), tmp_path):
+            chunks.append(item)
+        return chunks
+
+    chunks = asyncio.run(consume())
+    assert chunks[0] == ("content", "partial")
+    assert "出错" in chunks[-1][1]
 
 
 def test_expert_disabled_skill_names_excludes_only_active_expert(tmp_path, monkeypatch):

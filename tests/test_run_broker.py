@@ -29,6 +29,319 @@ def test_run_request_rejects_unknown_channel():
         RunRequest(channel="email", profile_name="owner", user_key="ou_1", content="hi")
 
 
+def test_run_broker_writes_one_terminal_for_completed_expert(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+    broker = RunBroker(dispatch_agent=lambda _request: "ok")
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_private",
+        content="secret prompt",
+        idempotency_key="same-content-is-not-terminal-id",
+        metadata={"expert_id": "resource-delivery"},
+    )
+
+    result = asyncio.run(broker.run(request))
+
+    assert result.content == "ok"
+    rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["terminal_status"] == "completed"
+    assert rows[0]["expert_resolution"] == "resolved"
+    assert rows[0]["answer_completed"] is True
+    assert "ou_private" not in json.dumps(rows[0])
+    assert "secret prompt" not in json.dumps(rows[0])
+
+
+def test_run_broker_writes_rejected_terminal_for_unavailable_expert(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.agent_real import ExpertUnavailableError
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+
+    def reject(_request):
+        raise ExpertUnavailableError()
+
+    broker = RunBroker(dispatch_agent=reject)
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_private",
+        content="hi",
+        metadata={"expert_id": "missing"},
+    )
+
+    with pytest.raises(ExpertUnavailableError, match="EXPERT_UNAVAILABLE"):
+        asyncio.run(broker.run(request))
+
+    row = json.loads(audit_path.read_text("utf-8"))
+    assert row["terminal_status"] == "rejected"
+    assert row["failure_subsystem"] == "expert_resolution"
+    assert row["error_code"] == "EXPERT_UNAVAILABLE"
+    assert row["retryable"] is False
+    assert row["answer_completed"] is False
+
+
+def test_run_broker_terminal_marks_generic_retry_and_uses_unique_execution_ids(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import RunBroker, mark_current_run_retried
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+
+    def dispatch(_request):
+        mark_current_run_retried()
+        return "ok"
+
+    broker = RunBroker(dispatch_agent=dispatch)
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="owner",
+        content="same",
+    )
+
+    asyncio.run(broker.run(request))
+    asyncio.run(broker.run(request))
+
+    rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+    assert len(rows) == 2
+    assert len({row["terminal_event_id"] for row in rows}) == 2
+    assert all(row["retried"] is True for row in rows)
+    assert all(row["expert_requested"] is False for row in rows)
+    assert all(row["expert_id"] is None for row in rows)
+    assert all(row["expert_resolution"] == "not_requested" for row in rows)
+
+
+def test_run_broker_terminal_marks_completed_expert_retry(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import RunBroker, mark_current_run_retried
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+
+    def dispatch(_request):
+        mark_current_run_retried()
+        return "ok"
+
+    broker = RunBroker(dispatch_agent=dispatch)
+    asyncio.run(
+        broker.run(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="owner",
+                content="hi",
+                metadata={"expert_id": "resource-delivery"},
+            )
+        )
+    )
+
+    row = json.loads(audit_path.read_text("utf-8"))
+    assert row["expert_resolution"] == "resolved"
+    assert row["terminal_status"] == "completed"
+    assert row["retried"] is True
+    assert row["answer_completed"] is True
+
+
+def test_run_broker_terminal_audit_failure_does_not_change_result(
+    monkeypatch,
+):
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setattr(
+        "hermes_multitenancy.conversation_audit.append_run_terminal_event",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("audit unavailable")),
+    )
+    broker = RunBroker(dispatch_agent=lambda _request: "ok")
+
+    result = asyncio.run(
+        broker.run(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="owner",
+                content="hi",
+            )
+        )
+    )
+
+    assert result.content == "ok"
+
+
+def test_run_broker_consumes_structured_failure_fields_without_text_parsing(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import (
+        RunBroker,
+        record_current_run_failure,
+    )
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+
+    def dispatch(_request):
+        record_current_run_failure(
+            failure_subsystem="lark_api",
+            error_code="FEISHU_RATE_LIMITED",
+            retryable=True,
+        )
+        raise RuntimeError("opaque")
+
+    broker = RunBroker(dispatch_agent=dispatch)
+    with pytest.raises(RuntimeError, match="opaque"):
+        asyncio.run(
+            broker.run(
+                RunRequest(
+                    channel="webui",
+                    profile_name="owner",
+                    user_key="owner",
+                    content="hi",
+                )
+            )
+        )
+
+    row = json.loads(audit_path.read_text("utf-8"))
+    assert row["failure_subsystem"] == "lark_api"
+    assert row["error_code"] == "FEISHU_RATE_LIMITED"
+    assert row["retryable"] is True
+
+
+def test_run_broker_stable_execution_writes_terminal_after_waiter_disconnect(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    async def run():
+        audit_path = tmp_path / "audit.jsonl"
+        monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+        monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def dispatch(_request):
+            started.set()
+            await release.wait()
+            return "ok"
+
+        broker = RunBroker(dispatch_agent=dispatch)
+        waiter = asyncio.create_task(
+            broker.run(
+                RunRequest(
+                    channel="webui",
+                    profile_name="owner",
+                    user_key="owner",
+                    content="hi",
+                )
+            )
+        )
+        await started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        for _ in range(100):
+            if audit_path.exists():
+                break
+            await asyncio.sleep(0)
+        rows = [json.loads(line) for line in audit_path.read_text("utf-8").splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["terminal_status"] == "completed"
+
+    asyncio.run(run())
+
+
+def test_partial_stream_failure_writes_failed_output_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+    from types import SimpleNamespace
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.run_broker import RunBroker
+    from hermes_multitenancy.run_models import RunRequest
+
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit_path))
+    monkeypatch.setattr(
+        "hermes_multitenancy.agent_real._core._resolve_explicit_expert_for_execution",
+        lambda *_args: None,
+    )
+
+    async def partial(*_args, **_kwargs):
+        yield "content", "partial"
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", partial)
+
+    async def dispatch(_request):
+        event = SimpleNamespace(text="hi", raw_event={"metadata": {}})
+        async for _item in agent_real.stream_run_agent(event, tmp_path):
+            pass
+        return ""
+
+    broker = RunBroker(dispatch_agent=dispatch)
+    asyncio.run(
+        broker.run(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="owner",
+                content="hi",
+            )
+        )
+    )
+
+    row = json.loads(audit_path.read_text("utf-8"))
+    assert row["terminal_status"] == "failed"
+    assert row["failure_subsystem"] == "output"
+    assert row["error_code"] == "OUTPUT_INCOMPLETE"
+    assert row["answer_completed"] is False
+
+
 def test_run_request_builds_stable_idempotency_key():
     from hermes_multitenancy.run_models import RunRequest
 

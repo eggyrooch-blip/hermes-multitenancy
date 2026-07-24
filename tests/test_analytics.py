@@ -42,6 +42,122 @@ def _message(
     }
 
 
+def _terminal(
+    ts: str,
+    *,
+    event_id: str,
+    profile: str,
+    expert_id: str,
+    status: str,
+    error_code: str | None = None,
+    subsystem: str | None = None,
+    retried: bool = False,
+) -> dict:
+    return {
+        "@timestamp": ts,
+        "event_type": "run_terminal",
+        "schema_version": 1,
+        "terminal_event_id": event_id,
+        "profile": profile,
+        "platform": "webui",
+        "chat_type": "webui",
+        "source": "run_broker",
+        "expert_requested": True,
+        "expert_id": expert_id,
+        "expert_resolution": "rejected" if status == "rejected" else "resolved",
+        "terminal_status": status,
+        "error_code": error_code,
+        "failure_subsystem": subsystem,
+        "retryable": False,
+        "retried": retried,
+        "answer_completed": status == "completed",
+        "duration_ms": 5,
+    }
+
+
+def test_summary_aggregates_deduped_run_terminals_without_changing_turns() -> None:
+    from hermes_multitenancy.analytics import build_summary_from_records
+
+    rows = [
+        _message(
+            "2026-06-11T12:00:00+08:00",
+            profile="profile_a",
+            platform="webui",
+            session="s",
+            message_id=1,
+            role="user",
+            content="hello",
+        ),
+        _terminal(
+            "2026-06-11T12:00:01+08:00",
+            event_id="run-1",
+            profile="profile_a",
+            expert_id="resource-delivery",
+            status="completed",
+        ),
+        _terminal(
+            "2026-06-11T12:00:02+08:00",
+            event_id="run-1",
+            profile="profile_a",
+            expert_id="resource-delivery",
+            status="completed",
+        ),
+        _terminal(
+            "2026-06-11T12:01:00+08:00",
+            event_id="run-2",
+            profile="profile_b",
+            expert_id="resource-delivery",
+            status="rejected",
+            error_code="EXPERT_UNAVAILABLE",
+            subsystem="expert_resolution",
+            retried=True,
+        ),
+    ]
+
+    summary = build_summary_from_records(rows)
+
+    assert summary["windows"]["7d"]["turns"] == 1
+    expert = summary["run_terminals"]["by_expert"]["resource-delivery"]
+    assert expert == {
+        "requests": 2,
+        "resolved": 1,
+        "answers_completed": 1,
+        "completed": 1,
+        "failed": 0,
+        "rejected": 1,
+        "cancelled": 0,
+        "retried": 1,
+        "active_profiles": 2,
+        "failure_subsystems": {"expert_resolution": 1},
+        "error_codes": {"EXPERT_UNAVAILABLE": 1},
+    }
+
+
+def test_summary_marks_structured_terminal_data_unavailable_for_legacy_rows() -> None:
+    from hermes_multitenancy.analytics import build_summary_from_records, render_markdown
+
+    summary = build_summary_from_records(
+        [
+            _message(
+                "2026-06-11T12:00:00+08:00",
+                profile="profile_a",
+                platform="webui",
+                session="s",
+                message_id=1,
+                role="user",
+                content="hello",
+            )
+        ]
+    )
+
+    assert summary["run_terminals"] == {
+        "available": False,
+        "events": 0,
+        "by_expert": {},
+    }
+    assert "No structured run-terminal data" in render_markdown(summary)
+
+
 def _routing_db(path: Path) -> None:
     conn = sqlite3.connect(path)
     try:

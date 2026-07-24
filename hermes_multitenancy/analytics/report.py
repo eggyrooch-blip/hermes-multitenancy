@@ -100,6 +100,7 @@ def routing_summary_from_records(records: list[dict[str, Any]] | None) -> dict[s
 
 def _audit_load_from_records(records: list[dict[str, Any]]) -> AuditLoadResult:
     rows: list[dict[str, Any]] = []
+    terminal_rows: list[dict[str, Any]] = []
     bad = 0
     first: datetime | None = None
     last: datetime | None = None
@@ -107,7 +108,20 @@ def _audit_load_from_records(records: list[dict[str, Any]]) -> AuditLoadResult:
         if not isinstance(record, dict):
             bad += 1
             continue
-        if record.get("event_type", "conversation_message") != "conversation_message":
+        event_type = record.get("event_type", "conversation_message")
+        if event_type == "run_terminal":
+            if record.get("schema_version") != 1:
+                continue
+            timestamp = parse_timestamp(record.get("@timestamp"))
+            if timestamp is None:
+                continue
+            row = dict(record)
+            row["_dt"] = timestamp
+            terminal_rows.append(row)
+            first = timestamp if first is None or timestamp < first else first
+            last = timestamp if last is None or timestamp > last else last
+            continue
+        if event_type != "conversation_message":
             continue
         timestamp = parse_timestamp(record.get("@timestamp"))
         if timestamp is None:
@@ -119,7 +133,15 @@ def _audit_load_from_records(records: list[dict[str, Any]]) -> AuditLoadResult:
         first = timestamp if first is None or timestamp < first else first
         last = timestamp if last is None or timestamp > last else last
     rows.sort(key=lambda row: (row["_dt"], str(row.get("session_id") or ""), str(row.get("message_id") or "")))
-    return AuditLoadResult(rows=rows, total_lines=len(records), bad_lines=bad, first_timestamp=first, last_timestamp=last)
+    terminal_rows.sort(key=lambda row: (row["_dt"], str(row.get("terminal_event_id") or "")))
+    return AuditLoadResult(
+        rows=rows,
+        total_lines=len(records),
+        bad_lines=bad,
+        first_timestamp=first,
+        last_timestamp=last,
+        terminal_rows=terminal_rows,
+    )
 
 
 def _window_turns(turns: list[Turn], last: datetime | None, days: int | None) -> list[Turn]:
@@ -343,6 +365,65 @@ def _insights(turns: list[Turn], scenario_counts: dict[str, Any], failure_counts
     return insights
 
 
+def _run_terminal_metrics(
+    rows: list[dict[str, Any]],
+    *,
+    last: datetime | None,
+    days: int,
+) -> dict[str, Any]:
+    if not rows:
+        return {"available": False, "events": 0, "by_expert": {}}
+    cutoff = last - timedelta(days=max(1, int(days))) if last is not None else None
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        timestamp = row.get("_dt")
+        if cutoff is not None and isinstance(timestamp, datetime) and timestamp < cutoff:
+            continue
+        event_id = str(row.get("terminal_event_id") or "").strip()
+        if event_id:
+            deduped[event_id] = row
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in deduped.values():
+        if not row.get("expert_requested"):
+            continue
+        expert_id = str(row.get("expert_id") or "").strip()
+        if expert_id:
+            grouped[expert_id].append(row)
+
+    by_expert: dict[str, Any] = {}
+    for expert_id, items in sorted(grouped.items()):
+        statuses = Counter(str(item.get("terminal_status") or "") for item in items)
+        subsystems = Counter(
+            str(item.get("failure_subsystem"))
+            for item in items
+            if item.get("failure_subsystem")
+        )
+        error_codes = Counter(
+            str(item.get("error_code"))
+            for item in items
+            if item.get("error_code")
+        )
+        by_expert[expert_id] = {
+            "requests": len(items),
+            "resolved": sum(1 for item in items if item.get("expert_resolution") == "resolved"),
+            "answers_completed": sum(1 for item in items if item.get("answer_completed") is True),
+            "completed": statuses["completed"],
+            "failed": statuses["failed"],
+            "rejected": statuses["rejected"],
+            "cancelled": statuses["cancelled"],
+            "retried": sum(1 for item in items if item.get("retried") is True),
+            "active_profiles": len({str(item.get("profile") or "") for item in items}),
+            "failure_subsystems": dict(sorted(subsystems.items())),
+            "error_codes": dict(sorted(error_codes.items())),
+        }
+    return {
+        "available": bool(deduped),
+        "events": len(deduped),
+        "by_expert": by_expert,
+    }
+
+
 def _build_summary(
     *,
     load: AuditLoadResult,
@@ -383,6 +464,11 @@ def _build_summary(
         "scenarios": {},
         "failure_categories": {},
         "top": {},
+        "run_terminals": _run_terminal_metrics(
+            load.terminal_rows,
+            last=last,
+            days=days,
+        ),
     }
 
     for item in window_days:
@@ -581,6 +667,40 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         _table(["Command", "Turns"], summary.get("top", {}).get(selected_key, {}).get("lark_commands", [])[:15]),
     ]
+    terminals = summary.get("run_terminals", {})
+    lines.extend(["## Expert Run Terminals", ""])
+    if not terminals.get("available"):
+        lines.extend(["_No structured run-terminal data._", ""])
+    else:
+        lines.append(
+            _table(
+                [
+                    "Expert",
+                    "Requests",
+                    "Resolved",
+                    "Answers Completed",
+                    "Failed",
+                    "Rejected",
+                    "Cancelled",
+                    "Retried",
+                    "Active Profiles",
+                ],
+                [
+                    [
+                        expert_id,
+                        metrics["requests"],
+                        metrics["resolved"],
+                        metrics["answers_completed"],
+                        metrics["failed"],
+                        metrics["rejected"],
+                        metrics["cancelled"],
+                        metrics["retried"],
+                        metrics["active_profiles"],
+                    ]
+                    for expert_id, metrics in terminals.get("by_expert", {}).items()
+                ],
+            )
+        )
     top_profiles = summary.get("top", {}).get(selected_key, {}).get("top_active_profiles")
     if top_profiles is not None:
         lines.extend(["## Top Profiles", "", _table(["Profile", "Turns"], top_profiles[:20])])

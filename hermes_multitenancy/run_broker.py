@@ -7,11 +7,14 @@ rendering ``RunEvent`` objects back to their clients.
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import replace
 import inspect
 import logging
 import os
 import threading
+import time
+import uuid
 from typing import Awaitable, Callable, Optional
 
 from .run_models import RunEvent, RunRequest, RunResult
@@ -42,6 +45,28 @@ _PREPARE_INFLIGHT: dict[
 _EXECUTION_INFLIGHT: dict[
     tuple[int, int, int, str, str, str, str], "_ExecutionInflight"
 ] = {}
+_RUN_RETRIED: ContextVar[bool] = ContextVar("hermes_run_retried", default=False)
+_RUN_FAILURE_FIELDS: ContextVar[tuple[str, str, bool] | None] = ContextVar(
+    "hermes_run_failure_fields",
+    default=None,
+)
+
+
+def mark_current_run_retried() -> None:
+    """Mark the admitted execution in this async context as having retried."""
+    _RUN_RETRIED.set(True)
+
+
+def record_current_run_failure(
+    *,
+    failure_subsystem: str,
+    error_code: str,
+    retryable: bool,
+) -> None:
+    """Carry S2's structured classifier output to the admitted terminal."""
+    _RUN_FAILURE_FIELDS.set(
+        (str(failure_subsystem), str(error_code), bool(retryable))
+    )
 
 
 def _request_identity(request: RunRequest) -> tuple[str, str, str, str]:
@@ -421,12 +446,97 @@ class RunBroker:
                 raise TypeError("AdmittedRun was already claimed")
             object.__setattr__(admitted, "_claimed", True)
         request = admitted.request
-        response = await _maybe_await((dispatch_agent or self._dispatch_agent)(request))
-        content = str(response or "")
-        if content:
-            await self._emit_to(RunEvent(kind="content", text=content), emit_event)
-        await self._emit_to(RunEvent(kind="done"), emit_event)
-        return RunResult(content=content, duplicate=False)
+        started = time.monotonic()
+        terminal_event_id = str(uuid.uuid4())
+        retry_token = _RUN_RETRIED.set(False)
+        failure_fields_token = _RUN_FAILURE_FIELDS.set(None)
+        expert_id = str((request.metadata or {}).get("expert_id") or "").strip()
+        expert_requested = bool(expert_id)
+        terminal_status = "completed"
+        error_code: str | None = None
+        failure_subsystem: str | None = None
+        retryable = False
+        answer_completed = False
+        try:
+            response = await _maybe_await((dispatch_agent or self._dispatch_agent)(request))
+            content = str(response or "")
+            if content:
+                await self._emit_to(RunEvent(kind="content", text=content), emit_event)
+            await self._emit_to(RunEvent(kind="done"), emit_event)
+            classified = _RUN_FAILURE_FIELDS.get()
+            if classified is None:
+                answer_completed = True
+            else:
+                terminal_status = "failed"
+                failure_subsystem, error_code, retryable = classified
+            return RunResult(content=content, duplicate=False)
+        except asyncio.CancelledError:
+            terminal_status = "cancelled"
+            error_code = "RUN_CANCELLED"
+            failure_subsystem = "runtime"
+            raise
+        except BaseException as exc:
+            code = str(getattr(exc, "error_code", "") or "")
+            subsystem = str(getattr(exc, "failure_subsystem", "") or "")
+            classified = _RUN_FAILURE_FIELDS.get()
+            if classified is not None and not code and not subsystem:
+                subsystem, code, retryable = classified
+            if code == "EXPERT_UNAVAILABLE":
+                terminal_status = "rejected"
+                error_code = code
+                failure_subsystem = "expert_resolution"
+            else:
+                terminal_status = "failed"
+                error_code = code or "UNKNOWN"
+                failure_subsystem = subsystem or "runtime"
+            if classified is None or getattr(exc, "retryable", None) is not None:
+                retryable = getattr(exc, "retryable", False) is True
+            raise
+        finally:
+            retried = _RUN_RETRIED.get()
+            _RUN_RETRIED.reset(retry_token)
+            _RUN_FAILURE_FIELDS.reset(failure_fields_token)
+            try:
+                from .conversation_audit import (
+                    _FAILURE_SUBSYSTEMS,
+                    _REGISTERED_ERROR_CODES,
+                    append_run_terminal_event,
+                )
+
+                if terminal_status != "completed":
+                    if error_code not in _REGISTERED_ERROR_CODES:
+                        error_code = "UNKNOWN"
+                    if failure_subsystem not in _FAILURE_SUBSYSTEMS:
+                        failure_subsystem = "runtime"
+                safe_expert_id = (
+                    expert_id
+                    if expert_id and all(c.isalnum() or c in "-_.:" for c in expert_id)
+                    else None
+                )
+                append_run_terminal_event(
+                    terminal_event_id=terminal_event_id,
+                    profile_name=request.profile_name,
+                    platform=request.channel,
+                    chat_type=str((request.metadata or {}).get("chat_type") or request.channel),
+                    expert_requested=expert_requested,
+                    expert_id=safe_expert_id,
+                    expert_resolution=(
+                        "not_requested"
+                        if not expert_requested
+                        else "rejected"
+                        if terminal_status == "rejected"
+                        else "resolved"
+                    ),
+                    terminal_status=terminal_status,
+                    error_code=error_code,
+                    failure_subsystem=failure_subsystem,
+                    retryable=retryable,
+                    retried=retried,
+                    answer_completed=answer_completed,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                )
+            except Exception:
+                logger.exception("[multitenancy] run terminal audit append failed")
 
     async def prepare_and_execute(
         self,
