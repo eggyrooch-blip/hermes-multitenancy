@@ -16,7 +16,6 @@ import os
 import shutil
 import sqlite3
 import tempfile
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -625,33 +624,12 @@ def _ingest_plugin_candidate(
             force=force,
             activate=activate,
             allow_create_distribution=allow_create_distribution,
+            release_version=release_version,
+            release_id=release_id,
             _lock_held=True,
         )
         if previous_active or health_required:
             _assert_plugin_candidate_health(shared, profiles, plugin_id)
-        if release_version:
-            manifest = json.loads(managed_path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(manifest, dict)
-                or manifest.get("plugin_id") != plugin_id
-                or manifest.get("status") != "active"
-            ):
-                raise plugin_ingest.PluginIngestError(
-                    "plugin release metadata found no active candidate"
-                )
-            same_release = (
-                manifest.get("release_version") == release_version
-                and manifest.get("release_id") == release_id
-                and isinstance(manifest.get("release_installed_at"), int)
-            )
-            manifest["release_version"] = release_version
-            if release_id:
-                manifest["release_id"] = release_id
-            else:
-                manifest.pop("release_id", None)
-            if not same_release:
-                manifest["release_installed_at"] = int(time.time())
-            plugin_ingest._write_managed_manifest(shared, manifest, dry_run=False)
         return report
     except Exception as exc:
         if previous_active:

@@ -1265,6 +1265,8 @@ def ingest(
     force: bool = False,
     allow_create_distribution: bool = False,
     activate: bool = False,
+    release_version: str | None = None,
+    release_id: str | None = None,
     _lock_held: bool = False,
 ) -> dict[str, Any]:
     shared_home = (shared_home or _default_shared_home()).expanduser()
@@ -1281,6 +1283,8 @@ def ingest(
             force=force,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
+            release_version=release_version,
+            release_id=release_id,
         )
     with _plugin_ingest_lock(shared_home, plugin["id"]):
         return _ingest_locked(
@@ -1293,6 +1297,8 @@ def ingest(
             force=force,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
+            release_version=release_version,
+            release_id=release_id,
         )
 
 
@@ -1307,6 +1313,8 @@ def _ingest_locked(
     force: bool,
     allow_create_distribution: bool,
     activate: bool,
+    release_version: str | None,
+    release_id: str | None,
 ) -> dict[str, Any]:
     aud = resolve_audience(audience, profiles_root=profiles_root)
     if dry_run:
@@ -1320,6 +1328,8 @@ def _ingest_locked(
             force=force,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
+            release_version=release_version,
+            release_id=release_id,
         )
     with _active_plugin_state_transaction(
         plugin,
@@ -1337,6 +1347,8 @@ def _ingest_locked(
             force=force,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
+            release_version=release_version,
+            release_id=release_id,
         )
 
 
@@ -1351,6 +1363,8 @@ def _ingest_locked_impl(
     force: bool,
     allow_create_distribution: bool,
     activate: bool,
+    release_version: str | None,
+    release_id: str | None,
 ) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     existing_status = "active"
@@ -1395,6 +1409,18 @@ def _ingest_locked_impl(
         "experts": list(plugin.get("experts") or []),
         "assets": {},
     }
+    if release_version:
+        same_release = (
+            existing.get("release_version") == release_version
+            and existing.get("release_id") == release_id
+            and isinstance(existing.get("release_installed_at"), int)
+        )
+        manifest["release_version"] = release_version
+        if release_id:
+            manifest["release_id"] = release_id
+        manifest["release_installed_at"] = (
+            existing["release_installed_at"] if same_release else int(time.time())
+        )
     managed_path = _managed_path(shared_home, plugin["id"])
     report["managed_manifest"] = str(managed_path)
     if not preserve_active_manifest:

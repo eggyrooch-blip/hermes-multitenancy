@@ -142,6 +142,12 @@ def _bad_plugin_zip() -> bytes:
     return buffer.getvalue()
 
 
+def _plugin_repo(root: Path, **kwargs) -> Path:
+    with zipfile.ZipFile(BytesIO(_plugin_zip(**kwargs))) as archive:
+        archive.extractall(root)
+    return root / "keep-rd-plugin"
+
+
 def _plugin_event(
     *,
     event_type: str = "skill.install_approved",
@@ -249,6 +255,82 @@ def test_plugin_governance_failure_is_auditable_and_inactive(tmp_path: Path) -> 
     assert not (
         shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json"
     ).exists()
+
+
+def test_nonactivating_ingest_keeps_release_metadata(tmp_path: Path) -> None:
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    repo = _plugin_repo(tmp_path / "repo")
+    pi.ingest(
+        repo,
+        audience="alice",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        activate=True,
+    )
+    inactive = _managed_manifest(shared_home)
+    inactive["status"] = "inactive"
+    pi._write_managed_manifest(shared_home, inactive, dry_run=False)
+
+    pi.ingest(
+        repo,
+        audience="alice",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        force=True,
+        release_version="1.0.5",
+        release_id="196",
+    )
+
+    manifest = _managed_manifest(shared_home)
+    assert manifest["status"] == "inactive"
+    assert manifest["release_version"] == "1.0.5"
+    assert manifest["release_id"] == "196"
+    assert manifest["release_installed_at"] > 0
+
+
+def test_release_metadata_write_failure_rolls_back_plugin_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    original = _plugin_repo(tmp_path / "original", content_tag="OLD")
+    upgraded = _plugin_repo(tmp_path / "upgraded", content_tag="NEW")
+    pi.ingest(
+        original,
+        audience="alice",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        activate=True,
+        release_version="1.0.0",
+        release_id="100",
+    )
+    previous_manifest = _managed_manifest(shared_home)
+    previous_shared = _tree_snapshot(shared_home / "skills")
+    previous_profile = _tree_snapshot(profiles_root / "alice" / "skills")
+    original_write = pi._write_managed_manifest
+
+    def reject_release(shared, manifest, *, dry_run):
+        if manifest.get("release_version") == "1.0.5":
+            raise pi.PluginIngestError("forced release metadata failure")
+        return original_write(shared, manifest, dry_run=dry_run)
+
+    monkeypatch.setattr(pi, "_write_managed_manifest", reject_release)
+    with pytest.raises(pi.PluginIngestError, match="forced release metadata failure"):
+        pi.ingest(
+            upgraded,
+            audience="alice",
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            activate=True,
+            force=True,
+            release_version="1.0.5",
+            release_id="196",
+        )
+
+    assert _managed_manifest(shared_home) == previous_manifest
+    assert _tree_snapshot(shared_home / "skills") == previous_shared
+    assert _tree_snapshot(profiles_root / "alice" / "skills") == previous_profile
 
 
 def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path) -> None:
