@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 import threading
 from typing import Any, Callable
@@ -588,6 +589,150 @@ def _set_plugin_status_locked(shared_home: Path, plugin_id: str, status: str) ->
     manifest["status"] = status
     plugin_ingest._write_managed_manifest(shared_home, manifest, dry_run=False)
     return True
+
+
+def _ingest_plugin_candidate(
+    repo_root: Path,
+    *,
+    audience: str,
+    shared: Path,
+    profiles: Path,
+    force: bool = False,
+    activate: bool = False,
+    allow_create_distribution: bool = False,
+    health_required: bool = False,
+) -> dict[str, Any]:
+    plugin_id = plugin_ingest.load_plugin_manifest(repo_root)["id"]
+    managed_path = plugin_ingest._managed_path(shared, plugin_id)
+    try:
+        previous = json.loads(managed_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        previous = None
+    previous_active = (
+        isinstance(previous, dict)
+        and previous.get("plugin_id") == plugin_id
+        and previous.get("status") in {None, "", "active"}
+    )
+    try:
+        report = plugin_ingest.ingest(
+            repo_root,
+            audience=audience,
+            shared_home=shared,
+            profiles_root=profiles,
+            force=force,
+            activate=activate,
+            allow_create_distribution=allow_create_distribution,
+            _lock_held=True,
+        )
+        if previous_active or health_required:
+            _assert_plugin_candidate_health(shared, profiles, plugin_id)
+        return report
+    except Exception as exc:
+        if previous_active:
+            plugin_ingest._write_managed_manifest(shared, previous, dry_run=False)
+        if isinstance(exc, plugin_ingest.PluginIngestError):
+            raise
+        raise plugin_ingest.PluginIngestError(
+            f"plugin candidate failed: {type(exc).__name__}"
+        ) from exc
+
+
+@contextmanager
+def _plugin_update_transaction(
+    repo_root: Path,
+    *,
+    audience: str,
+    shared: Path,
+    profiles: Path,
+):
+    plugin = plugin_ingest.load_plugin_manifest(repo_root)
+    resolved = plugin_ingest.resolve_audience(audience, profiles_root=profiles)
+    was_active = _plugin_managed_status(shared, plugin["id"]) == "active"
+    try:
+        with plugin_ingest._active_plugin_state_transaction(
+            plugin,
+            resolved,
+            shared_home=shared,
+            profiles_root=profiles,
+        ):
+            yield was_active
+    except Exception as exc:
+        if isinstance(exc, plugin_ingest.PluginIngestError):
+            raise
+        raise plugin_ingest.PluginIngestError(
+            f"plugin update transaction failed: {type(exc).__name__}"
+        ) from exc
+
+
+def _assert_plugin_candidate_health(
+    shared: Path,
+    profiles: Path,
+    plugin_id: str,
+) -> None:
+    managed_path = plugin_ingest._managed_path(shared, plugin_id)
+    try:
+        manifest = json.loads(managed_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        raise plugin_ingest.PluginIngestError("plugin health check could not read active manifest") from exc
+    if not isinstance(manifest, dict) or manifest.get("status") != "active":
+        raise plugin_ingest.PluginIngestError("plugin health check found no active candidate")
+    expected = {
+        str(row.get("id"))
+        for row in (manifest.get("experts") or [])
+        if isinstance(row, dict) and row.get("id")
+    }
+    if not expected:
+        return
+    skill_names = {
+        str(name)
+        for name in (manifest.get("skills") or [])
+        if str(name).strip()
+    }
+    audience = manifest.get("audience") if isinstance(manifest.get("audience"), dict) else {}
+    if audience.get("mode") == "profile":
+        targets = [profiles / str(name) for name in (audience.get("profiles") or [])]
+    elif audience.get("mode") == "all":
+        try:
+            targets = [
+                path
+                for path in profiles.iterdir()
+                if path.is_dir() and not path.is_symlink()
+            ]
+        except OSError as exc:
+            raise plugin_ingest.PluginIngestError(
+                "plugin health check could not enumerate intended profiles"
+            ) from exc
+    else:
+        return
+    from . import expert_overlay
+
+    missing = 0
+    for profile_home in targets:
+        visible = {str(row.get("id")) for row in expert_overlay.list_experts(profile_home)}
+        skills_ready = audience.get("mode") != "profile"
+        if not skills_ready:
+            skills_ready = True
+            for name in skill_names:
+                source = shared / "skills" / name
+                target = profile_home / "skills" / name
+                if target.is_symlink():
+                    matches = target.resolve() == source.resolve()
+                else:
+                    matches = (
+                        source.is_dir()
+                        and target.is_dir()
+                        and plugin_ingest._skill_tree_digest(target)
+                        == plugin_ingest._skill_tree_digest(source)
+                    )
+                if not matches:
+                    skills_ready = False
+                    break
+        if not expected.issubset(visible) or not skills_ready:
+            missing += 1
+    if missing:
+        raise plugin_ingest.PluginIngestError(
+            f"plugin health check failed for {missing} intended profile(s)"
+        )
 
 
 def _best_effort_plugin_uninstall(
@@ -1201,25 +1346,35 @@ def _process_plugin_event_locked(
                     "plugin_id": plugin_id,
                     "reason": "no download_url and no cached plugin repo",
                 }
-        # Repo secured (dir survives uninstall — only the manifest json is unlinked). Now clear
-        # any prior install so the all-ingest doesn't orphan per-profile copies, then re-register.
-        _best_effort_plugin_uninstall(plugin_id, shared=shared, profiles=profiles)
         try:
-            report = plugin_ingest.ingest(
+            with _plugin_update_transaction(
                 repo_root,
                 audience="all",
-                shared_home=shared,
-                profiles_root=profiles,
-                # Thread the caller's opt-in instead of hardcoding True. Creating
-                # skill-distribution.yaml where none exists overrides every
-                # profile's default-skill source; the skill path already gates
-                # this behind allow_create_distribution (default False), and the
-                # plugin path must match. MED-4, audit 2026-07-03.
-                allow_create_distribution=allow_create_distribution,
-                force=fresh_repo,
-                activate=activate,
-                _lock_held=True,
-            )
+                shared=shared,
+                profiles=profiles,
+            ) as was_active:
+                # Repo is secured before uninstall. The outer transaction keeps the
+                # previous manifest, fanout, sources and profile trees recoverable.
+                _best_effort_plugin_uninstall(
+                    plugin_id,
+                    shared=shared,
+                    profiles=profiles,
+                )
+                report = _ingest_plugin_candidate(
+                    repo_root,
+                    audience="all",
+                    shared=shared,
+                    profiles=profiles,
+                    # Thread the caller's opt-in instead of hardcoding True. Creating
+                    # skill-distribution.yaml where none exists overrides every
+                    # profile's default-skill source; the skill path already gates
+                    # this behind allow_create_distribution (default False), and the
+                    # plugin path must match. MED-4, audit 2026-07-03.
+                    allow_create_distribution=allow_create_distribution,
+                    force=fresh_repo,
+                    activate=activate,
+                    health_required=was_active,
+                )
         except plugin_ingest.PluginIngestError as exc:
             raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
         return {"action": "plugin_install", "mode": "all", "plugin_id": plugin_id, "ingest": report}
@@ -1281,12 +1436,6 @@ def _process_plugin_event_locked(
             # sticky whitelist always stays installed + in the manifest audience, so a
             # short upstream list can never shrink it away (reconcile also exempts sticky).
             target |= _plugin_sticky_profiles(shared, plugin_id)
-            _reconcile_plugin_full_snapshot(
-                plugin_id,
-                shared=shared,
-                profiles=profiles,
-                new_profiles=set(resolved_names) | defaults | retained,
-            )
         if not target:
             return {
                 "action": "plugin_install",
@@ -1294,16 +1443,30 @@ def _process_plugin_event_locked(
                 "users": user_report,
                 "ingest": None,
             }
+        target_audience = ",".join(sorted(target))
         try:
-            report = plugin_ingest.ingest(
+            with _plugin_update_transaction(
                 repo_root,
-                audience=",".join(sorted(target)),
-                shared_home=shared,
-                profiles_root=profiles,
-                force=fresh_repo,
-                activate=activate,
-                _lock_held=True,
-            )
+                audience=target_audience,
+                shared=shared,
+                profiles=profiles,
+            ) as was_active:
+                if full_snapshot:
+                    _reconcile_plugin_full_snapshot(
+                        plugin_id,
+                        shared=shared,
+                        profiles=profiles,
+                        new_profiles=set(resolved_names) | defaults | retained,
+                    )
+                report = _ingest_plugin_candidate(
+                    repo_root,
+                    audience=target_audience,
+                    shared=shared,
+                    profiles=profiles,
+                    force=fresh_repo,
+                    activate=activate,
+                    health_required=was_active,
+                )
         except plugin_ingest.PluginIngestError as exc:
             raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
         return {
@@ -1335,12 +1498,6 @@ def _process_plugin_event_locked(
         # sticky whitelist stays in the manifest audience on this cached-repo path too,
         # else the ingest below would rewrite the manifest without sticky (codex 2026-07-02).
         target |= _plugin_sticky_profiles(shared, plugin_id)
-        _reconcile_plugin_full_snapshot(
-            plugin_id,
-            shared=shared,
-            profiles=profiles,
-            new_profiles=set(resolved_names) | defaults | retained,
-        )
     if not target:
         return {
             "action": "plugin_install",
@@ -1349,15 +1506,29 @@ def _process_plugin_event_locked(
             "users": user_report,
             "ingest": None,
         }
+    target_audience = ",".join(sorted(target))
     try:
-        report = plugin_ingest.ingest(
+        with _plugin_update_transaction(
             repo_root,
-            audience=",".join(sorted(target)),
-            shared_home=shared,
-            profiles_root=profiles,
-            activate=activate,
-            _lock_held=True,
-        )
+            audience=target_audience,
+            shared=shared,
+            profiles=profiles,
+        ) as was_active:
+            if full_snapshot:
+                _reconcile_plugin_full_snapshot(
+                    plugin_id,
+                    shared=shared,
+                    profiles=profiles,
+                    new_profiles=set(resolved_names) | defaults | retained,
+                )
+            report = _ingest_plugin_candidate(
+                repo_root,
+                audience=target_audience,
+                shared=shared,
+                profiles=profiles,
+                activate=activate,
+                health_required=was_active,
+            )
     except plugin_ingest.PluginIngestError as exc:
         raise SkillhubInstallError(str(exc), error_code="PLUGIN_INGEST_FAILED") from exc
     return {

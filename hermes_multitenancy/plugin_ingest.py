@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -75,6 +76,8 @@ _ASSET_MIME_BY_SUFFIX = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
 }
+_PLUGIN_STATE_THREAD_LOCK = threading.RLock()
+_PLUGIN_STATE_LOCAL = threading.local()
 
 
 class PluginIngestError(RuntimeError):
@@ -451,19 +454,35 @@ def _register_shared_skill_source(
                 for manifest_path in (shared_skills.parent / MANAGED_DIR).glob("*.json"):
                     try:
                         managed = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-                        continue
+                    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+                        raise PluginIngestError(
+                            f"cannot verify legacy owner for shared skill {name!r}"
+                        ) from exc
                     if (
                         isinstance(managed, dict)
                         and managed.get("plugin_id")
                         and name in (managed.get("skills") or [])
                     ):
-                        claims.append(str(managed["plugin_id"]))
-                if set(claims) != {plugin_id} or _skill_tree_digest(dst) != source_digest:
+                        claimed_id = _safe_component(
+                            managed["plugin_id"],
+                            kind="plugin id",
+                        )
+                        if (
+                            manifest_path.name != f"{claimed_id}.json"
+                            or managed.get("status") not in {None, "", "active"}
+                        ):
+                            raise PluginIngestError(
+                                f"cannot verify legacy owner for shared skill {name!r}"
+                            )
+                        claims.append(claimed_id)
+                if claims != [plugin_id]:
                     raise PluginIngestError(
                         f"shared skill source collision: {name!r} has ambiguous legacy owners {sorted(set(claims))}"
                     )
-                owner = {"plugin_id": plugin_id, "digest": source_digest}
+                owner = {
+                    "plugin_id": plugin_id,
+                    "digest": _skill_tree_digest(dst),
+                }
             if owner is not None and owner.get("plugin_id") != plugin_id:
                 raise PluginIngestError(
                     f"shared skill source collision: {name!r} belongs to plugin {owner.get('plugin_id')!r}"
@@ -1022,6 +1041,220 @@ def _plugin_ingest_lock(shared_home: Path, plugin_id: str):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+@contextmanager
+def _global_plugin_state_lock(shared_home: Path):
+    """Serialize snapshots that include shared cross-plugin registry files."""
+    # ponytail: one global lock; use entry-level CAS only if update throughput
+    # becomes a measured bottleneck.
+    with _PLUGIN_STATE_THREAD_LOCK:
+        depth = getattr(_PLUGIN_STATE_LOCAL, "depth", 0)
+        if depth:
+            _PLUGIN_STATE_LOCAL.depth = depth + 1
+            try:
+                yield
+            finally:
+                _PLUGIN_STATE_LOCAL.depth = depth
+            return
+
+        lock_path = shared_home / MANAGED_DIR / ".locks" / "plugin-state.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            _PLUGIN_STATE_LOCAL.depth = 1
+            try:
+                yield
+            finally:
+                _PLUGIN_STATE_LOCAL.depth = 0
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _remove_snapshot_target(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+@contextmanager
+def _active_plugin_state_transaction(
+    plugin: dict[str, Any],
+    audience: Audience,
+    *,
+    shared_home: Path,
+    profiles_root: Path,
+):
+    with _global_plugin_state_lock(shared_home):
+        with _active_plugin_state_transaction_locked(
+            plugin,
+            audience,
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+        ):
+            yield
+
+
+@contextmanager
+def _active_plugin_state_transaction_locked(
+    plugin: dict[str, Any],
+    audience: Audience,
+    *,
+    shared_home: Path,
+    profiles_root: Path,
+):
+    """Restore every plugin-owned runtime path if an active upgrade fails."""
+    manifest_path = _managed_path(shared_home, plugin["id"])
+    if not manifest_path.exists():
+        yield
+        return
+    try:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        raise PluginIngestError(
+            f"cannot verify existing managed manifest for plugin {plugin['id']!r}"
+        ) from exc
+    if not isinstance(existing, dict) or existing.get("plugin_id") != plugin["id"]:
+        raise PluginIngestError(
+            f"cannot verify existing managed manifest for plugin {plugin['id']!r}"
+        )
+    if existing.get("status") not in {None, "", "active"}:
+        yield
+        return
+
+    old_skills = {
+        _safe_skill_name(name) for name in (existing.get("skills") or [])
+    }
+    new_skills = {
+        _safe_skill_name(name) for name in plugin["skills"]["list"]
+    }
+    old_audience = (
+        existing.get("audience")
+        if isinstance(existing.get("audience"), dict)
+        else {}
+    )
+    profile_names = {
+        _safe_component(name, kind="profile")
+        for name in (old_audience.get("profiles") or [])
+    }
+    profile_names.update(
+        _safe_component(name, kind="profile") for name in audience.profiles
+    )
+    if old_audience.get("mode") == "all":
+        if not profiles_root.is_dir() or profiles_root.is_symlink():
+            raise PluginIngestError("profiles root is unavailable or unsafe")
+        profile_names.update(
+            path.name
+            for path in profiles_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        )
+
+    cli_ids = {
+        _safe_component(value, kind="cli id")
+        for value in (existing.get("clis") or [])
+    }
+    cli_ids.update(
+        _safe_component(row["id"], kind="cli id")
+        for row in (plugin.get("clis") or [])
+    )
+    paths = {
+        manifest_path,
+        shared_home / MANAGED_DIR / ".locks" / "source-owners.json",
+        shared_home / SKILL_DISTRIBUTION_FILE,
+        shared_home / MANAGED_ASSETS_DIR / plugin["id"],
+        *(shared_home / "skills" / name for name in old_skills | new_skills),
+        *(shared_home / "bin" / cli_id for cli_id in cli_ids),
+    }
+    for profile_name in profile_names:
+        skills_root = profiles_root / profile_name / "skills"
+        paths.update(
+            {
+                skills_root / ".hermes-personal-installs.json",
+                skills_root / ".hermes-managed.json",
+                *(skills_root / name for name in old_skills | new_skills),
+            }
+        )
+
+    transaction_root = shared_home / MANAGED_DIR / ".transactions"
+    transaction_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=transaction_root,
+        prefix=f".{plugin['id']}-",
+    ) as temp_dir:
+        backup_root = Path(temp_dir)
+        snapshots: list[tuple[Path, str, Path | str | None]] = []
+        for index, path in enumerate(sorted(paths, key=str)):
+            if path.is_symlink():
+                snapshots.append((path, "symlink", os.readlink(path)))
+            elif path.is_dir():
+                backup = backup_root / str(index)
+                shutil.copytree(path, backup, symlinks=True)
+                snapshots.append((path, "dir", backup))
+            elif path.is_file():
+                backup = backup_root / str(index)
+                shutil.copy2(path, backup)
+                snapshots.append((path, "file", backup))
+            else:
+                snapshots.append((path, "missing", None))
+        try:
+            yield
+        except Exception:
+            try:
+                for path, kind, backup in reversed(snapshots):
+                    _remove_snapshot_target(path)
+                    if kind == "missing":
+                        continue
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if kind == "symlink":
+                        os.symlink(str(backup), path)
+                    elif kind == "dir":
+                        shutil.copytree(Path(backup), path, symlinks=True)
+                    else:
+                        shutil.copy2(Path(backup), path)
+            except Exception as restore_exc:
+                raise PluginIngestError(
+                    f"failed to restore active plugin {plugin['id']!r}"
+                ) from restore_exc
+            raise
+
+
+def _preflight_plugin_candidate(
+    plugin: dict[str, Any],
+    *,
+    shared_home: Path,
+    force: bool,
+) -> None:
+    """Run deterministic package/source checks before touching active content."""
+    assert_governance(plugin)
+    validate_connectors(plugin.get("connectors") or [])
+    names = list(plugin["skills"]["list"])
+    _assert_skill_content_governance(
+        plugin,
+        skills_root=Path(plugin["_repo"]) / plugin["_skills_dir"],
+        installed_skills=names,
+        scope=f"{plugin['id']}:package",
+    )
+    for name in names:
+        _register_shared_skill_source(
+            Path(plugin["_repo"]),
+            shared_home / "skills",
+            name,
+            plugin_id=plugin["id"],
+            skills_dir=plugin["_skills_dir"],
+            dry_run=True,
+            force=force,
+        )
+    install_clis(
+        plugin.get("clis") or [],
+        shared_bin=shared_home / "bin",
+        dry_run=True,
+        force=force,
+    )
+    _materialize_expert_assets(
+        plugin,
+        shared_home=shared_home,
+        dry_run=True,
+    )
+
+
 def ingest(
     repo: Path,
     *,
@@ -1076,6 +1309,49 @@ def _ingest_locked(
     activate: bool,
 ) -> dict[str, Any]:
     aud = resolve_audience(audience, profiles_root=profiles_root)
+    if dry_run:
+        return _ingest_locked_impl(
+            repo,
+            plugin=plugin,
+            aud=aud,
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            dry_run=True,
+            force=force,
+            allow_create_distribution=allow_create_distribution,
+            activate=activate,
+        )
+    with _active_plugin_state_transaction(
+        plugin,
+        aud,
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+    ):
+        return _ingest_locked_impl(
+            repo,
+            plugin=plugin,
+            aud=aud,
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            dry_run=False,
+            force=force,
+            allow_create_distribution=allow_create_distribution,
+            activate=activate,
+        )
+
+
+def _ingest_locked_impl(
+    repo: Path,
+    *,
+    plugin: dict[str, Any],
+    aud: Audience,
+    shared_home: Path,
+    profiles_root: Path,
+    dry_run: bool,
+    force: bool,
+    allow_create_distribution: bool,
+    activate: bool,
+) -> dict[str, Any]:
     existing: dict[str, Any] = {}
     existing_status = "active"
     try:
@@ -1086,6 +1362,13 @@ def _ingest_locked(
                 existing_status = str(existing["status"])
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
         pass
+    preserve_active_manifest = bool(existing) and existing_status == "active"
+    if not dry_run:
+        _preflight_plugin_candidate(
+            plugin,
+            shared_home=shared_home,
+            force=force,
+        )
 
     report: dict[str, Any] = {
         "plugin_id": plugin["id"],
@@ -1112,9 +1395,10 @@ def _ingest_locked(
         "experts": list(plugin.get("experts") or []),
         "assets": {},
     }
-    report["managed_manifest"] = str(
+    managed_path = _managed_path(shared_home, plugin["id"])
+    report["managed_manifest"] = str(managed_path)
+    if not preserve_active_manifest:
         _write_managed_manifest(shared_home, manifest, dry_run=dry_run)
-    )
     report["clis"] = install_clis(plugin.get("clis") or [], shared_bin=shared_home / "bin", dry_run=dry_run, force=force)
 
     if aud.mode == "profile":
@@ -1150,10 +1434,9 @@ def _ingest_locked(
     )
     manifest["experts"] = experts
     manifest["assets"] = assets
-    _write_managed_manifest(shared_home, manifest, dry_run=dry_run)
-
-    # Governance runs after the inactive manifest is persisted so a partial install is
-    # recoverable without ever publishing an unvalidated expert as active.
+    # A new or already-inactive plugin keeps the recoverable inactive manifest above.
+    # An active plugin keeps its previous manifest authoritative until the candidate
+    # has passed every install/governance step below.
     if aud.mode == "profile" and not dry_run:
         owned = report["skills"].get("owned", {})
         report["profile_governance"] = [
@@ -1162,7 +1445,7 @@ def _ingest_locked(
         ]
     if not dry_run and (activate or existing_status == "active"):
         manifest["status"] = "active"
-        _write_managed_manifest(shared_home, manifest, dry_run=False)
+    _write_managed_manifest(shared_home, manifest, dry_run=dry_run)
 
     report["note"] = (
         "skills cached in .skills_prompt_snapshot.json — restart the gateway for the "
@@ -1183,7 +1466,7 @@ def uninstall(
 ) -> dict[str, Any]:
     _safe_component(plugin_id, kind="plugin id")
     resolved_home = (shared_home or _default_shared_home()).expanduser()
-    if dry_run or _lock_held:
+    if dry_run:
         return _uninstall_locked(
             plugin_id,
             shared_home=resolved_home,
@@ -1192,15 +1475,26 @@ def uninstall(
             purge_clis=purge_clis,
             profiles=profiles,
         )
+    if _lock_held:
+        with _global_plugin_state_lock(resolved_home):
+            return _uninstall_locked(
+                plugin_id,
+                shared_home=resolved_home,
+                profiles_root=profiles_root,
+                dry_run=False,
+                purge_clis=purge_clis,
+                profiles=profiles,
+            )
     with _plugin_ingest_lock(resolved_home, plugin_id):
-        return _uninstall_locked(
-            plugin_id,
-            shared_home=resolved_home,
-            profiles_root=profiles_root,
-            dry_run=False,
-            purge_clis=purge_clis,
-            profiles=profiles,
-        )
+        with _global_plugin_state_lock(resolved_home):
+            return _uninstall_locked(
+                plugin_id,
+                shared_home=resolved_home,
+                profiles_root=profiles_root,
+                dry_run=False,
+                purge_clis=purge_clis,
+                profiles=profiles,
+            )
 
 
 def deactivate(
@@ -1214,21 +1508,23 @@ def deactivate(
     _safe_component(plugin_id, kind="plugin id")
     resolved_home = (shared_home or _default_shared_home()).expanduser()
     if _lock_held:
-        _mark_plugin_inactive(resolved_home, plugin_id)
-        return _uninstall_locked(
-            plugin_id,
-            shared_home=resolved_home,
-            profiles_root=profiles_root,
-            retain_status="inactive",
-        )
+        with _global_plugin_state_lock(resolved_home):
+            _mark_plugin_inactive(resolved_home, plugin_id)
+            return _uninstall_locked(
+                plugin_id,
+                shared_home=resolved_home,
+                profiles_root=profiles_root,
+                retain_status="inactive",
+            )
     with _plugin_ingest_lock(resolved_home, plugin_id):
-        _mark_plugin_inactive(resolved_home, plugin_id)
-        return _uninstall_locked(
-            plugin_id,
-            shared_home=resolved_home,
-            profiles_root=profiles_root,
-            retain_status="inactive",
-        )
+        with _global_plugin_state_lock(resolved_home):
+            _mark_plugin_inactive(resolved_home, plugin_id)
+            return _uninstall_locked(
+                plugin_id,
+                shared_home=resolved_home,
+                profiles_root=profiles_root,
+                retain_status="inactive",
+            )
 
 
 def _mark_plugin_inactive(shared_home: Path, plugin_id: str) -> None:

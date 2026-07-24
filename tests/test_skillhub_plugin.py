@@ -71,6 +71,7 @@ def _plugin_zip(
     plugin_id: str = PLUGIN_ID,
     version: str = PLUGIN_VERSION,
     content_tag: str = "",
+    with_expert: bool = False,
     approval_gates: list[str] | None = None,
     documented_gates: list[str] | None = None,
 ) -> bytes:
@@ -94,6 +95,21 @@ def _plugin_zip(
         },
         "persona_policy": "skill_inline",
     }
+    if with_expert:
+        manifest["experts"] = [
+            {
+                "id": "kep-trevi-resource-delivery-expert",
+                "name": "资源投放专家",
+                "title": "资源投放专家",
+                "tagline": "资源投放全链路",
+                "agent_md": "./agents/kep-trevi-resource-delivery-expert.md",
+                "skills": list(PLUGIN_SKILLS),
+                "governance": {
+                    "env_default": "pre",
+                    "approval_required": list(approval_gates),
+                },
+            }
+        ]
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("__MACOSX/foo", "")
@@ -109,6 +125,11 @@ def _plugin_zip(
             if content_tag:
                 body += f"{content_tag}\n"
             archive.writestr(f"keep-rd-plugin/skills/{name}/SKILL.md", body)
+        if with_expert:
+            archive.writestr(
+                "keep-rd-plugin/agents/kep-trevi-resource-delivery-expert.md",
+                "---\nname: kep-trevi-resource-delivery-expert\n---\n# 资源投放专家\n",
+            )
     return buffer.getvalue()
 
 
@@ -153,6 +174,20 @@ def _plugin_event(
 
 def _managed_manifest(shared_home: Path, plugin_id: str = PLUGIN_ID) -> dict[str, object]:
     return json.loads((shared_home / pi.MANAGED_DIR / f"{plugin_id}.json").read_text(encoding="utf-8"))
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes | str]:
+    if not root.exists() and not root.is_symlink():
+        return {}
+    if root.is_symlink():
+        return {".": str(root.readlink())}
+    return {
+        path.relative_to(root).as_posix(): (
+            str(path.readlink()) if path.is_symlink() else path.read_bytes()
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    }
 
 
 def _distribution_plugin_entries(shared_home: Path, plugin_id: str = PLUGIN_ID) -> list[dict[str, object]]:
@@ -211,9 +246,9 @@ def test_plugin_governance_failure_is_auditable_and_inactive(tmp_path: Path) -> 
         )
 
     assert exc.value.error_code == "PLUGIN_INGEST_FAILED"
-    manifest = _managed_manifest(shared_home)
-    assert manifest["status"] == "inactive"
-    assert manifest["audience"]["profiles"] == ["alice", "sunke"]
+    assert not (
+        shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json"
+    ).exists()
 
 
 def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path) -> None:
@@ -260,6 +295,193 @@ def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path)
     )
     assert result_dup["action"] == "plugin_install"
     assert Path(str(_managed_manifest(shared_home)["repo"])).name == "1.0.1-r168"
+
+
+def test_failed_plugin_upgrade_keeps_previous_expert_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.plugin_state import assert_no_stale_inactive_skills
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(with_expert=True),
+    )
+    previous = _managed_manifest(shared_home)
+    previous_owner_registry = (
+        shared_home / pi.MANAGED_DIR / ".locks" / "source-owners.json"
+    ).read_bytes()
+    previous_shared = _tree_snapshot(shared_home / "skills")
+    previous_profile = _tree_snapshot(profiles_root / "alice" / "skills")
+    assert previous["status"] == "active"
+    assert expert_overlay.list_experts(profiles_root / "alice")
+
+    def reject(*_args):
+        raise pi.PluginIngestError("forced candidate failure")
+
+    monkeypatch.setattr(pi, "assert_profile_governance", reject)
+    with pytest.raises(SkillhubInstallError) as exc:
+        process_event(
+            _plugin_event(users=["alice-ldap"], version="1.0.5", release_id="105"),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(
+                content_tag="RELEASE-105-CONTENT",
+                with_expert=True,
+            ),
+        )
+
+    assert exc.value.error_code == "PLUGIN_INGEST_FAILED"
+    assert _managed_manifest(shared_home) == previous
+    assert (
+        shared_home / pi.MANAGED_DIR / ".locks" / "source-owners.json"
+    ).read_bytes() == previous_owner_registry
+    assert _tree_snapshot(shared_home / "skills") == previous_shared
+    assert _tree_snapshot(profiles_root / "alice" / "skills") == previous_profile
+    assert expert_overlay.list_experts(profiles_root / "alice")
+    assert_no_stale_inactive_skills(profiles_root / "alice")
+
+
+def test_plugin_upgrade_health_failure_restores_previous_expert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(with_expert=True),
+    )
+    previous = _managed_manifest(shared_home)
+    previous_owner_registry = (
+        shared_home / pi.MANAGED_DIR / ".locks" / "source-owners.json"
+    ).read_bytes()
+    previous_shared = _tree_snapshot(shared_home / "skills")
+    previous_profile = _tree_snapshot(profiles_root / "alice" / "skills")
+
+    monkeypatch.setattr(expert_overlay, "list_experts", lambda *_args, **_kwargs: [])
+    with pytest.raises(SkillhubInstallError) as exc:
+        process_event(
+            _plugin_event(users=["alice-ldap"], version="1.0.5", release_id="105"),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(
+                content_tag="RELEASE-105-CONTENT",
+                with_expert=True,
+            ),
+        )
+
+    assert exc.value.error_code == "PLUGIN_INGEST_FAILED"
+    assert _managed_manifest(shared_home) == previous
+    assert (
+        shared_home / pi.MANAGED_DIR / ".locks" / "source-owners.json"
+    ).read_bytes() == previous_owner_registry
+    assert _tree_snapshot(shared_home / "skills") == previous_shared
+    assert _tree_snapshot(profiles_root / "alice" / "skills") == previous_profile
+
+
+def test_all_audience_failed_upgrade_restores_distribution_and_profile_fanout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    (shared_home / pi.SKILL_DISTRIBUTION_FILE).write_text(
+        "skills: []\n",
+        encoding="utf-8",
+    )
+    process_event(
+        _plugin_event(auth_type="all", users=[], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    _sync_default_profile_skills(profiles_root / "alice", shared_home)
+    previous_manifest = _managed_manifest(shared_home)
+    previous_distribution = (shared_home / pi.SKILL_DISTRIBUTION_FILE).read_bytes()
+    previous_shared = _tree_snapshot(shared_home / "skills")
+    previous_profile = _tree_snapshot(profiles_root / "alice" / "skills")
+
+    def reject(*_args):
+        raise pi.PluginIngestError("forced all-audience candidate failure")
+
+    monkeypatch.setattr(pi, "assert_profile_governance", reject)
+    with pytest.raises(SkillhubInstallError):
+        process_event(
+            _plugin_event(
+                auth_type="all",
+                users=[],
+                version="1.0.5",
+                release_id="105",
+            ),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(content_tag="RELEASE-105-CONTENT"),
+        )
+
+    assert _managed_manifest(shared_home) == previous_manifest
+    assert (shared_home / pi.SKILL_DISTRIBUTION_FILE).read_bytes() == previous_distribution
+    assert _tree_snapshot(shared_home / "skills") == previous_shared
+    assert _tree_snapshot(profiles_root / "alice" / "skills") == previous_profile
+
+
+def test_full_snapshot_failed_upgrade_restores_dropped_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
+    _seed_routing_db(
+        shared_home,
+        [("alice-ldap", "alice"), ("bob-ldap", "bob")],
+    )
+    process_event(
+        _plugin_event(
+            users=["alice-ldap", "bob-ldap"],
+            version="1.0.0",
+            release_id="100",
+        ),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )
+    previous_manifest = _managed_manifest(shared_home)
+    previous_bob = _tree_snapshot(profiles_root / "bob" / "skills")
+
+    def reject(*_args):
+        raise pi.PluginIngestError("forced snapshot candidate failure")
+
+    monkeypatch.setattr(pi, "assert_profile_governance", reject)
+    with pytest.raises(SkillhubInstallError):
+        process_event(
+            _plugin_event(
+                event_type="skill.status_changed",
+                users=["alice-ldap"],
+                version="1.0.5",
+                release_id="105",
+            ),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(content_tag="RELEASE-105-CONTENT"),
+        )
+
+    assert _managed_manifest(shared_home) == previous_manifest
+    assert _tree_snapshot(profiles_root / "bob" / "skills") == previous_bob
 
 
 def test_plugin_pending_skips_without_download(tmp_path: Path) -> None:
@@ -673,15 +895,12 @@ def test_explicit_active_and_failed_ingest_share_one_plugin_transaction(tmp_path
     second.start()
     assert not second_mutating.wait(0.1)
     release_first.set()
-    assert second_mutating.wait(2)
-    assert _managed_manifest(shared_home)["status"] == "inactive"
-    release_second.set()
     first.join(2)
     second.join(2)
 
     assert not first.is_alive() and not second.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], si.SkillhubInstallError)
-    assert _managed_manifest(shared_home)["status"] == "inactive"
+    assert _managed_manifest(shared_home)["status"] == "active"
 
 
 def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path, monkeypatch):
@@ -756,15 +975,12 @@ def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path,
     second.start()
     assert not invalid_mutating.wait(0.1)
     release_reconcile.set()
-    assert invalid_mutating.wait(2)
-    assert _managed_manifest(shared_home)["status"] == "inactive"
-    release_invalid.set()
     first.join(2)
     second.join(2)
 
     assert not first.is_alive() and not second.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], si.SkillhubInstallError)
-    assert _managed_manifest(shared_home)["status"] == "inactive"
+    assert _managed_manifest(shared_home)["status"] == "active"
 
 
 def test_inactive_unknown_plugin_never_downloads(tmp_path: Path) -> None:
