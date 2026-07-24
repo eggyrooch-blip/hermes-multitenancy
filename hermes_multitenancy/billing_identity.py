@@ -226,12 +226,17 @@ class BillingIdentityPreparer:
         metadata = _clean_metadata(request.metadata)
         payer = self._payer(request, metadata)
         if payer is None:
-            is_group = str(metadata.get("chat_type") or "").strip().lower() in {
-                "group",
-                "topic",
-            }
             profile_binding = self._store.get_by_profile(request.profile_name)
-            if is_group or _billing_enabled() or profile_binding is not None:
+            owner = self._employee_row(self._profile_owner(request.profile_name))
+            owner_binding = self._store.get(owner.user_id) if owner is not None else None
+            if (
+                _billing_enabled()
+                or profile_binding is not None
+                or (
+                    owner_binding is not None
+                    and owner_binding.migration_state == "enforced"
+                )
+            ):
                 raise RunRejected("employee billing identity could not be resolved")
             return request if metadata == request.metadata else replace(
                 request, metadata=metadata

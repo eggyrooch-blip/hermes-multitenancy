@@ -558,6 +558,35 @@ def test_enforced_group_missing_owner_route_stops_when_billing_off(
         ))
 
 
+def test_disabled_billing_admits_group_without_payer(tmp_path, monkeypatch):
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    class MissingGroupOwnerRouting(_Routing):
+        def lookup_by_chat_id(self, _chat_id):
+            return None
+
+        def lookup_by_profile_name(self, _profile_name):
+            return None
+
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "false")
+    preparer = BillingIdentityPreparer(
+        routing=MissingGroupOwnerRouting(),
+        store=BillingIdentityStore(tmp_path / "multitenancy.db"),
+        credentials=_FakeCredentials(),
+    )
+    request = _request(
+        chat_type="group",
+        sender="ou_member",
+        chat_id="oc_missing",
+        profile_name="group_oc_missing",
+    )
+
+    assert preparer.prepare(request) == request
+
+
 def test_multiple_group_profiles_bill_the_same_trusted_owner(
     tmp_path, monkeypatch
 ):
