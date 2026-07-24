@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -646,8 +648,17 @@ def _skillhub_targets(payload: dict[str, Any]) -> list[str]:
             user.get("profile_id"), user.get("employee_id"), user.get("open_id")
         )
         if identity:
-            targets.append("profile_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12])
+            targets.append(identity)
     return targets or ["audience_all"]
+
+
+def _skillhub_anonymous_profile(identity: str, hmac_key: bytes | None) -> str | None:
+    if identity == "audience_all":
+        return identity
+    if not hmac_key:
+        return None
+    digest = hmac.new(hmac_key, identity.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    return f"profile_{digest}"
 
 
 def _skillhub_private_values(payload: dict[str, Any]) -> list[str]:
@@ -683,7 +694,9 @@ def _skillhub_terminal_status(status: str) -> str:
     return "completed"
 
 
-def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _skillhub_aggregate(
+    rows: list[sqlite3.Row], *, profile_hmac_key: bytes | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for row in rows:
         payload = _skillhub_json_object(row["raw_payload"])
@@ -738,7 +751,8 @@ def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[s
     fanout_counts: Counter[str] = Counter()
     affected_targets = 0
     raw_failures_in_failed_fanouts = 0
-    for grouped in fanout_groups.values():
+    fanout_rows: list[dict[str, Any]] = []
+    for fanout_index, (_, grouped) in enumerate(sorted(fanout_groups.items()), start=1):
         final: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for entry in grouped:
             for target in entry["targets"]:
@@ -754,6 +768,11 @@ def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[s
         if status == "failed":
             affected_targets += sum(entry["status"] == "failed" for entry in final.values())
             raw_failures_in_failed_fanouts += sum(entry["status"] == "failed" for entry in grouped)
+        fanout_rows.append({
+            "fanout_key": f"fanout_{fanout_index:04d}",
+            "status": status,
+            "affected_targets": sum(entry["status"] == "failed" for entry in final.values()),
+        })
 
     target_final: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for entry in entries:
@@ -765,16 +784,19 @@ def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[s
             ):
                 target_final[key] = entry
     target_counts = Counter(entry["status"] for entry in target_final.values())
-    target_rows = [
-        {
-            "item": key[0],
-            "version": key[1],
-            "anonymous_profile": key[2],
-            "desired_state": key[3],
-            "status": entry["status"],
-        }
-        for key, entry in sorted(target_final.items())
-    ]
+    target_rows: list[dict[str, Any]] = []
+    if profile_hmac_key:
+        for key, entry in sorted(target_final.items()):
+            anonymous = _skillhub_anonymous_profile(key[2], profile_hmac_key)
+            if anonymous is None:
+                continue
+            target_rows.append({
+                "item": key[0],
+                "version": key[1],
+                "anonymous_profile": anonymous,
+                "desired_state": key[3],
+                "status": entry["status"],
+            })
     failed_fanouts = fanout_counts["failed"]
     return (
         {
@@ -783,12 +805,12 @@ def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[s
             "failed": failed_fanouts,
             "pending": fanout_counts["pending"],
             "affected_targets": affected_targets,
-            "duplicate_aggregate_failures": 0,
             "collapsed_raw_failures": max(0, raw_failures_in_failed_fanouts - failed_fanouts),
             "trusted": sum(key.startswith("trusted:") for key in fanout_groups),
             "inferred": sum(key.startswith("inferred:") for key in fanout_groups),
             "single_event": sum(key.startswith("event:") for key in fanout_groups),
             "aggregation_window_seconds": 600,
+            "items": sorted(fanout_rows, key=lambda item: item["fanout_key"]),
         },
         {
             "total": len(target_final),
@@ -796,6 +818,8 @@ def _skillhub_aggregate(rows: list[sqlite3.Row]) -> tuple[dict[str, Any], dict[s
             "failed": target_counts["failed"],
             "pending": target_counts["pending"],
             "items": target_rows,
+            "profile_details_available": bool(profile_hmac_key),
+            "profile_details_reason": None if profile_hmac_key else "missing_or_invalid_hmac_key",
         },
     )
 
@@ -844,6 +868,7 @@ def build_skillhub_audit(
     all_time_only: bool = False,
     sample_limit: int = 5,
     top_n: int = 10,
+    profile_hmac_key: str | bytes | None = None,
 ) -> dict[str, Any]:
     """Aggregate the skillhub_events ledger: received / processed / failed / queued
     counts (all-time + last N days), failures grouped by error_code with newest-K
@@ -933,7 +958,24 @@ def build_skillhub_audit(
         by_item_type[_skillhub_item_type(r["raw_payload"])] += 1
         by_skill[r["skill_code"] or "(none)"] += 1
 
-    fanouts, target_final_states = _skillhub_aggregate(rows)
+    configured_hmac_key = (
+        profile_hmac_key
+        if profile_hmac_key is not None
+        else os.environ.get("HERMES_ANALYTICS_PROFILE_HMAC_KEY")
+    )
+    candidate_hmac_key = (
+        configured_hmac_key.encode("utf-8")
+        if isinstance(configured_hmac_key, str) and configured_hmac_key
+        else configured_hmac_key if isinstance(configured_hmac_key, bytes) and configured_hmac_key else None
+    )
+    hmac_key_bytes = (
+        candidate_hmac_key
+        if candidate_hmac_key is not None and len(candidate_hmac_key) >= 32
+        else None
+    )
+    fanouts, target_final_states = _skillhub_aggregate(
+        rows, profile_hmac_key=hmac_key_bytes
+    )
     raw_events = _tally(rows)
     audit: dict[str, Any] = {
         "db_path": str(db_path),
@@ -982,6 +1024,8 @@ def render_skillhub_markdown(audit: dict[str, Any]) -> str:
         f"目标最终状态：共 {final['total']} · 完成 {final['completed']} · "
         f"失败 {final['failed']} · 待处理 {final['pending']}"
     )
+    if not final["profile_details_available"]:
+        out.append("Profile 明细：未输出（缺少或无效的 HMAC 匿名化密钥）")
     out.append("")
     errs = audit["failures"]["by_error_code"]
     if errs:

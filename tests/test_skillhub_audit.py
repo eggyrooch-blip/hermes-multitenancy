@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
-import json
 from pathlib import Path
 
 import pytest
@@ -30,10 +30,16 @@ def _insert_full(
     desired_state: str = "active",
     batched_events: int | None = None,
     employee_id: str | None = None,
+    name: str | None = None,
+    display_name: str | None = None,
 ) -> None:
     user = {"profile_id": profile}
     if employee_id:
         user["employee_id"] = employee_id
+    if name:
+        user["name"] = name
+    if display_name:
+        user["display_name"] = display_name
     payload = {
         "event_id": event_id,
         "event_type": "skill.permission_approved",
@@ -44,7 +50,13 @@ def _insert_full(
         "skill_status": desired_state,
         "audience": {"auth_type": "auth", "users": [user]},
     }
-    result = {"error_code": "PLUGIN_GOVERNANCE_FAILED", "message": f"failed for {profile}"}
+    private_text = " ".join(
+        value for value in (profile, employee_id, name, display_name) if value
+    )
+    result = {
+        "error_code": "PLUGIN_GOVERNANCE_FAILED",
+        "message": f"failed for {private_text}",
+    }
     if batched_events is not None:
         result["batched_events"] = batched_events
     conn.execute(
@@ -226,19 +238,29 @@ def test_293_row_release_fanout_is_one_failure_without_losing_raw_rows(tmp_path:
             batched_events=293,
         )
     conn.commit()
+    before = conn.execute(
+        "SELECT event_id, status, raw_payload, results_json FROM skillhub_events ORDER BY event_id"
+    ).fetchall()
     conn.close()
 
     audit = build_skillhub_audit(db)
+    verify = sqlite3.connect(db)
+    after = verify.execute(
+        "SELECT event_id, status, raw_payload, results_json FROM skillhub_events ORDER BY event_id"
+    ).fetchall()
+    verify.close()
 
     assert audit["all_time"]["failed"] == 293  # legacy field remains raw
     assert audit["raw_events"]["failed"] == 293
     assert audit["fanouts"]["total"] == 1
     assert audit["fanouts"]["failed"] == 1
     assert audit["fanouts"]["affected_targets"] == 293
-    assert audit["fanouts"]["duplicate_aggregate_failures"] == 0
     assert audit["fanouts"]["collapsed_raw_failures"] == 292
+    fanout_keys = [item["fanout_key"] for item in audit["fanouts"]["items"]]
+    assert len(fanout_keys) == len(set(fanout_keys)) == audit["fanouts"]["total"] == 1
     assert audit["target_final_states"]["total"] == 293
     assert audit["target_final_states"]["failed"] == 293
+    assert after == before
 
 
 def test_target_final_state_uses_latest_status_and_keeps_version_and_desired_state(tmp_path: Path) -> None:
@@ -263,7 +285,7 @@ def test_target_final_state_uses_latest_status_and_keeps_version_and_desired_sta
     conn.commit()
     conn.close()
 
-    audit = build_skillhub_audit(db)
+    audit = build_skillhub_audit(db, profile_hmac_key="test-only-hmac-key-32-bytes-long!!")
 
     assert audit["raw_events"]["received"] == 4
     assert audit["target_final_states"]["total"] == 3
@@ -310,25 +332,52 @@ def test_report_anonymizes_skillhub_target_identifiers(tmp_path: Path) -> None:
         event_id="private",
         profile="ou_sensitive_profile",
         employee_id="employee-12345",
+        name="Sensitive Name",
+        display_name="Private Display",
         status="failed",
         at=int(time.time()),
     )
     conn.commit()
     conn.close()
 
-    audit = build_skillhub_audit(db)
+    audit = build_skillhub_audit(db, profile_hmac_key="test-only-hmac-key-32-bytes-long!!")
     rendered = json.dumps(audit, ensure_ascii=False) + render_skillhub_markdown(audit)
 
     assert "ou_sensitive_profile" not in rendered
     assert "employee-12345" not in rendered
+    assert "Sensitive Name" not in rendered
+    assert "Private Display" not in rendered
+    assert "test-only-hmac-key-32-bytes-long!!" not in rendered
     assert audit["target_final_states"]["items"][0]["anonymous_profile"].startswith("profile_")
+
+
+def test_missing_hmac_key_omits_profile_details_fail_closed(tmp_path: Path) -> None:
+    db = tmp_path / "multitenancy.db"
+    conn = sqlite3.connect(db)
+    _full_schema(conn)
+    _insert_full(
+        conn,
+        event_id="private",
+        profile="enumerable-employee",
+        status="failed",
+        at=int(time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    final = build_skillhub_audit(db, profile_hmac_key=b"")["target_final_states"]
+
+    assert final["total"] == 1
+    assert final["items"] == []
+    assert final["profile_details_available"] is False
+    assert final["profile_details_reason"] == "missing_or_invalid_hmac_key"
 
 
 def test_legacy_schema_marks_single_event_fallback_and_markdown_layers(tmp_path: Path) -> None:
     db = tmp_path / "multitenancy.db"
     _seed(db)
 
-    audit = build_skillhub_audit(db)
+    audit = build_skillhub_audit(db, profile_hmac_key=b"")
     markdown = render_skillhub_markdown(audit)
 
     assert audit["fanouts"]["single_event"] == 7
