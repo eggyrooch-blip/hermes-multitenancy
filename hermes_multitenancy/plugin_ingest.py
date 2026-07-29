@@ -599,12 +599,23 @@ def _displace_standalone_skill(profile_home: Path, name: str, *, plugin_source: 
 
 def _restore_standalone_skill(profile_home: Path, name: str, entry: dict[str, Any]) -> None:
     """Best-effort undo of ``_displace_standalone_skill``: re-link the standalone
-    canonical release recorded in its ownership entry."""
+    canonical release recorded in its ownership entry. A partial plugin link/copy
+    left by a failed install is discarded first — disk must match the retained
+    standalone ownership entry (review PT-001 round 2)."""
     target = profile_home / "skills" / name
     canonical = str(entry.get("target") or entry.get("source") or "")
+    if not canonical or not Path(canonical).is_dir():
+        return
     try:
-        if not target.exists() and not target.is_symlink() and canonical and Path(canonical).is_dir():
-            target.symlink_to(canonical)
+        if target.is_symlink():
+            if str(target.readlink()) == canonical:
+                return
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        target.symlink_to(canonical)
     except OSError:
         pass
 

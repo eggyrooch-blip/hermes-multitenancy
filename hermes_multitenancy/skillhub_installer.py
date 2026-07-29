@@ -10,7 +10,6 @@ import hashlib
 import ipaddress
 import socket
 import io
-import contextlib
 import json
 import logging
 import os
@@ -1158,26 +1157,6 @@ def _active_plugin_owner(shared: Path, profile_name: str, skill_code: str) -> st
     return None
 
 
-def _plugin_manifests_declaring(shared: Path, skill_code: str) -> list[str]:
-    """Plugin ids of ANY managed manifest (any status) declaring ``skill_code``."""
-    managed_dir = shared / plugin_ingest.MANAGED_DIR
-    out: list[str] = []
-    try:
-        paths = sorted(managed_dir.glob("*.json"))
-    except OSError:
-        return out
-    for path in paths:
-        if path.name.endswith(".sticky.json"):
-            continue
-        try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(manifest, dict) and skill_code in (manifest.get("skills") or []):
-            out.append(str(manifest.get("plugin_id") or path.stem))
-    return out
-
-
 def _install_into_profile(
     *,
     shared: Path,
@@ -1187,14 +1166,11 @@ def _install_into_profile(
     release_id: str | None,
     canonical_skill_root: Path,
 ) -> dict[str, Any]:
-    # PT-002: serialize the owner check + write against in-flight plugin transactions.
-    # The worker holds the per-plugin fcntl lock for the WHOLE plugin event, so taking
-    # the same lock for every plugin that declares this name closes the check→write
-    # race window. (A plugin's very first install has no manifest to claim through yet;
-    # that residual window degrades loudly — health check fails, next plugin event takes over.)
-    with contextlib.ExitStack() as stack:
-        for pid in _plugin_manifests_declaring(shared, skill_code):
-            stack.enter_context(plugin_ingest._plugin_ingest_lock(shared, pid))
+    # PT-002: plugin ingest holds _global_plugin_state_lock for its COMPLETE
+    # transaction (_active_plugin_state_transaction), first installs included.
+    # Holding the same lock across owner check + write fully serializes the
+    # standalone path against in-flight plugin transactions — no residual window.
+    with plugin_ingest._global_plugin_state_lock(shared):
         owner = _active_plugin_owner(shared, profile_home.name, skill_code)
         if owner:
             return {"status": "skipped-plugin-owned", "profile": profile_home.name, "plugin": owner}

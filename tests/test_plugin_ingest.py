@@ -1087,3 +1087,81 @@ def test_standalone_install_blocks_until_plugin_transaction_completes(tmp_path, 
     b.join(10)
     assert not a.is_alive() and not b.is_alive()
     assert results["standalone"]["status"] == "skipped-plugin-owned"
+
+
+def test_takeover_restores_standalone_after_partial_install(tmp_path, monkeypatch):
+    # PT-001 round 2: install fails AFTER replacing the target — restore must
+    # discard the partial plugin link and re-link the standalone release
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    release = _seed_standalone_install(home, "feishu_test", "kep-halo-cli")
+
+    real = pi.install_shared_skill_for_profile
+
+    def boom(*, shared_home, profile_home, skill_path, source, version):
+        if skill_path == "kep-halo-cli":
+            (profile_home / "skills" / skill_path).symlink_to(source)  # partial write…
+            raise OSError("manifest write failed")  # …then die
+        return real(shared_home=shared_home, profile_home=profile_home,
+                    skill_path=skill_path, source=source, version=version)
+
+    monkeypatch.setattr(pi, "install_shared_skill_for_profile", boom)
+
+    with pytest.raises(OSError, match="manifest write failed"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    target = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
+    assert target.is_symlink() and target.readlink() == release
+    managed = json.loads((home / "profiles" / "feishu_test" / "skills" / ".hermes-managed.json").read_text())
+    assert "kep-halo-cli" in managed["skills"]
+
+
+def test_standalone_install_blocks_during_first_plugin_ingest(tmp_path, monkeypatch):
+    # PT-002 round 2: even the FIRST ingest (no manifest on disk yet) holds the
+    # global state lock — a concurrent standalone event must block, then skip
+    from hermes_multitenancy import skillhub_installer as si
+
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+
+    paused = threading.Event()
+    release_evt = threading.Event()
+    real = pi._install_skills_to_profile
+
+    def pause(*args, **kwargs):
+        paused.set()
+        assert release_evt.wait(5)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pi, "_install_skills_to_profile", pause)
+
+    results = {}
+
+    def run_first_ingest():
+        pi.ingest(repo, audience="feishu_test", shared_home=home, activate=True)
+
+    def run_standalone():
+        rel = tmp_path / "release" / "kep-halo-cli"
+        rel.mkdir(parents=True, exist_ok=True)
+        (rel / "SKILL.md").write_text("standalone racer\n", encoding="utf-8")
+        results["standalone"] = si._install_into_profile(
+            shared=home,
+            profile_home=home / "profiles" / "feishu_test",
+            skill_code="kep-halo-cli",
+            version="2.0.0",
+            release_id="9",
+            canonical_skill_root=rel,
+        )
+
+    a = threading.Thread(target=run_first_ingest)
+    a.start()
+    assert paused.wait(5)
+    b = threading.Thread(target=run_standalone)
+    b.start()
+    b.join(0.3)
+    assert b.is_alive()  # blocked behind the first-install transaction
+    release_evt.set()
+    a.join(10)
+    b.join(10)
+    assert not a.is_alive() and not b.is_alive()
+    assert results["standalone"]["status"] == "skipped-plugin-owned"
