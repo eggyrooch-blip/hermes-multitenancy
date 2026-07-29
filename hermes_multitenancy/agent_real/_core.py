@@ -557,7 +557,7 @@ async def _legacy_real_run_agent(
             logger.debug("real_run_agent: bad model spec %r: %s", model_spec, exc)
             continue
 
-        api_key = _resolve_api_key(provider, env_overrides, auth)
+        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
         if not api_key:
             logger.debug("real_run_agent: no API key for provider %s", provider)
             continue
