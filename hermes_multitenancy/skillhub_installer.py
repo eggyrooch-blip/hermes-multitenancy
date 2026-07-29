@@ -10,6 +10,7 @@ import hashlib
 import ipaddress
 import socket
 import io
+import contextlib
 import json
 import logging
 import os
@@ -1157,6 +1158,26 @@ def _active_plugin_owner(shared: Path, profile_name: str, skill_code: str) -> st
     return None
 
 
+def _plugin_manifests_declaring(shared: Path, skill_code: str) -> list[str]:
+    """Plugin ids of ANY managed manifest (any status) declaring ``skill_code``."""
+    managed_dir = shared / plugin_ingest.MANAGED_DIR
+    out: list[str] = []
+    try:
+        paths = sorted(managed_dir.glob("*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        if path.name.endswith(".sticky.json"):
+            continue
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(manifest, dict) and skill_code in (manifest.get("skills") or []):
+            out.append(str(manifest.get("plugin_id") or path.stem))
+    return out
+
+
 def _install_into_profile(
     *,
     shared: Path,
@@ -1166,9 +1187,34 @@ def _install_into_profile(
     release_id: str | None,
     canonical_skill_root: Path,
 ) -> dict[str, Any]:
-    owner = _active_plugin_owner(shared, profile_home.name, skill_code)
-    if owner:
-        return {"status": "skipped-plugin-owned", "profile": profile_home.name, "plugin": owner}
+    # PT-002: serialize the owner check + write against in-flight plugin transactions.
+    # The worker holds the per-plugin fcntl lock for the WHOLE plugin event, so taking
+    # the same lock for every plugin that declares this name closes the check→write
+    # race window. (A plugin's very first install has no manifest to claim through yet;
+    # that residual window degrades loudly — health check fails, next plugin event takes over.)
+    with contextlib.ExitStack() as stack:
+        for pid in _plugin_manifests_declaring(shared, skill_code):
+            stack.enter_context(plugin_ingest._plugin_ingest_lock(shared, pid))
+        owner = _active_plugin_owner(shared, profile_home.name, skill_code)
+        if owner:
+            return {"status": "skipped-plugin-owned", "profile": profile_home.name, "plugin": owner}
+        return _install_into_profile_unlocked(
+            profile_home=profile_home,
+            skill_code=skill_code,
+            version=version,
+            release_id=release_id,
+            canonical_skill_root=canonical_skill_root,
+        )
+
+
+def _install_into_profile_unlocked(
+    *,
+    profile_home: Path,
+    skill_code: str,
+    version: str,
+    release_id: str | None,
+    canonical_skill_root: Path,
+) -> dict[str, Any]:
     rel_path = _safe_skill_relative_path(skill_code)
     managed = _read_manifest(profile_home, MANAGED_SKILL_MANIFEST)
     existing_entry = managed.get(str(rel_path)) if isinstance(managed, dict) else None

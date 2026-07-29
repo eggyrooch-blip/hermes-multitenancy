@@ -578,9 +578,11 @@ def _standalone_managed_entry(profile_home: Path, name: str) -> dict[str, Any] |
     return None
 
 
-def _takeover_standalone_skill(profile_home: Path, name: str, *, plugin_source: Path) -> bool:
-    """Drop the standalone manifest entry + on-disk copy so the plugin source can land.
-    Returns whether the displaced content was byte-identical to the plugin source."""
+def _displace_standalone_skill(profile_home: Path, name: str, *, plugin_source: Path) -> bool:
+    """Remove ONLY the on-disk standalone copy so the plugin source can land; the
+    ownership entry stays until the install succeeds (PT-001: a failed install must
+    leave the user restorable, never skill-less). Returns whether the displaced
+    content was byte-identical to the plugin source."""
     target = profile_home / "skills" / name
     identical = False
     try:
@@ -588,19 +590,34 @@ def _takeover_standalone_skill(profile_home: Path, name: str, *, plugin_source: 
             identical = _skill_tree_digest(target) == _skill_tree_digest(plugin_source)
     except OSError:
         identical = False
-    mf = profile_home / "skills" / ".hermes-managed.json"
-    try:
-        data = json.loads(mf.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    if isinstance(data.get("skills"), dict):
-        data["skills"].pop(name, None)
-        mf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     if target.is_symlink():
         target.unlink()
     elif target.is_dir():
         shutil.rmtree(target)
     return identical
+
+
+def _restore_standalone_skill(profile_home: Path, name: str, entry: dict[str, Any]) -> None:
+    """Best-effort undo of ``_displace_standalone_skill``: re-link the standalone
+    canonical release recorded in its ownership entry."""
+    target = profile_home / "skills" / name
+    canonical = str(entry.get("target") or entry.get("source") or "")
+    try:
+        if not target.exists() and not target.is_symlink() and canonical and Path(canonical).is_dir():
+            target.symlink_to(canonical)
+    except OSError:
+        pass
+
+
+def _drop_standalone_ownership(profile_home: Path, name: str) -> None:
+    mf = profile_home / "skills" / ".hermes-managed.json"
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data.get("skills"), dict) and name in data["skills"]:
+        data["skills"].pop(name)
+        mf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _managed_skill_present(profile_home: Path, name: str) -> bool:
@@ -668,16 +685,21 @@ def _install_skills_to_profile(
                     installed.append({"profile": profile, "skill": name, "action": "would-takeover-standalone"})
                     owned.setdefault(profile, []).append(name)
                     continue
-                identical = _takeover_standalone_skill(
+                identical = _displace_standalone_skill(
                     profile_home, name, plugin_source=shared_skills / name
                 )
-                install_shared_skill_for_profile(
-                    shared_home=shared_home,
-                    profile_home=profile_home,
-                    skill_path=name,
-                    source=shared_skills / name,
-                    version=version,
-                )
+                try:
+                    install_shared_skill_for_profile(
+                        shared_home=shared_home,
+                        profile_home=profile_home,
+                        skill_path=name,
+                        source=shared_skills / name,
+                        version=version,
+                    )
+                except BaseException:
+                    _restore_standalone_skill(profile_home, name, standalone)
+                    raise
+                _drop_standalone_ownership(profile_home, name)
                 installed.append({
                     "profile": profile,
                     "skill": name,

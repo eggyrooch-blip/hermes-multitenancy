@@ -1011,3 +1011,79 @@ def test_standalone_event_cannot_steal_plugin_owned_name(tmp_path):
         canonical_skill_root=release,
     )
     assert free["status"] in {"installed", "repointed"}
+
+
+def test_takeover_restores_standalone_when_install_fails(tmp_path, monkeypatch):
+    # PT-001: a failed plugin install must put the displaced standalone skill back
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    release = _seed_standalone_install(home, "feishu_test", "kep-halo-cli")
+
+    real = pi.install_shared_skill_for_profile
+
+    def boom(*, shared_home, profile_home, skill_path, source, version):
+        if skill_path == "kep-halo-cli":
+            raise OSError("disk full")
+        return real(shared_home=shared_home, profile_home=profile_home,
+                    skill_path=skill_path, source=source, version=version)
+
+    monkeypatch.setattr(pi, "install_shared_skill_for_profile", boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    target = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
+    assert target.is_symlink() and target.readlink() == release
+    managed = json.loads((home / "profiles" / "feishu_test" / "skills" / ".hermes-managed.json").read_text())
+    assert "kep-halo-cli" in managed["skills"]
+
+
+def test_standalone_install_blocks_until_plugin_transaction_completes(tmp_path, monkeypatch):
+    # PT-002: standalone install serializes on the per-plugin lock the transaction holds
+    from hermes_multitenancy import skillhub_installer as si
+
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    pi.ingest(repo, audience="feishu_test", shared_home=home, activate=True)
+
+    paused = threading.Event()
+    release_evt = threading.Event()
+    real = pi._install_skills_to_profile
+
+    def pause(*args, **kwargs):
+        paused.set()
+        assert release_evt.wait(5)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pi, "_install_skills_to_profile", pause)
+
+    results = {}
+
+    def run_plugin():
+        pi.ingest(repo, audience="feishu_test", shared_home=home, force=True, activate=True)
+
+    def run_standalone():
+        rel = tmp_path / "release" / "kep-halo-cli"
+        rel.mkdir(parents=True, exist_ok=True)
+        (rel / "SKILL.md").write_text("standalone update\n", encoding="utf-8")
+        results["standalone"] = si._install_into_profile(
+            shared=home,
+            profile_home=home / "profiles" / "feishu_test",
+            skill_code="kep-halo-cli",
+            version="2.0.0",
+            release_id="9",
+            canonical_skill_root=rel,
+        )
+
+    a = threading.Thread(target=run_plugin)
+    a.start()
+    assert paused.wait(5)
+    b = threading.Thread(target=run_standalone)
+    b.start()
+    b.join(0.3)
+    assert b.is_alive()  # blocked behind the in-flight plugin transaction
+    release_evt.set()
+    a.join(10)
+    b.join(10)
+    assert not a.is_alive() and not b.is_alive()
+    assert results["standalone"]["status"] == "skipped-plugin-owned"
