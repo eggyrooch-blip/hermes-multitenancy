@@ -216,16 +216,18 @@ def test_load_manifest_rejects_flag_injection_cli_install(tmp_path):
         pi.load_plugin_manifest(repo)
 
 
-def test_governance_failure_leaves_no_runtime_manifest(tmp_path):
+def test_governance_gap_is_advisory_and_still_installs(tmp_path):
+    # trusted-source doctrine (2026-07-29): gate literals absent from SKILL.md
+    # warn + report but never block the install.
     repo = tmp_path / "plug"
     _write_plugin_repo(repo, skills=["using-resource-delivery", "kep-trevi-delivery-orchestrate"])
     (repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").write_text(
         "---\nname: o\n---\nno gate text here\n", encoding="utf-8")
     home = _shared_home(tmp_path)
-    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
-        pi.ingest(repo, audience="feishu_test", shared_home=home)
-    managed_path = home / pi.MANAGED_DIR / "test-plugin.json"
-    assert not managed_path.exists()
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    pg = report["profile_governance"][0]
+    assert any("1 of 1" in w for w in pg["governance_warnings"])
+    assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()
 
 
 def test_profile_governance_accepts_gates_in_all_owned_declared_skills(tmp_path):
@@ -258,7 +260,7 @@ def test_profile_governance_accepts_gates_in_all_owned_declared_skills(tmp_path)
     assert report["profile_governance"][0]["gates_present_in_installed_skills"] == 5
 
 
-def test_profile_governance_rejects_one_missing_gate_and_keeps_previous_active(tmp_path):
+def test_profile_governance_warns_on_missing_gate_and_stays_active(tmp_path):
     repo = _write_plugin_repo(tmp_path / "plug")
     home = _shared_home(tmp_path)
     pi.ingest(repo, audience="feishu_test", shared_home=home)
@@ -267,8 +269,10 @@ def test_profile_governance_rejects_one_missing_gate_and_keeps_previous_active(t
     manifest["governance"]["approval_required"] = ["x approve", "missing gate"]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(pi.PluginIngestError, match="1 of 2"):
-        pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+    pg = report["profile_governance"][0]
+    assert pg["gates_missing_from_content"] == ["missing gate"]
+    assert any("1 of 2" in w for w in pg["governance_warnings"])
 
     managed = json.loads((home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8"))
     assert managed["status"] == "active"
@@ -300,7 +304,9 @@ def test_concurrent_reingests_serialize_activation_and_failed_mutation(tmp_path,
     invalid_repo = _write_plugin_repo(tmp_path / "invalid")
     invalid_manifest_path = invalid_repo / pi.PLUGIN_MANIFEST_REL
     invalid_manifest = json.loads(invalid_manifest_path.read_text(encoding="utf-8"))
-    invalid_manifest["governance"]["approval_required"] = ["missing gate"]
+    # governance is advisory now — use an unregistered required connector as the
+    # still-fatal preflight failure for the transaction semantics under test.
+    invalid_manifest["connectors"] = [{"id": "not-registered-cli", "required": True}]
     invalid_manifest_path.write_text(json.dumps(invalid_manifest), encoding="utf-8")
     home = _shared_home(tmp_path)
     managed_path = home / pi.MANAGED_DIR / "test-plugin.json"
@@ -463,10 +469,10 @@ def test_profile_governance_ignores_foreign_and_undeclared_gate_docs(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
-        pi.ingest(repo, audience="feishu_test", shared_home=home)
-
-    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+    # foreign/undeclared docs still never count as enforcement — advisory warning
+    assert report["profile_governance"][0]["gates_missing_from_content"] == ["foreign gate"]
+    assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()
 
 
 def test_profile_governance_does_not_join_gate_across_skill_docs(tmp_path):
@@ -482,12 +488,12 @@ def test_profile_governance_does_not_join_gate_across_skill_docs(tmp_path):
         " now starts here", encoding="utf-8"
     )
 
-    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
-        pi.ingest(repo, audience="feishu_test", shared_home=_shared_home(tmp_path))
+    report = pi.ingest(repo, audience="feishu_test", shared_home=_shared_home(tmp_path))
+    assert report["profile_governance"][0]["gates_missing_from_content"] == ["approve now"]
 
 
 @pytest.mark.parametrize("audience", ["all", "101"])
-def test_nonprofile_governance_rejects_missing_gate_before_distribution(tmp_path, audience):
+def test_nonprofile_governance_warns_but_distributes(tmp_path, audience):
     repo = _write_plugin_repo(tmp_path / "plug")
     (repo / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").write_text(
         "no declared gate", encoding="utf-8"
@@ -496,11 +502,11 @@ def test_nonprofile_governance_rejects_missing_gate_before_distribution(tmp_path
     config = home / pi.SKILL_DISTRIBUTION_FILE
     config.write_text("skills: []\n", encoding="utf-8")
 
-    with pytest.raises(pi.PluginIngestError, match="gates not enforced"):
-        pi.ingest(repo, audience=audience, shared_home=home)
+    report = pi.ingest(repo, audience=audience, shared_home=home)
 
-    assert yaml.safe_load(config.read_text(encoding="utf-8")) == {"skills": []}
-    assert not (home / pi.MANAGED_DIR / "test-plugin.json").exists()
+    assert report["skills"]["package_governance"]["governance_warnings"]
+    assert yaml.safe_load(config.read_text(encoding="utf-8"))["skills"]
+    assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()
 
 
 def test_profile_ingest_rejects_shared_source_owned_by_other_plugin(tmp_path):
@@ -795,18 +801,18 @@ def test_ingest_profile_mode_asserts_profile_governance(tmp_path):
     assert "kep-trevi-delivery-orchestrate" in pg["governance_skills_live"]
 
 
-def test_assert_profile_governance_raises_if_orchestrator_absent(tmp_path):
-    # orchestrator declared by plugin but never installed in the profile → fatal
+def test_assert_profile_governance_warns_if_orchestrator_absent(tmp_path):
+    # orchestrator declared by plugin but never installed in the profile → advisory warning
     repo = _write_plugin_repo(tmp_path / "plug", skills=["using-resource-delivery", "kep-trevi-delivery-orchestrate"])
     home = _shared_home(tmp_path)
     plugin = pi.load_plugin_manifest(repo)
     empty_profile = home / "profiles" / "feishu_test"  # has empty skills/ dir
-    with pytest.raises(pi.PluginIngestError, match="gates cannot be enforced"):
-        pi.assert_profile_governance(
-            plugin,
-            empty_profile,
-            ["using-resource-delivery", "kep-trevi-delivery-orchestrate"],
-        )
+    pg = pi.assert_profile_governance(
+        plugin,
+        empty_profile,
+        ["using-resource-delivery", "kep-trevi-delivery-orchestrate"],
+    )
+    assert any("required governance skill" in w for w in pg["governance_warnings"])
 
 
 def test_ingest_department_mode_refuses_to_create_config(tmp_path):

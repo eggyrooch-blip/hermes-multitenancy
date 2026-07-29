@@ -74,9 +74,11 @@ def _plugin_zip(
     with_expert: bool = False,
     approval_gates: list[str] | None = None,
     documented_gates: list[str] | None = None,
+    connectors: list[dict] | None = None,
 ) -> bytes:
     approval_gates = approval_gates or ["x approve"]
     documented_gates = documented_gates or ["x approve"]
+    connectors = connectors or [{"id": "kep-cli", "required": True}]
     manifest = {
         "schema": pi.SUPPORTED_SCHEMA,
         "id": plugin_id,
@@ -87,7 +89,7 @@ def _plugin_zip(
         "install_mode": "copy",
         "audience": {"department_ids": []},
         "clis": [],
-        "connectors": [{"id": "kep-cli", "required": True}],
+        "connectors": connectors,
         "governance": {
             "env_default": "pre",
             "approval_required": approval_gates,
@@ -233,28 +235,26 @@ def test_plugin_install_approved_installs_for_authorized_profiles_only(tmp_path:
     assert not (profiles_root / "charlie" / "skills" / "kep-halo-cli").exists()
 
 
-def test_plugin_governance_failure_is_auditable_and_inactive(tmp_path: Path) -> None:
-    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+def test_plugin_governance_gap_installs_with_warning(tmp_path: Path) -> None:
+    # trusted-source doctrine (2026-07-29): a declared gate missing from skill
+    # docs warns but no longer blocks the install (keep-server-dev incident).
+    from hermes_multitenancy.skillhub_installer import process_event
 
     shared_home = tmp_path / ".hermes"
     profiles_root = _make_profile_dirs(shared_home, "alice")
     _seed_routing_db(shared_home, [("alice-ldap", "alice")])
 
-    with pytest.raises(SkillhubInstallError) as exc:
-        process_event(
-            _plugin_event(users=["alice-ldap"]),
-            shared_home=shared_home,
-            profiles_root=profiles_root,
-            downloader=lambda _: _plugin_zip(
-                approval_gates=["x approve", "missing gate"],
-                documented_gates=["x approve"],
-            ),
-        )
+    process_event(
+        _plugin_event(users=["alice-ldap"]),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(
+            approval_gates=["x approve", "missing gate"],
+            documented_gates=["x approve"],
+        ),
+    )
 
-    assert exc.value.error_code == "PLUGIN_INGEST_FAILED"
-    assert not (
-        shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json"
-    ).exists()
+    assert (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
 
 
 def test_nonactivating_ingest_keeps_release_metadata(tmp_path: Path) -> None:
@@ -971,7 +971,7 @@ def test_explicit_active_and_failed_ingest_share_one_plugin_transaction(tmp_path
                 shared_home=shared_home,
                 profiles_root=profiles_root,
                 downloader=lambda _: _plugin_zip(
-                    approval_gates=["missing gate"], documented_gates=["x approve"]
+                    connectors=[{"id": "not-registered-cli", "required": True}]
                 ),
             )
         except Exception as exc:
@@ -1052,7 +1052,7 @@ def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path,
                 shared_home=shared_home,
                 profiles_root=profiles_root,
                 downloader=lambda _: _plugin_zip(
-                    approval_gates=["missing gate"], documented_gates=["x approve"]
+                    connectors=[{"id": "not-registered-cli", "required": True}]
                 ),
             )
         except Exception as exc:

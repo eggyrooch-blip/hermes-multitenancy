@@ -860,18 +860,21 @@ def assert_profile_governance(
 def _assert_skill_content_governance(
     plugin: dict[str, Any], *, skills_root: Path, installed_skills: list[str], scope: str
 ) -> dict[str, Any]:
+    # ADVISORY since 2026-07-29 (sunke): AiDock is the trusted publishing source —
+    # content-governance findings (gate literals absent from SKILL.md, missing
+    # entry/orchestrator) WARN and land in the report, but never block ingest.
+    # env_default=pre stays hard-enforced in assert_governance().
     gov = plugin.get("governance") or {}
     gates = list(gov.get("approval_required") or [])
     installed = set(installed_skills)
+    warnings: list[str] = []
 
-    # the orchestrator skill (its SKILL.md enforces the staged gates) must be live.
+    # the orchestrator skill (its SKILL.md enforces the staged gates) should be live.
     # Resolve by the plugin's own (possibly nested) skill path, not a flat dir name.
     orchestrate = next((s for s in plugin["skills"]["list"] if "orchestrat" in s), None)
     entry = plugin.get("entry_skill")
     if gates and (not orchestrate or not entry):
-        raise PluginIngestError(
-            "governance check failed: entry and orchestrator skills must be declared"
-        )
+        warnings.append("entry and orchestrator skills must be declared")
 
     def _installed(name: str) -> bool:
         p = skills_root / name
@@ -880,12 +883,11 @@ def _assert_skill_content_governance(
         s for s in (orchestrate, entry) if s and (s not in installed or not _installed(s))
     ]
     if missing_skills:
-        raise PluginIngestError(
-            f"governance check failed: required governance skill(s) {missing_skills} "
-            f"not installed in {scope} — gates cannot be enforced"
+        warnings.append(
+            f"required governance skill(s) {missing_skills} not installed in {scope}"
         )
 
-    # Each gate must appear in a plugin-declared skill this ingest actually owns.
+    # Each gate should appear in a plugin-declared skill this ingest actually owns.
     # Foreign/managed same-name installs are deliberately excluded.
     docs = []
     live_skills = []
@@ -900,11 +902,12 @@ def _assert_skill_content_governance(
             pass
     ungoverned = [g for g in gates if g and not any(g in text for text in docs)]
     if ungoverned:
-        raise PluginIngestError(
-            f"governance check failed: {len(ungoverned)} of {len(gates)} declared approval "
-            f"gate(s) are missing from installed plugin skills for {scope} — "
-            "gates not enforced"
+        warnings.append(
+            f"{len(ungoverned)} of {len(gates)} declared approval gate(s) are missing "
+            f"from installed plugin skills for {scope}"
         )
+    for w in warnings:
+        sys.stderr.write(f"WARN: governance (advisory, trusted source): {w}\n")
     return {
         "profile": scope,
         "env_default": gov.get("env_default") or "pre",
@@ -912,6 +915,7 @@ def _assert_skill_content_governance(
         "gates_present_in_installed_skills": len(gates) - len(ungoverned),
         "gates_missing_from_content": ungoverned,
         "governance_skills_live": live_skills,
+        "governance_warnings": warnings,
     }
 
 
