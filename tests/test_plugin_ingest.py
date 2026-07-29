@@ -908,3 +908,106 @@ def test_install_clis_dry_run_no_write(tmp_path):
 
 # (slash-alias distribution removed — aliases are now skill-declared frontmatter,
 #  scanned per-profile by skill_slash; see test_skill_slash_aliases.py)
+
+
+# ─────────────── plugin takeover of aidock standalone same-name skills ───────────────
+
+def _seed_standalone_install(home, profile, name, *, origin="aidock-skillhub", content="standalone body\n"):
+    """Simulate a prior AiDock standalone skill install owned via .hermes-managed.json."""
+    release = home / "_managed" / "aidock-skillhub" / name / "1.0.0" / name
+    release.mkdir(parents=True, exist_ok=True)
+    (release / "SKILL.md").write_text(content, encoding="utf-8")
+    skills = home / "profiles" / profile / "skills"
+    (skills / name).symlink_to(release)
+    mf = skills / ".hermes-managed.json"
+    data = json.loads(mf.read_text(encoding="utf-8")) if mf.exists() else {"skills": {}}
+    data.setdefault("skills", {})[name] = {
+        "source": str(release), "target": str(release), "version": "1.0.0", "origin": origin,
+    }
+    mf.write_text(json.dumps(data), encoding="utf-8")
+    return release
+
+
+def test_plugin_takes_over_aidock_standalone_same_name_skill(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    release = _seed_standalone_install(home, "feishu_test", "kep-halo-cli")
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    actions = {r["skill"]: r for r in report["skills"]["installed"] if r["profile"] == "feishu_test"}
+    row = actions["kep-halo-cli"]
+    assert row["action"] == "takeover-standalone"
+    assert row["previous_target"] == str(release)
+    assert row["content_identical"] is False
+    # profile copy now matches the plugin source, ownership entry is gone
+    target = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
+    assert pi._skill_tree_digest(target) == pi._skill_tree_digest(home / "skills" / "kep-halo-cli")
+    managed = json.loads((home / "profiles" / "feishu_test" / "skills" / ".hermes-managed.json").read_text())
+    assert "kep-halo-cli" not in managed["skills"]
+
+
+def test_plugin_takeover_flags_identical_content(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    same = (repo / "skills" / "kep-halo-cli" / "SKILL.md").read_text(encoding="utf-8")
+    home = _shared_home(tmp_path)
+    _seed_standalone_install(home, "feishu_test", "kep-halo-cli", content=same)
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    row = next(r for r in report["skills"]["installed"]
+               if r["skill"] == "kep-halo-cli" and r["profile"] == "feishu_test")
+    assert row["action"] == "takeover-standalone"
+    assert row["content_identical"] is True
+
+
+def test_plugin_never_takes_over_non_aidock_managed_skill(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path)
+    release = _seed_standalone_install(home, "feishu_test", "kep-halo-cli", origin="org-default")
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    row = next(r for r in report["skills"]["installed"]
+               if r["skill"] == "kep-halo-cli" and r["profile"] == "feishu_test")
+    assert row["action"] == "skipped-managed"
+    # untouched: still the foreign symlink and the ownership entry
+    target = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
+    assert target.is_symlink() and target.readlink() == release
+    managed = json.loads((home / "profiles" / "feishu_test" / "skills" / ".hermes-managed.json").read_text())
+    assert "kep-halo-cli" in managed["skills"]
+
+
+def test_standalone_event_cannot_steal_plugin_owned_name(tmp_path):
+    from hermes_multitenancy import skillhub_installer as si
+
+    repo = _write_plugin_repo(tmp_path / "plug")
+    home = _shared_home(tmp_path, profiles=("feishu_test", "other"))
+    pi.ingest(repo, audience="feishu_test", shared_home=home, activate=True)
+    release = tmp_path / "release" / "kep-halo-cli"
+    release.mkdir(parents=True)
+    (release / "SKILL.md").write_text("standalone update\n", encoding="utf-8")
+
+    # profile inside the active plugin audience → guarded
+    guarded = si._install_into_profile(
+        shared=home,
+        profile_home=home / "profiles" / "feishu_test",
+        skill_code="kep-halo-cli",
+        version="2.0.0",
+        release_id="7",
+        canonical_skill_root=release,
+    )
+    assert guarded == {"status": "skipped-plugin-owned", "profile": "feishu_test", "plugin": "test-plugin"}
+    target = home / "profiles" / "feishu_test" / "skills" / "kep-halo-cli"
+    assert pi._skill_tree_digest(target) == pi._skill_tree_digest(home / "skills" / "kep-halo-cli")
+
+    # profile outside the plugin audience → standalone installs as before
+    free = si._install_into_profile(
+        shared=home,
+        profile_home=home / "profiles" / "other",
+        skill_code="kep-halo-cli",
+        version="2.0.0",
+        release_id="7",
+        canonical_skill_root=release,
+    )
+    assert free["status"] in {"installed", "repointed"}

@@ -1130,14 +1130,45 @@ def _profiles_with_skill(
     return matches
 
 
+def _active_plugin_owner(shared: Path, profile_name: str, skill_code: str) -> str | None:
+    """Plugin id of an ACTIVE plugin that declares ``skill_code`` in its audience for
+    ``profile_name``, else None. Standalone installs must not steal such names back —
+    the reverse half of the plugin-takeover rule (sunke 2026-07-29)."""
+    managed_dir = shared / plugin_ingest.MANAGED_DIR
+    try:
+        paths = sorted(managed_dir.glob("*.json"))
+    except OSError:
+        return None
+    for path in paths:
+        if path.name.endswith(".sticky.json"):
+            continue
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(manifest, dict) or manifest.get("status") != "active":
+            continue
+        if skill_code not in (manifest.get("skills") or []):
+            continue
+        aud = manifest.get("audience") if isinstance(manifest.get("audience"), dict) else {}
+        mode = aud.get("mode")
+        if mode == "all" or (mode == "profile" and profile_name in (aud.get("profiles") or [])):
+            return str(manifest.get("plugin_id") or path.stem)
+    return None
+
+
 def _install_into_profile(
     *,
+    shared: Path,
     profile_home: Path,
     skill_code: str,
     version: str,
     release_id: str | None,
     canonical_skill_root: Path,
 ) -> dict[str, Any]:
+    owner = _active_plugin_owner(shared, profile_home.name, skill_code)
+    if owner:
+        return {"status": "skipped-plugin-owned", "profile": profile_home.name, "plugin": owner}
     rel_path = _safe_skill_relative_path(skill_code)
     managed = _read_manifest(profile_home, MANAGED_SKILL_MANIFEST)
     existing_entry = managed.get(str(rel_path)) if isinstance(managed, dict) else None
@@ -1251,6 +1282,7 @@ def _install_from_existing_release(
         profile_home = profiles / profile_name
         profile_home.mkdir(parents=True, exist_ok=True)
         results["users"][ldap] = _install_into_profile(
+            shared=shared,
             profile_home=profile_home,
             skill_code=skill_code,
             version=version,
@@ -1700,6 +1732,7 @@ def process_event(
     for ldap, profile_home in install_targets:
         profile_home.mkdir(parents=True, exist_ok=True)
         results["users"][ldap] = _install_into_profile(
+            shared=shared,
             profile_home=profile_home,
             skill_code=skill_code,
             version=version,

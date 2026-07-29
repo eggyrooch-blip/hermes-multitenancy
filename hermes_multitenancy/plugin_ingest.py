@@ -561,6 +561,48 @@ def _personal_install_is_unchanged(
     )
 
 
+def _standalone_managed_entry(profile_home: Path, name: str) -> dict[str, Any] | None:
+    """This profile's `.hermes-managed.json` entry for ``name`` when it is an AiDock
+    STANDALONE skill install (``origin == "aidock-skillhub"``) — the one managed owner
+    a plugin from the same trusted source takes over (sunke 2026-07-29: 勾选专家以
+    专家为准). Any other owner (org default, employee upload) returns None."""
+    mf = profile_home / "skills" / ".hermes-managed.json"
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    skills = data.get("skills") if isinstance(data, dict) else None
+    entry = skills.get(name) if isinstance(skills, dict) else None
+    if isinstance(entry, dict) and entry.get("origin") == "aidock-skillhub":
+        return entry
+    return None
+
+
+def _takeover_standalone_skill(profile_home: Path, name: str, *, plugin_source: Path) -> bool:
+    """Drop the standalone manifest entry + on-disk copy so the plugin source can land.
+    Returns whether the displaced content was byte-identical to the plugin source."""
+    target = profile_home / "skills" / name
+    identical = False
+    try:
+        if target.is_dir() and plugin_source.is_dir():
+            identical = _skill_tree_digest(target) == _skill_tree_digest(plugin_source)
+    except OSError:
+        identical = False
+    mf = profile_home / "skills" / ".hermes-managed.json"
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if isinstance(data.get("skills"), dict):
+        data["skills"].pop(name, None)
+        mf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if target.is_symlink():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    return identical
+
+
 def _managed_skill_present(profile_home: Path, name: str) -> bool:
     """True if the org-managed manifest (`.hermes-managed.json`) already owns this skill.
 
@@ -618,7 +660,32 @@ def _install_skills_to_profile(
             # / another plugin) OR an org-managed/default skill (which uninstall can't
             # roll back). Skip it, and never record it as ours.
             if _managed_skill_present(profile_home, name):
-                installed.append({"profile": profile, "skill": name, "action": "skipped-managed"})
+                standalone = _standalone_managed_entry(profile_home, name)
+                if standalone is None:
+                    installed.append({"profile": profile, "skill": name, "action": "skipped-managed"})
+                    continue
+                if dry_run:
+                    installed.append({"profile": profile, "skill": name, "action": "would-takeover-standalone"})
+                    owned.setdefault(profile, []).append(name)
+                    continue
+                identical = _takeover_standalone_skill(
+                    profile_home, name, plugin_source=shared_skills / name
+                )
+                install_shared_skill_for_profile(
+                    shared_home=shared_home,
+                    profile_home=profile_home,
+                    skill_path=name,
+                    source=shared_skills / name,
+                    version=version,
+                )
+                installed.append({
+                    "profile": profile,
+                    "skill": name,
+                    "action": "takeover-standalone",
+                    "previous_target": standalone.get("target"),
+                    "content_identical": identical,
+                })
+                owned.setdefault(profile, []).append(name)
                 continue
             if existing is not None and existing != my_source:
                 installed.append({"profile": profile, "skill": name, "action": "skipped-foreign", "target": existing})

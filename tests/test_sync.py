@@ -1973,6 +1973,7 @@ def _install_via_skillhub(profile_home: Path, shared: Path, rel_path: str = "kee
         canonical.mkdir(parents=True)
         (canonical / "SKILL.md").write_text(f"# {rel_path} 1.0.3\n", encoding="utf-8")
     result = skillhub_installer._install_into_profile(
+        shared=shared,
         profile_home=profile_home,
         skill_code=rel_path,
         version="1.0.3",
