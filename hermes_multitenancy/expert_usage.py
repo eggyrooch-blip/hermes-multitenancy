@@ -29,15 +29,20 @@ CREATE TABLE IF NOT EXISTS expert_usage (
     expert_id  TEXT PRIMARY KEY,
     use_count  INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
-);
+)
 """
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=5.0)
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript("PRAGMA journal_mode=WAL;")
-    conn.executescript(_SCHEMA)
+    try:
+        # WAL is a persistent DB property; switching can hit SQLITE_BUSY during
+        # concurrent first-connect — non-fatal, this call just runs non-WAL once
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(_SCHEMA)
     return conn
 
 
