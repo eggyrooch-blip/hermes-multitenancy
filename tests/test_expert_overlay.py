@@ -344,6 +344,42 @@ def test_list_experts_exposes_optional_skillhub_release_metadata(tmp_path, monke
     assert "release_id" not in row
 
 
+def test_list_experts_falls_back_to_ingested_at_for_unstamped_manifests(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    manifest_path = shared / pi.MANAGED_DIR / "keep-resource-delivery.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # pre-2026-07-24 ingest: no release stamp, only ingested_at
+    manifest.pop("release_version", None)
+    manifest.pop("release_installed_at", None)
+    manifest["ingested_at"] = 1_784_000_000
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    row = eo.list_experts(shared / "profiles" / "feishu_test")[0]
+
+    assert row["release_installed_at"] == 1_784_000_000
+    assert "release_version" not in row
+
+
+def test_list_experts_ignores_invalid_ingested_at_fallback(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    manifest_path = shared / pi.MANAGED_DIR / "keep-resource-delivery.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("release_version", None)
+    manifest.pop("release_installed_at", None)
+    manifest["ingested_at"] = "not-a-timestamp"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    row = eo.list_experts(shared / "profiles" / "feishu_test")[0]
+
+    assert "release_installed_at" not in row
+
+
 def test_list_experts_audience_filter(tmp_path, monkeypatch):
     # expert scoped to department 42
     repo = _plugin_repo(tmp_path / "plug", audience={"department_ids": ["42"]})

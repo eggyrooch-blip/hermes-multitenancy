@@ -426,6 +426,12 @@ def list_experts(
             manifest_audience = manifest.get("audience")
             release_version = manifest.get("release_version")
             release_installed_at = manifest.get("release_installed_at")
+            if not (isinstance(release_installed_at, int) and release_installed_at > 0):
+                # pre-2026-07-24 ingests were never stamped with release metadata;
+                # ingested_at is the honest "last updated" for those plugins
+                ingested_at = manifest.get("ingested_at")
+                if isinstance(ingested_at, int) and ingested_at > 0:
+                    release_installed_at = ingested_at
             for ex in experts:
                 if not isinstance(ex, dict):
                     continue
