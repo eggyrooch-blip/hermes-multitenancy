@@ -801,6 +801,32 @@ async def _stream_aiagent_subprocess(
                         returncode,
                         redacted_stderr_text[-4000:] or "<empty>",
                     )
+                elif returncode < 0:
+                    # Killed by signal -returncode, with no result delivered.
+                    # In prod this is always the gateway going down: systemd
+                    # SIGTERMs the whole process group on deploy/restart and
+                    # every in-flight child dies with it (the child is spawned
+                    # without start_new_session, so it shares the group). A
+                    # *sandboxed* child that dies by signal surfaces as bwrap's
+                    # 128+N, i.e. positive — a negative code really does mean
+                    # our own direct child was signalled.
+                    #
+                    # The stderr tail is unrelated output from seconds earlier,
+                    # so splicing it into the user-facing message lies about the
+                    # cause: on 2026-07-30 a stale "Encrypted reasoning replay
+                    # was rejected" warning sent everyone chasing a model-compat
+                    # bug that did not exist. Full stderr stays in the log.
+                    logger.warning(
+                        "[multitenancy] AIAgent subprocess killed by signal %s "
+                        "(gateway restart/shutdown kills in-flight runs); the stderr "
+                        "tail below is stale output, NOT the cause of death: %s",
+                        -returncode,
+                        redacted_stderr_text[-4000:] or "<empty>",
+                    )
+                    raise RuntimeError(
+                        f"⚠️ 这一轮被网关重启/关闭打断了（子进程收到信号 {-returncode}），"
+                        "没能跑完。麻烦再发一次。"
+                    )
                 else:
                     raise RuntimeError(
                         f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
