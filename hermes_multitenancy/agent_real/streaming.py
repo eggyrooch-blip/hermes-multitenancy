@@ -783,9 +783,28 @@ async def _stream_aiagent_subprocess(
                 time.monotonic() - started_at,
             )
             if returncode != 0:
-                raise RuntimeError(
-                    f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
-                )
+                # ponytail: the ``done`` event IS the child's terminal outcome
+                # report — a failed turn arrives as done+error and already
+                # raised above. A non-zero exit *after* done therefore carries
+                # no user-facing meaning: the answer was produced and streamed.
+                # Raising anyway turned self-healed turns (core strips a
+                # rejected encrypted-reasoning replay and retries, then the
+                # child is SIGTERMed by an external process-group signal during
+                # teardown) into red error bubbles AND discarded the finished
+                # answer, because stream_run_agent drops ``final_text`` on any
+                # exception. Log loudly, surface nothing.
+                if saw_done:
+                    logger.warning(
+                        "[multitenancy] AIAgent subprocess exited %s AFTER delivering its "
+                        "done event; keeping the completed turn instead of surfacing an "
+                        "error. stderr: %s",
+                        returncode,
+                        redacted_stderr_text[-4000:] or "<empty>",
+                    )
+                else:
+                    raise RuntimeError(
+                        f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
+                    )
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
     except asyncio.TimeoutError as exc:
