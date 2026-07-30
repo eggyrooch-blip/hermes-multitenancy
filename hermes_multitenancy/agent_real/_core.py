@@ -81,15 +81,24 @@ class ExpertUnavailableError(RuntimeError):
 class GatewayRestartInterruptedError(RuntimeError):
     """The AIAgent child was killed by a signal — the gateway went down mid-run.
 
-    Carries a user-ready message. ``stream_run_agent`` must surface it verbatim:
-    the generic ``_PARTIAL_FAILURE_NOTICE`` would hide *why* the turn broke, and
-    the legacy-stream fallback is wrong here — nothing is wrong with the model,
-    the process was killed (deploy/restart SIGTERMs the whole process group).
+    Carries a user-ready message. ``stream_run_agent`` and ``real_run_agent``
+    must surface it verbatim: the generic ``_PARTIAL_FAILURE_NOTICE`` would hide
+    *why* the turn broke, and both legacy fallbacks are wrong here — nothing is
+    wrong with the model, the process was killed (deploy/restart SIGTERMs the
+    whole process group).
     """
 
     error_code = "GATEWAY_RESTART_INTERRUPTED"
     failure_subsystem = "gateway_lifecycle"
     retryable = True
+
+
+def _gateway_restart_interrupted(signum: int) -> GatewayRestartInterruptedError:
+    """One wording for both the streaming and the non-streaming raise sites."""
+    return GatewayRestartInterruptedError(
+        f"⚠️ 这一轮被网关重启/关闭打断了（子进程收到信号 {signum}），"
+        "没能跑完。麻烦再发一次。"
+    )
 
 
 # StreamReader line-buffer cap for the AIAgent subprocess NDJSON protocol. The
@@ -474,6 +483,12 @@ async def real_run_agent(
             return await _run_aiagent_subprocess(event, profile_home)
         except Exception as exc:
             if isinstance(exc, ExpertUnavailableError):
+                raise
+            if isinstance(exc, GatewayRestartInterruptedError):
+                # Must jump the ladder below: the legacy spike runner would
+                # silently re-run the whole prompt (double tool side effects,
+                # double spend) and answer as if nothing had happened, hiding
+                # the restart from the user entirely.
                 raise
             kind = _billing_failure_kind(event, exc)
             retry_safe = getattr(exc, "billing_retry_safe", False) is True
@@ -3861,9 +3876,35 @@ async def _run_aiagent_subprocess(
     if stderr_text:
         logger.debug("[multitenancy] AIAgent subprocess stderr: %s", redacted_stderr_text[-4000:])
 
+    # Killed by signal → the gateway went down mid-run: systemd SIGTERMs the
+    # whole process group on deploy/restart and every in-flight child dies with
+    # it (we spawn without start_new_session, so the child shares our group). A
+    # *sandboxed* child killed by a signal surfaces as bwrap's 128+N, i.e.
+    # positive — a negative code really is our own direct child being signalled.
+    # Same classification, same reason as streaming.py's raise site: the stderr
+    # tail is unrelated output from seconds earlier, so splicing it into the
+    # user-facing message lies about the cause (2026-07-30: a stale "Encrypted
+    # reasoning replay was rejected" warning sent everyone chasing a model-compat
+    # bug that did not exist). Full stderr stays in the log.
+    signal_death = proc.returncode is not None and proc.returncode < 0
+
     try:
         data = json.loads(stdout_text)
     except json.JSONDecodeError as exc:
+        if signal_death:
+            # This is the common shape: the child dies before writing its result
+            # JSON, so stdout is empty and the invalid-JSON diagnostic below used
+            # to fire first — blaming the child's protocol for a death it had no
+            # part in, stale stderr quoted as evidence.
+            logger.warning(
+                "[multitenancy] AIAgent subprocess killed by signal %s before "
+                "delivering its result (gateway restart/shutdown kills in-flight "
+                "runs); the full stderr below is stale output, NOT the cause of "
+                "death: %s",
+                -proc.returncode,
+                redacted_stderr_text or "<empty>",
+            )
+            raise _gateway_restart_interrupted(-proc.returncode) from exc
         raise RuntimeError(
             "AIAgent subprocess returned invalid JSON "
             f"(exit={proc.returncode}, stdout={redacted_stdout_text[-1000:]!r}, stderr={redacted_stderr_text[-1000:]!r})"
@@ -3880,7 +3921,25 @@ async def _run_aiagent_subprocess(
             error_code=str(error_code),
             retryable=retryable,
         )
-    if proc.returncode != 0:
+    if signal_death:
+        # The result JSON is this path's terminal outcome report — the exact
+        # analogue of the streaming ``done`` event. If it arrived with a real
+        # answer the turn finished and the later signal is teardown noise:
+        # keep the answer rather than throwing it away for an exit code. If it
+        # arrived empty (or the run failed), the signal is still the honest
+        # cause — never the stderr tail the branch below would quote.
+        logger.warning(
+            "[multitenancy] AIAgent subprocess killed by signal %s AFTER "
+            "delivering its result JSON (result=%s chars, carried_error=%s); the "
+            "full stderr below is stale output, NOT the cause of death: %s",
+            -proc.returncode,
+            len(str(data.get("result") or "")),
+            bool(data.get("error")),
+            redacted_stderr_text or "<empty>",
+        )
+        if not str(data.get("result") or "").strip():
+            raise _gateway_restart_interrupted(-proc.returncode)
+    elif proc.returncode != 0:
         child_error = _redact_billing_runtime_text(data.get("error") or "", event, env)
         raise _subprocess_failure(
             f"AIAgent subprocess exited {proc.returncode}: "

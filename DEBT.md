@@ -19,9 +19,22 @@ in-flight run 随进程组一起吃 SIGTERM。qiaojunlong 那轮 `saw_done=False
 停止 admit 新 run + 等在途 run 收尾(有上限),或把被打断的 run 标记 `interrupted_by_restart`
 并自动重投该轮输入。涉及用户可见语义(自动重发会重复扣费/重复副作用),不能由实施侧单方决定。
 
-**D2 — gateway 收 SIGTERM 后非干净退出(`status=1/FAILURE`)**
-journal 两次都是 `Stopping → exited status=1/FAILURE → Started`,不是干净停。退出码 1 说明
-shutdown 路径本身有异常未处理。没查,单独立项。与 D1 相关但可独立修。
+**D2 — gateway 收 SIGTERM 后非干净退出(`status=1/FAILURE`)** — 2026-07-30 已查清,**结论:不是 bug,不改**
+journal 两次都是 `Stopping → exited status=1/FAILURE → Started`。原猜测"shutdown 路径有未处理异常"**被推翻**:
+退出码 1 是上游**刻意**的,证据链(核心仓 `hermes-agent`,非本仓):
+- `gateway/run.py:11166` `_signal_initiated_shutdown = False` + `:11190` 信号处理器置 True(仅当不是 `--replace` 计划接管)
+- `gateway/run.py:11326-11331` `if _signal_initiated_shutdown and not runner._restart_requested: return False`
+  —— 注释原话:"exit non-zero so systemd's Restart=on-failure revives the process";覆盖 `hermes update` 杀网关 / 外部 kill / 容器运行时乱发信号
+- `hermes_cli/gateway.py:2353-2355`(以及 `gateway/run.py:11355-11357`)`success = asyncio.run(start_gateway(...)); if not success: sys.exit(1)`
+- 设计注释 `gateway/run.py:11161-11166` 明确解释为什么 `systemctl stop` 安全:systemd 独立跟踪 stop-requested,`Restart=` 不会为主动 stop 触发
+复现推理:部署脚本 `systemctl restart` → systemd 发 SIGTERM → 处理器置 `_signal_initiated_shutdown=True`(无 takeover marker)
+→ `runner.stop()` 正常 drain(`run.py:2680-2703` 会 interrupt 在途 agent 并等 5s)→ 返回 False → `sys.exit(1)` → journal 记 FAILURE → systemd 拉起。
+**为什么不改**:①代码在 SPEC 禁改的核心仓;②把它改成 exit 0 就等于删掉"意外 SIGTERM 后 systemd 复活网关"的语义,
+是拿可用性换日志好看;③systemd 无法在带内区分"systemctl restart 发的 SIGTERM"和"外人 kill 发的 SIGTERM",
+想干净退出必须先解决这个区分问题(可行方向:部署脚本改用 `SIGUSR1`(`run.py:11229` 已注册 restart handler,走 `_restart_requested` 分支 → exit 0),
+或部署前写 takeover marker 走 `--replace` 计划接管路径 `run.py:11178-11188`)。
+**实际代价**:仅日志/告警噪音(`OnFailure=` 会误报),重启本身正常。要消噪就走上面两个方向之一,别动退出码。
+> 注:本条依据本机 `~/code/hermes-agent` 工作树读码(HEAD `e045d2809`)+ 上一 slug 记录的 journal 证据;未 ssh 生产核对已安装版本。
 
 **D4 — 上游 flake:`test_hook_dispatch.py::test_concurrent_uploaded_files_keep_profile_and_prompt_isolated`**
 全量套件里间歇红(`AttributeError: 'FullFeishuAdapter' object has no attribute 'send'`,

@@ -830,10 +830,7 @@ async def _stream_aiagent_subprocess(
                         -returncode,
                         redacted_stderr_text or "<empty>",
                     )
-                    raise GatewayRestartInterruptedError(
-                        f"⚠️ 这一轮被网关重启/关闭打断了（子进程收到信号 {-returncode}），"
-                        "没能跑完。麻烦再发一次。"
-                    )
+                    raise _gateway_restart_interrupted(-returncode)
                 else:
                     raise RuntimeError(
                         f"AIAgent subprocess exited {returncode}: {redacted_stderr_text[-1000:]}"
