@@ -346,7 +346,11 @@ def override_matcher(matcher: Optional[PushCardMatcher]) -> None:
 
 # --- live FeishuAdapter wiring (fail-open, mirrors feishu_reply_quote_api) --
 
-_HOOK_INSTALLED = False
+#: NO module-level installed-flag on purpose: a global one latched True on the
+#: register-time install against the WRONG class (v0190 lazy-platform clone) and
+#: short-circuited every later re-arm against the live class. The per-function
+#: markers below are read off the class being patched, so they are already the
+#: correct idempotence guard.
 _DISPATCH_FLAG = "_hermes_multitenancy_push_card_matcher_dispatch_patched"
 _RECALL_FLAG = "_hermes_multitenancy_push_card_recall_patched"
 _REGISTRY_CTX_ATTR = "_mt_push_registry_context"
@@ -404,9 +408,6 @@ def install_feishu_push_card_matcher_patch(FeishuAdapter: Any = None) -> None:
     supplied by the on-dispatch re-arm in ``push_send_queue`` when the register-
     time install deferred because the class was not yet importable). When omitted
     it is resolved via ``load_feishu_adapter`` (register-time path)."""
-    global _HOOK_INSTALLED
-    if _HOOK_INSTALLED:
-        return
     if FeishuAdapter is None:
         try:
             from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
@@ -422,7 +423,6 @@ def install_feishu_push_card_matcher_patch(FeishuAdapter: Any = None) -> None:
             return
     _patch_dispatch(FeishuAdapter)
     _patch_recall(FeishuAdapter)
-    _HOOK_INSTALLED = True
 
 
 # --- fill-loop runtime driver (the match→clarify→form loop, wired) -------

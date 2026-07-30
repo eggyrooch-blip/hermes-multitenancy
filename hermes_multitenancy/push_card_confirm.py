@@ -53,7 +53,10 @@ _STALE_CARD_MSG = "该卡片已失效或已录入，请使用最新的卡片。"
 
 logger = logging.getLogger(__name__)
 
-_HOOK_INSTALLED = False
+#: No module-level installed-flag on purpose — see the note in
+#: ``push_card_matcher``: a global latched True on the register-time install
+#: against the wrong class and killed every later re-arm. ``_CARD_ACTION_FLAG``
+#: is read off the class being patched, which is the correct guard.
 _CARD_ACTION_FLAG = "_hermes_multitenancy_push_confirm_card_action_patched"
 
 
@@ -713,9 +716,6 @@ def install_feishu_push_card_confirm_patch(FeishuAdapter: Any = None) -> None:
     supplied by the on-dispatch re-arm in ``push_send_queue`` when the register-
     time install deferred because the class was not yet importable). When omitted
     it is resolved via ``load_feishu_adapter`` (register-time path)."""
-    global _HOOK_INSTALLED
-    if _HOOK_INSTALLED:
-        return
     if FeishuAdapter is None:
         try:
             from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
@@ -729,7 +729,7 @@ def install_feishu_push_card_confirm_patch(FeishuAdapter: Any = None) -> None:
             except Exception:
                 logger.debug("[push_card] confirm patch deferred", exc_info=True)
             return
-    _HOOK_INSTALLED = _patch_card_action(FeishuAdapter)
+    _patch_card_action(FeishuAdapter)
 
 
 def _patch_card_action(FeishuAdapter: Any) -> bool:

@@ -65,14 +65,50 @@ def is_executor_shutdown_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "cannot schedule new futures" in str(exc)
 
 
+def _loaded_synthetic_module() -> ModuleType | None:
+    # Guarded on the ``FeishuAdapter`` attr so a half-initialized module never wins.
+    module = sys.modules.get(_PLUGIN_LOADER_MODULE_NAME)
+    if module is not None and getattr(module, "FeishuAdapter", None) is not None:
+        return module
+    return None
+
+
+def _materialize_deferred_feishu_platform() -> None:
+    """Force the lazily-registered feishu platform plugin to actually load.
+
+    Since core v0190 bundled ``kind: platform`` plugins are DEFERRED
+    (``hermes_cli/plugins.py`` → ``_register_deferred_platform``): discovery only
+    hands ``platform_registry`` a loader, so the synthetic module does not exist
+    until the first registry lookup. multitenancy ``register()`` runs before that
+    — it used to miss, fall back, and import the same source file a second time,
+    landing all 15 class patches on a clone the gateway never instantiates
+    (prod 2026-07-25 → 07-30, silently).
+
+    ``get()`` is the public API and runs the deferred loader; it only imports +
+    registers (``check_fn``/``validate_config`` are reached from
+    ``create_adapter`` alone), so a non-gateway context with no ``FEISHU_*`` env
+    is safe. Fail-open: nothing here is worth breaking a patch install over —
+    on any failure we are exactly where we were before, at the old fallback.
+    """
+    try:
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.get("feishu")
+    except Exception:
+        pass
+
+
 def load_feishu_module() -> ModuleType:
     # The plugin-loader's synthetic module wins when present: it is the
     # adapter the gateway actually runs. (For the legacy names below a plain
     # ``import_module`` already returns the cached ``sys.modules`` entry, so
-    # only the synthetic name needs an explicit lookup.) Guarded on the
-    # ``FeishuAdapter`` attr so a half-initialized module never wins.
-    module = sys.modules.get(_PLUGIN_LOADER_MODULE_NAME)
-    if module is not None and getattr(module, "FeishuAdapter", None) is not None:
+    # only the synthetic name needs an explicit lookup.)
+    module = _loaded_synthetic_module()
+    if module is not None:
+        return module
+    _materialize_deferred_feishu_platform()
+    module = _loaded_synthetic_module()
+    if module is not None:
         return module
     last_error: Exception | None = None
     for module_name in _FEISHU_MODULE_NAMES:

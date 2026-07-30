@@ -179,7 +179,8 @@ def install_gateway_push_card_adapter_capture() -> None:
 def ensure_push_card_adapter_patches_armed(adapter: Any) -> None:
     """Re-arm the inbound matcher / confirm patches against the LIVE adapter and
     stash it for proactive sends. Called on every gateway dispatch (cheap once
-    armed — each install returns immediately on its ``_HOOK_INSTALLED`` guard).
+    armed — each ``_patch_*`` returns immediately on the per-function marker it
+    reads off the class it is about to patch).
 
     register() installs these once, but if the runtime FeishuAdapter class was
     not importable at that moment (``load_feishu_adapter`` deferred) the install
