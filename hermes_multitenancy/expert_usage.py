@@ -77,7 +77,16 @@ def counts(db_path: Path | None = None) -> dict[str, int]:
             rows = conn.execute("SELECT expert_id, use_count FROM expert_usage").fetchall()
         finally:
             conn.close()
-        return {str(r[0]): int(r[1]) for r in rows}
+        out: dict[str, int] = {}
+        for r in rows:
+            # one dirty row (NULL / non-int) must not blank the whole map
+            try:
+                eid = str(r[0] or "").strip()
+                if eid:
+                    out[eid] = int(r[1] or 0)
+            except Exception:
+                continue
+        return out
     except Exception:
         logger.debug("[multitenancy] expert_usage counts read failed", exc_info=True)
         return {}

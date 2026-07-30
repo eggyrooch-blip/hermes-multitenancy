@@ -3873,7 +3873,10 @@ async def _run_aiagent_subprocess(
             retryable=data.get("retryable"),
         )
     _write_token_ledger_from_child(event, profile_home, data.get("usage"))
-    _bump_expert_usage_from_event(event)
+    try:  # shim injects the name (agent_real/__init__ step-2); guard even NameError
+        _bump_expert_usage_from_event(event)
+    except Exception:
+        logger.debug("[multitenancy] expert usage bump call failed", exc_info=True)
     return str(data.get("result") or "")
 
 

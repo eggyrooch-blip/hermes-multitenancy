@@ -2499,9 +2499,19 @@ def create_run_broker_app(
                 profile_home,
                 department_ids=department_ids,
             )
-            usage = await asyncio.to_thread(expert_usage.counts)
+            # usage merge is strictly best-effort: any failure here must still
+            # return the catalog (rows default to use_count=0)
+            try:
+                usage = await asyncio.to_thread(expert_usage.counts)
+            except Exception:
+                logger.debug("[multitenancy] expert usage counts failed", exc_info=True)
+                usage = {}
             for row in experts:
-                row["use_count"] = int(usage.get(str(row.get("id")), 0))
+                try:
+                    if isinstance(row, dict):
+                        row["use_count"] = int(usage.get(str(row.get("id")), 0))
+                except Exception:
+                    row["use_count"] = 0
             return web.json_response({"profile_name": profile_name, "experts": experts})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)

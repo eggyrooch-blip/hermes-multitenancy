@@ -714,7 +714,10 @@ async def _stream_aiagent_subprocess(
                 _mirror.retag_source()
                 _mirror.dedupe()
                 _write_token_ledger_from_child(event, profile_home, data.get("usage"))
-                _bump_expert_usage_from_event(event)
+                try:  # shim injects the name (agent_real/__init__ step-2); guard even NameError
+                    _bump_expert_usage_from_event(event)
+                except Exception:
+                    logger.debug("expert usage bump call failed", exc_info=True)
                 yield "done", _strip_empty_message_protocol_placeholder(raw_done_text)
                 continue
             if event_name == "content":

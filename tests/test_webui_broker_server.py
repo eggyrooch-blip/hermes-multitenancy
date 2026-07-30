@@ -4937,3 +4937,82 @@ def test_connectors_handler_maps_fresh_query_to_use_cache(monkeypatch, tmp_path)
 
     asyncio.run(runner())
     assert captured == [True, False]  # cached by default; fresh=1 bypasses
+
+
+def test_webui_experts_endpoint_always_carries_use_count(monkeypatch, tmp_path: Path):
+    """SPEC contract: every experts row has int use_count; bumped id shows N,
+    unmatched catalog experts 0; usage failure still returns the catalog."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import expert_overlay, expert_usage
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="root-owner",
+        profile_name="owner_sync_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    usage_db = tmp_path / "usage.db"
+    assert expert_usage.bump("kep-a", usage_db)
+    assert expert_usage.bump("kep-a", usage_db)
+    monkeypatch.setattr(expert_usage, "DEFAULT_DB_PATH", usage_db)
+
+    monkeypatch.setattr(
+        expert_overlay,
+        "resolve_caller_departments",
+        lambda *_a, **_k: [],
+    )
+    monkeypatch.setattr(
+        expert_overlay,
+        "list_experts",
+        lambda *_a, **_k: [
+            {"id": "kep-a", "name": "A", "release_version": "1.0.9"},
+            {"id": "kep-b", "name": "B"},
+        ],
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        try:
+            app = create_run_broker_app(
+                mark_seen=lambda _request: True,
+                sandbox_available=lambda: True,
+            )
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            try:
+                headers = {"X-Hermes-Owner-Open-Id": "ou_owner"}
+                ok = await client.get("/api/run-broker/experts", headers=headers)
+                ok_body = await ok.json()
+
+                # usage read failure → catalog still served with use_count 0
+                monkeypatch.setattr(
+                    expert_usage,
+                    "counts",
+                    lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+                )
+                degraded = await client.get("/api/run-broker/experts", headers=headers)
+                degraded_body = await degraded.json()
+            finally:
+                await client.close()
+        finally:
+            router_mod.override_routing_table(None)
+
+        assert ok.status == 200
+        rows = {r["id"]: r for r in ok_body["experts"]}
+        assert rows["kep-a"]["use_count"] == 2
+        assert rows["kep-a"]["release_version"] == "1.0.9"
+        assert rows["kep-b"]["use_count"] == 0
+        assert all("agent_md" not in r for r in ok_body["experts"])
+
+        assert degraded.status == 200
+        assert all(r["use_count"] == 0 for r in degraded_body["experts"])
+
+    asyncio.run(runner())
