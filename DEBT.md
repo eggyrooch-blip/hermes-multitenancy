@@ -42,6 +42,13 @@ journal 两次都是 `Stopping → exited status=1/FAILURE → Started`。原猜
 **已核实与本 slug 无关**:在干净 `origin/main`(32db743,零本地改动)上全量跑 3 次,第 2 次同样红。
 会间歇卡住 ftask TEST 闸,建议单独立项查 monkeypatch/adapter 的 teardown 顺序。
 
+> **2026-07-30 已关闭(slug `test-timing-flakes-fix` 复核)**:不是跨测试污染,是真竞态——
+> `RoutingTable` 的 sqlite 连接以 `check_same_thread=False` 无锁共享,billing 工作线程
+> (`prepare_billing_request` → `asyncio.to_thread`)与事件循环线程同时 step 同一份缓存
+> prepared statement → `sqlite3.InterfaceError`,被 `except Exception` 吞掉后才在 423 行
+> 触到桩 adapter 没有的 `send`。已由 `2a64a7f`(routing.py `@_serialized` RLock)根治。
+> 复核证据:16 路 CPU 负载下 `tests/test_hook_dispatch.py` ×20 全绿(该用例 0 失败)。
+
 **D3 — 非流式路径(`agent_real/_core.py:3826/3845`)仍会拼 stderr 尾巴**
 本次只改了流式 `agent_real/streaming.py` 的抛错点(SPEC 限定最小面)。`_run_aiagent_subprocess`
 (飞书/cron 走的非流式路径)同样把 stderr 尾巴拼进用户可见错误;且信号死时 stdout 为空,

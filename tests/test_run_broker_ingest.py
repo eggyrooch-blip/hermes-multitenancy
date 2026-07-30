@@ -2058,6 +2058,12 @@ def test_ingest_sync_pre_admission_timeout_keeps_claim_until_shared_task_stops(
     monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
     monkeypatch.setenv("HERMES_INGEST_KEY", "testkey")
     monkeypatch.setenv("HERMES_INGEST_PROFILE", "owner")
+    # Only the FIRST request is supposed to time out, and it does so
+    # deterministically: its ``prepare`` blocks on an event that is never set,
+    # so any positive timeout fires. The handler re-reads HERMES_INGEST_TIMEOUT
+    # per request, so the later requests — which must SUCCEED — get a generous
+    # bound instead of racing a 20ms wall clock (that race is the whole flake:
+    # under load the retry's full round trip exceeds 20ms and returns 504).
     monkeypatch.setenv("HERMES_INGEST_TIMEOUT", "0.02")
 
     app = server_mod.create_run_broker_app(
@@ -2082,6 +2088,7 @@ def test_ingest_sync_pre_admission_timeout_keeps_claim_until_shared_task_stops(
                 headers=headers,
             )
             timed_out_body = await timed_out.json()
+            monkeypatch.setenv("HERMES_INGEST_TIMEOUT", "60")
             await asyncio.wait_for(prepare_cancelled.wait(), timeout=1)
 
             mismatch = await client.post(

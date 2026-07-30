@@ -1383,6 +1383,9 @@ async def test_hook_schedules_background_task():
         # Track adapter calls so we can verify the task ran
         send_typing_calls = []
         send_calls = []
+        # ``send`` is the last adapter call of the background loop, so this
+        # event — not a wall-clock sleep — is what "the task finished" means.
+        replied = asyncio.Event()
 
         class MockAdapter:
             async def send_typing(self, chat_id):
@@ -1390,6 +1393,7 @@ async def test_hook_schedules_background_task():
 
             async def send(self, chat_id, content, *, reply_to=None, metadata=None):
                 send_calls.append((chat_id, content))
+                replied.set()
 
         gateway = SimpleNamespace(adapters={"feishu": MockAdapter()})
 
@@ -1404,8 +1408,9 @@ async def test_hook_schedules_background_task():
         after = len(asyncio.all_tasks())
         assert after > before, f"expected >1 task scheduled (before={before}, after={after})"
 
-        # Let the task run
-        await asyncio.sleep(0.05)
+        # Let the task run. Wait on the task's own completion signal; a fixed
+        # sleep loses the race whenever the machine is loaded.
+        await asyncio.wait_for(replied.wait(), timeout=10)
 
         # Adapter should have received both calls (full loop runs)
         assert len(send_typing_calls) == 1
