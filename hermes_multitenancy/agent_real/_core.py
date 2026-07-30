@@ -3709,6 +3709,19 @@ def _install_session_search_recall_db_proxy(aiagent_cls: Any) -> None:
     aiagent_cls._get_session_db_for_recall = _get_session_db_for_recall
 
 
+def _bump_expert_usage_from_event(event: Any) -> None:
+    """专家使用计数(所有渠道每 run 一次, sunke 2026-07-30 口径) — 父进程 best-effort."""
+    try:
+        expert_id = _expert_id_for_event(event)
+        if not expert_id:
+            return
+        from ..expert_usage import bump
+
+        bump(expert_id)
+    except Exception:
+        logger.debug("[multitenancy] expert usage bump failed", exc_info=True)
+
+
 def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -> None:
     """工件1a：父进程侧写 token 台账（子进程沙箱不能写 /var/log/hermes）。
 
@@ -3860,6 +3873,7 @@ async def _run_aiagent_subprocess(
             retryable=data.get("retryable"),
         )
     _write_token_ledger_from_child(event, profile_home, data.get("usage"))
+    _bump_expert_usage_from_event(event)
     return str(data.get("result") or "")
 
 

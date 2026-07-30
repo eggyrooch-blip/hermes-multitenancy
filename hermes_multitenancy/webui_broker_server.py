@@ -2478,6 +2478,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         from . import expert_overlay
+        from . import expert_usage
 
         try:
             profile_name, user_key = _owner_scoped_tenant(request)
@@ -2498,6 +2499,9 @@ def create_run_broker_app(
                 profile_home,
                 department_ids=department_ids,
             )
+            usage = await asyncio.to_thread(expert_usage.counts)
+            for row in experts:
+                row["use_count"] = int(usage.get(str(row.get("id")), 0))
             return web.json_response({"profile_name": profile_name, "experts": experts})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)

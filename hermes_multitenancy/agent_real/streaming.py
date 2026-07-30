@@ -714,6 +714,7 @@ async def _stream_aiagent_subprocess(
                 _mirror.retag_source()
                 _mirror.dedupe()
                 _write_token_ledger_from_child(event, profile_home, data.get("usage"))
+                _bump_expert_usage_from_event(event)
                 yield "done", _strip_empty_message_protocol_placeholder(raw_done_text)
                 continue
             if event_name == "content":
