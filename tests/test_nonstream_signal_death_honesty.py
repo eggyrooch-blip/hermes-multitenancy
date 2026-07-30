@@ -151,6 +151,39 @@ async def test_signal_death_after_result_delivered_keeps_the_turn(
     )
 
 
+@pytest.mark.parametrize("payload", ["null", "[]", '"half-written"'])
+@pytest.mark.asyncio
+async def test_signal_death_with_non_object_json_never_falls_back(
+    monkeypatch, tmp_path: Path, payload: str
+):
+    """F002: valid JSON that isn't an object used to AttributeError into legacy.
+
+    A half-written stdout can still parse (``null``, ``[]``, a bare string).
+    Every ``.get`` below the parse then raised ``AttributeError``, which
+    ``real_run_agent``'s catch-all converted into a legacy re-run — double tool
+    side effects, double spend, and the restart hidden from the user.
+    """
+    from hermes_multitenancy import agent_real
+
+    _install_fake_proc(
+        monkeypatch,
+        stdout=payload.encode("utf-8"),
+        stderr=_STALE_STDERR.encode("utf-8"),
+        returncode=-15,
+    )
+
+    async def legacy_must_not_run(event, profile_home, messages=None):
+        raise AssertionError("legacy runner must not answer an interrupted turn")
+
+    monkeypatch.setattr(agent_real, "_legacy_real_run_agent", legacy_must_not_run)
+
+    with pytest.raises(agent_real.GatewayRestartInterruptedError) as excinfo:
+        await agent_real.real_run_agent(_event(), tmp_path)
+
+    assert "网关重启" in str(excinfo.value) and "信号 15" in str(excinfo.value)
+    assert "Encrypted reasoning replay" not in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 async def test_true_crash_invalid_json_message_unchanged(monkeypatch, tmp_path: Path):
     """returncode > 0 with unparseable stdout → the old diagnostic, verbatim."""

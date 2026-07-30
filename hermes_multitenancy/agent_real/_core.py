@@ -3888,6 +3888,16 @@ async def _run_aiagent_subprocess(
     # bug that did not exist). Full stderr stays in the log.
     signal_death = proc.returncode is not None and proc.returncode < 0
 
+    def _warn_signal_death(what: str) -> None:
+        logger.warning(
+            "[multitenancy] AIAgent subprocess killed by signal %s %s (gateway "
+            "restart/shutdown kills in-flight runs); the full stderr below is "
+            "stale output, NOT the cause of death: %s",
+            -proc.returncode,
+            what,
+            redacted_stderr_text or "<empty>",
+        )
+
     try:
         data = json.loads(stdout_text)
     except json.JSONDecodeError as exc:
@@ -3896,19 +3906,24 @@ async def _run_aiagent_subprocess(
             # JSON, so stdout is empty and the invalid-JSON diagnostic below used
             # to fire first — blaming the child's protocol for a death it had no
             # part in, stale stderr quoted as evidence.
-            logger.warning(
-                "[multitenancy] AIAgent subprocess killed by signal %s before "
-                "delivering its result (gateway restart/shutdown kills in-flight "
-                "runs); the full stderr below is stale output, NOT the cause of "
-                "death: %s",
-                -proc.returncode,
-                redacted_stderr_text or "<empty>",
-            )
+            _warn_signal_death("before delivering its result")
             raise _gateway_restart_interrupted(-proc.returncode) from exc
         raise RuntimeError(
             "AIAgent subprocess returned invalid JSON "
             f"(exit={proc.returncode}, stdout={redacted_stdout_text[-1000:]!r}, stderr={redacted_stderr_text[-1000:]!r})"
         ) from exc
+
+    if signal_death and not isinstance(data, dict):
+        # Valid JSON that isn't an object (``null`` / ``[]`` / a bare string) is
+        # not a result report either — a half-written stdout can still parse.
+        # Without this guard every ``.get`` below raises AttributeError, and
+        # real_run_agent's catch-all turns that into a legacy re-run: double
+        # tool side effects, double spend, restart hidden. Same honest error as
+        # the empty-stdout shape above.
+        _warn_signal_death(
+            f"leaving a non-object result payload ({type(data).__name__})"
+        )
+        raise _gateway_restart_interrupted(-proc.returncode)
 
     failure_subsystem = data.get("failure_subsystem")
     error_code = data.get("error_code")
@@ -3928,14 +3943,10 @@ async def _run_aiagent_subprocess(
         # keep the answer rather than throwing it away for an exit code. If it
         # arrived empty (or the run failed), the signal is still the honest
         # cause — never the stderr tail the branch below would quote.
-        logger.warning(
-            "[multitenancy] AIAgent subprocess killed by signal %s AFTER "
-            "delivering its result JSON (result=%s chars, carried_error=%s); the "
-            "full stderr below is stale output, NOT the cause of death: %s",
-            -proc.returncode,
-            len(str(data.get("result") or "")),
-            bool(data.get("error")),
-            redacted_stderr_text or "<empty>",
+        _warn_signal_death(
+            "AFTER delivering its result JSON "
+            f"(result={len(str(data.get('result') or ''))} chars, "
+            f"carried_error={bool(data.get('error'))})"
         )
         if not str(data.get("result") or "").strip():
             raise _gateway_restart_interrupted(-proc.returncode)
