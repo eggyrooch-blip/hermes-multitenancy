@@ -20,8 +20,10 @@ Read/write contract (per design D6 in review v2 + group-profile extension):
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -361,6 +363,31 @@ LEFT JOIN multitenancy_principals p
 """
 
 
+def _serialized(method):
+    """Hold the table's RLock for the whole method — one connection, many threads.
+
+    ``check_same_thread=False`` lets several threads share this connection, and
+    they do: the gateway event loop reads routes inline while
+    ``billing_identity.prepare_billing_request`` resolves the payer on an
+    ``asyncio.to_thread`` worker. CPython's sqlite3 caches prepared statements
+    per connection, so two threads running the SAME sql step/reset the same
+    ``sqlite3_stmt`` and sqlite raises ``InterfaceError: bad parameter or other
+    API misuse``. Same RLock pattern ``SessionStore`` already uses.
+
+    Locked per whole method (not per statement) so a cursor is always drained by
+    the thread that opened it. ponytail: that means a write which blocks on the
+    cross-process credential flock also parks other threads' reads for the flock
+    timeout — go per-statement + explicit transactions if that ever bites.
+    """
+
+    @functools.wraps(method)
+    def _locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return _locked
+
+
 class RoutingTable:
     """SQLite-backed routing table.
 
@@ -373,9 +400,12 @@ class RoutingTable:
         self.db_path = str(db_path) if db_path is not None else str(DEFAULT_DB_PATH)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        # Reentrant: @_serialized methods call each other (e.g. __init__ →
+        # _migrate, upsert → lookup_*).
+        self._lock = threading.RLock()
         # check_same_thread=False so the same connection survives across the
-        # asyncio task switches that the plugin does. SQLite operations are
-        # short and serial within a single dispatch.
+        # asyncio task switches that the plugin does. Every connection touch
+        # goes through @_serialized so the threads sharing it never interleave.
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript("PRAGMA journal_mode=WAL;")
@@ -389,6 +419,7 @@ class RoutingTable:
         self._migrate()
         self._conn.commit()
 
+    @_serialized
     def _active_user_identity(self, user_id: str) -> tuple[str, str] | None:
         row = self._conn.execute(
             "SELECT profile_name, open_id FROM multitenancy_routing "
@@ -433,6 +464,7 @@ class RoutingTable:
                     raise
             yield
 
+    @_serialized
     def _migrate(self) -> None:
         """Bring an older DB up to the current schema. Safe to call repeatedly."""
         cur = self._conn.execute("PRAGMA table_info(multitenancy_routing)")
@@ -536,6 +568,7 @@ class RoutingTable:
 
     # -- read path (router) -----------------------------------------------
 
+    @_serialized
     def lookup_by_open_id(self, open_id: str) -> Optional[RoutingRow]:
         """Return the active user row for open_id, or None if missing.
 
@@ -551,6 +584,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    @_serialized
     def lookup_by_union_id(self, union_id: str) -> Optional[RoutingRow]:
         """Return the active user row whose union_id column matches."""
         cur = self._conn.execute(
@@ -561,6 +595,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    @_serialized
     def lookup_users_by_union_id(self, union_id: str) -> list[RoutingRow]:
         """Return every active sync-owned user row for union_id."""
         cur = self._conn.execute(
@@ -571,6 +606,7 @@ class RoutingTable:
         )
         return [_row_to_dataclass(row) for row in cur.fetchall()]
 
+    @_serialized
     def lookup_by_user_id(self, user_id: str) -> Optional[RoutingRow]:
         """Return the active row by tenant user_id (PRIMARY KEY).
 
@@ -629,6 +665,7 @@ class RoutingTable:
             route_version=int(row.version),
         )
 
+    @_serialized
     def lookup_agent(self, agent_id: str) -> Optional[RoutingRow]:
         """Return the active row for a stable agent_id, or None if missing.
 
@@ -643,6 +680,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    @_serialized
     def lookup_by_profile_name(self, profile_name: str) -> Optional[RoutingRow]:
         """Return the active row that owns ``profile_name``, if any."""
         cur = self._conn.execute(
@@ -654,6 +692,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    @_serialized
     def lookup_by_chat_id(self, chat_id: str) -> Optional[RoutingRow]:
         """Return the active group row for chat_id, or None if missing.
 
@@ -668,6 +707,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    @_serialized
     def resolve_owner_root(self, open_id: str) -> Optional[RoutingRow]:
         """Return the deterministic sync-root user row for a login open_id.
 
@@ -683,6 +723,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _row_to_dataclass(row) if row else None
 
+    @_serialized
     def list_by_owner(
         self, owner_open_id: str, *, kind: str | None = None
     ) -> list[RoutingRow]:
@@ -711,6 +752,7 @@ class RoutingTable:
         """
         return self.list_by_owner(open_id, kind=None)
 
+    @_serialized
     def touch_active(self, open_id: str) -> None:
         """Update last_active_at — router-only, does NOT bump version."""
         self._conn.execute(
@@ -720,6 +762,7 @@ class RoutingTable:
         )
         self._conn.commit()
 
+    @_serialized
     def touch_active_group(self, chat_id: str) -> None:
         """Update last_active_at for a group row — does NOT bump version."""
         self._conn.execute(
@@ -729,6 +772,7 @@ class RoutingTable:
         )
         self._conn.commit()
 
+    @_serialized
     def put_pending_inviter(
         self,
         chat_id: str,
@@ -758,6 +802,7 @@ class RoutingTable:
         )
         self._conn.commit()
 
+    @_serialized
     def get_pending_inviter(self, chat_id: str) -> Optional[str]:
         """Return the raw stored inviter_open_id for ``chat_id``, if any.
 
@@ -773,6 +818,7 @@ class RoutingTable:
         row = cur.fetchone()
         return str(row["inviter_open_id"]) if row is not None else None
 
+    @_serialized
     def get_pending_inviter_union_id(self, chat_id: str) -> Optional[str]:
         """Return the raw stored inviter_union_id for ``chat_id``, if any."""
         cur = self._conn.execute(
@@ -786,6 +832,7 @@ class RoutingTable:
         value = row["inviter_union_id"]
         return str(value) if value else None
 
+    @_serialized
     def clear_pending_inviter(self, chat_id: str) -> None:
         """Delete a pending inviter hand-off row for ``chat_id`` if present."""
         self._conn.execute(
@@ -794,6 +841,7 @@ class RoutingTable:
         )
         self._conn.commit()
 
+    @_serialized
     def prune_pending_inviters(self, now: int, ttl_seconds: int) -> int:
         """Delete expired pending inviter rows and return how many were removed."""
         cur = self._conn.execute(
@@ -806,6 +854,7 @@ class RoutingTable:
 
     # -- write path (feishu-sync) ----------------------------------------
 
+    @_serialized
     def upsert(
         self,
         *,
@@ -872,6 +921,7 @@ class RoutingTable:
             f"route identity kept changing for user_id={user_id}"
         )
 
+    @_serialized
     def upsert_group(
         self,
         *,
@@ -968,6 +1018,7 @@ class RoutingTable:
         self._conn.commit()
         return synthetic_user_id
 
+    @_serialized
     def upsert_owned_agent(
         self,
         *,
@@ -1048,6 +1099,7 @@ class RoutingTable:
         self._conn.commit()
         return agent_id
 
+    @_serialized
     def update_display_label(self, chat_id: str, display_label: str) -> bool:
         """Refresh a group row's display_label (e.g. after group rename).
 
@@ -1062,6 +1114,7 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_serialized
     def get_group_reply_mode(self, chat_id: str) -> str:
         """Return the per-group reply mode ('mention' | 'all'), default 'mention'.
 
@@ -1080,6 +1133,7 @@ class RoutingTable:
             return mode
         return _DEFAULT_REPLY_MODE
 
+    @_serialized
     def set_group_reply_mode(self, chat_id: str, mode: str) -> None:
         """Upsert the per-group reply mode. Works before the group routing row
         exists (owner can flip it from the welcome card right after bot-added).
@@ -1099,6 +1153,7 @@ class RoutingTable:
 
     # -- agent sharing ----------------------------------------------------
 
+    @_serialized
     def upsert_principal(
         self,
         *,
@@ -1188,6 +1243,7 @@ class RoutingTable:
         self._conn.commit()
         return principal
 
+    @_serialized
     def find_principal(
         self,
         *,
@@ -1210,6 +1266,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _principal_row_to_dataclass(row) if row else None
 
+    @_serialized
     def lookup_principal(self, principal_id: str) -> Optional[PrincipalRow]:
         principal_id = (principal_id or "").strip()
         if not principal_id:
@@ -1221,6 +1278,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _principal_row_to_dataclass(row) if row else None
 
+    @_serialized
     def upsert_principal_alias(
         self,
         *,
@@ -1252,6 +1310,7 @@ class RoutingTable:
             (provider, tenant_key, id_type, id_value, app_id, principal_id, now, now),
         )
 
+    @_serialized
     def lookup_principal_by_alias(
         self,
         *,
@@ -1285,6 +1344,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _principal_row_to_dataclass(row) if row else None
 
+    @_serialized
     def grant_agent_share(
         self,
         *,
@@ -1344,6 +1404,7 @@ class RoutingTable:
             raise RuntimeError("agent share grant did not persist")
         return share
 
+    @_serialized
     def grant_agent_share_principal(
         self,
         *,
@@ -1410,6 +1471,7 @@ class RoutingTable:
             raise RuntimeError("agent principal share grant did not persist")
         return share
 
+    @_serialized
     def lookup_agent_share(
         self, agent_id: str, grantee_open_id: str
     ) -> Optional[AgentShareRow]:
@@ -1424,6 +1486,7 @@ class RoutingTable:
         row = cur.fetchone()
         return _agent_share_row_to_dataclass(row) if row else None
 
+    @_serialized
     def lookup_agent_share_by_principal(
         self, agent_id: str, grantee_principal_id: str
     ) -> Optional[AgentShareRow]:
@@ -1454,6 +1517,7 @@ class RoutingTable:
             return None
         return share.role
 
+    @_serialized
     def list_agent_shares(
         self, agent_id: str, *, active_only: bool = True
     ) -> list[AgentShareRow]:
@@ -1469,6 +1533,7 @@ class RoutingTable:
         cur = self._conn.execute(sql, params)
         return [_agent_share_row_to_dataclass(row) for row in cur.fetchall()]
 
+    @_serialized
     def list_shared_agents_for_actor(self, open_id: str) -> list[SharedAgentRow]:
         open_id = (open_id or "").strip()
         if not open_id:
@@ -1545,6 +1610,7 @@ class RoutingTable:
             rows.append(SharedAgentRow(route=route, share=share))
         return rows
 
+    @_serialized
     def list_shared_agents_for_principal(self, principal_id: str) -> list[SharedAgentRow]:
         principal_id = (principal_id or "").strip()
         if not principal_id:
@@ -1627,6 +1693,7 @@ class RoutingTable:
             rows.append(SharedAgentRow(route=route, share=share))
         return rows
 
+    @_serialized
     def revoke_agent_share(self, agent_id: str, grantee_open_id: str) -> bool:
         agent_id = (agent_id or "").strip()
         grantee_open_id = (grantee_open_id or "").strip()
@@ -1644,6 +1711,7 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_serialized
     def revoke_agent_share_by_id(self, agent_id: str, share_id: str) -> bool:
         agent_id = (agent_id or "").strip()
         share_id = (share_id or "").strip()
@@ -1661,6 +1729,7 @@ class RoutingTable:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_serialized
     def soft_delete(self, user_id: str) -> bool:
         """Mark a route as inactive (kind-agnostic). Returns True on update."""
         for attempt in range(_ROUTE_IDENTITY_RETRY_LIMIT):
@@ -1700,6 +1769,7 @@ class RoutingTable:
 
     # -- diagnostics -------------------------------------------------------
 
+    @_serialized
     def count_active(
         self, *, kind: Optional[str] = None, provenance: Optional[str] = None
     ) -> int:
@@ -1717,6 +1787,7 @@ class RoutingTable:
         )
         return int(cur.fetchone()[0])
 
+    @_serialized
     def close(self) -> None:
         self._conn.close()
 

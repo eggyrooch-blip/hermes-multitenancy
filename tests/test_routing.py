@@ -1174,3 +1174,48 @@ def test_us03_scale_idempotency_1300_rows(tmp_path):
     second_snapshot = _snapshot_rows(db_path)
 
     assert second_snapshot == first_snapshot
+
+
+def test_shared_connection_survives_concurrent_threads(table):
+    """One RoutingTable, two threads: the billing payer resolver runs routing
+    lookups on an ``asyncio.to_thread`` worker while the gateway event loop
+    reads/writes the same table. Unserialized, the two threads step and reset
+    the same cached ``sqlite3_stmt`` and sqlite raises
+    ``InterfaceError: bad parameter or other API misuse`` (the intermittent red
+    behind test_concurrent_uploaded_files_keep_profile_and_prompt_isolated)."""
+    table.upsert(user_id="u_race", profile_name="racer", open_id="ou_race", union_id="on_race")
+    assert table.lookup_by_open_id("ou_race").last_active_at is None
+    errors: list[BaseException] = []
+    # All four threads meet here, so they contend inside one window instead of
+    # running back-to-back and passing on timing alone.
+    start = threading.Barrier(4, timeout=30)
+
+    def read():
+        try:
+            start.wait()
+            for _ in range(1200):
+                assert table.lookup_by_profile_name("racer") is not None
+                assert table.lookup_by_open_id("ou_race") is not None
+        except BaseException as exc:  # pragma: no cover - only on regression
+            errors.append(exc)
+
+    def write():
+        try:
+            start.wait()
+            for _ in range(1200):
+                # open_id, not user_id: touch_active matches on open_id, so the
+                # user_id would silently UPDATE zero rows and never write.
+                table.touch_active("ou_race")
+        except BaseException as exc:  # pragma: no cover - only on regression
+            errors.append(exc)
+
+    threads = [threading.Thread(target=read) for _ in range(3)]
+    threads.append(threading.Thread(target=write))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    # The writer really wrote — otherwise the "write" thread was only reading.
+    assert table.lookup_by_open_id("ou_race").last_active_at is not None
