@@ -52,6 +52,19 @@ def log_feishu_adapter_load_error(logger: Any, message: str, exc: BaseException)
         logger.warning("%s: %s", message, exc, exc_info=True)
 
 
+def is_executor_shutdown_error(exc: BaseException) -> bool:
+    """True for the fatal ``RuntimeError`` raised once the process is tearing down.
+
+    ``loop.run_in_executor`` / ``asyncio.to_thread`` raise this the moment the
+    SDK executor (or the interpreter itself) has been shut down; both wordings
+    ("after shutdown" and "after interpreter shutdown") share the same prefix.
+    Nothing can be sent from this process again, so retrying is always futile —
+    the send-retry loop must give up immediately instead of paying 1s + 2s of
+    backoff per chat (prod 2026-07-30: 4-minute SIGTERM→SIGKILL hang).
+    """
+    return isinstance(exc, RuntimeError) and "cannot schedule new futures" in str(exc)
+
+
 def load_feishu_module() -> ModuleType:
     # The plugin-loader's synthetic module wins when present: it is the
     # adapter the gateway actually runs. (For the legacy names below a plain

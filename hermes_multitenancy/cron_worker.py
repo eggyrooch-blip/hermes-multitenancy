@@ -125,6 +125,7 @@ _LIVE_STATE_OWNERS = {
     "_worker_thread": _patches,
     "_worker_stop": _patches,
     "_gateway_watcher_installed": _patches,
+    "_gateway_ref": _patches,
     "_cron_module_patch_lock": _orchestrator,
     "_cron_in_flight_lock": _orchestrator,
 }
@@ -186,6 +187,7 @@ def install_cron_runtime_patches() -> None:
     _patch_scheduler_owner_open_id_delivery()
     _patch_cron_delivery_mirror()
     _patch_feishu_open_id_send()
+    _patch_feishu_send_retry_shutdown_fatal()
     _patch_feishu_outbound_link_render()
     install_feishu_inbound_richtext_patch()
     from .feishu_merge_forward_api import install_feishu_merge_forward_api_patch

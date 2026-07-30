@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 import copy
+import weakref
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from types import SimpleNamespace
@@ -43,7 +44,12 @@ except ImportError:  # pragma: no cover - non-Windows
 
 from .. import cron_worker as _cw
 from ..feishu_inbound_richtext import install_feishu_inbound_richtext_patch
-from ..feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
+from ..feishu_adapter_compat import (
+    is_executor_shutdown_error,
+    load_feishu_adapter,
+    load_feishu_module,
+    log_feishu_adapter_load_error,
+)
 from .. import gateway_ownership
 
 # Keep the historical logger name so log records are attributed to
@@ -61,6 +67,34 @@ _worker_stop: Optional[threading.Event] = None
 # shim — not here — to keep single-owner semantics for the reassigned flag.
 _gateway_watcher_installed = False
 _watcher_attr = "_hermes_multitenancy_cron_watch_scheduled"
+# Weak handle on the live GatewayRunner, remembered on the paths that already
+# receive it, so shutdown-sensitive code can read core's own ``_draining`` flag
+# instead of tracking teardown state itself. Reassigned → proxied live through
+# the cron_worker shim (_LIVE_STATE_OWNERS), never snapshot-copied.
+_gateway_ref: "Optional[weakref.ref[Any]]" = None
+
+
+def _remember_gateway(gateway: Any) -> None:
+    global _gateway_ref
+    try:
+        _gateway_ref = weakref.ref(gateway)
+    except TypeError:  # pragma: no cover - non-weakrefable double
+        _gateway_ref = None
+
+
+def gateway_is_shutting_down() -> bool:
+    """True once the gateway entered teardown (``stop()`` sets ``_draining``).
+
+    Core flips ``_draining`` at the top of ``_stop_impl`` — before the drain,
+    adapter disconnect and executor teardown — and back to False only after
+    "Gateway stopped". Unknown gateway → False (fail-open: never suppress a
+    delivery just because we lost the handle).
+    """
+    ref = _gateway_ref
+    gateway = ref() if ref is not None else None
+    if gateway is None:
+        return False
+    return bool(getattr(gateway, "_draining", False))
 
 
 def ensure_cron_worker_started(gateway: Any) -> None:
@@ -71,6 +105,7 @@ def ensure_cron_worker_started(gateway: Any) -> None:
     layout (``<root>/profiles/<name>``).
     """
     global _worker_started, _worker_thread, _worker_stop
+    _remember_gateway(gateway)
     if _worker_started:
         return
     with _worker_lock:
@@ -182,6 +217,7 @@ def install_gateway_startup_watcher() -> None:
 
 
 def _schedule_startup_watch(gateway: Any) -> None:
+    _remember_gateway(gateway)
     if gateway_ownership.is_router_profile_runtime():
         try:
             from ..webui_broker_server import ensure_run_broker_server_started
@@ -312,6 +348,20 @@ def _patch_cron_delivery_mirror() -> None:
 
     @functools.wraps(original)
     def deliver_result(job: dict, content: str, adapters: Any = None, loop: Any = None) -> Optional[str]:
+        # Once the gateway is draining, every Feishu send is doomed (the SDK
+        # executor is going away) and each attempt still pays the retry tax —
+        # that is how prod 2026-07-30 logged "delivery error: Feishu send
+        # failed: cannot schedule new futures after interpreter shutdown" while
+        # the process hung for 4 minutes. Skip the send and report a delivery
+        # error so mark_job_run records the miss instead of silently claiming
+        # the result was delivered.
+        if _cw.gateway_is_shutting_down():
+            logger.info(
+                "[multitenancy] cron delivery skipped during gateway shutdown job=%s",
+                job.get("id", "?"),
+            )
+            return "cron delivery skipped: gateway is shutting down"
+
         # Deliver Feishu cron output as a STREAMING CardKit card (same UX as a
         # normal agent reply: streaming print + rendered markdown + Done footer)
         # before core falls back to flattened plain text. Only when every target
@@ -413,6 +463,140 @@ def _patch_feishu_open_id_send() -> None:
     setattr(send_raw_message, "_hermes_multitenancy_patched", True)
     FeishuAdapter._send_raw_message = send_raw_message
     logger.info("[multitenancy] patched Feishu delivery for user open_id targets")
+
+
+_SEND_RETRY_KWARGS = frozenset({"chat_id", "msg_type", "payload", "reply_to", "metadata"})
+
+
+def _patch_feishu_send_retry_shutdown_fatal() -> None:
+    """Stop the Feishu send-retry loop from retrying process-teardown errors.
+
+    Core's ``_feishu_send_with_retry`` treats every exception as transient and
+    sleeps 1s then 2s before giving up on attempt 3. Once the interpreter / SDK
+    executor is shut down, every send raises ``RuntimeError: cannot schedule new
+    futures after …shutdown`` — fatal and unrecoverable — so the loop burned ~3s
+    per chat and, serialized over the chats with live sessions, held the process
+    open for 4 minutes until systemd SIGKILLed it (prod 2026-07-30
+    18:00:11→18:04:11, teardown itself took 0.91s).
+
+    This REPLACES the loop instead of wrapping it: the retry decision lives
+    inside core's ``except`` block and there is no seam to hook from outside.
+    Everything else mirrors core, including the two escape branches
+    (post-content-invalid, withdrawn-reply fallback) and the exact
+    "[Feishu] Send attempt …" wording ops greps for. The tunables are read from
+    the runtime adapter module on every call so core retuning still applies.
+
+    ponytail: a fork of ~30 core lines is the ceiling here. If core grows a
+    parameter or an ``_is_retryable`` seam, this delegates to the original and
+    warns (see the call-shape check) rather than mirroring stale logic — upgrade
+    path is to drop this patch and use the core seam.
+    """
+    try:
+        # ONE resolution for both, so the patched class and the module we read
+        # the tunables from can never come from different copies of the adapter
+        # source (the double-import trap: the plugin loader's synthetic module vs
+        # ``plugins.platforms.feishu.adapter``).
+        adapter_module = load_feishu_module()
+        FeishuAdapter = getattr(adapter_module, "FeishuAdapter")
+    except Exception as exc:
+        log_feishu_adapter_load_error(
+            logger,
+            "[multitenancy] FeishuAdapter not importable yet; send retry shutdown patch deferred",
+            exc,
+        )
+        return
+
+    original = getattr(FeishuAdapter, "_feishu_send_with_retry", None)
+    if original is None or getattr(original, "_hermes_multitenancy_send_retry_fatal_patched", False):
+        return
+
+    @functools.wraps(original)
+    async def feishu_send_with_retry(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Never assume the core signature: anything we don't recognise goes
+        # straight to the original (2026-07-21 cron run_job taught us what a
+        # hard-coded signature costs).
+        if args or not _SEND_RETRY_KWARGS.issuperset(kwargs) or "chat_id" not in kwargs:
+            logger.warning(
+                "[multitenancy] unexpected _feishu_send_with_retry call shape %r; "
+                "using core retry loop (shutdown fast-fail inactive)",
+                sorted(kwargs),
+            )
+            return await original(self, *args, **kwargs)
+
+        attempts = max(int(getattr(adapter_module, "_FEISHU_SEND_ATTEMPTS", 3) or 1), 1)
+        fallback_codes = getattr(adapter_module, "_FEISHU_REPLY_FALLBACK_CODES", frozenset())
+        post_invalid_re = getattr(adapter_module, "_POST_CONTENT_INVALID_RE", None)
+
+        chat_id = kwargs.get("chat_id")
+        msg_type = kwargs.get("msg_type")
+        payload = kwargs.get("payload")
+        metadata = kwargs.get("metadata")
+        active_reply_to = kwargs.get("reply_to")
+
+        last_error: Optional[BaseException] = None
+        for attempt in range(attempts):
+            try:
+                response = await self._send_raw_message(
+                    chat_id=chat_id,
+                    msg_type=msg_type,
+                    payload=payload,
+                    reply_to=active_reply_to,
+                    metadata=metadata,
+                )
+                # Replying to a withdrawn/missing message: post a new message
+                # to the chat instead (core behaviour, preserved verbatim).
+                if active_reply_to and not self._response_succeeded(response):
+                    code = getattr(response, "code", None)
+                    if code in fallback_codes:
+                        logger.warning(
+                            "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
+                            "falling back to new message in chat %s",
+                            active_reply_to,
+                            code,
+                            chat_id,
+                        )
+                        active_reply_to = None
+                        response = await self._send_raw_message(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=None,
+                            metadata=metadata,
+                        )
+                return response
+            except Exception as exc:
+                last_error = exc
+                if is_executor_shutdown_error(exc):
+                    logger.warning(
+                        "[multitenancy] Feishu send aborted for chat %s — "
+                        "process is shutting down, not retrying: %s",
+                        chat_id,
+                        exc,
+                    )
+                    raise
+                if msg_type == "post" and post_invalid_re is not None and post_invalid_re.search(str(exc)):
+                    raise
+                if attempt >= attempts - 1:
+                    raise
+                wait_seconds = 2 ** attempt
+                logger.warning(
+                    "[Feishu] Send attempt %d/%d failed for chat %s; retrying in %ds: %s",
+                    attempt + 1,
+                    attempts,
+                    chat_id,
+                    wait_seconds,
+                    exc,
+                )
+                await asyncio.sleep(wait_seconds)
+        raise last_error or RuntimeError("Feishu send failed")
+
+    setattr(feishu_send_with_retry, "_hermes_multitenancy_send_retry_fatal_patched", True)
+    setattr(feishu_send_with_retry, "_hermes_multitenancy_original", original)
+    FeishuAdapter._feishu_send_with_retry = feishu_send_with_retry
+    logger.info(
+        "[multitenancy] patched Feishu send retry to fail fast on executor-shutdown errors (%s)",
+        getattr(adapter_module, "__name__", "?"),
+    )
 
 
 def _patch_feishu_outbound_link_render() -> None:
