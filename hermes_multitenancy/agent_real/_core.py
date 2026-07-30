@@ -78,6 +78,20 @@ class ExpertUnavailableError(RuntimeError):
         super().__init__("EXPERT_UNAVAILABLE")
 
 
+class GatewayRestartInterruptedError(RuntimeError):
+    """The AIAgent child was killed by a signal — the gateway went down mid-run.
+
+    Carries a user-ready message. ``stream_run_agent`` must surface it verbatim:
+    the generic ``_PARTIAL_FAILURE_NOTICE`` would hide *why* the turn broke, and
+    the legacy-stream fallback is wrong here — nothing is wrong with the model,
+    the process was killed (deploy/restart SIGTERMs the whole process group).
+    """
+
+    error_code = "GATEWAY_RESTART_INTERRUPTED"
+    failure_subsystem = "gateway_lifecycle"
+    retryable = True
+
+
 # StreamReader line-buffer cap for the AIAgent subprocess NDJSON protocol. The
 # child writes one JSON event per line; asyncio's default 64 KiB limit makes a
 # single large event line (a big final answer, a large tool arg / thinking block)
@@ -313,6 +327,20 @@ async def stream_run_agent(  # type: ignore[override]
             return
     except Exception as exc:
         if isinstance(exc, ExpertUnavailableError):
+            raise
+        if isinstance(exc, GatewayRestartInterruptedError):
+            # Handled BEFORE the billing / partial-content / legacy-fallback
+            # ladder below, all three of which would bury the honest message:
+            # the generic notice would replace it, and the legacy stream would
+            # swallow it entirely and answer as if nothing happened.
+            if content_parts:
+                # Keep what the user already saw and append the reason, rather
+                # than overwriting it with _PARTIAL_FAILURE_NOTICE.
+                yield "content", "\n\n" + str(exc)
+                from ..run_broker import mark_current_run_output_incomplete
+
+                mark_current_run_output_incomplete()
+                return
             raise
         kind = _billing_failure_kind(event, exc)
         retry_safe = (

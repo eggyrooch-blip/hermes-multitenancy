@@ -23,6 +23,12 @@ in-flight run 随进程组一起吃 SIGTERM。qiaojunlong 那轮 `saw_done=False
 journal 两次都是 `Stopping → exited status=1/FAILURE → Started`,不是干净停。退出码 1 说明
 shutdown 路径本身有异常未处理。没查,单独立项。与 D1 相关但可独立修。
 
+**D4 — 上游 flake:`test_hook_dispatch.py::test_concurrent_uploaded_files_keep_profile_and_prompt_isolated`**
+全量套件里间歇红(`AttributeError: 'FullFeishuAdapter' object has no attribute 'send'`,
+`router/commands.py:423`),单跑该文件 5/5 绿,只在全量上下文出现 → 跨测试污染。
+**已核实与本 slug 无关**:在干净 `origin/main`(32db743,零本地改动)上全量跑 3 次,第 2 次同样红。
+会间歇卡住 ftask TEST 闸,建议单独立项查 monkeypatch/adapter 的 teardown 顺序。
+
 **D3 — 非流式路径(`agent_real/_core.py:3826/3845`)仍会拼 stderr 尾巴**
 本次只改了流式 `agent_real/streaming.py` 的抛错点(SPEC 限定最小面)。`_run_aiagent_subprocess`
 (飞书/cron 走的非流式路径)同样把 stderr 尾巴拼进用户可见错误;且信号死时 stdout 为空,

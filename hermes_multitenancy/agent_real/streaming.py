@@ -794,12 +794,19 @@ async def _stream_aiagent_subprocess(
                 # answer, because stream_run_agent drops ``final_text`` on any
                 # exception. Log loudly, surface nothing.
                 if saw_done:
-                    logger.warning(
+                    # Keeping the turn is right either way, but the two signs
+                    # mean very different things operationally: a signal is
+                    # routine gateway teardown, while a non-zero *code* after a
+                    # successful done means the child crashed during its own
+                    # teardown — a real defect someone must look at. Full
+                    # stderr in both cases so triage never needs DEBUG.
+                    log_post_done = logger.warning if returncode < 0 else logger.error
+                    log_post_done(
                         "[multitenancy] AIAgent subprocess exited %s AFTER delivering its "
                         "done event; keeping the completed turn instead of surfacing an "
-                        "error. stderr: %s",
+                        "error. Full stderr: %s",
                         returncode,
-                        redacted_stderr_text[-4000:] or "<empty>",
+                        redacted_stderr_text or "<empty>",
                     )
                 elif returncode < 0:
                     # Killed by signal -returncode, with no result delivered.
@@ -818,12 +825,12 @@ async def _stream_aiagent_subprocess(
                     # bug that did not exist. Full stderr stays in the log.
                     logger.warning(
                         "[multitenancy] AIAgent subprocess killed by signal %s "
-                        "(gateway restart/shutdown kills in-flight runs); the stderr "
-                        "tail below is stale output, NOT the cause of death: %s",
+                        "(gateway restart/shutdown kills in-flight runs); the full "
+                        "stderr below is stale output, NOT the cause of death: %s",
                         -returncode,
-                        redacted_stderr_text[-4000:] or "<empty>",
+                        redacted_stderr_text or "<empty>",
                     )
-                    raise RuntimeError(
+                    raise GatewayRestartInterruptedError(
                         f"⚠️ 这一轮被网关重启/关闭打断了（子进程收到信号 {-returncode}），"
                         "没能跑完。麻烦再发一次。"
                     )

@@ -238,3 +238,130 @@ def test_selfheal_then_failure_still_raises(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="HTTP 400"):
         asyncio.run(drain())
+
+
+# ── MT-001: the honest message must actually reach the user ──────────────────
+# stream_run_agent's except ladder has three exits below the tag check, two of
+# which used to destroy the message: content_parts → _PARTIAL_FAILURE_NOTICE
+# replaces it, and the zero-content/zero-tool path falls through to the legacy
+# stream, which answers as if nothing happened.
+
+
+def test_signal_death_message_survives_to_the_user_no_legacy_fallback(monkeypatch, tmp_path):
+    """Zero content, zero tools → the old code fell through to _stream_loop."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = _make_profile_home(tmp_path)
+    _install_fake_proc(
+        monkeypatch,
+        lines=[json.dumps({"event": "thinking", "text": "..."}).encode() + b"\n"],
+        stderr=_REPLAY_SELF_HEAL_STDERR.encode("utf-8"),
+        returncode=-15,
+    )
+
+    async def legacy_must_not_run(event, profile_home, messages=None):
+        raise AssertionError("legacy stream must not answer an interrupted turn")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_must_not_run)
+
+    async def collect():
+        return [item async for item in agent_real.stream_run_agent(_event(), profile_home)]
+
+    with pytest.raises(agent_real.GatewayRestartInterruptedError) as excinfo:
+        asyncio.run(collect())
+    assert "网关重启" in str(excinfo.value)
+    assert excinfo.value.error_code == "GATEWAY_RESTART_INTERRUPTED"
+
+
+def test_signal_death_appends_reason_after_partial_content(monkeypatch, tmp_path):
+    """Partial output stays, reason is APPENDED — not replaced by the generic notice."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = _make_profile_home(tmp_path)
+    _install_fake_proc(
+        monkeypatch,
+        lines=[json.dumps({"event": "content", "text": "前半段答案"}).encode() + b"\n"],
+        stderr=b"stale",
+        returncode=-15,
+    )
+
+    async def legacy_must_not_run(event, profile_home, messages=None):
+        raise AssertionError("legacy stream must not answer an interrupted turn")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_must_not_run)
+
+    async def collect():
+        return [item async for item in agent_real.stream_run_agent(_event(), profile_home)]
+
+    events = asyncio.run(collect())
+    streamed = "".join(payload for kind, payload in events if kind == "content")
+    assert "前半段答案" in streamed          # what the user already saw survives
+    assert "网关重启" in streamed            # ...with the real reason appended
+    assert agent_real._PARTIAL_FAILURE_NOTICE not in streamed
+
+
+# ── MT-002 (partial): post-done log level carries the sign's meaning ──────────
+
+
+def _run_post_done_exit(monkeypatch, tmp_path, returncode: int):
+    from hermes_multitenancy import agent_real
+
+    profile_home = _make_profile_home(tmp_path)
+    _install_fake_proc(
+        monkeypatch,
+        lines=[b'{"event": "done", "result": "ok", "error": null}\n'],
+        stderr=b"teardown noise",
+        returncode=returncode,
+    )
+
+    async def collect():
+        return [
+            item
+            async for item in agent_real._stream_aiagent_subprocess(_event(), profile_home)
+        ]
+
+    return asyncio.run(collect())
+
+
+def test_post_done_signal_exit_logs_warning(monkeypatch, tmp_path, caplog):
+    with caplog.at_level("WARNING"):
+        _run_post_done_exit(monkeypatch, tmp_path, -15)
+    post_done = [r for r in caplog.records if "AFTER delivering its done event" in r.getMessage()]
+    assert post_done and all(r.levelname == "WARNING" for r in post_done)
+
+
+def test_post_done_crash_exit_logs_error(monkeypatch, tmp_path, caplog):
+    """A non-zero CODE after a successful done = the child crashed in teardown."""
+    with caplog.at_level("WARNING"):
+        _run_post_done_exit(monkeypatch, tmp_path, 3)
+    post_done = [r for r in caplog.records if "AFTER delivering its done event" in r.getMessage()]
+    assert post_done and all(r.levelname == "ERROR" for r in post_done)
+
+
+# ── MT-004: "full stderr" must mean full, not a 4000-char tail ────────────────
+
+
+def test_signal_death_logs_stderr_head_and_tail(monkeypatch, tmp_path, caplog):
+    from hermes_multitenancy import agent_real
+
+    profile_home = _make_profile_home(tmp_path)
+    huge = "HEAD-MARKER" + ("x" * 12000) + "TAIL-MARKER"
+    _install_fake_proc(
+        monkeypatch,
+        lines=[json.dumps({"event": "thinking", "text": "..."}).encode() + b"\n"],
+        stderr=huge.encode("utf-8"),
+        returncode=-15,
+    )
+
+    async def drain():
+        async for _ in agent_real._stream_aiagent_subprocess(_event(), profile_home):
+            pass
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(agent_real.GatewayRestartInterruptedError):
+            asyncio.run(drain())
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "HEAD-MARKER" in logged and "TAIL-MARKER" in logged
