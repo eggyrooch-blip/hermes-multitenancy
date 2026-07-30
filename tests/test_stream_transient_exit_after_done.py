@@ -365,3 +365,96 @@ def test_signal_death_logs_stderr_head_and_tail(monkeypatch, tmp_path, caplog):
 
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "HEAD-MARKER" in logged and "TAIL-MARKER" in logged
+
+
+# ── MT-002 rebuttal evidence (round-2) ───────────────────────────────────────
+# Review holds that keeping the saw_done guard manufactures a "false success"
+# (done + SIGTERM) and hides crashes (done + exit 3). Both tests below run at
+# the public stream_run_agent layer the review itself named, and show the user
+# receives the COMPLETE answer in both cases — a turn whose answer was fully
+# delivered is a real success, not a fake one. The sign only changes log level.
+
+
+def _collect_stream_run_agent_after_done_exit(monkeypatch, tmp_path, returncode: int):
+    from hermes_multitenancy import agent_real
+
+    profile_home = _make_profile_home(tmp_path)
+    _install_fake_proc(
+        monkeypatch,
+        lines=[
+            json.dumps({"event": "content", "text": "完整"}).encode() + b"\n",
+            json.dumps({"event": "content", "text": "答案"}).encode() + b"\n",
+            b'{"event": "done", "result": "\\u5b8c\\u6574\\u7b54\\u6848", "error": null}\n',
+        ],
+        stderr=b"teardown stderr HEAD" + (b"y" * 9000) + b"teardown stderr TAIL",
+        returncode=returncode,
+    )
+
+    async def legacy_must_not_run(event, profile_home, messages=None):
+        raise AssertionError("a completed turn must never re-answer via the legacy stream")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy_must_not_run)
+
+    async def collect():
+        return [item async for item in agent_real.stream_run_agent(_event(), profile_home)]
+
+    return asyncio.run(collect())
+
+
+def test_public_layer_signal_after_done_still_delivers_whole_answer(monkeypatch, tmp_path, caplog):
+    """done + SIGTERM: the user gets the full answer → success is real, not false."""
+    with caplog.at_level("WARNING"):
+        events = _collect_stream_run_agent_after_done_exit(monkeypatch, tmp_path, -15)
+
+    assert "".join(p for k, p in events if k == "content") == "完整答案"
+    assert not [k for k, _ in events if k == "error"]
+    post_done = [r for r in caplog.records if "AFTER delivering its done event" in r.getMessage()]
+    assert post_done and all(r.levelname == "WARNING" for r in post_done)
+
+
+def test_public_layer_crash_after_done_delivers_answer_and_logs_error(monkeypatch, tmp_path, caplog):
+    """done + exit 3: answer still complete, but the crash is ERROR + full stderr."""
+    with caplog.at_level("WARNING"):
+        events = _collect_stream_run_agent_after_done_exit(monkeypatch, tmp_path, 3)
+
+    assert "".join(p for k, p in events if k == "content") == "完整答案"
+    assert not [k for k, _ in events if k == "error"]
+    post_done = [r for r in caplog.records if "AFTER delivering its done event" in r.getMessage()]
+    assert post_done and all(r.levelname == "ERROR" for r in post_done)
+    logged = "\n".join(r.getMessage() for r in post_done)
+    assert "teardown stderr HEAD" in logged and "teardown stderr TAIL" in logged
+
+
+def test_core_discards_final_text_on_any_exception(monkeypatch, tmp_path):
+    """Why the saw_done guard must stay — anchors the MT-002 rebuttal.
+
+    ``final_text`` is assigned from the done event at _core.py:283 but is only
+    ever handed to the consumer on the normal exit (_core.py:326). EVERY path
+    out of ``except Exception`` at _core.py:328 drops it on the floor:
+    _core.py:394-395 replaces it with _PARTIAL_FAILURE_NOTICE, _core.py:400
+    re-raises, _core.py:421 falls through to the legacy stream.
+
+    So raising on a post-``done`` non-zero exit — what the review asks for —
+    does not "surface a hidden failure"; it deletes an answer the child already
+    produced and the user was already owed. This test pins that behaviour, so
+    if anyone removes the guard the consequence is visible, not theoretical.
+    """
+    from hermes_multitenancy import agent_real
+
+    async def done_then_die(event, profile_home, messages=None):
+        yield "done", "完整答案"                       # child delivered the answer
+        raise RuntimeError("post-done teardown failure")
+
+    async def legacy(event, profile_home, messages=None):
+        yield "content", "LEGACY-REANSWER"
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", done_then_die)
+    monkeypatch.setattr(agent_real, "_stream_loop", legacy)
+
+    async def collect():
+        return [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+
+    streamed = "".join(p for k, p in asyncio.run(collect()) if k == "content")
+    assert "完整答案" not in streamed        # ← the answer is GONE
+    assert streamed == "LEGACY-REANSWER"     # ← user silently re-answered instead
