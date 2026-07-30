@@ -2478,7 +2478,6 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         from . import expert_overlay
-        from . import expert_usage
 
         try:
             profile_name, user_key = _owner_scoped_tenant(request)
@@ -2502,6 +2501,8 @@ def create_run_broker_app(
             # usage merge is strictly best-effort: any failure here must still
             # return the catalog (rows default to use_count=0)
             try:
+                from . import expert_usage
+
                 usage = await asyncio.to_thread(expert_usage.counts)
             except Exception:
                 logger.debug("[multitenancy] expert usage counts failed", exc_info=True)
