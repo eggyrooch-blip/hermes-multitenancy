@@ -82,6 +82,31 @@ def _remember_gateway(gateway: Any) -> None:
         _gateway_ref = None
 
 
+def _note_live_gateway(gateway: Any) -> None:
+    """A live gateway exists → remember it AND re-land the send-retry patch.
+
+    register()-time class patching lands on the WRONG class object. The core
+    plugin loader (``hermes_cli/plugins.py:_load_directory_module``) re-execs the
+    feishu platform source under the synthetic name
+    ``hermes_plugins.feishu_platform.adapter``, producing a class distinct from
+    ``plugins.platforms.feishu.adapter.FeishuAdapter`` — and at register() time
+    the synthetic module does not exist yet, so ``load_feishu_module()`` can only
+    return the fallback clone. prod v0190 boot 2026-07-30 18:04:19 shows exactly
+    that split: register-time hooks logged against
+    ``plugins.platforms.feishu.adapter.FeishuAdapter`` while the running adapter
+    logs under ``hermes_plugins.feishu_platform.adapter``.
+
+    A gateway instance only exists after the platforms are built, so re-running
+    the installer here re-resolves through ``load_feishu_module()`` — which now
+    prefers the synthetic module — and lands the patch on the class the gateway
+    actually runs (including a fresh ``adapter_module`` closure for the tunables).
+    The register()-time install stays, covering loaders with other orderings; the
+    marker makes both passes idempotent per class.
+    """
+    _remember_gateway(gateway)
+    _patch_feishu_send_retry_shutdown_fatal()
+
+
 def gateway_is_shutting_down() -> bool:
     """True once the gateway entered teardown (``stop()`` sets ``_draining``).
 
@@ -105,7 +130,7 @@ def ensure_cron_worker_started(gateway: Any) -> None:
     layout (``<root>/profiles/<name>``).
     """
     global _worker_started, _worker_thread, _worker_stop
-    _remember_gateway(gateway)
+    _note_live_gateway(gateway)
     if _worker_started:
         return
     with _worker_lock:
@@ -217,7 +242,7 @@ def install_gateway_startup_watcher() -> None:
 
 
 def _schedule_startup_watch(gateway: Any) -> None:
-    _remember_gateway(gateway)
+    _note_live_gateway(gateway)
     if gateway_ownership.is_router_profile_runtime():
         try:
             from ..webui_broker_server import ensure_run_broker_server_started
@@ -515,7 +540,10 @@ def _patch_feishu_send_retry_shutdown_fatal() -> None:
         # Never assume the core signature: anything we don't recognise goes
         # straight to the original (2026-07-21 cron run_job taught us what a
         # hard-coded signature costs).
-        if args or not _SEND_RETRY_KWARGS.issuperset(kwargs) or "chat_id" not in kwargs:
+        # EXACTLY core's five keyword-only required params — a subset would let a
+        # missing-arg call through and hand ``_send_raw_message`` a None where
+        # core would have raised TypeError immediately.
+        if args or set(kwargs) != _SEND_RETRY_KWARGS:
             logger.warning(
                 "[multitenancy] unexpected _feishu_send_with_retry call shape %r; "
                 "using core retry loop (shutdown fast-fail inactive)",
@@ -548,6 +576,18 @@ def _patch_feishu_send_retry_shutdown_fatal() -> None:
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in fallback_codes:
+                        # A thread reply that fails must NOT fall back to a
+                        # top-level message — that would open a new topic in the
+                        # group (core v0190 guard, kept verbatim).
+                        if (metadata or {}).get("thread_id"):
+                            logger.warning(
+                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
+                                "skipping top-level fallback to avoid creating a new topic",
+                                active_reply_to,
+                                (metadata or {}).get("thread_id"),
+                                code,
+                            )
+                            return response
                         logger.warning(
                             "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
                             "falling back to new message in chat %s",

@@ -237,6 +237,49 @@ def test_withdrawn_reply_falls_back_to_new_message(monkeypatch) -> None:
     assert sleeps == []
 
 
+def test_thread_reply_failure_does_not_fall_back_to_top_level(monkeypatch) -> None:
+    """Core v0190 guard: a failed reply INSIDE a thread must not be re-sent at
+    top level, or the group gets a spurious new topic."""
+    module, sleeps = _install_send_retry_patch(monkeypatch)
+    withdrawn = _FakeResponse(code=230011)
+    adapter = module.FeishuAdapter([withdrawn, _FakeResponse()])
+
+    result = asyncio.run(
+        _send(adapter, reply_to="om_parent", metadata={"thread_id": "omt_topic"})
+    )
+
+    assert result is withdrawn, "the failed response is returned as-is"
+    assert len(adapter.calls) == 1, "no top-level fallback message may be sent"
+    assert sleeps == []
+
+
+def test_reply_failure_without_thread_id_still_falls_back(monkeypatch) -> None:
+    module, _sleeps = _install_send_retry_patch(monkeypatch)
+    ok = _FakeResponse()
+    adapter = module.FeishuAdapter([_FakeResponse(code=230011), ok])
+
+    result = asyncio.run(
+        _send(adapter, reply_to="om_parent", metadata={"chat_id": "oc_chat"})
+    )
+
+    assert result is ok
+    assert [call["reply_to"] for call in adapter.calls] == ["om_parent", None]
+
+
+def test_missing_kwargs_delegates_instead_of_sending_none(monkeypatch, caplog) -> None:
+    """A subset of core's five required kwargs must reach core (which raises
+    TypeError) — never our loop, which would hand ``_send_raw_message`` None."""
+    module, _sleeps = _install_send_retry_patch(monkeypatch)
+    adapter = module.FeishuAdapter([_FakeResponse()])
+    caplog.set_level(logging.WARNING, logger=patches.logger.name)
+
+    with pytest.raises(TypeError):
+        asyncio.run(adapter._feishu_send_with_retry(chat_id="oc_chat"))
+
+    assert adapter.calls == [], "no send may be attempted from a malformed call"
+    assert "unexpected _feishu_send_with_retry call shape" in caplog.text
+
+
 def test_unexpected_call_shape_delegates_to_core_loop(monkeypatch, caplog) -> None:
     """The patch replaces a core loop; an unrecognised call shape must fall back
     to core rather than silently mirror a signature we no longer match
@@ -261,13 +304,69 @@ def test_unexpected_call_shape_delegates_to_core_loop(monkeypatch, caplog) -> No
 
 
 # --------------------------------------------------------------------------
-# 4. cron delivery skipped while the gateway drains
+# Loader-order regression: the patch must reach the class the gateway RUNS
 # --------------------------------------------------------------------------
 
 
 class _FakeGateway:
     def __init__(self, draining: bool = False) -> None:
         self._draining = draining
+
+
+_MARKER = "_hermes_multitenancy_send_retry_fatal_patched"
+
+
+def test_reinstall_at_gateway_startup_lands_on_synthetic_plugin_class(monkeypatch) -> None:
+    """prod v0190 boot: at register() time the plugin loader has not yet re-exec'd
+    the feishu source under ``hermes_plugins.feishu_platform.adapter``, so the
+    patch can only land on the ``plugins.platforms.feishu.adapter`` clone — a
+    DIFFERENT class object from the one the gateway runs. The startup pass, which
+    happens after the platforms are built, must re-resolve and land it on the
+    synthetic class too."""
+    fallback, sleeps = _install_send_retry_patch(monkeypatch)
+    assert getattr(fallback.FeishuAdapter._feishu_send_with_retry, _MARKER, False)
+
+    # The loader now re-execs the same source under the synthetic name: a
+    # distinct class object carrying the pristine core method.
+    synthetic = types.ModuleType("hermes_plugins.feishu_platform.adapter")
+    for attr in ("_FEISHU_SEND_ATTEMPTS", "_FEISHU_REPLY_FALLBACK_CODES", "_POST_CONTENT_INVALID_RE"):
+        setattr(synthetic, attr, getattr(fallback, attr))
+    synthetic.FeishuAdapter = type("FeishuAdapter", (_FakeFeishuAdapter,), {})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_plugins.feishu_platform.adapter", synthetic)
+    assert synthetic.FeishuAdapter is not fallback.FeishuAdapter
+    assert not getattr(synthetic.FeishuAdapter._feishu_send_with_retry, _MARKER, False)
+
+    gateway = _FakeGateway()  # strong ref
+    patches._note_live_gateway(gateway)
+
+    assert getattr(synthetic.FeishuAdapter._feishu_send_with_retry, _MARKER, False), (
+        "startup re-install must patch the class the gateway actually runs"
+    )
+    fatal = RuntimeError("cannot schedule new futures after interpreter shutdown")
+    adapter = synthetic.FeishuAdapter([fatal, fatal, fatal])
+    with pytest.raises(RuntimeError):
+        asyncio.run(_send(adapter))
+    assert len(adapter.calls) == 1
+    assert sleeps == []
+
+
+def test_startup_paths_route_through_note_live_gateway(monkeypatch) -> None:
+    """Both gateway-receiving entry points must take the remember + re-install
+    path, else the synthetic class never gets patched in prod."""
+    seen: list[Any] = []
+    monkeypatch.setattr(patches, "_note_live_gateway", lambda gateway: seen.append(gateway))
+    monkeypatch.setattr(patches.gateway_ownership, "is_router_profile_runtime", lambda: False)
+
+    gateway = _FakeGateway()
+    patches._schedule_startup_watch(gateway)  # no running loop → returns after the call
+    patches.ensure_cron_worker_started(gateway)  # no adapters → returns after the call
+
+    assert seen == [gateway, gateway]
+
+
+# --------------------------------------------------------------------------
+# 4. cron delivery skipped while the gateway drains
+# --------------------------------------------------------------------------
 
 
 def _install_fake_scheduler(monkeypatch) -> tuple[types.ModuleType, list[dict]]:

@@ -33,3 +33,27 @@ shutdown 路径本身有异常未处理。没查,单独立项。与 D1 相关但
 本次只改了流式 `agent_real/streaming.py` 的抛错点(SPEC 限定最小面)。`_run_aiagent_subprocess`
 (飞书/cron 走的非流式路径)同样把 stderr 尾巴拼进用户可见错误;且信号死时 stdout 为空,
 会先落到 `invalid JSON` 分支,文案更难懂。同一类"文案撒谎",修法可照抄本次的 returncode<0 分类。
+## 2026-07-30 gateway-shutdown-drain-fix · register 期类补丁落在克隆类上(范围外,仅记债)
+
+**现象(prod v0190 boot 2026-07-30 18:04:19 实证)**:核心 plugin loader
+`hermes_cli/plugins.py:_load_directory_module` 会把 feishu 平台插件源码在合成名
+`hermes_plugins.feishu_platform.adapter` 下**重新 exec**,与
+`plugins.platforms.feishu.adapter` 是两份独立类对象。multitenancy `register()`
+执行时合成模块**尚不存在**,于是 `load_feishu_module()` 只能返回 fallback 克隆类
+——所有 register 期类补丁都打在**运行时不用的那份类**上。日志实证:
+`installed cred_auth card-action hook on plugins.platforms.feishu.adapter.FeishuAdapter`
+而运行时 adapter 的 logger 名是 `hermes_plugins.feishu_platform.adapter`。
+
+**受影响面(本 slug 未处理)**:`_patch_feishu_open_id_send`、
+`_patch_feishu_outbound_link_render`、`install_feishu_inbound_richtext_patch`、
+merge_forward / reply_quote / reaction_lifecycle / group_valve / auth_hub_actions、
+`group_inviter_hook`、`feishu_group_topic_session` —— 凡在 register 期按类打的补丁同理。
+`feishu_adapter_compat` 里的 sys.modules 优先只在**调用时合成模块已存在**才救得回来。
+
+**本 slug 只修了自己那一个**:`_patch_feishu_send_retry_shutdown_fatal` 在
+`_note_live_gateway()`(启动期、平台构建后拿到 gateway 实例时)重跑一次,重新解析到
+synthetic 类补上;register 期安装保留兜其它装载顺序。
+
+**根治方向**:把"启动期重跑全部类补丁"做成一个统一入口(或等核心给 gateway-started
+钩子),而不是每个补丁各自补一次。修前必须逐个确认幂等 marker 挂在方法对象上、
+且重跑不会双重包裹。
