@@ -610,6 +610,7 @@ async def _stream_into_feishu_shared_consumer(
     first_agent_event_seen = False
     content_delta_seen = False
     stream_failed = False
+    jit_auth_started = False
     content = ""
     thinking = ""
     last_reasoning_edit = 0.0
@@ -781,6 +782,23 @@ async def _stream_into_feishu_shared_consumer(
                             _m.logger.debug("multitenancy: approval status update failed: %s", exc)
                         continue
 
+                    if kind == "auth_required":
+                        # A tool failed for lack of a Feishu scope: push a device-code
+                        # auth card (once per turn) and replay the original request on
+                        # success. Never blocks the answer already streaming above.
+                        if not jit_auth_started:
+                            jit_auth_started = True
+                            await _m._handle_jit_auth_required(
+                                gateway=gateway,
+                                adapter=adapter,
+                                chat_id=chat_id,
+                                profile_name=profile_name,
+                                profile_home=profile_home,
+                                event=event,
+                                payload=delta,
+                            )
+                        continue
+
                     if kind == "clarify_required":
                         from ..feishu_clarify_cards import handle_feishu_clarify_required
 
@@ -945,6 +963,7 @@ async def _stream_into_feishu(
     first_agent_event_seen = False
     terminal_update_sent = False
     stream_failed = False
+    jit_auth_started = False
     card_reasoning_sent = False
     idle_heartbeat_task: Optional[asyncio.Task] = None
 
@@ -1186,6 +1205,22 @@ async def _stream_into_feishu(
                             _m.logger.debug("multitenancy: approval status update failed: %s", exc)
                         last_edit_time = time.monotonic()
                         last_render_len = len(render())
+                        continue
+                    elif kind == "auth_required":
+                        # Tool failed for lack of a Feishu scope → device-code auth
+                        # card (once per turn) + original-request replay on success.
+                        # Additive to the answer already streaming; never blocks.
+                        if not jit_auth_started:
+                            jit_auth_started = True
+                            await _m._handle_jit_auth_required(
+                                gateway=gateway,
+                                adapter=adapter,
+                                chat_id=chat_id,
+                                profile_name=profile_name,
+                                profile_home=profile_home,
+                                event=event,
+                                payload=delta,
+                            )
                         continue
                     elif kind == "clarify_required":
                         from ..feishu_clarify_cards import handle_feishu_clarify_required

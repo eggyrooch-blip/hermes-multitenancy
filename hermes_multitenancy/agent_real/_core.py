@@ -128,6 +128,15 @@ _AIAGENT_STREAM_LIMIT = _resolve_aiagent_stream_limit()
 _CREDENTIAL_EXPIRY_SIGNAL: ContextVar[Optional[_CredentialExpirySignal]] = ContextVar(
     "hermes_lark_cli_credential_expiry_signal", default=None
 )
+# Mirror of _CREDENTIAL_EXPIRY_SIGNAL for the JIT permission-denied path. The
+# lark-cli auth broker records into this (same one-shot holder) from its handler
+# thread when a forwarded Feishu response carries an app/user scope-missing code
+# (99991672 / 99991679). Read after the run to yield ("auth_required", payload) so
+# the Feishu router pushes a device-code auth card and replays the original
+# request once the user authorizes. Unset (None) on paths that don't stream.
+_PERMISSION_AUTH_SIGNAL: ContextVar[Optional[_CredentialExpirySignal]] = ContextVar(
+    "hermes_lark_cli_permission_auth_signal", default=None
+)
 _EXECUTE_CODE_PROFILE_CHILD_ENV_LOCK = threading.RLock()
 _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 0
 _PROFILE_ANCHOR_ENV_KEYS = frozenset({
@@ -278,6 +287,8 @@ async def stream_run_agent(  # type: ignore[override]
     _resolve_explicit_expert_for_execution(event, profile_home)
     signal = _CredentialExpirySignal()
     signal_token = _CREDENTIAL_EXPIRY_SIGNAL.set(signal)
+    permission_signal = _CredentialExpirySignal()
+    permission_signal_token = _PERMISSION_AUTH_SIGNAL.set(permission_signal)
     try:
         content_parts: list[str] = []
         final_text = ""
@@ -332,6 +343,9 @@ async def stream_run_agent(  # type: ignore[override]
         expiry = signal.get()
         if expiry:
             yield "auth_required", expiry
+        permission = permission_signal.get()
+        if permission:
+            yield "auth_required", permission
         if final_text or content_parts:
             return
     except Exception as exc:
@@ -395,6 +409,9 @@ async def stream_run_agent(  # type: ignore[override]
         expiry = signal.get()
         if expiry:
             yield "auth_required", expiry
+        permission = permission_signal.get()
+        if permission:
+            yield "auth_required", permission
         # If we already streamed partial content into the card, re-running the
         # legacy stream below would DUPLICATE everything the user has seen. Stop
         # with an honest recovery hint instead of re-streaming. (Only fall through
@@ -426,6 +443,7 @@ async def stream_run_agent(  # type: ignore[override]
         )
     finally:
         _CREDENTIAL_EXPIRY_SIGNAL.reset(signal_token)
+        _PERMISSION_AUTH_SIGNAL.reset(permission_signal_token)
 
     async for kind, text in _pkg._stream_loop(event, profile_home, messages=messages):
         yield kind, text
@@ -2412,6 +2430,7 @@ def _lark_cli_auth_broker_scope(
     allowed_identities = frozenset({"user", "bot"})
     key = secrets.token_urlsafe(32)
     expiry_signal = _CREDENTIAL_EXPIRY_SIGNAL.get(None)
+    permission_signal = _PERMISSION_AUTH_SIGNAL.get(None)
     server = start_lark_cli_auth_broker_server(
         LarkCliAuthBrokerContext(
             shared_home=_resolve_shared_hermes_home(profile_home),
@@ -2423,6 +2442,7 @@ def _lark_cli_auth_broker_scope(
             current_chat_id=_group_profile_chat_id(profile_home) if is_group_profile else "",
             allowed_bot_chat_ids=allowed_bot_chat_ids,
             credential_expiry_sink=expiry_signal.set if expiry_signal is not None else None,
+            permission_denied_sink=permission_signal.set if permission_signal is not None else None,
         )
     )
     try:

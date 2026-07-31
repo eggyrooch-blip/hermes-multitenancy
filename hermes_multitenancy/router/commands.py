@@ -801,6 +801,101 @@ async def _handle_feishu_auth_command(
     )
 
 
+async def _handle_jit_auth_required(
+    *,
+    gateway: Any,
+    adapter: Any,
+    chat_id: str,
+    profile_name: Optional[str],
+    profile_home: Optional[Path],
+    event: Any,
+    payload: Any = None,
+) -> None:
+    """JIT device-code auth: a tool failed mid-run because the user lacks a Feishu
+    scope (99991672 app-scope / 99991679 user-scope). Push the SAME device-flow
+    auth card as ``/feishu_auth`` — but with the verification link wrapped as a
+    sidebar applink — and reuse its poll task. On success the poll calls
+    ``_dispatch_synthetic_auth_complete``, which replays the user's ORIGINAL
+    request (captured in ``_capture_pending_auth_replay`` at inbound), so the
+    stuck operation finishes itself with no re-typing.
+
+    Non-blocking + refusable: the run's answer already streamed before this fires;
+    ignoring the card just leaves the op undone (device code expires on its own).
+    Identity is bound to the INITIATOR's open_id, so ``poll_session`` rejects a
+    different account authorizing (group anti-spoof, free via the existing
+    mismatch card). ``payload`` (broker scope_status) is unused for now — a
+    full-grant card is enough (precise scope mapping is a follow-up slug)."""
+    del payload, profile_home
+    from .. import feishu_uat_auth
+    from ..feishu_auth_cards import (
+        auth_text_fallback,
+        build_auth_card,
+        send_auth_card,
+        to_in_app_web_url,
+    )
+
+    if adapter is None or not profile_name:
+        return
+    # 群/智能体 profile 只用应用(bot)身份——群里不弹「授权你个人 lark-cli」的卡
+    # (sunke 设定)。双保险：broker 的 permission sink 已按 identity!=user 拦下，
+    # 这里再从 profile 维度挡一次(防其它信号源/未来改动漏进群)。
+    if _m.is_group_profile_name(profile_name):
+        return
+    open_id = (
+        _m._normalize_feishu_open_id(getattr(event, "sender_open_id", None))
+        or _m._normalize_feishu_open_id(
+            getattr(getattr(event, "source", None), "user_id", None)
+        )
+        or _m._profile_open_id_for_auth(profile_name)
+        or ""
+    )
+    if not _m._is_feishu_open_id(open_id):
+        return
+    try:
+        # Reuse one live device code per (profile, open_id) so a run that fails on
+        # several tool calls (or an expiry + permission in the same turn) shows ONE
+        # card / drives ONE poll instead of racing duplicate sessions.
+        session = feishu_uat_auth.find_active_session(
+            profile_name=profile_name, open_id=open_id
+        )
+        if not session:
+            session = feishu_uat_auth.start_session(
+                profile_name=profile_name, open_id=open_id
+            )
+    except feishu_uat_auth.FeishuUatAuthError as exc:
+        _m.logger.info("multitenancy: JIT auth session start failed: %s", exc.message)
+        return
+
+    session_id = str(session.get("session_id") or "")
+    verification_uri = str(session.get("verification_uri") or "")
+    user_code = str(session.get("user_code") or "")
+    expires_at = float(session.get("expires_at") or 0)
+    expires_min = max(1, int((expires_at - time.time() + 59) // 60)) if expires_at else 10
+
+    card = build_auth_card(
+        verification_uri=to_in_app_web_url(verification_uri),
+        user_code=user_code,
+        expires_min=expires_min,
+    )
+    auth_card = await send_auth_card(adapter=adapter, chat_id=chat_id, card=card)
+    if auth_card is None:
+        await _m._safe_call(
+            adapter.send,
+            chat_id,
+            auth_text_fallback(verification_uri=verification_uri, user_code=user_code),
+        )
+    _m._start_feishu_auth_poll_task(
+        session_id=session_id,
+        profile_name=profile_name,
+        open_id=open_id,
+        chat_id=chat_id,
+        gateway=gateway,
+        event=event,
+        interval=int(session.get("interval") or 3),
+        auth_card=auth_card,
+    )
+
+
 def _profile_open_id_for_auth(profile_name: Optional[str]) -> Optional[str]:
     if not profile_name:
         return None

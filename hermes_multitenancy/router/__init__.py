@@ -2758,6 +2758,7 @@ from .commands import (  # noqa: E402,F401
     _should_check_skill_slash_command,
     _handle_command,
     _handle_feishu_auth_command,
+    _handle_jit_auth_required,
     _profile_open_id_for_auth,
     _start_feishu_auth_poll_task,
     _dispatch_synthetic_auth_complete,

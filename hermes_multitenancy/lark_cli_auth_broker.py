@@ -84,6 +84,12 @@ class LarkCliAuthBrokerContext:
     # signal (e.g. the non-streaming / Feishu path). Holds a callable, never
     # mutated after construction — safe on this frozen dataclass.
     credential_expiry_sink: Optional[Callable[[dict], None]] = None
+    # Same contract, but for a forwarded Feishu response carrying an app/user
+    # scope-missing code (99991672 / 99991679). Unlike expiry (raised BEFORE the
+    # forward when the stored UAT is stale), a permission error is only visible in
+    # the response Feishu returns, so it fires AFTER the forward. Drives the JIT
+    # device-code auth card + original-request replay in the streaming run scope.
+    permission_denied_sink: Optional[Callable[[dict], None]] = None
 
 
 Forwarder = Callable[[str, str, Mapping[str, str], bytes, float], BrokerResponse]
@@ -223,13 +229,15 @@ class LarkCliAuthBroker:
         else:
             forward_headers[auth_header] = token
 
-        return self.forwarder(
+        response = self.forwarder(
             method,
             "https://" + host + path_and_query,
             forward_headers,
             body,
             self.context.request_timeout_seconds,
         )
+        self._maybe_signal_permission_denied(identity, response.body)
+        return response
 
     def _resolve_token(self, identity: str) -> str:
         from .credentials import CredentialStore
@@ -349,6 +357,46 @@ class LarkCliAuthBroker:
             return
         try:
             sink({"provider": "feishu", "connector_id": "lark-cli"})
+        except Exception:
+            pass
+
+    def _maybe_signal_permission_denied(self, identity: str, body: bytes) -> None:
+        """Fire the permission sink when a forwarded Feishu response is a genuine
+        app/user scope-missing error (code 99991672 / 99991679).
+
+        Cheap fast-path: a normal success response never contains those digit runs,
+        so a bytes substring check short-circuits before any JSON parse. Structured
+        confirm (``classify_lark_error``: STRUCTURED FIELDS ONLY) then rejects a
+        coincidental digit run inside data — only a top-level ``code`` classifies.
+        Best-effort: a broken sink or unparseable body must never disturb the
+        proxied response.
+        """
+        sink = self.context.permission_denied_sink
+        if sink is None:
+            return
+        # 群/智能体 profile 按设计只用应用(bot)身份 (sunke: 群里只用应用身份、不授权
+        # 个人 lark-cli)。用户授权卡只对 USER 身份的调用有意义 —— bot/群一律不触发。
+        if identity != "user":
+            return
+        if b"99991672" not in body and b"99991679" not in body:
+            return
+        try:
+            from .feishu_permission_errors import classify_lark_error
+
+            label = classify_lark_error(json.loads(body.decode("utf-8")))
+        except Exception:
+            return
+        if label is None:
+            return
+        try:
+            sink(
+                {
+                    "provider": "feishu",
+                    "connector_id": "lark-cli",
+                    "identity": identity,
+                    "scope_status": label,  # app_scope_missing | user_scope_insufficient
+                }
+            )
         except Exception:
             pass
 

@@ -27,6 +27,37 @@ logger = logging.getLogger(__name__)
 
 _LOCALES = ["zh_cn", "en_us"]
 
+_APPLINK_DOMAINS = {
+    "feishu": "https://applink.feishu.cn",
+    "larksuite": "https://applink.larksuite.com",
+}
+
+
+def to_in_app_web_url(target_url: str, *, brand: str = "feishu") -> str:
+    """Wrap a URL so a Feishu card button opens it in the in-app SIDE PANEL
+    (sidebar-semi) instead of an external browser — the user never leaves the
+    Feishu app to authorize. Mirrors openclaw-lark ``toInAppWebUrl``: an applink
+    ``/client/web_url/open`` carrying a ``lk_meta`` that hides the nav bars.
+    Returns the input unchanged when it is empty (nothing to wrap)."""
+    from urllib.parse import quote
+
+    if not target_url:
+        return target_url
+    domain = _APPLINK_DOMAINS.get(
+        str(brand or "feishu").strip().lower(), _APPLINK_DOMAINS["feishu"]
+    )
+    lk_meta = quote(
+        json.dumps({"page-meta": {"showNavBar": "false", "showBottomNavBar": "false"}}),
+        safe="",
+    )
+    separator = "&" if "?" in target_url else "?"
+    full_url = f"{target_url}{separator}lk_meta={lk_meta}"
+    encoded = quote(full_url, safe="")
+    return (
+        f"{domain}/client/web_url/open"
+        f"?mode=sidebar-semi&max_width=800&reload=false&url={encoded}"
+    )
+
 
 def build_auth_card(
     *,
