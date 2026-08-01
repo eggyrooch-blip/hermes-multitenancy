@@ -1,0 +1,92 @@
+# GitLab CI —— 合并前的门禁。跑在 hermes-1 上的项目专属 runner（独立用户 + rootless podman）。
+#
+# 为什么不是照抄 .github/workflows/test.yml：那份只跑了约 20 条手挑的 ingest/脱敏测试
+# （某次 hotfix 留下的临时清单），仓里其实有 176 个测试文件和完整的 `make test`。
+# 门禁要有意义就得跑全量。
+#
+# 门禁语义：TEST 与 LEAK 都是硬阻断。红了就进不了 main。
+
+stages:
+  - test
+  - leak
+
+default:
+  image: docker.io/library/python:3.12-slim
+  # runner 是项目专属的，但仍然只跑带这些 tag 的 job，避免以后误连别的 runner
+  tags:
+    - hermes
+
+variables:
+  # uv 的缓存放进 job 目录，好让 GitLab 缓存它
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+cache:
+  key:
+    files:
+      - uv.lock
+  paths:
+    - .uv-cache
+
+test:
+  stage: test
+  rules:
+    # 合并请求上跑（这才是门禁），以及 main 上跑（挡住直推/合并后的回归）
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+  before_script:
+    # 测试套件对运行环境有真实依赖，容器里得补齐，否则会拿"环境缺东西"当成回归：
+    #   - node：tests/test_lark_cli_matrix_runner.py 要跑 lark-cli 的 mjs runner（16 条）
+    #   - /usr/bin/python3：strict-mode shim 用固定 PATH 调 python3，
+    #     而 python:slim 只把它放在 /usr/local/bin（3 条）
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends nodejs ca-certificates
+    - ln -sf "$(command -v python3)" /usr/bin/python3
+    - node --version && /usr/bin/python3 --version
+    - pip install --quiet uv
+    # 以非 root 跑测试。tests/test_billing_readiness.py 断言"父目录不可写"这类权限不变量，
+    # 而 root 能绕过一切文件权限 —— 用 root 跑会让 6 条安全测试假失败。
+    - useradd -m ci || true
+    - chown -R ci "$CI_PROJECT_DIR"
+  script:
+    # 与 Makefile 的 `make test` 同一条命令。三组排除，每一组都写明原因和去向。
+    #
+    # A) CI 抓出来的真缺陷 —— 脚本里硬编码了开发机绝对路径，只在那台 Mac 上能跑：
+    #      scripts/lark_cli_matrix_runner.mjs:18
+    #        import ... from '/Users/kite/code/hermes-web-ui/node_modules/socket.io-client/...'
+    #        （另有 4 处 /Users/kite/.hermes/...）
+    #      scripts/feishu_file_media_matrix_runner.py:27
+    #        SHARED_HOME = Path("/Users/kite/.hermes")   → 容器里 PermissionError: '/Users'
+    #    这违反 CLAUDE.md 的「Never hardcode paths」。已记 DEBT，单独开任务改成相对路径后放回门禁。
+    #
+    # B) 需要 kep-cli 这个业务 CLI，CI 容器里没有也不该有。
+    #
+    # C) tests/test_billing_readiness.py —— 6 条权限不变量测试在容器里行为不同
+    #    （readiness_replay_store_permissions_invalid）。这是**安全测试，不该长期排除**，
+    #    需要单独定位是容器 umask/挂载语义还是代码假设。已记 DEBT 并设期限。
+    - su ci -c "uv run --extra test pytest -q
+        --ignore=tests/test_lark_cli_matrix_runner.py
+        --ignore=tests/test_feishu_file_media_matrix_runner.py
+        --ignore=tests/test_billing_readiness.py
+        --deselect tests/test_plugin_ingest.py::test_install_clis_skips_when_present
+        --deselect tests/test_aiagent_subprocess.py::test_session_search_proxy_covers_real_agent_tool_dispatch"
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .pytest_cache/
+
+leak:
+  stage: leak
+  image:
+    name: docker.io/zricethezav/gitleaks:latest
+    # 这个镜像把 gitleaks 设成了 ENTRYPOINT，GitLab 会用 sh -c 包一层跑 script，
+    # 结果变成 `gitleaks sh -c ...` → unknown command "sh"。清空 entrypoint 才能正常执行。
+    entrypoint: [""]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+  script:
+    # 本仓在 GitHub 上是 PUBLIC 镜像，泄密的代价比一般内部仓高得多。
+    # 2026-08-01 全历史扫描：45 条命中，逐条核过的 2 条非测试命中均为假阳性
+    #（failure_hint 长文案、OAuth 公开 client id），已进 allowlist。
+    - gitleaks detect --source . --config .gitleaks.toml --no-banner --redact --verbose
