@@ -69,6 +69,51 @@ def _job_belongs_to_this_gateway(job: dict) -> bool:
     return bool(source_app) and bool(owned_app) and source_app == owned_app
 
 
+def _release_cron_run_claim(cron_jobs: Any, cron_scheduler: Any, job: dict) -> bool:
+    """Clear the one-shot ``run_claim`` core stamped on a job we then rejected.
+
+    Core ``get_due_jobs()`` stamps a ``run_claim`` on every due ``once`` job
+    BEFORE returning it, so the ownership filter always runs on an
+    already-claimed job. A claim we abandon is not re-scanned by core until it
+    ages past ``ONESHOT_RUN_CLAIM_TTL_SECONDS`` (1800s), which is longer than
+    the one-shot's whole life: the gateway that DOES own the job never sees it
+    as due and it silently never fires. Releasing in the same tick hands it
+    back immediately.
+
+    Compare-and-clear under the jobs lock (same shape as core's
+    ``heartbeat_run_claim``) so a claim another process has since taken over is
+    left alone. Never raises — a failed release costs one TTL, an exception
+    here would cost the rest of the profile's scan.
+    """
+    claim = job.get("run_claim")
+    if not isinstance(claim, dict) or job.get("schedule", {}).get("kind") != "once":
+        return False  # only one-shots are ever claimed by the due scan
+    job_id = str(job.get("id") or "").strip()
+    try:
+        load_jobs = _cw._cron_scheduler_function(cron_jobs, cron_scheduler, "load_jobs")
+        save_jobs = _cw._cron_scheduler_function(cron_jobs, cron_scheduler, "save_jobs")
+        # save_jobs() takes the lock itself (re-entrant); holding it across the
+        # whole load→modify→save is what keeps the read-modify-write atomic
+        # against a concurrent tick. Cores without the private lock helper
+        # degrade to save_jobs()' own locking.
+        jobs_lock = getattr(cron_jobs, "_jobs_lock", None)
+        with jobs_lock() if callable(jobs_lock) else contextlib.nullcontext():
+            jobs = load_jobs()
+            for stored in jobs:
+                if str(stored.get("id") or "").strip() != job_id:
+                    continue
+                if stored.get("run_claim") != claim:
+                    return False  # re-claimed or already cleared elsewhere
+                stored["run_claim"] = None
+                save_jobs(jobs)
+                return True
+    except Exception:
+        logger.exception(
+            "[multitenancy] cron run_claim release failed job=%s", job_id
+        )
+    return False
+
+
 def _resolve_profiles_root() -> Optional[Path]:
     hermes_home = os.environ.get("HERMES_HOME")
     if not hermes_home:
@@ -391,6 +436,10 @@ def _scan_and_submit_due_profile_jobs(
                     # per-app sub-locks only if mixed router/expert scans ever
                     # show starvation under real load.
                     if not _cw._job_belongs_to_this_gateway(job):
+                        # get_due_jobs() already claimed this one-shot for us;
+                        # hand it straight back or the owning gateway is locked
+                        # out of it for the whole claim TTL.
+                        _cw._release_cron_run_claim(cron_jobs, cron_scheduler, job)
                         logger.debug(
                             "[multitenancy] cron due job owned by another gateway profile=%s job=%s source_app=%s",
                             profile_dir.name,
