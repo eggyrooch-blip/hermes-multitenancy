@@ -309,3 +309,31 @@ def test_first_full_profiles_run_raises_the_disk_floor(env):
     assert result.returncode != 0
     assert "首次全量" in result.stdout
     assert _state_snapshots(env) == []
+
+
+def test_drill_ignores_incomplete_backup_without_sentinel(env):
+    """半途失败留下的残缺目录不能被当成"最新一份"——拿残缺备份跑出"通过"比没备份更糟。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    good = _state_snapshots(env)[-1]
+    assert (good / "COMPLETE").exists(), "成功的备份必须落下完成哨兵"
+
+    # 伪造一份"更新但残缺"的备份（时间戳更大、没有哨兵）
+    broken = good.parent / "29991231T235959"
+    shutil.copytree(good, broken)
+    (broken / "COMPLETE").unlink()
+
+    result = _run(DRILL_SH, env)
+    assert result.returncode == 0, "应当跳过残缺目录、改用上一份完整备份"
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert good.name in report, "演练应当选中带哨兵的那一份"
+    assert "29991231" not in report
+
+
+def test_drill_refuses_when_every_backup_is_incomplete(env):
+    """一份完整的都没有时，必须明确报错，而不是拿残缺的凑合。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    (_state_snapshots(env)[-1] / "COMPLETE").unlink()
+
+    result = _run(DRILL_SH, env)
+    assert result.returncode != 0
+    assert "COMPLETE" in result.stderr

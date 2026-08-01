@@ -200,6 +200,10 @@ uniq_dest() {
 STATE_DEST="$(uniq_dest "$STATE_ROOT/$TS")"
 mv "$STAGING" "$STATE_DEST"
 STAGING=""   # 已落地，别让 cleanup 再去动它
+# 完成哨兵：只有走到这里的目录才算一份可用备份。
+# 没有它的话，一次半途失败留下的目录会被演练/下次增量当成"最新的一份"，
+# 于是拿一份残缺备份去演练还报"通过"——那比没有备份更糟。
+date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DEST/COMPLETE"
 log "状态核心完成 → ${STATE_DEST}（${backed_up} 个库）"
 
 # ── 第二层:profiles 硬链增量 ────────────────────────────────────────

@@ -25,8 +25,14 @@ REPORT="$REPORT_DIR/drill-$TS.md"
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 [ -d "$STATE_ROOT" ] || die "找不到备份目录 $STATE_ROOT —— 先跑过一次 hermes-backup.sh"
-SRC="$(ls -1d "$STATE_ROOT"/*/ 2>/dev/null | sort | tail -1 || true)"
-[ -n "$SRC" ] || die "$STATE_ROOT 下没有任何备份"
+# 只认带 COMPLETE 哨兵的目录。半途失败留下的残缺目录必须被跳过，
+# 否则演练会拿一份缺数据的备份跑出"通过"——假绿比没有更危险。
+SRC=""
+while IFS= read -r cand; do
+  [ -n "$cand" ] || continue
+  [ -f "${cand%/}/COMPLETE" ] && SRC="${cand%/}"
+done < <(ls -1d "$STATE_ROOT"/*/ 2>/dev/null | sort || true)
+[ -n "$SRC" ] || die "$STATE_ROOT 下没有任何【完整】备份（缺 COMPLETE 哨兵）"
 SRC="${SRC%/}"
 
 # 顺序很重要：先校验目标合法，再创建任何东西。
