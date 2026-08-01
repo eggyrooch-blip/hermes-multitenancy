@@ -413,3 +413,21 @@ def test_installer_seeds_stable_bin_on_a_fresh_host(tmp_path):
              "SRC": str(DEPLOY), "HOME": str(tmp_path), "PATH": os.environ["PATH"]},
         capture_output=True,
     ).returncode == 0
+
+
+def test_deploy_scripts_are_executable_in_git(): 
+    """发布脚本在 git 里必须是 100755。
+
+    2026-08-01 实弹踩到：它们被以 644 提交，worktree 检出后不可执行，
+    执行器的「新版本必须自带可执行探针」守卫直接拒绝切换 —— 守卫是对的，
+    但根因是打包缺陷。用测试守住，别再靠实弹发现。
+    """
+    import subprocess as sp
+    repo = Path(__file__).resolve().parents[1]
+    out = sp.run(["git", "-C", str(repo), "ls-files", "-s", "deploy/"],
+                 capture_output=True, text=True).stdout
+    modes = {line.split()[3]: line.split()[0] for line in out.splitlines() if line.strip()}
+    for f in ("deploy/hermes-release.sh", "deploy/hermes-release-probes.sh",
+              "deploy/hermes_patch_probe.py", "deploy/install-hermes-release.sh",
+              "deploy/hermes-backup.sh", "deploy/hermes-restore-drill.sh"):
+        assert modes.get(f) == "100755", f"{f} 在 git 里是 {modes.get(f)}，必须是 100755"
