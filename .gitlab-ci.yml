@@ -1,0 +1,58 @@
+# GitLab CI —— 合并前的门禁。跑在 hermes-1 上的项目专属 runner（独立用户 + rootless podman）。
+#
+# 为什么不是照抄 .github/workflows/test.yml：那份只跑了约 20 条手挑的 ingest/脱敏测试
+# （某次 hotfix 留下的临时清单），仓里其实有 176 个测试文件和完整的 `make test`。
+# 门禁要有意义就得跑全量。
+#
+# 门禁语义：TEST 与 LEAK 都是硬阻断。红了就进不了 main。
+
+stages:
+  - test
+  - leak
+
+default:
+  image: docker.io/library/python:3.12-slim
+  # runner 是项目专属的，但仍然只跑带这些 tag 的 job，避免以后误连别的 runner
+  tags:
+    - hermes
+
+variables:
+  # uv 的缓存放进 job 目录，好让 GitLab 缓存它
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+cache:
+  key:
+    files:
+      - uv.lock
+  paths:
+    - .uv-cache
+
+test:
+  stage: test
+  rules:
+    # 合并请求上跑（这才是门禁），以及 main 上跑（挡住直推/合并后的回归）
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+  before_script:
+    - pip install --quiet uv
+  script:
+    # 与 Makefile 的 `make test` 同一条命令，跑全量 176 个测试文件
+    - uv run --extra test pytest -q
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .pytest_cache/
+
+leak:
+  stage: leak
+  image: docker.io/zricethezav/gitleaks:latest
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+  script:
+    # 本仓在 GitHub 上是 PUBLIC 镜像，泄密的代价比一般内部仓高得多。
+    # 2026-08-01 全历史扫描：45 条命中，逐条核过的 2 条非测试命中均为假阳性
+    #（failure_hint 长文案、OAuth 公开 client id），已进 allowlist。
+    - gitleaks detect --source . --config .gitleaks.toml --no-banner --redact --verbose

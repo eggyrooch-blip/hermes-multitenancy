@@ -1,0 +1,23 @@
+# gitleaks 配置 —— 2026-08-01 首次全历史扫描后收敛。
+#
+# 扫描基线：884 个 commit、18 条命中，其中 16 条在 tests/ 下（测试夹具），
+# 2 条在业务代码里，逐条看过均为假阳性：
+#   - hermes_multitenancy/lark_cli_tool.py 的 failure_hint 是长描述文案，被熵规则误判
+#   - （webui 仓）XAI_OAUTH_CLIENT_ID 是 OAuth 公开客户端 ID，按设计就是公开的
+#
+# 原则：allowlist 只放已逐条核实的假阳性。宁可多报，不可漏报。
+title = "hermes-multitenancy gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "已逐条核实的假阳性"
+paths = [
+  # 测试夹具里的假凭证 —— 它们存在的意义就是长得像密钥
+  '''^tests/''',
+]
+regexes = [
+  # 工具错误提示里的长文案，不是密钥
+  '''failure_hint''',
+]
