@@ -89,6 +89,12 @@ def env(tmp_path: Path):
     (stable / ".env").write_text("SECRET=x\n")
     (stable / ".env").chmod(0o600)
 
+    # 桩备份脚本：脚本现在要求 BACKUP_SH 必须存在且可执行
+    #（缺了就静默跳过 = 悄悄失去「不带备份不发布」这条保护）
+    bstub = tmp_path / "backup-stub.sh"
+    bstub.write_text('#!/usr/bin/env bash\nmkdir -p "$BACKUP_ROOT/state/x/db"\nexit 0\n')
+    bstub.chmod(0o755)
+
     # 桩 systemctl：只记调用，不真动服务
     stub = tmp_path / "systemctl-stub.sh"
     stub.write_text("#!/usr/bin/env bash\necho \"$@\" >> \"$SYSTEMCTL_LOG\"\nexit 0\n")
@@ -100,7 +106,7 @@ def env(tmp_path: Path):
         "BACKUP_ROOT": str(home / "backups" / "pre-release"),
         "LOCK": str(home / ".hermes" / ".release.lock"),
         "SYSTEMCTL": str(stub), "SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
-        "BACKUP_SH": "/nonexistent",       # 备份另有测试覆盖，这里不重复
+        "BACKUP_SH": str(bstub),           # 备份本体另有测试覆盖，这里只要它存在
         "PROBES": str(DEPLOY / "hermes-release-probes.sh"),
         "PATH": os.environ["PATH"],
         "_mt_sha": mt_sha, "_webui_sha": webui_sha,
@@ -362,3 +368,12 @@ def test_stable_bin_bootstrap_only_after_success(env, tmp_path):
     _tag(env, "release-sb2", f"multitenancy: {_git(src, 'rev-parse', 'HEAD')}\nwebui: {env['_webui_sha']}")
     assert _run({**env, "STABLE_BIN": str(stable)}).returncode == 0
     assert (stable / "hermes-release.sh").exists(), "成功后应把执行器同步到稳定路径"
+
+
+def test_missing_backup_script_blocks_release(env):
+    """缺了备份脚本就静默跳过 = 悄悄失去「不带备份不发布」这条保护。
+    换机器或路径变动时最容易踩，必须拒绝。"""
+    _tag(env, "release-nobk", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run({**env, "BACKUP_SH": "/nonexistent"})
+    assert r.returncode != 0
+    assert "不带备份不发布" in r.stderr

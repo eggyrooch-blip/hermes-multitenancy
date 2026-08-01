@@ -17,7 +17,9 @@ set -uo pipefail
 HERMES_HOME_DIR="${HERMES_HOME_DIR:-$HOME/.hermes}"
 HERMES_WEBUI_DIR="${HERMES_WEBUI_DIR:-$HOME/.hermes-web-ui}"
 VENV_PY="${VENV_PY:-$HOME/.hermes/hermes-agent/venv/bin/python}"
-USER_UNITS="${USER_UNITS:-hermes-gateway.service hermes-web-ui.service ai-gateway-broker.service}"
+# 专家 bot 的 gateway 也要探 —— 它跑着同一份代码，发布后没起来就是发布没成功。
+_expert_units() { $SYSTEMCTL list-units --type=service --all --no-pager 2>/dev/null \
+  | grep -oE 'hermes-gateway@[A-Za-z0-9_-]+\.service' | sort -u | tr '\n' ' '; }
 WEBUI_URL="${WEBUI_URL:-http://127.0.0.1:8648}"
 BROKER_URL="${BROKER_URL:-http://127.0.0.1:8766}"
 APISERVER_PORT="${APISERVER_PORT:-8652}"
@@ -32,6 +34,9 @@ ok()  { printf '  ✓ %s\n' "$*"; pass=$((pass+1)); }
 bad() { printf '  ✗ %s\n' "$*"; fail=$((fail+1)); }
 
 # ── 1. systemd 单元 ──────────────────────────────────────────────────
+# 探针本来就要跑 systemctl，这里展开无所谓；专家 bot 的 gateway 也必须探 ——
+# 它跑着同一份代码，发布后没起来就是发布没成功。
+USER_UNITS="${USER_UNITS:-hermes-gateway.service hermes-web-ui.service ai-gateway-broker.service $(_expert_units)}"
 for u in $USER_UNITS; do
   st=$($SYSTEMCTL is-active "$u" 2>/dev/null)
   [ "$st" = "active" ] && ok "$u = active" || bad "$u = ${st:-unknown}"

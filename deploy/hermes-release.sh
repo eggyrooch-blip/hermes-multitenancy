@@ -25,7 +25,14 @@ KEEP_RELEASES="${KEEP_RELEASES:-3}"
 PROBES="${PROBES:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hermes-release-probes.sh}"
 BACKUP_SH="${BACKUP_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hermes-backup.sh}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl --user}"
-UNITS="${UNITS:-hermes-gateway.service hermes-web-ui.service}"
+# 生产上除了主 gateway 还跑着 hermes-gateway@<profile>.service（专家 bot）。
+# 它的 WorkingDirectory 也走同一条软链，但进程不重启 = 内存里还是旧代码，
+# 发布等于没对它生效。动态枚举，以后新增专家 profile 自动覆盖。
+# 注意是【惰性】求值：无新标签时脚本必须完全静默，连一次 list-units 都不该跑。
+# 在变量赋值处直接展开会让每次定时器空转都去问一遍 systemd。
+_expert_units() { $SYSTEMCTL list-units --type=service --all --no-pager 2>/dev/null \
+  | grep -oE 'hermes-gateway@[A-Za-z0-9_-]+\.service' | sort -u | tr '\n' ' '; }
+_units() { printf '%s' "${UNITS:-hermes-gateway.service hermes-web-ui.service $(_expert_units)}"; }
 DRY_RUN="${DRY_RUN:-0}"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -102,10 +109,11 @@ PREV_WEBUI=$(readlink "$CODE/hermes-web-ui" || true)
 SNAP="$BACKUP_ROOT/$TAG"
 log "做发布前回滚包 → $SNAP"
 mkdir -p "$SNAP"
-if [ -x "$BACKUP_SH" ]; then
-  SKIP_PROFILES=1 BACKUP_ROOT="$SNAP" "$BACKUP_SH" >"$SNAP/backup.log" 2>&1 \
-    || die "发布前备份失败 —— 不带备份不发布"
-fi
+# 缺了备份脚本就静默跳过 = 悄悄失去「不带备份不发布」这条保护。
+# 换机器或路径变动时最容易踩。缺失即拒绝。
+[ -x "$BACKUP_SH" ] || die "找不到可执行的备份脚本（$BACKUP_SH）—— 不带备份不发布"
+SKIP_PROFILES=1 BACKUP_ROOT="$SNAP" "$BACKUP_SH" >"$SNAP/backup.log" 2>&1 \
+  || die "发布前备份失败 —— 不带备份不发布"
 { echo "tag=$TAG"; echo "prev_mt=$PREV_MT"; echo "prev_webui=$PREV_WEBUI"
   echo "new_mt=$MT_SHA"; echo "new_webui=$WEBUI_SHA"
   echo "state_snapshot=$SNAP/state"
@@ -170,27 +178,41 @@ NEW_PROBES="$MT_DIR/deploy/$(basename "$PROBES")"
 log "  两个版本目录都就绪且自带探针（此刻生产仍跑旧版）"
 
 # ── 原子切换 ─────────────────────────────────────────────────────────
+# `ln -sfn` 是「先 unlink 再 symlink」——中间有一瞬间这个路径根本不存在。
+# 而 editable 导入(MAPPING 写死 /home/hermes/code/hermes-multitenancy/...)和
+# webui 的 WorkingDirectory 都要走这条路径，落在窗口里的请求会直接失败。
+# 唯一原子的做法是 rename(2)，也就是 `mv -T`（GNU 扩展）。
+# 生产是 Linux，必须走原子路径；macOS 没有 -T，只在本地测试里退化，
+# 并且这里会明说它非原子，免得以后有人以为两边行为一样。
+if mv --help 2>&1 | grep -q -- "-T"; then ATOMIC_MV=1; else ATOMIC_MV=0; fi
+
+relink() {  # $1=目标  $2=软链路径
+  if [ "$ATOMIC_MV" = "1" ]; then
+    ln -sfn "$1" "$2.new" || return 1
+    mv -Tf "$2.new" "$2" || return 1      # rename(2)：路径任何一刻都指向一个有效版本
+  else
+    ln -sfn "$1" "$2" || return 1          # 非原子，仅本地测试
+  fi
+}
+
 flip() {  # $1=mt 目标  $2=webui 目标
-  # `ln -sfn` 对「已存在的指向目录的软链」是就地替换，Linux 和 macOS 都认。
-  # 别用 `mv -T`：那是 GNU 扩展，macOS 没有 —— 本地测试里它静默失败，
-  # 软链根本没翻，脚本却照样打印 RELEASE OK。切换必须有错误检查。
-  ln -sfn "$1" "$CODE/hermes-multitenancy" || return 1
-  ln -sfn "$2" "$CODE/hermes-web-ui" || return 1
+  relink "$1" "$CODE/hermes-multitenancy" || return 1
+  relink "$2" "$CODE/hermes-web-ui" || return 1
   # 读回来核对：切换是这套系统里最不能"以为成功"的一步
   [ "$(readlink "$CODE/hermes-multitenancy")" = "$1" ] || return 1
   [ "$(readlink "$CODE/hermes-web-ui")" = "$2" ] || return 1
 }
 
 log "停服务 → 翻软链 → 起服务"
-$SYSTEMCTL stop $UNITS 2>/dev/null || true
+$SYSTEMCTL stop $(_units) 2>/dev/null || true
 if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DIR")"; then
   log "软链切换失败 —— 翻回原样并放弃本次发布"
   flip "$PREV_MT" "$PREV_WEBUI" || true
-  $SYSTEMCTL start $UNITS 2>/dev/null || true
+  $SYSTEMCTL start $(_units) 2>/dev/null || true
   outcome FLIP_FAILED
   die "切换失败，当前版本继续跑"
 fi
-$SYSTEMCTL start $UNITS 2>/dev/null || true
+$SYSTEMCTL start $(_units) 2>/dev/null || true
 log "  已切到 $TAG，开始跑探针"
 
 # ── 探针决定去留 ─────────────────────────────────────────────────────
@@ -238,9 +260,9 @@ fi
 
 # ── 探针没过：自动翻回上一版 ─────────────────────────────────────────
 log "探针失败 —— 自动回滚到上一版"
-$SYSTEMCTL stop $UNITS 2>/dev/null || true
+$SYSTEMCTL stop $(_units) 2>/dev/null || true
 flip "$PREV_MT" "$PREV_WEBUI"
-$SYSTEMCTL start $UNITS 2>/dev/null || true
+$SYSTEMCTL start $(_units) 2>/dev/null || true
 # 回滚校验要用【旧版本自带】的探针 —— 现在跑的是旧版，判据就该跟着旧版走。
 # （用新版的探针去验旧版是张冠李戴：新版可能改了期望值。）
 OLD_PROBES="$CODE/hermes-multitenancy/deploy/$(basename "$PROBES")"
