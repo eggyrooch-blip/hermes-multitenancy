@@ -662,9 +662,10 @@ def _patch_feishu_outbound_link_render() -> None:
     if original is None or getattr(original, "_hermes_multitenancy_patched", False):
         return
 
+    # Core owns this signature; v0.19 added the keyword-only ``prefer_post``.
     @functools.wraps(original)
-    def build_outbound_payload(self: Any, content: str) -> tuple[str, str]:
-        msg_type, payload = original(self, content)
+    def build_outbound_payload(self: Any, content: str, *args: Any, **kwargs: Any) -> tuple[str, str]:
+        msg_type, payload = original(self, content, *args, **kwargs)
         if msg_type != "text":
             return msg_type, payload
         try:
