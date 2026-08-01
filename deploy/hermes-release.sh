@@ -78,6 +78,11 @@ MT_SHA=$(printf '%s\n' "$BODY" | sed -n 's/^multitenancy:[[:space:]]*//p' | head
 WEBUI_SHA=$(printf '%s\n' "$BODY" | sed -n 's/^webui:[[:space:]]*//p' | head -1)
 [ -n "$MT_SHA" ] && [ -n "$WEBUI_SHA" ] \
   || die "$TAG 的 annotation 里缺 multitenancy/webui 的 SHA —— 拒绝发布残缺清单"
+# 必须是完整 40 位 hex。手打标签时少几位、或写成分支名，都可能检出到别的东西。
+case "$MT_SHA" in *[!0-9a-f]*|"") die "multitenancy SHA 不是 40 位 hex：$MT_SHA" ;; esac
+case "$WEBUI_SHA" in *[!0-9a-f]*|"") die "webui SHA 不是 40 位 hex：$WEBUI_SHA" ;; esac
+[ ${#MT_SHA} -eq 40 ] || die "multitenancy SHA 长度不是 40：$MT_SHA"
+[ ${#WEBUI_SHA} -eq 40 ] || die "webui SHA 长度不是 40：$WEBUI_SHA"
 log "  multitenancy: ${MT_SHA:0:12}"
 log "  webui:        ${WEBUI_SHA:0:12}"
 
@@ -108,6 +113,15 @@ build_worktree() {  # $1=canonical 仓  $2=目标目录  $3=sha
   git -C "$repo" fetch -q --all --tags 2>/dev/null || true
   git -C "$repo" worktree add -q --detach "$dest" "$sha" || return 1
 }
+
+# 对象必须真的存在于各自的仓里 —— 不然 worktree add 会报一个难懂的错，
+# 而我们要的是「拒绝发布」这个明确结论。
+git -C "$RELEASES/.repo-mt" fetch -q --all --tags 2>/dev/null || true
+git -C "$RELEASES/.repo-webui" fetch -q --all --tags 2>/dev/null || true
+git -C "$RELEASES/.repo-mt" cat-file -e "${MT_SHA}^{commit}" 2>/dev/null \
+  || die "multitenancy 仓里没有这个提交：$MT_SHA"
+git -C "$RELEASES/.repo-webui" cat-file -e "${WEBUI_SHA}^{commit}" 2>/dev/null \
+  || die "webui 仓里没有这个提交：$WEBUI_SHA"
 
 MT_DIR="$RELEASES/mt-${MT_SHA:0:7}"
 WEBUI_DIR="$RELEASES/webui-${WEBUI_SHA:0:8}"
@@ -165,6 +179,16 @@ if [ ! -x "$NEW_PROBES" ]; then
 elif "$NEW_PROBES"; then
   echo "$TAG" > "$STATE_FILE"
   log "RELEASE OK — $TAG 已生效"
+  # 把执行器自身同步到「不会被翻转」的稳定路径，而且只在发布成功之后同步。
+  # 否则执行器就住在它自己要改写的那棵树里：发一个坏版本，
+  # 下次部署和回滚工具会一起坏掉 —— 连退路都没了。
+  if [ -n "${STABLE_BIN:-}" ]; then
+    mkdir -p "$STABLE_BIN"
+    for f in hermes-release.sh hermes-release-probes.sh hermes_patch_probe.py hermes-backup.sh; do
+      [ -f "$MT_DIR/deploy/$f" ] && install -m 755 "$MT_DIR/deploy/$f" "$STABLE_BIN/$f"
+    done
+    log "  执行器已同步到稳定路径 $STABLE_BIN（只在发布成功后同步）"
+  fi
   # 保留最近 N 个版本目录，别把盘撑爆
   for prefix in mt webui; do
     mapfile -t olds < <(ls -1dt "$RELEASES/$prefix"-* 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)))

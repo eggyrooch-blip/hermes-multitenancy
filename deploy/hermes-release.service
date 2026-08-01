@@ -17,7 +17,11 @@ Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin
 # 版本升级导致这个数字合理变化时，要连同代码评审一起改。
 Environment=PATCH_MIN=16
 Environment=KEEP_RELEASES=3
-ExecStart=/home/hermes/code/hermes-multitenancy/deploy/hermes-release.sh
+# 关键：跑「稳定路径」上的那份，不是 code 软链下面的那份。
+# 执行器不能住在它自己要改写的那棵树里 —— 否则发一个坏版本就把下次部署
+# 和回滚工具一起弄坏，连退路都没有。这份只在发布成功之后才被同步更新。
+Environment=STABLE_BIN=/home/hermes/.local/lib/hermes-release
+ExecStart=/home/hermes/.local/lib/hermes-release/hermes-release.sh
 # 构建 webui 要几分钟，别抢生产 IO；但不能用 idle 类（会被饿死，2026-08-01 实测）
 Nice=10
 IOSchedulingClass=best-effort
