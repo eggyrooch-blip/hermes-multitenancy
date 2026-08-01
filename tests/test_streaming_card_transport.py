@@ -309,8 +309,16 @@ def test_streaming_clarify_resolved_event_not_leaked_into_reply(monkeypatch, tmp
     async def fake_send(*, adapter, chat_id, card):
         return {"message_id": "om_clarify"}
 
+    updated: list[dict] = []
+
+    async def fake_update(*, adapter, auth_card, card):
+        updated.append(card)
+        return True
+
     monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
     monkeypatch.setattr(feishu_clarify_cards, "send_auth_card", fake_send)
+    monkeypatch.setattr(feishu_clarify_cards, "update_auth_card", fake_update)
+    monkeypatch.setattr(feishu_clarify_cards, "_CLARIFY_CARD_BY_ID", {})
     monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None)
 
     result = asyncio.run(
@@ -323,6 +331,7 @@ def test_streaming_clarify_resolved_event_not_leaked_into_reply(monkeypatch, tmp
         )
     )
 
+    assert [card["header"]["title"]["content"] for card in updated] == ["问题已过期"]
     assert result == "北京明天多云"
     assert "clarify_id" not in result
     assert "timed_out" not in result

@@ -369,3 +369,68 @@ def test_cross_chat_clarify_submit_is_rejected(monkeypatch, tmp_path):
     )
     assert same["toast"]["type"] == "success"
     assert _read_clarify_response(_clarify_bridge_dir() / f"{cid}.json") == "mine"
+
+
+def test_streaming_clarify_resolved_writes_terminal_card_without_leaking_payload(
+    monkeypatch, tmp_path
+):
+    """Regression: answering a clarify card must retire it out of 「等待你的选择」.
+
+    main only swallowed ``clarify_resolved`` so the payload dict could not reach
+    ``piece = str(delta)``; the form card was left forever showing its pending
+    state. Both halves are pinned here: exactly one terminal card is written, and
+    the reply text is still clean.
+    """
+    import asyncio
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import feishu_clarify_cards
+    from hermes_multitenancy import router as router_mod
+    from tests.test_streaming_card_transport import _CardCapableAdapter
+
+    clarify_id = "clarify_0123456789abcdef0123456789abcdef"
+    adapter = _CardCapableAdapter()
+    updated: list[dict] = []
+
+    async def fake_stream(*_args, **_kwargs):
+        yield "clarify_required", {
+            "clarify_id": clarify_id,
+            "question": "选择城市",
+            "choices": ["北京", "上海"],
+        }
+        yield "clarify_resolved", {
+            "clarify_id": clarify_id,
+            "session_key": "multitenancy:feishu:feishu_x:oc_y:ou_z",
+            "response": "北京",
+            "timed_out": False,
+        }
+        yield "content", "北京明天多云"
+        yield "done", "北京明天多云"
+
+    async def fake_send(*, adapter, chat_id, card):
+        return {"transport": "cardkit", "card_id": "cid_1", "message_id": "om_clarify", "sequence": 1}
+
+    async def fake_update(*, adapter, auth_card, card):
+        updated.append(card)
+        return True
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(feishu_clarify_cards, "send_auth_card", fake_send)
+    monkeypatch.setattr(feishu_clarify_cards, "update_auth_card", fake_update)
+    monkeypatch.setattr(feishu_clarify_cards, "_CLARIFY_CARD_BY_ID", {})
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", None)
+
+    result = asyncio.run(
+        router_mod._stream_into_feishu(
+            adapter,
+            "oc_test",
+            "profile",
+            tmp_path,
+            SimpleNamespace(source=SimpleNamespace(chat_type="dm")),
+        )
+    )
+
+    assert len(updated) == 1
+    assert updated[0]["header"]["title"]["content"] == "已回答"
+    assert result == "北京明天多云"
+    assert clarify_id not in result

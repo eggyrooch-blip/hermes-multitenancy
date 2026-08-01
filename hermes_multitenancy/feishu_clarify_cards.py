@@ -12,7 +12,7 @@ from typing import Any
 
 from .agent_real import _clarify_bridge_dir, _configure_webui_clarify_bridge
 from .feishu_adapter_compat import load_feishu_adapter, log_feishu_adapter_load_error
-from .feishu_auth_cards import send_auth_card
+from .feishu_auth_cards import send_auth_card, update_auth_card
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +30,11 @@ _MAX_ANSWER_CHARS = 2000  # ponytail: submitted-answer ceiling
 # falls back to first-writer-wins, which is acceptable.
 _CLARIFY_CHAT_BY_ID: dict[str, str] = {}  # clarify_id -> chat_id
 _LATEST_CLARIFY_BY_CHAT: dict[str, str] = {}  # chat_id -> latest clarify_id
+_CLARIFY_CARD_BY_ID: dict[str, Any] = {}  # clarify_id -> send_auth_card handle
 _CLARIFY_MAP_MAX = 256  # ponytail: in-flight clarify ceiling per process; oldest-first eviction
 
 
-def _remember(store: dict[str, str], key: str, value: str) -> None:
+def _remember(store: dict[str, Any], key: str, value: Any) -> None:
     """Record key->value with most-recent at the end, bounded oldest-first."""
     if key in store:
         del store[key]
@@ -119,7 +120,7 @@ async def handle_feishu_clarify_required(adapter: Any, chat_id: str, payload: An
     _remember(_CLARIFY_CHAT_BY_ID, clarify_id, chat_id)
     _remember(_LATEST_CLARIFY_BY_CHAT, chat_id, clarify_id)
     try:
-        await send_auth_card(
+        auth_card = await send_auth_card(
             adapter=adapter,
             chat_id=chat_id,
             card=build_clarify_card(
@@ -128,6 +129,9 @@ async def handle_feishu_clarify_required(adapter: Any, chat_id: str, payload: An
                 choices=data.get("choices"),
             ),
         )
+        if auth_card:
+            # Keep the handle so clarify_resolved can retire this exact card.
+            _remember(_CLARIFY_CARD_BY_ID, clarify_id, auth_card)
     except Exception:
         logger.warning(
             "[multitenancy] clarify card delivery failed; unblocking agent with fallback",
@@ -144,6 +148,43 @@ async def handle_feishu_clarify_required(adapter: Any, chat_id: str, payload: An
             )
         except Exception:
             logger.warning("[multitenancy] clarify fallback write failed", exc_info=True)
+
+
+def _clarify_final_card(*, timed_out: bool) -> dict[str, Any]:
+    title, body, template = (
+        ("问题已过期", "<font color='grey'>等待回答已超时，Hermes 将按最佳判断继续。</font>", "yellow")
+        if timed_out
+        else ("已回答", "已收到你的回答。", "green")
+    )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
+        "body": {"elements": [{"tag": "markdown", "content": body}]},
+    }
+
+
+async def handle_feishu_clarify_resolved(adapter: Any, payload: Any) -> None:
+    """Retire the pending clarify form to its terminal state, never blocking the run."""
+    data = payload if isinstance(payload, dict) else {}
+    clarify_id = str(data.get("clarify_id") or "")
+    if not _CLARIFY_ID_RE.fullmatch(clarify_id):
+        return
+    # The pop is the write-once guard: a replayed bridge event, or a card whose
+    # send returned no handle, is a no-op rather than a second edit.
+    auth_card = _CLARIFY_CARD_BY_ID.pop(clarify_id, None)
+    if not auth_card:
+        return
+    try:
+        await update_auth_card(
+            adapter=adapter,
+            auth_card=auth_card,
+            card=_clarify_final_card(timed_out=bool(data.get("timed_out"))),
+        )
+    except Exception:
+        # Self-protecting like handle_feishu_clarify_required: the streaming loop
+        # must never die because a card edit failed.
+        logger.warning("[multitenancy] clarify terminal card update failed", exc_info=True)
 
 
 def install_feishu_clarify_card_action_patch() -> None:

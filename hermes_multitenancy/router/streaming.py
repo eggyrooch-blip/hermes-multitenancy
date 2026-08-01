@@ -832,9 +832,13 @@ async def _stream_into_feishu_shared_consumer(
 
                     if kind == "clarify_resolved":
                         # Bridge event carries {clarify_id, session_key, response,
-                        # timed_out}; swallow it. Without this branch it falls through
-                        # to `piece = str(delta)` below and the raw dict leaks into the
-                        # user-visible reply (symmetric to approval_resolved above).
+                        # timed_out}: retire the form card, then swallow it. Without
+                        # the swallow it falls through to `piece = str(delta)` below
+                        # and the raw dict leaks into the user-visible reply
+                        # (symmetric to approval_resolved above).
+                        from ..feishu_clarify_cards import handle_feishu_clarify_resolved
+
+                        await handle_feishu_clarify_resolved(adapter, delta)
                         continue
 
                     if kind == "done":
@@ -1260,9 +1264,13 @@ async def _stream_into_feishu(
                             _m._clear_pending_approval(delta)
                         continue
                     elif kind == "clarify_resolved":
-                        # Swallow the resolved bridge event so its payload dict never
-                        # reaches the str(delta) fallthrough and leaks into the reply
-                        # text (see the shared-consumer path for the same guard).
+                        # Retire the form card, then swallow the resolved bridge event
+                        # so its payload dict never reaches the str(delta) fallthrough
+                        # and leaks into the reply text (see the shared-consumer path
+                        # for the same guard).
+                        from ..feishu_clarify_cards import handle_feishu_clarify_resolved
+
+                        await handle_feishu_clarify_resolved(adapter, delta)
                         continue
                     elif kind == "status":
                         status_text = str(delta or "").strip()
