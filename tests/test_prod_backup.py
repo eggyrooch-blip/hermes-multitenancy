@@ -63,6 +63,10 @@ def env(tmp_path: Path) -> dict[str, str]:
         "BACKUP_ROOT": str(tmp_path / "backups"),
         "DRILL_ROOT": str(tmp_path / "drill"),
         "MIN_FREE_GB": "1",
+        # 必须一起钉死：默认 FIRST_FULL_GB=25 会把首次全量的门槛抬到 1+25=26G，
+        # 于是测试变成「取决于这台机器还剩多少盘」—— 26G 以下就全红。
+        # 2026-08-01 在只剩 25G 的 Mac 上真的踩到了。磁盘门槛另有专门的测试覆盖。
+        "FIRST_FULL_GB": "0",
         "HOME": str(tmp_path / "home"),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     }
