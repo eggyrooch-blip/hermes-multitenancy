@@ -83,6 +83,12 @@ def env(tmp_path: Path):
     (code / "hermes-multitenancy").symlink_to("../releases/mt-current")
     (code / "hermes-web-ui").symlink_to("../releases/webui-current")
 
+    # 稳定 .env：脚本会校验它存在且权限 600
+    stable = home / ".hermes-web-ui"
+    stable.mkdir(parents=True, exist_ok=True)
+    (stable / ".env").write_text("SECRET=x\n")
+    (stable / ".env").chmod(0o600)
+
     # 桩 systemctl：只记调用，不真动服务
     stub = tmp_path / "systemctl-stub.sh"
     stub.write_text("#!/usr/bin/env bash\necho \"$@\" >> \"$SYSTEMCTL_LOG\"\nexit 0\n")
@@ -219,3 +225,99 @@ def test_dry_run_never_touches_anything(env):
     assert "DRY_RUN=1" in r.stdout
     assert _links(env) == before
     assert not Path(env["SYSTEMCTL_LOG"]).exists()
+
+
+# ── 6. 评审 round 2 逼出来的加固项 ───────────────────────────────────
+
+
+@pytest.mark.parametrize("bad", ["deadbeef", "zz" * 20, ""])
+def test_malformed_sha_is_refused(env, bad):
+    """手打标签少写几位、或误写成分支名，必须得到明确的拒绝，
+    而不是一个难懂的 worktree 报错、更不能检出到别的东西。"""
+    _tag(env, f"release-bad-{abs(hash(bad)) % 9999}",
+         f"multitenancy: {bad}\nwebui: {env['_webui_sha']}")
+    before = _links(env)
+    r = _run(env)
+    assert r.returncode != 0
+    assert ("40 位 hex" in r.stderr or "长度不是 40" in r.stderr
+            or "没有这个提交" in r.stderr or "残缺清单" in r.stderr)
+    assert _links(env) == before
+
+
+def test_missing_stable_env_blocks_build(env):
+    """webui 的 .env 不在 git 里；稳定副本缺了就起不来，必须在构建前拦住。"""
+    (Path(env["HOME"]) / ".hermes-web-ui" / ".env").unlink()
+    _tag(env, "release-noenv", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert "缺少稳定的 webui .env" in r.stderr
+
+
+def test_loose_env_permissions_block_build(env):
+    """22 行密钥不能摊开给同机其他用户。"""
+    envfile = Path(env["HOME"]) / ".hermes-web-ui" / ".env"
+    envfile.chmod(0o644)
+    _tag(env, "release-openenv", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert "必须是 600" in r.stderr
+
+
+def test_every_terminal_branch_records_an_outcome(env):
+    """只 exit 1 的话运维手上只有一份陈旧锚点，看不出这次是成了、退了、还是退也没退成。"""
+    src = env["_mt_src"]
+    (src / "extra").write_text("x\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "green")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-outcome", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    assert _run(env).returncode == 0
+    rb = Path(env["BACKUP_ROOT"]) / "release-outcome" / "ROLLBACK.txt"
+    assert "outcome=SUCCESS" in rb.read_text()
+
+
+def test_rollback_branch_records_outcome(env):
+    src = env["_mt_src"]
+    (src / "deploy" / "hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (src / "deploy" / "hermes-release-probes.sh").chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "red")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-redout", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    assert _run(env).returncode != 0
+    rb = (Path(env["BACKUP_ROOT"]) / "release-redout" / "ROLLBACK.txt").read_text()
+    assert "outcome=ROLLED_BACK" in rb or "outcome=NEEDS_HUMAN" in rb
+
+
+def test_env_hash_survives_a_release(env):
+    """.env 跨版本必须原样存活 —— 这是迁移时最大的雷。"""
+    import hashlib
+    envfile = Path(env["HOME"]) / ".hermes-web-ui" / ".env"
+    before = hashlib.sha256(envfile.read_bytes()).hexdigest()
+
+    src = env["_mt_src"]
+    (src / "e2").write_text("x\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "g2")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-envkeep", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+    assert _run(env).returncode == 0
+
+    assert hashlib.sha256(envfile.read_bytes()).hexdigest() == before
+    link = Path(env["CODE"]) / "hermes-web-ui" / ".env"
+    assert link.exists(), "release 目录里应有指向稳定 .env 的软链"
+
+
+def test_prune_never_removes_the_rollback_target(env):
+    """裁剪按绝对路径精确比对：当前版本和上一版(回滚目标)都不许删。"""
+    src = env["_mt_src"]
+    kept = []
+    for i in range(3):
+        (src / f"f{i}").write_text("x\n")
+        _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", f"c{i}")
+        sha = _git(src, "rev-parse", "HEAD")
+        _tag(env, f"release-p{i}", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+        assert _run(env).returncode == 0, f"第 {i} 次发布应成功"
+        kept.append(sha[:7])
+
+    cur = os.readlink(Path(env["CODE"]) / "hermes-multitenancy")
+    assert (Path(env["RELEASES"]) / Path(cur).name).is_dir(), "当前版本目录必须还在"

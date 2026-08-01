@@ -51,6 +51,10 @@ for r in "$RELEASES/.repo-mt" "$RELEASES/.repo-webui"; do
   if [ -n "$(find "$r" -not -user "$(id -un)" -print -quit 2>/dev/null)" ]; then
     log "修正 $r 的属主（root 占用是本机老坑）"
     chown -R "$(id -un):$(id -gn)" "$r" 2>/dev/null || true
+    # `|| true` 吞掉失败等于放任下一次 18:00 部署撞在同一个坑上。
+    # 必须核实真的能写，不能只是"试过了"。
+    [ -w "$r/.git" ] || [ -w "$r" ] \
+      || die "$r 仍不可写（属主修正失败）—— 拒绝在坏权限上跑 git"
   fi
 done
 
@@ -103,8 +107,18 @@ if [ -x "$BACKUP_SH" ]; then
     || die "发布前备份失败 —— 不带备份不发布"
 fi
 { echo "tag=$TAG"; echo "prev_mt=$PREV_MT"; echo "prev_webui=$PREV_WEBUI"
-  echo "new_mt=$MT_SHA"; echo "new_webui=$WEBUI_SHA"; } > "$SNAP/ROLLBACK.txt"
+  echo "new_mt=$MT_SHA"; echo "new_webui=$WEBUI_SHA"
+  echo "state_snapshot=$SNAP/state"
+  # 哪些库进了快照、哪些没有，直接指到备份自己的 MANIFEST，别让人去猜
+  for m in "$SNAP"/state/*/MANIFEST.txt; do
+    [ -f "$m" ] || continue
+    grep -E '^(db_count|db_missing|db_empty_skipped)=' "$m" | sed 's/^/backup_/'
+  done; } > "$SNAP/ROLLBACK.txt"
 log "  回滚锚点已记录"
+
+# 每个终局都要留下结论。只 exit 1 的话，运维手上只有一份"陈旧的锚点"，
+# 根本看不出这次到底是成功了、回滚了、还是回滚也没成。
+outcome() { printf '%s\n' "outcome=$1" "at=$(date -Is)" >> "$SNAP/ROLLBACK.txt"; }
 
 # ── 构建新版本目录（不碰正在跑的目录）────────────────────────────────
 build_worktree() {  # $1=canonical 仓  $2=目标目录  $3=sha
@@ -131,8 +145,14 @@ build_worktree "$RELEASES/.repo-mt" "$MT_DIR" "$MT_SHA" || die "multitenancy 检
 
 log "构建 webui → $WEBUI_DIR（含 npm ci + build，要几分钟）"
 if build_worktree "$RELEASES/.repo-webui" "$WEBUI_DIR" "$WEBUI_SHA"; then
-  # .env 不在 git 里，指向跨版本稳定的那一份
-  ln -sfn "$HOME/.hermes-web-ui/.env" "$WEBUI_DIR/.env"
+  # .env 不在 git 里，指向跨版本稳定的那一份。
+  # 先确认它真的在、且权限没被放宽 —— 缺了它 webui 起不来，
+  # 权限松了等于把 22 行密钥摊开给同机其他用户。
+  STABLE_ENV="$HOME/.hermes-web-ui/.env"
+  [ -f "$STABLE_ENV" ] || die "缺少稳定的 webui .env（$STABLE_ENV）—— 拒绝构建"
+  mode=$(stat -c '%a' "$STABLE_ENV" 2>/dev/null || stat -f '%Lp' "$STABLE_ENV" 2>/dev/null)
+  [ "$mode" = "600" ] || die "$STABLE_ENV 权限是 $mode，必须是 600"
+  ln -sfn "$STABLE_ENV" "$WEBUI_DIR/.env"
   if [ ! -f "$WEBUI_DIR/dist/server/index.js" ]; then
     ( cd "$WEBUI_DIR" && npm ci --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1 ) \
       || die "webui 构建失败 —— 没切换任何东西，当前版本继续跑"
@@ -167,6 +187,7 @@ if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DI
   log "软链切换失败 —— 翻回原样并放弃本次发布"
   flip "$PREV_MT" "$PREV_WEBUI" || true
   $SYSTEMCTL start $UNITS 2>/dev/null || true
+  outcome FLIP_FAILED
   die "切换失败，当前版本继续跑"
 fi
 $SYSTEMCTL start $UNITS 2>/dev/null || true
@@ -178,6 +199,7 @@ if [ ! -x "$NEW_PROBES" ]; then
   log "探针脚本消失了（$NEW_PROBES）—— 无法验证，按最坏情况回滚"
 elif "$NEW_PROBES"; then
   echo "$TAG" > "$STATE_FILE"
+  outcome SUCCESS
   log "RELEASE OK — $TAG 已生效"
   # 把执行器自身同步到「不会被翻转」的稳定路径，而且只在发布成功之后同步。
   # 否则执行器就住在它自己要改写的那棵树里：发一个坏版本，
@@ -190,15 +212,25 @@ elif "$NEW_PROBES"; then
     log "  执行器已同步到稳定路径 $STABLE_BIN（只在发布成功后同步）"
   fi
   # 保留最近 N 个版本目录，别把盘撑爆
+  # 保护名单按【绝对路径精确比对】。子串匹配会误伤：
+  # 比如 mt-df0 会被 mt-df07143 的链接串命中而永不裁剪，
+  # 反过来也可能把该留的回滚目标当成无关目录删掉。
+  KEEP_A=$(cd "$CODE" && cd "$(readlink hermes-multitenancy)" && pwd)
+  KEEP_B=$(cd "$CODE" && cd "$(readlink hermes-web-ui)" && pwd)
+  KEEP_C=$(cd "$RELEASES" && cd "$(basename "$PREV_MT")" 2>/dev/null && pwd || true)
+  KEEP_D=$(cd "$RELEASES" && cd "$(basename "$PREV_WEBUI")" 2>/dev/null && pwd || true)
   for prefix in mt webui; do
+    repo="$RELEASES/.repo-$prefix"
     mapfile -t olds < <(ls -1dt "$RELEASES/$prefix"-* 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)))
     for d in "${olds[@]:-}"; do
-      [ -n "$d" ] || continue
-      case "$(readlink "$CODE/hermes-multitenancy")$(readlink "$CODE/hermes-web-ui")" in
-        *"$(basename "$d")"*) continue ;;   # 正在用的绝不删
+      [ -n "$d" ] && [ -d "$d" ] || continue
+      abs=$(cd "$d" && pwd)
+      # 当前在用的、以及上一版（回滚目标）都不许删
+      case "$abs" in
+        "$KEEP_A"|"$KEEP_B"|"$KEEP_C"|"$KEEP_D") continue ;;
       esac
-      git -C "$RELEASES/.repo-${prefix/mt/mt}" worktree remove --force "$d" 2>/dev/null || rm -rf "$d"
-      log "  裁剪旧版本 $(basename "$d")"
+      git -C "$repo" worktree remove --force "$abs" 2>/dev/null || rm -rf "$abs"
+      log "  裁剪旧版本 $(basename "$abs")"
     done
   done
   exit 0
@@ -213,8 +245,10 @@ $SYSTEMCTL start $UNITS 2>/dev/null || true
 # （用新版的探针去验旧版是张冠李戴：新版可能改了期望值。）
 OLD_PROBES="$CODE/hermes-multitenancy/deploy/$(basename "$PROBES")"
 if [ -x "$OLD_PROBES" ] && "$OLD_PROBES"; then
+  outcome ROLLED_BACK
   log "ROLLED BACK — 已退回 ${CURRENT:-上一版}，探针复检通过"
 else
+  outcome NEEDS_HUMAN
   log "ROLLED BACK 但复检仍未全过 —— 需要人工介入，回滚锚点在 $SNAP/ROLLBACK.txt"
 fi
 exit 1
