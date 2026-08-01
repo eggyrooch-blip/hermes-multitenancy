@@ -148,3 +148,40 @@ CI（`.gitlab-ci.yml`）首次真跑全量测试时暴露的，逐条记账。�
 pre-receive 拒（GitHub 正常）。这是**设计预期**——一切必须走 MR——但在
 `ship_backend=pr` 打通之前，GitLab 镜像会滞后。当前靠临时放开保护同步基线，
 不可持续。修法：把 `ship_backend` 翻成 `pr`。
+
+## 2026-08-01 — 原子发布执行器上线时的已知缺口
+
+### D5 — 发布前备份只做状态核心，不含 profiles
+
+`hermes-release.sh` 调 `hermes-backup.sh` 时传了 `SKIP_PROFILES=1`：发布回滚包只需要
+6 个库 + 配置，40G profiles 每次发布都拷一遍不现实。代价：如果一次发布同时改坏了
+profiles 里的东西，回滚包救不了 —— 得靠每日备份（保留 7 份硬链快照）。
+目前发布不碰 profiles，风险可接受；哪天发布开始动 profiles 结构，这条要重新评估。
+
+### D6 — webui 构建期若需要 .env，当前没喂
+
+`.env` 已挪到 `~/.hermes-web-ui/.env` 并在 release 目录里做软链，运行期没问题。
+但如果将来构建期（vite/next 的 define 注入）也要读它，现在的流程没有显式传入。
+届时要从稳定路径 source 进构建环境，且不能把密钥写进 release 树。
+
+### D7 — 首次部署的鸡生蛋
+
+`~/code/hermes-*` 必须先是软链，执行器才肯工作（否则直接 die）。这次是手工迁移的，
+迁移步骤只在 SPEC 的 Plan 里，没有脚本化。换机器或重建时要照着 Plan 手工再来一遍。
+
+### D8 — 保留策略只按目录数，不看磁盘
+
+`KEEP_RELEASES=3` 是固定份数。webui 一个 release 目录 834M（含 node_modules），
+3 份约 2.5G，当前 275G 可用没问题。但没有「磁盘低于 X 就多裁」的逻辑。
+
+### D9 — 原子发布执行器:终局评审 BLOCK 的开放项（2026-08-01）
+
+grok 终局裁决为 BLOCK，开放项全是**测试覆盖完整性**，不是已实现行为的缺陷：
+dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单元启动断言、
+六库快照布局在 release 层的显式记录、EnvironmentFiles 预检。
+已补三条（裁剪必须保住回滚目标、非软链拒绝、STABLE_BIN 只在成功后同步），18/18 绿。
+剩余项需要注入 live systemctl 或属于 ops checklist。**未 ship，等 sunke 放行。**
+
+同轮降级为债的还有：`hermes-release.sh:backup:missing-script-skips-silently` ——
+`BACKUP_SH` 不可执行时静默跳过发布前备份。当前生产上它存在且可执行，
+但换机器/路径变动时会静默失去"不带备份不发布"这条保护。修法：缺失即 die。
