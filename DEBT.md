@@ -77,3 +77,37 @@ synthetic 类补上;register 期安装保留兜其它装载顺序。
 **根治方向**:把"启动期重跑全部类补丁"做成一个统一入口(或等核心给 gateway-started
 钩子),而不是每个补丁各自补一次。修前必须逐个确认幂等 marker 挂在方法对象上、
 且重跑不会双重包裹。
+
+## 2026-08-01 v0190-compat-commit-triage · `44f6d71` 多问题澄清卡能力未搬入 main(需产品拍板)
+
+**背景**:`feat/local-hermes-agent-v0190-compat` 分支(分叉点 `c5e4110` @ 2026-07-10)上的
+`44f6d71 feat: improve Feishu card feedback` 是一整套澄清卡能力增强,281 行实质代码 +
+约 1700 行测试,横跨 10 个源文件。main 在分叉后独立走了 161 个 commit,澄清卡是另一套实现。
+本 slug 的 triage 判定它为**真缺口**,但**不在 triage 里搬运** —— 它是 `feat:` 不是 `fix:`,
+整体搬运是独立项目,需要产品决策。其余 5 个 commit 的裁定见
+`.ftask/v0190-compat-commit-triage/TRIAGE.md`。
+
+**能力差(一句话)**:main 的澄清卡是「单问题 + 提交即完」,compat 的是
+「多问题 + 处理中/过期状态卡 + 结构化答案」。
+规模对照 `hermes_multitenancy/feishu_clarify_cards.py`:compat **520 行** vs main **251 行**。
+
+**main 缺失的 9 个符号及归属**:
+- `feishu_clarify_cards.py`:`_normalize_questions`(多问题归一化)、
+  `handle_feishu_clarify_resolved`(完成回收)、`_structured_answers`(结构化多答案)、
+  `_clarify_status_card`、`_clarify_processing_card`
+- `agent_real/_core.py`:`_claim_clarify_timeout`、`_clarify_response_expired`、
+  `_request_clarify_response`
+- `router/streaming.py`:`_tool_display_title`
+
+**要拍的板**:多问题澄清是不是我们要的产品形态?是 → 单独立 slug,按功能块分批搬
+(建议顺序:`_normalize_questions` + `build_clarify_card` 多问题签名 → 状态卡 →
+`handle_feishu_clarify_resolved` 回收链 → agent_real 超时/过期)。否 → 关闭本条,
+compat 分支可直接删除。
+
+**注**:本次 triage 顺带实证了一件与上一条 DEBT(v0190 类补丁装错模块)相关的事 ——
+在 main + 核心 v0.19.1 上,活 gateway 启动日志里 **全部 13 类飞书补丁的安装目标都是
+`hermes_plugins.feishu_platform.adapter.FeishuAdapter`**(合成模块,即运行时真用的那份),
+不再是 `plugins.platforms.feishu.adapter`。疑似 `d0433e5`(materialize deferred platform)
+已比那条 DEBT 描述的范围修得更广。**未逐个复核,仅作线索**,建议下次碰这块时用
+`__code__.co_filename` 逐个复验后再决定关不关那条债(注意:`__module__` 会被
+`functools.wraps` 伪造,不能用作判据)。

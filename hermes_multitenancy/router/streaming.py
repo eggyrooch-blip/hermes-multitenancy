@@ -639,6 +639,22 @@ async def _stream_into_feishu_shared_consumer(
         except asyncio.CancelledError:
             pass
 
+    async def _update_reasoning_best_effort(text: str) -> bool:
+        # A failed reasoning edit must not abort the stream: the card is a
+        # nice-to-have overlay, the answer is the product. Returning False keeps
+        # the throttle counters unadvanced so the next delta retries the edit.
+        try:
+            await consumer.update_streaming_card_reasoning(text)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _m.logger.debug(
+                "multitenancy: shared card reasoning update failed: %s",
+                type(exc).__name__,
+            )
+            return False
+
     def _abort_content() -> str:
         raw = content if content else (thinking if thinking else _m._STREAM_ABORT_FALLBACK)
         return _clean_stream_display_text(raw, profile_home)
@@ -742,9 +758,9 @@ async def _stream_into_feishu_shared_consumer(
                             or len(thinking) - last_reasoning_len >= _m._STREAM_CARD_REASONING_MIN_CHARS
                             or now - last_reasoning_edit >= _m._STREAM_CARD_REASONING_MIN_SECONDS
                         ):
-                            await consumer.update_streaming_card_reasoning(thinking)
-                            last_reasoning_len = len(thinking)
-                            last_reasoning_edit = now
+                            if await _update_reasoning_best_effort(thinking):
+                                last_reasoning_len = len(thinking)
+                                last_reasoning_edit = now
                         continue
 
                     if kind == "status":
@@ -828,9 +844,9 @@ async def _stream_into_feishu_shared_consumer(
                     if not piece:
                         continue
                     if thinking and len(thinking) > last_reasoning_len:
-                        await consumer.update_streaming_card_reasoning(thinking)
-                        last_reasoning_len = len(thinking)
-                        last_reasoning_edit = time.monotonic()
+                        if await _update_reasoning_best_effort(thinking):
+                            last_reasoning_len = len(thinking)
+                            last_reasoning_edit = time.monotonic()
                     content += piece
                     consumer.on_delta(_clean_stream_delta_text(piece, profile_home))
                     content_delta_seen = True

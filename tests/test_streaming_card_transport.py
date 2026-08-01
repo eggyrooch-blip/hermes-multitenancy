@@ -2130,6 +2130,95 @@ async def _run_shared_consumer_flushes_short_reasoning_before_first_content(
     assert created[0].deltas == ["answer"]
 
 
+def test_shared_consumer_survives_failing_reasoning_edit(monkeypatch, tmp_path):
+    """A raising reasoning edit must not abort the run.
+
+    The reasoning block is a nice-to-have card overlay; the answer is the
+    product. Before the best-effort guard the raise escaped into the stream's
+    generic `except Exception`, which flipped `stream_failed` and replaced the
+    real answer with failure text.
+    """
+    asyncio.run(_run_shared_consumer_survives_failing_reasoning_edit(monkeypatch, tmp_path))
+
+
+async def _run_shared_consumer_survives_failing_reasoning_edit(monkeypatch, tmp_path):
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("thinking", "first ")
+        yield ("thinking", "second")
+        yield ("content", "answer")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    created = []
+
+    class ReasoningExplodesConsumer:
+        def __init__(
+            self,
+            adapter,
+            chat_id,
+            config=None,
+            metadata=None,
+            initial_reply_to_id=None,
+        ):
+            self.reasoning_attempts = 0
+            self.deltas = []
+            self.statuses = []
+            self._done = asyncio.Event()
+            created.append(self)
+
+        async def ensure_streaming_card_started(self):
+            return True
+
+        async def run(self):
+            await self._done.wait()
+
+        def on_delta(self, text):
+            self.deltas.append(text)
+
+        async def update_streaming_card_status(self, content):
+            self.statuses.append(content)
+            return True
+
+        async def update_streaming_card_reasoning(self, content):
+            self.reasoning_attempts += 1
+            raise RuntimeError("card reasoning edit rejected by Feishu")
+
+        async def update_streaming_card_tool_started(self, tool_name, *, preview=None, args=None):
+            return True
+
+        async def update_streaming_card_tool_completed(self, tool_name, *, duration=None, is_error=False):
+            return True
+
+        def finish(self):
+            self._done.set()
+
+    monkeypatch.setattr(
+        router_mod, "GatewayStreamConsumer", ReasoningExplodesConsumer, raising=False
+    )
+    monkeypatch.setattr(
+        router_mod,
+        "StreamConsumerConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+
+    response = await router_mod._stream_into_feishu(
+        _CardCapableAdapter(),
+        "chat-1",
+        "profile",
+        tmp_path,
+        SimpleNamespace(text="hi"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "answer"
+    assert created[0].deltas == ["answer"]
+    # Counters stay unadvanced on failure, so every reasoning delta retries.
+    assert created[0].reasoning_attempts >= 2
+
+
 def test_stream_card_idle_status_emits_invisible_marker_while_refreshing():
     """Idle heartbeat keeps the card refreshing via rotating zero-width markers
     only — no visible waiting text (no `Thinking...`, no dots). The marker
