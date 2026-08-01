@@ -105,13 +105,12 @@ def test_backup_produces_selfcontained_dbs_manifest_and_checksums(env):
 
     snap = _state_snapshots(env)[-1]
     dbs = sorted(p.name for p in (snap / "db").iterdir())
+    # 只有 4 个：另外两个是 0 字节的空库，故意不打开、不备份（见 zero_byte 那条测试）
     assert dbs == [
         "hermes-web-ui.db",
         "kanban.db",
         "multitenancy.db",
-        "multitenancy_routing.db",
         "state.db",
-        "web-ui.db",
     ], "备份目录里应当只剩纯 .db，不留 -wal/-shm 旁文件"
 
     manifest = (snap / "MANIFEST.txt").read_text()
@@ -208,3 +207,105 @@ def test_drill_refuses_to_restore_into_production_dirs(env):
     result = _run(DRILL_SH, env, DRILL_ROOT=env["HERMES_HOME_DIR"])
     assert result.returncode != 0
     assert "拒绝执行" in result.stderr
+
+
+# ── 6. 跨模型评审 round 1 提出的加固项 ─────────────────────────────
+
+
+def test_zero_byte_db_is_skipped_and_never_opened(env):
+    """0 字节的库不能交给 sqlite 打开——sqlite 会给它写文件头，那就是写生产了。"""
+    empty = Path(env["HERMES_HOME_DIR"]) / "multitenancy_routing.db"
+    assert empty.stat().st_size == 0
+
+    assert _run(BACKUP_SH, env, SKIP_PROFILES="1").returncode == 0
+
+    assert empty.stat().st_size == 0, "源文件被写了——违反『备份只读生产』"
+    snap = _state_snapshots(env)[-1]
+    assert not (snap / "db" / "multitenancy_routing.db").exists()
+    assert "db_empty_skipped=multitenancy_routing.db" in (snap / "MANIFEST.txt").read_text()
+
+
+def test_missing_known_db_is_reported_not_silently_skipped(env):
+    """6 个库是写死的已知清单，缺一个就是异常，必须留痕。"""
+    (Path(env["HERMES_HOME_DIR"]) / "kanban.db").unlink()
+
+    result = _run(BACKUP_SH, env, SKIP_PROFILES="1")
+    assert result.returncode == 0
+    assert "kanban.db 不存在" in result.stdout
+
+    manifest = (_state_snapshots(env)[-1] / "MANIFEST.txt").read_text()
+    assert "db_missing=kanban.db," in manifest
+
+
+def test_missing_profiles_dir_is_fatal(env):
+    """profiles 是 sunke 要求必须备的那层，目录不在就该拒绝，而不是产出半份备份。"""
+    shutil.rmtree(Path(env["HERMES_HOME_DIR"]) / "profiles")
+
+    result = _run(BACKUP_SH, env)
+    assert result.returncode != 0
+    assert "拒绝产出只有状态核心的半份备份" in result.stderr
+
+
+def test_unreadable_profile_file_blocks_backup(env):
+    """读不到的文件会被 rsync 静默跳过——默认必须硬拦，不能只警告。"""
+    if shutil.which("find") is None:
+        pytest.skip("需要 find")
+    victim = Path(env["HERMES_HOME_DIR"]) / "profiles" / "u1" / "secret.txt"
+    victim.write_text("x\n")
+    victim.chmod(0o000)
+    try:
+        result = _run(BACKUP_SH, env)
+        # GNU find 才有 -readable；BSD find（macOS）下脚本会跳过这项检查
+        probe = subprocess.run(["find", "/dev/null", "-readable"], capture_output=True)
+        if probe.returncode != 0:
+            pytest.skip("BSD find 不支持 -readable，该检查只在 Linux 生效")
+        assert result.returncode != 0
+        assert "静默漏数据" in result.stderr
+        # 显式放行时应当能继续
+        assert _run(BACKUP_SH, env, ALLOW_UNREADABLE="1").returncode == 0
+    finally:
+        victim.chmod(0o644)
+
+
+def test_drill_rejects_symlink_into_production(env, tmp_path):
+    """字符串前缀挡不住软链：一条指向 ~/.hermes 的链接能骗过前缀比较，
+    然后把生产覆盖掉。守卫必须比真实路径。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+
+    sneaky = tmp_path / "innocent-looking"
+    sneaky.symlink_to(env["HERMES_HOME_DIR"])
+
+    result = _run(DRILL_SH, env, DRILL_ROOT=str(sneaky))
+    assert result.returncode != 0
+    assert "拒绝执行" in result.stderr
+    # 而且不能在生产目录里留下任何演练残留
+    assert not list(Path(env["HERMES_HOME_DIR"]).glob("hermes-drill-*"))
+
+
+def test_drill_report_covers_profiles_layer(env):
+    """Done 是两层备份，演练报告必须把 40G 那层也核一遍。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    assert _run(DRILL_SH, env).returncode == 0
+
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert "## 第二层：profiles" in report
+    assert "个文件" in report
+
+
+def test_drill_fails_when_profiles_snapshot_is_missing(env):
+    """有 state 备份却没有 profiles 快照 = 半份备份，演练必须判失败。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    shutil.rmtree(Path(env["BACKUP_ROOT"]) / "profiles")
+
+    result = _run(DRILL_SH, env)
+    assert result.returncode != 0
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert "缺失" in report
+
+
+def test_first_full_profiles_run_raises_the_disk_floor(env):
+    """首次全量要吃掉一整份 profiles，门槛必须相应抬高，否则 30G 门槛挡不住 25G 写入。"""
+    result = _run(BACKUP_SH, env, MIN_FREE_GB="1", FIRST_FULL_GB="999999999")
+    assert result.returncode != 0
+    assert "首次全量" in result.stdout
+    assert _state_snapshots(env) == []

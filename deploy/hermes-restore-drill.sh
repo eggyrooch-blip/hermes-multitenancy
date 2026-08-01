@@ -29,12 +29,27 @@ SRC="$(ls -1d "$STATE_ROOT"/*/ 2>/dev/null | sort | tail -1 || true)"
 [ -n "$SRC" ] || die "$STATE_ROOT 下没有任何备份"
 SRC="${SRC%/}"
 
+# 顺序很重要：先校验目标合法，再创建任何东西。
+# 反过来的话，一个指向生产的 DRILL_ROOT 会先把目录建出来（或报个无关的 mkdir 错），
+# 守卫就永远轮不到执行 —— 我自己的测试就是这么抓到这个次序 bug 的。
+#
+# 演练永远写 scratch，绝不写回 ~/.hermes —— 这条是硬约束。
+# 必须比较「真实路径」而不是字符串前缀：/tmp/../home/hermes/.hermes 或一条软链
+# 都能骗过字符串比较，然后把生产覆盖掉。realpath -m 允许目标还不存在。
+canon() { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
+WORK_REAL="$(canon "$WORK")"
+for guarded in "$HERMES_HOME_DIR" "$HERMES_WEBUI_DIR"; do
+  [ -e "$guarded" ] || continue
+  G_REAL="$(canon "$guarded")"
+  case "$WORK_REAL/" in
+    "$G_REAL"/*|"$G_REAL"/) die "还原目标的真实路径落在生产目录里，拒绝执行：$WORK_REAL" ;;
+  esac
+  [ "$WORK_REAL" = "$G_REAL" ] && die "还原目标就是生产目录本身，拒绝执行：$WORK_REAL"
+done
+
+# 守卫过了才动手建目录
 mkdir -p "$REPORT_DIR" "$WORK"
 chmod 700 "$WORK"
-# 演练永远写 scratch，绝不写回 ~/.hermes —— 这条是硬约束
-case "$WORK" in
-  "$HERMES_HOME_DIR"*|"$HERMES_WEBUI_DIR"*) die "还原目标落在生产目录里，拒绝执行：$WORK" ;;
-esac
 
 backup_ts="$(grep '^backup_ts=' "$SRC/MANIFEST.txt" | cut -d= -f2)"
 started=$(date +%s)
@@ -71,6 +86,51 @@ for db in "$WORK"/db/*.db; do
   db_rows="${db_rows}| \`${dbn}\` | ${chk} | ${checked} | ${mismatch} |
 "
 done
+
+# ── 校验 4:profiles 层也必须被演练到 ────────────────────────────────
+# Done 是两层备份。只演练数据库、不碰那 40G，等于把 sunke 明确要求的那一层
+# 留到真出事那天才第一次验证。这里做轻量但真实的检查：快照存在、非空、
+# 抽样文件的内容与源一致（用校验和比，不是只看存在）。
+PROFILES_ROOT="$BACKUP_ROOT/profiles"
+prof_line=""
+PSRC="$(ls -1d "$PROFILES_ROOT"/*/ 2>/dev/null | sort | tail -1 || true)"
+if [ -z "$PSRC" ]; then
+  if [ -d "$HERMES_HOME_DIR/profiles" ]; then
+    prof_line="| **缺失** | 有 state 备份却没有 profiles 快照 | — |"
+    fail=1
+  else
+    prof_line="| （本环境无 profiles） | — | — |"
+  fi
+else
+  PSRC="${PSRC%/}"
+  # `2>/dev/null` 只吞掉了消息，没吞掉退出码：38 万个文件里只要有一个 find 读不动，
+  # 它就返回非零，pipefail 把整条管道判失败，set -e 直接把脚本踢出去 ——
+  # 生产上第一次跑就是死在这一行，而且一声不吭。统计类命令一律不参与 -e 判定。
+  set +e +o pipefail
+  pfiles=$(find "$PSRC" -type f 2>/dev/null | wc -l | tr -d ' ')
+  set -e -o pipefail
+  [ "${pfiles:-0}" -gt 0 ] || fail=1
+  # 抽 5 个文件跟源比内容。
+  # 注意 `set -o pipefail` + `head` 的经典坑：head 读够就关管道，find 收到 SIGPIPE
+  # 退出非零，pipefail 把整条管道判失败，再被 set -e 一脚踢出去 —— 生产上就是
+  # 这么静默挂掉的。所以这里先关掉 -e/pipefail 取样，取完再开回来。
+  set +e +o pipefail
+  sample_list="$(cd "$PSRC" && find . -type f 2>/dev/null | head -400 | sed 's|^\./||' | awk 'NR%80==1' | head -5)"
+  set -e -o pipefail
+
+  sample_ok=0; sample_n=0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    sample_n=$((sample_n + 1))
+    if [ -f "$HERMES_HOME_DIR/profiles/$rel" ] \
+       && cmp -s "$PSRC/$rel" "$HERMES_HOME_DIR/profiles/$rel"; then
+      sample_ok=$((sample_ok + 1))
+    fi
+  done <<< "$sample_list"
+  # 抽样只作信息，不判失败：快照拍完之后员工继续改文件，内容不一致是正常的。
+  # 真正的失败条件只有两个 —— 快照缺失、或快照 0 个文件（上面已置 fail=1）。
+  prof_line="| \`$(basename "$PSRC")\` | ${pfiles} 个文件 | 抽样 ${sample_ok}/${sample_n} 内容一致（仅供参考） |"
+fi
 
 # ── 信息项:与当下生产的漂移(不参与判定) ─────────────────────────────
 drift=""
@@ -113,6 +173,14 @@ cat > "$REPORT" <<EOF
 $db_rows
 > 「行数不符」必须全是 0。判据是**还原结果 vs 备份当时记录的行数**，
 > 不是 vs 当下生产 —— 生产一直在写，快照必然落后，那不是错误。
+
+## 第二层：profiles（40G 那层）
+
+| 快照 | 规模 | 抽样内容核对 |
+|---|---|---|
+$prof_line
+> 抽样是拿快照里的文件跟当前源文件逐字节比。有差异不一定是错（备份之后员工又改了），
+> 但**快照缺失或 0 个文件一定是错**，会直接判失败。
 
 ## 参考：这份备份比当下生产落后多少
 
