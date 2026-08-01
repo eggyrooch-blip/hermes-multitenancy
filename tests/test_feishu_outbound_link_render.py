@@ -18,6 +18,7 @@ from hermes_multitenancy.cron_worker import (
     _linkify_markdown_links_in_text,
     _patch_feishu_outbound_link_render,
 )
+from hermes_multitenancy.feishu_adapter_compat import _PLUGIN_LOADER_MODULE_NAME
 
 _TABLE = (
     "| 排名 | 笔记 | 核心信号 |\n"
@@ -48,15 +49,21 @@ def _install_fake_feishu(build_impl):
     parents = ("gateway", "gateway.platforms")
     saved_parents = {name: sys.modules.get(name) for name in parents}
     saved_module = sys.modules.get("gateway.platforms.feishu")
+    saved_synthetic = sys.modules.get(_PLUGIN_LOADER_MODULE_NAME)
     for name in parents:
         if name not in sys.modules:
             sys.modules[name] = types.ModuleType(name)
     sys.modules["gateway.platforms.feishu"] = fake_module
-    return FakeFeishuAdapter, (saved_parents, saved_module)
+    sys.modules[_PLUGIN_LOADER_MODULE_NAME] = fake_module
+    return FakeFeishuAdapter, (saved_parents, saved_module, saved_synthetic)
 
 
 def _restore(saved):
-    saved_parents, saved_module = saved
+    saved_parents, saved_module, saved_synthetic = saved
+    if saved_synthetic is None:
+        sys.modules.pop(_PLUGIN_LOADER_MODULE_NAME, None)
+    else:
+        sys.modules[_PLUGIN_LOADER_MODULE_NAME] = saved_synthetic
     if saved_module is None:
         sys.modules.pop("gateway.platforms.feishu", None)
     else:
@@ -93,6 +100,25 @@ def test_patch_linkifies_text_payload_but_leaves_post_untouched():
         )
         assert mt2 == "post"
         assert "[t](https://x.com/s?k=a)" in json.loads(pl2)["post"]
+    finally:
+        _restore(saved)
+
+
+def test_patch_forwards_new_core_keyword_arguments():
+    seen = {}
+
+    def core_build(self, content, *, prefer_post=False):
+        seen["prefer_post"] = prefer_post
+        return "text", json.dumps({"text": content}, ensure_ascii=False)
+
+    FakeFeishuAdapter, saved = _install_fake_feishu(core_build)
+    try:
+        _patch_feishu_outbound_link_render()
+        _, payload = FakeFeishuAdapter()._build_outbound_payload(
+            "[docs](https://example.com)", prefer_post=True
+        )
+        assert seen["prefer_post"] is True
+        assert json.loads(payload)["text"] == "docs (https://example.com)"
     finally:
         _restore(saved)
 
