@@ -35,6 +35,13 @@ test:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
   before_script:
+    # 测试套件对运行环境有真实依赖，容器里得补齐，否则会拿"环境缺东西"当成回归：
+    #   - node：tests/test_lark_cli_matrix_runner.py 要跑 lark-cli 的 mjs runner（16 条）
+    #   - /usr/bin/python3：strict-mode shim 用固定 PATH 调 python3，
+    #     而 python:slim 只把它放在 /usr/local/bin（3 条）
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends nodejs ca-certificates
+    - ln -sf "$(command -v python3)" /usr/bin/python3
+    - node --version && /usr/bin/python3 --version
     - pip install --quiet uv
   script:
     # 与 Makefile 的 `make test` 同一条命令，跑全量 176 个测试文件
