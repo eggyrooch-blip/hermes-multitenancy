@@ -337,3 +337,39 @@ def test_drill_refuses_when_every_backup_is_incomplete(env):
     result = _run(DRILL_SH, env)
     assert result.returncode != 0
     assert "COMPLETE" in result.stderr
+
+
+def test_late_profiles_failure_leaves_no_complete_backup(env):
+    """哨兵必须等两层都成功才落。否则 profiles 失败后，演练会挑中这份"完整"的
+    状态核心、再自己配一份更老的 profiles，对一份从未同时完成的备份报"通过"。"""
+    # 先做一份正常的，确认哨兵里记了配套的 profiles 快照
+    assert _run(BACKUP_SH, env).returncode == 0
+    sentinel = (_state_snapshots(env)[-1] / "COMPLETE").read_text()
+    assert "profiles_snapshot=" in sentinel
+
+    # 再让 profiles 那层必失败：把源目录换成一个不可进入的目录
+    before = len(_state_snapshots(env))
+    victim = Path(env["HERMES_HOME_DIR"]) / "profiles"
+    victim.chmod(0o000)
+    try:
+        result = _run(BACKUP_SH, env)
+        assert result.returncode != 0
+        # 半份 state 目录不能留下来冒充"最新一份"
+        assert len(_state_snapshots(env)) == before
+    finally:
+        victim.chmod(0o755)
+
+
+def test_drill_reports_all_six_known_dbs_by_name(env):
+    """报告要按固定六库清单点名，而不是按备份目录里恰好有什么。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    assert _run(DRILL_SH, env).returncode == 0
+
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert "## 六库清单对账" in report
+    for known in [
+        "multitenancy.db", "state.db", "kanban.db",
+        "multitenancy_routing.db", "hermes-web-ui.db", "web-ui.db",
+    ]:
+        assert known in report, f"{known} 未在报告里点名"
+    assert "0 字节，按设计跳过" in report

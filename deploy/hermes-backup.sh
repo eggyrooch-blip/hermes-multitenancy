@@ -83,6 +83,11 @@ chmod 700 "$STAGING"
 STAGING_PROF=""
 cleanup_all() {
   rm -rf "${STAGING:-}" ${STAGING_PROF:+"$STAGING_PROF"}
+  # 已落地但还没拿到哨兵的 state 目录 = 半份备份，同样要收走，
+  # 否则它会一直躺在那里冒充"最新一份"。
+  if [ -n "${STATE_DEST:-}" ] && [ -d "$STATE_DEST" ] && [ ! -f "$STATE_DEST/COMPLETE" ]; then
+    rm -rf "$STATE_DEST"
+  fi
   [ -n "${LOCK_DIR:-}" ] && rm -rf "$LOCK_DIR"
   return 0
 }
@@ -200,10 +205,10 @@ uniq_dest() {
 STATE_DEST="$(uniq_dest "$STATE_ROOT/$TS")"
 mv "$STAGING" "$STATE_DEST"
 STAGING=""   # 已落地，别让 cleanup 再去动它
-# 完成哨兵：只有走到这里的目录才算一份可用备份。
-# 没有它的话，一次半途失败留下的目录会被演练/下次增量当成"最新的一份"，
-# 于是拿一份残缺备份去演练还报"通过"——那比没有备份更糟。
-date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DEST/COMPLETE"
+# 注意：哨兵不在这里落。两层都成功才算一份完整备份 —— 见文件末尾。
+# 评审 round 2 抓到的：如果在这里就标 COMPLETE，随后 profiles 失败，
+# 演练会挑中这份"完整"的状态核心、再自己去配一份更老的 profiles 快照，
+# 然后对一份两层从未同时完成的备份报"通过"。假绿比没有备份更危险。
 log "状态核心完成 → ${STATE_DEST}（${backed_up} 个库）"
 
 # ── 第二层:profiles 硬链增量 ────────────────────────────────────────
@@ -286,6 +291,13 @@ prune() {
 }
 prune "$STATE_ROOT" "$KEEP_STATE"
 prune "$PROFILES_ROOT" "$KEEP_PROFILES"
+
+# ── 完成哨兵：走到这里才算两层都成功 ────────────────────────────────
+# 内容里带上本次配套的 profiles 快照名，演练据此确认两层是同一次产出的。
+{
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "profiles_snapshot=${PROF_DEST:-(skipped)}"
+} > "$STATE_DEST/COMPLETE"
 
 [ -z "$missing" ] || log "⚠️  本次未备到的库：${missing%,}"
 [ -z "$empty" ] || log "  （0 字节跳过：${empty%,}）"

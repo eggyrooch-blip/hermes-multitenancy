@@ -93,6 +93,26 @@ for db in "$WORK"/db/*.db; do
 "
 done
 
+# ── 校验 3.5:六库清单对账 ───────────────────────────────────────────
+# 只遍历 db/*.db 会漏掉"这次根本没备到的库"——那恰恰是最该被看见的。
+# 从 MANIFEST 把缺失/空库读回来，在报告里逐个点名。
+man_missing="$(grep '^db_missing=' "$SRC/MANIFEST.txt" | cut -d= -f2-)"
+man_empty="$(grep '^db_empty_skipped=' "$SRC/MANIFEST.txt" | cut -d= -f2-)"
+inventory=""
+for known in multitenancy.db state.db kanban.db multitenancy_routing.db hermes-web-ui.db web-ui.db; do
+  if [ -f "$WORK/db/$known" ]; then
+    st="已备份并核对"
+  elif printf '%s' "$man_empty" | grep -q "$known"; then
+    st="0 字节，按设计跳过"
+  elif printf '%s' "$man_missing" | grep -q "$known"; then
+    st="**缺失** —— 备份时源文件不存在"; fail=1
+  else
+    st="**未知** —— 既不在备份里也不在 MANIFEST 记录中"; fail=1
+  fi
+  inventory="${inventory}| \`${known}\` | ${st} |
+"
+done
+
 # ── 校验 4:profiles 层也必须被演练到 ────────────────────────────────
 # Done 是两层备份。只演练数据库、不碰那 40G，等于把 sunke 明确要求的那一层
 # 留到真出事那天才第一次验证。这里做轻量但真实的检查：快照存在、非空、
@@ -179,6 +199,14 @@ cat > "$REPORT" <<EOF
 $db_rows
 > 「行数不符」必须全是 0。判据是**还原结果 vs 备份当时记录的行数**，
 > 不是 vs 当下生产 —— 生产一直在写，快照必然落后，那不是错误。
+
+## 六库清单对账
+
+| 已知数据库 | 本次状态 |
+|---|---|
+$inventory
+> 这张表按**固定的六库清单**走，不是按备份目录里有什么走 ——
+> 「这次根本没备到的库」恰恰是最需要被看见的那一类。
 
 ## 第二层：profiles（40G 那层）
 
