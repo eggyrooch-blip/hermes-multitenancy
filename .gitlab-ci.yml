@@ -77,7 +77,11 @@ test:
 
 leak:
   stage: leak
-  image: docker.io/zricethezav/gitleaks:latest
+  image:
+    name: docker.io/zricethezav/gitleaks:latest
+    # 这个镜像把 gitleaks 设成了 ENTRYPOINT，GitLab 会用 sh -c 包一层跑 script，
+    # 结果变成 `gitleaks sh -c ...` → unknown command "sh"。清空 entrypoint 才能正常执行。
+    entrypoint: [""]
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
