@@ -1,0 +1,28 @@
+# 生产侧发布执行器。每天 18:00 醒来看一眼有没有新的 release-* 标签，没有就什么都不做。
+#
+# 半自动的准确含义：触发是自动的，决定是手动的（sunke 打不打标签）。
+# 授权 = GitLab 上的受保护标签（只有 Maintainer 能创建 release-*）。
+[Unit]
+Description=Hermes release executor (pull-based: protected tag -> atomic deploy -> probes -> auto-rollback)
+After=network-online.target
+Wants=network-online.target
+# 发布失败必须有人知道 —— 静默失败等于没有发布系统
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# 补丁存活下限：2026-08-01 首次部署实测 16/156，低于它就说明有补丁掉了。
+# 版本升级导致这个数字合理变化时，要连同代码评审一起改。
+Environment=PATCH_MIN=16
+Environment=KEEP_RELEASES=3
+ExecStart=/home/hermes/code/hermes-multitenancy/deploy/hermes-release.sh
+# 构建 webui 要几分钟，别抢生产 IO；但不能用 idle 类（会被饿死，2026-08-01 实测）
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=default.target
