@@ -321,3 +321,44 @@ def test_prune_never_removes_the_rollback_target(env):
 
     cur = os.readlink(Path(env["CODE"]) / "hermes-multitenancy")
     assert (Path(env["RELEASES"]) / Path(cur).name).is_dir(), "当前版本目录必须还在"
+    # 关键：跑过 KEEP_RELEASES+1 次之后，**上一版（回滚目标）也必须还在**。
+    # 只断言"当前还在"是不够的 —— 把回滚目标裁掉，等于发布出问题时无路可退。
+    prev_dir = Path(env["RELEASES"]) / f"mt-{kept[-2]}"
+    assert prev_dir.is_dir(), f"上一版 {prev_dir.name} 被裁掉了 —— 回滚目标不能删"
+
+
+def test_refuses_when_code_paths_are_not_symlinks(env):
+    """执行器要求 ~/code/hermes-* 已经是软链。不是的话必须明确拒绝，
+    而不是稀里糊涂地在真目录上乱来。"""
+    code = Path(env["CODE"])
+    (code / "hermes-multitenancy").unlink()
+    (code / "hermes-multitenancy").mkdir()
+    _tag(env, "release-nolink", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert "还不是软链" in r.stderr
+
+
+def test_stable_bin_bootstrap_only_after_success(env, tmp_path):
+    """执行器自身只在发布成功之后才同步到稳定路径 —— 否则一个坏版本
+    会把下次部署和回滚工具一起弄坏，连退路都没有。"""
+    stable = tmp_path / "stable-bin"
+    src = env["_mt_src"]
+
+    # 先来一次会失败的发布：稳定路径不该被写
+    (src / "deploy" / "hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (src / "deploy" / "hermes-release-probes.sh").chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "red")
+    _tag(env, "release-sb1", f"multitenancy: {_git(src, 'rev-parse', 'HEAD')}\nwebui: {env['_webui_sha']}")
+    assert _run({**env, "STABLE_BIN": str(stable)}).returncode != 0
+    assert not (stable / "hermes-release.sh").exists(), "失败的发布不许更新执行器自身"
+
+    # 再来一次会成功的：这时才允许同步
+    (src / "deploy" / "hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (src / "deploy" / "hermes-release-probes.sh").chmod(0o755)
+    (src / "deploy" / "hermes-release.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (src / "deploy" / "hermes-release.sh").chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "green")
+    _tag(env, "release-sb2", f"multitenancy: {_git(src, 'rev-parse', 'HEAD')}\nwebui: {env['_webui_sha']}")
+    assert _run({**env, "STABLE_BIN": str(stable)}).returncode == 0
+    assert (stable / "hermes-release.sh").exists(), "成功后应把执行器同步到稳定路径"
