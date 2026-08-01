@@ -32,8 +32,18 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 mkdir -p "$RELEASES" "$BACKUP_ROOT" "$(dirname "$STATE_FILE")"
-exec 9>"$LOCK"
-flock -n 9 || { log "另一个发布正在进行，本次退出"; exit 0; }
+# Linux(生产)用 flock：进程被 kill 时内核自动释放，不会留死锁。
+# macOS 没有 flock（只在本地跑测试时走 mkdir 分支）。
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK"
+  flock -n 9 || { log "另一个发布正在进行，本次退出"; exit 0; }
+else
+  LOCK_DIR="$LOCK.d"
+  # 陈旧锁自动清理：一次硬崩不该让发布永久停摆
+  [ -d "$LOCK_DIR" ] && [ -z "$(find "$LOCK_DIR" -maxdepth 0 -mmin -360 2>/dev/null)" ] && rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null || { log "另一个发布正在进行，本次退出"; exit 0; }
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+fi
 
 # ── 生产上 .git 被 root 占是反复出现的坑，动 git 之前先归位 ──────────
 for r in "$RELEASES/.repo-mt" "$RELEASES/.repo-webui"; do
@@ -117,22 +127,42 @@ if build_worktree "$RELEASES/.repo-webui" "$WEBUI_DIR" "$WEBUI_SHA"; then
 else
   die "webui 检出失败"
 fi
-log "  两个版本目录都就绪（此刻生产仍跑旧版）"
+# 切之前先确认新版本自带探针。少了它就没有存活判据，
+# 切过去只会立刻回滚 —— 白白让 1259 个人经历一次重启。
+# （2026-08-01 首次实弹就撞上这个：新版本还没 ship 进探针脚本，
+#   切过去 → 找不到探针 → 自动回滚。回滚是对的，但这次重启本可以避免。）
+NEW_PROBES="$MT_DIR/deploy/$(basename "$PROBES")"
+[ -x "$NEW_PROBES" ] || die "新版本 $MT_DIR 里没有可执行的探针（$NEW_PROBES）—— 拒绝切换，当前版本继续跑"
+log "  两个版本目录都就绪且自带探针（此刻生产仍跑旧版）"
 
 # ── 原子切换 ─────────────────────────────────────────────────────────
 flip() {  # $1=mt 目标  $2=webui 目标
-  ln -sfn "$1" "$CODE/.hermes-multitenancy.new" && mv -Tf "$CODE/.hermes-multitenancy.new" "$CODE/hermes-multitenancy"
-  ln -sfn "$2" "$CODE/.hermes-web-ui.new" && mv -Tf "$CODE/.hermes-web-ui.new" "$CODE/hermes-web-ui"
+  # `ln -sfn` 对「已存在的指向目录的软链」是就地替换，Linux 和 macOS 都认。
+  # 别用 `mv -T`：那是 GNU 扩展，macOS 没有 —— 本地测试里它静默失败，
+  # 软链根本没翻，脚本却照样打印 RELEASE OK。切换必须有错误检查。
+  ln -sfn "$1" "$CODE/hermes-multitenancy" || return 1
+  ln -sfn "$2" "$CODE/hermes-web-ui" || return 1
+  # 读回来核对：切换是这套系统里最不能"以为成功"的一步
+  [ "$(readlink "$CODE/hermes-multitenancy")" = "$1" ] || return 1
+  [ "$(readlink "$CODE/hermes-web-ui")" = "$2" ] || return 1
 }
 
 log "停服务 → 翻软链 → 起服务"
 $SYSTEMCTL stop $UNITS 2>/dev/null || true
-flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DIR")"
+if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DIR")"; then
+  log "软链切换失败 —— 翻回原样并放弃本次发布"
+  flip "$PREV_MT" "$PREV_WEBUI" || true
+  $SYSTEMCTL start $UNITS 2>/dev/null || true
+  die "切换失败，当前版本继续跑"
+fi
 $SYSTEMCTL start $UNITS 2>/dev/null || true
 log "  已切到 $TAG，开始跑探针"
 
 # ── 探针决定去留 ─────────────────────────────────────────────────────
-if [ -x "$PROBES" ] && "$PROBES"; then
+# 用新版本自带的那份探针：判据要跟着被验的版本走
+if [ ! -x "$NEW_PROBES" ]; then
+  log "探针脚本消失了（$NEW_PROBES）—— 无法验证，按最坏情况回滚"
+elif "$NEW_PROBES"; then
   echo "$TAG" > "$STATE_FILE"
   log "RELEASE OK — $TAG 已生效"
   # 保留最近 N 个版本目录，别把盘撑爆
@@ -155,7 +185,10 @@ log "探针失败 —— 自动回滚到上一版"
 $SYSTEMCTL stop $UNITS 2>/dev/null || true
 flip "$PREV_MT" "$PREV_WEBUI"
 $SYSTEMCTL start $UNITS 2>/dev/null || true
-if [ -x "$PROBES" ] && "$PROBES"; then
+# 回滚校验要用【旧版本自带】的探针 —— 现在跑的是旧版，判据就该跟着旧版走。
+# （用新版的探针去验旧版是张冠李戴：新版可能改了期望值。）
+OLD_PROBES="$CODE/hermes-multitenancy/deploy/$(basename "$PROBES")"
+if [ -x "$OLD_PROBES" ] && "$OLD_PROBES"; then
   log "ROLLED BACK — 已退回 ${CURRENT:-上一版}，探针复检通过"
 else
   log "ROLLED BACK 但复检仍未全过 —— 需要人工介入，回滚锚点在 $SNAP/ROLLBACK.txt"
