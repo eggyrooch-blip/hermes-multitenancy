@@ -434,3 +434,121 @@ def test_streaming_clarify_resolved_writes_terminal_card_without_leaking_payload
     assert updated[0]["header"]["title"]["content"] == "已回答"
     assert result == "北京明天多云"
     assert clarify_id not in result
+
+
+def test_shared_consumer_clarify_resolved_writes_terminal_card_without_leaking_payload(
+    monkeypatch, tmp_path
+):
+    """Same guard on the branch production actually takes first.
+
+    The sibling test above pins the legacy edit transport (GatewayStreamConsumer
+    forced to None). When the core exposes a card-capable consumer, streaming.py
+    routes into `_stream_into_feishu_shared_consumer` instead and never reaches
+    that code, so deleting the terminal-card write there stays green without
+    this test.
+    """
+    import asyncio
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import feishu_clarify_cards
+    from hermes_multitenancy import router as router_mod
+    from tests.test_streaming_card_transport import _CardCapableAdapter
+
+    clarify_id = "clarify_0123456789abcdef0123456789abcdef"
+    updated: list[dict] = []
+    consumers = []
+
+    async def fake_stream(event, home, *, messages=None):
+        yield "clarify_required", {
+            "clarify_id": clarify_id,
+            "question": "选择城市",
+            "choices": ["北京", "上海"],
+        }
+        yield "clarify_resolved", {
+            "clarify_id": clarify_id,
+            "session_key": "multitenancy:feishu:feishu_x:oc_y:ou_z",
+            "response": "北京",
+            "timed_out": False,
+        }
+        yield "content", "北京明天多云"
+        yield "done", "北京明天多云"
+
+    async def fake_send(*, adapter, chat_id, card):
+        return {
+            "transport": "cardkit",
+            "card_id": "cid_1",
+            "message_id": "om_clarify",
+            "sequence": 1,
+        }
+
+    async def fake_update(*, adapter, auth_card, card):
+        updated.append(card)
+        return True
+
+    class StubConsumer:
+        """Minimal stand-in for the core's card-capable GatewayStreamConsumer."""
+
+        def __init__(
+            self, adapter, chat_id, config=None, metadata=None, initial_reply_to_id=None
+        ):
+            self.deltas: list[str] = []
+            self.statuses: list[str] = []
+            self._done = asyncio.Event()
+            consumers.append(self)
+
+        async def ensure_streaming_card_started(self):
+            return True
+
+        async def run(self):
+            await self._done.wait()
+
+        def on_delta(self, text):
+            self.deltas.append(text)
+
+        async def update_streaming_card_status(self, content):
+            self.statuses.append(content)
+            return True
+
+        async def update_streaming_card_reasoning(self, content):
+            return True
+
+        async def update_streaming_card_tool_started(self, tool_name, *, preview=None, args=None):
+            return True
+
+        async def update_streaming_card_tool_completed(
+            self, tool_name, *, duration=None, is_error=False
+        ):
+            return True
+
+        def finish(self):
+            self._done.set()
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(feishu_clarify_cards, "send_auth_card", fake_send)
+    monkeypatch.setattr(feishu_clarify_cards, "update_auth_card", fake_update)
+    monkeypatch.setattr(feishu_clarify_cards, "_CLARIFY_CARD_BY_ID", {})
+    monkeypatch.setattr(router_mod, "GatewayStreamConsumer", StubConsumer, raising=False)
+    monkeypatch.setattr(
+        router_mod,
+        "StreamConsumerConfig",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+
+    result = asyncio.run(
+        router_mod._stream_into_feishu(
+            _CardCapableAdapter(),
+            "oc_test",
+            "profile",
+            tmp_path,
+            SimpleNamespace(source=SimpleNamespace(chat_type="dm")),
+        )
+    )
+
+    assert consumers, "shared-consumer branch was not taken"
+    assert "等待你的选择" in consumers[0].statuses
+    assert len(updated) == 1
+    assert updated[0]["header"]["title"]["content"] == "已回答"
+    assert result == "北京明天多云"
+    assert clarify_id not in result
+    assert clarify_id not in "".join(consumers[0].deltas)
