@@ -1,0 +1,18 @@
+# 每月灾备演练：把最新一份备份真的还原一遍，出一份 sunke 能读的报告。
+# 没演练过的备份不叫备份，叫许愿。
+[Unit]
+Description=Hermes monthly restore drill (restore latest backup to scratch + verify + report)
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/hermes/code/hermes-multitenancy/deploy/hermes-restore-drill.sh
+Nice=10
+# 不用 idle 类：实测会被生产 IO 饿死(见 hermes-backup.service 里的对照数据)
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target

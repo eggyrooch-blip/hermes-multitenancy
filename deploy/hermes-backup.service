@@ -1,0 +1,32 @@
+# 每日本机备份：状态核心（6 个 sqlite + config + 凭证）全量 + profiles 硬链增量。
+# 安装到 hermes-1，作为 hermes 用户的 user unit（systemctl --user）。
+[Unit]
+Description=Hermes daily local backup (sqlite .backup + profiles hardlink snapshot)
+After=network-online.target
+Wants=network-online.target
+# 备份最坏的失败模式是"静默停摆"——跑失败了没人知道，等真要恢复时才发现三个月没备过。
+# 所以失败必须告警，复用既有的飞书群通知模板单元。
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+# 定时器不继承交互 shell，路径必须钉死。sqlite3/rsync/sha256sum/flock 都在 /usr/bin。
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+# 保留策略：状态核心 30 份（约 3.8G），profiles 硬链快照 7 份。
+# MIN_FREE_GB 是自伤保护——安全机制不能自己把盘写满造成真故障。
+Environment=MIN_FREE_GB=30
+Environment=KEEP_STATE=30
+Environment=KEEP_PROFILES=7
+ExecStart=/home/hermes/code/hermes-multitenancy/deploy/hermes-backup.sh
+# profiles 那一层要扫 40G / 725k 个文件，必须让出 IO——生产上有 1259 人在用。
+# 但绝不能用 IOSchedulingClass=idle：实测同样 40 个 profile / 305MB / 7189 文件，
+# ionice -c3(idle) 用了 187 秒，不加 ionice 只用 2 秒 —— 93 倍差距。
+# idle 类只在磁盘完全空闲时才拿得到 IO，而 gateway/webui/broker 一直在读写，
+# 于是备份被饿死，全量要跑 11 小时。best-effort 最低优先级才是对的：让路但仍有进展。
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target
