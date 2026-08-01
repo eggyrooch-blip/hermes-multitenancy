@@ -104,6 +104,10 @@ PREV_MT=$(readlink "$CODE/hermes-multitenancy" || true)
 PREV_WEBUI=$(readlink "$CODE/hermes-web-ui" || true)
 [ -n "$PREV_MT" ] && [ -n "$PREV_WEBUI" ] \
   || die "$CODE/hermes-* 还不是软链 —— 先做一次迁移再启用本执行器"
+# 回滚目标必须真的存在。悬空的话，一旦新版本探针失败，回滚会把两个对外路径
+# 指到不存在的目录上 —— 比不回滚还糟。要拒就在动任何东西之前拒。
+[ -d "$CODE/hermes-multitenancy/." ] || die "当前 multitenancy 软链悬空（$PREV_MT）—— 没有可用的回滚目标，拒绝发布"
+[ -d "$CODE/hermes-web-ui/." ] || die "当前 webui 软链悬空（$PREV_WEBUI）—— 没有可用的回滚目标，拒绝发布"
 
 # ── 发布前回滚包（不是灾备，是「这次发错了能退回去」）────────────────
 SNAP="$BACKUP_ROOT/$TAG"
@@ -261,7 +265,13 @@ fi
 # ── 探针没过：自动翻回上一版 ─────────────────────────────────────────
 log "探针失败 —— 自动回滚到上一版"
 $SYSTEMCTL stop $(_units) 2>/dev/null || true
-flip "$PREV_MT" "$PREV_WEBUI"
+# 回滚本身也可能失败（第二个 rename 挂了 = 两个路径指向不同版本）。
+# 不检查就可能在半坏状态上打印 ROLLED_BACK —— 那是最恶劣的假绿。
+if ! flip "$PREV_MT" "$PREV_WEBUI"; then
+  $SYSTEMCTL start $(_units) 2>/dev/null || true
+  outcome NEEDS_HUMAN
+  die "回滚时软链切换失败 —— 两个路径可能指向不同版本，必须人工介入（锚点：$SNAP/ROLLBACK.txt）"
+fi
 $SYSTEMCTL start $(_units) 2>/dev/null || true
 # 回滚校验要用【旧版本自带】的探针 —— 现在跑的是旧版，判据就该跟着旧版走。
 # （用新版的探针去验旧版是张冠李戴：新版可能改了期望值。）

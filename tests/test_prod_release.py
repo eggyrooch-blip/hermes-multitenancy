@@ -377,3 +377,39 @@ def test_missing_backup_script_blocks_release(env):
     r = _run({**env, "BACKUP_SH": "/nonexistent"})
     assert r.returncode != 0
     assert "不带备份不发布" in r.stderr
+
+
+def test_dangling_rollback_target_is_refused_before_touching_anything(env):
+    """回滚目标悬空时必须在动任何东西之前拒绝。否则新版本探针一失败，
+    回滚会把两个对外路径指到不存在的目录上 —— 比不回滚还糟。"""
+    shutil.rmtree(Path(env["RELEASES"]) / "mt-current")
+    _tag(env, "release-dangle", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert "悬空" in r.stderr
+    assert not Path(env["SYSTEMCTL_LOG"]).exists(), "拒绝要发生在碰服务之前"
+
+
+def test_installer_seeds_stable_bin_on_a_fresh_host(tmp_path):
+    """鸡生蛋：单元跑 STABLE_BIN 下的副本，而那份平时只在发布成功后更新。
+    全新机器上它不存在，第一次触发必然失败 —— 安装脚本负责把它种下去。"""
+    stable = tmp_path / "stable"
+    units = tmp_path / "units"
+    r = subprocess.run(
+        ["bash", str(DEPLOY / "install-hermes-release.sh")],
+        env={"STABLE_BIN": str(stable), "UNIT_DIR": str(units),
+             "SRC": str(DEPLOY), "HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    for f in ("hermes-release.sh", "hermes-release-probes.sh", "hermes_patch_probe.py"):
+        assert (stable / f).exists(), f"{f} 没被种下"
+        assert os.access(stable / f, os.X_OK)
+    assert (units / "hermes-release.service").exists()
+    # 幂等：再跑一次不该炸
+    assert subprocess.run(
+        ["bash", str(DEPLOY / "install-hermes-release.sh")],
+        env={"STABLE_BIN": str(stable), "UNIT_DIR": str(units),
+             "SRC": str(DEPLOY), "HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        capture_output=True,
+    ).returncode == 0
