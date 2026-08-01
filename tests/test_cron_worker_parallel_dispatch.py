@@ -1,4 +1,6 @@
 import concurrent.futures
+import contextlib
+import json
 import os
 import sys
 import threading
@@ -591,6 +593,160 @@ def test_finalize_runs_parent_side_delivery_under_original_profile_context(tmp_p
     assert cron_jobs.HERMES_DIR == Path("/original/hermes")
     assert cron_jobs.JOBS_FILE == Path("/original/hermes/cron/jobs.json")
     assert os.environ["HERMES_HOME"] == "/outer/home"
+
+
+class ClaimStore:
+    """cron.jobs stand-in whose load/save round-trip a real jobs.json.
+
+    The release path has to survive the actual file, not an in-memory dict —
+    that file is what the OWNING gateway's next tick reads.
+    """
+
+    def __init__(self, jobs_file: Path, jobs: list[dict]) -> None:
+        self.HERMES_DIR = jobs_file.parent.parent
+        self.CRON_DIR = jobs_file.parent
+        self.JOBS_FILE = jobs_file
+        self.OUTPUT_DIR = self.CRON_DIR / "output"
+        self._lock_depth = 0
+        self.unlocked_saves = 0
+        self._write(jobs)
+
+    @contextlib.contextmanager
+    def _jobs_lock(self):
+        self._lock_depth += 1
+        try:
+            yield
+        finally:
+            self._lock_depth -= 1
+
+    def _write(self, jobs: list[dict]) -> None:
+        self.JOBS_FILE.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+
+    def load_jobs(self) -> list[dict]:
+        return json.loads(self.JOBS_FILE.read_text(encoding="utf-8"))["jobs"]
+
+    def save_jobs(self, jobs: list[dict]) -> None:
+        if self._lock_depth == 0:
+            self.unlocked_saves += 1
+        self._write(jobs)
+
+    def stored(self, job_id: str) -> dict:
+        return next(job for job in self.load_jobs() if job["id"] == job_id)
+
+
+class ClaimingDueScheduler(DueScheduler):
+    """Mirrors core get_due_jobs(): stamps a run_claim on every due one-shot
+    BEFORE the caller gets any chance to filter it by ownership."""
+
+    CLAIM = {"at": "2026-08-01T10:00:00+08:00", "by": "scanning-gateway"}
+
+    def __init__(self, store: ClaimStore) -> None:
+        super().__init__({})
+        self.store = store
+
+    def get_due_jobs(self) -> list[dict]:
+        with self.store._jobs_lock():
+            jobs = self.store.load_jobs()
+            for job in jobs:
+                if job.get("schedule", {}).get("kind") == "once":
+                    job["run_claim"] = dict(self.CLAIM)
+            self.store.save_jobs(jobs)
+            return [dict(job) for job in jobs]
+
+
+def _scan_with_store(store, scheduler, profile, executor):
+    return cron_worker._scan_and_submit_due_profile_jobs(
+        store,
+        scheduler,
+        profile.parent,
+        {profile.name},
+        adapters=None,
+        loop=SimpleNamespace(is_running=lambda: False),
+        patch_lock=threading.Lock(),
+        executor=executor,
+        in_flight=set(),
+        runner=lambda _profile_home, _job: None,
+    )
+
+
+def _router_gateway(monkeypatch) -> None:
+    monkeypatch.setattr(cron_worker, "backfill_cron_owner_context_for_profile", lambda _p: None)
+    monkeypatch.setattr(cron_worker, "_acquire_cron_tick_file_lock", lambda *_args: FakeTickLock())
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_FIXED_EXPERT_APP_ID", raising=False)
+
+
+def test_rejected_claimed_oneshot_has_its_run_claim_released(tmp_path, monkeypatch):
+    """A one-shot this gateway does not own must go back to the pool NOW.
+
+    Core claims it during the due scan; if we drop it still claimed, core skips
+    it for the whole claim TTL (1800s) and the owning gateway never fires it.
+    """
+    profile = _profile(tmp_path / "profiles", "alice")
+    store = ClaimStore(
+        profile / "cron" / "jobs.json",
+        [
+            {
+                "id": "expert_once",
+                "name": "Expert reminder",
+                "source_app": "cli_expert",
+                "schedule": {"kind": "once"},
+            }
+        ],
+    )
+    scheduler = ClaimingDueScheduler(store)
+    executor = RecordingExecutor()
+    _router_gateway(monkeypatch)
+
+    submitted = _scan_with_store(store, scheduler, profile, executor)
+
+    assert submitted == 0
+    assert executor.submissions == []
+    assert store.stored("expert_once")["run_claim"] is None
+    assert store.unlocked_saves == 0
+
+
+def test_accepted_claimed_oneshot_keeps_its_run_claim(tmp_path, monkeypatch):
+    """The claim on a job we DO run is the cross-process in-flight guard —
+    releasing it here would let a second gateway re-dispatch the same run."""
+    profile = _profile(tmp_path / "profiles", "alice")
+    store = ClaimStore(
+        profile / "cron" / "jobs.json",
+        [{"id": "own_once", "name": "Mine", "schedule": {"kind": "once"}}],
+    )
+    scheduler = ClaimingDueScheduler(store)
+    executor = RecordingExecutor()
+    _router_gateway(monkeypatch)
+
+    submitted = _scan_with_store(store, scheduler, profile, executor)
+
+    assert submitted == 1
+    assert store.stored("own_once")["run_claim"] == ClaimingDueScheduler.CLAIM
+
+
+def test_release_leaves_a_claim_another_process_has_taken_over(tmp_path, monkeypatch):
+    profile = _profile(tmp_path / "profiles", "alice")
+    store = ClaimStore(
+        profile / "cron" / "jobs.json",
+        [
+            {
+                "id": "expert_once",
+                "schedule": {"kind": "once"},
+                "run_claim": {"at": "2026-08-01T10:05:00+08:00", "by": "other-gateway"},
+            }
+        ],
+    )
+    stale = {
+        "id": "expert_once",
+        "schedule": {"kind": "once"},
+        "run_claim": {"at": "2026-08-01T10:00:00+08:00", "by": "us"},
+    }
+
+    assert cron_worker._release_cron_run_claim(store, DueScheduler({}), stale) is False
+    assert store.stored("expert_once")["run_claim"] == {
+        "at": "2026-08-01T10:05:00+08:00",
+        "by": "other-gateway",
+    }
 
 
 def test_multitenancy_cron_worker_count_defaults_to_four_and_honors_env(monkeypatch):

@@ -78,36 +78,104 @@ synthetic 类补上;register 期安装保留兜其它装载顺序。
 钩子),而不是每个补丁各自补一次。修前必须逐个确认幂等 marker 挂在方法对象上、
 且重跑不会双重包裹。
 
-## 2026-08-01 v0190-compat-commit-triage · `44f6d71` 多问题澄清卡能力未搬入 main(需产品拍板)
+## 2026-08-01 v0190-compat-commit-triage · `44f6d71` 多问题澄清卡:**弃**,唯一真缺口已修(残留 4 符号未复核)
 
-**背景**:`feat/local-hermes-agent-v0190-compat` 分支(分叉点 `c5e4110` @ 2026-07-10)上的
-`44f6d71 feat: improve Feishu card feedback` 是一整套澄清卡能力增强,281 行实质代码 +
-约 1700 行测试,横跨 10 个源文件。main 在分叉后独立走了 161 个 commit,澄清卡是另一套实现。
-本 slug 的 triage 判定它为**真缺口**,但**不在 triage 里搬运** —— 它是 `feat:` 不是 `fix:`,
-整体搬运是独立项目,需要产品决策。其余 5 个 commit 的裁定见
+**裁定(2026-08-01)**:`44f6d71 feat: improve Feishu card feedback` 的多问题机制**弃**,不搬。
+理由是无驱动而非无价值:核心 clarify schema 收的是**单数** `question` string,
+`_ClarifyEntry.signature()` 也只发单个问题,多问题分支在 main 上永远走不到,搬过去是不可达代码。
+随之作废:`_normalize_questions`、`_structured_answers`、多问题版 `build_clarify_card`、
+`_clarify_status_card`、`_clarify_processing_card`(处理中态也不要 —— 提交 toast 已经说了
+「已提交,正在继续」,同一张卡再多一次往返没收益)。
+
+**唯一真缺口 = 卡片终态,已修**:main 收到 `clarify_resolved` 只 `continue` 吞事件(防 payload
+dict 泄进回复正文),那张表单卡就永远停在「等待你的选择」。slug `clarify-card-final-state` 修掉了:
+发卡 handle 存进有界 map,resolved 时 pop 出来走 `update_auth_card` 落终态(pop 即 write-once 闸),
+`_stream_into_feishu` 与 `_stream_into_feishu_shared_consumer` 两条分支都覆盖,各有一条改坏即红的测试。
+
+**顺带搁置、未复核**:`agent_real/_core.py` 的 `_claim_clarify_timeout` /
+`_clarify_response_expired` / `_request_clarify_response` 与 `router/streaming.py` 的
+`_tool_display_title` —— 与多问题一并搁置,**没有逐条核过 main 是否已有等价路径**,
+真要用时重新 triage,别把本条当"已确认无缺口"。其余 5 个 commit 的裁定见
 `.ftask/v0190-compat-commit-triage/TRIAGE.md`。
 
-**能力差(一句话)**:main 的澄清卡是「单问题 + 提交即完」,compat 的是
-「多问题 + 处理中/过期状态卡 + 结构化答案」。
-规模对照 `hermes_multitenancy/feishu_clarify_cards.py`:compat **520 行** vs main **251 行**。
-
-**main 缺失的 9 个符号及归属**:
-- `feishu_clarify_cards.py`:`_normalize_questions`(多问题归一化)、
-  `handle_feishu_clarify_resolved`(完成回收)、`_structured_answers`(结构化多答案)、
-  `_clarify_status_card`、`_clarify_processing_card`
-- `agent_real/_core.py`:`_claim_clarify_timeout`、`_clarify_response_expired`、
-  `_request_clarify_response`
-- `router/streaming.py`:`_tool_display_title`
-
-**要拍的板**:多问题澄清是不是我们要的产品形态?是 → 单独立 slug,按功能块分批搬
-(建议顺序:`_normalize_questions` + `build_clarify_card` 多问题签名 → 状态卡 →
-`handle_feishu_clarify_resolved` 回收链 → agent_real 超时/过期)。否 → 关闭本条,
-compat 分支可直接删除。
-
-**注**:本次 triage 顺带实证了一件与上一条 DEBT(v0190 类补丁装错模块)相关的事 ——
+**注**:那次 triage 顺带实证了一件与上一条 DEBT(v0190 类补丁装错模块)相关的事 ——
 在 main + 核心 v0.19.1 上,活 gateway 启动日志里 **全部 13 类飞书补丁的安装目标都是
 `hermes_plugins.feishu_platform.adapter.FeishuAdapter`**(合成模块,即运行时真用的那份),
 不再是 `plugins.platforms.feishu.adapter`。疑似 `d0433e5`(materialize deferred platform)
 已比那条 DEBT 描述的范围修得更广。**未逐个复核,仅作线索**,建议下次碰这块时用
 `__code__.co_filename` 逐个复验后再决定关不关那条债(注意:`__module__` 会被
 `functools.wraps` 伪造,不能用作判据)。
+
+## 2026-08-01 — CI 门禁上线时排除的项（都要放回去）
+
+CI（`.gitlab-ci.yml`）首次真跑全量测试时暴露的，逐条记账。排除的都是「这台机器
+没有的外部依赖」或「CI 抓出来的真缺陷」，不是放宽断言。
+
+### D1 — 脚本里硬编码开发机绝对路径（**CI 抓出来的真缺陷**，优先级最高）
+
+- `scripts/lark_cli_matrix_runner.mjs:18`
+  `import { io } from '/Users/kite/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
+  另有 4 处 `/Users/kite/.hermes/...`（第 138、158、388、393 行）
+- `scripts/feishu_file_media_matrix_runner.py:27`
+  `SHARED_HOME = Path("/Users/kite/.hermes")`，第 387 行 `"/Users/kite/.hermes/profiles" in text`
+
+后果：这 17 条测试**只在 sunke 那台 Mac 上能过**，生产机和任何新同事的机器都会失败
+（容器里直接 `PermissionError: '/Users'`）。这违反 CLAUDE.md 的「Never hardcode paths」。
+修法：改成相对路径 / 走仓内依赖，然后从 `.gitlab-ci.yml` 的 `--ignore` 里拿掉。
+
+### D2 — `tests/test_billing_readiness.py` 6 条权限不变量测试（**安全测试，不该长期排除**）
+
+容器里报 `readiness_replay_store_permissions_invalid`。已排除 root 身份这个因素
+（job 改成非 root 的 `ci` 用户跑仍失败）。需要定位是容器的 umask/挂载语义不同，
+还是 `billing_readiness.py:568` 的权限假设本身太紧。**这是安全面，别拖。**
+
+### D3 — 需要外部业务 CLI 的 2 条
+
+- `tests/test_plugin_ingest.py::test_install_clis_skips_when_present` — 要 `kep-cli`，CI 里没有也不该有
+- `tests/test_aiagent_subprocess.py::test_session_search_proxy_covers_real_agent_tool_dispatch`
+
+修法：让它们在依赖缺失时自行 skip，而不是 fail。
+
+### D4 — GitLab 双推被自己的分支保护挡住
+
+`main` 设了 `push=No one` 之后，ftask 的 `postship --finalize` 往 GitLab 推 main 会被
+pre-receive 拒（GitHub 正常）。这是**设计预期**——一切必须走 MR——但在
+`ship_backend=pr` 打通之前，GitLab 镜像会滞后。当前靠临时放开保护同步基线，
+不可持续。修法：把 `ship_backend` 翻成 `pr`。
+
+## 2026-08-01 — 原子发布执行器上线时的已知缺口
+
+### D5 — 发布前备份只做状态核心，不含 profiles
+
+`hermes-release.sh` 调 `hermes-backup.sh` 时传了 `SKIP_PROFILES=1`：发布回滚包只需要
+6 个库 + 配置，40G profiles 每次发布都拷一遍不现实。代价：如果一次发布同时改坏了
+profiles 里的东西，回滚包救不了 —— 得靠每日备份（保留 7 份硬链快照）。
+目前发布不碰 profiles，风险可接受；哪天发布开始动 profiles 结构，这条要重新评估。
+
+### D6 — webui 构建期若需要 .env，当前没喂
+
+`.env` 已挪到 `~/.hermes-web-ui/.env` 并在 release 目录里做软链，运行期没问题。
+但如果将来构建期（vite/next 的 define 注入）也要读它，现在的流程没有显式传入。
+届时要从稳定路径 source 进构建环境，且不能把密钥写进 release 树。
+
+### D7 — 首次部署的鸡生蛋
+
+`~/code/hermes-*` 必须先是软链，执行器才肯工作（否则直接 die）。这次是手工迁移的，
+迁移步骤只在 SPEC 的 Plan 里，没有脚本化。换机器或重建时要照着 Plan 手工再来一遍。
+
+### D8 — 保留策略只按目录数，不看磁盘
+
+`KEEP_RELEASES=3` 是固定份数。webui 一个 release 目录 834M（含 node_modules），
+3 份约 2.5G，当前 275G 可用没问题。但没有「磁盘低于 X 就多裁」的逻辑。
+
+### D9 — 原子发布执行器:终局评审 BLOCK 的开放项（2026-08-01）
+
+grok 终局裁决为 BLOCK，开放项全是**测试覆盖完整性**，不是已实现行为的缺陷：
+dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单元启动断言、
+六库快照布局在 release 层的显式记录、EnvironmentFiles 预检。
+已补三条（裁剪必须保住回滚目标、非软链拒绝、STABLE_BIN 只在成功后同步），18/18 绿。
+剩余项需要注入 live systemctl 或属于 ops checklist。**未 ship，等 sunke 放行。**
+
+同轮降级为债的还有：`hermes-release.sh:backup:missing-script-skips-silently` ——
+`BACKUP_SH` 不可执行时静默跳过发布前备份。当前生产上它存在且可执行，
+但换机器/路径变动时会静默失去"不带备份不发布"这条保护。修法：缺失即 die。
