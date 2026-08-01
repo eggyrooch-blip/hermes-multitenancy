@@ -14,6 +14,7 @@ A tool fails mid-run because the user lacks a Feishu scope (99991672 app-scope /
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -284,3 +285,44 @@ async def test_card_noop_for_group_profile(monkeypatch: pytest.MonkeyPatch) -> N
         profile_name="feishu_group_abc123", profile_home=None,
         event=SimpleNamespace(sender_open_id="ou_alice", source=None),
     )
+
+
+@pytest.mark.asyncio
+async def test_second_jit_does_not_double_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two JIT triggers for the SAME device-code session (a concurrent run, or a turn
+    # that both expires creds and hits a permission error) must drive ONE poll task,
+    # not two — otherwise a successful auth fires the synthetic replay twice.
+    from hermes_multitenancy import router
+    from hermes_multitenancy.router import commands
+
+    commands._ACTIVE_AUTH_POLLS.clear()
+
+    started = 0
+    release = asyncio.Event()
+
+    async def fake_poll(**_kw):
+        nonlocal started
+        started += 1
+        await release.wait()
+
+    monkeypatch.setattr(router, "_poll_feishu_auth_session_until_done", fake_poll)
+
+    common = dict(
+        profile_name="feishu_g1", open_id="ou_alice", chat_id="c",
+        gateway=SimpleNamespace(), event=SimpleNamespace(), interval=1, auth_card=None,
+    )
+    router._start_feishu_auth_poll_task(session_id="sess-1", **common)
+    router._start_feishu_auth_poll_task(session_id="sess-1", **common)  # duplicate → dropped
+    await asyncio.sleep(0)  # let the first task body reach its await
+    assert started == 1
+    assert "sess-1" in commands._ACTIVE_AUTH_POLLS
+
+    # First poller finishes → session frees → a later JIT can start a fresh poll.
+    release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)  # drain task completion + done-callback
+    assert "sess-1" not in commands._ACTIVE_AUTH_POLLS
+
+    router._start_feishu_auth_poll_task(session_id="sess-1", **common)
+    await asyncio.sleep(0)
+    assert started == 2

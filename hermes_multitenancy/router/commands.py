@@ -922,6 +922,15 @@ def _profile_open_id_for_auth(profile_name: Optional[str]) -> Optional[str]:
     return str(row[0]) if row else None
 
 
+# One live poller per device-code session. find_active_session already de-dups the
+# device code across tool failures in a turn, but each JIT trigger (a concurrent run,
+# or a run that both expires creds and hits a permission error) would still spawn its
+# OWN poll task on that shared session_id → duplicate polls + double synthetic replay
+# on success. Single asyncio loop, so this set's check+add is atomic (no await between).
+# ponytail: process-local set, no lock — one event loop.
+_ACTIVE_AUTH_POLLS: set[str] = set()
+
+
 def _start_feishu_auth_poll_task(
     *,
     session_id: str,
@@ -935,6 +944,12 @@ def _start_feishu_auth_poll_task(
 ) -> None:
     if not session_id:
         return
+    if session_id in _ACTIVE_AUTH_POLLS:
+        _m.logger.debug(
+            "Feishu auth poll already live for session %s — skip duplicate", session_id
+        )
+        return
+    _ACTIVE_AUTH_POLLS.add(session_id)
     task = asyncio.create_task(
         _m._poll_feishu_auth_session_until_done(
             session_id=session_id,
@@ -948,7 +963,12 @@ def _start_feishu_auth_poll_task(
         ),
         name=f"feishu-auth:{profile_name}:{open_id}:{session_id}",
     )
-    task.add_done_callback(lambda t: _m.logger.debug("Feishu auth poll task ended: %s", t.get_name()))
+
+    def _on_poll_done(t: "asyncio.Task[Any]") -> None:
+        _ACTIVE_AUTH_POLLS.discard(session_id)
+        _m.logger.debug("Feishu auth poll task ended: %s", t.get_name())
+
+    task.add_done_callback(_on_poll_done)
 
 
 async def _dispatch_synthetic_auth_complete(
