@@ -11,10 +11,14 @@
 ;;;                     Writes scoped to this subtree.
 ;;;   SHARED_HOME     — ~/.hermes (cron/jobs storage, snapshot cache).
 ;;;   USER_HOME       — real user home (/Users/<user>). Needed because the
-;;;                     plugin runs on the host and host CLIs (kep-cli,
-;;;                     aws, gh) keep state under ~/.kep-cli, ~/.aws,
-;;;                     ~/.config/gh. We allow READ-ONLY traversal of
-;;;                     specific dotfiles below, NOT the whole home.
+;;;                     plugin runs on the host and kep-cli keeps state
+;;;                     under ~/.kep-cli. We allow READ-ONLY traversal of
+;;;                     that one dotdir, NOT the whole home. Host
+;;;                     credential dotdirs (~/.aws, ~/.config/gh,
+;;;                     ~/.config/git, ~/.gitconfig) are explicitly DENIED
+;;;                     below: they hold service-account credentials, not
+;;;                     tenant-scoped ones, and read-only does not stop
+;;;                     exfiltration.
 ;;;   HERMES_VENV     — Python venv root (where the interpreter +
 ;;;                     site-packages live).
 ;;;   HERMES_AGENT_INSTALL — venv.parent. Editable installs leave the
@@ -115,11 +119,7 @@
 ;; ``<HERMES_HOME>/tokens/`` rather than widening this allowlist.
 
 (allow file-read*
-    (subpath (string-append (param "USER_HOME") "/.kep-cli"))
-    (subpath (string-append (param "USER_HOME") "/.aws"))
-    (subpath (string-append (param "USER_HOME") "/.config/gh"))
-    (subpath (string-append (param "USER_HOME") "/.config/git"))
-    (literal (string-append (param "USER_HOME") "/.gitconfig")))
+    (subpath (string-append (param "USER_HOME") "/.kep-cli")))
 
 ;; Explicitly deny sensitive paths under USER_HOME so a typo above
 ;; cannot accidentally widen access. Sandbox evaluates DENY rules
@@ -127,7 +127,11 @@
 (deny file-read*
     (subpath (string-append (param "USER_HOME") "/.ssh"))
     (subpath (string-append (param "USER_HOME") "/Library/Keychains"))
-    (subpath (string-append (param "USER_HOME") "/.password-store")))
+    (subpath (string-append (param "USER_HOME") "/.password-store"))
+    (subpath (string-append (param "USER_HOME") "/.aws"))
+    (subpath (string-append (param "USER_HOME") "/.config/gh"))
+    (subpath (string-append (param "USER_HOME") "/.config/git"))
+    (literal (string-append (param "USER_HOME") "/.gitconfig")))
 
 ;; ── Profile read + write ──────────────────────────────────────────────
 
@@ -141,9 +145,6 @@
 (allow file-read* file-write*
     (subpath (string-append (param "SHARED_HOME") "/cron"))
     (subpath (string-append (param "SHARED_HOME") "/snapshots"))
-    (literal (string-append (param "SHARED_HOME") "/multitenancy.db"))
-    (literal (string-append (param "SHARED_HOME") "/multitenancy.db-wal"))
-    (literal (string-append (param "SHARED_HOME") "/multitenancy.db-shm"))
     (literal (string-append (param "SHARED_HOME") "/config.yaml"))
     (literal (string-append (param "SHARED_HOME") "/active_profile"))
     (literal (string-append (param "SHARED_HOME") "/.env"))

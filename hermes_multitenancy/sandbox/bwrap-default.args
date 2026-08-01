@@ -59,15 +59,17 @@
 
 # ── Shared tool binaries + legacy host CLI dotdirs ──────────────────
 # Shared Hermes-managed binaries (kep-auth, hades-cli, keep-record wrappers,
-# etc.) are executable from ${SHARED_HOME}/bin. Token state should live under
-# the routed profile via HOME=/PROFILE_HOME/home or /workspace; the host
-# dotdirs below are read-only legacy compatibility only.
+# etc.) are executable from ${SHARED_HOME}/bin. Token state lives under the
+# routed profile via HOME=/PROFILE_HOME/home or /workspace.
+#
+# Host credential dotdirs (~/.aws, ~/.config/gh, ~/.config/git, ~/.gitconfig)
+# are deliberately NOT mounted. They hold service-account credentials, not
+# tenant-scoped ones, and read-only does not stop exfiltration. The shared
+# control-plane database (multitenancy.db + WAL/SHM) is likewise not mounted:
+# it holds routing, principals, agent shares and encrypted credential rows,
+# and no sandboxed child reads it — the gateway parent owns that access.
 --ro-bind-try ${SHARED_HOME}/bin ${SHARED_HOME}/bin
 --ro-bind-try ${SHARED_HOME}/browser-browsers ${SHARED_HOME}/browser-browsers
---ro-bind-try ${USER_HOME}/.aws ${USER_HOME}/.aws
---ro-bind-try ${USER_HOME}/.config/gh ${USER_HOME}/.config/gh
---ro-bind-try ${USER_HOME}/.config/git ${USER_HOME}/.config/git
---ro-bind-try ${USER_HOME}/.gitconfig ${USER_HOME}/.gitconfig
 
 # ── Shared hermes home — explicit allowlist only ────────────────────
 # Do NOT bind SHARED_HOME wholesale. That would expose
@@ -87,9 +89,6 @@
 --bind-try ${SHARED_HOME}/cron ${SHARED_HOME}/cron
 --bind-try ${SHARED_HOME}/snapshots ${SHARED_HOME}/snapshots
 --bind-try ${SHARED_HOME}/audio_cache ${SHARED_HOME}/audio_cache
---bind-try ${SHARED_HOME}/multitenancy.db ${SHARED_HOME}/multitenancy.db
---bind-try ${SHARED_HOME}/multitenancy.db-wal ${SHARED_HOME}/multitenancy.db-wal
---bind-try ${SHARED_HOME}/multitenancy.db-shm ${SHARED_HOME}/multitenancy.db-shm
 
 # ── This profile — read + write ─────────────────────────────────────
 # Placed AFTER the SHARED_HOME ro-bind so it overrides the parent ro

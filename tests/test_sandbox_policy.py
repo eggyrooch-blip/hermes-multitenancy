@@ -166,3 +166,99 @@ def test_upstream_health_skips_required_sandbox_when_flag_off(tmp_path: Path, mo
     assert checks["required_sandbox"]["status"] == "skipped"
     assert "required_sandbox" not in report["attention"]
     assert report["ready"] is True
+
+
+# ── issue #10/#11/#12: host creds, control-plane db, fail-closed ──────────
+# The three published security issues. Both policy files are asserted, not just
+# the Linux one the issues named — the macOS .sb carried identical holes.
+
+import pytest
+
+_POLICY_DIR = Path(__file__).resolve().parent.parent / "hermes_multitenancy" / "sandbox"
+_FORBIDDEN_MOUNTS = (
+    "/.aws",
+    "/.config/gh",
+    "/.config/git",
+    "/.gitconfig",
+    "multitenancy.db",
+)
+
+
+def _granting_text(path: Path) -> str:
+    """Only the parts of a policy that GRANT access, comments stripped.
+
+    bwrap args are flat lines. The macOS .sb is S-expressions whose deny block
+    spans several lines, so a line-by-line filter would misread lines inside
+    `(deny ...)` as grants — split on top-level forms and keep the allows.
+    """
+    body = "\n".join(
+        raw for raw in path.read_text(encoding="utf-8").splitlines()
+        if raw.strip() and not raw.strip().startswith(("#", ";"))
+    )
+    if path.suffix != ".sb":
+        return body
+    forms = body.split("\n(")
+    return "\n".join(f for f in forms if f.lstrip("(").startswith("allow"))
+
+
+@pytest.mark.parametrize("policy", ["bwrap-default.args", "profile-default.sb"])
+@pytest.mark.parametrize("needle", _FORBIDDEN_MOUNTS)
+def test_policy_grants_no_host_creds_or_control_plane_db(policy, needle):
+    """#11 + #12: no grant line may reference host credentials or multitenancy.db.
+
+    Read-only was never enough for ~/.aws or ~/.config/gh — it stops writes, not
+    theft. multitenancy.db holds routing, principals, agent shares and encrypted
+    credential rows, and no sandboxed child reads it.
+    """
+    granting = [
+        line for line in _granting_text(_POLICY_DIR / policy).splitlines()
+        if needle in line
+    ]
+    assert granting == [], f"{policy} still grants {needle}: {granting}"
+
+
+def test_macos_policy_denies_host_credential_dirs():
+    """#12: removing the allow is not enough — a typo must not re-widen it."""
+    text = (_POLICY_DIR / "profile-default.sb").read_text(encoding="utf-8")
+    deny_block = text.split("(deny file-read*")[1].split(")\n\n")[0]
+    for needle in ("/.aws", "/.config/gh", "/.config/git", "/.gitconfig"):
+        assert needle in deny_block, f"{needle} missing from the macOS deny block"
+
+
+def test_require_sandbox_refuses_when_toggle_off(monkeypatch, tmp_path):
+    """#10: REQUIRE_SANDBOX=1 + sandbox off must raise, not return a bare cmd."""
+    from hermes_multitenancy.agent_real import _core
+
+    monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
+    monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
+    profile = tmp_path / "profiles" / "feishu_x"
+    profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="refusing to spawn"):
+        _core._wrap_with_sandbox(["/bin/echo", "hi"], profile)
+
+
+def test_require_sandbox_refuses_profile_gated_out_of_allowlist(monkeypatch, tmp_path):
+    """#10: a profile left out of the pilot allowlist is the exposure, not an excuse."""
+    from hermes_multitenancy.agent_real import _core
+
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SANDBOX_PROFILES", "spike_test")
+    monkeypatch.setenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", "1")
+    profile = tmp_path / "profiles" / "feishu_prod"
+    profile.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="profile_not_in_allowlist"):
+        _core._wrap_with_sandbox(["/bin/echo", "hi"], profile)
+
+
+def test_default_stays_fail_open_when_require_not_set(monkeypatch, tmp_path):
+    """Regression guard: without REQUIRE_SANDBOX the old contract is untouched."""
+    from hermes_multitenancy.agent_real import _core
+
+    monkeypatch.delenv("HERMES_USE_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_SANDBOX_PROFILES", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_REQUIRE_SANDBOX", raising=False)
+    profile = tmp_path / "profiles" / "feishu_x"
+    profile.mkdir(parents=True)
+    cmd = ["/bin/echo", "hi"]
+    assert _core._wrap_with_sandbox(cmd, profile) == cmd

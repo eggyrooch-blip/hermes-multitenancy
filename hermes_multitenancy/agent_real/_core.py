@@ -3319,7 +3319,24 @@ def _wrap_with_sandbox(cmd: list[str], profile_home: Path) -> list[str]:
     #     → every routed profile is sandboxed (final state after pilot).
     allowlist_raw = os.environ.get("HERMES_SANDBOX_PROFILES", "").strip()
     if not sandbox_profile_enabled(profile_home.name):
-        if os.environ.get("HERMES_USE_SANDBOX") == "1" and allowlist_raw:
+        gated_out = os.environ.get("HERMES_USE_SANDBOX") == "1" and allowlist_raw
+        # The two platform backends already honour HERMES_MULTITENANCY_REQUIRE_SANDBOX
+        # for their own preflight failures; this gate was the last path that could
+        # still hand back a bare, unsandboxed command. An operator who asked for
+        # fail-closed gets it here too — including for a profile deliberately left
+        # out of the pilot allowlist, which is exactly the cross-tenant exposure
+        # the allowlist is meant to be retired from.
+        if require_sandbox_enabled():
+            reason = "profile_not_in_allowlist" if gated_out else "sandbox_toggle_off"
+            msg = (
+                f"[multitenancy] HERMES_MULTITENANCY_REQUIRE_SANDBOX is set but "
+                f"profile {profile_home.name} would run unsandboxed ({reason}) — "
+                f"refusing to spawn."
+            )
+            logger.error(msg)
+            append_security_event(event_type="sandbox.denied", reason=reason)
+            raise RuntimeError(msg)
+        if gated_out:
             logger.debug(
                 "[multitenancy] sandbox gated: profile=%s not in HERMES_SANDBOX_PROFILES=%s",
                 profile_home.name, allowlist_raw,
