@@ -100,11 +100,14 @@ man_missing="$(grep '^db_missing=' "$SRC/MANIFEST.txt" | cut -d= -f2-)"
 man_empty="$(grep '^db_empty_skipped=' "$SRC/MANIFEST.txt" | cut -d= -f2-)"
 inventory=""
 for known in multitenancy.db state.db kanban.db multitenancy_routing.db hermes-web-ui.db web-ui.db; do
+  # 必须按逗号分词精确匹配：子串匹配下 `web-ui.db` 会命中 `hermes-web-ui.db`，
+  # 于是"缺失"被误报成"空库"，一个真缺的库就这么混过去了。
+  in_csv() { case ",$1," in *",$2,"*) return 0 ;; *) return 1 ;; esac; }
   if [ -f "$WORK/db/$known" ]; then
     st="已备份并核对"
-  elif printf '%s' "$man_empty" | grep -q "$known"; then
+  elif in_csv "$man_empty" "$known"; then
     st="0 字节，按设计跳过"
-  elif printf '%s' "$man_missing" | grep -q "$known"; then
+  elif in_csv "$man_missing" "$known"; then
     st="**缺失** —— 备份时源文件不存在"; fail=1
   else
     st="**未知** —— 既不在备份里也不在 MANIFEST 记录中"; fail=1
@@ -119,15 +122,26 @@ done
 # 抽样文件的内容与源一致（用校验和比，不是只看存在）。
 PROFILES_ROOT="$BACKUP_ROOT/profiles"
 prof_line=""
-PSRC="$(ls -1d "$PROFILES_ROOT"/*/ 2>/dev/null | sort | tail -1 || true)"
-if [ -z "$PSRC" ]; then
+# 用哨兵里记下的那一份，不是"当前最新的一份"。
+# 否则一次半途失败留下的更新的孤儿 profiles 目录，会被配到一份更老的 state 上，
+# 演练对一个从未同时产出的组合报"通过"。两层必须是同一次备份的产物。
+pinned="$(grep '^profiles_snapshot=' "$SRC/COMPLETE" 2>/dev/null | cut -d= -f2- || true)"
+PSRC=""
+if [ -n "$pinned" ] && [ "$pinned" != "(skipped)" ]; then
+  [ -d "$pinned" ] && PSRC="$pinned"
+  if [ -z "$PSRC" ]; then
+    prof_line="| **配套快照丢失** | 哨兵记的是 \`$(basename "$pinned")\`，现已不存在 | — |"
+    fail=1
+  fi
+fi
+if [ -z "$PSRC" ] && [ -z "$prof_line" ]; then
   if [ -d "$HERMES_HOME_DIR/profiles" ]; then
-    prof_line="| **缺失** | 有 state 备份却没有 profiles 快照 | — |"
+    prof_line="| **缺失** | 有 state 备份却没有配套 profiles 快照 | — |"
     fail=1
   else
     prof_line="| （本环境无 profiles） | — | — |"
   fi
-else
+elif [ -n "$PSRC" ]; then
   PSRC="${PSRC%/}"
   # `2>/dev/null` 只吞掉了消息，没吞掉退出码：38 万个文件里只要有一个 find 读不动，
   # 它就返回非零，pipefail 把整条管道判失败，set -e 直接把脚本踢出去 ——

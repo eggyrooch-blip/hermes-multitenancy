@@ -373,3 +373,41 @@ def test_drill_reports_all_six_known_dbs_by_name(env):
     ]:
         assert known in report, f"{known} 未在报告里点名"
     assert "0 字节，按设计跳过" in report
+
+
+def test_overlapping_db_names_are_matched_exactly(env):
+    """`web-ui.db` 是 `hermes-web-ui.db` 的子串。子串匹配会把「真缺失」误报成
+    「按设计跳过的空库」，一个真缺的库就这么混过去。必须按逗号分词精确匹配。"""
+    # 让 web-ui.db 真缺失（删掉），hermes-web-ui.db 正常存在
+    (Path(env["HERMES_WEBUI_DIR"]) / "web-ui.db").unlink()
+    assert _run(BACKUP_SH, env).returncode == 0
+
+    manifest = (_state_snapshots(env)[-1] / "MANIFEST.txt").read_text()
+    assert "db_missing=web-ui.db," in manifest
+
+    result = _run(DRILL_SH, env)
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert "| `web-ui.db` | **缺失**" in report, "真缺失被误判成空库了"
+    assert result.returncode != 0, "已知库缺失必须判失败"
+
+
+def test_drill_uses_the_profiles_snapshot_pinned_in_sentinel(env):
+    """两层必须是同一次备份的产物。一个更新的孤儿 profiles 目录不能被
+    配到更老的 state 上，凑出一个从未同时产出的组合。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    snap = _state_snapshots(env)[-1]
+    pinned = Path(
+        [l for l in (snap / "COMPLETE").read_text().splitlines()
+         if l.startswith("profiles_snapshot=")][0].split("=", 1)[1]
+    )
+    assert pinned.is_dir()
+
+    # 伪造一个"更新的"孤儿 profiles 目录
+    orphan = pinned.parent / "29991231T235959"
+    orphan.mkdir()
+    (orphan / "junk.txt").write_text("not part of any backup\n")
+
+    assert _run(DRILL_SH, env).returncode == 0
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert pinned.name in report, "演练应当用哨兵钉住的那一份"
+    assert "29991231" not in report, "孤儿快照不能被选中"

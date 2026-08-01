@@ -87,6 +87,9 @@ cleanup_all() {
   # 否则它会一直躺在那里冒充"最新一份"。
   if [ -n "${STATE_DEST:-}" ] && [ -d "$STATE_DEST" ] && [ ! -f "$STATE_DEST/COMPLETE" ]; then
     rm -rf "$STATE_DEST"
+    # 配套的 profiles 也要一起收：留下一个"更新的"孤儿 profiles 目录，
+    # 会被下次演练配到更老的 state 上，凑成一个从未同时产出的组合。
+    [ -n "${PROF_DEST:-}" ] && [ -d "$PROF_DEST" ] && rm -rf "$PROF_DEST"
   fi
   [ -n "${LOCK_DIR:-}" ] && rm -rf "$LOCK_DIR"
   return 0
@@ -198,8 +201,11 @@ trap - ERR
 # 时间戳只精确到秒。同一秒内跑两次(手动触发撞上定时器、或发布前备份紧跟日备)时目标已存在，
 # 而 `mv A B` 在 B 是已存在目录时会把 A 塞进 B 里，产生嵌套的烂摊子。加序号避开。
 uniq_dest() {
+  # 后缀必须用 `_` 不能用 `-`：prune 是按名字 sort 找最老的，
+  # 而 '-'(0x2D) < '/'(0x2F)，`...618-2/` 会排在 `...618/` 前面被当成更老的先删，
+  # 于是刚做好的那一份反而被裁掉。'_'(0x5F) > '/'，排序才是对的。
   local base="$1" n=1 dest="$1"
-  while [ -e "$dest" ]; do n=$((n + 1)); dest="${base}-${n}"; done
+  while [ -e "$dest" ]; do n=$((n + 1)); dest="$(printf '%s_%02d' "$base" "$n")"; done
   printf '%s' "$dest"
 }
 STATE_DEST="$(uniq_dest "$STATE_ROOT/$TS")"
@@ -278,7 +284,17 @@ else
   log "profiles 快照完成 → ${PROF_DEST}（${nprof} 个文件$([ -n "$prev" ] && echo "，增量，基于 $(basename "${prev%/}")" || echo "，首次全量")）"
 fi
 
+# ── 完成哨兵：走到这里才算两层都成功 ────────────────────────────────
+# 内容里带上本次配套的 profiles 快照名，演练据此确认两层是同一次产出的。
+# 先写 .tmp 再 rename —— 哨兵本身必须原子出现，不能被读到写了一半的版本
+{
+  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "profiles_snapshot=${PROF_DEST:-(skipped)}"
+} > "$STATE_DEST/.COMPLETE.tmp"
+mv "$STATE_DEST/.COMPLETE.tmp" "$STATE_DEST/COMPLETE"
+
 # ── 保留策略:安全机制不能自己把盘撑爆 ───────────────────────────────
+# 顺序：先落哨兵再裁剪。反过来的话，裁剪可能把本次刚落地、还没标完成的目录删掉。
 prune() {
   local root="$1" keep="$2"
   [ -d "$root" ] || return 0
@@ -291,13 +307,6 @@ prune() {
 }
 prune "$STATE_ROOT" "$KEEP_STATE"
 prune "$PROFILES_ROOT" "$KEEP_PROFILES"
-
-# ── 完成哨兵：走到这里才算两层都成功 ────────────────────────────────
-# 内容里带上本次配套的 profiles 快照名，演练据此确认两层是同一次产出的。
-{
-  echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "profiles_snapshot=${PROF_DEST:-(skipped)}"
-} > "$STATE_DEST/COMPLETE"
 
 [ -z "$missing" ] || log "⚠️  本次未备到的库：${missing%,}"
 [ -z "$empty" ] || log "  （0 字节跳过：${empty%,}）"
