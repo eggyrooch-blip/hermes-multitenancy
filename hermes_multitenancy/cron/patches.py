@@ -299,6 +299,9 @@ def _patch_scheduler_owner_open_id_delivery() -> None:
 
     @functools.wraps(original)
     def resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
+        target = original(job, deliver_value)
+        if target is not None:
+            return target
         owner_open_id = str(job.get("owner_open_id") or "").strip()
         if str(deliver_value).strip().lower() == "feishu" and owner_open_id.startswith("ou_"):
             return {
@@ -306,7 +309,7 @@ def _patch_scheduler_owner_open_id_delivery() -> None:
                 "chat_id": owner_open_id,
                 "thread_id": None,
             }
-        return original(job, deliver_value)
+        return None
 
     setattr(resolve_single_delivery_target, "_hermes_multitenancy_patched", True)
     scheduler._resolve_single_delivery_target = resolve_single_delivery_target
@@ -437,14 +440,14 @@ def _patch_cron_delivery_mirror() -> None:
         ):
             return "failed to resolve cron delivery target"
         if len(targets) == 1 and str(targets[0].get("platform") or "").strip().lower() == "feishu":
+            target = targets[0]
+            if not _cw._cron_delivery_identity_is_bound(job, target):
+                return "cron delivery identity is unavailable or ambiguous"
             try:
                 _, media_files = _cw._cron_delivery_payload_for_adapter(job, content)
             except Exception:
                 media_files = ["unknown"]
             if not media_files:
-                target = targets[0]
-                if not _cw._cron_delivery_identity_is_bound(job, target):
-                    return "cron delivery identity is unavailable or ambiguous"
                 live_error = _cw._deliver_cron_feishu_via_live_adapter(
                     scheduler,
                     job,
