@@ -96,10 +96,11 @@ def _deliver_cron_feishu_via_live_adapter(
     # stream as interactive CardKit cards. When enabled, render a simple
     # interactive card so scheduled-task output looks like a normal reply.
     card: Optional[dict] = None
+    card_sender_name = "_send_raw_message" if require_receipt else "_feishu_send_with_retry"
     if (
         text_to_send
         and _cw._cron_card_response_enabled()
-        and callable(getattr(adapter, "_feishu_send_with_retry", None))
+        and callable(getattr(adapter, card_sender_name, None))
     ):
         try:
             card, card_media = _cw._build_cron_card(job, content)
@@ -109,6 +110,8 @@ def _deliver_cron_feishu_via_live_adapter(
         except Exception:
             logger.warning("[multitenancy] cron card build failed; using text", exc_info=True)
             card = None
+    if require_receipt and card is None:
+        return "feishu confirmed card unavailable"
 
     errors: list[str] = []
     for target in feishu_targets:
@@ -269,7 +272,8 @@ def _send_cron_card_via_live_adapter(
     try:
         # ``_feishu_send_with_retry`` may raise synchronously while building the
         # coroutine; keep it inside the guard.
-        coro = adapter._feishu_send_with_retry(
+        sender = adapter._send_raw_message if require_receipt else adapter._feishu_send_with_retry
+        coro = sender(
             chat_id=chat_id,
             msg_type="interactive",
             payload=payload,

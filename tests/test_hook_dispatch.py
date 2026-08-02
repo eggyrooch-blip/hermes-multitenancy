@@ -712,8 +712,8 @@ def test_startup_watch_starts_cron_worker_when_adapters_ready(monkeypatch):
     assert calls == [gateway]
 
 
-def test_cron_delivery_patch_resolves_owner_open_id(monkeypatch):
-    """Bare deliver=feishu deterministically targets the WebUI owner's open_id."""
+def test_cron_delivery_patch_preserves_resolved_origin(monkeypatch):
+    """Bare deliver=feishu keeps core's resolved origin for media/multi-target jobs."""
     import sys
     import types
 
@@ -739,7 +739,7 @@ def test_cron_delivery_patch_resolves_owner_open_id(monkeypatch):
 
     assert target == {
         "platform": "feishu",
-        "chat_id": "ou_test_owner",
+        "chat_id": "oc_untrusted_origin",
         "thread_id": None,
     }
 
@@ -1162,8 +1162,8 @@ def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missi
     monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
 
     class Adapter:
-        async def send(self, chat_id, text, metadata=None):
-            sent.append((chat_id, text, metadata))
+        async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            sent.append((chat_id, msg_type, payload, reply_to, metadata))
             return types.SimpleNamespace(success=True, message_id="om_confirmed")
 
     def run_now(coro, _loop):
@@ -1189,8 +1189,9 @@ def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missi
     assert error is None
     assert len(sent) == 1
     assert sent[0][0] == "oc_target"
-    assert "Cronjob Response: IT reminder" in sent[0][1]
-    assert "cron body" in sent[0][1]
+    assert sent[0][1] == "interactive"
+    assert "IT reminder" in sent[0][2]
+    assert "cron body" in sent[0][2]
 
 
 def test_cron_delivery_patch_uses_one_receipted_live_send_even_if_core_would_succeed(monkeypatch):
@@ -1262,9 +1263,12 @@ def test_cron_delivery_patch_rejects_unconfirmed_live_feishu_send(monkeypatch, c
     )
 
     class Adapter:
-        async def send(self, chat_id, text, metadata=None):
-            sent.append((chat_id, text, metadata))
+        async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            sent.append((chat_id, msg_type, payload, reply_to, metadata))
             return types.SimpleNamespace(success=True, message_id=None)
+
+        def _finalize_send_result(self, response, _message):
+            return response
 
     def run_now(coro, _loop):
         result = asyncio.run(coro)
@@ -1561,7 +1565,7 @@ def test_cron_delivery_patch_filters_thread_id_for_feishu_dm(monkeypatch):
     monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
 
     class Adapter:
-        async def send(self, chat_id, text, metadata=None):
+        async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
             sent.append((chat_id, metadata))
             return types.SimpleNamespace(success=True, message_id="om_confirmed")
 
@@ -1618,6 +1622,7 @@ def test_cron_delivery_patch_handles_media_branch_without_name_error(monkeypatch
         return types.SimpleNamespace(result=lambda timeout=None: result, cancel=lambda: None)
 
     monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda _job, _target: True)
     cron_worker._patch_cron_delivery_mirror()
 
     error = scheduler._deliver_result(
@@ -1630,6 +1635,47 @@ def test_cron_delivery_patch_handles_media_branch_without_name_error(monkeypatch
     assert error is None
     assert sent == [("oc_target", "text body", None)]
     assert media_sent == [("oc_target", [("/tmp/a.png", False)])]
+
+
+def test_cron_delivery_patch_rejects_unbound_media_before_core(monkeypatch):
+    """Media keeps its legacy sender only after owner/profile/target binding."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    original_calls = []
+    scheduler._deliver_result = lambda *args, **kwargs: original_calls.append(True) or None
+    scheduler._resolve_delivery_targets = lambda _job: [
+        {"platform": "feishu", "chat_id": "oc_target", "thread_id": None}
+    ]
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setattr(
+        cron_worker,
+        "_cron_delivery_payload_for_adapter",
+        lambda _job, _content: ("text body", [("/tmp/a.png", False)]),
+    )
+    monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda _job, _target: False)
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {
+            "id": "job123",
+            "deliver": "feishu",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "owner",
+        },
+        "cron body",
+        adapters={"feishu": object()},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error == "cron delivery identity is unavailable or ambiguous"
+    assert original_calls == []
 
 
 def test_cron_worker_reads_active_profiles_from_routing_db(tmp_path):

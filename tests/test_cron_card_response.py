@@ -93,7 +93,7 @@ def test_send_cron_card_uses_interactive_msg_type(monkeypatch):
 
 
 def test_send_cron_card_requires_nonblank_message_id_when_requested(monkeypatch):
-    adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: "coro")
+    adapter = SimpleNamespace(_send_raw_message=lambda **k: "coro")
     monkeypatch.setattr(
         cron_worker,
         "_schedule_on_gateway_loop",
@@ -110,6 +110,31 @@ def test_send_cron_card_requires_nonblank_message_id_when_requested(monkeypatch)
     )
 
     assert err == "feishu card send missing message_id"
+
+
+def test_send_cron_card_receipt_path_uses_one_raw_attempt(monkeypatch):
+    calls = []
+    adapter = SimpleNamespace(
+        _send_raw_message=lambda **kwargs: calls.append(("raw", kwargs)) or "raw-coro",
+        _feishu_send_with_retry=lambda **kwargs: calls.append(("retry", kwargs)) or "retry-coro",
+    )
+    monkeypatch.setattr(
+        cron_worker,
+        "_schedule_on_gateway_loop",
+        lambda coro, loop: (_FakeFuture(SimpleNamespace(success=True, message_id="om_once")), None),
+    )
+
+    err = _send_cron_card_via_live_adapter(
+        adapter,
+        "oc_dm",
+        {"elements": []},
+        None,
+        object(),
+        require_receipt=True,
+    )
+
+    assert err is None
+    assert [kind for kind, _kwargs in calls] == ["raw"]
 
 
 def test_send_cron_card_detects_non_success_response(monkeypatch):
@@ -171,7 +196,7 @@ def _running_loop():
 
 def test_delivery_prefers_card_over_text(monkeypatch):
     target = {"platform": "feishu", "chat_id": "ou_abc"}
-    adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: None, send=lambda *a, **k: None)
+    adapter = SimpleNamespace(_send_raw_message=lambda **k: None, send=lambda *a, **k: None)
 
     monkeypatch.setattr(cron_worker, "_adapter_for_platform", lambda adapters, name: adapter)
     monkeypatch.setattr(cron_worker, "_cron_card_response_enabled", lambda: True)
@@ -204,7 +229,7 @@ def test_delivery_prefers_card_over_text(monkeypatch):
 
 def test_delivery_does_not_double_send_when_card_result_is_unconfirmed(monkeypatch):
     target = {"platform": "feishu", "chat_id": "ou_abc"}
-    adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: None, send=lambda *a, **k: "text-coro")
+    adapter = SimpleNamespace(_send_raw_message=lambda **k: None, send=lambda *a, **k: "text-coro")
 
     monkeypatch.setattr(cron_worker, "_adapter_for_platform", lambda adapters, name: adapter)
     monkeypatch.setattr(cron_worker, "_cron_card_response_enabled", lambda: True)
@@ -260,7 +285,7 @@ def test_legacy_delivery_still_falls_back_to_text_when_card_fails(monkeypatch):
     assert text_calls == ["text-coro"]
 
 
-def test_delivery_rejects_whitespace_message_id_when_receipt_required(monkeypatch):
+def test_delivery_requires_static_card_when_receipt_required(monkeypatch):
     target = {"platform": "feishu", "chat_id": "ou_abc"}
     adapter = SimpleNamespace(send=lambda *a, **k: "text-coro")
     monkeypatch.setattr(cron_worker, "_adapter_for_platform", lambda adapters, name: adapter)
@@ -280,4 +305,4 @@ def test_delivery_rejects_whitespace_message_id_when_receipt_required(monkeypatc
         require_receipt=True,
     )
 
-    assert err == "feishu live adapter send missing message_id"
+    assert err == "feishu confirmed card unavailable"
