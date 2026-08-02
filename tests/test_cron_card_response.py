@@ -4,8 +4,8 @@ Historically the cron worker delivered scheduled-task output via
 ``adapter.send`` as ``msg_type="text"``, which flattens markdown (bullets,
 bold, links) — unlike normal replies that stream as interactive CardKit cards.
 ``_build_cron_card`` + ``_send_cron_card_via_live_adapter`` render a simple
-interactive card instead, gated by ``cron.card_response`` (default on) with a
-plain-text fallback so a card failure never drops the delivery.
+interactive card instead, gated by ``cron.card_response`` (default on). An
+unconfirmed card send fails closed so a fallback cannot double-send it.
 
 These tests fail without the card path (delivery stays plain text).
 """
@@ -92,6 +92,26 @@ def test_send_cron_card_uses_interactive_msg_type(monkeypatch):
     assert json.loads(captured["payload"]) == card
 
 
+def test_send_cron_card_requires_nonblank_message_id_when_requested(monkeypatch):
+    adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: "coro")
+    monkeypatch.setattr(
+        cron_worker,
+        "_schedule_on_gateway_loop",
+        lambda coro, loop: (_FakeFuture(SimpleNamespace(success=True, message_id="  ")), None),
+    )
+
+    err = _send_cron_card_via_live_adapter(
+        adapter,
+        "ou_abc",
+        {"elements": []},
+        None,
+        object(),
+        require_receipt=True,
+    )
+
+    assert err == "feishu card send missing message_id"
+
+
 def test_send_cron_card_detects_non_success_response(monkeypatch):
     # A raw Feishu response with code != 0 and no message_id must be detected
     # as a failure (via _finalize), NOT silently treated as success — else the
@@ -139,7 +159,7 @@ def test_send_cron_card_contains_coroutine_raise(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# delivery: prefers card, falls back to text                                  #
+# delivery: prefers one provable card send                                   #
 # --------------------------------------------------------------------------- #
 def _fake_scheduler(target):
     return SimpleNamespace(_resolve_delivery_targets=lambda job: [target])
@@ -175,13 +195,14 @@ def test_delivery_prefers_card_over_text(monkeypatch):
         _MARKDOWN_BODY,
         adapters={"feishu": adapter},
         loop=_running_loop(),
+        require_receipt=True,
     )
     assert err is None
     assert calls["card"] == 1
     assert calls["text"] == 0  # card success → text path skipped
 
 
-def test_delivery_falls_back_to_text_when_card_fails(monkeypatch):
+def test_delivery_does_not_double_send_when_card_result_is_unconfirmed(monkeypatch):
     target = {"platform": "feishu", "chat_id": "ou_abc"}
     adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: None, send=lambda *a, **k: "text-coro")
 
@@ -195,8 +216,7 @@ def test_delivery_falls_back_to_text_when_card_fails(monkeypatch):
 
     def fake_schedule(coro, loop):
         text_calls["n"] += 1
-        assert coro == "text-coro"  # the plain-text send was attempted
-        return _FakeFuture(SimpleNamespace(success=True)), None
+        return _FakeFuture(SimpleNamespace(success=True, message_id="om_unexpected")), None
 
     monkeypatch.setattr(cron_worker, "_schedule_on_gateway_loop", fake_schedule)
 
@@ -206,6 +226,58 @@ def test_delivery_falls_back_to_text_when_card_fails(monkeypatch):
         _MARKDOWN_BODY,
         adapters={"feishu": adapter},
         loop=_running_loop(),
+        require_receipt=True,
     )
+    assert err == "card boom"
+    assert text_calls["n"] == 0
+
+
+def test_legacy_delivery_still_falls_back_to_text_when_card_fails(monkeypatch):
+    target = {"platform": "feishu", "chat_id": "ou_abc"}
+    adapter = SimpleNamespace(_feishu_send_with_retry=lambda **k: None, send=lambda *a, **k: "text-coro")
+    monkeypatch.setattr(cron_worker, "_adapter_for_platform", lambda adapters, name: adapter)
+    monkeypatch.setattr(cron_worker, "_cron_card_response_enabled", lambda: True)
+    monkeypatch.setattr(
+        cron_worker, "_send_cron_card_via_live_adapter", lambda *a, **k: "card boom"
+    )
+    text_calls = []
+    monkeypatch.setattr(
+        cron_worker,
+        "_schedule_on_gateway_loop",
+        lambda coro, loop: text_calls.append(coro)
+        or (_FakeFuture(SimpleNamespace(success=True)), None),
+    )
+
+    err = _deliver_cron_feishu_via_live_adapter(
+        _fake_scheduler(target),
+        {"id": "j1", "name": "task"},
+        _MARKDOWN_BODY,
+        adapters={"feishu": adapter},
+        loop=_running_loop(),
+    )
+
     assert err is None
-    assert text_calls["n"] == 1  # fell back to plain text after card failure
+    assert text_calls == ["text-coro"]
+
+
+def test_delivery_rejects_whitespace_message_id_when_receipt_required(monkeypatch):
+    target = {"platform": "feishu", "chat_id": "ou_abc"}
+    adapter = SimpleNamespace(send=lambda *a, **k: "text-coro")
+    monkeypatch.setattr(cron_worker, "_adapter_for_platform", lambda adapters, name: adapter)
+    monkeypatch.setattr(cron_worker, "_cron_card_response_enabled", lambda: False)
+    monkeypatch.setattr(
+        cron_worker,
+        "_schedule_on_gateway_loop",
+        lambda coro, loop: (_FakeFuture(SimpleNamespace(success=True, message_id="   ")), None),
+    )
+
+    err = _deliver_cron_feishu_via_live_adapter(
+        _fake_scheduler(target),
+        {"id": "j1", "name": "task"},
+        _MARKDOWN_BODY,
+        adapters={"feishu": adapter},
+        loop=_running_loop(),
+        require_receipt=True,
+    )
+
+    assert err == "feishu live adapter send missing message_id"
