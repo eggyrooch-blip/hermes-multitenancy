@@ -323,31 +323,43 @@ def _cron_run_broker_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _cron_delivery_identity_is_bound(job: dict, target: dict) -> bool:
-    """Prove one active profile route owns the Feishu delivery target."""
+def _cron_delivery_route(job: dict) -> Optional[dict[str, str]]:
+    """Return the one active route only when it matches the stored job owner."""
     owner = str(job.get("owner_open_id") or "").strip()
     profile = str(job.get("owner_profile") or "").strip()
     if not owner.startswith("ou_") or not profile or profile == "multitenancy_router":
-        return False
+        return None
     try:
         db_path = _cw._resolve_shared_home() / "multitenancy.db"
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
             rows = conn.execute(
-                "SELECT open_id, owner_open_id, chat_id "
+                "SELECT open_id, owner_open_id, chat_id, kind "
                 "FROM multitenancy_routing WHERE profile_name = ? AND active = 1",
                 (profile,),
             ).fetchall()
     except Exception:
-        return False
+        return None
     if len(rows) != 1 or str(rows[0][1] or rows[0][0] or "").strip() != owner:
+        return None
+    return {
+        "owner": owner,
+        "chat_id": str(rows[0][2] or "").strip(),
+        "kind": str(rows[0][3] or "").strip().lower(),
+    }
+
+
+def _cron_delivery_identity_is_bound(job: dict, target: dict) -> bool:
+    """Prove one active profile route owns the Feishu delivery target."""
+    route = _cw._cron_delivery_route(job)
+    if route is None:
         return False
 
     chat_id = str(target.get("chat_id") or "").strip()
     return bool(
         chat_id
         and (
-            chat_id == owner
-            or chat_id == str(rows[0][2] or "").strip()
+            chat_id == route["owner"]
+            or chat_id == route["chat_id"]
         )
     )
 
@@ -441,12 +453,20 @@ def _patch_cron_delivery_mirror() -> None:
             return "failed to resolve cron delivery target"
         if len(targets) == 1 and str(targets[0].get("platform") or "").strip().lower() == "feishu":
             target = targets[0]
-            if not _cw._cron_delivery_identity_is_bound(job, target):
-                return "cron delivery identity is unavailable or ambiguous"
             try:
                 _, media_files = _cw._cron_delivery_payload_for_adapter(job, content)
             except Exception:
                 media_files = ["unknown"]
+            if not _cw._cron_delivery_identity_is_bound(job, target):
+                route = _cw._cron_delivery_route(job)
+                if deliver == "feishu" and not media_files and route and route["kind"] == "user":
+                    target = {
+                        "platform": "feishu",
+                        "chat_id": route["owner"],
+                        "thread_id": None,
+                    }
+                else:
+                    return "cron delivery identity is unavailable or ambiguous"
             if not media_files:
                 live_error = _cw._deliver_cron_feishu_via_live_adapter(
                     scheduler,

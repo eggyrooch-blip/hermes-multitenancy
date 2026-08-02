@@ -713,7 +713,7 @@ def test_startup_watch_starts_cron_worker_when_adapters_ready(monkeypatch):
 
 
 def test_cron_delivery_patch_preserves_resolved_origin(monkeypatch):
-    """Bare deliver=feishu keeps core's resolved origin for media/multi-target jobs."""
+    """Target resolution keeps core's origin before delivery inspects media."""
     import sys
     import types
 
@@ -721,9 +721,8 @@ def test_cron_delivery_patch_preserves_resolved_origin(monkeypatch):
 
     cron_pkg = types.ModuleType("cron")
     scheduler = types.ModuleType("cron.scheduler")
-
     def original_resolver(_job, _deliver_value):
-        return {"platform": "feishu", "chat_id": "oc_untrusted_origin", "thread_id": None}
+        return {"platform": "feishu", "chat_id": "oc_stale_dm", "thread_id": None}
 
     scheduler._resolve_single_delivery_target = original_resolver
     cron_pkg.scheduler = scheduler
@@ -733,15 +732,104 @@ def test_cron_delivery_patch_preserves_resolved_origin(monkeypatch):
     cron_worker._patch_scheduler_owner_open_id_delivery()
 
     target = scheduler._resolve_single_delivery_target(
-        {"deliver": "feishu", "owner_open_id": "ou_test_owner"},
+        {
+            "deliver": "feishu",
+            "owner_open_id": "ou_test_owner",
+            "owner_profile": "owner",
+        },
         "feishu",
     )
 
-    assert target == {
+    assert target["chat_id"] == "oc_stale_dm"
+
+
+def test_cron_delivery_patch_preserves_group_route_target(monkeypatch):
+    """Bare deliver=feishu keeps core's target for a group-owned profile."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    scheduler._resolve_single_delivery_target = lambda _job, _deliver: {
         "platform": "feishu",
-        "chat_id": "oc_untrusted_origin",
+        "chat_id": "oc_group",
         "thread_id": None,
     }
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    cron_worker._patch_scheduler_owner_open_id_delivery()
+
+    assert scheduler._resolve_single_delivery_target(
+        {
+            "deliver": "feishu",
+            "owner_open_id": "ou_test_owner",
+            "owner_profile": "group_profile",
+        },
+        "feishu",
+    )["chat_id"] == "oc_group"
+
+
+@pytest.mark.parametrize("deliver_value", ["origin", "feishu:oc_explicit"])
+def test_cron_delivery_patch_preserves_explicit_feishu_intent(monkeypatch, deliver_value):
+    """Explicit origin/target delivery remains core-owned."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    scheduler._resolve_single_delivery_target = lambda _job, _deliver: {
+        "platform": "feishu",
+        "chat_id": "oc_explicit",
+        "thread_id": None,
+    }
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    cron_worker._patch_scheduler_owner_open_id_delivery()
+
+    assert scheduler._resolve_single_delivery_target(
+        {"owner_open_id": "ou_test_owner", "owner_profile": "owner"},
+        deliver_value,
+    )["chat_id"] == "oc_explicit"
+
+
+def test_cron_delivery_patch_preserves_multi_target_delivery(monkeypatch):
+    """A bare Feishu token inside a multi-target job stays on core's path."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    original_calls = []
+    scheduler._deliver_result = lambda job, content, adapters=None, loop=None: original_calls.append(job["deliver"])
+    scheduler._resolve_delivery_targets = lambda _job: [
+        {"platform": "feishu", "chat_id": "oc_original"},
+        {"platform": "slack", "chat_id": "channel"},
+    ]
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "deliver": "feishu,slack"},
+        "cron body",
+        adapters={},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error is None
+    assert original_calls == ["feishu,slack"]
 
 
 def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
@@ -1194,8 +1282,9 @@ def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missi
     assert "cron body" in sent[0][2]
 
 
-def test_cron_delivery_patch_uses_one_receipted_live_send_even_if_core_would_succeed(monkeypatch):
-    """Single-target Feishu cron uses one provable live send, not core's weak success."""
+def test_cron_delivery_patch_sends_verified_user_dm_with_receipt(monkeypatch, tmp_path):
+    """Bare Feishu delivery resolves the owner before strict receipt and mirror."""
+    import sqlite3
     import sys
     import types
 
@@ -1204,39 +1293,73 @@ def test_cron_delivery_patch_uses_one_receipted_live_send_even_if_core_would_suc
     cron_pkg = types.ModuleType("cron")
     scheduler = types.ModuleType("cron.scheduler")
     sent = []
+    mirrored = []
 
     scheduler._deliver_result = lambda _job, _content, adapters=None, loop=None: None
-    scheduler._resolve_delivery_targets = lambda _job: [{"platform": "feishu", "chat_id": "oc_target"}]
+    scheduler._resolve_single_delivery_target = lambda _job, _deliver: {
+        "platform": "feishu",
+        "chat_id": "oc_target",
+        "thread_id": None,
+    }
+    scheduler._resolve_delivery_targets = lambda job: [
+        scheduler._resolve_single_delivery_target(job, "feishu")
+    ]
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)
     monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(tmp_path))
+    with sqlite3.connect(tmp_path / "multitenancy.db") as conn:
+        conn.execute(
+            "CREATE TABLE multitenancy_routing "
+            "(open_id TEXT, owner_open_id TEXT, profile_name TEXT, active INTEGER, "
+            "kind TEXT, chat_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO multitenancy_routing VALUES (?, NULL, ?, 1, 'user', NULL)",
+            ("ou_owner", "owner"),
+        )
 
     class Adapter:
-        async def send(self, chat_id, text, metadata=None):
-            sent.append((chat_id, text, metadata))
+        async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            sent.append((chat_id, msg_type, payload, reply_to, metadata))
             return types.SimpleNamespace(success=True, message_id="om_confirmed")
+
+        def _finalize_send_result(self, response, _message):
+            return response
 
     def run_now(coro, _loop):
         result = asyncio.run(coro)
         return types.SimpleNamespace(result=lambda timeout=None: result, cancel=lambda: None)
 
-    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    agent_pkg = types.ModuleType("agent")
+    async_utils = types.ModuleType("agent.async_utils")
+    async_utils.safe_schedule_threadsafe = run_now
+    agent_pkg.async_utils = async_utils
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.async_utils", async_utils)
     monkeypatch.setattr(
-        cron_worker,
-        "_cron_delivery_identity_is_bound",
-        lambda job, target: target.get("chat_id") == job.get("owner_open_id"),
+        cron_worker, "_mirror_cron_delivery_to_owner",
+        lambda job, content: mirrored.append((job["id"], content)),
     )
+    cron_worker._patch_scheduler_owner_open_id_delivery()
     cron_worker._patch_cron_delivery_mirror()
 
     error = scheduler._deliver_result(
-        {"id": "job123", "name": "Daily digest", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        {
+            "id": "job123",
+            "name": "Daily digest",
+            "deliver": "feishu",
+            "owner_open_id": "ou_owner",
+            "owner_profile": "owner",
+        },
         "cron body",
         adapters={"feishu": Adapter()},
         loop=types.SimpleNamespace(is_running=lambda: True),
     )
 
-    assert error == "cron delivery identity is unavailable or ambiguous"
-    assert sent == []
+    assert error is None
+    assert [item[0] for item in sent] == ["ou_owner"]
+    assert mirrored == [("job123", "cron body")]
 
 
 def test_cron_delivery_patch_rejects_unconfirmed_live_feishu_send(monkeypatch, caplog):
@@ -1519,10 +1642,11 @@ def test_cron_delivery_identity_requires_one_matching_active_route(monkeypatch, 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TABLE multitenancy_routing "
-            "(open_id TEXT, owner_open_id TEXT, profile_name TEXT, active INTEGER, chat_id TEXT)"
+            "(open_id TEXT, owner_open_id TEXT, profile_name TEXT, active INTEGER, "
+            "chat_id TEXT, kind TEXT)"
         )
         conn.execute(
-            "INSERT INTO multitenancy_routing VALUES (?, ?, ?, 1, NULL)",
+            "INSERT INTO multitenancy_routing VALUES (?, ?, ?, 1, NULL, 'user')",
             ("ou_owner", None, "owner"),
         )
     monkeypatch.setenv("HERMES_SHARED_HOME", str(tmp_path))
@@ -1540,7 +1664,7 @@ def test_cron_delivery_identity_requires_one_matching_active_route(monkeypatch, 
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "INSERT INTO multitenancy_routing VALUES (?, ?, ?, 1, NULL)",
+            "INSERT INTO multitenancy_routing VALUES (?, ?, ?, 1, NULL, 'user')",
             ("ou_other", None, "owner"),
         )
 
