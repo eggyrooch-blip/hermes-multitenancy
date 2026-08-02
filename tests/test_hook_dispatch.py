@@ -1282,8 +1282,19 @@ def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missi
     assert "cron body" in sent[0][2]
 
 
-def test_cron_delivery_patch_sends_verified_user_dm_with_receipt(monkeypatch, tmp_path):
-    """Bare Feishu delivery resolves the owner before strict receipt and mirror."""
+@pytest.mark.parametrize(
+    ("deliver_value", "route_case", "expected_error", "expected_chat"),
+    [
+        ("feishu", "user", None, "ou_owner"),
+        ("origin", "user", None, "ou_owner"),
+        ("origin", "group", None, "oc_target"),
+        ("origin", "mismatched-group", "cron delivery identity is unavailable or ambiguous", None),
+    ],
+)
+def test_cron_delivery_patch_binds_only_verified_user_dm_with_receipt(
+    monkeypatch, tmp_path, deliver_value, route_case, expected_error, expected_chat
+):
+    """Feishu delivery preserves bound groups and resolves only verified user DMs."""
     import sqlite3
     import sys
     import types
@@ -1302,7 +1313,9 @@ def test_cron_delivery_patch_sends_verified_user_dm_with_receipt(monkeypatch, tm
         "thread_id": None,
     }
     scheduler._resolve_delivery_targets = lambda job: [
-        scheduler._resolve_single_delivery_target(job, "feishu")
+        job["origin"]
+        if job["deliver"] == "origin"
+        else scheduler._resolve_single_delivery_target(job, "feishu")
     ]
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)
@@ -1314,10 +1327,21 @@ def test_cron_delivery_patch_sends_verified_user_dm_with_receipt(monkeypatch, tm
             "(open_id TEXT, owner_open_id TEXT, profile_name TEXT, active INTEGER, "
             "kind TEXT, chat_id TEXT)"
         )
-        conn.execute(
-            "INSERT INTO multitenancy_routing VALUES (?, NULL, ?, 1, 'user', NULL)",
-            ("ou_owner", "owner"),
-        )
+        if route_case == "group":
+            conn.execute(
+                "INSERT INTO multitenancy_routing VALUES ('', ?, ?, 1, 'group', ?)",
+                ("ou_owner", "owner", "oc_target"),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO multitenancy_routing VALUES (?, NULL, ?, 1, 'user', NULL)",
+                ("ou_owner", "owner"),
+            )
+            if route_case == "mismatched-group":
+                conn.execute(
+                    "INSERT INTO multitenancy_routing VALUES ('', ?, ?, 1, 'group', ?)",
+                    ("ou_owner", "group_profile", "oc_target"),
+                )
 
     class Adapter:
         async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
@@ -1344,22 +1368,26 @@ def test_cron_delivery_patch_sends_verified_user_dm_with_receipt(monkeypatch, tm
     cron_worker._patch_scheduler_owner_open_id_delivery()
     cron_worker._patch_cron_delivery_mirror()
 
+    job = {
+        "id": "job123",
+        "name": "Daily digest",
+        "deliver": deliver_value,
+        "owner_open_id": "ou_owner",
+        "owner_profile": "owner",
+    }
+    if deliver_value == "origin":
+        job["origin"] = {"platform": "feishu", "chat_id": "oc_target", "thread_id": None}
+
     error = scheduler._deliver_result(
-        {
-            "id": "job123",
-            "name": "Daily digest",
-            "deliver": "feishu",
-            "owner_open_id": "ou_owner",
-            "owner_profile": "owner",
-        },
+        job,
         "cron body",
         adapters={"feishu": Adapter()},
         loop=types.SimpleNamespace(is_running=lambda: True),
     )
 
-    assert error is None
-    assert [item[0] for item in sent] == ["ou_owner"]
-    assert mirrored == [("job123", "cron body")]
+    assert error == expected_error
+    assert [item[0] for item in sent] == ([] if expected_chat is None else [expected_chat])
+    assert mirrored == ([] if expected_error else [("job123", "cron body")])
 
 
 def test_cron_delivery_patch_rejects_unconfirmed_live_feishu_send(monkeypatch, caplog):

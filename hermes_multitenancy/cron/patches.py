@@ -323,7 +323,7 @@ def _cron_run_broker_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _cron_delivery_route(job: dict) -> Optional[dict[str, str]]:
+def _cron_delivery_route(job: dict) -> Optional[dict[str, Any]]:
     """Return the one active route only when it matches the stored job owner."""
     owner = str(job.get("owner_open_id") or "").strip()
     profile = str(job.get("owner_profile") or "").strip()
@@ -337,6 +337,16 @@ def _cron_delivery_route(job: dict) -> Optional[dict[str, str]]:
                 "FROM multitenancy_routing WHERE profile_name = ? AND active = 1",
                 (profile,),
             ).fetchall()
+            origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+            origin_chat_id = str(origin.get("chat_id") or "").strip()
+            origin_is_group = bool(
+                origin_chat_id
+                and conn.execute(
+                    "SELECT 1 FROM multitenancy_routing "
+                    "WHERE chat_id = ? AND kind = 'group' LIMIT 1",
+                    (origin_chat_id,),
+                ).fetchone()
+            )
     except Exception:
         return None
     if len(rows) != 1 or str(rows[0][1] or rows[0][0] or "").strip() != owner:
@@ -345,6 +355,7 @@ def _cron_delivery_route(job: dict) -> Optional[dict[str, str]]:
         "owner": owner,
         "chat_id": str(rows[0][2] or "").strip(),
         "kind": str(rows[0][3] or "").strip().lower(),
+        "origin_is_group": origin_is_group,
     }
 
 
@@ -431,12 +442,13 @@ def _patch_cron_delivery_mirror() -> None:
         # core and the old multi-stage stream both accept weaker acknowledgments.
         deliver = str(job.get("deliver") or "").strip().lower()
         origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
-        requests_feishu = any(
-            part.strip().split(":", 1)[0] == "feishu" for part in deliver.split(",")
-        ) or (
+        owner_dm_delivery = deliver == "feishu" or (
             deliver == "origin"
             and str(origin.get("platform") or "").strip().lower() == "feishu"
         )
+        requests_feishu = any(
+            part.strip().split(":", 1)[0] == "feishu" for part in deliver.split(",")
+        ) or owner_dm_delivery
         try:
             targets = scheduler._resolve_delivery_targets(job)
         except Exception:
@@ -459,7 +471,13 @@ def _patch_cron_delivery_mirror() -> None:
                 media_files = ["unknown"]
             if not _cw._cron_delivery_identity_is_bound(job, target):
                 route = _cw._cron_delivery_route(job)
-                if deliver == "feishu" and not media_files and route and route["kind"] == "user":
+                if (
+                    owner_dm_delivery
+                    and not media_files
+                    and route
+                    and route["kind"] == "user"
+                    and route["origin_is_group"] is False
+                ):
                     target = {
                         "platform": "feishu",
                         "chat_id": route["owner"],
