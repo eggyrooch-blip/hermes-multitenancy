@@ -62,14 +62,19 @@ def _deliver_cron_feishu_via_live_adapter(
     *,
     adapters: Any = None,
     loop: Any = None,
+    require_receipt: bool = False,
+    targets_override: Optional[list[dict]] = None,
 ) -> Optional[str]:
     """Fallback for multitenancy gateways where Feishu exists only as a live adapter."""
     if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
         return "feishu live adapter unavailable"
-    try:
-        targets = scheduler._resolve_delivery_targets(job)
-    except Exception as exc:
-        return f"failed to resolve feishu delivery target: {exc}"
+    if targets_override is None:
+        try:
+            targets = scheduler._resolve_delivery_targets(job)
+        except Exception as exc:
+            return f"failed to resolve feishu delivery target: {exc}"
+    else:
+        targets = targets_override
 
     feishu_targets = [
         target for target in targets
@@ -83,6 +88,8 @@ def _deliver_cron_feishu_via_live_adapter(
         return "feishu live adapter unavailable"
 
     text_to_send, media_files = _cw._cron_delivery_payload_for_adapter(job, content)
+    if require_receipt and not text_to_send and not media_files:
+        return "feishu live adapter delivery has no payload"
 
     # Cron deliveries historically go out as plain text via ``adapter.send``,
     # which flattens markdown (bullets/bold/links) — unlike normal replies that
@@ -97,8 +104,7 @@ def _deliver_cron_feishu_via_live_adapter(
         try:
             card, card_media = _cw._build_cron_card(job, content)
             if card is not None:
-                # Card and text paths extract media from the same content; keep
-                # one media list so a card→text fallback never double-sends.
+                # Card and text paths extract media from the same content.
                 media_files = card_media
         except Exception:
             logger.warning("[multitenancy] cron card build failed; using text", exc_info=True)
@@ -116,16 +122,19 @@ def _deliver_cron_feishu_via_live_adapter(
             sent_payload = False
             if card is not None:
                 card_error = _cw._send_cron_card_via_live_adapter(
-                    adapter, chat_id, card, metadata, loop
+                    adapter, chat_id, card, metadata, loop,
+                    require_receipt=require_receipt,
                 )
                 if card_error is None:
                     sent_payload = True
                     logger.info(
-                        "[multitenancy] cron delivered card to feishu:%s job=%s",
-                        chat_id,
+                        "[multitenancy] cron delivered card to Feishu job=%s",
                         job.get("id", "?"),
                     )
                 else:
+                    if require_receipt:
+                        errors.append(card_error)
+                        continue
                     logger.warning(
                         "[multitenancy] cron card send failed for %s (%s); "
                         "falling back to plain text",
@@ -148,11 +157,20 @@ def _deliver_cron_feishu_via_live_adapter(
                 except FuturesTimeout:
                     future.cancel()
                     raise
-                if result and not getattr(result, "success", True):
+                if require_receipt and (not result or not getattr(result, "success", False)):
                     errors.append(
                         f"feishu live adapter send failed for {chat_id}: "
                         f"{getattr(result, 'error', 'unknown')}"
                     )
+                    continue
+                if not require_receipt and result and not getattr(result, "success", True):
+                    errors.append(
+                        f"feishu live adapter send failed for {chat_id}: "
+                        f"{getattr(result, 'error', 'unknown')}"
+                    )
+                    continue
+                if require_receipt and not str(getattr(result, "message_id", "") or "").strip():
+                    errors.append("feishu live adapter send missing message_id")
                     continue
             if media_files:
                 media_error = _cw._send_media_files_via_live_adapter(
@@ -167,8 +185,7 @@ def _deliver_cron_feishu_via_live_adapter(
                     errors.append(media_error)
                     continue
             logger.info(
-                "[multitenancy] cron delivered to feishu:%s via live adapter job=%s",
-                chat_id,
+                "[multitenancy] cron delivered to Feishu via live adapter job=%s",
                 job.get("id", "?"),
             )
         except Exception as exc:
@@ -233,14 +250,16 @@ def _send_cron_card_via_live_adapter(
     card: dict[str, Any],
     metadata: Optional[dict],
     loop: Any,
+    *,
+    require_receipt: bool = False,
 ) -> Optional[str]:
     """Send one interactive card on the gateway loop. Returns error str or None.
 
     This MUST NEVER raise: any failure (serialize, synchronous adapter raise,
     scheduling, timeout, coroutine exception, non-success response) is returned
     as an error string so the caller can fall back to the plain-text path. An
-    escaped exception here would skip the text fallback and silently drop the
-    cron delivery.
+    escaped exception here would skip delivery bookkeeping and falsely mark the
+    cron run as delivered.
     """
     try:
         payload = json.dumps(card, ensure_ascii=False)
@@ -276,11 +295,18 @@ def _send_cron_card_via_live_adapter(
         from ..card.card_error import _finalize
 
         result = _finalize(adapter, response, "cron card send failed")
-        if result is not None and not getattr(result, "success", True):
+        if require_receipt and (result is None or not getattr(result, "success", False)):
             return (
                 f"feishu card send failed for {chat_id}: "
                 f"{getattr(result, 'error', 'unknown')}"
             )
+        if not require_receipt and result is not None and not getattr(result, "success", True):
+            return (
+                f"feishu card send failed for {chat_id}: "
+                f"{getattr(result, 'error', 'unknown')}"
+            )
+        if require_receipt and not str(getattr(result, "message_id", "") or "").strip():
+            return "feishu card send missing message_id"
         return None
     except Exception as exc:
         return f"feishu card send raised for {chat_id}: {exc}"

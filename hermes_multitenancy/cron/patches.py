@@ -299,19 +299,14 @@ def _patch_scheduler_owner_open_id_delivery() -> None:
 
     @functools.wraps(original)
     def resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
-        target = original(job, deliver_value)
-        if target is not None:
-            return target
-        if str(deliver_value).strip().lower() != "feishu":
-            return None
         owner_open_id = str(job.get("owner_open_id") or "").strip()
-        if not owner_open_id.startswith("ou_"):
-            return None
-        return {
-            "platform": "feishu",
-            "chat_id": owner_open_id,
-            "thread_id": None,
-        }
+        if str(deliver_value).strip().lower() == "feishu" and owner_open_id.startswith("ou_"):
+            return {
+                "platform": "feishu",
+                "chat_id": owner_open_id,
+                "thread_id": None,
+            }
+        return original(job, deliver_value)
 
     setattr(resolve_single_delivery_target, "_hermes_multitenancy_patched", True)
     scheduler._resolve_single_delivery_target = resolve_single_delivery_target
@@ -323,6 +318,35 @@ def _cron_run_broker_enabled() -> bool:
     if not value:
         return True
     return value in {"1", "true", "yes", "on"}
+
+
+def _cron_delivery_identity_is_bound(job: dict, target: dict) -> bool:
+    """Prove one active profile route owns the Feishu delivery target."""
+    owner = str(job.get("owner_open_id") or "").strip()
+    profile = str(job.get("owner_profile") or "").strip()
+    if not owner.startswith("ou_") or not profile or profile == "multitenancy_router":
+        return False
+    try:
+        db_path = _cw._resolve_shared_home() / "multitenancy.db"
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
+            rows = conn.execute(
+                "SELECT open_id, owner_open_id, chat_id "
+                "FROM multitenancy_routing WHERE profile_name = ? AND active = 1",
+                (profile,),
+            ).fetchall()
+    except Exception:
+        return False
+    if len(rows) != 1 or str(rows[0][1] or rows[0][0] or "").strip() != owner:
+        return False
+
+    chat_id = str(target.get("chat_id") or "").strip()
+    return bool(
+        chat_id
+        and (
+            chat_id == owner
+            or chat_id == str(rows[0][2] or "").strip()
+        )
+    )
 
 
 def _profile_native_cron_enabled() -> bool:
@@ -387,26 +411,75 @@ def _patch_cron_delivery_mirror() -> None:
             )
             return "cron delivery skipped: gateway is shutting down"
 
-        # Deliver Feishu cron output as a STREAMING CardKit card (same UX as a
-        # normal agent reply: streaming print + rendered markdown + Done footer)
-        # before core falls back to flattened plain text. Only when every target
-        # is Feishu, a streaming-capable live adapter is present, and there is no
-        # media. Any failure returns None so we fall through to core delivery —
-        # a cron delivery is never dropped.
-        if _cw._cron_card_response_enabled():
+        # A cron delivery has no interactive caller watching a stream. Send its
+        # single Feishu target once and require the resulting message receipt;
+        # core and the old multi-stage stream both accept weaker acknowledgments.
+        deliver = str(job.get("deliver") or "").strip().lower()
+        origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+        requests_feishu = any(
+            part.strip().split(":", 1)[0] == "feishu" for part in deliver.split(",")
+        ) or (
+            deliver == "origin"
+            and str(origin.get("platform") or "").strip().lower() == "feishu"
+        )
+        try:
+            targets = scheduler._resolve_delivery_targets(job)
+        except Exception:
+            if requests_feishu:
+                return "failed to resolve cron delivery target"
+            return original(job, content, adapters=adapters, loop=loop)
+        if requests_feishu and (
+            not targets
+            or (
+                len(targets) == 1
+                and str(targets[0].get("platform") or "").strip().lower() != "feishu"
+            )
+        ):
+            return "failed to resolve cron delivery target"
+        if len(targets) == 1 and str(targets[0].get("platform") or "").strip().lower() == "feishu":
             try:
-                streamed = _cw._try_deliver_cron_feishu_streaming_card(
-                    scheduler, job, content, adapters=adapters, loop=loop
-                )
+                _, media_files = _cw._cron_delivery_payload_for_adapter(job, content)
             except Exception:
-                logger.warning(
-                    "[multitenancy] cron streaming card path raised; using core delivery",
-                    exc_info=True,
+                media_files = ["unknown"]
+            if not media_files:
+                target = targets[0]
+                if not _cw._cron_delivery_identity_is_bound(job, target):
+                    return "cron delivery identity is unavailable or ambiguous"
+                live_error = _cw._deliver_cron_feishu_via_live_adapter(
+                    scheduler,
+                    job,
+                    content,
+                    adapters=adapters,
+                    loop=loop,
+                    require_receipt=True,
+                    targets_override=[target],
                 )
-                streamed = None
-            if streamed is True:
-                _cw._mirror_cron_delivery_to_owner(job, content)
-                return None
+                if live_error is None:
+                    _cw._mirror_cron_delivery_to_owner(job, content)
+                    return None
+                if live_error == "feishu live adapter unavailable":
+                    return live_error
+                reason = "other"
+                for marker, code in (
+                    ("no payload", "no_payload"),
+                    ("missing message_id", "missing_receipt"),
+                    ("timed out", "timeout"),
+                    ("loop unavailable", "loop_unavailable"),
+                    ("schedule", "loop_unavailable"),
+                    ("send failed", "rejected"),
+                    ("send raised", "exception"),
+                    ("delivery to", "exception"),
+                    ("serialize", "serialize"),
+                ):
+                    if marker in live_error:
+                        reason = code
+                        break
+                logger.warning(
+                    "[multitenancy] cron Feishu delivery unconfirmed job=%s reason=%s",
+                    job.get("id", "?"),
+                    reason,
+                )
+                return "feishu live adapter delivery unconfirmed"
 
         error = original(job, content, adapters=adapters, loop=loop)
         if error is not None and _cw._is_feishu_platform_config_error(error):
