@@ -179,3 +179,34 @@ dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单�
 同轮降级为债的还有：`hermes-release.sh:backup:missing-script-skips-silently` ——
 `BACKUP_SH` 不可执行时静默跳过发布前备份。当前生产上它存在且可执行，
 但换机器/路径变动时会静默失去"不带备份不发布"这条保护。修法：缺失即 die。
+
+### D10 — 发布执行器：评审 round 1（重开后）留作债的四条
+
+已修：首次安装鸡生蛋（新增 `deploy/install-hermes-release.sh`）、回滚 flip 不检查返回值
+（半坏状态会打印假的 ROLLED_BACK）、悬空回滚目标（动手前就拒）。
+
+**留作债的：**
+- `release-tag-fetch:deploys-uncertified-cached-tags-after-fetch-failure` —— 两个远端都拉不到时
+  会用本地缓存的标签继续。若一个坏标签在远端被撤销、而 hermes-1 恰好断网，定时器仍可能部署它。
+  修法：拉取失败就 log + exit 0，不碰服务。
+- `build_worktree:abbreviated-sha-directory-reuses-wrong-release` —— 目录名只用 7/8 位 SHA，
+  已存在就直接复用而不校验 HEAD。两个提交前缀相同时会静默部署成前一个。
+  修法：目录名用完整 SHA，或复用前 `git rev-parse HEAD` 核对。
+- `pre-release-backup:accepts-incomplete-database-backup` —— 只要备份退出 0 就放行，
+  没有解析 MANIFEST 确认六个库都在。修法：按 db_count/db_missing 卡。
+- SIM_VERDICT=trace_inadequate、QA_VERDICT=absent —— 生产实弹证据在 STATE.md 与本方案稿里，
+  但没进 SIM_TRACE 的 capture 块。
+
+**一条误报已核实并驳回：** `hermes_multitenancy/cron/orchestrator.py` 被指删了 run_claim 逻辑
+及其回归测试。实测本分支 vs main 是 **892 行纯新增、0 删除、只碰 6 个新文件**，
+`orchestrator.py` 一行未动。
+
+## 2026-08-03 · release editable-finder 钉死解析路径（发布假生效陷阱）
+- 现象: hermes-release.sh 翻 `~/code/hermes-multitenancy` 软链后，venv 的
+  `__editable___hermes_multitenancy_finder.py` 仍钉着上一个 `releases/mt-<旧sha>` 解析路径
+  → gateway 重启后照跑旧代码，RELEASE OK + 12 探针全绿也发现不了（release-20260803-02 实锤）。
+- 根因: 带外部署用 `pip/uv install -e <解析路径>` 会把 MAPPING 写死；uv 对软链路径也会 canonicalize，
+  软链间接层形同虚设。
+- 临时解法(已执行): `uv pip install --no-deps -e ~/code/hermes-multitenancy` + 重启双 gateway。
+- 根治方向: hermes-release.sh 在 flip 后无条件重装 editable 并加「进程实际 import 路径 == 本次 release 目录」探针
+  （probe 判据用 `hermes_multitenancy.__file__`，别信 deployed-release 文件）。
