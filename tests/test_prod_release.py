@@ -100,6 +100,28 @@ def env(tmp_path: Path):
     stub.write_text("#!/usr/bin/env bash\necho \"$@\" >> \"$SYSTEMCTL_LOG\"\nexit 0\n")
     stub.chmod(0o755)
 
+    # 桩 uv + venv python：editable 重装是每次切换的硬步骤（release-editable-reinstall）。
+    # uv 桩记录最后一个参数（editable 目标目录）；venv 桩模拟「读回真实 import 路径」——
+    # 与 uv 桩落盘的最后安装目标比对，一致才 0。UV_FAIL_FLAG 文件存在时 uv 装败。
+    uv_stub = tmp_path / "uv-stub.sh"
+    uv_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ -f "$UV_FAIL_FLAG" ] && exit 1\n'
+        'echo "uv-install ${@: -1}" >> "$SYSTEMCTL_LOG"\n'
+        'echo "${@: -1}" > "$UV_STATE"\n'
+        "exit 0\n"
+    )
+    uv_stub.chmod(0o755)
+    venv_stub = tmp_path / "venv-python-stub.sh"
+    venv_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat >/dev/null\n"  # 吞掉 heredoc stdin
+        'if [ "$1" = "-" ]; then\n'
+        '  [ "$(cat "$UV_STATE" 2>/dev/null)" = "$2" ] && exit 0 || exit 1\n'
+        "fi\nexit 0\n"
+    )
+    venv_stub.chmod(0o755)
+
     return {
         "HOME": str(home), "RELEASES": str(releases), "CODE": str(code),
         "STATE_FILE": str(home / ".hermes" / "deployed-release"),
@@ -108,6 +130,9 @@ def env(tmp_path: Path):
         "SYSTEMCTL": str(stub), "SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "BACKUP_SH": str(bstub),           # 备份本体另有测试覆盖，这里只要它存在
         "PROBES": str(DEPLOY / "hermes-release-probes.sh"),
+        "UV_BIN": str(uv_stub), "VENV_PY": str(venv_stub),
+        "UV_STATE": str(tmp_path / "uv-state"),
+        "UV_FAIL_FLAG": str(tmp_path / "uv-fail-flag"),
         "PATH": os.environ["PATH"],
         "_mt_sha": mt_sha, "_webui_sha": webui_sha,
         "_releases": releases, "_code": code, "_mt_src": mt_src,
@@ -293,6 +318,64 @@ def test_rollback_branch_records_outcome(env):
     assert _run(env).returncode != 0
     rb = (Path(env["BACKUP_ROOT"]) / "release-redout" / "ROLLBACK.txt").read_text()
     assert "outcome=ROLLED_BACK" in rb or "outcome=NEEDS_HUMAN" in rb
+
+
+def test_release_reinstalls_editable_before_start(env):
+    """翻软链不等于换 import（release-20260803-02/-03 两次实锤）：成功路径必须在
+    stop 之后、start 之前把 editable 重装到新 mt 目录并读回核对。"""
+    src = env["_mt_src"]
+    (src / "extra.txt").write_text("new\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "green")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-edi", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    r = _run(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    installed = Path(env["UV_STATE"]).read_text().strip()
+    assert installed == str(Path(env["RELEASES"]) / f"mt-{sha[:7]}")
+    lines = Path(env["SYSTEMCTL_LOG"]).read_text().splitlines()
+    i_stop = max(i for i, l in enumerate(lines) if l.startswith("stop"))
+    i_uv = next(i for i, l in enumerate(lines) if l.startswith("uv-install"))
+    i_start = min(i for i, l in enumerate(lines) if l.startswith("start"))
+    assert i_stop < i_uv < i_start, f"顺序必须 stop→重装→start：{lines}"
+
+
+def test_editable_reinstall_failure_rolls_back(env):
+    """重装/读回失败 = 新版本没真生效，必须按切换失败处理：翻回、重启、记 outcome。"""
+    src = env["_mt_src"]
+    (src / "extra.txt").write_text("new\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "green")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-edifail", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+    Path(env["UV_FAIL_FLAG"]).write_text("boom\n")
+
+    before = _links(env)
+    r = _run(env)
+    assert r.returncode != 0
+    assert _links(env) == before, "editable 失败必须原样翻回上一版"
+    assert not Path(env["STATE_FILE"]).exists()
+    rb = (Path(env["BACKUP_ROOT"]) / "release-edifail" / "ROLLBACK.txt").read_text()
+    assert "outcome=EDITABLE_FAILED" in rb
+    assert "start" in Path(env["SYSTEMCTL_LOG"]).read_text(), "回滚后必须把服务拉起来"
+
+
+def test_probe_rollback_reinstalls_editable_to_prev(env):
+    """探针失败自动回滚时，editable 也必须跟着回到上一版目录 —— 否则软链回去了、
+    import 还钉在坏版本上，回滚是假的。"""
+    src = env["_mt_src"]
+    (src / "deploy" / "hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (src / "deploy" / "hermes-release-probes.sh").chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "red probe")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-edirb", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    r = _run(env)
+    assert r.returncode != 0
+    installed = Path(env["UV_STATE"]).read_text().strip()
+    prev = str((Path(env["RELEASES"]) / "mt-current").resolve())
+    assert Path(installed).resolve() == Path(prev).resolve(), (
+        f"回滚后 editable 最终必须指向上一版：installed={installed}"
+    )
 
 
 def test_env_hash_survives_a_release(env):
