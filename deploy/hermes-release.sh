@@ -108,6 +108,7 @@ PREV_WEBUI=$(readlink "$CODE/hermes-web-ui" || true)
 # 指到不存在的目录上 —— 比不回滚还糟。要拒就在动任何东西之前拒。
 [ -d "$CODE/hermes-multitenancy/." ] || die "当前 multitenancy 软链悬空（$PREV_MT）—— 没有可用的回滚目标，拒绝发布"
 [ -d "$CODE/hermes-web-ui/." ] || die "当前 webui 软链悬空（$PREV_WEBUI）—— 没有可用的回滚目标，拒绝发布"
+PREV_MT_ABS=$(cd "$CODE/hermes-multitenancy/." && pwd)
 
 # ── 发布前回滚包（不是灾备，是「这次发错了能退回去」）────────────────
 SNAP="$BACKUP_ROOT/$TAG"
@@ -207,7 +208,30 @@ flip() {  # $1=mt 目标  $2=webui 目标
   [ "$(readlink "$CODE/hermes-web-ui")" = "$2" ] || return 1
 }
 
-log "停服务 → 翻软链 → 起服务"
+# ── editable 重装：翻软链不等于换 import ─────────────────────────────
+# gateway venv 的 editable finder 把 hermes_multitenancy 的映射写死在【解析后】
+# 的 releases/mt-<sha> 路径上（uv/pip 都会 canonicalize 软链）。只翻软链不重装，
+# 服务重启后照跑上一个版本 —— release-20260803-02/-03 连续两次实锤，
+# RELEASE OK + 探针全绿都发现不了。所以每次切换（前进和回滚）都必须朝目标
+# 目录重装一次，并用同一解释器读回真实 import 路径核对：「装过了」不算数。
+VENV_PY="${VENV_PY:-$HOME/.hermes/hermes-agent/venv/bin/python}"
+UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
+reinstall_editable() {  # $1=目标 mt 版本目录（绝对路径）
+  local target="$1"
+  [ -x "$UV_BIN" ] || { log "  ✗ 找不到 uv（$UV_BIN）—— 无法重装 editable"; return 1; }
+  [ -x "$VENV_PY" ] || { log "  ✗ 找不到 gateway venv python（$VENV_PY）"; return 1; }
+  ( cd /tmp && "$UV_BIN" pip install -p "$VENV_PY" --no-deps -q -e "$target" ) \
+    || { log "  ✗ editable 重装失败（目标 $target）"; return 1; }
+  "$VENV_PY" - "$target" <<'PY' || { log "  ✗ editable 读回核对失败（import 未指向 $target）"; return 1; }
+import importlib, sys
+m = importlib.import_module("hermes_multitenancy")
+t = sys.argv[1].rstrip("/")
+sys.exit(0 if str(getattr(m, "__file__", "") or "").startswith(t + "/") else 1)
+PY
+  log "  editable -> $target（读回核对通过）"
+}
+
+log "停服务 → 翻软链 → 重装 editable → 起服务"
 $SYSTEMCTL stop $(_units) 2>/dev/null || true
 if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DIR")"; then
   log "软链切换失败 —— 翻回原样并放弃本次发布"
@@ -215,6 +239,14 @@ if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DI
   $SYSTEMCTL start $(_units) 2>/dev/null || true
   outcome FLIP_FAILED
   die "切换失败，当前版本继续跑"
+fi
+if ! reinstall_editable "$MT_DIR"; then
+  log "editable 未指向新版本 —— 翻回原样并放弃本次发布"
+  flip "$PREV_MT" "$PREV_WEBUI" || true
+  reinstall_editable "$PREV_MT_ABS" || true
+  $SYSTEMCTL start $(_units) 2>/dev/null || true
+  outcome EDITABLE_FAILED
+  die "editable 重装/读回失败，当前版本继续跑"
 fi
 $SYSTEMCTL start $(_units) 2>/dev/null || true
 log "  已切到 $TAG，开始跑探针"
@@ -272,11 +304,17 @@ if ! flip "$PREV_MT" "$PREV_WEBUI"; then
   outcome NEEDS_HUMAN
   die "回滚时软链切换失败 —— 两个路径可能指向不同版本，必须人工介入（锚点：$SNAP/ROLLBACK.txt）"
 fi
+# 回滚方向同样要重装 editable —— 软链回去了、import 还钉在坏版本上，回滚就是假的
+EDITABLE_ROLLBACK_OK=1
+reinstall_editable "$PREV_MT_ABS" || EDITABLE_ROLLBACK_OK=0
 $SYSTEMCTL start $(_units) 2>/dev/null || true
 # 回滚校验要用【旧版本自带】的探针 —— 现在跑的是旧版，判据就该跟着旧版走。
 # （用新版的探针去验旧版是张冠李戴：新版可能改了期望值。）
 OLD_PROBES="$CODE/hermes-multitenancy/deploy/$(basename "$PROBES")"
-if [ -x "$OLD_PROBES" ] && "$OLD_PROBES"; then
+if [ "$EDITABLE_ROLLBACK_OK" != "1" ]; then
+  outcome NEEDS_HUMAN
+  log "ROLLED BACK 但 editable 重装失败 —— import 可能仍指向新版本，需人工介入（锚点：$SNAP/ROLLBACK.txt）"
+elif [ -x "$OLD_PROBES" ] && "$OLD_PROBES"; then
   outcome ROLLED_BACK
   log "ROLLED BACK — 已退回 ${CURRENT:-上一版}，探针复检通过"
 else
