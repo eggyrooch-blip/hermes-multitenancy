@@ -163,6 +163,41 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             # router command, which is exactly the "由 agent 跑 skill" contract.
             text = getattr(event, "text", text) or text
 
+            # Deterministic cron trigger (SPEC cron-trigger-deterministic-exec).
+            # A short "触发…<job id>" DM must not depend on the model choosing to
+            # call the trigger tool (prod 2026-08-03: tool_turns=0 + "已触发" =
+            # nothing ran). Resolve the route read-only — an unrouted sender
+            # falls through to the normal path below, which owns provisioning.
+            # Skipped for a yolo-rewritten text (the injected `/skill …` line is
+            # the push-card loop's payload, not a user instruction) and for
+            # fixed-expert DMs (read-only entrance must not fire the canonical
+            # profile's jobs) — codex review round-1.
+            from ..cron_trigger_direct import try_route_cron_trigger
+            from ..push_card_matcher import _YOLO_ROUTED_ATTR
+
+            trigger_profile_name, trigger_profile_home = _m._resolve_route(
+                sender, alt_id=sender_alt
+            )
+            if (
+                trigger_profile_home is not None
+                and fixed_context is None
+                and getattr(event, _YOLO_ROUTED_ATTR, None) is None
+            ) and await try_route_cron_trigger(
+                _m._get_feishu_adapter(gateway),
+                chat_id=chat_id,
+                profile_name=trigger_profile_name,
+                text=text,
+                message_id=_m._event_message_id(event),
+            ):
+                trigger_adapter = _m._get_feishu_adapter(gateway)
+                if trigger_adapter is not None and hasattr(
+                    trigger_adapter, "on_processing_complete"
+                ):
+                    await _complete_feishu_processing(
+                        trigger_adapter, event, failed=False
+                    )
+                return
+
         if cmd_pair is not None:
             if fixed_context is not None and not expert_bot_route.is_fixed_expert_slash_allowed(cmd_pair[0]):
                 adapter = _m._get_feishu_adapter(gateway)
