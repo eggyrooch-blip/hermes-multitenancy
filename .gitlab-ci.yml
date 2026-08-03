@@ -5,8 +5,13 @@
 # 门禁要有意义就得跑全量。
 #
 # 门禁语义：TEST 与 LEAK 都是硬阻断。红了就进不了 main。
+#
+# 防篡改（与 hermes-web-ui 对齐，2026-08-03）：项目 ci_config_path 已钉死
+# `.gitlab-ci.yml@sunke/hermes-multitenancy`（MR pipeline 永远用 protected main
+# 上的这份定义），policy job 是第二层——MR 里改门禁文件本身直接拒。
 
 stages:
+  - policy
   - test
   - leak
 
@@ -27,6 +32,28 @@ cache:
       - uv.lock
   paths:
     - .uv-cache
+
+policy:
+  stage: policy
+  image:
+    name: docker.io/alpine/git:v2.45.2
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - |
+      # MR 不许动门禁自身，无条件检查。不需要 bootstrap 例外：ci_config_path
+      # 钉死 main，引入本 job 的那个 MR 跑的是 main 上尚无 policy 的旧定义，
+      # 天然放行；合入后所有 MR（含存量老分支）一律受检——按 diff base 放行
+      # 会让早于 policy 的老分支永久绕过（codex review 2026-08-03 抓出）。
+      # merged-results pipeline 里 CI_COMMIT_SHA 是临时合并 commit,会把 main 侧
+      # 后来的门禁变更误算到本 MR 头上 —— 优先用 source branch SHA(codex review)。
+      SRC="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}"
+      changed=$(git diff --name-only "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$SRC" -- \
+        .gitlab-ci.yml .gitleaks.toml .gitleaksignore)
+      test -z "$changed" || { echo "Protected CI policy changed:"; echo "$changed"; exit 1; }
 
 test:
   stage: test

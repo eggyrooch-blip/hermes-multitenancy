@@ -42,3 +42,8 @@ Thumbs.db
 /ISA-*.md
 /.ftask/
 /docs/plans/
+
+# ftask: per-slug runtime files (env + sim artifacts) — never committed
+.ftask/*/STATE.json
+.ftask/*/STATE.json.tmp
+.gstack/
