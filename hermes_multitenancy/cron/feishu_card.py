@@ -93,13 +93,15 @@ def _cron_card_response_enabled() -> bool:
 
 
 def _build_cron_card(job: dict, content: str) -> tuple[Optional[dict[str, Any]], list]:
-    """Build a simple Feishu interactive card for a cron delivery.
+    """Build the Feishu interactive card for a cron delivery.
 
     Returns ``(card, media_files)``. ``card`` is ``None`` when the body is empty
-    (caller then falls back to the plain-text path). Layout mirrors the
-    ``wrap_response`` text form — header (task name), markdown body, and a
-    "stop this job" footer — but renders markdown as a real card so bullets,
-    bold, and links are no longer flattened.
+    (caller then falls back to the plain-text path). Visuals are pinned to the
+    historical streaming-card look sunke signed off on (cron-card-style-restore):
+    ``_build_cron_card_body`` composes bold ``**⏰ task**`` title in the body,
+    cardified markdown, and the Chinese stop-hint — no blue header bar, no
+    English "To stop or manage" footer. ``wrap_response=False`` sends just the
+    cardified body.
     """
     wrap_response = True
     try:
@@ -123,27 +125,16 @@ def _build_cron_card(job: dict, content: str) -> tuple[Optional[dict[str, Any]],
         return None, media_files
 
     try:
-        from ..card.markdown_style import _optimize_markdown_style
         from ..card.sanitization import _plain_summary
 
-        body_md = _optimize_markdown_style(body)
         summary = _plain_summary(body)
     except Exception:
-        body_md = body
         summary = "Hermes"
 
-    task_name = str(job.get("name") or job.get("id") or "Scheduled task")
-
-    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": body_md}]
     if wrap_response:
-        stop_hint = (
-            "To stop or manage this job, send me a new message "
-            f'(e.g. "stop reminder {task_name}").'
-        )
-        elements.append({"tag": "hr"})
-        elements.append(
-            {"tag": "markdown", "content": stop_hint, "text_size": "notation"}
-        )
+        body_md = _cw._build_cron_card_body(job, body)
+    else:
+        body_md = _cw._cardify_markdown_for_feishu(body)
 
     card: dict[str, Any] = {
         "config": {
@@ -152,13 +143,8 @@ def _build_cron_card(job: dict, content: str) -> tuple[Optional[dict[str, Any]],
             "locales": ["zh_cn", "en_us"],
             "summary": {"content": summary},
         },
-        "elements": elements,
+        "elements": [{"tag": "markdown", "content": body_md}],
     }
-    if wrap_response:
-        card["header"] = {
-            "title": {"tag": "plain_text", "content": f"⏰ {task_name}"},
-            "template": "blue",
-        }
     return card, media_files
 
 

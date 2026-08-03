@@ -12,6 +12,7 @@ These tests fail without the card path (delivery stays plain text).
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 from hermes_multitenancy import cron_worker
@@ -29,19 +30,48 @@ _MARKDOWN_BODY = "Here is your update:\n- **bold** item\n- [link](https://exampl
 # _build_cron_card                                                            #
 # --------------------------------------------------------------------------- #
 def test_build_cron_card_renders_markdown_card():
+    """cron-card-style-restore: the deterministic delivery path must look like the
+    old streaming card sunke had last week — bold ⏰ title IN the body (no blue
+    header bar), cardified markdown, Chinese italic stop-hint (no English
+    "To stop or manage" footer, no hr)."""
     job = {"id": "2515da283456", "name": "双周会前一天提醒"}
     card, media = _build_cron_card(job, _MARKDOWN_BODY)
 
     assert card is not None
-    # Header carries the task name (interactive card, not flattened text).
-    assert card["header"]["title"]["content"].endswith("双周会前一天提醒")
-    # Body is a markdown element that preserves the markdown verbatim.
+    assert "header" not in card, "no blue header bar — title lives in the body"
     body_elements = [e for e in card["elements"] if e.get("tag") == "markdown"]
-    assert any("**bold**" in e["content"] for e in body_elements)
-    assert any("[link](https://example.com)" in e["content"] for e in body_elements)
-    # A "stop this job" footer is present (wrap_response default on).
-    assert any("stop reminder 双周会前一天提醒" in e["content"] for e in body_elements)
+    assert len(body_elements) == 1
+    body = body_elements[0]["content"]
+    assert body.startswith("**⏰ 双周会前一天提醒**")
+    assert "**bold**" in body
+    assert "[link](https://example.com)" in body
+    assert body.rstrip().endswith("_停止该任务：回复 “stop reminder 双周会前一天提醒”_")
+    assert "To stop or manage" not in body
+    assert not any(e.get("tag") == "hr" for e in card["elements"])
     assert media == []
+
+
+def test_build_cron_card_cardifies_headings_and_tables():
+    job = {"id": "2515da283456", "name": "早报"}
+    content = "# 今日速览\n\n| 项目 | 值 |\n| --- | --- |\n| 限行 | 1和6 |"
+    card, _ = _build_cron_card(job, content)
+
+    body = card["elements"][0]["content"]
+    assert "**今日速览**" in body, "headings become bold (cards don't render #)"
+    assert "- **限行**：1和6" in body, "pipe tables become bullet key/values"
+    assert "#" not in body.split("停止该任务")[0].replace("**", "")
+
+
+def test_build_cron_card_wrap_response_off_sends_bare_body(monkeypatch):
+    import hermes_multitenancy.cron.feishu_card as feishu_card_mod
+
+    fake_cfg = SimpleNamespace(load_config=lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setitem(sys.modules, "cron.config", fake_cfg)
+
+    card, _ = _build_cron_card({"id": "x", "name": "早报"}, _MARKDOWN_BODY)
+    body = card["elements"][0]["content"]
+    assert "⏰" not in body and "停止该任务" not in body
+    assert "**bold**" in body
 
 
 def test_build_cron_card_empty_body_returns_none():
