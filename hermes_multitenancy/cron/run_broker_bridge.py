@@ -295,17 +295,21 @@ def _dotenv_lookup(path: Path, keys: set[str]) -> str:
 
 
 def _run_broker_key_for_profile(profile_home: Path) -> str:
-    value = (
+    """Return the RunBroker bearer from the process env — env ONLY.
+
+    The shared-``.env`` fallback that used to live here recovered the SHARED
+    master key whenever the env var was absent, which is exactly the case a
+    sandboxed child is supposed to hit when no owner binding could be minted
+    (codex review RBOS-DOTENV-FALLBACK: probed, returned the master key). It only
+    looked safe because Linux bwrap masks that file; the macOS policy permits
+    reading it, and any run with the sandbox disabled loses the protection too.
+    The parent cron worker always has the key in its own env, so nothing
+    legitimate depended on the fallback.
+    """
+    return (
         os.environ.get("HERMES_RUN_BROKER_KEY")
         or os.environ.get("HERMES_MULTITENANCY_RUN_BROKER_KEY")
         or ""
-    ).strip()
-    if value:
-        return value
-    shared_home = _cw._shared_home_for_profile(profile_home)
-    return _cw._dotenv_lookup(
-        shared_home / ".env",
-        {"HERMES_RUN_BROKER_KEY", "HERMES_MULTITENANCY_RUN_BROKER_KEY"},
     ).strip()
 
 

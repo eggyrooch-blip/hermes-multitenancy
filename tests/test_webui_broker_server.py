@@ -5016,3 +5016,449 @@ def test_webui_experts_endpoint_always_carries_use_count(monkeypatch, tmp_path: 
         assert all(r["use_count"] == 0 for r in degraded_body["experts"])
 
     asyncio.run(runner())
+
+
+def test_run_scoped_broker_token_binds_owner_and_rejects_spoofed_peer(monkeypatch, tmp_path: Path):
+    """A sandboxed agent's run-scoped broker token may only act as its own owner.
+
+    Regression for the 2026-08-04 security review finding: the sandbox child was
+    handed the SHARED master broker key while the owner identity was taken
+    verbatim from caller-supplied headers/query, so any agent shell could list or
+    mutate a colleague's cron jobs by passing their open_id. The run-scoped token
+    now carries the (profile, open_id) binding server-side; self-reported owner
+    fields are ignored, and a mismatching assertion is refused.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    (tmp_path / "profiles" / "alice_profile").mkdir(parents=True)
+    (tmp_path / "profiles" / "bob_profile").mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="alice",
+        profile_name="alice_profile",
+        open_id="ou_alice",
+        provenance="sync",
+    )
+    seeded.upsert(
+        user_id="bob",
+        profile_name="bob_profile",
+        open_id="ou_bob",
+        provenance="sync",
+    )
+    seeded.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-for-webui")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    # The real job store needs hermes-agent's `cron` package; this test is about
+    # the auth/owner seam, so record which tenant the handler resolved instead.
+    from hermes_multitenancy import cron_api
+
+    listed_for: list[str] = []
+
+    def fake_list_jobs(profile_name, include_disabled=False):
+        listed_for.append(profile_name)
+        return []
+
+    monkeypatch.setattr(cron_api, "list_jobs", fake_list_jobs)
+
+    run_scoped = "run-scoped-token-for-alice"
+    register_run_broker_scoped_token(
+        token=run_scoped,
+        profile_name="alice_profile",
+        open_id="ou_alice",
+        run_id="run-1",
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            # 1. run-scoped token + a colleague's open_id must NOT reach his jobs.
+            spoofed = await client.get(
+                "/api/run-broker/jobs",
+                params={"user_key": "ou_bob"},
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+            spoofed_body = await spoofed.json()
+
+            # 2. Same token with the header form of the spoof.
+            spoofed_header = await client.get(
+                "/api/run-broker/jobs",
+                headers={
+                    "Authorization": f"Bearer {run_scoped}",
+                    "X-Hermes-Owner-Open-Id": "ou_bob",
+                },
+            )
+
+            # 3. Same token asserting a foreign profile on its own route family.
+            spoofed_profile = await client.get(
+                "/api/run-broker/jobs",
+                headers={
+                    "Authorization": f"Bearer {run_scoped}",
+                    "X-Hermes-Profile": "bob_profile",
+                },
+            )
+
+            # 3b. The token is pinned to the cron route family: every other
+            # `_authorized`-only handler (agent shares, kanban dispatch, profile
+            # provisioning …) is unreachable with it, even for its own tenant.
+            off_route = await client.get(
+                "/api/run-broker/connectors",
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+            off_route_kanban = await client.get(
+                "/api/run-broker/kanban/tasks",
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+
+            # 4. The token acting as itself, asserting nothing, still works.
+            own = await client.get(
+                "/api/run-broker/jobs",
+                headers={"Authorization": f"Bearer {run_scoped}"},
+            )
+            own_body = await own.json()
+
+            # 5. The WebUI path (master key + server-stamped owner) is unchanged.
+            webui = await client.get(
+                "/api/run-broker/jobs",
+                headers={
+                    "Authorization": "Bearer master-key-for-webui",
+                    "X-Hermes-Owner-Open-Id": "ou_bob",
+                },
+            )
+        finally:
+            await client.close()
+            router_mod.override_routing_table(None)
+            unregister_run_broker_scoped_token(run_scoped)
+
+        return (
+            spoofed.status,
+            spoofed_body,
+            spoofed_header.status,
+            spoofed_profile.status,
+            off_route.status,
+            off_route_kanban.status,
+            own.status,
+            own_body,
+            webui.status,
+        )
+
+    (
+        spoofed_status,
+        spoofed_body,
+        spoofed_header_status,
+        spoofed_profile_status,
+        off_route_status,
+        off_route_kanban_status,
+        own_status,
+        own_body,
+        webui_status,
+    ) = asyncio.run(runner())
+
+    assert spoofed_status == 403, spoofed_body
+    assert "jobs" not in spoofed_body
+    assert spoofed_header_status == 403
+    assert spoofed_profile_status == 403
+    assert off_route_status == 401
+    assert off_route_kanban_status == 401
+    assert own_status == 200, own_body
+    assert "jobs" in own_body
+    assert webui_status == 200
+    # The run-scoped token only ever reached its own tenant; the master-key
+    # (WebUI) call still resolves the owner it stamped.
+    assert listed_for == ["alice_profile", "bob_profile"]
+
+
+def test_revoked_run_scoped_token_never_falls_back_to_header_trust(monkeypatch):
+    """A dead run-scoped token must fail closed, not demote to the master path.
+
+    Regression for codex review RBOS-SCOPE-REVOCATION-TOCTOU. `_authorized` runs
+    before a handler `await request.json()`, so a run finishing in between made
+    the second lookup miss; the resolver then treated the caller as a master-key
+    client and honoured its forged `X-Hermes-Owner-Open-Id`. Probed before the
+    fix: `_owner_scoped_tenant` returned ('bob_profile', 'ou_bob') for a token
+    bound to alice.
+    """
+    from types import SimpleNamespace
+
+    import pytest as _pytest
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import (
+        _authorized,
+        _owner_scoped_tenant,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master")
+
+    class Req:
+        path = "/api/run-broker/jobs"
+        headers = {
+            "Authorization": "Bearer scoped",
+            "X-Hermes-Owner-Open-Id": "ou_bob",
+            "X-Hermes-Profile": "bob_profile",
+        }
+        query: dict[str, str] = {}
+
+    class Table:
+        def resolve_owner_root(self, owner):
+            return SimpleNamespace(profile_name="bob_profile") if owner == "ou_bob" else None
+
+        def list_agents_for_owner(self, owner):
+            return []
+
+        def lookup_by_profile_name(self, profile):
+            return None
+
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: Table())
+
+    register_run_broker_scoped_token(
+        token="scoped", profile_name="alice_profile", open_id="ou_alice", run_id="run"
+    )
+    try:
+        assert _authorized(Req()) is True
+        # The run ends between auth and the handler's tenant resolution.
+        unregister_run_broker_scoped_token("scoped")
+        with _pytest.raises(PermissionError):
+            _owner_scoped_tenant(Req())
+        # And it is no longer authorized at all on a fresh request.
+        assert _authorized(Req()) is False
+    finally:
+        unregister_run_broker_scoped_token("scoped")
+
+
+def test_cron_bridge_key_lookup_has_no_shared_dotenv_fallback(monkeypatch, tmp_path: Path):
+    """The cron bridge must not recover the master key from the shared .env.
+
+    Regression for codex review RBOS-DOTENV-FALLBACK: probed before the fix, this
+    returned 'master-from-dotenv' with both env vars unset — i.e. a child that was
+    deliberately given no broker bearer could read the shared credential back off
+    disk. Only Linux bwrap's file mask was hiding it.
+    """
+    from hermes_multitenancy.cron.run_broker_bridge import _run_broker_key_for_profile
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    (shared / ".env").write_text(
+        "HERMES_MULTITENANCY_RUN_BROKER_KEY=master-from-dotenv\n", encoding="utf-8"
+    )
+
+    monkeypatch.delenv("HERMES_RUN_BROKER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", raising=False)
+
+    assert _run_broker_key_for_profile(profile) == ""
+
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "scoped-token-from-env")
+    assert _run_broker_key_for_profile(profile) == "scoped-token-from-env"
+
+
+def test_cron_trigger_end_to_end_over_http_with_run_scoped_token(monkeypatch, tmp_path: Path):
+    """End-to-end: the real cron bridge, over real HTTP, with a run-scoped token.
+
+    This is the functional half of the fix — the 2026-06-10 incident was the
+    sandboxed `cronjob(action=run)` tool failing to authenticate, so locking the
+    credential down must not resurrect it. Drives the actual
+    `trigger_profile_cron_job_via_run_broker` (urllib POST) against a live broker
+    app, then repeats it while asserting a colleague's identity.
+    """
+    from aiohttp.test_utils import TestServer
+
+    from hermes_multitenancy import cron_api, router as router_mod
+    from hermes_multitenancy.cron import run_broker_bridge
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    profile_home = tmp_path / "profiles" / "alice_profile"
+    profile_home.mkdir(parents=True)
+    (tmp_path / "profiles" / "bob_profile").mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="alice", profile_name="alice_profile", open_id="ou_alice", provenance="sync")
+    seeded.upsert(user_id="bob", profile_name="bob_profile", open_id="ou_bob", provenance="sync")
+    seeded.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-for-webui")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    triggered: list[tuple[str, str]] = []
+
+    def fake_trigger_job(profile_name, job_id):
+        triggered.append((profile_name, job_id))
+        return {"id": job_id, "profile": profile_name}
+
+    monkeypatch.setattr(cron_api, "trigger_job", fake_trigger_job)
+
+    scoped = "run-scoped-token-alice"
+    register_run_broker_scoped_token(
+        token=scoped, profile_name="alice_profile", open_id="ou_alice", run_id="run-1"
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        server = TestServer(
+            create_run_broker_app(mark_seen=lambda _r: True, sandbox_available=lambda: True)
+        )
+        await server.start_server()
+        try:
+            base = f"http://127.0.0.1:{server.port}"
+            # This is exactly what the sandboxed child's env looks like now.
+            monkeypatch.setenv("HERMES_RUN_BROKER_URL", base)
+            monkeypatch.setenv("HERMES_RUN_BROKER_KEY", scoped)
+
+            own = await asyncio.to_thread(
+                run_broker_bridge.trigger_profile_cron_job_via_run_broker,
+                job_id="job-abc",
+                profile_home=profile_home,
+                owner_open_id="ou_alice",
+            )
+
+            spoof_error = ""
+            try:
+                await asyncio.to_thread(
+                    run_broker_bridge.trigger_profile_cron_job_via_run_broker,
+                    job_id="job-abc",
+                    profile_home=tmp_path / "profiles" / "bob_profile",
+                    owner_open_id="ou_bob",
+                )
+            except RuntimeError as exc:
+                spoof_error = str(exc)
+            return own, spoof_error
+        finally:
+            await server.close()
+            router_mod.override_routing_table(None)
+
+    try:
+        own, spoof_error = asyncio.run(runner())
+    finally:
+        unregister_run_broker_scoped_token(scoped)
+
+    # The owner's own cron trigger still works, end to end.
+    assert own["profile"] == "alice_profile"
+    assert triggered == [("alice_profile", "job-abc")]
+    # Asserting a colleague's identity with the same token is refused, and the
+    # colleague's job store is never touched.
+    assert "403" in spoof_error
+    assert triggered == [("alice_profile", "job-abc")]
+
+
+def test_viewer_share_role_token_cannot_mutate_owner_cron(monkeypatch, tmp_path: Path):
+    """A shared-agent `viewer` token is read-only on the owner's cron store.
+
+    Regression for codex review RBOS-SHARED-VIEWER-JOBS-WRITE: the run-scoped
+    token recorded `share_role` but jobs auth ignored it and authorised the whole
+    prefix, so a viewer got 200 on `DELETE /api/run-broker/jobs/job-owner` and
+    really reached `delete_job` on the owner's profile.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import cron_api, router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import (
+        create_run_broker_app,
+        register_run_broker_scoped_token,
+        unregister_run_broker_scoped_token,
+    )
+
+    (tmp_path / "profiles" / "owner_agent_profile").mkdir(parents=True)
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(
+        user_id="owner",
+        profile_name="owner_agent_profile",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    seeded.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-for-webui")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+
+    deleted: list[tuple[str, str]] = []
+    listed: list[str] = []
+
+    monkeypatch.setattr(
+        cron_api, "delete_job", lambda profile, job_id: deleted.append((profile, job_id))
+    )
+    monkeypatch.setattr(
+        cron_api,
+        "list_jobs",
+        lambda profile, include_disabled=False: (listed.append(profile) or []),
+    )
+
+    viewer = "run-scoped-token-viewer"
+    register_run_broker_scoped_token(
+        token=viewer,
+        profile_name="owner_agent_profile",
+        open_id="ou_owner",
+        run_id="run-1",
+        agent_id="agent-1",
+        share_role="viewer",
+    )
+
+    async def runner():
+        router_mod.override_routing_table(db_path)
+        app = create_run_broker_app(
+            mark_seen=lambda _r: True, sandbox_available=lambda: True
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            delete = await client.delete(
+                "/api/run-broker/jobs/job-owner",
+                headers={"Authorization": f"Bearer {viewer}"},
+            )
+            read = await client.get(
+                "/api/run-broker/jobs",
+                headers={"Authorization": f"Bearer {viewer}"},
+            )
+            return delete.status, read.status
+        finally:
+            await client.close()
+            router_mod.override_routing_table(None)
+
+    try:
+        delete_status, read_status = asyncio.run(runner())
+    finally:
+        unregister_run_broker_scoped_token(viewer)
+
+    assert delete_status == 401
+    assert deleted == []          # the owner's job store was never touched
+    assert read_status == 200     # reading stays allowed for a viewer
+    assert listed == ["owner_agent_profile"]

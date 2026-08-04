@@ -8767,3 +8767,184 @@ def test_wrap_linux_bwrap_binds_token_named_source_script_skill(monkeypatch, tmp
 
     triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
     assert ("--ro-bind", str(skill_source), str(skill_source)) in triples
+
+
+def test_sandbox_child_gets_run_scoped_broker_token_not_master_key(monkeypatch, tmp_path: Path):
+    """The sandboxed child must never inherit the SHARED master RunBroker key.
+
+    Regression for the 2026-08-04 security review finding: holding the master key
+    plus a caller-asserted owner header was enough to act as any colleague. The
+    child now receives a per-run token whose (profile, open_id) binding is held
+    server-side, and it is revoked when the run's env scope exits.
+    """
+    import contextlib
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.webui_broker_server import _lookup_run_broker_scoped_token
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "0" * 64)
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    # Patch on the owning module: the package shim re-exports these, so patching
+    # the shim would leave `_core`'s own globals (what the scope actually calls)
+    # untouched.
+    from hermes_multitenancy.agent_real import _core as agent_core
+
+    monkeypatch.setattr(
+        agent_core, "_resolve_subprocess_sender_open_id", lambda _event: "ou_alice"
+    )
+
+    @contextlib.contextmanager
+    def fake_lark_scope(_profile_home, _open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_core, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        object(), profile_home, approval_dir=approval_dir
+    ) as env:
+        token = env["HERMES_RUN_BROKER_KEY"]
+        assert token != "master-key-shared-by-everyone"
+        assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == token
+        record = _lookup_run_broker_scoped_token(token)
+        assert record is not None
+        assert record["profile_name"] == "alice"
+        assert record["open_id"] == "ou_alice"
+
+    # Revoked with the run — a token copied out of the child is dead afterwards.
+    assert _lookup_run_broker_scoped_token(token) is None
+
+
+def test_master_broker_key_is_stripped_even_when_strict_context_is_off(monkeypatch, tmp_path: Path):
+    """Master-key removal must not hang off an optional, default-off flag.
+
+    Regression for codex review RBOS-STRICT-OPTIONAL: the strip used to sit
+    inside `strict_context_enabled()`, which defaults to OFF and is not required
+    by `startup_guard`, so a deployment could pass preflight and still hand the
+    shared master key to every tenant child. The earlier test masked this by
+    forcing strict=1.
+    """
+    import contextlib
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import _core as agent_core
+    from hermes_multitenancy.webui_broker_server import _lookup_run_broker_scoped_token
+
+    monkeypatch.delenv("HERMES_MULTITENANCY_STRICT_CONTEXT", raising=False)
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    monkeypatch.setattr(
+        agent_core, "_resolve_subprocess_sender_open_id", lambda _event: "ou_alice"
+    )
+
+    @contextlib.contextmanager
+    def fake_lark_scope(_profile_home, _open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_core, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        object(), profile_home, approval_dir=approval_dir
+    ) as env:
+        token = env["HERMES_RUN_BROKER_KEY"]
+        assert token != "master-key-shared-by-everyone"
+        assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == token
+        record = _lookup_run_broker_scoped_token(token)
+        assert record is not None
+        assert record["profile_name"] == "alice"
+        assert record["open_id"] == "ou_alice"
+
+    assert _lookup_run_broker_scoped_token(token) is None
+
+
+def test_child_gets_no_broker_bearer_when_owner_cannot_be_bound(monkeypatch, tmp_path: Path):
+    """No resolvable owner → no broker credential at all (never the master key)."""
+    import contextlib
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import _core as agent_core
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+    monkeypatch.setenv("HERMES_RUN_BROKER_KEY", "master-key-shared-by-everyone")
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+
+    monkeypatch.setattr(agent_core, "_resolve_subprocess_sender_open_id", lambda _event: "")
+    monkeypatch.setattr(agent_core, "_profile_owner_open_id", lambda _home: "")
+
+    @contextlib.contextmanager
+    def fake_lark_scope(_profile_home, _open_id):
+        yield {}
+
+    monkeypatch.setattr(agent_core, "_lark_cli_auth_broker_scope", fake_lark_scope)
+
+    with agent_real._aiagent_subprocess_env_scope(
+        object(), profile_home, approval_dir=approval_dir
+    ) as env:
+        assert "HERMES_RUN_BROKER_KEY" not in env
+        assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env
+
+
+def test_profile_dotenv_cannot_reintroduce_master_broker_key(monkeypatch, tmp_path: Path):
+    """A master key sitting in the profile .env must not reach the child.
+
+    Regression for codex review RBOS-MASTER-REINTRODUCTION. The strip used to run
+    at the top of `_build_subprocess_env`, but `_profile_env_for_aiagent` loads
+    the profile dotenv AFTERWARDS and re-injected both names verbatim; the probed
+    child env came back as
+    {'HERMES_RUN_BROKER_KEY': 'master-from-profile', 'HERMES_MULTITENANCY_RUN_BROKER_KEY': ...}.
+    Only the token minted for this spawn may survive, whatever the source.
+    """
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    (profile_home / ".env").write_text(
+        "HERMES_RUN_BROKER_KEY=master-from-profile\n"
+        "HERMES_MULTITENANCY_RUN_BROKER_KEY=master-from-profile\n",
+        encoding="utf-8",
+    )
+
+    # 1. No minted token → the child gets no broker bearer at all.
+    env = agent_real._build_subprocess_env(profile_home, approval_dir=approval_dir)
+    assert "HERMES_RUN_BROKER_KEY" not in env
+    assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env
+
+    # 2. Minted token → only that value survives; the dotenv master is dropped.
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={
+            "HERMES_RUN_BROKER_KEY": "scoped-token-for-this-run",
+            "HERMES_MULTITENANCY_RUN_BROKER_KEY": "scoped-token-for-this-run",
+        },
+    )
+    assert env["HERMES_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
+    assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
+
+    # 3. A tampered second name cannot smuggle the master through.
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        extra={"HERMES_RUN_BROKER_KEY": "scoped-token-for-this-run"},
+    )
+    assert env["HERMES_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
+    assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env

@@ -2052,13 +2052,14 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "HERMES_CREDENTIAL_KEY",
     "HERMES_APPROVAL_GATEWAY_TIMEOUT",
     "HERMES_VOD_IMAGE_MODEL_OVERRIDE",
-    # RunBroker auth so the sandboxed agent's cronjob(action=run) tool can
-    # authenticate to the router-owned RunBroker (:8766). Shared infra key
-    # (server enforces per-profile scope via X-Hermes-Profile / X-Hermes-User-Key),
-    # same class as the credential keys above — not a per-user secret. Without
-    # it the child sends no Bearer token and the cron trigger gets 401.
-    "HERMES_RUN_BROKER_KEY",
-    "HERMES_MULTITENANCY_RUN_BROKER_KEY",
+    # RunBroker *URLs* only. The bearer is deliberately NOT inheritable: the
+    # claim that once justified forwarding it — "server enforces per-profile
+    # scope via X-Hermes-Profile / X-Hermes-User-Key" — was false, those headers
+    # are caller-asserted (2026-08-04 security review). The child's
+    # cronjob(action=run) tool instead receives a run-scoped token minted per
+    # spawn by `_aiagent_subprocess_env_scope`, whose (profile, open_id) binding
+    # lives server-side. `_build_subprocess_env` also pops the two key names
+    # unconditionally as a backstop against this allowlist regrowing them.
     "HERMES_RUN_BROKER_URL",
     "HERMES_MULTITENANCY_RUN_BROKER_URL",
     "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
@@ -2476,8 +2477,10 @@ def _aiagent_subprocess_env_scope(
     from ..webui_broker_server import (
         credential_broker_url,
         register_credential_broker_token,
+        register_run_broker_scoped_token,
         register_session_search_broker_token,
         unregister_credential_broker_token,
+        unregister_run_broker_scoped_token,
         unregister_session_search_broker_token,
     )
 
@@ -2505,6 +2508,7 @@ def _aiagent_subprocess_env_scope(
             merged_extra["HERMES_AGENT_ID"] = share_agent_id
         merged_extra["HERMES_AGENT_SHARE_ROLE"] = share_role
     broker_token = ""
+    run_broker_scoped_token = ""
     session_search_token = secrets.token_urlsafe(32)
     session_search_run_id = secrets.token_urlsafe(24)
     if strict_context_enabled():
@@ -2558,6 +2562,27 @@ def _aiagent_subprocess_env_scope(
         agent_id=share_agent_id if shared_agent_run else "",
         share_role=share_role if shared_agent_run else "",
     )
+    # RunBroker bearer for the child's native cronjob(action=run) tool. Minted
+    # OUTSIDE the strict-context branch on purpose: `_build_subprocess_env` now
+    # drops the master key unconditionally, so a non-strict deployment would
+    # otherwise lose cron triggering entirely. No resolvable owner → no token at
+    # all (fail-closed) rather than a shared credential.
+    if scoped_open_id_for_search:
+        run_broker_scoped_token = secrets.token_urlsafe(32)
+        merged_extra.update(
+            {
+                "HERMES_RUN_BROKER_KEY": run_broker_scoped_token,
+                "HERMES_MULTITENANCY_RUN_BROKER_KEY": run_broker_scoped_token,
+            }
+        )
+        register_run_broker_scoped_token(
+            token=run_broker_scoped_token,
+            profile_name=profile_home.name,
+            open_id=scoped_open_id_for_search,
+            run_id=session_search_run_id,
+            agent_id=share_agent_id if shared_agent_run else "",
+            share_role=share_role if shared_agent_run else "",
+        )
     with _lark_cli_auth_broker_scope(
         profile_home,
         str(merged_extra.get("HERMES_FEISHU_USER_OPEN_ID") or sender_open_id),
@@ -2573,6 +2598,8 @@ def _aiagent_subprocess_env_scope(
         finally:
             if broker_token:
                 unregister_credential_broker_token(broker_token)
+            if run_broker_scoped_token:
+                unregister_run_broker_scoped_token(run_broker_scoped_token)
             unregister_session_search_broker_token(session_search_token)
 
 

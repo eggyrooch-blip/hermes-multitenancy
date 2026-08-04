@@ -84,6 +84,8 @@ _LIVE_STATE_OWNERS = {
     '_credential_broker_tokens': _periphery,
     '_credential_broker_tokens_lock': _periphery,
     '_pending_clarifies': _periphery,
+    '_run_broker_scoped_tokens': _periphery,
+    '_run_broker_scoped_tokens_lock': _periphery,
     '_runner': _periphery,
     '_server_task': _periphery,
     '_session_search_broker_tokens': _periphery,
