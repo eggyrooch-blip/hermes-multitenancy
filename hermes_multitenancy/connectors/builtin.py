@@ -26,8 +26,9 @@ KEP_CLI = "kep-cli"
 KEP_CLI_ONLINE = "kep-cli-online"
 KEP_CLI_PRE = "kep-cli-pre"
 GITLAB = "gitlab"
+GITLAB_PERSONAL = "gitlab-personal"
 
-CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB)
+CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB, GITLAB_PERSONAL)
 
 
 BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
@@ -179,6 +180,31 @@ BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
             supported_identities=("user",),
             default_identity="user",
             audit=True,
+            secrets_owner="profile_home",
+            runtime_policy_owner="connector_driver",
+        ),
+        ui=ConnectorUiSpec(group="internal-systems", action="manual"),
+    ),
+    # 与 GITLAB 同一个 provider、同一条命令通道，区别只在凭证来自谁：上面那条是管理员
+    # 放的全局 token（员工只读不可改），这条是员工自己交的。拆成两个 connector 才能让
+    # 面板同时呈现"公司给的"和"我自己的"，绑定入口也才有地方挂。
+    GITLAB_PERSONAL: ConnectorDefinition(
+        id=GITLAB_PERSONAL,
+        title="GitLab（我的）",
+        provider="gitlab",
+        kind="manual",
+        scope="profile",
+        invocation=InvocationSpec(type="native_cli", detail="glab"),
+        auth_flow=AuthFlowSpec(type="manual_token", status_probe="credential_hub.gitlab_status"),
+        policy=ConnectorPolicy(
+            supported_identities=("user",),
+            default_identity="user",
+            audit=True,
+            # 沿用 profile_home：个人 token 实际存在 vault 里（env-only，从不落
+            # workspace/credentials/gitlab.token，见 readers/gitlab._personal_record），
+            # 但 secrets_owner 是 credential_owner 的推导源，它必须解析成脱敏的 profile
+            # 名。这里写 "vault" 会让 credential_owner 变成字面量 "vault"，破坏
+            # "owner 永远是 profile 名" 的契约。存储位置的差异记在 reader 里，不记这。
             secrets_owner="profile_home",
             runtime_policy_owner="connector_driver",
         ),

@@ -19,8 +19,12 @@ KEP_CLI = "kep-cli"
 KEP_CLI_ONLINE = "kep-cli-online"
 KEP_CLI_PRE = "kep-cli-pre"
 GITLAB = "gitlab"
+# 全局 token 与员工自己绑的 token 是两件独立的事，各占一张卡：以前它们挤在 `gitlab`
+# 一行里互斥切换，员工看不出"公司给的"和"我自己的"同时存在，也就找不到绑定入口。
+# 拆行的形状照抄 kep-cli 的 online/pre —— orchestrator 早就支持 reader 返回多行。
+GITLAB_PERSONAL = "gitlab-personal"
 
-CREDENTIAL_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB)
+CREDENTIAL_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB, GITLAB_PERSONAL)
 KEP_CLI_ENV_IDS = {"online": KEP_CLI_ONLINE, "pre": KEP_CLI_PRE}
 KEP_CLI_IDS = (KEP_CLI_ONLINE, KEP_CLI_PRE)
 
@@ -31,7 +35,8 @@ _TITLES = {
     KEP_CLI: "kep-cli",
     KEP_CLI_ONLINE: "kep-cli online",
     KEP_CLI_PRE: "kep-cli pre",
-    GITLAB: "GitLab",
+    GITLAB: "GitLab（全局）",
+    GITLAB_PERSONAL: "GitLab（我的）",
 }
 
 # Status vocabulary (matches the WebUI SkillCredentialState set).
@@ -72,7 +77,11 @@ class CredentialRow:
             "installed": self.installed,
             "status": self.status,
             "expires_at": self.expires_at,
-            "action": self.action or {"kind": "manual", "label": ""},
+            # None，不是伪造一个 {"kind":"manual","label":""}：空 action 表示"这张卡
+            # 没有员工可执行的操作"（如「GitLab（全局）」由管理员运维）。伪造成 manual
+            # 会把这个语义抹掉，逼下游拿空 label 当哨兵 —— codex 评审 2026-08-04 指出，
+            # 且该脆性已实际咬过一次（webui 降级态全员丢按钮）。
+            "action": self.action or None,
         }
         if self.account_hint:
             out["account_hint"] = self.account_hint

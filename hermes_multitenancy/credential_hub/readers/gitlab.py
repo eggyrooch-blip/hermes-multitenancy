@@ -8,6 +8,7 @@ from typing import Any, Optional
 from .._io import _read_small_text
 from ..model import (
     GITLAB,
+    GITLAB_PERSONAL,
     S_CONFIGURED,
     S_MISSING,
     S_NEEDS_AUTH,
@@ -52,39 +53,60 @@ def _personal_record(profile_dir: Path) -> Optional[dict[str, Any]]:
         return None
 
 
-def gitlab_status(*, profile_dir: Path, installed: bool = False) -> CredentialRow:
-    """gitlab — personal vaulted token wins; shared token file is the fallback."""
+def gitlab_status(*, profile_dir: Path, installed: bool = False) -> list[CredentialRow]:
+    """gitlab — 两行：管理员放的全局 token，和员工自己绑的个人 token。
+
+    以前这是一行，两种来源互斥地抢同一张卡（有个人的就把全局的顶掉）。结果员工既看不出
+    "公司给了我一个共用的"和"我可以绑自己的"是两件事，也找不到绑定入口 —— 那张卡在只有
+    全局 token 时按钮叫「改用我自己的」，在页面上被当成刷新按钮从没人点过。
+
+    拆成两行后各自独立：左卡只陈述全局 token 的存在（管理员运维，员工改不了，所以
+    ``action={}`` —— 客户端据此不渲染按钮），右卡才是员工的操作面。
+    """
     token_path = Path(profile_dir) / "workspace" / "credentials" / "gitlab.token"
     can_read = bool(_hub._read_small_text(token_path).strip())
     personal = _personal_record(profile_dir)
+    # 任一来源可用即算"装了"，两行共享这个判断：个人卡在没有全局 token 时也要能显示成
+    # "未绑定"而不是"未安装"，否则员工连绑定按钮都看不到。
     is_installed = installed or can_read or personal is not None
-    row = CredentialRow(
+
+    # --- 左卡：全局 token（只读陈述，无按钮）---
+    global_row = CredentialRow(
         id=GITLAB, title=_TITLES[GITLAB], provider="gitlab",
-        installed=is_installed, status=S_MISSING,
-        action={"kind": "manual", "label": "配置"},
+        installed=is_installed,
+        status=S_CONFIGURED if can_read else (S_NEEDS_AUTH if is_installed else S_MISSING),
+        action={},  # 管理员运维，员工无操作 —— 给按钮等于骗人
+    )
+    if can_read:
+        global_row.default_identity = "shared"
+        global_row.detail = "管理员配置的共用 GitLab token（不展示内容），全员共享；你不能改它。"
+    elif is_installed:
+        global_row.detail = "当前 profile 读不到全局 GitLab token，需要管理员配置。"
+    else:
+        global_row.detail = "该 profile 没有 GitLab 相关 skill 或 token。"
+
+    # --- 右卡：员工自己的 token（唯一的操作面）---
+    personal_row = CredentialRow(
+        id=GITLAB_PERSONAL, title=_TITLES[GITLAB_PERSONAL], provider="gitlab",
+        installed=is_installed, status=S_NEEDS_AUTH,
+        action={"kind": "manual", "label": "绑定我的 GitLab"},
     )
     if personal is not None:
         expires_at = personal.get("expires_at")
-        row.status = S_CONFIGURED
-        row.expires_at = expires_at
-        row.default_identity = "user"
+        personal_row.status = S_CONFIGURED
+        personal_row.expires_at = expires_at
+        personal_row.default_identity = "user"
         window = human_expiry(expires_at)
-        row.detail = "使用你本人提供的 GitLab token（不展示内容）。"
+        personal_row.detail = "使用你本人提供的 GitLab token（不展示内容）。"
         if window:
-            row.detail += f"{window}。"
+            personal_row.detail += f"{window}。"
         if personal.get("status") == "expired":
             # Still "configured" in the WebUI's vocabulary — there IS a token —
             # but it will fail every call until replaced, so say so plainly.
-            row.status = S_NEEDS_AUTH
-            row.detail = "你的 GitLab token 已过期，请重新提交一个。"
-        row.action["label"] = "更换"
-    elif can_read:
-        row.status = S_CONFIGURED
-        row.detail = "当前使用全局 GitLab token（不展示内容）。可提交你自己的 token 来替代它。"
-        row.action["label"] = "改用我自己的"
-    elif is_installed:
-        row.status = S_NEEDS_AUTH
-        row.detail = "需要为当前 profile 提供可读的 GitLab token。"
+            personal_row.status = S_NEEDS_AUTH
+            personal_row.detail = "你的 GitLab token 已过期，请重新提交一个。"
+        personal_row.action["label"] = "更换"
     else:
-        row.detail = "该 profile 没有 GitLab 相关 skill 或 token。"
-    return row
+        personal_row.detail = "绑定后 hermes 用你本人的权限操作仓库；不绑就一直用全局那个。"
+
+    return [global_row, personal_row]
