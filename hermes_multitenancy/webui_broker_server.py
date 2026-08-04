@@ -125,6 +125,37 @@ class _ShimModule(_ModuleType):
 _sys.modules[__name__].__class__ = _ShimModule
 
 
+def build_ingest_run_request(
+    *,
+    bound_profile: str,
+    content: str,
+    delivery_mode: str,
+    metadata: Optional[dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+) -> RunRequest:
+    """Field contract for an ingest-bound WebUI run request.
+
+    Module-level and pure (no aiohttp request / binding plumbing) so the
+    billing shadow runner can replay the exact production field shape without
+    standing up the server; ``_prepare_ingest_run_request`` routes through it.
+    """
+    merged = dict(metadata or {})
+    merged.setdefault("source", "ingest")
+    return RunRequest(
+        channel="webui",
+        profile_name=bound_profile,
+        user_key=bound_profile,
+        content=content,
+        idempotency_key=idempotency_key,
+        delivery_mode=delivery_mode,
+        credential_subject=bound_profile,
+        # Ingest is an external execution surface: the caller cannot downgrade
+        # sandbox admission by declaring that host tools are unnecessary.
+        requires_host_tools=True,
+        metadata=merged,
+    )
+
+
 def create_run_broker_app(
     *,
     dispatch_agent: Optional[DispatchAgent] = None,
@@ -519,22 +550,15 @@ def create_run_broker_app(
         if secret_spec and secret_spec.manifest:
             metadata["ingest_secrets"] = list(secret_spec.manifest)
 
-        # Ingest is an external execution surface: the caller cannot downgrade
-        # sandbox admission by declaring that host tools are unnecessary.
-        requires_host_tools = True
         interactive = bool(payload.get("interactive", False))
 
         try:
-            run_request = RunRequest(
-                channel="webui",
-                profile_name=bound_profile,
-                user_key=bound_profile,
+            run_request = build_ingest_run_request(
+                bound_profile=bound_profile,
                 content=content,
-                idempotency_key=str(payload.get("idempotency_key") or "").strip() or None,
                 delivery_mode=delivery_mode,
-                credential_subject=bound_profile,
-                requires_host_tools=requires_host_tools,
                 metadata=metadata,
+                idempotency_key=str(payload.get("idempotency_key") or "").strip() or None,
             )
         except Exception as exc:
             return None, web.json_response({"ok": False, "error": str(exc)}, status=400)
