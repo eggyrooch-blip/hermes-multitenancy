@@ -51,7 +51,24 @@ policy:
       # merged-results pipeline 里 CI_COMMIT_SHA 是临时合并 commit,会把 main 侧
       # 后来的门禁变更误算到本 MR 头上 —— 优先用 source branch SHA(codex review)。
       SRC="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}"
-      changed=$(git diff --name-only "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$SRC" -- \
+      # CI_MERGE_REQUEST_DIFF_BASE_SHA is not always populated (measured empty on
+      # MR !14, 2026-08-04, and it stayed empty across a retry — not a race).
+      # Feeding an empty string to git diff makes it fall back to --no-index mode
+      # and die with a usage error: the job goes red for a PLUMBING failure that
+      # looks identical to "the policy was violated", and it blocked every MR
+      # while test/leak were skipped behind it — i.e. no gate ran at all.
+      BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      if [ -z "$BASE" ]; then
+        TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-main}"
+        git fetch -q origin "refs/heads/$TARGET" || true
+        BASE=$(git merge-base FETCH_HEAD "$SRC" 2>/dev/null || true)
+      fi
+      # Fail CLOSED: never let an undeterminable base silently pass the check.
+      if [ -z "$BASE" ] || [ -z "$SRC" ]; then
+        echo "policy: cannot determine diff range (base='$BASE' src='$SRC') — refusing"
+        exit 1
+      fi
+      changed=$(git diff --name-only "$BASE" "$SRC" -- \
         .gitlab-ci.yml .gitleaks.toml .gitleaksignore)
       test -z "$changed" || { echo "Protected CI policy changed:"; echo "$changed"; exit 1; }
 
