@@ -206,7 +206,12 @@ class BillingCredentialManager:
         force_reason: str = "",
     ) -> BillingIdentity:
         with self._payer_lock(payer.employee_user_id):
-            return self._ensure_locked(payer, existing, force_reason=force_reason)
+            return self._ensure_locked(
+                payer,
+                existing,
+                force_reason=force_reason,
+                gone_reissues_remaining=1,
+            )
 
     def runtime_api_key(self, metadata: dict[str, Any]) -> str:
         employee_id = str(metadata.get("litellm_billing_employee_user_id") or "")
@@ -241,6 +246,7 @@ class BillingCredentialManager:
         existing: BillingIdentity | None,
         *,
         force_reason: str,
+        gone_reissues_remaining: int = 1,
     ) -> BillingIdentity:
         payload = self._load_payload(payer.profile_name, payer.employee_user_id)
         if payload is not None:
@@ -346,7 +352,19 @@ class BillingCredentialManager:
         self._save_payload(payer.profile_name, payer.employee_user_id, new_payload)
         finished = self._finish_pending(payer, new_payload)
         if finished is None:
-            return self._ensure_locked(payer, existing, force_reason="missing")
+            # credential_gone deleted the generation we just issued.  Reissue
+            # once; a broker that keeps discarding fresh generations is an
+            # outage, not something to hammer in an unbounded ensure loop.
+            if gone_reissues_remaining <= 0:
+                raise RunRejected(
+                    "employee billing initialization is temporarily unavailable"
+                )
+            return self._ensure_locked(
+                payer,
+                existing,
+                force_reason="missing",
+                gone_reissues_remaining=gone_reissues_remaining - 1,
+            )
         return _binding_from_payload(finished)
 
     def _finish_pending(
@@ -475,6 +493,9 @@ class BillingCredentialManager:
         existing: BillingIdentity | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        version = str(payload.get("contract_version") or "").strip()
+        if not version or version.split(".", 1)[0] != _CONTRACT_MAJOR:
+            raise RunRejected("billing credential contract version is unsupported")
         required = (
             "employee_id", "profile_name", "enterprise_email",
             "litellm_user_id", "team_id", "team_alias", "key_id",
@@ -671,7 +692,11 @@ def _allowed_billing_endpoint(left: str, right: str) -> bool:
         destination = urlparse(str(right or "").strip())
     except ValueError:
         return False
-    if configured.scheme not in {"http", "https"} or destination.scheme != configured.scheme:
+    # This endpoint receives a per-employee Bearer credential.  Never permit
+    # plaintext transport, including loopback/private-network URLs: an
+    # accidentally relaxed production URL must fail before the key is put on
+    # the wire.
+    if configured.scheme != "https" or destination.scheme != "https":
         return False
     if any(
         (
