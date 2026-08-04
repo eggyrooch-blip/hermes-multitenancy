@@ -71,9 +71,108 @@ git -C "$RELEASES/.repo-mt" fetch -q --tags --prune origin 2>/dev/null \
   || log "警告：拉取标签失败，用本地已有的（GitLab/GitHub 不可用时不影响当前运行的版本）"
 
 TAG=$(git -C "$RELEASES/.repo-mt" tag -l 'release-*' --sort=-creatordate | head -1)
-[ -n "$TAG" ] || { log "没有任何 release-* 标签，什么都不做"; exit 0; }
-
 CURRENT=$(cat "$STATE_FILE" 2>/dev/null || echo "")
+
+# ── 漂移探针：活的软链，是不是真等于当前标签钉的 SHA ──────────────────
+# 本执行器判断「当前已部署版本」用的是状态文件里的一个**标签名**，不是活的
+# 软链。于是任何带外部署（ssh 上去 build + ln -sfn + restart）都没有任何东西
+# 会发现，而且会一直挂着，直到下一个新标签把两个仓一起翻掉。2026-08-04 生产
+# webui 就是这么漂的：软链指着 webui-6aca93cc，而当时最新标签 -02 的
+# annotation 记的是 290c1152，直到 -03 才被动钉回一致，全程零告警。
+#
+# 三条设计决定，都是评审推翻第一版后定的：
+#  1) fail-closed。只有「从没部署过」才允许跳过。取不到清单、软链悬空、名字
+#     判读不出，一律算「无法证明一致」并失败 —— 否则自定义目录名就是绕过探针
+#     的方法，而「取不到清单时发布路径自己会拒」在 TAG==CURRENT 时根本不成立
+#     （那条路径在校验清单之前就早退了）。
+#  2) 挡在所有分支前面，不只是无新标签那条。带着未确认的漂移继续发布，会把
+#     别人手工部上去的止血补丁静默盖掉。
+#  3) 只报不改。带外部署可能正是当时唯一的止血手段，静默翻回去等于二次事故。
+DRIFT_LOG="${DRIFT_LOG:-$HOME/.hermes/release-drift.log}"
+DRIFT_ACK="${DRIFT_ACK:-$STATE_FILE.drift-ack}"
+DRIFT_FINGERPRINT=""
+
+# 软链名 → 短 sha。发布器两个仓的宽度**不一样**（mt 取 7 位、webui 取 8 位，
+# 见下方 MT_DIR/WEBUI_DIR），所以这里两种都认，并按实际位数去截期望值比。
+# 写死 8 位的第一版在生产上 mt 永远判读不出 → 整条探针空转，评审实测抓到。
+_link_sha() {
+  local name="$1" prefix="$2" rest
+  rest="${name#"$prefix"-}"
+  [ "$rest" != "$name" ] || return 0
+  case "${#rest}" in 7|8) ;; *) return 0 ;; esac
+  case "$rest" in *[!0-9a-f]*) return 0 ;; esac
+  printf '%s' "$rest"
+}
+
+# 返回 0 = 已证明一致（或确认过）；1 = 漂了 / 无法证明。
+drift_check() {
+  [ -n "$CURRENT" ] || return 0   # 从没部署过，无从比较，是唯一允许跳过的情形
+
+  local body cur_mt cur_webui live_mt live_webui live_mt_sha live_webui_sha
+  local want_mt want_webui reason
+  reason=""; want_mt="?"; want_webui="?"
+
+  # 先把「实际在跑什么」问清楚，且**无条件**问 —— 它与标签读不读得到无关。
+  # 早期版本把这段塞在 `[ -z "$reason" ]` 后面，于是标签一旦读不到，指纹就退化成
+  # `<标签> ? ? <无> <无>`：ack 掉这一条之后，只要标签仍读不到，软链随便怎么换都
+  # 静默放行。评审 round-2 实测出来的洞 —— 指纹里必须永远带真实的那一对。
+  live_mt=$(readlink "$CODE/hermes-multitenancy" 2>/dev/null || true)
+  live_webui=$(readlink "$CODE/hermes-web-ui" 2>/dev/null || true)
+  live_mt=$(basename "${live_mt:-}")
+  live_webui=$(basename "${live_webui:-}")
+
+  body=$(git -C "$RELEASES/.repo-mt" tag -l --format='%(contents)' "$CURRENT" 2>/dev/null)
+  cur_mt=$(printf '%s\n' "$body" | sed -n 's/^multitenancy:[[:space:]]*//p' | head -1)
+  cur_webui=$(printf '%s\n' "$body" | sed -n 's/^webui:[[:space:]]*//p' | head -1)
+  if [ ${#cur_mt} -ne 40 ] || [ ${#cur_webui} -ne 40 ]; then
+    reason="无法证明一致：取不到 $CURRENT 的完整发布清单（标签被删，或 annotation 残缺）"
+  fi
+
+  # 悬空软链 readlink 照样回显目标名，只比名字会把「目标已被删」判成一致。
+  if [ -z "$reason" ]; then
+    if [ ! -L "$CODE/hermes-multitenancy" ] || [ ! -d "$CODE/hermes-multitenancy/." ]; then
+      reason="无法证明一致：$CODE/hermes-multitenancy 不是软链，或已悬空"
+    elif [ ! -L "$CODE/hermes-web-ui" ] || [ ! -d "$CODE/hermes-web-ui/." ]; then
+      reason="无法证明一致：$CODE/hermes-web-ui 不是软链，或已悬空"
+    fi
+  fi
+
+  if [ -z "$reason" ]; then
+    live_mt_sha=$(_link_sha "$live_mt" mt)
+    live_webui_sha=$(_link_sha "$live_webui" webui)
+    if [ -z "$live_mt_sha" ] || [ -z "$live_webui_sha" ]; then
+      reason="无法证明一致：软链名不是发布器的 <仓>-<短sha> 命名（mt=$live_mt webui=$live_webui）"
+    else
+      want_mt="mt-${cur_mt:0:${#live_mt_sha}}"
+      want_webui="webui-${cur_webui:0:${#live_webui_sha}}"
+      [ "$live_mt" = "$want_mt" ] && [ "$live_webui" = "$want_webui" ] && return 0
+      reason="发布漂移：$CURRENT 钉的是 $want_mt / $want_webui，实际在跑的是 $live_mt / $live_webui"
+    fi
+  fi
+
+  log "!! $reason"
+  mkdir -p "$(dirname "$DRIFT_LOG")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date -Is)" "$reason" >> "$DRIFT_LOG" 2>/dev/null || true
+
+  # 确认过的不再天天告警（告警疲劳的终点是有人把定时器关了）。指纹绑死
+  # 「基准标签 + 期望的那一对 + 实际的那一对」：换了标签、或又漂到别处，
+  # 旧 ack 一律失效。只绑 live 那一对的第一版会跨发布永久静默，评审抓到。
+  DRIFT_FINGERPRINT="$CURRENT $want_mt $want_webui ${live_mt:-<无>} ${live_webui:-<无>}"
+  if [ "$(cat "$DRIFT_ACK" 2>/dev/null)" = "$DRIFT_FINGERPRINT" ]; then
+    log "   （已在 $DRIFT_ACK 里确认过这一条，不再告警）"
+    return 0
+  fi
+  return 1
+}
+
+if ! drift_check; then
+  log "!! 生产在跑的东西无法证明等于 $CURRENT 钉的版本 —— 不发布、不动软链，以失败退出让 OnFailure 捅出来。"
+  log "!! 确认这次是有意的（例如紧急止血），把下面这行原样写进 ack 文件后重跑："
+  log "     printf '%s' '$DRIFT_FINGERPRINT' > $DRIFT_ACK"
+  exit 1
+fi
+
+[ -n "$TAG" ] || { log "没有任何 release-* 标签，什么都不做"; exit 0; }
 if [ "$TAG" = "$CURRENT" ]; then
   log "已是最新（$TAG），什么都不做"
   exit 0
