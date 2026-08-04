@@ -259,3 +259,75 @@ dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单�
      （注：本 slug 已让**新增的个人 token** 走"只注 env 不落文件"，但不动存量文件。）
   3. 给该 admin 账号下 12 条永不过期 token 定期轮换/设过期——需先确认各自归属与用途，
      不能直接 revoke（会打断 Jenkins / murphysec 等 CI）。
+
+## 2026-08-04 · run-broker 47 个 handler 里 16 个不做 owner 收口（主密钥持有者可达，独立于 owner-spoof 那条）
+
+> 来源：slug `run-broker-owner-spoof-failclosed` 的类扫（Algorithm 规则 9），SPEC 完成项第 65 行写了
+> 「属独立债，不在本 slug 范围」但**没落到本文件**。2026-08-04 在 main `d3843a8` 上独立复跑类扫复现：
+> 47 条路由 / 23 条过 owner 收口 / **16 条只过 `_authorized`**，与 SPEC 记的数字逐字一致。
+> 记在此以免只活在 SPEC 和评审回执里。
+
+- **已经关掉的部分**：沙箱里那枚 run-scoped token 按路由钉死在 `/api/run-broker/jobs` 前缀，
+  对这 16 个兄弟一次性 401。**agent 侧不再是入口**。
+- **仍然开着的部分**：`_authorized` 认的另一把是 **run-broker 主密钥**。任何持主密钥的调用方
+  （WebUI 服务端、内部脚本、以及任何能读到主密钥的人）打这 16 个端点时，**broker 不校验它代表谁**，
+  owner 完全来自请求自报或干脆不看。修 owner-spoof 那条**没有改变**这一点。
+- **清单**（`hermes_multitenancy/webui_broker_server.py` @ `d3843a8`，行号为 handler 定义行）：
+
+  | 端点 | handler | 行 | 影响面 |
+  |---|---|---|---|
+  | `POST /profiles` | `handle_provision_profile` | 1972 | 任意开户 |
+  | `GET /agents/shared` | `handle_list_shared_agents` | 2056 | 跨租户读共享关系 |
+  | `GET /agents/{id}/shares` | `handle_list_agent_shares` | 2083 | 同上 |
+  | `POST /agents/{id}/shares` | `handle_grant_agent_share` | 2105 | **代他人授权** |
+  | `DELETE /agents/{id}/shares/{key}` | `handle_revoke_agent_share` | 2150 | **代他人撤权** |
+  | `GET /plugin-assets/{plugin}/{asset}` | `handle_plugin_asset` | 2527 | 跨租户读插件资产 |
+  | `GET /kanban/boards` | `handle_kanban_boards` | 2813 | 跨租户读看板 |
+  | `GET /kanban/capabilities` | `handle_kanban_capabilities` | 2776 | 同上 |
+  | `GET /kanban/assignees` | `handle_kanban_assignees` | 2759 | 同上（含人员名单） |
+  | `GET /kanban/stats` | `handle_kanban_stats` | 2796 | 同上 |
+  | `GET /kanban/tasks` | `handle_kanban_tasks` | 2831 | 同上 |
+  | `POST /kanban/tasks` | `handle_kanban_create_task` | 2853 | **代他人建任务** |
+  | `POST /kanban/dispatch` | `handle_kanban_dispatch` | 2872 | **代他人派活（会真跑 agent）** |
+  | `GET /skills/audit` | `handle_skill_audit` | 2965 | 跨租户读技能审计 |
+
+  另两条计入 16、但**不算债**，写出来是免得下次类扫又当新发现：
+  `GET /health`（2 个字段，无租户数据）、`POST /feishu/helpdesk/events`
+  （ws-adapter 内部扇入口，owner 从事件体推出，本来就不是按调用方分租户的）。
+  → **真正的债面是 14 条**，其中 4 条是写操作。
+
+- **为什么现在不修**：这 16 条的调用方目前只有 WebUI 服务端（它自己已在 chat-plane 做过用户鉴权，
+  再盖 owner 头下来），改成 owner 收口要逐个确认「WebUI 盖的头是不是够权威」，
+  不是一次机械替换；而且 `handle_provision_profile` / `handle_kanban_dispatch` 这类本来就是
+  **管理面**语义，收口方式应该是「区分管理面密钥和租户面密钥」，不是给每个 handler 补 `_owner_scoped_tenant`。
+- **根治方向**：给 `_authorized` 分层——主密钥只放行显式标注为管理面的路由，
+  其余一律要求可解析到租户（run-scoped token 或服务端签名的 owner 头，而非自报头）；
+  新增 handler 默认落在「要租户」那一侧，fail-closed。类扫脚本应固化成测试，
+  防止 47/23/16 这三个数字无声漂移。
+
+## 2026-08-04 · 生产发布漂移在构造上不可察觉（软链被手工翻过，执行器只比标签名）
+
+> 来源：2026-08-04 安全评审附带发现——生产 webui 软链指着 `6aca93cc`，而当时最新标签 `release-20260804-02`
+> 的 annotation 记的是 `290c1152`。当天 `-03` 标签把它钉回一致了，**但成因没查**。本条是成因。
+
+- **机制（不是操作事故，是设计缺口）**：`deploy/hermes-release.sh:21,73-80` 里，执行器认定的
+  「当前已部署版本」是 `~/.hermes/deployed-release` 里的**一个标签名**，不是 `readlink` 出来的实际软链。
+  最新标签 == 状态文件里的标签 → `log "已是最新"; exit 0`，**全程不看 `~/code/hermes-web-ui` 指向哪**。
+  于是：任何带外的 `ln -sfn` 都不会被发现，而且会一直挂着，直到下一个新标签把两个仓一起翻掉。
+  脚本对标签 annotation 的校验很硬（40 位 hex、缺仓即拒、SHA 必须在仓里），
+  但**从来没有「活的软链 == 当前标签钉的 SHA」这条不变量**。
+- **为什么会有人绕过**（诱因，非借口）：
+  - `ftask ship` 只负责合进 main，**不负责部署**；部署要另外手打一枚 annotated `release-*` 标签。
+  - 打标签**没有任何工具**：全仓 + `LIFEOS/TOOLS/ftask.ts` 里没有一处创建 `release-*`，
+    只有 `hermes-release.sh` 读它。这一步纯靠人记得。
+  - 触发是 `hermes-release.timer` 每天 18:00 一次。急修等窗口 → ssh 上去 build + `ln -sfn` + restart
+    是**更短更确定**的路径，而且成功了没有任何东西会说它不对。
+  - 参见本文件 2026-08-03「release editable-finder 钉死解析路径」——那条也是带外部署留下的坑，
+    同一个诱因的第二次发作。
+- **最小修法**：在 `hermes-release.sh` 早退分支（`$TAG == $CURRENT`）**之前**加漂移探针：
+  读 `$CURRENT` 标签的 annotation → 两个 SHA → 与 `readlink` 出来的 `mt-<sha8>` / `webui-<sha8>` 比对，
+  不等就大声报（日志 + 告警），**但不要自动翻回去**（带外部署可能正是当时唯一止血手段，
+  静默改回等于二次事故）。这条探针在「无新标签」路径上也必须跑——那正是漂移唯一存活的地方。
+- **配套（可选，但成因就在这）**：给打标签这一步一个动词（从 main 的两仓 HEAD 生成 annotation、
+  校验 SHA 确在 main、推受保护标签），并允许手动立刻触发一次执行器，
+  让「正规路径」比 ssh 手翻更省事——否则诱因还在。
