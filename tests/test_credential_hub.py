@@ -691,6 +691,79 @@ def test_gitlab_missing_when_nothing(tmp_path):
     assert row.status == "missing"
 
 
+def _gitlab_personal_home(tmp_path, monkeypatch, *, expires_at):
+    """A shared home whose 'alice' profile has vaulted her own gitlab token."""
+    from hermes_multitenancy.credentials import CredentialStore
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "alice"
+    profile_dir.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        "credentials:\n  - subject_id: kep-prd-skills\n    provider: gitlab\n"
+        "    secret_kind: token\n    vault_profile: __self__\n    profiles: ['*']\n",
+        encoding="utf-8",
+    )
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="alice",
+            subject_id="kep-prd-skills",
+            provider="gitlab",
+            secret_kind="token",
+            payload={"token": "personal-alice"},
+            expires_at=expires_at,
+        )
+    finally:
+        store.close()
+    return profile_dir
+
+
+def test_gitlab_personal_vaulted_token_reads_as_configured_without_any_file(tmp_path, monkeypatch):
+    """The env-only lane must not read as 'missing'.
+
+    A personal token never lands on disk, so a file-only reader would tell the
+    exact users who just configured themselves that they are unconfigured.
+    """
+    from hermes_multitenancy import credential_hub
+
+    future = 4102444800000  # 2100-01-01
+    profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=future)
+    assert not (profile_dir / "workspace" / "credentials" / "gitlab.token").exists()
+
+    row = credential_hub.gitlab_status(profile_dir=profile_dir, installed=False)
+
+    assert row.status == "configured"
+    assert row.expires_at == future
+    assert "本人" in (row.detail or "")
+
+
+def test_gitlab_expired_personal_token_asks_for_a_new_one(tmp_path, monkeypatch):
+    from hermes_multitenancy import credential_hub
+
+    profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=1000)  # long past
+    row = credential_hub.gitlab_status(profile_dir=profile_dir, installed=False)
+
+    assert row.status == "needs_auth"
+    assert "过期" in (row.detail or "")
+
+
+def test_gitlab_shared_token_offers_switching_to_a_personal_one(tmp_path, monkeypatch):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "bob"
+    cred = profile_dir / "workspace" / "credentials"
+    cred.mkdir(parents=True)
+    (cred / "gitlab.token").write_text("global-token", encoding="utf-8")
+
+    row = credential_hub.gitlab_status(profile_dir=profile_dir, installed=False)
+
+    assert row.status == "configured"
+    assert "全局" in (row.detail or "")
+
+
 # -- lark-cli reader (reuses feishu_uat_auth.credential_status) --------------
 
 

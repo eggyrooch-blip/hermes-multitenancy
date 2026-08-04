@@ -169,7 +169,11 @@ BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
         provider="gitlab",
         kind="manual",
         scope="profile",
-        invocation=InvocationSpec(type="token", detail="gitlab.token"),
+        # native_cli, not token: the connector now has a real command channel
+        # (the glab binary in the shared bin dir, driven by GITLAB_TOKEN +
+        # GITLAB_HOST). The credential is still operator-or-employee supplied,
+        # so the auth flow stays manual_token.
+        invocation=InvocationSpec(type="native_cli", detail="glab"),
         auth_flow=AuthFlowSpec(type="manual_token", status_probe="credential_hub.gitlab_status"),
         policy=ConnectorPolicy(
             supported_identities=("user",),

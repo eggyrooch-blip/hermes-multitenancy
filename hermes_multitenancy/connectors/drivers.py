@@ -77,7 +77,13 @@ class ConnectorDriver:
 
 
 class NativeCliConnectorDriver(ConnectorDriver):
-    """lark-cli / feishu UAT. Runtime owned by authsidecar_broker — NO IM proxy here."""
+    """A connector fronted by a real CLI binary in the shared bin dir.
+
+    lark-cli / feishu UAT: runtime owned by authsidecar_broker — NO IM proxy here.
+    gitlab: runtime is the ``glab`` binary, driven purely by the GITLAB_TOKEN /
+    GITLAB_HOST pair injected per profile; there is no interactive auth start,
+    so ``start_auth`` still raises for its manual_token flow.
+    """
 
 
 class SkillScriptConnectorDriver(ConnectorDriver):

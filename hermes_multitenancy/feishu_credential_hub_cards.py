@@ -149,6 +149,111 @@ def build_qr_card(title: str, image_key: str, *, hint_zh: str = "请用对应 Ap
     }
 
 
+#: Feishu form control names — read back off ``action.form_value`` on submit.
+GITLAB_FORM = "gitlab_token_form"
+GITLAB_TOKEN_FIELD = "gitlab_token"
+GITLAB_EXPIRY_FIELD = "gitlab_expiry"
+GITLAB_TIER_FIELD = "gitlab_tier"
+GITLAB_SUBMIT_ACTION = "gitlab_token"
+
+
+def build_gitlab_token_form_card(*, notice: str = "") -> dict[str, Any]:
+    """The employee's own-GitLab-token form.
+
+    A form, not a chat prompt, on purpose: what the user types into a form
+    control is submitted as ``form_value`` and never becomes a chat message, so
+    the token does not end up sitting in the conversation history.
+
+    Follows the same four rules the clarify/fill-form cards were hardened on:
+    ONE form container (Feishu only returns ``form_value`` for controls inside a
+    single form), the submit button MUST carry a ``value`` (a value-less submit
+    is silently dropped with error 200340), the action name is mirrored in both
+    ``value`` and ``behaviors`` so a double-tap collapses to one key, and the
+    card is re-rendered in place so the DM-allowlist message id is preserved.
+    """
+    elements: list[dict[str, Any]] = []
+    if notice:
+        elements.append({
+            "tag": "markdown",
+            "content": notice,
+            "text_size": "notation",
+        })
+    elements.append({
+        "tag": "markdown",
+        "content": (
+            "填你自己的 GitLab token，hermes 之后就用**你本人的权限**操作仓库。\n\n"
+            "在 GitLab 建 token 时：\n"
+            "1. **名字必须填 `hermes`** —— 我们靠这个名字找到它、核对你给的权限\n"
+            "2. **填一个到期日**（GitLab 允许不填，但我们不接受永久有效的）\n"
+            "3. 按你选的档位勾 scope：\n"
+            "   · **只读** —— 看 MR、issue、流水线、拉代码：勾 `read_api` + `read_repository`\n"
+            "   · **可写** —— 上面全部再加改动和推代码：勾 `api` + `write_repository`\n\n"
+            "两档都必须带一个 API scope，只勾 repository 的话 hermes 调不动 GitLab 接口。\n"
+            "过期后会自动停用，需要你回这里换一个新的。\n\n"
+            "**说明**：我们靠 token 的名字去核对权限，这能帮你发现填错档位，"
+            "但**没法严格保证**你粘贴的就是那个 token。请你自己确认交出的权限就是你想给的——"
+            "hermes 会拿着它以你的身份操作仓库。"
+        ),
+        "text_size": "notation",
+    })
+    elements.append({
+        "tag": "form",
+        "name": GITLAB_FORM,
+        "elements": [
+            {
+                "tag": "select_static",
+                "name": GITLAB_TIER_FIELD,
+                "required": True,
+                "label": _plain_i18n("授权档位", "Access tier"),
+                "placeholder": _plain_i18n("选一档", "Pick one"),
+                "options": [
+                    {"text": _plain_i18n("只读（read_api + read_repository）",
+                                         "Read-only"), "value": "read"},
+                    {"text": _plain_i18n("可写（api + write_repository）",
+                                         "Read-write"), "value": "write"},
+                ],
+            },
+            {
+                "tag": "input",
+                "name": GITLAB_TOKEN_FIELD,
+                "required": True,
+                "label": _plain_i18n("GitLab token", "GitLab token"),
+                "placeholder": _plain_i18n("粘贴你的 token", "Paste your token"),
+            },
+            {
+                "tag": "input",
+                "name": GITLAB_EXPIRY_FIELD,
+                "required": True,
+                "label": _plain_i18n("到期日", "Expires on"),
+                "placeholder": _plain_i18n("YYYY-MM-DD", "YYYY-MM-DD"),
+            },
+            {
+                "tag": "button",
+                "name": "gitlab_token_submit",
+                "text": _plain_i18n("提交", "Submit"),
+                "type": "primary",
+                "size": "small",
+                "form_action_type": "submit",
+                "value": {"hermes_action": GITLAB_SUBMIT_ACTION},
+                "behaviors": [
+                    {"type": "callback", "value": {"hermes_action": GITLAB_SUBMIT_ACTION}}
+                ],
+            },
+        ],
+    })
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": False, "update_multi": True, "locales": _LOCALES},
+        "header": {
+            "title": _plain_i18n("GitLab — 使用我自己的权限", "GitLab — use my own access"),
+            "subtitle": {"tag": "plain_text", "content": ""},
+            "template": "orange", "padding": "12px 12px 12px 12px",
+            "icon": {"tag": "standard_icon", "token": "lock-chat_filled"},
+        },
+        "body": {"elements": elements},
+    }
+
+
 def build_url_card(title: str, url: str, *, label_zh: str = "前往认证", label_en: str = "Authorize") -> dict[str, Any]:
     """A card with a 前往认证 URL button (sent after the user clicks 认证)."""
     return {
