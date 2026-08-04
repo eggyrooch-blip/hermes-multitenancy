@@ -210,3 +210,52 @@ dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单�
 - 临时解法(已执行): `uv pip install --no-deps -e ~/code/hermes-multitenancy` + 重启双 gateway。
 - 根治方向: hermes-release.sh 在 flip 后无条件重装 editable 并加「进程实际 import 路径 == 本次 release 目录」探针
   （probe 判据用 `hermes_multitenancy.__file__`，别信 deployed-release 文件）。
+
+## 2026-08-03 · 个人 token 档位闸只能防误操作，不能防故意规避（sunke 显式接受为债）
+
+> 三轮跨模型评审（codex gpt-5.6-sol）round-3 终裁为 **block**，sunke 2026-08-03 显式接受为债后放行。
+> 记在此以免只活在评审回执里。
+
+- **缺陷**：档位校验靠"员工把 token 命名为 `hermes`，我们列出他的 token 找到那一行读 scopes"。
+  这回答的是「**有个**叫 hermes 的 token 权限如何」，不是「**我这个** token 权限如何」。
+  员工可以建一个只读的 `hermes` token，提交时却粘贴另一个带 `api` 的 token：
+  匹配到只读那行 → 档位闸通过 → 而入库的是大权限的那个。
+- **为什么不修**：能回答"我是哪一行"的只有 `GET /personal_access_tokens/self`，
+  **CE 14.10 没有这个端点**。`last_used_at` 官方文档明说 24 小时才更新一次，`created_at` 同样
+  无法把 token **值**绑定到元数据行。这个版本上没有任何 API 能做这个绑定。
+  （前两版方案也都栽在同一处：先是"拒收 api"让 glab 完全不可用，再是"行为探针"——
+  14.10 对所有 GET 同放 `api`/`read_api`，非 GET 端点实测连 `api` 都被拒。）
+- **为什么可以作为债**：绕过**不产生提权**——hermes 拿到的是员工本来就持有的权限，
+  差别只是标签不准，不是越权；且绕过必须**故意**（没人会不小心先建只读 token 再粘贴强 token）。
+  定位因此是**防误操作的提示**，不是安全边界。
+- **已落地的诚实措施**：
+  - vault 行的 scopes 追加 `gitlab:scope-binding-unverified` 标记；
+    **存储的 scope 列表永不可作为审计依据**（本文件下一条就是这个教训的来源）。
+  - 飞书卡片明写"能帮你发现填错档位，但没法严格保证你粘贴的就是那个 token，请自行确认"。
+- **将来根治**：GitLab 升到有 `/personal_access_tokens/self` 的版本（16.x+）后，
+  改为直接问"我是谁"，即可把档位闸变成真边界。
+
+## 2026-08-03 · 全局 GitLab token 实为管理员凭据、明文分发全员（P0，sunke 已知，排期止损）
+
+> 2026-08-03 gitlab-user-token 调研时实测发现。sunke 拍板：先做个人 token 功能，本条另排期止损。
+> **不是本 slug 的交付范围**，记在此以免只活在聊天里。
+
+- **现象**: vault 里 `__shared__ / kep-prd-skills / gitlab` 这条凭据，scope 标签写的是
+  `["gitlab:read"]`，实测权限与标签完全不符。用 prod profile 里的明文 token 打 API：
+  - `GET /api/v4/user` → 200，返回 `is_admin: True`（**GitLab 管理员账号**，非服务账号）
+  - `GET /api/v4/projects` → 200
+  - `GET /api/v4/personal_access_tokens` → 200 ← 该端点需要完整 `api` scope，`read_api` 不够
+- **爆炸半径**: 该 token 以明文落在 **1426 个员工 profile** 的
+  `workspace/credentials/gitlab.token`（共 2041 个 profile），任一员工会话或一次 prompt
+  injection 都能 `cat` 到，拿到的是管理员 API 权限。经它列出的同账号活跃 token 有 12 条、
+  **全部 `expires_at: None`**（jenkins / bjtx-jenkins-01 / murphysec / zion / tianfeng /
+  glib_cli 等），其中 5 条带 `write_repository` —— 即泄漏面还包含整条 CI 凭据链。
+- **未证实的部分（别当护身符）**: 试过 `POST /api/v4/projects` 返回 403，但那次请求参数为空，
+  403 不能证明它不能写。按 `api` scope 定义应为完整读写；**没有在生产上实证写权限，也不该试**。
+- **止损方向**（按优先级）:
+  1. 换成最小权限的**专用服务账号** token（非管理员），scope 只给 `read_repository`；
+     并让 vault 里的 scope 标签与实际一致（现在是假的，不能作为审计依据）。
+  2. 收回明文分发：改为只注 `GITLAB_TOKEN` env、不写 profile 文件，并清理既有 1426 份文件。
+     （注：本 slug 已让**新增的个人 token** 走"只注 env 不落文件"，但不动存量文件。）
+  3. 给该 admin 账号下 12 条永不过期 token 定期轮换/设过期——需先确认各自归属与用途，
+     不能直接 revoke（会打断 Jenkins / murphysec 等 CI）。

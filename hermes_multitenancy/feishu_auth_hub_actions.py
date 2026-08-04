@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import threading
 from collections import OrderedDict
@@ -110,7 +111,10 @@ def _patch_card_action(FeishuAdapter: Any) -> None:
             action_value = _read_value(action, "value") or {}
             if not isinstance(action_value, dict):
                 action_value = {}
-            if action_value.get("hermes_action") != "cred_auth":
+            hermes_action = action_value.get("hermes_action")
+            if hermes_action == "gitlab_token":
+                return _handle_gitlab_token_submit(self, event, action)
+            if hermes_action != "cred_auth":
                 return original(self, data)
             return _handle_cred_auth_action(self, event, action_value)
         except Exception:
@@ -173,6 +177,16 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     # event — nothing sensitive ever rides in the button payload.
     ctx: dict[str, Any] = {}
 
+    # gitlab has no interactive auth flow to mint — the employee supplies the
+    # token themselves, so this row opens a form instead. Rendered in place so
+    # the DM-allowlist message id (checked again on submit) is preserved.
+    from . import credential_hub as _ch
+
+    if cred == _ch.GITLAB:
+        from .feishu_credential_hub_cards import build_gitlab_token_form_card
+
+        return _updated_card_response(build_gitlab_token_form_card())
+
     # Mint ONLY this credential's entry (blocking network — Feishu shows the
     # button's native loading spinner meanwhile).
     auth_urls, qr_image_keys, pending_note, flows = _mint_one_cred(
@@ -205,6 +219,81 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
             logger.debug("[multitenancy] cred_auth poll schedule failed", exc_info=True)
 
     return _updated_card_response(card)
+
+
+def _gitlab_form_value(action: Any) -> tuple[str, str, str]:
+    """Pull (token, expiry, tier) out of the submitted form. Untrusted input."""
+    from .feishu_credential_hub_cards import (
+        GITLAB_EXPIRY_FIELD,
+        GITLAB_TIER_FIELD,
+        GITLAB_TOKEN_FIELD,
+    )
+
+    raw = _read_value(action, "form_value")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    if not isinstance(raw, dict):
+        return "", "", ""
+    return (
+        str(raw.get(GITLAB_TOKEN_FIELD) or "").strip(),
+        str(raw.get(GITLAB_EXPIRY_FIELD) or "").strip(),
+        str(raw.get(GITLAB_TIER_FIELD) or "").strip(),
+    )
+
+
+def _handle_gitlab_token_submit(adapter: Any, event: Any, action: Any) -> Any:
+    """Vault an employee's own GitLab token, submitted from the hub form card.
+
+    This is a credential WRITE path, so it repeats the cred_auth guards verbatim
+    rather than trusting that the user reached the form legitimately:
+    group chats are refused, the click must land on a hub card WE sent into a
+    DM (message-id allowlist, which survives because the form is rendered in
+    place), and the target profile is derived from the Feishu-SIGNED operator —
+    never from the callback payload or the form body, either of which an
+    attacker controls.
+
+    The token value itself is never logged and never echoed back into the card.
+    """
+    from . import feishu_uat_auth
+    from .feishu_credential_hub_cards import build_gitlab_token_form_card, build_hub_card
+    from .gitlab_token_intake import TokenRejected, submit_personal_token
+
+    chat_id = _signed_chat_id(event)
+    message_id = _ctx_message_id(event)
+    if _chat_is_group(event, chat_id):
+        return _toast_response("认证只能在私聊里进行，请私聊我发送 /auth")
+    if not _is_known_dm_auth_card(message_id):
+        return _toast_response("认证卡片已过期或不在私聊里，请重新私聊我发送 /auth")
+
+    shared = feishu_uat_auth.resolve_shared_home()
+    profile_name, open_id, pdir = _resolve_operator_profile(event, shared)
+    if not profile_name or not open_id or pdir is None:
+        return _toast_response("无法确认你的 Hermes profile，请先私聊我发送 /auth")
+
+    token, expiry, tier = _gitlab_form_value(action)
+    try:
+        submit_personal_token(
+            profile_name=profile_name,
+            token=token,
+            expires_on=expiry,
+            tier=tier,
+            shared_home=shared,
+        )
+    except TokenRejected as exc:
+        # Re-render the form with the reason so the user can correct it without
+        # starting over. Never include the submitted token in the notice.
+        return _updated_card_response(
+            build_gitlab_token_form_card(notice=f"**没有保存：**{exc.reason}")
+        )
+    except Exception:
+        logger.debug("[multitenancy] gitlab token submit failed", exc_info=True)
+        return _toast_response("保存失败，请稍后重试", level="error")
+
+    rows = _collect_rows(profile_name=profile_name, open_id=open_id, pdir=pdir)
+    return _updated_card_response(build_hub_card(rows=rows, ctx={}))
 
 
 def _mint_one_cred(

@@ -25,6 +25,11 @@ DEFAULT_CONFIG_NAMES = (
     "credential-materialization.yml",
 )
 DEFAULT_SHARED_PROFILE = "__shared__"
+#: ``vault_profile: __self__`` opts an entry into the personal-token lane: each
+#: profile reads its OWN vault record and falls back to the shared one when the
+#: user has not supplied a token. One config entry therefore expresses both
+#: "personal token wins" and "everyone else keeps the shared credential".
+SELF_PROFILE_MARKER = "__self__"
 _DEFAULT_PAYLOAD_KEYS = ("token", "content", "value")
 _FORBIDDEN_TARGET_NAMES = {".env", "auth.json", "feishu_uat.json"}
 _ALL_ACTIVE_PROFILE_MARKERS = {"*", "all", "all_active", "__all_active__"}
@@ -55,6 +60,9 @@ def materialize_credentials(
         "would_write": 0,
         "missing_credentials": 0,
         "skipped_profiles": 0,
+        "personal_env_only": 0,
+        "stale_files_removed": 0,
+        "stale_files_unremovable": 0,
     }
     if config is None:
         return stats
@@ -77,7 +85,8 @@ def materialize_credentials(
                 profiles_root=profiles,
                 dry_run=dry_run,
             )
-            for key in ("profiles_targeted", "written", "would_write", "missing_credentials", "skipped_profiles"):
+            for key in ("profiles_targeted", "written", "would_write", "missing_credentials", "skipped_profiles", "personal_env_only",
+                        "stale_files_removed", "stale_files_unremovable"):
                 stats[key] += entry_stats[key]
     finally:
         store.close()
@@ -98,26 +107,44 @@ def _materialize_entry(
         "would_write": 0,
         "missing_credentials": 0,
         "skipped_profiles": 0,
+        "personal_env_only": 0,
+        "stale_files_removed": 0,
+        "stale_files_unremovable": 0,
     }
     target_rel = _safe_target(entry.get("target") or "workspace/credentials/token")
     target_profiles = _target_profiles(entry, shared_home=shared_home)
     if not target_profiles:
         return stats
 
-    try:
-        payload = store.get_secret_for_runtime(
-            profile_name=str(entry.get("vault_profile") or DEFAULT_SHARED_PROFILE),
-            subject_id=str(entry["subject_id"]),
-            provider=str(entry["provider"]),
-            secret_kind=str(entry.get("secret_kind") or "token"),
-        )
-    except PermissionError:
-        stats["missing_credentials"] += len(target_profiles)
-        return stats
-
-    content = _payload_content(payload, entry.get("payload_key"))
+    # ponytail: one indexed SQLite lookup per profile instead of one per entry.
+    # Required for __self__ (each profile resolves a different record) and cheap
+    # next to the file write it guards.
     for profile_name in target_profiles:
         stats["profiles_targeted"] += 1
+        payload, vault_profile = resolve_runtime_secret(store, entry, profile_name=profile_name)
+        if payload is None:
+            stats["missing_credentials"] += 1
+            continue
+        if vault_profile == profile_name:
+            # Personal token: env-only by construction. Materializing it would
+            # widen the plaintext-on-disk surface the shared credential already
+            # has (DEBT.md 2026-08-03) by one file per user.
+            stats["personal_env_only"] += 1
+            # Retire THIS user's stale shared-credential file. Skipping the
+            # write is not enough: an existing gitlab.token left behind means
+            # their disk holds the global token while their env holds their own
+            # — precisely the split this design exists to prevent — and it keeps
+            # a broad credential readable in a profile that no longer needs it.
+            # Scope note: this removes one file for one user at the moment they
+            # switch. Bulk-cleaning the other profiles stays out of scope.
+            stale = profiles_root / profile_name / target_rel
+            if not dry_run and stale.is_file():
+                try:
+                    stale.unlink()
+                    stats["stale_files_removed"] += 1
+                except OSError:
+                    stats["stale_files_unremovable"] += 1
+            continue
         profile_home = profiles_root / profile_name
         if not profile_home.is_dir():
             stats["skipped_profiles"] += 1
@@ -126,9 +153,60 @@ def _materialize_entry(
         if dry_run:
             stats["would_write"] += 1
             continue
-        _atomic_write_secret(target, content)
+        _atomic_write_secret(target, _payload_content(payload, entry.get("payload_key")))
         stats["written"] += 1
     return stats
+
+
+def resolve_runtime_secret(
+    store: CredentialStore,
+    entry: dict[str, Any],
+    *,
+    profile_name: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve one config entry's secret for ``profile_name``.
+
+    Returns ``(payload, vault_profile)`` — ``vault_profile`` is the record the
+    payload actually came from, so callers can tell a personal token from the
+    shared fallback. ``(None, None)`` when nothing is stored.
+
+    This is the ONLY place the vault-profile precedence is expressed. Both write
+    sites (file materialization here, env injection in ``agent_real._core``) go
+    through it: resolving in two places is how the file and the env silently
+    disagree about which token a profile is using.
+    """
+    raw = str(entry.get("vault_profile") or DEFAULT_SHARED_PROFILE).strip()
+    candidates = (
+        [profile_name, DEFAULT_SHARED_PROFILE] if raw == SELF_PROFILE_MARKER else [raw]
+    )
+    subject_id = str(entry["subject_id"])
+    provider = str(entry["provider"])
+    secret_kind = str(entry.get("secret_kind") or "token")
+    for vault_profile in candidates:
+        # An expired personal token must not be injected: it can only produce
+        # confusing auth failures, and silently falling back to the shared
+        # credential would quietly re-escalate the user to the broad token they
+        # opted out of. Expired => this candidate is unusable, full stop.
+        if vault_profile != DEFAULT_SHARED_PROFILE:
+            status = store.get_status(
+                profile_name=vault_profile,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+            )
+            if status.get("status") == "expired":
+                return None, None
+        try:
+            payload = store.get_secret_for_runtime(
+                profile_name=vault_profile,
+                subject_id=subject_id,
+                provider=provider,
+                secret_kind=secret_kind,
+            )
+        except PermissionError:
+            continue
+        return payload, vault_profile
+    return None, None
 
 
 def _resolve_config_path(shared_home: Path, config_path: Path | None) -> Path | None:

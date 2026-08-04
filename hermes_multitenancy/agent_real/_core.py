@@ -2663,10 +2663,10 @@ def _credential_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     loaded: dict[str, str] = {}
     try:
         from ..credential_materializer import (
-            DEFAULT_SHARED_PROFILE,
             _payload_content,
             _resolve_config_path,
             _target_profiles,
+            resolve_runtime_secret,
         )
         from ..credentials import CredentialStore
 
@@ -2696,16 +2696,25 @@ def _credential_env_for_aiagent(profile_home: Path) -> dict[str, str]:
                     continue
                 if profile_home.name not in _target_profiles(entry, shared_home=shared_home):
                     continue
-                try:
-                    payload = store.get_secret_for_runtime(
-                        profile_name=str(entry.get("vault_profile") or DEFAULT_SHARED_PROFILE),
-                        subject_id=str(entry["subject_id"]),
-                        provider=str(entry["provider"]),
-                        secret_kind=str(entry.get("secret_kind") or "token"),
-                    )
-                except PermissionError:
+                payload, _vault_profile = resolve_runtime_secret(
+                    store, entry, profile_name=profile_home.name
+                )
+                if payload is None:
                     continue
                 loaded[env_name] = _payload_content(payload, entry.get("payload_key")).rstrip("\n")
+                # Non-secret companion vars (e.g. GITLAB_HOST) that a CLI needs
+                # alongside the token. Injected only once the credential itself
+                # resolved, so a profile never carries half a connector's env.
+                extra = entry.get("env_extra")
+                if isinstance(extra, dict):
+                    for extra_name, extra_value in extra.items():
+                        extra_name = str(extra_name).strip()
+                        if _CREDENTIAL_ENV_NAME_RE.match(extra_name):
+                            loaded[extra_name] = str(extra_value)
+                        else:
+                            logger.warning(
+                                "[multitenancy] skipped invalid env_extra name %r", extra_name
+                            )
         finally:
             store.close()
     except Exception:
