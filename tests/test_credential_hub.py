@@ -673,22 +673,38 @@ def test_which_meegle_resolves_npx_via_extra_path(monkeypatch, tmp_path):
 # -- gitlab reader -----------------------------------------------------------
 
 
-def test_gitlab_configured_when_token_readable(tmp_path):
+def _gitlab_rows(profile_dir, *, installed=False):
+    """gitlab_status now emits TWO rows — (global, personal). Split them by id so a
+    reordering of the list can never silently swap what a test is asserting on."""
     from hermes_multitenancy import credential_hub
 
+    rows = credential_hub.gitlab_status(profile_dir=profile_dir, installed=installed)
+    assert isinstance(rows, list) and len(rows) == 2, f"expected 2 gitlab rows, got {rows!r}"
+    by_id = {r.id: r for r in rows}
+    assert set(by_id) == {"gitlab", "gitlab-personal"}
+    return by_id["gitlab"], by_id["gitlab-personal"]
+
+
+def test_gitlab_configured_when_token_readable(tmp_path):
     cred = tmp_path / "workspace" / "credentials"
     cred.mkdir(parents=True)
     (cred / "gitlab.token").write_text("glpat-xxx", encoding="utf-8")
-    row = credential_hub.gitlab_status(profile_dir=tmp_path, installed=False)
-    assert row.id == "gitlab"
-    assert row.status == "configured"
+
+    global_row, personal_row = _gitlab_rows(tmp_path)
+
+    assert global_row.status == "configured"
+    # 全局卡是纯陈述：管理员运维，员工点不了 —— 客户端据 action 为空不渲染按钮
+    assert global_row.action == {}
+    # 有全局 token 不代表他绑了自己的；两张卡的状态互相独立
+    assert personal_row.status == "needs_auth"
+    assert personal_row.action.get("label") == "绑定我的 GitLab"
 
 
 def test_gitlab_missing_when_nothing(tmp_path):
-    from hermes_multitenancy import credential_hub
+    global_row, personal_row = _gitlab_rows(tmp_path)
 
-    row = credential_hub.gitlab_status(profile_dir=tmp_path, installed=False)
-    assert row.status == "missing"
+    assert global_row.status == "missing"
+    assert personal_row.status == "needs_auth"
 
 
 def _gitlab_personal_home(tmp_path, monkeypatch, *, expires_at):
@@ -725,32 +741,35 @@ def test_gitlab_personal_vaulted_token_reads_as_configured_without_any_file(tmp_
     A personal token never lands on disk, so a file-only reader would tell the
     exact users who just configured themselves that they are unconfigured.
     """
-    from hermes_multitenancy import credential_hub
-
     future = 4102444800000  # 2100-01-01
     profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=future)
     assert not (profile_dir / "workspace" / "credentials" / "gitlab.token").exists()
 
-    row = credential_hub.gitlab_status(profile_dir=profile_dir, installed=False)
+    global_row, personal_row = _gitlab_rows(profile_dir)
 
-    assert row.status == "configured"
-    assert row.expires_at == future
-    assert "本人" in (row.detail or "")
+    assert personal_row.status == "configured"
+    assert personal_row.expires_at == future
+    assert "本人" in (personal_row.detail or "")
+    assert personal_row.action.get("label") == "更换"
+    # 他绑了自己的，不代表公司那个全局 token 也在 —— 这里确实没有文件
+    assert global_row.status == "needs_auth"
 
 
 def test_gitlab_expired_personal_token_asks_for_a_new_one(tmp_path, monkeypatch):
-    from hermes_multitenancy import credential_hub
-
     profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=1000)  # long past
-    row = credential_hub.gitlab_status(profile_dir=profile_dir, installed=False)
+    _global_row, personal_row = _gitlab_rows(profile_dir)
 
-    assert row.status == "needs_auth"
-    assert "过期" in (row.detail or "")
+    assert personal_row.status == "needs_auth"
+    assert "过期" in (personal_row.detail or "")
+    assert personal_row.action.get("label") == "更换"
 
 
 def test_gitlab_shared_token_offers_switching_to_a_personal_one(tmp_path, monkeypatch):
-    from hermes_multitenancy import credential_hub
+    """有全局 token、没绑个人 token —— 这是绝大多数员工的状态。
 
+    绑定入口必须在这个状态下就可见：以前它是同一张卡上一颗叫「改用我自己的」的按钮，
+    挤在全局 token 的文案旁边，没人认得出那是绑定入口（sunke 2026-08-04 实机反馈）。
+    """
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = tmp_path / ".hermes"
     profile_dir = shared / "profiles" / "bob"
@@ -758,10 +777,13 @@ def test_gitlab_shared_token_offers_switching_to_a_personal_one(tmp_path, monkey
     cred.mkdir(parents=True)
     (cred / "gitlab.token").write_text("global-token", encoding="utf-8")
 
-    row = credential_hub.gitlab_status(profile_dir=profile_dir, installed=False)
+    global_row, personal_row = _gitlab_rows(profile_dir)
 
-    assert row.status == "configured"
-    assert "全局" in (row.detail or "")
+    assert global_row.status == "configured"
+    assert "管理员" in (global_row.detail or "")
+    assert global_row.action == {}
+    assert personal_row.status == "needs_auth"
+    assert personal_row.action.get("label") == "绑定我的 GitLab"
 
 
 # -- lark-cli reader (reuses feishu_uat_auth.credential_status) --------------
@@ -1002,6 +1024,7 @@ def test_collect_returns_all_credentials_in_order(monkeypatch, tmp_path):
         "kep-cli-online",
         "kep-cli-pre",
         "gitlab",
+        "gitlab-personal",
     ]
     assert rows[0].status == "authenticated"
     # to_dict shape is SkillCredentialEntry-compatible
@@ -1207,7 +1230,7 @@ def test_collect_credential_rows_preserves_order_under_parallelism(monkeypatch, 
     monkeypatch.setattr(ch, "feishu_project_status", lambda **k: _row(ch.FEISHU_PROJECT))
     monkeypatch.setattr(ch, "keep_record_status", lambda **k: _row(ch.KEEP_RECORD))
     monkeypatch.setattr(ch, "kep_cli_statuses", lambda **k: [_row(ch.KEP_CLI_ONLINE), _row(ch.KEP_CLI_PRE)])
-    monkeypatch.setattr(ch, "gitlab_status", lambda **k: _row(ch.GITLAB))
+    monkeypatch.setattr(ch, "gitlab_status", lambda **k: [_row(ch.GITLAB), _row(ch.GITLAB_PERSONAL)])
 
     rows = ch._collect_credential_rows(profile_name="owner", open_id="o", shared_home=tmp_path)
     assert [r.id for r in rows] == list(ch.CREDENTIAL_ORDER)

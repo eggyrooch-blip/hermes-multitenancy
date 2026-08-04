@@ -71,6 +71,7 @@ from .model import (
     CREDENTIAL_ORDER,
     FEISHU_PROJECT,
     GITLAB,
+    GITLAB_PERSONAL,
     KEEP_RECORD,
     KEP_CLI,
     KEP_CLI_ENV_IDS,

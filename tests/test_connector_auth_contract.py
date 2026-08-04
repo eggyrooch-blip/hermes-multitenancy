@@ -174,10 +174,37 @@ def test_action_dict_round_trip_is_lossless_per_kind(monkeypatch, tmp_path):
     assert public["kep-cli-pre"]["action"]["kind"] == "oauth_url"
     assert public["kep-cli-pre"]["action"]["env"] == "pre"
     assert public["feishu-project"]["action"]["kind"] == "oauth_url"
-    assert public["gitlab"]["action"]["kind"] == "manual"
+    # gitlab 拆成两行后，全局那行是管理员运维的纯陈述 —— 它 *没有* 员工可执行的操作，
+    # 所以 action 必须是 None 而不是伪造一个 manual。空 action 被伪造成
+    # {"kind":"manual","label":""} 正是下游被迫拿空 label 当哨兵的根源。
+    assert public["gitlab"]["action"] is None
+    assert public["gitlab-personal"]["action"]["kind"] == "manual"
+    assert public["gitlab-personal"]["action"]["label"]  # 个人行必须带可点的标签
 
-    for cid in ("lark-cli", "feishu-project", "keep-record", "kep-cli-online", "kep-cli-pre", "gitlab"):
+    for cid in ("lark-cli", "feishu-project", "keep-record", "kep-cli-online", "kep-cli-pre",
+                "gitlab", "gitlab-personal"):
         assert public[cid]["action"] == low[cid]["action"], cid
+
+
+def test_connector_status_serializer_does_not_fabricate_an_action():
+    """`/connectors` must报出「没有操作」，而不是伪造一个空 manual。
+
+    这一层是 WebUI 真正读的产物。伪造成 {"kind":"manual","label":""} 会把「这张卡
+    由管理员运维、员工无可执行操作」的语义抹掉，逼客户端拿空 label 当哨兵 —— 该脆性
+    已实际咬过一次（webui 降级态全员空 label，去掉客户端兜底后一颗按钮都不剩）。
+    """
+    from hermes_multitenancy.connectors.models import AuthAction, ConnectorStatus
+
+    def _status(action):
+        return ConnectorStatus(
+            id="x", title="X", provider="p", installed=True, status="configured",
+            action=action,
+        ).to_dict()
+
+    assert _status(None)["action"] is None
+    assert _status(AuthAction(kind="manual", label="绑定"))["action"] == {
+        "kind": "manual", "label": "绑定",
+    }
 
 
 def test_kep_cli_expired_jwt_collapses_to_needs_auth_through_registry(monkeypatch, tmp_path):

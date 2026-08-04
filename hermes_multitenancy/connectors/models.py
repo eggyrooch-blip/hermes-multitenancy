@@ -173,7 +173,10 @@ class ConnectorStatus:
             "runtime_policy_owner": self.runtime_policy_owner,
             "kind": self.kind,
             "stale": self.stale,
-            "action": self.action.to_dict() if self.action else {"kind": "manual", "label": ""},
+            # None，不是伪造 {"kind":"manual","label":""}。这一层才是 WebUI 真正读的
+            # /connectors 产物；伪造在这里等于把「这张卡没有员工可执行的操作」的语义
+            # 抹掉，逼客户端拿空 label 当哨兵（codex 评审 2026-08-04）。
+            "action": self.action.to_dict() if self.action else None,
         }
         if self.account_hint:
             out["account_hint"] = self.account_hint

@@ -69,7 +69,9 @@ def test_collect_returns_statuses_with_scope_fields(monkeypatch, tmp_path):
     statuses = registry.collect_connector_statuses(
         profile_name="owner", open_id="ou_owner", shared_home=shared
     )
-    assert len(statuses) == 6
+    # lark-cli / feishu-project / keep-record / kep-cli-online / kep-cli-pre /
+    # gitlab（全局）/ gitlab-personal（员工自己绑的）
+    assert len(statuses) == 7
     for status in statuses:
         assert status.profile == "owner"
         assert status.scope  # non-empty
