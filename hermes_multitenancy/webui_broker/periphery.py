@@ -82,6 +82,19 @@ _credential_broker_tokens: dict[str, dict[str, str]] = {}
 _credential_broker_tokens_lock = threading.Lock()
 
 
+# Run-scoped RunBroker bearer tokens. A sandboxed AIAgent child must never hold
+# the SHARED master broker key: owner identity on this seam is caller-asserted
+# (see `_owner_scoped_tenant`), so master-key + a colleague's open_id used to be
+# enough to read/mutate that colleague's tenant state from any agent shell
+# (2026-08-04 security review). Each spawn now gets its own token whose
+# (profile, open_id) binding lives HERE, server-side — a leaked token can only
+# ever act as the run it was minted for.
+_run_broker_scoped_tokens: dict[str, dict[str, str]] = {}
+
+
+_run_broker_scoped_tokens_lock = threading.Lock()
+
+
 _session_search_broker_tokens: dict[str, dict[str, str]] = {}
 
 
@@ -327,6 +340,147 @@ def _lookup_credential_broker_token(token: str) -> dict[str, str] | None:
         return dict(record)
 
 
+def register_run_broker_scoped_token(
+    *,
+    token: str,
+    profile_name: str,
+    open_id: str,
+    run_id: str,
+    agent_id: str = "",
+    share_role: str = "",
+) -> None:
+    """Bind a per-run RunBroker bearer to the tenant it may act as."""
+    key = str(token or "").strip()
+    if not key:
+        return
+    with _run_broker_scoped_tokens_lock:
+        _run_broker_scoped_tokens[key] = {
+            "profile_name": str(profile_name or "").strip(),
+            "open_id": str(open_id or "").strip(),
+            "run_id": str(run_id or "").strip(),
+            "agent_id": str(agent_id or "").strip(),
+            "share_role": str(share_role or "").strip(),
+        }
+
+
+def unregister_run_broker_scoped_token(token: str) -> None:
+    key = str(token or "").strip()
+    if not key:
+        return
+    with _run_broker_scoped_tokens_lock:
+        _run_broker_scoped_tokens.pop(key, None)
+
+
+def _lookup_run_broker_scoped_token(token: str) -> dict[str, str] | None:
+    key = str(token or "").strip()
+    if not key:
+        return None
+    with _run_broker_scoped_tokens_lock:
+        record = _run_broker_scoped_tokens.get(key)
+        if record is None or not hmac.compare_digest(key, token):
+            return None
+        return dict(record)
+
+
+# Routes a sandboxed agent's run-scoped token may reach. The ONLY in-sandbox
+# consumer is `cron/run_broker_bridge.trigger_profile_cron_job_via_run_broker`
+# (native `cronjob(action=run)` → POST /api/run-broker/jobs/<id>/run), and every
+# route under this prefix resolves its tenant through `_owner_scoped_tenant`.
+# Deny-by-default matters: 16 of the 47 broker handlers authenticate via
+# `_authorized` without owner scoping (agent-share grants, kanban dispatch,
+# profile provisioning …). They were reachable while the child held the master
+# key; pinning the run-scoped token to this prefix closes that whole class for
+# this credential instead of leaving 15 siblings open.
+_RUN_SCOPED_TOKEN_PATH_PREFIXES: tuple[str, ...] = ("/api/run-broker/jobs",)
+
+# A shared-agent run carries the sharer's role. `viewer` means read-only, so its
+# token must not mutate the OWNER's cron store — the jobs prefix includes
+# POST/PATCH/DELETE and previously ignored the role entirely (codex review
+# RBOS-SHARED-VIEWER-JOBS-WRITE, probed live: a viewer token got 200 on
+# `DELETE /api/run-broker/jobs/job-owner` and really called delete_job on the
+# owner's profile).
+_RUN_SCOPED_READONLY_SHARE_ROLES: frozenset[str] = frozenset({"viewer"})
+_SAFE_HTTP_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _run_scoped_token_may_reach(request: Any, scope: dict[str, str]) -> bool:
+    path = str(getattr(request, "path", "") or "")
+    if not path:
+        # Unknown route → fail closed. This credential is deliberately narrow;
+        # nothing legitimate calls it without a real request path.
+        return False
+    if not any(path.startswith(prefix) for prefix in _RUN_SCOPED_TOKEN_PATH_PREFIXES):
+        return False
+    if str(scope.get("share_role") or "").strip().lower() in _RUN_SCOPED_READONLY_SHARE_ROLES:
+        # Unknown/absent method also fails closed: "" is not a safe method.
+        return str(getattr(request, "method", "") or "").upper() in _SAFE_HTTP_METHODS
+    return True
+
+
+def _bearer_token(request: Any) -> str:
+    try:
+        header = str(request.headers.get("Authorization", "") or "")
+    except Exception:
+        return ""
+    prefix = "Bearer "
+    return header[len(prefix):].strip() if header.startswith(prefix) else ""
+
+
+class RunScopeRevoked(Exception):
+    """A non-master bearer no longer resolves to a live run binding."""
+
+
+def _presented_master_key(request: Any) -> bool:
+    master = _m._run_broker_key()
+    token = _bearer_token(request)
+    return bool(master) and bool(token) and hmac.compare_digest(token, master)
+
+
+def _run_broker_scope_for_request(request: Any) -> Optional[dict[str, str]]:
+    """Return the run binding for a run-scoped caller, or None for the master key.
+
+    Stateless by design (re-reads the bearer rather than stashing state on the
+    request, which keeps plain-object fake requests and in-process callers
+    working), and therefore explicitly guarded against the revoke window:
+    ``_authorized`` runs BEFORE handlers ``await request.json()``, so a run that
+    finishes in between would make a second lookup miss. Returning None there
+    would silently demote the caller to the header-trusting master path and let a
+    forged owner through (codex review RBOS-SCOPE-REVOCATION-TOCTOU). Anything
+    that is not the master key must therefore fail closed, never fall back.
+    """
+    if _presented_master_key(request):
+        return None
+    token = _bearer_token(request)
+    if not token:
+        return None
+    scope = _lookup_run_broker_scoped_token(token)
+    if scope is None:
+        raise RunScopeRevoked("run-scoped token is no longer valid")
+    return scope
+
+
+def _run_scoped_assertion_conflict(
+    scope: dict[str, str],
+    asserted_owner: str,
+    asserted_profile: str,
+) -> str:
+    """Refuse a run-scoped caller that asserts an identity other than its own.
+
+    The assertion is never *needed* (the binding is authoritative), so a
+    mismatching one is either a bug or an attempt to act as somebody else —
+    both must fail closed rather than be silently rewritten.
+    """
+    bound_open_id = str(scope.get("open_id") or "").strip()
+    bound_profile = str(scope.get("profile_name") or "").strip()
+    if asserted_owner and bound_open_id and asserted_owner != bound_open_id:
+        return "run-scoped token cannot act as another owner"
+    if asserted_profile and bound_profile and asserted_profile != bound_profile:
+        return "run-scoped token cannot act on another profile"
+    if not bound_profile:
+        return "run-scoped token has no bound profile"
+    return ""
+
+
 def register_session_search_broker_token(
     *,
     token: str,
@@ -499,7 +653,16 @@ def _authorized(request: Any) -> bool:
     prefix = "Bearer "
     if not header.startswith(prefix):
         return False
-    return hmac.compare_digest(header[len(prefix):].strip(), expected)
+    token = header[len(prefix):].strip()
+    if hmac.compare_digest(token, expected):
+        return True
+    # Per-run tokens minted for sandboxed AIAgent children: narrow by route AND
+    # by tenant. Tenant-scoped handlers under the allowed prefix resolve
+    # owner/profile from the server-side binding, never from caller assertions.
+    scope = _lookup_run_broker_scoped_token(token)
+    if scope is None:
+        return False
+    return _run_scoped_token_may_reach(request, scope)
 
 
 _auth_signal_store: dict[str, dict[str, Any]] = {}
@@ -1788,6 +1951,21 @@ def _resolve_owner_scoped_profile(
     the trusted owner header is present.
     """
     trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+
+    try:
+        run_scope = _run_broker_scope_for_request(request)
+    except RunScopeRevoked as exc:
+        return None, str(exc)
+    if run_scope is not None:
+        conflict = _run_scoped_assertion_conflict(
+            run_scope,
+            trusted_owner,
+            str(payload.get("profile_name") or payload.get("profile") or "").strip(),
+        )
+        if conflict:
+            return None, conflict
+        return str(run_scope.get("profile_name") or "").strip(), None
+
     if not trusted_owner:
         if _owner_enforcement_enabled():
             return None, "owner identity required (X-Hermes-Owner-Open-Id)"
@@ -1858,6 +2036,34 @@ def _owner_scoped_tenant(request: Any, payload: Optional[dict[str, Any]] = None)
         trusted_owner = str(value or "").strip()
         if trusted_owner:
             break
+
+    # A run-scoped bearer carries its own (profile, open_id) binding, so nothing
+    # the caller asserts is consulted. Every field above is attacker-controlled
+    # from inside a sandboxed agent; the binding is not.
+    try:
+        run_scope = _run_broker_scope_for_request(request)
+    except RunScopeRevoked as exc:
+        raise PermissionError(str(exc)) from exc
+    if run_scope is not None:
+        asserted_profile = ""
+        for value in (
+            request.headers.get("X-Hermes-Profile"),
+            payload.get("profile_name"),
+            payload.get("profile"),
+            request.query.get("profile_name"),
+            request.query.get("profile"),
+        ):
+            asserted_profile = str(value or "").strip()
+            if asserted_profile:
+                break
+        conflict = _run_scoped_assertion_conflict(run_scope, trusted_owner, asserted_profile)
+        if conflict:
+            raise PermissionError(conflict)
+        return (
+            cron_api.validate_profile_name(str(run_scope.get("profile_name") or "").strip()),
+            str(run_scope.get("open_id") or "").strip(),
+        )
+
     if not trusted_owner:
         raise PermissionError("owner identity required (X-Hermes-Owner-Open-Id)")
 

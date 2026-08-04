@@ -68,6 +68,7 @@ def _build_subprocess_env(
         env.pop("HERMES_MULTITENANCY_CREDENTIAL_KEY", None)
         env.pop("HERMES_CREDENTIAL_KEY", None)
 
+
     profile_home = profile_home.expanduser()
     share_role = str((extra or {}).get("HERMES_AGENT_SHARE_ROLE") or "").strip()
     shared_agent_run = share_role in _AGENT_SHARED_ROLES
@@ -180,6 +181,28 @@ def _build_subprocess_env(
                 env["HERMES_FEISHU_USER_OPEN_ID"] = str(_sender)
         except Exception:
             pass
+
+    # LAST WORD on the RunBroker bearer — must stay at the very end.
+    #
+    # The SHARED master key must never reach a tenant child: owner identity on
+    # that seam was caller-asserted, so holding it was enough to act as any
+    # colleague (2026-08-04 security review). Only the run-scoped token that
+    # `_aiagent_subprocess_env_scope` minted for THIS spawn (handed in via
+    # `extra`) may survive; anything else is dropped, and with no minted token
+    # the child correctly gets no broker bearer at all.
+    #
+    # Deliberately positioned after every env source rather than up top: an
+    # earlier pop was silently undone by `_profile_env_for_aiagent`, which loads
+    # the profile `.env` and re-injected both master names verbatim (codex review
+    # RBOS-MASTER-REINTRODUCTION, probed: the final child env came back with
+    # {'HERMES_RUN_BROKER_KEY': 'master-from-profile', ...}). Filtering by value
+    # here closes the whole class — parent env, profile dotenv, or any future
+    # source — instead of chasing each one.
+    _minted = str((extra or {}).get("HERMES_RUN_BROKER_KEY") or "").strip()
+    for _broker_key_name in ("HERMES_RUN_BROKER_KEY", "HERMES_MULTITENANCY_RUN_BROKER_KEY"):
+        if not _minted or str(env.get(_broker_key_name) or "").strip() != _minted:
+            env.pop(_broker_key_name, None)
+
     return env
 
 
