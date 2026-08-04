@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -168,13 +169,215 @@ def test_no_tag_is_a_noop(env):
 
 
 def test_already_deployed_tag_is_a_noop(env):
-    _tag(env, "release-x", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
-    Path(env["STATE_FILE"]).write_text("release-x\n")
+    # 先走一次**真实发布**，让软链是发布器自己生成的那对，再验「已是最新」noop。
+    # 原来这条直接手写 STATE_FILE、软链还停在 mt-current，等于在一个探针眼里
+    # 「无法证明一致」的状态上断言 noop —— 探针上线后这个前提不再成立。
+    _deploy_once(env, "release-x")
     before = _links(env)
     r = _run(env)
     assert r.returncode == 0
     assert "已是最新" in r.stdout
     assert _links(env) == before
+
+
+# ── 1b. 漂移探针：软链被带外改过，必须有人知道 ────────────────────────
+#
+# 执行器认「状态文件里的标签名」，不认活的软链，所以带外部署（ssh 上去
+# build + ln -sfn + restart）在构造上不可察觉。2026-08-04 生产 webui 就是
+# 这么漂的。探针只报不改，fail-closed，且挡在所有分支之前。
+#
+# 这批测试的铁律：**基准状态必须由真实发布流程生成**，不许手搓目录名。
+# 第一版手搓 mt-<8位>，而发布器实际生成的是 mt-<7位>（webui 才是 8 位），
+# 于是探针在生产上永远判读不出 mt、整条空转，测试却全绿 —— codex 评审实测抓到。
+
+
+ACK = ".drift-ack"
+
+
+def _deploy_once(env, tag: str = "release-x") -> None:
+    """跑一次真实发布，得到发布器自己生成的软链命名与状态文件。"""
+    _tag(env, tag, f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode == 0, f"基准发布必须成功才能谈漂移：{r.stdout}\n{r.stderr}"
+    assert Path(env["STATE_FILE"]).read_text().strip() == tag
+    Path(env["SYSTEMCTL_LOG"]).unlink(missing_ok=True)
+
+
+def _repoint(env, which: str, target: str) -> None:
+    """把一条软链指到别的目录（目录会被建出来，模拟带外部署真的放了东西）。"""
+    releases, code = Path(env["RELEASES"]), Path(env["CODE"])
+    (releases / target).mkdir(parents=True, exist_ok=True)
+    (code / which).unlink()
+    (code / which).symlink_to(f"../releases/{target}")
+
+
+def _fingerprint(r) -> str:
+    """从脚本输出里抠出它让人写进 ack 文件的那一行指纹。
+
+    顺带验证「照着提示复制粘贴」这条路真的走得通——提示词本身也是接口。"""
+    m = re.search(r"printf '%s' '([^']*)'", r.stdout)
+    assert m, f"输出里没有可复制的 ack 指纹：{r.stdout}"
+    return m.group(1)
+
+
+def test_links_from_a_real_deploy_are_a_clean_noop(env):
+    """对得上就安静退出，不许因为多了探针就开始吵。
+
+    同时把发布器真实的命名宽度钉住：mt 取 7 位、webui 取 8 位。这条不变量
+    一旦改了，探针的解析必须跟着改，否则又变成空转。"""
+    _deploy_once(env)
+    mt_link, webui_link = _links(env)
+    assert mt_link.endswith(f"mt-{env['_mt_sha'][:7]}"), mt_link
+    assert webui_link.endswith(f"webui-{env['_webui_sha'][:8]}"), webui_link
+    r = _run(env)
+    assert r.returncode == 0
+    assert "已是最新" in r.stdout
+    assert "漂移" not in r.stdout
+
+
+def test_webui_only_drift_is_caught(env):
+    """只有一个仓被带外换掉也必须抓到（第一版会因为 mt 判读不出而整条跳过）。"""
+    _deploy_once(env)
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    before = _links(env)
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "发布漂移" in r.stdout
+    assert "webui-deadbeef" in r.stdout
+    assert _links(env) == before, "探针只报不改"
+    drift_log = Path(env["HOME"]) / ".hermes" / "release-drift.log"
+    assert drift_log.exists() and "发布漂移" in drift_log.read_text()
+
+
+def test_mt_only_drift_is_caught(env):
+    _deploy_once(env)
+    _repoint(env, "hermes-multitenancy", "mt-dead123")
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "mt-dead123" in r.stdout
+
+
+def test_drift_blocks_a_new_release_too(env):
+    """有新标签时也必须先挡住：带着未确认的漂移继续发布，会把别人手工部上去的
+    止血补丁静默盖掉。"""
+    _deploy_once(env, "release-x")
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    _tag(env, "release-y", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    before = _links(env)
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "发布漂移" in r.stdout
+    assert "发现新发布" not in r.stdout, "挡住了就不该再往下走发布流程"
+    assert _links(env) == before
+    assert Path(env["STATE_FILE"]).read_text().strip() == "release-x"
+
+
+def test_dangling_link_is_not_mistaken_for_consistent(env):
+    """readlink 对悬空软链照样回显目标名。只比名字会把「目标已被删」判成一致。"""
+    _deploy_once(env)
+    live = Path(env["CODE"], "hermes-web-ui").resolve()
+    shutil.rmtree(live)
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "悬空" in r.stdout
+
+
+def test_missing_current_tag_is_unverifiable_not_clean(env):
+    """CURRENT 指向的标签被删了 → 取不到期望值 → 无法证明一致，不许当没事。"""
+    _deploy_once(env)
+    # 注意 `git fetch --tags --prune` **不会**删本地已有的标签（那要 --prune-tags），
+    # 所以源仓删掉还不够，克隆里也得删——否则脚本照样看得见它。
+    _git(env["_mt_src"], "tag", "-d", "release-x")
+    _git(Path(env["RELEASES"]) / ".repo-mt", "tag", "-d", "release-x")
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "无法证明一致" in r.stdout
+
+
+def test_unparseable_link_names_are_unverifiable_not_clean(env):
+    """自定义目录名不能成为绕过探针的方法。想放行就显式 ack。
+
+    代价写明：刚迁移完、软链还叫 mt-current 的新机器，第一次跑会告警一次，
+    由迁移方 ack 一下。用「静默放行」换这点便利，等于给探针留一个后门。"""
+    _deploy_once(env)
+    _repoint(env, "hermes-multitenancy", "mt-current")
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "无法证明一致" in r.stdout
+    assert "mt-current" in r.stdout
+
+
+def test_ack_silences_the_alert(env):
+    """确认过的不再天天告警——否则终点是有人把定时器关了。"""
+    _deploy_once(env)
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    first = _run(env)
+    assert first.returncode == 1
+    Path(env["STATE_FILE"] + ACK).write_text(_fingerprint(first))
+    r = _run(env)
+    assert r.returncode == 0, r.stdout
+    assert "不再告警" in r.stdout
+
+
+def test_ack_does_not_survive_drifting_somewhere_else(env):
+    _deploy_once(env)
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    Path(env["STATE_FILE"] + ACK).write_text(_fingerprint(_run(env)))
+    _repoint(env, "hermes-web-ui", "webui-cafebabe")
+    r = _run(env)
+    assert r.returncode == 1, r.stdout
+    assert "webui-cafebabe" in r.stdout
+
+
+def test_ack_does_not_survive_a_new_baseline_tag(env):
+    """ack 绑死基准标签。发布到新标签后又漂回曾确认过的那一对，旧 ack 必须失效
+    ——只绑 live 那一对的第一版会跨发布永久静默。"""
+    _deploy_once(env, "release-x")
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    Path(env["STATE_FILE"] + ACK).write_text(_fingerprint(_run(env)))
+    # 换个基准：状态文件改记 release-y（annotation 相同，只是标签名变了）
+    _tag(env, "release-y", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    Path(env["STATE_FILE"]).write_text("release-y\n")
+    r = _run(env)
+    assert r.returncode == 1, "换了基准标签，旧 ack 不该再生效"
+
+
+def test_ack_of_an_unreadable_tag_does_not_blind_the_probe(env):
+    """标签读不到时，ack 只能确认「这一对软链」，不能变成一张空白通行证。
+
+    评审 round-2 实测的洞：早期版本在标签读不到时根本不去读软链，指纹退化成
+    `release-x ? ? <无> <无>`，ack 掉之后只要标签仍读不到，软链随便怎么换都
+    静默放行。指纹里必须永远带真实的那一对。"""
+    _deploy_once(env, "release-x")
+    _git(env["_mt_src"], "tag", "-d", "release-x")
+    _git(Path(env["RELEASES"]) / ".repo-mt", "tag", "-d", "release-x")
+
+    first = _run(env)
+    assert first.returncode == 1
+    fp = _fingerprint(first)
+    assert "<无>" not in fp, f"标签读不到也必须记下实际在跑的那一对：{fp}"
+    Path(env["STATE_FILE"] + ACK).write_text(fp)
+    assert _run(env).returncode == 0, "确认过的那一条应当放行"
+
+    # 同一个「标签读不到」状态下换掉 webui 软链 —— 旧 ack 必须失效
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    r = _run(env)
+    assert r.returncode == 1, f"ack 不该变成空白通行证：{r.stdout}"
+    assert "webui-deadbeef" in r.stdout
+
+
+def test_drift_probe_is_silent_before_the_first_deploy(env):
+    """状态文件还不存在时无从比较，别对着空状态喊。
+
+    必须真的有标签存在，否则脚本在「没有任何 release-* 标签」处就退了，
+    根本走不到 CURRENT 为空那条分支——第一版就是这么空跑的。"""
+    _tag(env, "release-x", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    assert not Path(env["STATE_FILE"]).exists()
+    _repoint(env, "hermes-web-ui", "webui-deadbeef")
+    r = _run(env)
+    assert "漂移" not in r.stdout
+    assert "无法证明一致" not in r.stdout
+    assert "发现新发布" in r.stdout, "没有基准就不该挡住首次发布"
 
 
 # ── 2. 清单残缺就别发 ────────────────────────────────────────────────
