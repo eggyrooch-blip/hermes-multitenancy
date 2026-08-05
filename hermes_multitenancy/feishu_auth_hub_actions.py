@@ -221,10 +221,13 @@ def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, A
     return _updated_card_response(card)
 
 
-def _gitlab_form_value(action: Any) -> tuple[str, str, str]:
-    """Pull (token, expiry, tier) out of the submitted form. Untrusted input."""
+def _gitlab_form_value(action: Any) -> tuple[str, str]:
+    """Pull (token, tier) out of the submitted form. Untrusted input.
+
+    No expiry field any more: the expiry is read off the token's own GitLab row
+    during intake, never re-typed by the employee.
+    """
     from .feishu_credential_hub_cards import (
-        GITLAB_EXPIRY_FIELD,
         GITLAB_TIER_FIELD,
         GITLAB_TOKEN_FIELD,
     )
@@ -236,10 +239,9 @@ def _gitlab_form_value(action: Any) -> tuple[str, str, str]:
         except Exception:
             raw = None
     if not isinstance(raw, dict):
-        return "", "", ""
+        return "", ""
     return (
         str(raw.get(GITLAB_TOKEN_FIELD) or "").strip(),
-        str(raw.get(GITLAB_EXPIRY_FIELD) or "").strip(),
         str(raw.get(GITLAB_TIER_FIELD) or "").strip(),
     )
 
@@ -273,12 +275,11 @@ def _handle_gitlab_token_submit(adapter: Any, event: Any, action: Any) -> Any:
     if not profile_name or not open_id or pdir is None:
         return _toast_response("无法确认你的 Hermes profile，请先私聊我发送 /auth")
 
-    token, expiry, tier = _gitlab_form_value(action)
+    token, tier = _gitlab_form_value(action)
     try:
         submit_personal_token(
             profile_name=profile_name,
             token=token,
-            expires_on=expiry,
             tier=tier,
             shared_home=shared,
         )
