@@ -2596,6 +2596,68 @@ def create_run_broker_app(
             },
         )
 
+    async def handle_gitlab_personal_token(request):
+        """员工提交自己的 GitLab token。
+
+        身份**只**从 ``X-Hermes-Owner-Open-Id`` 取，并用空 payload 调
+        ``_resolve_owner_scoped_profile`` —— 故意不把请求体交给它，让请求体在结构上
+        无法影响身份解析。BFF 侧已经把客户端可能塞的 profile_name/open_id 全丢掉了，
+        这里再从 body 取等于把刚建立的边界拆掉。
+
+        校验逻辑全在 ``gitlab_token_intake.submit_personal_token``（档位与实际 scope
+        双向核验、到期日必填、命名核对），本函数只负责鉴权、解析身份、映射错误。
+
+        token 明文绝不进日志或响应 —— 出错只回 ``TokenRejected`` 给的员工可读文案。
+        """
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "请求格式不对，请重试。"}, status=400)
+
+        # 传 {} 而不是 payload：身份不接受任何来自请求体的输入。
+        resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, {})
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+        trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if not trusted_owner or not resolved_profile_name:
+            return web.json_response({
+                "error": "无法确认你的身份，请重新登录后再试。"
+            }, status=403)
+
+        try:
+            from .gitlab_token_intake import TokenRejected, submit_personal_token
+        except Exception:  # pragma: no cover - import wiring
+            return web.json_response({"error": "凭据服务暂不可用，请稍后重试。"}, status=503)
+
+        try:
+            result = submit_personal_token(
+                profile_name=str(resolved_profile_name),
+                token=str(payload.get("token") or ""),
+                expires_on=str(payload.get("expires_on") or ""),
+                tier=str(payload.get("tier") or ""),
+                shared_home=_shared_home_from_env(),
+            )
+        except TokenRejected as exc:
+            # 员工可自行修正的输入问题 —— 必须把可读理由原样回去，否则他只会看到
+            # 「无法解析的响应」，跟没接这个端点一样没用。
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            # 绝不把内部异常文本回给前端：它可能带上 token 片段或内网细节。
+            logger.exception("gitlab personal token intake failed (token redacted)")
+            return web.json_response({"error": "保存失败，请稍后重试。"}, status=500)
+
+        # 回执只带非敏感字段，绝不回 token 本身。
+        return web.json_response({
+            "ok": True,
+            "stored": bool(result.get("stored")),
+            "expires_at": result.get("expires_at"),
+            "tier": result.get("tier"),
+            "scopes": result.get("scopes") or [],
+        })
+
     async def handle_credential_lease(request):
         header = request.headers.get("Authorization", "")
         prefix = "Bearer "
@@ -3246,6 +3308,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/agents/{agent_id}/shares", handle_grant_agent_share)
     app.router.add_delete("/api/run-broker/agents/{agent_id}/shares/{share_key}", handle_revoke_agent_share)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
+    app.router.add_post("/api/run-broker/credentials/gitlab", handle_gitlab_personal_token)
     app.router.add_post("/api/run-broker/credentials/lease", handle_credential_lease)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
