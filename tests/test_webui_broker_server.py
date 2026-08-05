@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import json
 import os
 import sys
@@ -5462,3 +5463,153 @@ def test_viewer_share_role_token_cannot_mutate_owner_cron(monkeypatch, tmp_path:
     assert deleted == []          # the owner's job store was never touched
     assert read_status == 200     # reading stays allowed for a viewer
     assert listed == ["owner_agent_profile"]
+
+
+# --- POST /api/run-broker/credentials/gitlab -------------------------------
+# 员工提交自己的 GitLab token。这个端点收的是凭据，身份解析是历史事故高发区
+# （2026-08-04 安全评审：run-broker owner 自报 + 共享 Bearer），所以这里逐条钉死
+# 鉴权、身份来源、以及"请求体不能冒充身份"。
+
+
+def _gitlab_app(monkeypatch, *, capture=None, raises=None, resolve_to=None):
+    """起一个只关心 gitlab 端点的 broker app，并把入库逻辑换成探针。"""
+    from hermes_multitenancy import webui_broker_server as mod
+
+    def fake_submit(**kwargs):
+        if capture is not None:
+            capture.update(kwargs)
+        if raises is not None:
+            raise raises
+        return {"stored": True, "profile_name": kwargs.get("profile_name"),
+                "expires_at": 4102444800000, "tier": kwargs.get("tier"),
+                "scopes": ["read_api", "read_repository"]}
+
+    import hermes_multitenancy.gitlab_token_intake as intake
+    monkeypatch.setattr(intake, "submit_personal_token", fake_submit)
+    monkeypatch.setattr(mod, "_shared_home_from_env", lambda: pathlib.Path("/tmp/shared-home-probe"))
+    if resolve_to is not None:
+        # 真实解析器要求 owner 有 sync-root profile，测试环境没有 —— 不桩掉的话请求会
+        # 停在 403，后面的断言全部空过（本轮第一版就是这么假绿的）。
+        monkeypatch.setattr(mod, "_resolve_owner_scoped_profile", lambda request, payload: (resolve_to, None))
+    return mod.create_run_broker_app(
+        dispatch_agent=lambda request: "",
+        mark_seen=lambda _request: True,
+        sandbox_available=lambda: True,
+    )
+
+
+def _run(coro_factory):
+    import asyncio
+    return asyncio.run(coro_factory())
+
+
+def test_gitlab_token_endpoint_rejects_a_request_with_no_owner_identity(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    captured = {}
+    app = _gitlab_app(monkeypatch, capture=captured)
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                json={"token": "glpat-x", "expires_on": "2030-01-01", "tier": "read"},
+            )
+            body = await res.json()
+        finally:
+            await client.close()
+        # 无身份必须拒，且绝不回落到任何默认 profile
+        assert res.status in (401, 403), body
+        assert not captured, "无身份时不得调用入库逻辑"
+
+    _run(runner)
+
+
+def test_gitlab_token_endpoint_ignores_identity_fields_smuggled_in_the_body(monkeypatch):
+    """请求体里塞 profile_name/open_id 试图冒充别人 —— 必须完全不生效。
+
+    身份只从 X-Hermes-Owner-Open-Id 走 _resolve_owner_scoped_profile（且传空 payload）。
+    这条是本端点最该守住的边界：BFF 已在上游把身份字段丢掉，broker 若从 body 取就等于
+    把那道边界拆了。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    captured = {}
+    app = _gitlab_app(monkeypatch, capture=captured, resolve_to="owner_profile")
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "token": "glpat-x", "expires_on": "2030-01-01", "tier": "read",
+                    "profile_name": "victim", "open_id": "ou_victim",
+                },
+            )
+            await res.text()
+        finally:
+            await client.close()
+        # 无论放行与否，都绝不能拿 body 里的 victim 去入库
+        assert captured.get("profile_name") == "owner_profile", captured
+        assert captured.get("open_id") is None
+
+    _run(runner)
+
+
+def test_gitlab_token_endpoint_relays_the_employee_facing_rejection_reason(monkeypatch):
+    """TokenRejected 必须原样回给员工，而不是变成 500/无法解析。
+
+    今天 sunke 撞到的就是链路错（403 → 404「无法解析的响应」），那种报错对他毫无用处。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy.gitlab_token_intake import TokenRejected
+
+    reason = "你选了只读，但这个 token 带 api 权限，比你以为的大。"
+    app = _gitlab_app(monkeypatch, raises=TokenRejected(reason), resolve_to="owner_profile")
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={"token": "glpat-x", "expires_on": "2030-01-01", "tier": "read"},
+            )
+            body = await res.json()
+        finally:
+            await client.close()
+        assert res.status == 400, body
+        assert body.get("error") == reason
+
+    _run(runner)
+
+
+def test_gitlab_token_endpoint_never_echoes_the_token(monkeypatch):
+    """回执与错误信息都不得带 token 明文。"""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    secret = "glpat-super-secret-value"
+    app = _gitlab_app(monkeypatch, resolve_to="owner_profile")
+
+    async def runner():
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            res = await client.post(
+                "/api/run-broker/credentials/gitlab",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={"token": secret, "expires_on": "2030-01-01", "tier": "read"},
+            )
+            text = await res.text()
+        finally:
+            await client.close()
+        assert res.status == 200, text
+        assert secret not in text, "响应体里不得出现 token 明文"
+
+    _run(runner)
