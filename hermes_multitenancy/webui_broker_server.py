@@ -2636,7 +2636,8 @@ def create_run_broker_app(
             result = submit_personal_token(
                 profile_name=str(resolved_profile_name),
                 token=str(payload.get("token") or ""),
-                expires_on=str(payload.get("expires_on") or ""),
+                # 到期日不从请求体取：由 intake 从 GitLab 的 token 行直接读。
+                # 老客户端可能仍在 payload 里带 expires_on，这里静默忽略。
                 tier=str(payload.get("tier") or ""),
                 shared_home=_shared_home_from_env(),
             )

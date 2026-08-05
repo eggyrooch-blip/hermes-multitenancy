@@ -315,7 +315,6 @@ def submit_personal_token(
     host: str = DEFAULT_HOST,
     db_path: Optional[Path] = None,
     prober: Any = None,
-    expires_on: str = "",
 ) -> dict[str, Any]:
     """Validate an employee's token and store it under their own profile.
 
@@ -326,14 +325,10 @@ def submit_personal_token(
     fail at the job they expect it to do.
 
     The expiry is read off the token's own GitLab row (see
-    :func:`expiry_from_gitlab`); ``expires_on`` is DEPRECATED and ignored — kept
-    only so not-yet-shipped callers that still pass it keep working (the
-    broker-gitlab-token-endpoint branch, older WebUI payloads). Remove once both
-    have shipped.
+    :func:`expiry_from_gitlab`) — never supplied by the caller.
 
     Raises :class:`TokenRejected` with an employee-facing reason on any gate.
     """
-    del expires_on  # deprecated: expiry comes from the GitLab probe row
     shared_home = Path(shared_home)
     cleaned = str(token or "").strip()
     if not cleaned:
@@ -529,9 +524,6 @@ def _demo() -> None:
         (legacy / "gitlab.token").write_text("global-token\n", encoding="utf-8")
         result = submit_personal_token(
             **common,
-            # The date that used to 400 the whole form — now ignored entirely:
-            # the stored expiry comes from the probe row, not this argument.
-            expires_on="2031-11-31",
             prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"], "2099-01-01"),
         )
         assert result["stored"] and result["tier"] == TIER_READ

@@ -5557,6 +5557,9 @@ def test_gitlab_token_endpoint_ignores_identity_fields_smuggled_in_the_body(monk
         # 无论放行与否，都绝不能拿 body 里的 victim 去入库
         assert captured.get("profile_name") == "owner_profile", captured
         assert captured.get("open_id") is None
+        # 老客户端仍会在 payload 里带 expires_on；端点必须静默丢掉它，
+        # 到期日只有一个来源 —— GitLab 上 token 自己那一行。
+        assert "expires_on" not in captured, captured
 
     _run(runner)
 

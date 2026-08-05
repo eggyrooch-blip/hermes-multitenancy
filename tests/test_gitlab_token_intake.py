@@ -358,15 +358,21 @@ def test_already_expired_token_is_refused(monkeypatch, tmp_path):
     assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
 
 
-def test_legacy_expires_on_argument_is_accepted_and_ignored(monkeypatch, tmp_path):
-    """Merge-order safety: the unshipped broker endpoint and older WebUI
-    payloads still pass expires_on. It must change nothing — the stored expiry
-    is the probe row's, even when the argument is the impossible date that used
-    to 400 the whole form."""
+def test_caller_cannot_supply_an_expiry_at_all(monkeypatch, tmp_path):
+    """The deprecated ``expires_on`` shim is gone: the expiry has exactly one
+    source, the token's own GitLab row. A caller that still passes a date must
+    fail loudly rather than have it silently ignored — silent acceptance is how
+    a caller keeps believing it controls the expiry."""
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = _home(tmp_path)
+    with pytest.raises(TypeError):
+        submit_personal_token(
+            profile_name="alice", token="glpat-x", expires_on="2031-11-31",
+            tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
+        )
+    # …and the normal call still stores the probe row's expiry.
     result = submit_personal_token(
-        profile_name="alice", token="glpat-x", expires_on="2031-11-31",
+        profile_name="alice", token="glpat-x",
         tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
     )
     assert result["stored"] and result["expires_at"] == 4070908800000
