@@ -85,7 +85,6 @@ VALID_TIERS = (TIER_READ, TIER_WRITE)
 PROBE_OK = "probe_ok"                # found the row; scopes are known
 PROBE_GIT_ONLY = "probe_git_only"    # no REST access at all => glab cannot work
 PROBE_NOT_FOUND = "probe_not_found"  # no active token named HERMES_TOKEN_NAME
-PROBE_AMBIGUOUS = "probe_ambiguous"  # several — we cannot tell which one this is
 INVALID_TOKEN = "invalid_token"
 UNDETERMINED = "undetermined"
 
@@ -131,6 +130,22 @@ def expiry_from_gitlab(raw: Any, *, today: Optional[date] = None) -> int:
     return int(
         datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc).timestamp() * 1000
     )
+
+
+#: Oldest possible key: an unparseable/missing created_at must never BEAT a
+#: legitimate timestamp (codex review: a garbage string would win a raw
+#: lexicographic sort).
+_CREATED_AT_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _created_at_utc(row: Any) -> datetime:
+    """Defensive ISO-8601 parse of a PAT row's ``created_at`` for sorting."""
+    raw = str(row.get("created_at") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return _CREATED_AT_FLOOR
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def probe_token(
@@ -187,9 +202,16 @@ def probe_token(
     if not matches:
         return PROBE_NOT_FOUND, [], None
     if len(matches) > 1:
-        # We cannot tell which of them is the one just submitted, so we would be
-        # recording someone else's scope set. Refuse instead of guessing.
-        return PROBE_AMBIGUOUS, [], None
+        # Several rows share the agreed name (stale tokens from earlier rounds).
+        # Refusing here dead-ended the employee (sunke 2026-08-05: 「能用不就行
+        # 了」), so pick the NEWEST created row — the real-world flow is "create
+        # a token, paste it immediately". A wrong pick mislabels scopes/expiry
+        # but grants nothing (same accepted-debt class as
+        # SCOPE_BINDING_UNVERIFIED); a mis-recorded expiry is caught at runtime
+        # by the expired-record refusal and fixed by re-binding. Ties (same
+        # second / both unparseable) fall back to listing order — still one of
+        # the user's own hermes-named tokens; never a dead end (his call).
+        matches.sort(key=_created_at_utc, reverse=True)
     scopes = [str(s) for s in (matches[0].get("scopes") or []) if str(s).strip()]
     expires_at = str(matches[0].get("expires_at") or "").strip() or None
     return PROBE_OK, scopes, expires_at
@@ -340,11 +362,6 @@ def submit_personal_token(
             f"在你的 GitLab 账号里找不到名字叫 {HERMES_TOKEN_NAME} 的有效 token。"
             f"请把 token 的名字改成 {HERMES_TOKEN_NAME}（或重建一个这样命名的），我们靠名字确认它的权限。"
         )
-    if verdict == PROBE_AMBIGUOUS:
-        raise TokenRejected(
-            f"你有多个名字叫 {HERMES_TOKEN_NAME} 的有效 token，我无法确认是哪一个。"
-            "请在 GitLab 里撤销多余的，只留这一个。"
-        )
     if verdict != PROBE_OK:
         raise TokenRejected(
             "暂时无法校验这个 token（连不上 GitLab 或校验超时），没有入库，请稍后重试。"
@@ -448,8 +465,7 @@ def _demo() -> None:
         common = dict(profile_name="alice", token="t", tier=TIER_READ, shared_home=home)
 
         # Every non-OK lookup outcome must refuse.
-        for status in (INVALID_TOKEN, UNDETERMINED, PROBE_GIT_ONLY,
-                       PROBE_NOT_FOUND, PROBE_AMBIGUOUS):
+        for status in (INVALID_TOKEN, UNDETERMINED, PROBE_GIT_ONLY, PROBE_NOT_FOUND):
             try:
                 submit_personal_token(**common, prober=lambda *a, _s=status, **k: (_s, [], None))
             except TokenRejected:
@@ -559,10 +575,14 @@ def _demo() -> None:
         assert probe_token("t", opener=_rows(
             [{"name": "hermes", "active": False, "scopes": ["api"]}]
         )) == (PROBE_NOT_FOUND, [], None)
+        # Duplicate names: the newest created row wins (people recreate tokens;
+        # the freshly created one is what they are pasting).
         assert probe_token("t", opener=_rows([
-            {"name": "hermes", "active": True, "scopes": ["api"]},
-            {"name": "hermes", "active": True, "scopes": ["read_api"]},
-        ])) == (PROBE_AMBIGUOUS, [], None)
+            {"name": "hermes", "active": True, "scopes": ["api"],
+             "created_at": "2026-08-01T00:00:00Z", "expires_at": "2027-01-01"},
+            {"name": "hermes", "active": True, "scopes": ["read_api"],
+             "created_at": "2026-08-05T00:00:00Z", "expires_at": "2027-06-01"},
+        ])) == (PROBE_OK, ["read_api"], "2027-06-01")
         print("gitlab_token_intake self-check OK")
 
 
