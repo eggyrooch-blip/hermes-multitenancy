@@ -152,7 +152,6 @@ def build_qr_card(title: str, image_key: str, *, hint_zh: str = "请用对应 Ap
 #: Feishu form control names — read back off ``action.form_value`` on submit.
 GITLAB_FORM = "gitlab_token_form"
 GITLAB_TOKEN_FIELD = "gitlab_token"
-GITLAB_EXPIRY_FIELD = "gitlab_expiry"
 GITLAB_TIER_FIELD = "gitlab_tier"
 GITLAB_SUBMIT_ACTION = "gitlab_token"
 
@@ -184,7 +183,8 @@ def build_gitlab_token_form_card(*, notice: str = "") -> dict[str, Any]:
             "填你自己的 GitLab token，hermes 之后就用**你本人的权限**操作仓库。\n\n"
             "在 GitLab 建 token 时：\n"
             "1. **名字必须填 `hermes`** —— 我们靠这个名字找到它、核对你给的权限\n"
-            "2. **填一个到期日**（GitLab 允许不填，但我们不接受永久有效的）\n"
+            "2. **在 GitLab 那边填一个到期日**——不填我们不收；到期日我们直接从 GitLab 读，"
+            "不用抄回来\n"
             "3. 按你选的档位勾 scope：\n"
             "   · **只读** —— 看 MR、issue、流水线、拉代码：勾 `read_api` + `read_repository`\n"
             "   · **可写** —— 上面全部再加改动和推代码：勾 `api` + `write_repository`\n\n"
@@ -219,13 +219,6 @@ def build_gitlab_token_form_card(*, notice: str = "") -> dict[str, Any]:
                 "required": True,
                 "label": _plain_i18n("GitLab token", "GitLab token"),
                 "placeholder": _plain_i18n("粘贴你的 token", "Paste your token"),
-            },
-            {
-                "tag": "input",
-                "name": GITLAB_EXPIRY_FIELD,
-                "required": True,
-                "label": _plain_i18n("到期日", "Expires on"),
-                "placeholder": _plain_i18n("YYYY-MM-DD", "YYYY-MM-DD"),
             },
             {
                 "tag": "button",

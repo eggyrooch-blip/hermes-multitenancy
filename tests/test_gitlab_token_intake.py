@@ -15,7 +15,7 @@ from hermes_multitenancy.gitlab_token_intake import (
     TIER_WRITE,
     UNDETERMINED,
     TokenRejected,
-    parse_expiry,
+    expiry_from_gitlab,
     probe_token,
     submit_personal_token,
 )
@@ -24,8 +24,8 @@ READ_SCOPES = ["read_api", "read_repository"]
 WRITE_SCOPES = ["api", "write_repository"]
 
 
-def _ok(scopes):
-    return lambda *a, **k: (PROBE_OK, list(scopes))
+def _ok(scopes, expires_at="2099-01-01"):
+    return lambda *a, **k: (PROBE_OK, list(scopes), expires_at)
 
 
 def _home(tmp_path: Path) -> Path:
@@ -44,16 +44,18 @@ def _home(tmp_path: Path) -> Path:
 # -- expiry gate -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "not-a-date", "2026/01/01", "2000-01-01"])
+@pytest.mark.parametrize("bad", ["", "   ", None, "not-a-date", "2026/01/01", "2000-01-01"])
 def test_expiry_is_mandatory_and_must_be_in_the_future(bad):
     """GitLab CE 14.10 allows a blank expiry and has no max-lifetime policy, so
-    this gate is the only thing standing between us and a permanent token."""
+    this gate is the only thing standing between us and a permanent token. The
+    value comes off the token's own GitLab row now — None is a never-expiring
+    token and must refuse."""
     with pytest.raises(TokenRejected):
-        parse_expiry(bad)
+        expiry_from_gitlab(bad)
 
 
 def test_expiry_parses_to_utc_midnight_epoch_ms():
-    assert parse_expiry("2099-01-01") == 4070908800000
+    assert expiry_from_gitlab("2099-01-01") == 4070908800000
 
 
 # -- scope probe -------------------------------------------------------------
@@ -101,16 +103,26 @@ def test_scopes_are_read_off_gitlab_not_inferred():
     """
     assert probe_token("t", opener=_rows(
         [{"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api", "write_repository"]}]
-    )) == (PROBE_OK, ["api", "write_repository"])
+    )) == (PROBE_OK, ["api", "write_repository"], None)
+
+
+def test_expiry_is_read_off_the_same_row():
+    """The row that gives us the scopes also carries expires_at — read it there
+    instead of making the employee re-type it (a hand-copied 2031-11-31 once
+    400'd the whole form)."""
+    assert probe_token("t", opener=_rows(
+        [{"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"],
+          "expires_at": "2027-01-31"}]
+    )) == (PROBE_OK, ["api"], "2027-01-31")
 
 
 def test_only_an_active_row_with_the_agreed_name_counts():
     assert probe_token("t", opener=_rows(
         [{"name": "something-else", "active": True, "scopes": ["api"]}]
-    )) == (PROBE_NOT_FOUND, [])
+    )) == (PROBE_NOT_FOUND, [], None)
     assert probe_token("t", opener=_rows(
         [{"name": HERMES_TOKEN_NAME, "active": False, "scopes": ["api"]}]
-    )) == (PROBE_NOT_FOUND, [])
+    )) == (PROBE_NOT_FOUND, [], None)
 
 
 def test_duplicate_names_are_ambiguous_not_a_guess():
@@ -118,28 +130,28 @@ def test_duplicate_names_are_ambiguous_not_a_guess():
     assert probe_token("t", opener=_rows([
         {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"]},
         {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["read_api"]},
-    ])) == (PROBE_AMBIGUOUS, [])
+    ])) == (PROBE_AMBIGUOUS, [], None)
 
 
 def test_401_is_an_invalid_token():
-    assert probe_token("t", opener=_http(401)) == (INVALID_TOKEN, [])
+    assert probe_token("t", opener=_http(401)) == (INVALID_TOKEN, [], None)
 
 
 def test_403_means_no_api_scope_at_all_so_glab_cannot_work():
     """Repository-only token: fine for git clone, inert for every glab command."""
-    assert probe_token("t", opener=_http(403)) == (PROBE_GIT_ONLY, [])
+    assert probe_token("t", opener=_http(403)) == (PROBE_GIT_ONLY, [], None)
 
 
 @pytest.mark.parametrize("code", [500, 502, 404])
 def test_unexpected_codes_are_undetermined(code):
-    assert probe_token("t", opener=_http(code)) == (UNDETERMINED, [])
+    assert probe_token("t", opener=_http(code)) == (UNDETERMINED, [], None)
 
 
 def test_network_failure_is_undetermined_not_a_pass():
     def _boom(*a, **k):
         raise OSError("dns")
 
-    assert probe_token("t", opener=_boom) == (UNDETERMINED, [])
+    assert probe_token("t", opener=_boom) == (UNDETERMINED, [], None)
 
 
 # -- storage -----------------------------------------------------------------
@@ -154,8 +166,8 @@ def test_no_lookup_outcome_but_ok_may_store(monkeypatch, tmp_path, status):
     shared = _home(tmp_path)
     with pytest.raises(TokenRejected):
         submit_personal_token(
-            profile_name="alice", token="glpat-x", expires_on="2099-01-01",
-            tier=TIER_READ, shared_home=shared, prober=lambda *a, **k: (status, []),
+            profile_name="alice", token="glpat-x",
+            tier=TIER_READ, shared_home=shared, prober=lambda *a, **k: (status, [], None),
         )
     assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
 
@@ -168,7 +180,7 @@ def test_read_tier_refuses_wrong_scope_sets(monkeypatch, tmp_path, scopes):
     shared = _home(tmp_path)
     with pytest.raises(TokenRejected):
         submit_personal_token(
-            profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+            profile_name="alice", token="glpat-x",
             tier=TIER_READ, shared_home=shared, prober=_ok(scopes),
         )
     assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
@@ -180,7 +192,7 @@ def test_write_claim_with_a_read_only_token_is_refused(monkeypatch, tmp_path):
     shared = _home(tmp_path)
     with pytest.raises(TokenRejected):
         submit_personal_token(
-            profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+            profile_name="alice", token="glpat-x",
             tier=TIER_WRITE, shared_home=shared, prober=_ok(READ_SCOPES),
         )
 
@@ -190,7 +202,7 @@ def test_api_scope_satisfies_read_api_requirement_for_the_write_tier(monkeypatch
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = _home(tmp_path)
     result = submit_personal_token(
-        profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+        profile_name="alice", token="glpat-x",
         tier=TIER_WRITE, shared_home=shared, prober=_ok(WRITE_SCOPES),
     )
     assert result["stored"] and result["tier"] == TIER_WRITE
@@ -206,7 +218,7 @@ def test_submit_retires_the_legacy_file_synchronously(monkeypatch, tmp_path):
     (legacy / "gitlab.token").write_text("global-token\n", encoding="utf-8")
 
     result = submit_personal_token(
-        profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+        profile_name="alice", token="glpat-x",
         tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
     )
     assert result["legacy_file_retired"] is True
@@ -227,7 +239,7 @@ def test_unremovable_legacy_file_fails_closed_and_stores_nothing(monkeypatch, tm
     monkeypatch.setattr(Path, "unlink", _boom)
     with pytest.raises(TokenRejected):
         submit_personal_token(
-            profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+            profile_name="alice", token="glpat-x",
             tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
         )
     assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
@@ -254,7 +266,7 @@ def test_incomplete_runtime_contract_refuses(monkeypatch, tmp_path, drop):
 
     with pytest.raises(TokenRejected):
         submit_personal_token(
-            profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+            profile_name="alice", token="glpat-x",
             tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
         )
     assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
@@ -273,19 +285,61 @@ def test_refuses_while_the_self_lane_is_not_deployed(monkeypatch, tmp_path):
     )
     with pytest.raises(TokenRejected, match="尚未开启"):
         submit_personal_token(
-            profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+            profile_name="alice", token="glpat-x",
             tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
         )
 
 
-def test_rejection_reason_never_echoes_the_submitted_value(monkeypatch, tmp_path):
-    """The token and expiry inputs are adjacent; a mis-paste puts a live
-    credential in the expiry field, and the reason is rendered into a card that
-    persists in chat history."""
+def test_rejection_reason_never_echoes_the_raw_value(monkeypatch, tmp_path):
+    """Defensive no-echo: rejection reasons render into cards that persist in
+    chat history, so even a GitLab-sourced value that fails to parse must never
+    appear in the reason verbatim."""
     secret = "glpat-SECRETVALUE"
     with pytest.raises(TokenRejected) as exc:
-        parse_expiry(secret)
+        expiry_from_gitlab(secret)
     assert secret not in exc.value.reason
+
+
+def test_never_expiring_token_is_refused_and_stores_nothing(monkeypatch, tmp_path):
+    """A null expires_at row is a permanent token — the one thing this gate
+    exists to keep out of the vault. 14.10 cannot add an expiry to an existing
+    PAT, so the reason must steer the employee to rebuild."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _home(tmp_path)
+    with pytest.raises(TokenRejected, match="没有到期日"):
+        submit_personal_token(
+            profile_name="alice", token="glpat-x",
+            tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES, expires_at=None),
+        )
+    assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
+
+
+def test_already_expired_token_is_refused(monkeypatch, tmp_path):
+    """An expired record would be refused at runtime anyway; catch it at intake
+    where the employee can still act on it."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _home(tmp_path)
+    with pytest.raises(TokenRejected):
+        submit_personal_token(
+            profile_name="alice", token="glpat-x",
+            tier=TIER_READ, shared_home=shared,
+            prober=_ok(READ_SCOPES, expires_at="2000-01-01"),
+        )
+    assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
+
+
+def test_legacy_expires_on_argument_is_accepted_and_ignored(monkeypatch, tmp_path):
+    """Merge-order safety: the unshipped broker endpoint and older WebUI
+    payloads still pass expires_on. It must change nothing — the stored expiry
+    is the probe row's, even when the argument is the impossible date that used
+    to 400 the whole form."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _home(tmp_path)
+    result = submit_personal_token(
+        profile_name="alice", token="glpat-x", expires_on="2031-11-31",
+        tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
+    )
+    assert result["stored"] and result["expires_at"] == 4070908800000
 
 
 def _vault_empty(shared: Path) -> bool:
@@ -310,7 +364,6 @@ def test_clean_token_lands_in_the_submitters_own_profile(monkeypatch, tmp_path):
     result = submit_personal_token(
         profile_name="alice",
         token="glpat-clean",
-        expires_on="2099-01-01",
         tier=TIER_READ,
         shared_home=shared,
         prober=_ok(READ_SCOPES),
@@ -318,6 +371,8 @@ def test_clean_token_lands_in_the_submitters_own_profile(monkeypatch, tmp_path):
     assert result["stored"] and result["tier"] == TIER_READ
     assert result["scopes"] == READ_SCOPES
     assert result["scope_binding_verified"] is False
+    # The stored expiry is the probe row's date, converted to UTC-midnight ms.
+    assert result["expires_at"] == 4070908800000
 
     store = CredentialStore(shared / "multitenancy.db")
     try:
@@ -356,7 +411,7 @@ def test_subject_id_follows_the_config_so_the_runtime_can_find_it(monkeypatch, t
         encoding="utf-8",
     )
     submit_personal_token(
-        profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+        profile_name="alice", token="glpat-x",
         tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
     )
 
@@ -394,7 +449,7 @@ def submit_harness(monkeypatch):
         fha, "_resolve_operator_profile", lambda e, s: ("alice", "ou_alice", Path("/tmp/p"))
     )
     monkeypatch.setattr(
-        fha, "_gitlab_form_value", lambda a: ("glpat-typed", "2099-01-01", "read")
+        fha, "_gitlab_form_value", lambda a: ("glpat-typed", "read")
     )
 
     class _Uat:
@@ -423,6 +478,8 @@ def test_harness_reaches_the_vault_when_every_guard_passes(submit_harness):
     assert len(captured) == 1
     assert captured[0]["profile_name"] == "alice"
     assert captured[0]["token"] == "glpat-typed"
+    # The Feishu path must not resurrect the deprecated expiry argument.
+    assert "expires_on" not in captured[0]
 
 
 def test_group_chat_submit_is_refused(submit_harness, monkeypatch):
@@ -449,7 +506,7 @@ def test_profile_comes_from_the_signed_operator_never_the_payload(submit_harness
     # The signed operator is the only identity source; a hostile form body
     # carrying someone else's profile must not change where the token lands.
     monkeypatch.setattr(
-        fha, "_gitlab_form_value", lambda a: ("glpat-typed", "2099-01-01", "read")
+        fha, "_gitlab_form_value", lambda a: ("glpat-typed", "read")
     )
     monkeypatch.setattr(
         fha, "_resolve_operator_profile", lambda e, s: ("alice", "ou_alice", Path("/tmp/p"))
@@ -459,27 +516,61 @@ def test_profile_comes_from_the_signed_operator_never_the_payload(submit_harness
     assert captured[0]["profile_name"] == "alice"
 
 
+def test_gitlab_form_card_has_no_expiry_control_and_says_expiry_is_read():
+    """Render-level regression guard (codex review finding): all other tests
+    exercise parsing and the vault path, so a card edit that restores a
+    gitlab_expiry input or the old '把日期抄回来' copy would pass every one of
+    them. Walk the actual card payload instead."""
+    from hermes_multitenancy.feishu_credential_hub_cards import (
+        GITLAB_FORM,
+        build_gitlab_token_form_card,
+    )
+
+    card = build_gitlab_token_form_card()
+
+    def _walk(node):
+        if isinstance(node, dict):
+            yield node
+            for value in node.values():
+                yield from _walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from _walk(value)
+
+    nodes = list(_walk(card))
+    names = {n.get("name") for n in nodes if isinstance(n.get("name"), str)}
+    assert GITLAB_FORM in names, "the form container itself must still render"
+    assert "gitlab_expiry" not in names
+    copy = "".join(str(n.get("content") or "") for n in nodes)
+    assert "直接从 GitLab 读" in copy
+    # Marker-agnostic guard against the old step-2 wording: the original text
+    # was `**填一个到期日**（GitLab 允许不填…` — asserting on a substring that
+    # ignores the Markdown ** so a resurrected old line cannot hide behind
+    # formatting (codex delta-review catch: the first version of this assert
+    # included the parens without ** and matched nothing).
+    assert "允许不填" not in copy
+
+
 def test_form_value_parsing_handles_dict_and_json_string():
     from hermes_multitenancy import feishu_auth_hub_actions as fha
 
     class _A:
+        # A stale client still sending gitlab_expiry must not break parsing.
         form_value = {
             "gitlab_token": " t ", "gitlab_expiry": " 2099-01-01 ", "gitlab_tier": "read",
         }
 
-    assert fha._gitlab_form_value(_A()) == ("t", "2099-01-01", "read")
+    assert fha._gitlab_form_value(_A()) == ("t", "read")
 
     class _B:
-        form_value = (
-            '{"gitlab_token": "j", "gitlab_expiry": "2099-02-02", "gitlab_tier": "write"}'
-        )
+        form_value = '{"gitlab_token": "j", "gitlab_tier": "write"}'
 
-    assert fha._gitlab_form_value(_B()) == ("j", "2099-02-02", "write")
+    assert fha._gitlab_form_value(_B()) == ("j", "write")
 
     class _C:
         form_value = None
 
-    assert fha._gitlab_form_value(_C()) == ("", "", "")
+    assert fha._gitlab_form_value(_C()) == ("", "")
 
 
 def test_stored_scopes_are_marked_unverified_so_they_are_never_audit_evidence(monkeypatch, tmp_path):
@@ -495,7 +586,7 @@ def test_stored_scopes_are_marked_unverified_so_they_are_never_audit_evidence(mo
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = _home(tmp_path)
     submit_personal_token(
-        profile_name="alice", token="glpat-x", expires_on="2099-01-01",
+        profile_name="alice", token="glpat-x",
         tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
     )
     conn = sqlite3.connect(str(shared / "multitenancy.db"))

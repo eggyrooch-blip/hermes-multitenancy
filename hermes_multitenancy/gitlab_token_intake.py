@@ -2,10 +2,15 @@
 
 Gates, all of which exist because the GitLab instance enforces none of them:
 
-* **An expiry is mandatory.** CE 14.10 lets a PAT be created with a blank expiry
-  and self-managed CE has no instance-wide maximum-lifetime policy, so nothing
-  upstream will ever age this credential out. Expiry also bites at runtime — an
-  expired record is refused rather than injected.
+* **An expiry is mandatory — read off GitLab, never typed.** CE 14.10 lets a
+  PAT be created with a blank expiry and self-managed CE has no instance-wide
+  maximum-lifetime policy, so nothing upstream will ever age this credential
+  out. The date comes from the token's own row in the same listing the scope
+  probe reads (``expires_at``: ``YYYY-MM-DD`` or null); a null row is refused
+  with rebuild guidance, because 14.10 cannot add an expiry to an existing PAT.
+  Employees no longer re-type the date — a hand-copied ``2031-11-31`` (a date
+  that does not exist) once 400'd the whole form. Expiry also bites at
+  runtime — an expired record is refused rather than injected.
 
 * **The granted scopes must match the tier the employee picked.** Scopes are
   READ OFF GitLab, not inferred: the employee names the token
@@ -100,24 +105,29 @@ class TokenRejected(Exception):
         self.reason = reason
 
 
-def parse_expiry(raw: str, *, today: Optional[date] = None) -> int:
-    """``YYYY-MM-DD`` -> epoch ms at UTC midnight. Raises TokenRejected."""
+def expiry_from_gitlab(raw: Any, *, today: Optional[date] = None) -> int:
+    """GitLab's ``expires_at`` (``YYYY-MM-DD`` or null) -> epoch ms at UTC midnight.
+
+    The value comes off the token's own row in the probe listing, never from the
+    employee. Raises :class:`TokenRejected` on null (a never-expiring token) or
+    a non-future date.
+    """
     text = str(raw or "").strip()
     if not text:
         raise TokenRejected(
-            "到期日必填。GitLab 允许 token 永不过期，我们这边不接受——"
-            "请在 GitLab 建 token 时填一个到期日，再把同一个日期填在这里。"
+            "这个 token 在 GitLab 上没有到期日，我们不收永久有效的。"
+            "GitLab 没法给建好的 token 补到期日——请重建一个填了到期日的"
+            f"（名字仍叫 {HERMES_TOKEN_NAME}），再来提交。"
         )
     try:
         parsed = datetime.strptime(text, "%Y-%m-%d").date()
     except ValueError:
-        # NEVER echo the submitted text back. The token and expiry inputs sit
-        # next to each other, so a mis-paste puts a live credential in this
-        # string — and the rejection reason is rendered into a Feishu card that
-        # persists in the user's chat history.
-        raise TokenRejected("到期日格式应为 YYYY-MM-DD，例如 2027-01-31。请重新填写。") from None
+        # Defensive: 14.10 formats expires_at server-side as YYYY-MM-DD, so an
+        # unparseable value means upstream changed shape. NEVER echo it — this
+        # string is rendered into cards that persist in chat history.
+        raise TokenRejected("读不到这个 token 的到期日，请稍后重试或联系管理员。") from None
     if parsed <= (today or datetime.now(timezone.utc).date()):
-        raise TokenRejected("到期日必须是未来的日期，请重新填写。")
+        raise TokenRejected("这个 token 的到期日已过或就在今天，请在 GitLab 重建一个再提交。")
     return int(
         datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc).timestamp() * 1000
     )
@@ -129,13 +139,18 @@ def probe_token(
     host: str = DEFAULT_HOST,
     timeout: float = 10.0,
     opener: Any = None,
-) -> tuple[str, list[str]]:
-    """Read the token's REAL scopes from GitLab. Returns ``(status, scopes)``.
+) -> tuple[str, list[str], Optional[str]]:
+    """Read the token's REAL scopes and expiry from GitLab.
+
+    Returns ``(status, scopes, expires_at)`` — ``expires_at`` is the row's own
+    ``YYYY-MM-DD`` string or None, meaningful only on :data:`PROBE_OK`.
 
     We ask GitLab to list the submitter's tokens (a GET, reachable with either
     API scope) and pick the row named :data:`HERMES_TOKEN_NAME`. That row's
     ``scopes`` is authoritative — no inference, and it covers the repository
-    scopes too, which no endpoint probe could ever establish.
+    scopes too, which no endpoint probe could ever establish. The same row
+    carries ``expires_at``, so the expiry is read here too instead of being
+    re-typed by the employee.
 
     A 403 on the listing means the token holds no API scope at all: fine for
     ``git clone``, useless to glab. 401 means GitLab does not recognise it.
@@ -149,20 +164,20 @@ def probe_token(
     try:
         with _open(request, timeout=timeout) as response:
             if not 200 <= int(response.status) < 300:
-                return UNDETERMINED, []
+                return UNDETERMINED, [], None
             rows = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         code = int(exc.code)
         if code == 401:
-            return INVALID_TOKEN, []
+            return INVALID_TOKEN, [], None
         if code == 403:
-            return PROBE_GIT_ONLY, []
-        return UNDETERMINED, []
+            return PROBE_GIT_ONLY, [], None
+        return UNDETERMINED, [], None
     except Exception:
-        return UNDETERMINED, []
+        return UNDETERMINED, [], None
 
     if not isinstance(rows, list):
-        return UNDETERMINED, []
+        return UNDETERMINED, [], None
     matches = [
         row for row in rows
         if isinstance(row, dict)
@@ -170,13 +185,14 @@ def probe_token(
         and str(row.get("name") or "").strip().lower() == HERMES_TOKEN_NAME
     ]
     if not matches:
-        return PROBE_NOT_FOUND, []
+        return PROBE_NOT_FOUND, [], None
     if len(matches) > 1:
         # We cannot tell which of them is the one just submitted, so we would be
         # recording someone else's scope set. Refuse instead of guessing.
-        return PROBE_AMBIGUOUS, []
+        return PROBE_AMBIGUOUS, [], None
     scopes = [str(s) for s in (matches[0].get("scopes") or []) if str(s).strip()]
-    return PROBE_OK, scopes
+    expires_at = str(matches[0].get("expires_at") or "").strip() or None
+    return PROBE_OK, scopes, expires_at
 
 
 def gitlab_config_entry(shared_home: Path) -> Optional[dict[str, Any]]:
@@ -272,12 +288,12 @@ def submit_personal_token(
     *,
     profile_name: str,
     token: str,
-    expires_on: str,
     tier: str,
     shared_home: Path,
     host: str = DEFAULT_HOST,
     db_path: Optional[Path] = None,
     prober: Any = None,
+    expires_on: str = "",
 ) -> dict[str, Any]:
     """Validate an employee's token and store it under their own profile.
 
@@ -287,8 +303,15 @@ def submit_personal_token(
     they handed over, and one less powerful means the connector would silently
     fail at the job they expect it to do.
 
+    The expiry is read off the token's own GitLab row (see
+    :func:`expiry_from_gitlab`); ``expires_on`` is DEPRECATED and ignored — kept
+    only so not-yet-shipped callers that still pass it keep working (the
+    broker-gitlab-token-endpoint branch, older WebUI payloads). Remove once both
+    have shipped.
+
     Raises :class:`TokenRejected` with an employee-facing reason on any gate.
     """
+    del expires_on  # deprecated: expiry comes from the GitLab probe row
     shared_home = Path(shared_home)
     cleaned = str(token or "").strip()
     if not cleaned:
@@ -296,12 +319,11 @@ def submit_personal_token(
     if tier not in VALID_TIERS:
         raise TokenRejected("请先选择授权档位（只读 / 可写）。")
 
-    expires_at = parse_expiry(expires_on)
     entry = assert_runtime_contract_live(shared_home, profile_name=profile_name)
     subject_id = str(entry["subject_id"]).strip()
 
     probe = prober or probe_token
-    verdict, scopes = probe(cleaned, host=host)
+    verdict, scopes, expiry_raw = probe(cleaned, host=host)
 
     if verdict == INVALID_TOKEN:
         raise TokenRejected(
@@ -347,6 +369,11 @@ def submit_personal_token(
             "你选的是「只读」，但这个 token 带着 api 权限——那是对所有项目的完整读写，"
             "比你以为的大。请重建一个只勾 read_api + read_repository 的，或改选「可写」。"
         )
+
+    # Scopes are right — now the expiry, read off the same GitLab row. Checked
+    # last so the employee gets at most one "rebuild it" message per round, with
+    # everything else already correct.
+    expires_at = expiry_from_gitlab(expiry_raw)
 
     # Retire the legacy file FIRST: if this fails the user stays exactly as they
     # were, instead of ending up with a personal env token and a global on disk.
@@ -409,24 +436,22 @@ def _demo() -> None:
             "kep-prd-skills"
         )
 
-        for bad in ("", "not-a-date", "2000-01-01"):
+        for bad in ("", None, "not-a-date", "2000-01-01"):
             try:
-                parse_expiry(bad)
+                expiry_from_gitlab(bad)
             except TokenRejected as exc:
-                assert not bad.strip() or bad not in exc.reason
+                assert not str(bad or "").strip() or str(bad) not in exc.reason
             else:  # pragma: no cover
                 raise AssertionError(f"expiry {bad!r} should have been rejected")
+        assert expiry_from_gitlab("2099-01-01") == 4070908800000
 
-        common = dict(
-            profile_name="alice", token="t", expires_on="2099-01-01",
-            tier=TIER_READ, shared_home=home,
-        )
+        common = dict(profile_name="alice", token="t", tier=TIER_READ, shared_home=home)
 
         # Every non-OK lookup outcome must refuse.
         for status in (INVALID_TOKEN, UNDETERMINED, PROBE_GIT_ONLY,
                        PROBE_NOT_FOUND, PROBE_AMBIGUOUS):
             try:
-                submit_personal_token(**common, prober=lambda *a, _s=status, **k: (_s, []))
+                submit_personal_token(**common, prober=lambda *a, _s=status, **k: (_s, [], None))
             except TokenRejected:
                 pass
             else:  # pragma: no cover
@@ -439,7 +464,10 @@ def _demo() -> None:
             ([], "no scopes at all"),
         ):
             try:
-                submit_personal_token(**common, prober=lambda *a, _s=scopes, **k: (PROBE_OK, _s))
+                submit_personal_token(
+                    **common,
+                    prober=lambda *a, _s=scopes, **k: (PROBE_OK, _s, "2099-01-01"),
+                )
             except TokenRejected:
                 pass
             else:  # pragma: no cover
@@ -447,12 +475,23 @@ def _demo() -> None:
         try:
             submit_personal_token(
                 **{**common, "tier": TIER_WRITE},
-                prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"]),
+                prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"], "2099-01-01"),
             )
         except TokenRejected:
             pass
         else:  # pragma: no cover
             raise AssertionError("write tier given a read-only token should be rejected")
+
+        # A never-expiring token is refused even with perfect scopes.
+        try:
+            submit_personal_token(
+                **common,
+                prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"], None),
+            )
+        except TokenRejected:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("null expires_at should have been rejected")
 
         # An incomplete runtime contract must refuse in every shape.
         for kwargs in ({"self_lane": False}, {"env": False}, {"profiles": "[bob]"}):
@@ -473,10 +512,15 @@ def _demo() -> None:
         legacy.mkdir(parents=True)
         (legacy / "gitlab.token").write_text("global-token\n", encoding="utf-8")
         result = submit_personal_token(
-            **common, prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"])
+            **common,
+            # The date that used to 400 the whole form — now ignored entirely:
+            # the stored expiry comes from the probe row, not this argument.
+            expires_on="2031-11-31",
+            prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"], "2099-01-01"),
         )
         assert result["stored"] and result["tier"] == TIER_READ
         assert result["scopes"] == ["read_api", "read_repository"]
+        assert result["expires_at"] == 4070908800000
         assert result["legacy_file_retired"] is True
         assert not (legacy / "gitlab.token").exists()
 
@@ -502,18 +546,23 @@ def _demo() -> None:
             return _open
 
         assert probe_token("t", opener=_rows(
-            [{"name": "hermes", "active": True, "scopes": ["api"]}]
-        )) == (PROBE_OK, ["api"])
+            [{"name": "hermes", "active": True, "scopes": ["api"],
+              "expires_at": "2099-01-01"}]
+        )) == (PROBE_OK, ["api"], "2099-01-01")
+        # A row with no expiry still probes OK — the refusal happens at submit.
+        assert probe_token("t", opener=_rows(
+            [{"name": "hermes", "active": True, "scopes": ["api"], "expires_at": None}]
+        )) == (PROBE_OK, ["api"], None)
         assert probe_token("t", opener=_rows(
             [{"name": "other", "active": True, "scopes": ["api"]}]
-        )) == (PROBE_NOT_FOUND, [])
+        )) == (PROBE_NOT_FOUND, [], None)
         assert probe_token("t", opener=_rows(
             [{"name": "hermes", "active": False, "scopes": ["api"]}]
-        )) == (PROBE_NOT_FOUND, [])
+        )) == (PROBE_NOT_FOUND, [], None)
         assert probe_token("t", opener=_rows([
             {"name": "hermes", "active": True, "scopes": ["api"]},
             {"name": "hermes", "active": True, "scopes": ["read_api"]},
-        ])) == (PROBE_AMBIGUOUS, [])
+        ])) == (PROBE_AMBIGUOUS, [], None)
         print("gitlab_token_intake self-check OK")
 
 
