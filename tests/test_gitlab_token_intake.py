@@ -7,7 +7,6 @@ from hermes_multitenancy.gitlab_token_intake import (
     HERMES_TOKEN_NAME,
     SCOPE_BINDING_UNVERIFIED,
     INVALID_TOKEN,
-    PROBE_AMBIGUOUS,
     PROBE_GIT_ONLY,
     PROBE_NOT_FOUND,
     PROBE_OK,
@@ -125,12 +124,43 @@ def test_only_an_active_row_with_the_agreed_name_counts():
     )) == (PROBE_NOT_FOUND, [], None)
 
 
-def test_duplicate_names_are_ambiguous_not_a_guess():
-    """Picking one would record a scope set that may belong to the other token."""
+def test_duplicate_names_pick_the_newest_created_row():
+    """Stale hermes tokens from earlier rounds must not dead-end the submit
+    (sunke 2026-08-05: 「能用不就行了」). The real-world flow is create-then-
+    paste, so the newest created row is the one being submitted; a wrong pick
+    only mislabels (SCOPE_BINDING_UNVERIFIED accepted-debt class), never
+    escalates."""
     assert probe_token("t", opener=_rows([
-        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"]},
-        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["read_api"]},
-    ])) == (PROBE_AMBIGUOUS, [], None)
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"],
+         "created_at": "2026-08-01T00:00:00Z", "expires_at": "2027-01-01"},
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["read_api"],
+         "created_at": "2026-08-05T00:00:00Z", "expires_at": "2027-06-01"},
+    ])) == (PROBE_OK, ["read_api"], "2027-06-01")
+    # Order in the listing must not matter — only created_at does.
+    assert probe_token("t", opener=_rows([
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["read_api"],
+         "created_at": "2026-08-05T00:00:00Z", "expires_at": "2027-06-01"},
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"],
+         "created_at": "2026-08-01T00:00:00Z", "expires_at": "2027-01-01"},
+    ])) == (PROBE_OK, ["read_api"], "2027-06-01")
+
+
+def test_garbage_or_missing_created_at_never_beats_a_real_timestamp():
+    """codex review: a raw lexicographic sort would let a garbage created_at
+    string ("zzz…") outrank every legitimate ISO timestamp. Parse defensively:
+    unparseable/missing sorts as oldest-possible, so the real timestamp wins."""
+    assert probe_token("t", opener=_rows([
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"],
+         "created_at": "zzz-not-a-date", "expires_at": "2027-01-01"},
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["read_api"],
+         "created_at": "2026-08-05T00:00:00Z", "expires_at": "2027-06-01"},
+    ])) == (PROBE_OK, ["read_api"], "2027-06-01")
+    assert probe_token("t", opener=_rows([
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["api"],
+         "expires_at": "2027-01-01"},
+        {"name": HERMES_TOKEN_NAME, "active": True, "scopes": ["read_api"],
+         "created_at": "2026-08-05T00:00:00Z", "expires_at": "2027-06-01"},
+    ])) == (PROBE_OK, ["read_api"], "2027-06-01")
 
 
 def test_401_is_an_invalid_token():
@@ -158,7 +188,7 @@ def test_network_failure_is_undetermined_not_a_pass():
 
 
 @pytest.mark.parametrize(
-    "status", [INVALID_TOKEN, UNDETERMINED, PROBE_GIT_ONLY, PROBE_NOT_FOUND, PROBE_AMBIGUOUS]
+    "status", [INVALID_TOKEN, UNDETERMINED, PROBE_GIT_ONLY, PROBE_NOT_FOUND]
 )
 def test_no_lookup_outcome_but_ok_may_store(monkeypatch, tmp_path, status):
     """Fail closed: if we could not read the real scopes, nothing is banked."""
