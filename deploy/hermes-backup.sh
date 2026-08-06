@@ -301,6 +301,10 @@ prune() {
   local n; n=$(ls -1d "$root"/*/ 2>/dev/null | wc -l)
   if [ "$n" -gt "$keep" ]; then
     ls -1d "$root"/*/ | sort | head -n "$((n - keep))" | while read -r old; do
+      # profiles 快照里有用户 home 的 Go modules 等只读文件（go mod cache 的
+      # 文件权限是 0444），rm -rf 会 permission denied 导致整个备份退出码 1。
+      # 先 chmod -R u+w 解除只读位再删（生产 #backup-fail-20260806）。
+      chmod -R u+w "$old" 2>/dev/null || true
       rm -rf "$old"; log "  裁剪 $(basename "${old%/}")"
     done
   fi
