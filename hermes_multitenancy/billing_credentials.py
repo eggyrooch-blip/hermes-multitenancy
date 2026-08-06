@@ -13,6 +13,17 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
+from .billing_employee_key import (
+    _MIN_LIFETIME_MS,
+    _NO_REDIRECT_OPENER,
+    AccountDriftError,
+    needs_new_key,
+    EmployeeKeyError,
+    IssuedKey,
+    check_account_drift,
+    next_credential_version,
+    to_vault_payload,
+)
 from .credentials import CredentialStore
 from .run_broker import RunRejected
 
@@ -69,7 +80,13 @@ class BillingGatewayClient:
         token: str = "",
         *,
         timeout: float = 5.0,
-        opener: Callable[..., Any] = urllib.request.urlopen,
+        # Same shared no-follow opener EmployeeKeyClient._post and
+        # BillingCredentialManager._probe_key use (defined once in
+        # billing_employee_key.py). This request carries the broker bearer
+        # that mints/renews any employee's credential via legacy ensure/ack
+        # — the exact same class of leak ecc9b16 fixed on the employee-key
+        # transport, just on this one. A redirect here must fail, not follow.
+        opener: Callable[..., Any] = _NO_REDIRECT_OPENER.open,
     ) -> None:
         self.base_url = str(base_url or "").strip().rstrip("/")
         self.token = str(token or "").strip()
@@ -213,6 +230,102 @@ class BillingCredentialManager:
                 gone_reissues_remaining=1,
             )
 
+    def adopt_employee_key(
+        self, payer: _ResolvedPayer, issued: IssuedKey
+    ) -> BillingIdentity:
+        """Store a credential minted by the gateway's employee-key endpoint.
+
+        The counterpart to :meth:`ensure_available` for the auto-provisioning
+        path: that one speaks the ensure/ack protocol, this one takes a key the
+        gateway already minted and makes it the live credential for this payer.
+
+        Fails closed. A drift or shape problem raises BEFORE anything is
+        written, so a rejected issuance never half-lands — the previous
+        credential stays exactly as it was.
+        """
+        if issued.employee_id != payer.employee_user_id:
+            raise RunRejected("billing credential is for a different employee")
+        if issued.email.casefold() != payer.email.casefold():
+            raise RunRejected("billing credential is for a different email")
+        # NOTE on the two checks above: both sides come from the request we
+        # made, so they catch a caller wiring the wrong payer — they do NOT
+        # authenticate the gateway's answer. The only field that does is
+        # `account_identity_verified`, which is why an unverified credential is
+        # refused outright rather than stored: a binding we cannot attribute
+        # would bill somebody. Under-counting (no binding, run unattributed) is
+        # a finance gap; mis-counting is charging the wrong person.
+        if not issued.account_identity_verified:
+            # RunRejected on this branch. The `billing-degrade-not-refuse` slug
+            # introduces BillingUnavailable and should retype this on rebase:
+            # semantically this is "could not obtain a usable credential",
+            # which that slug degrades past instead of refusing service.
+            raise RunRejected(
+                "gateway could not verify the credential's account identity"
+            )
+        # Defense in depth: EmployeeKeyClient._validate already enforces this
+        # floor on the HTTP response, but that check lives on the client,
+        # not on this method — the actual vault-write boundary. Anything
+        # that builds an IssuedKey directly and calls adopt_employee_key
+        # (a future caller, a test helper mistake, a bug in a client
+        # subclass) would otherwise land a below-floor key — inside its own
+        # refresh window the instant it is stored — with no defense left.
+        # Same constant as the client: one floor, checked at both the
+        # network boundary and the storage boundary.
+        if issued.expires_at_ms - self._now_ms() < _MIN_LIFETIME_MS:
+            raise RunRejected("billing credential lifetime is implausible")
+        with self._payer_lock(payer.employee_user_id):
+            stored = self._load_payload(payer.profile_name, payer.employee_user_id)
+            try:
+                check_account_drift(issued, stored)
+                payload = to_vault_payload(
+                    issued,
+                    profile_name=payer.profile_name,
+                    credential_version=next_credential_version(stored),
+                )
+            except AccountDriftError as exc:
+                raise RunRejected(str(exc)) from exc
+            except EmployeeKeyError as exc:
+                raise RunRejected(f"billing credential is unusable: {exc}") from exc
+            # A key that is syntactically fine (right shape, right subject,
+            # plausible lifetime) can still be unusable: wrong LiteLLM
+            # cluster, revoked the instant it was minted, whatever the
+            # gateway got wrong on its side. Nothing upstream of this line
+            # calls LiteLLM, so an unprobed key would overwrite the sole
+            # valid credential on faith alone. Probe it against the real
+            # endpoint before it is allowed to become the live row; a probe
+            # failure must leave the previous credential exactly as it was.
+            try:
+                self._probe(issued.api_key)
+            except Exception as exc:
+                raise RunRejected(
+                    f"billing credential failed activation probe: {exc}"
+                ) from exc
+            self._save_payload(payer.profile_name, payer.employee_user_id, payload)
+            return _binding_from_payload(payload)
+
+    def credential_source(self, payer: _ResolvedPayer) -> str:
+        """Which protocol currently owns this payer's stored credential.
+
+        Empty string for "nothing stored" or a pre-migration row that predates
+        the ``source`` marker. Read-only, used to route 401 repair to the
+        right protocol instead of always falling back to legacy ensure/ack.
+        """
+        with self._payer_lock(payer.employee_user_id):
+            stored = self._load_payload(payer.profile_name, payer.employee_user_id)
+        return str((stored or {}).get("source") or "")
+
+    def employee_key_needed(self, payer: _ResolvedPayer) -> bool:
+        """Read-only: does this payer need a key minted right now?
+
+        The caller mints only when this says so, then hands the result to
+        :meth:`adopt_employee_key`. Keeping the decision separate from the
+        minting is what lets a failed refresh be harmless — nothing is written,
+        so the still-valid stored credential keeps serving.
+        """
+        with self._payer_lock(payer.employee_user_id):
+            stored = self._load_payload(payer.profile_name, payer.employee_user_id)
+        return needs_new_key(stored, self._now_ms())
+
     def runtime_api_key(self, metadata: dict[str, Any]) -> str:
         employee_id = str(metadata.get("litellm_billing_employee_user_id") or "")
         profile_name = str(metadata.get("litellm_billing_profile_name") or "")
@@ -260,6 +373,23 @@ class BillingCredentialManager:
                 reason = force_reason or (
                     "invalid_401" if payload.get("invalid") else ""
                 )
+                if (
+                    not reason
+                    and payload.get("source") == "employee_key"
+                    and int(payload["expires_at"]) > now
+                ):
+                    # Maintained by the refresh sweep (one day before expiry),
+                    # not by this protocol's 23-30 day window. Both firing on
+                    # the same row would have them re-minting over each other.
+                    # `not reason` means this only guards the PASSIVE renewal
+                    # check: a forced reason (401 repair, "missing", ...) is
+                    # always non-empty and never reaches this branch. 401
+                    # repair for a source=employee_key row is routed by
+                    # BillingIdentityPreparer.repair_metadata to the
+                    # employee-key client before `ensure_available` is ever
+                    # called — this method sees invalid_401 only for
+                    # legacy-protocol rows.
+                    return binding
                 if not reason and int(payload["expires_at"]) > now:
                     jitter = _renew_jitter_ms(payer.employee_user_id)
                     if int(payload["expires_at"]) - now > _RENEW_WINDOW_MS - jitter:
@@ -601,7 +731,14 @@ class BillingCredentialManager:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            # Same class of leak ecc9b16 fixed on EmployeeKeyClient._post: the
+            # default opener follows 3xx and replays Authorization on the new
+            # origin, including https->http. This header carries a live
+            # per-employee billing key, so a redirect (misconfigured ingress,
+            # hijacked DNS) would hand it to whoever controls the redirect
+            # target. Reuse the same refuse-every-redirect opener; a redirect
+            # here must fail the probe, not follow it.
+            with _NO_REDIRECT_OPENER.open(request, timeout=5) as response:
                 response.read(1)
                 if int(getattr(response, "status", 200)) != 200:
                     raise RunRejected("billing credential validation failed")
