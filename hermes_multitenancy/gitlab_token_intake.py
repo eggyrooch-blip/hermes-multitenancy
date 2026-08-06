@@ -2,15 +2,16 @@
 
 Gates, all of which exist because the GitLab instance enforces none of them:
 
-* **An expiry is mandatory — read off GitLab, never typed.** CE 14.10 lets a
-  PAT be created with a blank expiry and self-managed CE has no instance-wide
-  maximum-lifetime policy, so nothing upstream will ever age this credential
-  out. The date comes from the token's own row in the same listing the scope
-  probe reads (``expires_at``: ``YYYY-MM-DD`` or null); a null row is refused
-  with rebuild guidance, because 14.10 cannot add an expiry to an existing PAT.
-  Employees no longer re-type the date — a hand-copied ``2031-11-31`` (a date
-  that does not exist) once 400'd the whole form. Expiry also bites at
-  runtime — an expired record is refused rather than injected.
+* **The expiry is RECORDED, never judged.** sunke 2026-08-06: 有效期归上游
+  GitLab 管，不是这里该拦的事。We copy whatever the token's own row says
+  (``expires_at``: ``YYYY-MM-DD`` or null) onto the vault row and store it —
+  a null simply means no expiry, which the vault already treats as
+  never-expires (``credentials.py``: the staleness check is guarded on
+  ``expires_at is not None``). Two earlier versions of this gate were removed
+  for good reason: employees had to hand-copy the date (a typo'd
+  ``2031-11-31`` 400'd the whole form), and then a null row was refused
+  outright — both dead-ended the submit over something GitLab, not hermes,
+  owns.
 
 * **The granted scopes must match the tier the employee picked.** Scopes are
   READ OFF GitLab, not inferred: the employee names the token
@@ -104,29 +105,33 @@ class TokenRejected(Exception):
         self.reason = reason
 
 
-def expiry_from_gitlab(raw: Any, *, today: Optional[date] = None) -> int:
-    """GitLab's ``expires_at`` (``YYYY-MM-DD`` or null) -> epoch ms at UTC midnight.
+def expiry_from_gitlab(raw: Any, *, today: Optional[date] = None) -> Optional[int]:
+    """GitLab's ``expires_at`` (``YYYY-MM-DD`` or null) -> epoch ms, or None.
 
-    The value comes off the token's own row in the probe listing, never from the
-    employee. Raises :class:`TokenRejected` on null (a never-expiring token) or
-    a non-future date.
+    Transcription — it NEVER rejects. Whether a token may live forever is
+    GitLab's call, not ours (sunke 2026-08-06). None means "no expiry we will
+    hold the runtime to", which the vault already reads as never-expires. An
+    unparseable value is None too: refusing a working token because we could
+    not read a date we do not even gate on would be the tail wagging the dog.
+
+    A date already in the past is ALSO stored as None, and that is the subtle
+    one (codex review). GitLab marks genuinely expired PATs inactive, so the
+    probe would not have handed us the row at all — an active row with a past
+    date means GitLab still considers it valid and we merely disagree by clock
+    or timezone. Writing that date through would make ``credentials.py``
+    refuse to inject the token on OUR clock, i.e. re-introduce the very expiry
+    judgement we just removed, and in the worst possible shape: intake reports
+    stored, every later call silently falls back to the shared credential.
     """
     text = str(raw or "").strip()
     if not text:
-        raise TokenRejected(
-            "这个 token 在 GitLab 上没有到期日，我们不收永久有效的。"
-            "GitLab 没法给建好的 token 补到期日——请重建一个填了到期日的"
-            f"（名字仍叫 {HERMES_TOKEN_NAME}），再来提交。"
-        )
+        return None
     try:
         parsed = datetime.strptime(text, "%Y-%m-%d").date()
     except ValueError:
-        # Defensive: 14.10 formats expires_at server-side as YYYY-MM-DD, so an
-        # unparseable value means upstream changed shape. NEVER echo it — this
-        # string is rendered into cards that persist in chat history.
-        raise TokenRejected("读不到这个 token 的到期日，请稍后重试或联系管理员。") from None
+        return None
     if parsed <= (today or datetime.now(timezone.utc).date()):
-        raise TokenRejected("这个 token 的到期日已过或就在今天，请在 GitLab 重建一个再提交。")
+        return None
     return int(
         datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc).timestamp() * 1000
     )
@@ -382,9 +387,8 @@ def submit_personal_token(
             "比你以为的大。请重建一个只勾 read_api + read_repository 的，或改选「可写」。"
         )
 
-    # Scopes are right — now the expiry, read off the same GitLab row. Checked
-    # last so the employee gets at most one "rebuild it" message per round, with
-    # everything else already correct.
+    # Transcribe whatever expiry GitLab has on the row (may be None). Not a
+    # gate — see the module docstring.
     expires_at = expiry_from_gitlab(expiry_raw)
 
     # Retire the legacy file FIRST: if this fails the user stays exactly as they
@@ -448,13 +452,10 @@ def _demo() -> None:
             "kep-prd-skills"
         )
 
-        for bad in ("", None, "not-a-date", "2000-01-01"):
-            try:
-                expiry_from_gitlab(bad)
-            except TokenRejected as exc:
-                assert not str(bad or "").strip() or str(bad) not in exc.reason
-            else:  # pragma: no cover
-                raise AssertionError(f"expiry {bad!r} should have been rejected")
+        # Transcription only — nothing here may raise. Blank / unreadable /
+        # already-past all collapse to None (no expiry held against the runtime).
+        for blank in ("", None, "not-a-date", "2000-01-01"):
+            assert expiry_from_gitlab(blank) is None
         assert expiry_from_gitlab("2099-01-01") == 4070908800000
 
         common = dict(profile_name="alice", token="t", tier=TIER_READ, shared_home=home)
@@ -493,16 +494,13 @@ def _demo() -> None:
         else:  # pragma: no cover
             raise AssertionError("write tier given a read-only token should be rejected")
 
-        # A never-expiring token is refused even with perfect scopes.
-        try:
-            submit_personal_token(
-                **common,
-                prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"], None),
-            )
-        except TokenRejected:
-            pass
-        else:  # pragma: no cover
-            raise AssertionError("null expires_at should have been rejected")
+        # A never-expiring token is ACCEPTED and stored with expires_at=None:
+        # whether a token may live forever is GitLab's call, not ours.
+        never = submit_personal_token(
+            **common,
+            prober=lambda *a, **k: (PROBE_OK, ["read_api", "read_repository"], None),
+        )
+        assert never["stored"] and never["expires_at"] is None
 
         # An incomplete runtime contract must refuse in every shape.
         for kwargs in ({"self_lane": False}, {"env": False}, {"profiles": "[bob]"}):

@@ -1,4 +1,5 @@
 """Employee GitLab token intake: gates, storage, and the Feishu submit guards."""
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -43,18 +44,20 @@ def _home(tmp_path: Path) -> Path:
 # -- expiry gate -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", ["", "   ", None, "not-a-date", "2026/01/01", "2000-01-01"])
-def test_expiry_is_mandatory_and_must_be_in_the_future(bad):
-    """GitLab CE 14.10 allows a blank expiry and has no max-lifetime policy, so
-    this gate is the only thing standing between us and a permanent token. The
-    value comes off the token's own GitLab row now — None is a never-expiring
-    token and must refuse."""
-    with pytest.raises(TokenRejected):
-        expiry_from_gitlab(bad)
+@pytest.mark.parametrize("blank", ["", "   ", None, "not-a-date", "2026/01/01", "2000-01-01"])
+def test_unreadable_or_absent_expiry_is_None_never_an_error(blank):
+    """Transcription, not a gate (sunke 2026-08-06: 有效期归上游 GitLab 管).
+    None means "no expiry on the row" and the vault already reads that as
+    never-expires. Refusing here would dead-end a submit over something we do
+    not even gate on."""
+    assert expiry_from_gitlab(blank) is None
 
 
 def test_expiry_parses_to_utc_midnight_epoch_ms():
     assert expiry_from_gitlab("2099-01-01") == 4070908800000
+    # 边界：到期日就是今天也算不再持有（今天午夜早已过去）。
+    assert expiry_from_gitlab("2026-08-06", today=date(2026, 8, 6)) is None
+    assert expiry_from_gitlab("2026-08-07", today=date(2026, 8, 6)) is not None
 
 
 # -- scope probe -------------------------------------------------------------
@@ -256,7 +259,12 @@ def test_submit_retires_the_legacy_file_synchronously(monkeypatch, tmp_path):
 
 
 def test_unremovable_legacy_file_fails_closed_and_stores_nothing(monkeypatch, tmp_path):
-    """Half-switched is worse than not switched: refuse rather than split."""
+    """Half-switched is worse than not switched: refuse rather than split.
+
+    Also the last refusing branch the no-echo sweeps cannot reach (it fires
+    after the probe, on the filesystem) — codex delta review named it, so the
+    token-absent assertion rides here rather than in a fourth sweep.
+    """
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = _home(tmp_path)
     legacy = shared / "profiles" / "alice" / "workspace" / "credentials"
@@ -267,12 +275,13 @@ def test_unremovable_legacy_file_fails_closed_and_stores_nothing(monkeypatch, tm
         raise OSError("read-only fs")
 
     monkeypatch.setattr(Path, "unlink", _boom)
-    with pytest.raises(TokenRejected):
+    with pytest.raises(TokenRejected) as exc:
         submit_personal_token(
-            profile_name="alice", token="glpat-x",
+            profile_name="alice", token="glpat-SECRETVALUE",
             tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
         )
     assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
+    assert "glpat-SECRETVALUE" not in exc.value.reason
 
 
 @pytest.mark.parametrize("drop", ["vault_profile", "env", "targeting"])
@@ -320,42 +329,100 @@ def test_refuses_while_the_self_lane_is_not_deployed(monkeypatch, tmp_path):
         )
 
 
-def test_rejection_reason_never_echoes_the_raw_value(monkeypatch, tmp_path):
-    """Defensive no-echo: rejection reasons render into cards that persist in
-    chat history, so even a GitLab-sourced value that fails to parse must never
-    appear in the reason verbatim."""
+@pytest.mark.parametrize(
+    "status", [INVALID_TOKEN, UNDETERMINED, PROBE_GIT_ONLY, PROBE_NOT_FOUND]
+)
+def test_no_rejection_reason_ever_echoes_the_token(monkeypatch, tmp_path, status):
+    """Rejection reasons render into Feishu cards that persist in chat history,
+    so the submitted token must never appear in one verbatim. Swept across every
+    refusing path rather than a single one — a new gate that interpolates the
+    token would otherwise slip in unnoticed."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _home(tmp_path)
     secret = "glpat-SECRETVALUE"
     with pytest.raises(TokenRejected) as exc:
-        expiry_from_gitlab(secret)
+        submit_personal_token(
+            profile_name="alice", token=secret,
+            tier=TIER_READ, shared_home=shared,
+            prober=lambda *a, **k: (status, [], None),
+        )
     assert secret not in exc.value.reason
 
 
-def test_never_expiring_token_is_refused_and_stores_nothing(monkeypatch, tmp_path):
-    """A null expires_at row is a permanent token — the one thing this gate
-    exists to keep out of the vault. 14.10 cannot add an expiry to an existing
-    PAT, so the reason must steer the employee to rebuild."""
+@pytest.mark.parametrize(
+    "tier,prober_scopes,why",
+    [
+        (TIER_READ, WRITE_SCOPES, "只读档收到 api token"),
+        (TIER_WRITE, READ_SCOPES, "可写档收到只读 token"),
+        (TIER_READ, ["read_api"], "缺 read_repository"),
+        ("bogus-tier", READ_SCOPES, "非法档位"),
+    ],
+)
+def test_no_scope_or_tier_rejection_echoes_the_token(
+    monkeypatch, tmp_path, tier, prober_scopes, why
+):
+    """codex review: 原来只扫了 probe 失败一类路径。scope/档位这几条会把档位名和
+    scope 名拼进更长的句子，正是最容易顺手把 token 也拼进去的地方。"""
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = _home(tmp_path)
-    with pytest.raises(TokenRejected, match="没有到期日"):
+    secret = "glpat-SECRETVALUE"
+    with pytest.raises(TokenRejected) as exc:
         submit_personal_token(
-            profile_name="alice", token="glpat-x",
-            tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES, expires_at=None),
+            profile_name="alice", token=secret,
+            tier=tier, shared_home=shared, prober=_ok(prober_scopes),
         )
-    assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
+    assert secret not in exc.value.reason, why
 
 
-def test_already_expired_token_is_refused(monkeypatch, tmp_path):
-    """An expired record would be refused at runtime anyway; catch it at intake
-    where the employee can still act on it."""
+def test_runtime_contract_rejection_does_not_echo_the_token(monkeypatch, tmp_path):
+    """The runtime-contract path refuses BEFORE the probe runs, so it is the one
+    branch the probe-driven sweeps above can never reach."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    shared.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        "credentials:\n  - subject_id: kep-prd-skills\n    provider: gitlab\n"
+        "    secret_kind: token\n    profiles: ['*']\n",
+        encoding="utf-8",
+    )
+    secret = "glpat-SECRETVALUE"
+    with pytest.raises(TokenRejected) as exc:
+        submit_personal_token(
+            profile_name="alice", token=secret,
+            tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
+        )
+    assert secret not in exc.value.reason
+
+
+def test_never_expiring_token_is_stored_with_a_null_expiry(monkeypatch, tmp_path):
+    """sunke 2026-08-06 拍板：有效期归上游 GitLab 管，不是这里该拦的。
+    A null row must NOT dead-end the submit — store it with expires_at=None,
+    which credentials.py already treats as never-expires (its staleness check
+    is guarded on ``expires_at is not None``)."""
     monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
     shared = _home(tmp_path)
-    with pytest.raises(TokenRejected):
-        submit_personal_token(
-            profile_name="alice", token="glpat-x",
-            tier=TIER_READ, shared_home=shared,
-            prober=_ok(READ_SCOPES, expires_at="2000-01-01"),
-        )
-    assert not (shared / "multitenancy.db").exists() or _vault_empty(shared)
+    result = submit_personal_token(
+        profile_name="alice", token="glpat-x",
+        tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES, expires_at=None),
+    )
+    assert result["stored"] and result["expires_at"] is None
+    assert not _vault_empty(shared), "永久 token 也要真入库"
+
+
+def test_a_past_expiry_is_accepted_and_stored_as_no_expiry(monkeypatch, tmp_path):
+    """codex review 抓到的静默坏状态：过去的日期若原样写进 vault，
+    ``credentials.py`` 会按**我们的**时钟判它过期并拒绝注入 —— intake 报「已保存」，
+    之后每次调用却悄悄回落到共享凭据。GitLab 会把真过期的 PAT 标为 inactive（那样
+    probe 根本拿不到行），所以 active 行带过去日期只意味着我们和 GitLab 的时钟/时区
+    不一致。存 None：不收，也不替 GitLab 判。"""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _home(tmp_path)
+    result = submit_personal_token(
+        profile_name="alice", token="glpat-x",
+        tier=TIER_READ, shared_home=shared,
+        prober=_ok(READ_SCOPES, expires_at="2000-01-01"),
+    )
+    assert result["stored"] and result["expires_at"] is None
 
 
 def test_caller_cannot_supply_an_expiry_at_all(monkeypatch, tmp_path):

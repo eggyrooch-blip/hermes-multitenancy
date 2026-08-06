@@ -331,3 +331,24 @@ dangling PREV 拒绝、STABLE_BIN 首次 bootstrap 的 live 路径、expert 单�
 - **配套（可选，但成因就在这）**：给打标签这一步一个动词（从 main 的两仓 HEAD 生成 annotation、
   校验 SHA 确在 main、推受保护标签），并允许手动立刻触发一次执行器，
   让「正规路径」比 ssh 手翻更省事——否则诱因还在。
+
+## 2026-08-06 · `expires_at` 一个字段兼任「展示事实」与「本地失效门」（codex 复评，deferred）
+
+**现状**：vault 行的 `expires_at` 既是「这枚 token 什么时候到期」的事实记录，又被
+`credentials.py:158` 拿来做本地失效判定（到点即拒绝注入）。两种用途的正确来源不同：
+前者应如实反映 GitLab，后者本应由 GitLab 说了算。
+
+**本单（gitlab-drop-expiry-gate）做了什么**：sunke 拍板「有效期归上游 GitLab 管，不是
+hermes 该判的」，于是 intake 不再因到期日拒收；并且**过去的日期不写进 vault（存 None）**——
+否则 intake 报「已保存」，运行时却按我们的时钟判过期拒注入，之后每次调用静默回落到共享
+凭据，是最坏的一种失败形态。
+
+**残留（本单不修）**：这只压住了最坏形态，没有拆掉两种用途的耦合。时钟/时区分歧仍可能在
+未来某个边界重新表现出来（比如 GitLab 认为还有效、我们已判过期）。真正的解是把字段拆成
+「展示用的 expires_at（如实抄）」和「本地失效用的 enforce_until（可为空＝不本地失效）」，
+涉及 vault schema 与所有 provider 的消费方，独立重构。
+
+**为什么不夹带进本单**：本单是 credential intake 的准入语义变更，sunke 正在等着绑 token；
+把 schema 重构塞进来会把一个可当场验证的小改动变成跨 provider 的大改。
+
+**触发条件**：再出现一次「凭据显示已绑定但实际走了共享凭据」的报障，就该排这条。
