@@ -218,17 +218,34 @@ def test_http_runtime_env_is_consumed_and_rejected(monkeypatch):
 
 
 def test_pre_ack_vault_persist_failure_never_calls_ack(tmp_path: Path):
+    import sqlite3
+
     from hermes_multitenancy.billing_identity import BillingCredentialManager
     from hermes_multitenancy.credentials import CredentialStore
     from hermes_multitenancy.run_broker import RunRejected
 
+    db_path = tmp_path / "vault.db"
+
     class JournalFailingVault(CredentialStore):
-        def put_credential(self, **_kwargs):
-            raise RuntimeError("journal unavailable")
+        def put_credential(self, **kwargs):
+            # A REAL SQLITE_BUSY (codex r3 #2: a hand-built exception with a
+            # manually-assigned ``sqlite_errorcode`` attribute proves
+            # nothing about what SQLite actually raises). A second
+            # connection holds a genuine EXCLUSIVE lock on this same file,
+            # so the underlying INSERT below genuinely fails.
+            blocker = sqlite3.connect(db_path, timeout=0.05)
+            blocker.execute("BEGIN EXCLUSIVE")
+            try:
+                return super().put_credential(**kwargs)
+            finally:
+                blocker.rollback()
+                blocker.close()
 
     gateway = FakeGateway([FIXTURE["ensure_issued_response"]])
+    vault = JournalFailingVault(db_path, encryption_key=VAULT_KEY)
+    vault._conn.execute("PRAGMA busy_timeout = 50")  # keep the test fast
     manager = BillingCredentialManager(
-        vault=JournalFailingVault(tmp_path / "vault.db", encryption_key=VAULT_KEY),
+        vault=vault,
         gateway=gateway,
         model_base_url=BASE_URL,
         now_ms=lambda: NOW_MS,

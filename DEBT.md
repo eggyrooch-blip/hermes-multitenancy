@@ -368,3 +368,30 @@ hermes 该判的」，于是 intake 不再因到期日拒收；并且**过去的
 **触发条件**：下次碰 `billing_readiness.py` 时确认是否还有任何调用方（含手工 CLI 脚本/文档
 指引的调用方式）；如果确认彻底无人用，直接删掉 `verify_enabled_environment` 连带
 `tests/test_billing_readiness.py` 里只测它的用例，不必等一个专门 slug。
+
+## 2026-08-06 · codex 终审 ship-with-debt 残留两条 #p1（billing-degrade-not-refuse）
+
+**背景**：codex 终局评审判 ship-with-debt（无 P0）。回执两次被 ftask 拒收——台账里的 open
+finding ID 长 123/131 字符，超出 `FINDING_ID` 正则的 120 上限（写入侧没做同样校验），叠加
+「终局裁决禁开新 ID」+「concerns 必须带 ID」形成记账死结。债按 ftask 自己的约定
+（"Review findings shipped as debt (concerns never block)"）落在这里，不落回执。
+
+**#1 `BillingGatewayClient._post` 畸形 DNS label 分类成可降级**（原 ID:
+`billing_credentials.py:BillingGatewayClient._post/_gateway_rejection:broker-not-configured-degrades#p1`）
+- 症状：label 含下划线/空组件/首尾连字符的 broker URL 过了 ASCII 正则 + IDNA 兜底，到 opener
+  才炸 DNS，被归成 `broker_unavailable`（可降级）→ **永久配置错**的 cohort 请求会静默走共享
+  key，账一直记不上而无人知晓。codex 实测 `https://foo_bar.example` 复现。
+- 修法：`_post` 统一 IDNA 规范化 + 逐 label 校验（1-63 字节、非空、字母数字边界、主体仅
+  字母数字连字符、总长合法）；bearer 拒控制字符；请求构造期 `ValueError` 归
+  `broker_not_configured`（不可降级）；补 `ensure()` 全链测试断言 opener 从未被调用。
+
+**#2 `_is_vault_unavailable` 漏 SQLite 扩展错误码**（原 ID:
+`billing_credentials.py:_load_payload/_save_payload/_delete_payload:operational-error-classification-too-broad#p1`）
+- 症状：精确比对原生码，`SQLITE_LOCKED_SHAREDCACHE`(262) 等扩展码不被认作"暂态不可用"，
+  仅仅锁表的瞬间 cohort 成员被 `RunRejected` 拒服务——与本单「锁表应降级」的既定策略相反。
+  codex 用真实共享缓存锁复现。
+- 修法：要求整数码并以 `(code & 0xFF)` 比对 BUSY/LOCKED/FULL；补一条经 manager 路径的
+  共享缓存锁回归测试。
+
+**触发条件**：两条都在降级边界上，下一个碰 `billing_credentials.py` 的 slug 顺手清；或计费
+全员稳定运行一周后专门开一个小 slug 一起修。

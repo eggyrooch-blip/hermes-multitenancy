@@ -1,11 +1,13 @@
 """AI Gateway contract client and encrypted per-payer LiteLLM credentials."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 from dataclasses import dataclass
 import re
+import sqlite3
 import threading
 import time
 from typing import Any, Callable
@@ -29,6 +31,12 @@ from .run_broker import RunRejected
 
 
 _EMPLOYEE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# A syntactically valid hostname (or bare IPv4). IPv6 literals never get here:
+# urlparse() itself raises on a malformed one, and a well-formed one is
+# returned by .hostname already stripped of its brackets, so it would fail
+# this test — the broker is always a DNS name in practice, and a literal
+# address in the EnvironmentFile is a misconfiguration we want to catch.
+_HOSTNAME_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 _OPAQUE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,191}")
 _CONTRACT_MAJOR = "1"
 _CONTRACT_VERSION = "1.0"
@@ -61,6 +69,18 @@ class _ResolvedPayer:
     profile_name: str
     email: str
     department_alias: str = ""
+
+
+class BillingUnavailable(RunRejected):
+    """We could not OBTAIN a usable credential for this payer.
+
+    Deliberately distinct from a plain :class:`RunRejected`, which means the
+    data we already hold is inconsistent (drift, mismatch, conflict). The
+    caller degrades on this one — billing is bookkeeping, and failing to bill
+    must not cost the employee their service — but never on the other, because
+    falling back on an inconsistency would hide a real defect inside normal
+    traffic.
+    """
 
 
 class _GatewayError(RuntimeError):
@@ -144,10 +164,56 @@ class BillingGatewayClient:
         *,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        parsed = urlparse(self.base_url)
+        try:
+            parsed = urlparse(self.base_url)
+            # ``.port`` forces port-syntax validation (out-of-range or
+            # non-numeric) that urlparse() alone skips; a malformed IPv6
+            # authority raises inside urlparse() itself, caught by the same
+            # except. codex r3 #1: previously a malformed authority reached
+            # the real opener() and came back as either a degradable
+            # broker_unavailable (URLError) or an uncaught
+            # http.client.InvalidURL — neither is right, this is OUR config
+            # being syntactically broken, never sent over the wire.
+            _ = parsed.port
+            # codex 终审 #1: `.port` only validates the PORT. A host carrying a
+            # space, backslash or control char still parsed fine, reached the
+            # opener, and came back as a degradable broker_unavailable — our
+            # own broken config wearing an outage's clothes. A hostname is
+            # letters/digits/dot/hyphen (and brackets/colons for IPv6, already
+            # covered by urlparse raising above); anything else is a typo in
+            # the EnvironmentFile, never something to put on the wire.
+            host = parsed.hostname or ""
+            # Structurally dangerous characters are rejected outright, ahead
+            # of the IDN fallback below — `idna` happily encodes a backslash,
+            # and some URL parsers treat `\` as `/`, so letting it through
+            # would turn a typo into a different destination.
+            if any(ch in host for ch in "\\<>\"{}|^`"):
+                raise ValueError("broker hostname contains unsafe characters")
+            if host and not _HOSTNAME_RE.fullmatch(host):
+                # ASCII didn't match — before calling it malformed, give a
+                # Unicode IDN its chance (codex 终审: the ASCII-only regex
+                # over-rejected internationalized domains, i.e. refused a
+                # LEGITIMATE broker as misconfiguration). If it encodes to
+                # punycode cleanly it is a real hostname; if not, it isn't.
+                try:
+                    host.encode("idna")
+                except (UnicodeError, UnicodeDecodeError):
+                    raise ValueError("malformed broker hostname") from None
+            # And validate the RAW string too, not just the parsed view:
+            # urlparse() follows WHATWG and silently STRIPS tab/CR/LF, so a
+            # base_url with an embedded tab yields a perfectly clean
+            # .hostname — while the request below is built from
+            # ``self.base_url`` verbatim, tab and all, and blows up out at the
+            # opener as a "broker unavailable" outage. Checking the parsed
+            # view alone cannot see this class at all.
+            if any(ch.isspace() or ord(ch) < 0x20 for ch in self.base_url):
+                raise ValueError("broker url contains whitespace or control characters")
+        except ValueError:
+            raise _GatewayError(503, "broker_not_configured", True)
         if (
             parsed.scheme != "https"
             or not parsed.netloc
+            or not parsed.hostname
             or parsed.username
             or parsed.password
             or parsed.query
@@ -188,6 +254,44 @@ class BillingGatewayClient:
         payload = _decode_json(raw)
         _require_contract(payload)
         return payload
+
+
+# Whitelist, not blacklist (codex r2 p1-2): only the two SQLite result codes
+# that mean "busy right now, try later" degrade. Everything else that raises
+# sqlite3.OperationalError — corrupted schema ("no such table"), a
+# read-only mount, an unopenable file — is broken or misconfigured, not
+# transient, even though they share the exception CLASS. Checked via
+# ``sqlite_errorcode``, never the message text (Python 3.11+).
+#
+# SQLITE_FULL (codex 终审 #2): a genuinely full disk surfaces from SQLite as
+# result code 13, NOT as OSError(ENOSPC) — the errno set below never sees it.
+# Without this entry the "disk filled up" case refused, which is precisely the
+# outcome the ENOSPC entry was added to prevent ("the billing disk is full,
+# therefore employees cannot use AI"). The rule is unchanged — data might be
+# wrong -> refuse; cannot write right now -> degrade — this just makes the
+# implementation actually reach it.
+_SQLITE_TRANSIENT_ERRORCODES = frozenset(
+    {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL}
+)
+
+# Same idea for bare OSError (e.g. a non-sqlite3 I/O layer): only errno
+# values that mean "resource busy right now" degrade. ENOENT (path doesn't
+# exist), EISDIR, EROFS (read-only), EACCES/EPERM (permission) are
+# configuration/deployment defects, not outages — PermissionError's errno
+# is never in this set, so it is correctly excluded without a separate
+# isinstance check.
+_OSERROR_TRANSIENT_ERRNOS = frozenset({errno.EAGAIN, errno.EBUSY, errno.ENOSPC})
+
+
+def _is_vault_unavailable(exc: Exception) -> bool:
+    """True only for a genuine transient failure to reach/use the vault
+    store itself — never for the vault being reachable but broken,
+    misconfigured, or denying access."""
+    if isinstance(exc, sqlite3.OperationalError):
+        return getattr(exc, "sqlite_errorcode", None) in _SQLITE_TRANSIENT_ERRORCODES
+    if isinstance(exc, OSError):
+        return exc.errno in _OSERROR_TRANSIENT_ERRNOS
+    return False
 
 
 class BillingCredentialManager:
@@ -255,11 +359,16 @@ class BillingCredentialManager:
         # would bill somebody. Under-counting (no binding, run unattributed) is
         # a finance gap; mis-counting is charging the wrong person.
         if not issued.account_identity_verified:
-            # RunRejected on this branch. The `billing-degrade-not-refuse` slug
-            # introduces BillingUnavailable and should retype this on rebase:
-            # semantically this is "could not obtain a usable credential",
-            # which that slug degrades past instead of refusing service.
-            raise RunRejected(
+            # Retyped on rebase, exactly as the key-client slug's handoff note
+            # asked (codex 终审 #3). Two separate decisions live here and they
+            # do NOT have to match: we still refuse to STORE an unattributable
+            # binding (mis-counting is charging the wrong person), but the RUN
+            # degrades — the employee gets served on the shared key, unbilled,
+            # with an audit line. Refusing the run would mean "the gateway had
+            # a verification hiccup, therefore this person cannot use AI",
+            # which is the gate this slug exists to remove. Nothing suspect is
+            # persisted either way.
+            raise BillingUnavailable(
                 "gateway could not verify the credential's account identity"
             )
         # Defense in depth: EmployeeKeyClient._validate already enforces this
@@ -486,7 +595,11 @@ class BillingCredentialManager:
             # once; a broker that keeps discarding fresh generations is an
             # outage, not something to hammer in an unbounded ensure loop.
             if gone_reissues_remaining <= 0:
-                raise RunRejected(
+                # Same class as _gateway_rejection's retryable branch: the
+                # broker keeps discarding fresh generations, which is an
+                # outage of OUR ability to obtain a credential, not a defect
+                # in data we already hold. Must degrade, not fail closed.
+                raise BillingUnavailable(
                     "employee billing initialization is temporarily unavailable"
                 )
             return self._ensure_locked(
@@ -689,7 +802,18 @@ class BillingCredentialManager:
                     secret_kind=_SECRET_KIND,
                 )
         except Exception as exc:
-            raise RunRejected("billing credential vault is unavailable") from exc
+            if _is_vault_unavailable(exc):
+                # Genuinely transient: locked/busy DB, resource-busy I/O.
+                raise BillingUnavailable("billing credential vault is unavailable") from exc
+            # Everything else here is "we reached the vault and something is
+            # wrong with what's in it or how we're allowed to read it":
+            # HMAC/decrypt failure (tamper or key drift — a security event),
+            # missing encryption key (config error), a corrupted schema, a
+            # read-only mount, a row that vanished between the status check
+            # and the read. Never degrade past this — falling back would
+            # hide exactly the kind of defect this slug's boundary exists to
+            # keep visible.
+            raise RunRejected("billing credential vault entry is invalid") from exc
         if not isinstance(payload, dict):
             raise RunRejected("billing credential vault entry is invalid")
         return dict(payload)
@@ -708,7 +832,12 @@ class BillingCredentialManager:
                     expires_at=int(payload["expires_at"]),
                 )
         except Exception as exc:
-            raise RunRejected("billing credential vault is unavailable") from exc
+            if _is_vault_unavailable(exc):
+                raise BillingUnavailable("billing credential vault is unavailable") from exc
+            # Config error (no encryption key configured), corrupted schema,
+            # read-only mount, or a permission/integrity failure — not
+            # "could not obtain", stays closed.
+            raise RunRejected("billing credential vault write was rejected") from exc
 
     def _delete_payload(self, profile_name: str, employee_id: str) -> None:
         try:
@@ -720,7 +849,9 @@ class BillingCredentialManager:
                     secret_kind=_SECRET_KIND,
                 )
         except Exception as exc:
-            raise RunRejected("billing credential vault is unavailable") from exc
+            if _is_vault_unavailable(exc):
+                raise BillingUnavailable("billing credential vault is unavailable") from exc
+            raise RunRejected("billing credential vault delete was rejected") from exc
 
     def _probe_key(self, api_key: str) -> None:
         if not _allowed_billing_endpoint(self._model_base_url, self._model_base_url):
@@ -799,11 +930,55 @@ def _idempotency_key(kind: str, body: dict[str, Any]) -> str:
     return hashlib.sha256(f"hermes-v1:{kind}:{canonical}".encode("utf-8")).hexdigest()
 
 
+_GATEWAY_UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
+
+# _post() mints these itself when the RESPONSE is broken/mismatched — not
+# when the gateway is unreachable — even though it sometimes labels them
+# with a 502/503 status. Must never degrade even if the status looks
+# transport-shaped.
+_GATEWAY_DATA_INTEGRITY_CODES = frozenset({
+    "invalid_response",
+    "invalid_json",
+    "invalid_error_envelope",
+    "unsupported_contract_version",
+})
+
+# Minted by US (grepped every ``_GatewayError(`` call site in this file —
+# these are the only two that never reach the network at all, both from
+# _post()'s own precondition check). A malformed/missing broker URL or
+# token is OUR configuration being broken, not the gateway being
+# unreachable — codex r2 p1-1: this must stay closed even though _post()
+# happens to label it 503, the same status a genuine outage uses.
+# ``broker_unavailable`` is deliberately NOT here: that one fires from a
+# real connection attempt (URLError/OSError) and is a genuine "could not
+# obtain" signal.
+_GATEWAY_CONFIG_CODES = frozenset({"broker_not_configured"})
+
+
 def _gateway_rejection(exc: _GatewayError) -> RunRejected:
+    # A conflict means the gateway holds data that contradicts ours — a human
+    # has to look.
     if exc.code in {"identity_conflict", "account_topology_conflict"}:
         return RunRejected("employee LiteLLM account requires manual reconciliation")
-    if exc.retryable:
-        return RunRejected("employee billing initialization is temporarily unavailable")
+    # "We got an answer and it's wrong" (contract drift, malformed JSON, a
+    # broken error envelope) is never "we couldn't get one" — degrading here
+    # would bury a real contract break inside normal traffic.
+    if exc.code in _GATEWAY_DATA_INTEGRITY_CODES:
+        return RunRejected(f"AI Gateway response was invalid ({exc.code})")
+    # Our own misconfiguration, never sent over the wire — stays closed so
+    # ops notices instead of every request silently degrading forever.
+    if exc.code in _GATEWAY_CONFIG_CODES:
+        return RunRejected(f"AI Gateway is misconfigured ({exc.code})")
+    # Whitelist by transport/service-availability HTTP status ONLY — never
+    # by the gateway's self-declared ``retryable`` flag. That flag is
+    # remote-supplied data; trusting it let auth failures (401/403) and
+    # unrecognized 4xx rejections degrade past whenever the gateway (bug or
+    # not) happened to mark them retryable. 502/503/504 are the actual
+    # "could not obtain" shapes: bad gateway, service unavailable, timeout.
+    if exc.status in _GATEWAY_UNAVAILABLE_STATUSES:
+        return BillingUnavailable(
+            "employee billing initialization is temporarily unavailable"
+        )
     return RunRejected("employee billing initialization was rejected")
 
 

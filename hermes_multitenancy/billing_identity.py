@@ -8,6 +8,7 @@ model runtime after RunBroker admission.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from dataclasses import replace
@@ -19,6 +20,7 @@ import time
 from typing import Any, Optional
 
 from .billing_credentials import (
+    BillingUnavailable,
     BillingCredentialManager,
     BillingGatewayClient,
     BillingIdentity,
@@ -255,6 +257,14 @@ class BillingIdentityPreparer:
                     and owner_binding.migration_state == "enforced"
                 )
             ):
+                # NOT degraded on purpose. ``_payer()`` returns None for several
+                # different reasons — sender/profile mismatch, a non-sync route,
+                # no routing row — and they are not the same kind of problem.
+                # The mismatch and non-sync cases are identity SAFETY: letting
+                # them through unattributed would quietly admit a run we
+                # currently refuse to attribute to anybody. One None cannot tell
+                # them apart, so this stays closed; the degrade lives where the
+                # reason is unambiguous (credential could not be obtained).
                 raise RunRejected("employee billing identity could not be resolved")
             return request if metadata == request.metadata else replace(
                 request, metadata=metadata
@@ -278,7 +288,24 @@ class BillingIdentityPreparer:
                 raise RunRejected("billing payer profile drift detected")
             if existing.email and existing.email.lower() != payer.email.lower():
                 raise RunRejected("billing payer email drift detected")
-        binding = self._credentials.ensure_available(payer, existing)
+        try:
+            binding = self._credentials.ensure_available(payer, existing)
+        except BillingUnavailable as exc:
+            # Could not OBTAIN a credential (gateway down, rejected, not yet
+            # provisioned). Inconsistency raises plain RunRejected and is NOT
+            # caught here — falling back on drift would bury a real defect.
+            #
+            # The decision belongs HERE, before the run is labelled enforced:
+            # marking it enforced and failing later would just move the refusal
+            # to the runtime guard, which is exactly what we are removing.
+            _log_billing_degraded(
+                employee_id=payer.employee_user_id,
+                profile_name=payer.profile_name,
+                reason=type(exc).__name__ + ":" + str(exc),
+            )
+            return request if metadata == request.metadata else replace(
+                request, metadata=metadata
+            )
         binding = replace(binding, migration_state="enforced")
         self._store.put(binding)
         metadata.update(_metadata_for_binding(binding, _billing_model_base_url()))
@@ -461,6 +488,41 @@ def _default_preparer() -> BillingIdentityPreparer:
                 ),
             )
         return _DEFAULT_PREPARER
+
+
+
+_BILLING_DEGRADED_EVENT = "billing_degraded_unattributed"
+
+
+def _log_billing_degraded(*, employee_id: str, profile_name: str, reason: str) -> None:
+    """One greppable line per unattributed run.
+
+    This is the whole price of dropping fail-closed: spend stops being fully
+    attributable, so the gap has to be countable. ``billing_degraded_unattributed``
+    is the fixed token to grep or alert on — never reword it.
+
+    MUST NEVER RAISE (codex r2 p1-3): this runs inside prepare()'s only
+    degrade branch, called after we've already decided the run should
+    complete unattributed. A broken log sink (handler misconfigured, disk
+    full, whatever) raising here would propagate out of prepare() and turn
+    the degrade decision back into a hard failure — the exact fail-closed
+    behavior sunke chose C to remove, reintroduced by the audit call meant
+    to make C observable. An audit failure is never grounds to refuse the
+    run it's trying to log.
+    """
+    line = (
+        f"{_BILLING_DEGRADED_EVENT} employee={employee_id or '-'} "
+        f"profile={profile_name or '-'} reason={reason}"
+    )
+    try:
+        logging.getLogger(__name__).warning(line)
+    except Exception:
+        try:
+            import sys
+
+            print(line, file=sys.stderr)
+        except Exception:
+            pass
 
 
 async def prepare_billing_request(request: RunRequest) -> RunRequest:
