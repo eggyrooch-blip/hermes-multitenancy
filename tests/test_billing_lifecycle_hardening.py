@@ -133,6 +133,32 @@ class ToggleRouting:
         )
 
 
+def _provision_as_the_sweep(
+    preparer, manager, employee_id="alice", profile_name=None, email=None
+):
+    """Give this payer a credential the way production now does.
+
+    Since `billing-runtime-never-mints` the employee's request path may not
+    mint, so a test that wants an ENFORCED payer has to provision first — which
+    is exactly the production order: the hourly sweep mints, then the employee's
+    request finds the key. `allow_mint` defaults to True here on purpose: the
+    sweep is the one caller still allowed to ask the gateway for a key.
+    """
+    from hermes_multitenancy.billing_identity import _ResolvedPayer
+
+    payer = _ResolvedPayer(
+        employee_id,
+        profile_name or employee_id,
+        email or f"{employee_id}@keep.com",
+        "FD",
+    )
+    binding = manager.ensure_available(payer, None)
+    from dataclasses import replace as _replace
+
+    preparer._store.put(_replace(binding, migration_state="enforced"))
+    return binding
+
+
 def _billing_env(monkeypatch, tmp_path, payer_ids="alice"):
     monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
     monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", payer_ids)
@@ -285,6 +311,9 @@ def test_ack_loss_keeps_enforcement_and_route_loss_fails_closed(
     )
     _billing_env(monkeypatch, tmp_path)
 
+    # The sweep provisions; only then does the employee's request see a key.
+    _provision_as_the_sweep(preparer, manager)
+
     first = preparer.prepare(_request())
     assert first.metadata["litellm_billing_enforced"] is True
     assert store.get("alice").migration_state == "enforced"
@@ -325,6 +354,12 @@ def test_second_sender_on_shared_profile_never_bills_the_first_payer(
         credentials=_manager(db_path, gateway),
     )
     _billing_env(monkeypatch, tmp_path, payer_ids="alice,bob")
+
+    # Sweep-provisioned, as production now requires: the request path itself is
+    # not allowed to mint, so alice must already hold a key to be enforced.
+    _provision_as_the_sweep(
+        preparer, preparer._credentials, "alice", profile_name="guest"
+    )
 
     alice = preparer.prepare(_request("ou_alice", "guest"))
     assert alice.metadata["litellm_billing_employee_user_id"] == "alice"

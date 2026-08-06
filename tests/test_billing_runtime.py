@@ -71,12 +71,20 @@ def test_child_reports_if_a_failed_turn_is_safe_to_retry(monkeypatch, tmp_path: 
     assert json.loads(output.getvalue())["billing_retry_safe"] is False
 
 
-def test_nonstream_401_repairs_then_retries_once(monkeypatch, tmp_path: Path):
+def test_nonstream_401_degrades_then_retries_once(monkeypatch, tmp_path: Path):
+    """`billing-runtime-never-mints`: a 401 no longer re-mints on this path.
+
+    It marks the credential invalid (so the hourly sweep re-provisions) and
+    strips attribution so THIS attempt still completes — on the shared key,
+    unbilled. The employee still sees a normal answer, which is the whole point;
+    what changed is that no key is issued from the employee's own request.
+    """
     from hermes_multitenancy.agent_real import _core
 
     event = _event()
     calls = 0
-    repairs = 0
+    degrades = 0
+    marks = 0
 
     async def run(*_args, **_kwargs):
         nonlocal calls
@@ -85,16 +93,28 @@ def test_nonstream_401_repairs_then_retries_once(monkeypatch, tmp_path: Path):
             raise _failure("HTTP 401 invalid API key", retry_safe=True)
         return "ok"
 
-    def repair(target):
-        nonlocal repairs
-        repairs += 1
+    def degrade(target):
+        nonlocal degrades
+        degrades += 1
+        trace.append("degrade")
         target._hermes_billing_retry = True
 
+    def mark(_target):
+        nonlocal marks
+        marks += 1
+        trace.append("mark")
+
+    trace: list[str] = []
     monkeypatch.setattr(_core, "_run_aiagent_subprocess", run)
-    monkeypatch.setattr(_core, "_repair_billing_event", repair)
+    monkeypatch.setattr(_core, "_degrade_billing_event", degrade)
+    monkeypatch.setattr(_core, "_mark_billing_event_invalid", mark)
 
     assert asyncio.run(_core.real_run_agent(event, tmp_path)) == "ok"
-    assert (calls, repairs) == (2, 1)
+    assert (calls, degrades, marks) == (2, 1, 1)
+    # ORDER matters and counters cannot see it (codex #p1): degrade strips the
+    # billing metadata that `mark_invalid` needs to find the row, so marking
+    # second would silently stop the sweep from ever re-provisioning.
+    assert trace == ["mark", "degrade"], trace
 
 
 def test_nonstream_401_never_retries_after_a_tool_side_effect(monkeypatch, tmp_path: Path):
@@ -138,8 +158,8 @@ def test_429_types_have_distinct_messages_and_never_rotate(
     monkeypatch.setattr(_core, "_run_aiagent_subprocess", run)
     monkeypatch.setattr(
         _core,
-        "_repair_billing_event",
-        lambda _event: pytest.fail("429 must not rotate credentials"),
+        "_degrade_billing_event",
+        lambda _event: pytest.fail("429 must not degrade or rotate credentials"),
     )
 
     with pytest.raises(RuntimeError, match=message):
@@ -160,11 +180,12 @@ def test_stream_401_retries_once_before_content_or_tools(monkeypatch, tmp_path: 
         yield "content", "ok"
         yield "done", "ok"
 
-    def repair(target):
+    def degrade(target):
         target._hermes_billing_retry = True
 
     monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stream)
-    monkeypatch.setattr(_core, "_repair_billing_event", repair)
+    monkeypatch.setattr(_core, "_degrade_billing_event", degrade)
+    monkeypatch.setattr(_core, "_mark_billing_event_invalid", lambda _e: None)
 
     async def collect():
         return [item async for item in _core.stream_run_agent(_event(), tmp_path)]

@@ -373,12 +373,12 @@ async def stream_run_agent(  # type: ignore[override]
         )
         if kind == "invalid_credential":
             if retry_safe and not getattr(event, "_hermes_billing_retry", False):
-                try:
-                    _repair_billing_event(event)
-                except Exception as repair_exc:
-                    raise RuntimeError(
-                        _billing_failure_message(kind, retry_safe=True)
-                    ) from repair_exc
+                # Same as the non-streaming path: mark for the sweep, degrade
+                # this attempt, never mint on the employee's request path.
+                # Deliberately unguarded — a RunRejected out of `mark_invalid`
+                # is drift, and drift must surface, not degrade (codex #p1).
+                _mark_billing_event_invalid(event)
+                _degrade_billing_event(event)
                 from ..run_broker import mark_current_run_retried
 
                 mark_current_run_retried()
@@ -512,12 +512,16 @@ async def real_run_agent(
             retry_safe = getattr(exc, "billing_retry_safe", False) is True
             if kind == "invalid_credential":
                 if retry_safe and not billing_retried:
-                    try:
-                        _repair_billing_event(event)
-                    except Exception as repair_exc:
-                        raise RuntimeError(
-                            _billing_failure_message(kind, retry_safe=True)
-                        ) from repair_exc
+                    # Mark first so the sweep re-provisions, then degrade so
+                    # THIS attempt is still served (unattributed).
+                    # NOT wrapped in try/except: `mark_invalid` validates the
+                    # stored tuple and raises plain RunRejected when it does not
+                    # match this run's metadata — i.e. drift, "obtained but
+                    # WRONG". Swallowing that and degrading anyway would bury a
+                    # real integrity defect inside normal traffic, which is the
+                    # one thing the degrade must never do (codex #p1 2026-08-07).
+                    _mark_billing_event_invalid(event)
+                    _degrade_billing_event(event)
                     from ..run_broker import mark_current_run_retried
 
                     mark_current_run_retried()
@@ -691,12 +695,20 @@ def _billing_failure_kind(event: Any, error: Any) -> str:
     return classify_litellm_error(error)
 
 
-def _repair_billing_event(event: Any) -> None:
-    from ..billing_identity import repair_billing_metadata
+def _degrade_billing_event(event: Any) -> None:
+    """Retry this run unattributed instead of re-minting the dead credential.
+
+    Re-minting here would issue a key on the employee's own request path, which
+    `billing-runtime-never-mints` removed: the refresh sweep owns minting. The
+    credential is marked invalid first so the sweep re-provisions it, then the
+    billing metadata is stripped so THIS attempt still gets served — on the
+    shared key, unbilled, with a `billing_degraded_unattributed` audit line.
+    """
+    from ..billing_identity import degrade_billing_metadata
 
     raw_event = getattr(event, "raw_event", None)
     raw = dict(raw_event) if isinstance(raw_event, dict) else {}
-    raw["metadata"] = repair_billing_metadata(_event_metadata(event))
+    raw["metadata"] = degrade_billing_metadata(_event_metadata(event))
     event.raw_event = raw
     # A streaming retry must reuse the session epoch created by the first
     # attempt instead of looking like another fresh conversation.
