@@ -352,3 +352,19 @@ hermes 该判的」，于是 intake 不再因到期日拒收；并且**过去的
 把 schema 重构塞进来会把一个可当场验证的小改动变成跨 provider 的大改。
 
 **触发条件**：再出现一次「凭据显示已绑定但实际走了共享凭据」的报障，就该排这条。
+
+## 2026-08-06 · `billing_readiness.verify_enabled_environment` 生产代码已无调用方（billing-drop-release-gate）
+
+**现状**：`startup_guard._validate_billing_cohort` 摘除对 `verify_enabled_environment` 的调用后
+（同批 sunke 拍板：`ExecStartPre` 无前导 `-`，任何 raise 都是全员网关停服，ceremony 这类校验
+不该挂在启动路径上），核查发现 `billing_shadow.py` 只 `import` 了同模块的 `BillingReadinessError`
+与 `cohort_hash`，**不调用** `verify_enabled_environment` 本体。也就是说这个函数在生产代码里
+**已经没有调用方**——不是"仍被 shadow/CLI 用"（早期 release note 曾这样写，已改正），而是死代码。
+
+**为什么不删**：签名 artifact 验证机制本身（8 env + 双 artifact 验签 + nonce live recheck）
+可能还会被 operator 手工核查复用，且删除属于另一个决策面（`billing_readiness.py` 本体不在
+本单改动范围内，见 SPEC Out of Scope）。留着不碍事，删了省不了什么。
+
+**触发条件**：下次碰 `billing_readiness.py` 时确认是否还有任何调用方（含手工 CLI 脚本/文档
+指引的调用方式）；如果确认彻底无人用，直接删掉 `verify_enabled_environment` 连带
+`tests/test_billing_readiness.py` 里只测它的用例，不必等一个专门 slug。
