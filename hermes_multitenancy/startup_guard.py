@@ -52,12 +52,14 @@ def _validate_billing_cohort(env: Mapping[str, str]) -> None:
     selected = {item.strip() for item in raw.split(",") if item.strip()}
     if not selected or "*" in selected:
         raise StartupGuardError("billing_canary_cohort_invalid")
-    try:
-        from .billing_readiness import verify_enabled_environment
-
-        verify_enabled_environment(env)
-    except RuntimeError as exc:
-        raise StartupGuardError(str(exc)) from exc
+    # ponytail: the signed readiness-artifact ceremony (verify_enabled_environment)
+    # used to gate startup here too. sunke picked option C on 2026-08-06
+    # (billing-degrade-not-refuse): unavailable credentials now degrade to the
+    # shared key + an alert instead of refusing service, so the ceremony this
+    # startup gate existed to protect against has no failure mode left to
+    # prevent. Ceremony code lives on in billing_readiness.py for shadow/CLI
+    # use; it is just not wired into the startup path anymore. See
+    # .ftask/billing-degrade-not-refuse/SPEC.md.
 
 
 def validate_startup(

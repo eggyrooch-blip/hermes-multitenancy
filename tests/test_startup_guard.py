@@ -93,3 +93,42 @@ def test_preflight_rejects_enabled_billing_without_finite_canary(
         startup_guard.validate_startup(
             env=env, package_dir=package, profile_home=profile
         )
+
+
+def test_preflight_accepts_enabled_billing_with_finite_canary_and_no_readiness_env(
+    monkeypatch, tmp_path
+):
+    """billing-drop-release-gate: since billing-degrade-not-refuse (option C),
+    an unavailable readiness artifact degrades at runtime instead of refusing
+    service, so validate_startup no longer requires ANY
+    HERMES_LITELLM_BILLING_READINESS_ARTIFACT/replay-store/policy-digest/etc
+    env to admit an enabled cohort. Negative control: if the
+    verify_enabled_environment ceremony call is restored in
+    _validate_billing_cohort, this test goes red with
+    StartupGuardError("readiness_local_universe_unavailable") — the exact code
+    observed when the mutation was run, not a guess — because none of that
+    ceremony env is set here.
+    """
+    package, profile, env = _fixture(tmp_path)
+    env.update(
+        {
+            "HERMES_LITELLM_BILLING_ENABLED": "true",
+            "HERMES_LITELLM_BILLING_PAYER_IDS": "employee_a,employee_b",
+        }
+    )
+    monkeypatch.setattr(startup_guard, "_import_boundaries", lambda: None)
+
+    startup_guard.validate_startup(env=env, package_dir=package, profile_home=profile)
+
+
+def test_preflight_ignores_billing_cohort_when_billing_disabled(monkeypatch, tmp_path):
+    package, profile, env = _fixture(tmp_path)
+    env.update(
+        {
+            "HERMES_LITELLM_BILLING_ENABLED": "false",
+            "HERMES_LITELLM_BILLING_PAYER_IDS": "",
+        }
+    )
+    monkeypatch.setattr(startup_guard, "_import_boundaries", lambda: None)
+
+    startup_guard.validate_startup(env=env, package_dir=package, profile_home=profile)
