@@ -1,0 +1,26 @@
+# Hermes five-probe health check (API errors / queue backlog / zombie tasks /
+# notification failures / billing drift). Read-only probes + Feishu webhook
+# alert with 30-min dedup. All DB access uses known SQLite paths — no find /.
+#
+# Install as hermes user unit (systemctl --user).
+[Unit]
+Description=Hermes five-probe health check (read-only probes + Feishu alert)
+After=network-online.target
+Wants=network-online.target
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/hermes
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=PATH=/home/hermes/.hermes/hermes-agent/venv/bin:/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Webhook URL from the shared EnvironmentFile (same as update-center-alert).
+EnvironmentFile=-%h/.hermes/update-center/alert.env
+ExecStart=/home/hermes/code/hermes-multitenancy/deploy/hermes-health-check.sh
+# IO safety: low priority, never compete with production services.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target
