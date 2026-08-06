@@ -67,21 +67,38 @@ def _make_multitenancy_db(
     db_path: Path,
     billing_identities: list[dict] | None = None,
 ) -> None:
-    """Create a minimal multitenancy DB with billing_identity table."""
+    """Create a minimal multitenancy DB with the production billing table."""
     conn = sqlite3.connect(str(db_path))
     conn.execute(
-        "CREATE TABLE billing_identity ("
-        "id INTEGER PRIMARY KEY, "
-        "user_id TEXT NOT NULL, "
-        "key_value TEXT, "
-        "status TEXT NOT NULL DEFAULT 'active')"
+        "CREATE TABLE multitenancy_billing_identities ("
+        "employee_user_id TEXT PRIMARY KEY NOT NULL, "
+        "profile_name TEXT NOT NULL DEFAULT '', "
+        "email TEXT NOT NULL, "
+        "litellm_user_id TEXT NOT NULL, "
+        "team_id TEXT NOT NULL DEFAULT '', "
+        "team_alias TEXT NOT NULL DEFAULT '', "
+        "key_id TEXT NOT NULL DEFAULT '', "
+        "credential_version INTEGER NOT NULL DEFAULT 0, "
+        "expires_at INTEGER NOT NULL DEFAULT 0, "
+        "migration_state TEXT NOT NULL DEFAULT 'legacy', "
+        "created_at INTEGER NOT NULL, "
+        "updated_at INTEGER NOT NULL)"
     )
     if billing_identities:
         for bi in billing_identities:
             conn.execute(
-                "INSERT INTO billing_identity (user_id, key_value, status) "
-                "VALUES (?, ?, ?)",
-                (bi["user_id"], bi.get("key_value"), bi.get("status", "active")),
+                "INSERT INTO multitenancy_billing_identities "
+                "(employee_user_id, email, litellm_user_id, key_id, migration_state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    bi["user_id"],
+                    f"{bi['user_id']}@keep.com",
+                    bi.get("litellm_user_id", "llm-" + bi["user_id"]),
+                    bi.get("key_id", "sk-xxx"),
+                    bi.get("migration_state", "enforced"),
+                    int(time.time()),
+                    int(time.time()),
+                ),
             )
     conn.commit()
     conn.close()
@@ -241,11 +258,11 @@ def test_notify_failures_alert(tmp_path):
 
 
 def test_billing_drift_healthy(tmp_path):
-    """All keys present → pass."""
+    """All keys present and enforced → pass."""
     db = tmp_path / "multitenancy.db"
     _make_multitenancy_db(db, [
-        {"user_id": "u1", "key_value": "sk-xxx", "status": "active"},
-        {"user_id": "u2", "key_value": "sk-yyy", "status": "active"},
+        {"user_id": "u1", "key_id": "sk-xxx", "migration_state": "enforced"},
+        {"user_id": "u2", "key_id": "sk-yyy", "migration_state": "enforced"},
     ])
     result = probe_billing_drift(db, threshold=5)
     assert result.status == "pass"
@@ -256,7 +273,7 @@ def test_billing_drift_alert(tmp_path):
     """Many identities without keys → alert."""
     db = tmp_path / "multitenancy.db"
     _make_multitenancy_db(db, [
-        {"user_id": f"u{i}", "key_value": None, "status": "active"}
+        {"user_id": f"u{i}", "key_id": "", "migration_state": "enforced"}
         for i in range(8)
     ])
     result = probe_billing_drift(db, threshold=5)
@@ -277,7 +294,7 @@ def test_run_all_probes_healthy(tmp_path):
     now = int(time.time())
 
     _make_kanban_db(kanban_db, [{"id": "t1", "status": "done", "created_at": now}])
-    _make_multitenancy_db(mt_db, [{"user_id": "u1", "key_value": "sk-x", "status": "active"}])
+    _make_multitenancy_db(mt_db, [{"user_id": "u1", "key_id": "sk-x", "migration_state": "enforced"}])
     _write_log(log, [f"{_ts(10)} INFO gateway: ok"])
 
     results = run_all_probes(

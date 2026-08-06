@@ -276,8 +276,9 @@ def probe_billing_drift(
 ) -> ProbeResult:
     """Check for employees with billing identity but no active key.
 
-    Counts rows in the billing identity table that lack a corresponding
-    active personal key. This is the "should be billing but can't" gap.
+    Queries the production table ``multitenancy_billing_identities`` for rows
+    where ``key_id`` is empty (no personal key provisioned) or
+    ``migration_state`` is not ``enforced`` (identity not fully activated).
 
     Until the LiteLLM budget callback 403 fix lands (双周11), this probe
     ships with a high threshold so it detects but doesn't alert.
@@ -296,12 +297,14 @@ def probe_billing_drift(
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
 
-        if "billing_identity" in tables:
-            # Count employees with billing identity but no key
+        if "multitenancy_billing_identities" in tables:
+            # Count employees with billing identity but no key_id, or not yet enforced.
+            # Production schema: key_id TEXT (empty string = no key),
+            # migration_state TEXT ('enforced' = fully activated).
             row = conn.execute(
-                "SELECT COUNT(*) as n FROM billing_identity "
-                "WHERE key_value IS NULL OR key_value = '' "
-                "OR status != 'active'"
+                "SELECT COUNT(*) as n FROM multitenancy_billing_identities "
+                "WHERE key_id = '' OR key_id IS NULL "
+                "OR migration_state != 'enforced'"
             ).fetchone()
             count = row["n"] if row else 0
         else:
