@@ -16,6 +16,11 @@ Environment=HOME=/home/hermes
 # run_refresh 要求显式给库路径（缺了直接 employee_key_refresh_db_unset 退 1）。
 Environment=HERMES_MULTITENANCY_DB=/home/hermes/.hermes/multitenancy.db
 # cohort / 网关地址 / 静默 token 全部来自这份 0600 环境文件，值不入仓。
+# ⚠️ 这份文件还必须提供 HERMES_MULTITENANCY_CREDENTIAL_KEY（与网关 drop-in
+# 30-credential-vault.conf 里【同一把】）。它是凭据 vault 的封装密钥：缺了它
+# 备货扫描会在 sweep 之前直接退 1（employee_key_refresh_credential_key_unset），
+# 这是故意的——真到 vault 写入才发现，意味着 LiteLLM 那边已经签出一把存不下的
+# 孤儿 key，每人每轮一把。两边不是同一把则运行时解不开，等于全员拿不到凭据。
 EnvironmentFile=-%h/.hermes/litellm-billing.env
 ExecStart=@PYTHON@ -m hermes_multitenancy.billing_employee_key --max-issues 200
 Nice=10

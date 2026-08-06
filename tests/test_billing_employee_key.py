@@ -799,6 +799,8 @@ def test_dry_run_mints_nothing(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_MULTITENANCY_DB", str(db))
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    # run_refresh now needs the vault key in BOTH modes (see guard).
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-vault-key")
 
     minted: list[str] = []
 
@@ -851,6 +853,8 @@ def test_cohort_member_missing_from_routing_is_reported_not_guessed(
     monkeypatch.setenv("HERMES_MULTITENANCY_DB", str(db))
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    # run_refresh now needs the vault key in BOTH modes (see guard).
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-vault-key")
     import hermes_multitenancy.billing_identity as bi
 
     monkeypatch.setattr(
@@ -893,6 +897,8 @@ def test_synthetic_ou_id_in_cohort_is_rejected_not_swept(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_MULTITENANCY_DB", str(db))
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    # run_refresh now needs the vault key in BOTH modes (see guard).
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-vault-key")
     import hermes_multitenancy.billing_identity as bi
 
     monkeypatch.setattr(
@@ -1438,6 +1444,8 @@ def test_run_refresh_uses_the_snapshot_email_and_writes_both_stores(
     monkeypatch.setenv("HERMES_ORG_SNAPSHOT_DIR", str(snap_dir))
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
     monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    # A sweep ends in a vault write, which production cannot do without this.
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-vault-key")
 
     manager = _manager(tmp_path)
     identity_store = BillingIdentityStore(tmp_path / "identity.db")
@@ -1482,3 +1490,108 @@ def test_run_refresh_uses_the_snapshot_email_and_writes_both_stores(
     binding = identity_store.get("sunke")
     assert binding is not None, "BillingIdentityStore was never written"
     assert manager.runtime_api_key(_metadata(binding)) == "sk-sunke"
+
+
+def _routing_db_with_sunke(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "routing.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE multitenancy_routing (user_id TEXT, profile_name TEXT, "
+        "active INTEGER, kind TEXT, provenance TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO multitenancy_routing VALUES ('sunke','sunke',1,'user','sync')"
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _refresh_env_without_vault_key(monkeypatch, db):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "sunke")
+    monkeypatch.setenv("HERMES_MULTITENANCY_DB", str(db))
+    monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
+    monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    monkeypatch.delenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CREDENTIAL_KEY", raising=False)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_refresh_without_a_vault_key_stops_before_the_gateway(
+    monkeypatch, tmp_path, dry_run
+):
+    """No vault key => stop before LiteLLM issues anything, in BOTH modes.
+
+    The sweep needs the key to store what it mints: finding out at the vault
+    write would leave a real, live key at LiteLLM that nothing can store or
+    attribute — one orphan per cohort member, per run. `--dry-run` mints
+    nothing, but it still DECRYPTS existing rows via `employee_key_needed`, so
+    on a populated vault it fails anyway; exempting it only looked safe against
+    an empty vault (codex review, 2026-08-06).
+    """
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db_with_sunke(tmp_path)
+    _refresh_env_without_vault_key(monkeypatch, db)
+
+    minted: list[str] = []
+
+    class _RecordsMints:
+        def issue(self, **kw):
+            minted.append(kw["employee_id"])
+            raise AssertionError("must not mint without a vault key")
+
+    monkeypatch.setattr(bek, "EmployeeKeyClient", lambda *a, **k: _RecordsMints())
+
+    class _Creds:
+        def employee_key_needed(self, payer):
+            return True
+
+    import hermes_multitenancy.billing_identity as bi
+
+    monkeypatch.setattr(
+        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds()})()
+    )
+
+    with pytest.raises(EmployeeKeyError) as excinfo:
+        bek.run_refresh(dry_run=dry_run)
+    assert "credential_key_unset" in str(excinfo.value)
+    assert minted == [], "reached the gateway before the guard fired"
+
+
+def test_vault_key_check_agrees_with_the_vault_itself(monkeypatch, tmp_path):
+    """The guard must ask the same question CredentialStore asks.
+
+    `_resolve_optional_key` takes the first TRUTHY env value with NO strip(), so
+    a whitespace-only primary IS this host's key material as far as the vault is
+    concerned. A hand-rolled check that strip()s each name would call the very
+    same host unconfigured and refuse to run — the guard and the vault
+    disagreeing about one host. Discriminating case: whitespace-only primary and
+    NO legacy name (with a legacy name present both spellings happen to agree,
+    which is why an earlier version of this test had no power to fail).
+    """
+    from hermes_multitenancy import billing_employee_key as bek
+    from hermes_multitenancy.credentials import _resolve_optional_key
+
+    db = _routing_db_with_sunke(tmp_path)
+    _refresh_env_without_vault_key(monkeypatch, db)
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "   ")
+
+    assert _resolve_optional_key(None) is not None, "vault considers this host keyed"
+
+    class _Creds:
+        def employee_key_needed(self, payer):
+            return False
+
+    import hermes_multitenancy.billing_identity as bi
+
+    monkeypatch.setattr(
+        bi, "_default_preparer", lambda: type("P", (), {"_credentials": _Creds()})()
+    )
+    monkeypatch.setattr(bek, "EmployeeKeyClient", lambda *a, **k: object())
+
+    # Must NOT raise: refusing here would strand a host the vault can serve.
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == []

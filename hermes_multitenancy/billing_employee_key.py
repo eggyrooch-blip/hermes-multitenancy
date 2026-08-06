@@ -505,6 +505,7 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
         _is_canonical_employee_id,
     )
     from .billing_readiness import _cohort_ids
+    from .credentials import _resolve_optional_key
 
     cohort_ids = _cohort_ids(os.environ.get("HERMES_LITELLM_BILLING_PAYER_IDS", ""))
     domain = str(
@@ -556,6 +557,22 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
         if not email:
             email = f"{employee_id}@{domain}"
         payers.append(_ResolvedPayer(employee_id, profile, email, ""))
+
+    # Both modes need the vault key, for different reasons, so this guards both:
+    #   * the sweep ENDS each payer in a vault write (CredentialStore._require_key).
+    #     Learning the key is missing there means LiteLLM already minted a real key
+    #     we cannot store — one orphan per cohort member, per run. At 1282 people
+    #     that is thousands of live keys belonging to nobody.
+    #   * --dry-run stores nothing, but `employee_key_needed` DECRYPTS whatever is
+    #     already stored, so on any populated vault it fails too — just later and
+    #     with a stack trace instead of a name. (An earlier revision exempted
+    #     dry-run; codex refuted it: the exemption only held on an empty vault.)
+    # Ask the vault's own resolver rather than re-reading the env here: it picks the
+    # first TRUTHY of the two names without stripping, so a whitespace-only primary
+    # silently becomes the key material. A separate check with its own precedence
+    # and its own strip() would pass while the vault disagrees.
+    if _resolve_optional_key(None) is None:
+        raise EmployeeKeyError("employee_key_refresh_credential_key_unset")
 
     preparer = _default_preparer()
     credentials = preparer._credentials
