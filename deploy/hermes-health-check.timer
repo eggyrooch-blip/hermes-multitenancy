@@ -1,0 +1,13 @@
+# Run Hermes health checks every 5 minutes.
+# Frequency balances early detection against IO cost on mechanical-disk production.
+[Unit]
+Description=Run Hermes health check every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
