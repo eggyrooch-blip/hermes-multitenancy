@@ -101,15 +101,20 @@ def _request(
 class _FakeCredentials:
     def __init__(self):
         self.calls = []
+        self.mint_flags = []  # allow_mint as each caller passed it
         self.source = ""  # "" == no vault row / pre-migration: legacy owns it
 
     def credential_source(self, payer):
         return self.source
 
-    def ensure_available(self, payer, existing, *, force_reason=""):
+    def ensure_available(self, payer, existing, *, force_reason="", allow_mint=True):
         from hermes_multitenancy.billing_identity import BillingIdentity
 
+        # allow_mint is recorded, not honoured: this double stands in for the
+        # vault+gateway, and the tests below assert that the REQUEST path always
+        # asks with allow_mint=False (billing-runtime-never-mints).
         self.calls.append((payer, existing, force_reason))
+        self.mint_flags.append(allow_mint)
         return BillingIdentity(
             employee_user_id=payer.employee_user_id,
             profile_name=payer.profile_name,
@@ -1142,3 +1147,38 @@ def test_is_canonical_employee_id(value, ok):
     from hermes_multitenancy.billing_identity import _is_canonical_employee_id
 
     assert _is_canonical_employee_id(value) is ok
+
+
+def test_prepare_always_asks_with_minting_disabled(tmp_path, monkeypatch):
+    """The invariant of `billing-runtime-never-mints`, asserted at the seam.
+
+    `prepare()` is the employee's own request path. It must ask the credential
+    manager for a credential it may NOT mint — the hourly refresh sweep is the
+    only caller allowed to. Production on 2026-08-06 proved the consequence of
+    getting this wrong: three employees each had a key issued on their own
+    request path, minutes after the cohort opened.
+
+    This asserts the FLAG, not just the outcome: the manager is a double here,
+    so an outcome-only assertion would still pass if prepare() started asking
+    with minting enabled again (that mutation ran green before this test).
+    """
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "actor,owner")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_BASE_URL", "https://litellm.example/v1")
+    credentials = _FakeCredentials()
+    preparer = _identity_preparer(tmp_path, credentials)
+
+    preparer.prepare(_request())
+    preparer.prepare(
+        _request(
+            chat_type="group",
+            sender="ou_member",
+            chat_id="oc_group",
+            profile_name="owner",
+        )
+    )
+
+    assert credentials.mint_flags, "prepare() never reached the credential manager"
+    assert credentials.mint_flags == [False] * len(credentials.mint_flags), (
+        "prepare() asked with minting ENABLED — that is request-path issuance"
+    )

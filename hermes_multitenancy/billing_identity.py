@@ -289,7 +289,13 @@ class BillingIdentityPreparer:
             if existing.email and existing.email.lower() != payer.email.lower():
                 raise RunRejected("billing payer email drift detected")
         try:
-            binding = self._credentials.ensure_available(payer, existing)
+            # allow_mint=False: this is the employee's own request path, and the
+            # employee never triggers issuance (sunke 2026-08-06). A missing or
+            # dead credential degrades below; the hourly refresh sweep is the
+            # only thing that talks to the gateway about minting.
+            binding = self._credentials.ensure_available(
+                payer, existing, allow_mint=False
+            )
         except BillingUnavailable as exc:
             # Could not OBTAIN a credential (gateway down, rejected, not yet
             # provisioned). Inconsistency raises plain RunRejected and is NOT
@@ -339,11 +345,16 @@ class BillingIdentityPreparer:
         # sending an employee_key credential through legacy `ensure` mixes
         # the protocols on one row and contradicts the sweep's timer-only
         # minting promise (README, "Keeping the cohort provisioned").
+        # PRODUCTION-UNREACHABLE since `billing-runtime-never-mints`: the only
+        # caller (agent_real._core on a 401) now degrades instead of repairing.
+        # Both branches are kept mint-free so that re-wiring a caller cannot
+        # quietly reintroduce request-path minting — the invariant this slug
+        # exists to hold. See DEBT.md for the removal.
         if self._credentials.credential_source(payer) == CREDENTIAL_SOURCE:
             binding = self._repair_employee_key(payer)
         else:
             binding = self._credentials.ensure_available(
-                payer, existing, force_reason="invalid_401"
+                payer, existing, force_reason="invalid_401", allow_mint=False
             )
         binding = replace(binding, migration_state="enforced")
         self._store.put(binding)
@@ -361,17 +372,14 @@ class BillingIdentityPreparer:
         `repair_metadata`, has already run `payer.employee_user_id` through
         `_is_canonical_employee_id` before reaching either branch.
         """
-        client = EmployeeKeyClient(
-            os.environ.get("HERMES_EMPLOYEE_KEY_BASE_URL", "")
-            or os.environ.get("HERMES_AI_GATEWAY_BROKER_URL", ""),
-            os.environ.get("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", ""),
+        # No longer mints. This ran on the employee's own request path, which is
+        # exactly what `billing-runtime-never-mints` removed: a 401 now marks the
+        # credential invalid and serves the run unattributed, and the hourly
+        # refresh sweep re-provisions it. Raising the degradable error keeps any
+        # future caller on that same path instead of letting it mint here again.
+        raise BillingUnavailable(
+            "billing credential is dead; the refresh sweep owns re-provisioning"
         )
-        issued = client.issue(
-            employee_id=payer.employee_user_id,
-            enterprise_email=payer.email,
-            idempotency_key=f"repair-{payer.employee_user_id}-{uuid.uuid4().hex[:12]}",
-        )
-        return store_binding(self, payer, issued)
 
     def _payer(
         self, request: RunRequest, metadata: dict[str, Any]
@@ -579,6 +587,28 @@ def billing_runtime_for_image_prep(metadata: dict[str, Any]) -> dict[str, str]:
 def mark_billing_credential_invalid(metadata: dict[str, Any]) -> None:
     if metadata.get("litellm_billing_enforced") is True:
         _default_preparer()._credentials.mark_invalid(metadata)
+
+
+def degrade_billing_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Strip billing attribution so a retry runs on the shared key, unbilled.
+
+    The 401 answer since `billing-runtime-never-mints`: a dead credential used
+    to be re-minted on the employee's own request path, which is the one thing
+    the refresh sweep exists to prevent. Now the run keeps going without
+    attribution and the sweep re-provisions within the hour — the employee sees
+    nothing, and the cost is a bounded attribution gap rather than a refusal.
+
+    Pairs with :func:`mark_billing_credential_invalid`: mark first (so the sweep
+    knows to re-mint), then strip (so this attempt can still be served).
+    """
+    employee_id = str(metadata.get("litellm_billing_employee_user_id") or "")
+    profile_name = str(metadata.get("litellm_billing_profile_name") or "")
+    _log_billing_degraded(
+        employee_id=employee_id,
+        profile_name=profile_name,
+        reason="invalid_credential:retry_unattributed",
+    )
+    return _clean_metadata(metadata)
 
 
 def repair_billing_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

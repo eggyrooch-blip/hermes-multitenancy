@@ -158,7 +158,18 @@ class _SentinelCredentials:
     def __init__(self, counters: _Counters) -> None:
         object.__setattr__(self, "_counters", counters)
 
-    def ensure_available(self, payer: Any, existing: Any, *, force_reason: str = "") -> Any:
+    def ensure_available(
+        self,
+        payer: Any,
+        existing: Any,
+        *,
+        force_reason: str = "",
+        allow_mint: bool = True,
+    ) -> Any:
+        # `allow_mint` is accepted and ignored on purpose: this sentinel raises
+        # before doing anything, so it cannot mint either way. It has to match
+        # the real signature or the request path's `allow_mint=False` would make
+        # every shadow round die on a TypeError instead of recording a boundary.
         self._counters.planner_boundary_stops += 1
         if existing is not None and getattr(existing, "migration_state", "") == "enforced":
             raise _BoundaryStop(STATUS_ENFORCED_EXISTING)

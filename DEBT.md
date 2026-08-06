@@ -395,3 +395,18 @@ finding ID 长 123/131 字符，超出 `FINDING_ID` 正则的 120 上限（写�
 
 **触发条件**：两条都在降级边界上，下一个碰 `billing_credentials.py` 的 slug 顺手清；或计费
 全员稳定运行一周后专门开一个小 slug 一起修。
+
+## 2026-08-06 · `repair_metadata` / `_repair_employee_key` 已成生产不可达（billing-runtime-never-mints）
+
+**现状**：401 自愈的唯一生产调用方 `agent_real/_core.py` 改为降级（标 invalid + 剥计费
+metadata + 重试一次），不再调 `repair_billing_metadata`。于是 `BillingIdentityPreparer.repair_metadata`
+与 `_repair_employee_key` 在生产代码里**没有调用方**，只有测试还在调。
+
+**为什么不这轮删**：本单是全员开关前的阻塞项，删公开函数要连带改 3 个测试文件，
+midnight 前扩大 diff 不值得。两个分支都已改成**不能签发**（一个抛 `BillingUnavailable`，
+一个传 `allow_mint=False`），所以即使有人把调用方接回来，也不会重新引入
+「员工请求路径上签发」这条本单要消掉的东西。
+
+**触发条件**：下次碰 `billing_identity.py` 时，确认无人调用后直接删这两个函数 +
+`repair_billing_metadata` 包装 + 只测它们的用例；同时把 `CREDENTIAL_SOURCE` 分支判断
+一起清掉。

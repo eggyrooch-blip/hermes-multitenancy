@@ -390,25 +390,45 @@ credential minted while somebody waits turns a gateway hiccup into that
 person's failure. `--dry-run` reports who would be issued and mints nothing.
 Every issued key is stamped `source=employee_key` in the vault, and its
 credential row is maintained one day before expiry — never by the legacy
-23–30 day window below. **A 401 on a `source=employee_key` credential is
-repaired by re-issuing through this same client, not through legacy
-`ensure`/`ack`** — the two protocols never touch the same row, timer-only
-minting holds even on the repair path.
+23–30 day window below.
 
-The first selected run calls versioned AI Gateway `ensure`, atomically saves the
-returned key, validates it with zero-consumption `GET /v1/models`, and ACKs the
-credential generation. Valid cached keys do not call AI Gateway. ACK loss is
-retried idempotently; renewal starts 23–30 days before expiry with stable payer
-jitter. A new/missing/expired payer fails closed when the broker is unavailable,
-while another payer with an unexpired cached key continues normally. This
-23–30 day renewal and its 401 repair only ever apply to legacy (non
-`employee_key`) credential rows.
+**Timer-only minting is enforced, not just documented** (`billing-runtime-never-mints`,
+2026-08-07 — the previous wording promised it while the code broke it, and three
+employees had keys minted on their own request path in production before this
+landed). On the employee request path the credential manager is called with
+`allow_mint=False`, which makes it **read-only against the AI Gateway** — no
+`ensure`, and no `ack` of a pending generation either:
+
+| Stored credential on a request | What happens |
+|---|---|
+| usable (incl. pending-but-real) | served as-is; the sweep completes/rotates it later |
+| missing / expired / marked invalid | **degrades** — shared key, unbilled, one `billing_degraded_unattributed` audit line, employee sees a normal answer |
+| present but inconsistent (profile / email / account drift) | still **refused** — degrading on drift would hide a real defect |
+
+**A 401 is no longer repaired by re-issuing.** The credential is marked invalid
+(so the next sweep re-provisions it) and the run is retried with attribution
+stripped. Cost: that run, and anything until the next sweep, is unattributed —
+a bounded accounting gap instead of a refusal. Operators: this makes **sweep
+health the thing to watch**; a dead timer no longer shows up as failed requests,
+it shows up as a rising `billing_degraded_unattributed` count.
+
+The legacy `ensure`/ACK lifecycle — call versioned AI Gateway `ensure`, atomically
+save the returned key, validate it with zero-consumption `GET /v1/models`, ACK the
+generation, then renew 23–30 days before expiry with stable payer jitter — is now
+driven **only by the maintenance sweep**, never by a selected run. Since
+`billing-runtime-never-mints` a request path with `allow_mint=False` performs none of
+it: not `ensure`, not the ACK of a pending generation, not renewal. A
+new/missing/expired payer therefore no longer "fails closed when the broker is
+unavailable" — it degrades (see the table above), because the broker is not on the
+request path at all. This lifecycle and its 401 handling only ever apply to legacy
+(non `employee_key`) credential rows.
 
 Feishu DM bills the trusted sender; group/topic bills the group Agent owner;
 WebUI, cron, Kanban and shared Agents bill the routed profile/Agent owner.
 State moves only `legacy → enforced`: disabling the rollout flag stops new
-migrations but never sends an enforced payer back to the shared key. A 401 is
-repaired and retried once only before answer/tool side effects. Monthly-budget
+migrations but never sends an enforced payer back to the shared key. A 401 marks the
+credential invalid and retries once **unattributed** (never re-issuing), and only
+before answer/tool side effects. Monthly-budget
 429 and ordinary rate-limit 429 are reported separately and never rotate keys.
 Credential overrides in delegated/auxiliary calls and the direct-OpenRouter
 `moa` toolset are blocked for enforced runs.

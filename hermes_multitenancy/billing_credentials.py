@@ -325,13 +325,26 @@ class BillingCredentialManager:
         existing: BillingIdentity | None,
         *,
         force_reason: str = "",
+        allow_mint: bool = True,
     ) -> BillingIdentity:
+        """Resolve this payer's live credential.
+
+        ``allow_mint=False`` makes this method READ-ONLY with respect to the AI
+        Gateway: it will serve a stored credential that is still usable, and
+        raise :class:`BillingUnavailable` rather than ask the gateway to issue
+        or rotate one. The employee request path passes False — minting on that
+        path turns "the gateway had a bad minute" into "this person cannot use
+        AI", and it contradicts the timer-only minting promise the refresh sweep
+        exists to keep. The sweep itself (and shadow/replay callers) keep the
+        default, so their behaviour is unchanged.
+        """
         with self._payer_lock(payer.employee_user_id):
             return self._ensure_locked(
                 payer,
                 existing,
                 force_reason=force_reason,
                 gone_reissues_remaining=1,
+                allow_mint=allow_mint,
             )
 
     def adopt_employee_key(
@@ -469,8 +482,40 @@ class BillingCredentialManager:
         *,
         force_reason: str,
         gone_reissues_remaining: int = 1,
+        allow_mint: bool = True,
     ) -> BillingIdentity:
         payload = self._load_payload(payer.profile_name, payer.employee_user_id)
+        if not allow_mint:
+            # THE gate, and it sits here rather than at the `gateway.ensure`
+            # call because `_finish_pending` below reaches the gateway too:
+            # it ACKs a pending generation, which is a WRITE on the employee's
+            # own request (codex #p1, 2026-08-07). "The employee triggers
+            # nothing" has to mean the whole gateway, not just issuance.
+            #
+            # So: serve a usable stored credential — a pending-but-real key
+            # included, exactly as the existing ack-backoff windows already do —
+            # and degrade otherwise. Completing the pending lifecycle, rotating,
+            # and issuing are all maintenance-sweep work.
+            if payload is not None:
+                self._validate_local_payload(payload, payer=payer, existing=existing)
+                # `probe_pending` is a crash-recovery row: it was written
+                # before the activation probe confirmed the key works, so it has
+                # never been proven usable. Completing that probe is maintenance
+                # work (it can delete the row or fall back), so on the request
+                # path such a row counts as NOT provisioned and degrades —
+                # serving it would hand the runtime a key that may be dead
+                # (codex #4 notes, 2026-08-07). `ack_pending` is different: that
+                # key DID pass its probe, only the handshake is outstanding.
+                if (
+                    not payload.get("invalid")
+                    and not payload.get("probe_pending")
+                    and int(payload["expires_at"]) > self._now_ms()
+                ):
+                    return _binding_from_payload(payload)
+            raise BillingUnavailable(
+                "billing credential is not provisioned yet;"
+                " the refresh sweep owns minting"
+            )
         if payload is not None:
             self._validate_local_payload(payload, payer=payer, existing=existing)
             payload = self._finish_pending(payer, payload)

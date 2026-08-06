@@ -1230,15 +1230,20 @@ def test_a_department_transfer_updates_both_stores(tmp_path):
     assert manager.runtime_api_key(_metadata(put[-1])) == "sk-after-transfer"
 
 
-def test_401_repair_of_an_employee_key_credential_never_touches_legacy_gateway(
-    monkeypatch, tmp_path
-):
-    """codex r2: source=employee_key credentials went through legacy
-    ensure/ack on every 401, mixing two credential lifecycles on one row and
-    contradicting the sweep's timer-only minting promise (README). 401
-    repair must re-issue through the employee-key client for those rows and
-    must never reach the legacy gateway."""
-    from hermes_multitenancy.billing_employee_key import IssuedKey, store_binding
+def test_401_repair_never_mints_on_the_employee_request_path(monkeypatch, tmp_path):
+    """`billing-runtime-never-mints`: a 401 must not re-issue anything.
+
+    Supersedes the earlier contract (re-issue through the employee-key client).
+    Minting here ran on the employee's OWN request path, which is what the
+    hourly sweep exists to prevent — and codex's own comment in
+    billing_identity called it "the sweep's timer-only minting promise" while
+    the code broke it. Now repair raises the degradable error; the caller in
+    agent_real._core marks the credential invalid and serves the run
+    unattributed. NEITHER gateway may be touched: legacy ensure or the
+    employee-key client both count as minting on the request path.
+    """
+    from hermes_multitenancy.billing_credentials import BillingUnavailable
+    from hermes_multitenancy.billing_employee_key import store_binding
     from hermes_multitenancy.billing_identity import (
         BillingIdentityPreparer,
         BillingIdentityStore,
@@ -1249,46 +1254,66 @@ def test_401_repair_of_an_employee_key_credential_never_touches_legacy_gateway(
 
     class _ExplodingGateway:
         def ensure(self, **kw):
-            raise AssertionError(
-                "legacy ensure must not be called for source=employee_key"
-            )
+            raise AssertionError("legacy ensure must not be called on a 401")
 
     manager._gateway = _ExplodingGateway()
     identity_store = BillingIdentityStore(tmp_path / "identity.db")
     preparer = BillingIdentityPreparer(
         routing=None, store=identity_store, credentials=manager
     )
-
-    # A credential minted via the employee-key sweep, both stores agree.
     store_binding(preparer, _payer(), _issued())
+    before = identity_store.get("sunke").key_id
 
-    fresh = IssuedKey(
-        employee_id="sunke", email="sunke@keep.com", api_key="sk-repaired",
-        base_url="https://litellm.example/v1",
-        key_alias="auto-sunke-20260806-030000-repair", team_alias="技术平台部",
-        expires_at_ms=_NOW_MS + 30 * _DAY, litellm_user_id=USER_A,
-        team_id="13b7bdf4-97f5-45e2-9c57-abc3ea3949aa",
-        account_identity_verified=True,
-    )
-
-    class _FakeClient:
+    class _ExplodingClient:
         def __init__(self, *a, **kw):
             pass
 
         def issue(self, **kw):
-            return fresh
+            raise AssertionError("employee-key client must not mint on a 401")
 
-    monkeypatch.setattr(bi, "EmployeeKeyClient", _FakeClient)
+    monkeypatch.setattr(bi, "EmployeeKeyClient", _ExplodingClient)
 
     metadata = {
         "litellm_billing_employee_user_id": "sunke",
         "litellm_billing_profile_name": "sunke",
         "litellm_billing_email": "sunke@keep.com",
     }
-    repaired = preparer.repair_metadata(metadata)
+    with pytest.raises(BillingUnavailable):
+        preparer.repair_metadata(metadata)
 
-    assert repaired["litellm_billing_key_id"] == fresh.key_alias
-    assert identity_store.get("sunke").key_id == fresh.key_alias
+    # Nothing was rotated behind the caller's back either.
+    assert identity_store.get("sunke").key_id == before
+
+
+def test_degrade_billing_metadata_strips_attribution_and_audits(caplog):
+    """The 401 answer: serve the retry unattributed, and say so once.
+
+    `_clean_metadata` is what makes the retry run on the shared key; the fixed
+    `billing_degraded_unattributed` token is what makes the attribution gap
+    countable. Both have to happen, or the gap is either invisible or the run
+    is still billed to a dead key.
+    """
+    import logging
+
+    from hermes_multitenancy.billing_identity import degrade_billing_metadata
+
+    metadata = {
+        "litellm_billing_enforced": True,
+        "litellm_billing_employee_user_id": "sunke",
+        "litellm_billing_profile_name": "sunke",
+        "litellm_billing_email": "sunke@keep.com",
+        "litellm_billing_key_id": "key-dead",
+        "chat_type": "p2p",
+    }
+    with caplog.at_level(logging.WARNING):
+        out = degrade_billing_metadata(metadata)
+
+    assert not [k for k in out if k.startswith("litellm_billing")], out
+    assert out["chat_type"] == "p2p", "non-billing metadata must survive"
+    assert any(
+        "billing_degraded_unattributed" in r.getMessage() and "employee=sunke" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
 
 
 def test_401_repair_rejects_a_non_canonical_identity(monkeypatch, tmp_path):
@@ -1595,3 +1620,218 @@ def test_vault_key_check_agrees_with_the_vault_itself(monkeypatch, tmp_path):
     # Must NOT raise: refusing here would strand a host the vault can serve.
     out = bek.run_refresh(dry_run=True)
     assert out["would_issue"] == []
+
+
+# --- billing-runtime-never-mints: the employee request path asks for nothing ---
+
+class _ExplodingEnsureGateway:
+    """Any ensure() call is a test failure: that IS request-path minting."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def ensure(self, **kw):
+        self.calls += 1
+        raise AssertionError(f"gateway.ensure called on the request path: {kw}")
+
+
+def test_request_path_with_no_credential_degrades_without_calling_the_gateway(tmp_path):
+    """A cohort member who has not been provisioned yet: degrade, never mint.
+
+    This is the case that fires for EVERY not-yet-provisioned person the moment
+    the cohort opens, so it is the one that decides whether "the employee never
+    triggers issuance" is true. Verified in production 2026-08-06 to have been
+    FALSE before this slug: three employees each got a key minted on their own
+    request path.
+    """
+    from hermes_multitenancy.billing_credentials import BillingUnavailable
+
+    manager = _manager(tmp_path)
+    gateway = _ExplodingEnsureGateway()
+    manager._gateway = gateway
+
+    with pytest.raises(BillingUnavailable) as excinfo:
+        manager.ensure_available(_payer(), None, allow_mint=False)
+
+    assert "not provisioned yet" in str(excinfo.value)
+    assert gateway.calls == 0
+
+
+def test_request_path_serves_a_usable_stored_credential_unchanged(tmp_path):
+    """Having a key is the normal case and must be byte-identical to before."""
+    from hermes_multitenancy.billing_employee_key import store_binding
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    manager = _manager(tmp_path)
+    manager._gateway = _ExplodingEnsureGateway()
+    preparer = BillingIdentityPreparer(
+        routing=None, store=BillingIdentityStore(tmp_path / "identity.db"),
+        credentials=manager,
+    )
+    store_binding(preparer, _payer(), _issued())
+
+    binding = manager.ensure_available(_payer(), None, allow_mint=False)
+
+    assert binding.employee_user_id == "sunke"
+    assert binding.credential_version == 1
+    assert manager._gateway.calls == 0
+
+
+def test_request_path_inside_the_rotation_window_keeps_the_old_key(tmp_path):
+    """Rotation belongs to the sweep; the request path must not race it.
+
+    A key deep inside the legacy renew window is exactly when `_ensure_locked`
+    used to rotate. It must now keep serving the existing key — expiry is still
+    days away, and the hourly sweep rotates one day before it.
+    """
+    from hermes_multitenancy.billing_employee_key import store_binding
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    manager = _manager(tmp_path)
+    manager._gateway = _ExplodingEnsureGateway()
+    preparer = BillingIdentityPreparer(
+        routing=None, store=BillingIdentityStore(tmp_path / "identity.db"),
+        credentials=manager,
+    )
+    # Deep inside the legacy 30-day renew window, still comfortably valid.
+    # The expiry is written straight into the vault instead of minting a
+    # short-lived key: `_MIN_LIFETIME_MS` is exactly 2 days, so a fixture that
+    # asked the client for a 2-day key sat ON the floor and failed whenever any
+    # wall-clock time had passed since `_NOW_MS` was captured at import — green
+    # on a fast laptop, red in CI (which is how this was caught).
+    store_binding(preparer, _payer(), _issued())
+    payload = manager._load_payload("sunke", "sunke")
+    payload["expires_at"] = _NOW_MS + 20 * _DAY
+    # `source=ensure` on purpose: a `source=employee_key` row returns early via
+    # its own guard, so it would pass this test even with the no-mint gate
+    # removed (verified by mutation — the assertion had no power). The legacy
+    # protocol is the one whose 23–30 day renewal actually reaches the gateway,
+    # so that is the row that proves the request path no longer rotates.
+    payload["source"] = "ensure"
+    manager._save_payload("sunke", "sunke", payload)
+
+    binding = manager.ensure_available(_payer(), None, allow_mint=False)
+
+    assert binding.credential_version == 1
+    assert manager._gateway.calls == 0
+
+
+def test_the_sweep_itself_still_mints(tmp_path):
+    """Negative control for the whole slug: allow_mint defaults to True.
+
+    If this went red the change would have disarmed the ONLY provisioning path
+    instead of just the request path — nobody would ever get a key.
+    """
+    calls = []
+
+    class _RecordingGateway:
+        def ensure(self, **kw):
+            calls.append(kw)
+            raise RuntimeError("stop here — reaching the gateway is the assertion")
+
+    manager = _manager(tmp_path)
+    manager._gateway = _RecordingGateway()
+
+    with pytest.raises(Exception):
+        manager.ensure_available(_payer(), None)  # default allow_mint=True
+
+    assert len(calls) == 1, "the sweep path must still be allowed to mint"
+
+
+class _UntouchableGateway:
+    """ANY attribute access is a failure: proves gateway-read-only, not just
+    "no ensure()". codex #p1 (2026-08-07) found `_finish_pending` reaching
+    `gateway.ack()` — a WRITE — before the original gate, so asserting only on
+    ensure() would have passed while the employee's request still drove the
+    gateway."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"request path touched the gateway: .{name}")
+
+
+def test_request_path_never_touches_the_gateway_at_all(tmp_path):
+    """Not one gateway call from the employee's own request — ensure OR ack."""
+    from hermes_multitenancy.billing_credentials import BillingUnavailable
+
+    manager = _manager(tmp_path)
+    manager._gateway = _UntouchableGateway()
+
+    with pytest.raises(BillingUnavailable):
+        manager.ensure_available(_payer(), None, allow_mint=False)
+
+
+def test_request_path_serves_a_pending_row_without_acking_it(tmp_path):
+    """A pending-but-real key is served; completing the handshake is the sweep's.
+
+    This is the case codex caught: the row is usable, its ack backoff has
+    elapsed, and the old code would have ACKed it from inside the employee's
+    request. Serving it is correct — it is a live key — and the maintenance
+    sweep finishes the lifecycle.
+    """
+    from hermes_multitenancy.billing_employee_key import store_binding
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    manager = _manager(tmp_path)
+    preparer = BillingIdentityPreparer(
+        routing=None, store=BillingIdentityStore(tmp_path / "identity.db"),
+        credentials=manager,
+    )
+    store_binding(preparer, _payer(), _issued())
+
+    # Make it look like a legacy pending generation whose backoff has elapsed.
+    payload = manager._load_payload("sunke", "sunke")
+    payload["ack_pending"] = True
+    payload["ack_retry_after"] = 0
+    payload["source"] = "ensure"
+    manager._save_payload("sunke", "sunke", payload)
+
+    manager._gateway = _UntouchableGateway()
+    binding = manager.ensure_available(_payer(), None, allow_mint=False)
+
+    assert binding.employee_user_id == "sunke"
+    assert manager._load_payload("sunke", "sunke")["ack_pending"] is True, (
+        "the request path must not complete the pending handshake"
+    )
+
+
+def test_request_path_degrades_on_a_probe_pending_row(tmp_path):
+    """An unactivated crash-recovery row is NOT a usable credential.
+
+    `probe_pending` means the row was saved before the activation probe proved
+    the key works. Serving it unprobed would hand the runtime a possibly-dead
+    key; completing the probe is maintenance work (it may delete the row or fall
+    back to the previous generation). So the request path degrades instead —
+    contrast `ack_pending`, which did pass its probe and IS served.
+    """
+    from hermes_multitenancy.billing_credentials import BillingUnavailable
+    from hermes_multitenancy.billing_employee_key import store_binding
+    from hermes_multitenancy.billing_identity import (
+        BillingIdentityPreparer,
+        BillingIdentityStore,
+    )
+
+    manager = _manager(tmp_path)
+    preparer = BillingIdentityPreparer(
+        routing=None, store=BillingIdentityStore(tmp_path / "identity.db"),
+        credentials=manager,
+    )
+    store_binding(preparer, _payer(), _issued())
+    payload = manager._load_payload("sunke", "sunke")
+    payload["probe_pending"] = True
+    manager._save_payload("sunke", "sunke", payload)
+
+    manager._gateway = _UntouchableGateway()
+    with pytest.raises(BillingUnavailable):
+        manager.ensure_available(_payer(), None, allow_mint=False)
+
+    # And the row is left exactly as maintenance will find it.
+    assert manager._load_payload("sunke", "sunke")["probe_pending"] is True
