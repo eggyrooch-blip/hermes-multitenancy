@@ -59,6 +59,7 @@ hermes-multitenancy-doctor = "hermes_multitenancy.doctor:main"
 hermes-multitenancy-ingest = "hermes_multitenancy.ingest_key_admin_cli:main"
 hermes-multitenancy-update-center = "hermes_multitenancy.update_center_cli:main"
 hermes-multitenancy-billing-shadow = "hermes_multitenancy.billing_shadow:main"
+hermes-multitenancy-billing-refresh = "hermes_multitenancy.billing_employee_key:refresh_main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import replace
 from pathlib import Path
 import re
@@ -27,6 +28,7 @@ from .billing_credentials import (
     _allowed_billing_endpoint,
     _is_budget_exceeded_text,
 )
+from .billing_employee_key import CREDENTIAL_SOURCE, EmployeeKeyClient, store_binding
 from .credentials import CredentialStore
 from .routing import DEFAULT_DB_PATH, RoutingTable
 from .run_broker import RunRejected
@@ -52,6 +54,22 @@ _RESERVED_METADATA = frozenset({
     "litellm_billing_expires_at",
     "litellm_billing_base_url",
 })
+
+
+def _is_canonical_employee_id(user_id: str) -> bool:
+    """The one shape test for "this is a LiteLLM billing subject."
+
+    ``ou_*`` is a Feishu open_id — a chat identity, never a billing subject —
+    and the employee-id regex alone does not exclude it (underscore and
+    digits are both legal id characters). Every place that turns a raw string
+    into a payer's ``employee_id`` MUST run it through this, not just the ones
+    that happen to go through :meth:`BillingIdentityPreparer._employee_row`:
+    a query that filters routing rows on kind/active/provenance but skips the
+    shape check would accept a synthetic ``ou_*`` row that the live request
+    path would refuse to ever resolve as a payer.
+    """
+    value = str(user_id or "")
+    return bool(_EMPLOYEE_ID_RE.fullmatch(value)) and not value.startswith("ou_")
 
 
 def canonical_sync_open_id(routing: Any, sender: Any) -> str:
@@ -278,15 +296,55 @@ class BillingIdentityPreparer:
             or existing.email.lower() != email.lower()
         ):
             raise RunRejected("billing repair identity is invalid")
+        # Same canonical-subject guard `run_refresh` and `_employee_row` both
+        # enforce before ever minting. This payer comes from a vault-stored
+        # `BillingIdentityStore` row keyed on caller-supplied metadata, not
+        # from the live routing table, so it never passed through either of
+        # those checks — for EITHER branch below. Skipping it would let a
+        # non-canonical id (an `ou_*` Feishu open_id, never a billing
+        # subject) mint or renew a real key through the 401 path alone.
+        if not _is_canonical_employee_id(employee_id):
+            raise RunRejected("billing repair identity is invalid")
         payer = _ResolvedPayer(employee_id, profile_name, email)
-        binding = self._credentials.ensure_available(
-            payer, existing, force_reason="invalid_401"
-        )
+        # Two credential lifecycles now share this row's namespace: the
+        # legacy ensure/ack protocol and the employee-key sweep. A 401 must
+        # be repaired through whichever one actually minted the dead key —
+        # sending an employee_key credential through legacy `ensure` mixes
+        # the protocols on one row and contradicts the sweep's timer-only
+        # minting promise (README, "Keeping the cohort provisioned").
+        if self._credentials.credential_source(payer) == CREDENTIAL_SOURCE:
+            binding = self._repair_employee_key(payer)
+        else:
+            binding = self._credentials.ensure_available(
+                payer, existing, force_reason="invalid_401"
+            )
         binding = replace(binding, migration_state="enforced")
         self._store.put(binding)
         clean = _clean_metadata(metadata)
         clean.update(_metadata_for_binding(binding, _billing_model_base_url()))
         return clean
+
+    def _repair_employee_key(self, payer: _ResolvedPayer) -> BillingIdentity:
+        """401 repair for a credential the employee-key endpoint minted.
+
+        Re-issues through the same client the maintenance sweep uses and
+        adopts it through :func:`store_binding` — the same double-write path
+        the sweep uses, so a failed identity write rolls back here exactly as
+        it does there rather than half-landing a repair. Its only caller,
+        `repair_metadata`, has already run `payer.employee_user_id` through
+        `_is_canonical_employee_id` before reaching either branch.
+        """
+        client = EmployeeKeyClient(
+            os.environ.get("HERMES_EMPLOYEE_KEY_BASE_URL", "")
+            or os.environ.get("HERMES_AI_GATEWAY_BROKER_URL", ""),
+            os.environ.get("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", ""),
+        )
+        issued = client.issue(
+            employee_id=payer.employee_user_id,
+            enterprise_email=payer.email,
+            idempotency_key=f"repair-{payer.employee_user_id}-{uuid.uuid4().hex[:12]}",
+        )
+        return store_binding(self, payer, issued)
 
     def _payer(
         self, request: RunRequest, metadata: dict[str, Any]
@@ -366,8 +424,7 @@ class BillingIdentityPreparer:
         row = getter(owner_open_id) if callable(getter) else None
         user_id = str(getattr(row, "user_id", "") or "").strip() if row else ""
         if (
-            _EMPLOYEE_ID_RE.fullmatch(user_id)
-            and not user_id.startswith("ou_")
+            _is_canonical_employee_id(user_id)
             and getattr(row, "active", None) in {True, 1}
             and str(getattr(row, "kind", "") or "") == "user"
             and str(getattr(row, "provenance", "") or "") == "sync"

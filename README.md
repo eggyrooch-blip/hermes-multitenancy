@@ -371,14 +371,38 @@ export HERMES_AI_GATEWAY_BROKER_TOKEN="<dedicated-hermes-service-bearer>"
 export HERMES_AI_GATEWAY_BROKER_TIMEOUT="5"
 export HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN="keep.com"
 export HERMES_ORG_SNAPSHOT_DIR="$HERMES_HOME/org-snapshots"
+
+# Auto-provisioning path (hermes-multitenancy-billing-refresh). Separate bearer
+# on purpose: this one mints a key for ANY employee, so it must not be the
+# broker token. There is deliberately NO fallback — an unset value means the
+# refresh command cannot run, which is louder than quietly reusing a token with
+# a different audience.
+export HERMES_EMPLOYEE_KEY_SILENT_TOKEN="<dedicated-silent-minting-bearer>"
+# Optional: defaults to HERMES_AI_GATEWAY_BROKER_URL when unset.
+export HERMES_EMPLOYEE_KEY_BASE_URL="https://<gateway-ingress-host>"
 ```
+
+### Keeping the cohort provisioned
+
+`hermes-multitenancy-billing-refresh` runs on a timer and keeps every cohort
+member holding a usable key, so **the employee never triggers minting** — a
+credential minted while somebody waits turns a gateway hiccup into that
+person's failure. `--dry-run` reports who would be issued and mints nothing.
+Every issued key is stamped `source=employee_key` in the vault, and its
+credential row is maintained one day before expiry — never by the legacy
+23–30 day window below. **A 401 on a `source=employee_key` credential is
+repaired by re-issuing through this same client, not through legacy
+`ensure`/`ack`** — the two protocols never touch the same row, timer-only
+minting holds even on the repair path.
 
 The first selected run calls versioned AI Gateway `ensure`, atomically saves the
 returned key, validates it with zero-consumption `GET /v1/models`, and ACKs the
 credential generation. Valid cached keys do not call AI Gateway. ACK loss is
 retried idempotently; renewal starts 23–30 days before expiry with stable payer
 jitter. A new/missing/expired payer fails closed when the broker is unavailable,
-while another payer with an unexpired cached key continues normally.
+while another payer with an unexpired cached key continues normally. This
+23–30 day renewal and its 401 repair only ever apply to legacy (non
+`employee_key`) credential rows.
 
 Feishu DM bills the trusted sender; group/topic bills the group Agent owner;
 WebUI, cron, Kanban and shared Agents bill the routed profile/Agent owner.

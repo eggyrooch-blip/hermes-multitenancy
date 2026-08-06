@@ -101,6 +101,10 @@ def _request(
 class _FakeCredentials:
     def __init__(self):
         self.calls = []
+        self.source = ""  # "" == no vault row / pre-migration: legacy owns it
+
+    def credential_source(self, payer):
+        return self.source
 
     def ensure_available(self, payer, existing, *, force_reason=""):
         from hermes_multitenancy.billing_identity import BillingIdentity
@@ -1083,3 +1087,58 @@ def test_disabled_path_strips_every_spoofable_field(tmp_path, monkeypatch):
 
     assert "litellm_billing_enforced" not in prepared.metadata
     assert "litellm_billing_key_id" not in prepared.metadata
+
+
+# ---------------------------------------------- source-routed 401 repair
+
+
+def test_401_repair_of_a_legacy_credential_still_uses_ensure_available(tmp_path):
+    """Regression guard for the source-routing fix (codex r2): a
+    pre-migration / legacy row (credential_source() == "") must still repair
+    through ensure/ack, not the employee-key client. Only source=employee_key
+    rows are supposed to skip this path."""
+    from hermes_multitenancy.billing_identity import BillingIdentity
+
+    credentials = _FakeCredentials()  # .source == "" : legacy owns this row
+    preparer = _identity_preparer(tmp_path, credentials)
+    existing = BillingIdentity(
+        employee_user_id="actor", profile_name="actor", email="actor@keep.com",
+        litellm_user_id="llm-actor", team_id="team-fd", team_alias="FD",
+        key_id="key-actor", credential_version=1,
+        expires_at=FIXTURE["ensure_issued_response"]["expires_at"],
+        migration_state="enforced",
+    )
+    preparer._store.put(existing)
+
+    metadata = {
+        "litellm_billing_employee_user_id": "actor",
+        "litellm_billing_profile_name": "actor",
+        "litellm_billing_email": "actor@keep.com",
+    }
+    preparer.repair_metadata(metadata)
+
+    assert [call[2] for call in credentials.calls] == ["invalid_401"]
+
+
+# ------------------------------------------- canonical employee id guard
+
+
+@pytest.mark.parametrize(
+    "value,ok",
+    [
+        ("sunke", True),
+        ("sun-ke", True),
+        ("sun.ke_1", True),
+        ("ou_synthetic", False),  # Feishu open_id, never a billing subject
+        ("ou_", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_canonical_employee_id(value, ok):
+    """The one shape test every payer-resolution entry point must share —
+    codex r2 found the sweep's routing query skipped it while the live
+    request path (`_employee_row`) enforced it."""
+    from hermes_multitenancy.billing_identity import _is_canonical_employee_id
+
+    assert _is_canonical_employee_id(value) is ok
