@@ -631,3 +631,7 @@ def refresh_main(argv: list[str] | None = None) -> int:
     print(_json.dumps({"ok": True, **summary}, indent=2, sort_keys=True,
                       ensure_ascii=False))
     return 0 if not summary.get("failed") else 2
+
+
+if __name__ == "__main__":  # pragma: no cover — systemd timer entry (`@PYTHON@ -m`)
+    raise SystemExit(refresh_main())

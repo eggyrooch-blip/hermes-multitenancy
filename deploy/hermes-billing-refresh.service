@@ -1,0 +1,25 @@
+# 员工计费 key 定时备货：每小时扫 cohort（HERMES_LITELLM_BILLING_PAYER_IDS），
+# 谁缺 key / 快到期 / 已失效就通过网关静默通道补签并落库（员工零打扰）。
+# 员工永不触发签发；本单失败=告警（OnFailure 报飞书群），不是任何人的服务中断——
+# 他手上的旧 key 未到期就继续服务（billing-degrade-not-refuse 兜底缺 key 场景）。
+# 安装到 hermes-1（hermes 用户 user unit）。@PYTHON@ 部署时按 README 替换。
+[Unit]
+Description=Hermes employee billing key refresh (silent pre-provision sweep)
+After=network-online.target
+Wants=network-online.target
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=HOME=/home/hermes
+# run_refresh 要求显式给库路径（缺了直接 employee_key_refresh_db_unset 退 1）。
+Environment=HERMES_MULTITENANCY_DB=/home/hermes/.hermes/multitenancy.db
+# cohort / 网关地址 / 静默 token 全部来自这份 0600 环境文件，值不入仓。
+EnvironmentFile=-%h/.hermes/litellm-billing.env
+ExecStart=@PYTHON@ -m hermes_multitenancy.billing_employee_key --max-issues 200
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
