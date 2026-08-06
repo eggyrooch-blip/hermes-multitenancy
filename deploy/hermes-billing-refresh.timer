@@ -1,0 +1,13 @@
+# 每小时触发一次备货扫描（随机错峰 5 分钟）。
+# 频率与 hermes-feishu-sync 对齐：org 快照每小时刷新，key 备货跟着刷。
+# 1282 人在稳态下每小时命中的只有"距到期 ≤1 天"的一小撮，扫描本身是只读快路径。
+[Unit]
+Description=Run Hermes employee billing key refresh hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
