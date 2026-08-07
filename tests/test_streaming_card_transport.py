@@ -539,6 +539,67 @@ async def test_stream_into_feishu_uses_card_transport_when_adapter_supports_it(
 
 
 @pytest.mark.asyncio
+async def test_stream_into_feishu_renders_todo_progress_transitions_on_same_card(
+    monkeypatch, tmp_path
+):
+    """Todo writes stay on the same card's tool path, never the body status."""
+    from hermes_multitenancy import agent_real, router as router_mod
+
+    first = {
+        "todos": [
+            {"id": "1", "content": "拉取数据", "status": "in_progress"},
+            {"id": "2", "content": "生成报表", "status": "pending"},
+            {"id": "3", "content": "发送到群", "status": "pending"},
+        ]
+    }
+    second = {
+        "todos": [
+            {"id": "1", "content": "拉取数据", "status": "completed"},
+            {"id": "2", "content": "生成报表", "status": "in_progress"},
+            {"id": "3", "content": "发送到群", "status": "pending"},
+        ]
+    }
+
+    async def fake_stream(event, home, *, messages=None):
+        yield ("tool_started", {"name": "todo", "args": first})
+        yield ("tool_completed", {"name": "todo", "duration": 0.1})
+        yield ("content", "第一步做完了,")
+        yield ("tool_started", {"name": "todo", "args": second})
+        yield ("tool_completed", {"name": "todo", "duration": 0.1})
+        yield ("content", "继续第二步")
+
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+
+    adapter = _CardCapableAdapter()
+    event = SimpleNamespace(
+        text="做个三步任务",
+        message_id="om_source_todo",
+        source=SimpleNamespace(chat_type="group"),
+    )
+
+    response = await router_mod._stream_into_feishu(
+        adapter,
+        "chat-1",
+        "profile",
+        tmp_path,
+        event,
+        messages=[{"role": "user", "content": "做个三步任务"}],
+    )
+
+    assert response == "第一步做完了,继续第二步"
+    todo_statuses = [u for u in adapter.status_updates if u["content"].startswith("📋")]
+    assert todo_statuses == []
+    assert len(adapter.tool_starts) == 2
+    assert {u["message_id"] for u in adapter.tool_starts} == {"card-1"}
+    assert adapter.tool_starts[0]["args"] == first
+    assert adapter.tool_starts[1]["args"] == second
+    assert len(adapter.tool_completions) == 2
+    # non-todo behavior unchanged: final content still lands on the card
+    assert adapter.updates[-1]["content"] == "第一步做完了,继续第二步"
+    assert adapter.updates[-1]["finalize"] is True
+
+
+@pytest.mark.asyncio
 async def test_plaintext_reply_still_uses_card_because_core_owns_reply_mode(
     monkeypatch, tmp_path
 ):

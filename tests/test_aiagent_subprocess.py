@@ -3565,7 +3565,7 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
     profile_home = tmp_path / "profiles" / "coder"
     profile_home.mkdir(parents=True)
     (profile_home / "config.yaml").write_text(
-        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        "model:\n  default: openai/test-model\nplatform_toolsets:\n  feishu:\n  - hermes-api-server\n",
         encoding="utf-8",
     )
     (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
@@ -3593,12 +3593,18 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
     _install_fake_feishu_oapi(monkeypatch)
 
     event = _event()
-    event.source.platform = SimpleNamespace(value="webui")
+    event.source.platform = SimpleNamespace(value="feishu")
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     # identity rides ephemeral_system_prompt — never the fork-only identity_override
     assert "identity_override" not in captured["kwargs"]
-    assert captured["ephemeral_system_prompt"] == "ROLE OVERRIDE\n我是资源投放专家"
+    # Expert block leads; todo progress rules are CONCATENATED after it (R1:
+    # the two share one kwarg and must never overwrite each other).
+    ephemeral = captured["ephemeral_system_prompt"]
+    assert isinstance(ephemeral, str)
+    assert ephemeral.startswith("ROLE OVERRIDE\n我是资源投放专家")
+    assert "任务进度规则" in ephemeral
+    assert ephemeral.index("ROLE OVERRIDE") < ephemeral.index("任务进度规则")
     # and NOT smuggled through run_conversation(system_message=...)
     assert captured.get("run_system_message") is None
 
@@ -3650,13 +3656,19 @@ def test_run_with_aiagent_falls_back_when_core_lacks_ephemeral_seam(monkeypatch,
     assert "ephemeral_system_prompt" not in attempts[1]
 
 
-def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize(("platform", "has_todo_rules"), [("feishu", True), ("webui", False)])
+def test_run_with_aiagent_omits_expert_system_message_without_expert(
+    monkeypatch, tmp_path: Path, platform: str, has_todo_rules: bool
+):
     from hermes_multitenancy import agent_real
 
     profile_home = tmp_path / "profiles" / "coder"
     profile_home.mkdir(parents=True)
     (profile_home / "config.yaml").write_text(
-        "model:\n  default: openai/test-model\nplatform_toolsets:\n  webui:\n  - file\n",
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n"
+        "  feishu:\n  - hermes-api-server\n"
+        "  webui:\n  - hermes-api-server\n",
         encoding="utf-8",
     )
     (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
@@ -3678,10 +3690,94 @@ def test_run_with_aiagent_omits_expert_system_message_without_expert(monkeypatch
     _install_fake_feishu_oapi(monkeypatch)
 
     event = _event()
-    event.source.platform = SimpleNamespace(value="webui")
+    event.source.platform = SimpleNamespace(value=platform)
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert "identity_override" not in captured
+    ephemeral = captured.get("ephemeral_system_prompt")
+    if has_todo_rules:
+        assert isinstance(ephemeral, str)
+        assert ephemeral.startswith("任务进度规则")
+        assert "ROLE OVERRIDE" not in ephemeral
+    else:
+        assert ephemeral is None
+
+
+def test_run_with_aiagent_omits_todo_rules_when_todo_toolset_disabled(monkeypatch, tmp_path: Path):
+    """Profile with agent.disabled_toolsets: [todo] must not receive todo rules
+    (instructing the model to call a tool it doesn't have causes failed calls)."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n  feishu:\n  - hermes-api-server\n"
+        "agent:\n  disabled_toolsets:\n  - todo\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="feishu")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "ephemeral_system_prompt" not in captured
+
+
+def test_run_with_aiagent_omits_todo_rules_in_explicit_mode_without_todo(monkeypatch, tmp_path: Path):
+    """Explicit toolsets_mode with a list that resolves WITHOUT todo must not
+    inject the rules (review HIGH: never instruct the model to call a tool
+    absent from its schema)."""
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n"
+        "platform_toolsets:\n  feishu:\n  - file\n"
+        "multitenancy:\n  toolsets_mode: explicit\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    monkeypatch.setattr(agent_real, "_role_override_block_for_event", lambda event, home: None)
+    _install_fake_feishu_oapi(monkeypatch)
+
+    event = _event()
+    event.source.platform = SimpleNamespace(value="feishu")
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured.get("enabled_toolsets") == ["file"]
     assert "ephemeral_system_prompt" not in captured
 
 

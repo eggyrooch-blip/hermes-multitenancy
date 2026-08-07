@@ -904,6 +904,70 @@ def _role_override_block_for_event(event: Any, profile_home: Path) -> Optional[s
         raise ExpertUnavailableError()
 
 
+# Hard rules that make the todo tool fire on real multi-step work (the tool's
+# own schema description is advisory-only by design — todo_tool.py: "No system
+# prompt mutation"; measured usage before this block: 4 calls in 3562 WebUI
+# messages). Kept ~150 tokens: command sentences only, no examples — this rides
+# ``ephemeral_system_prompt`` and is re-paid every turn.
+_TODO_PROGRESS_RULES = "\n".join(
+    [
+        "任务进度规则（todo 工具，硬性要求）:",
+        "- 任何需要 ≥3 个不同步骤的任务，动手前先用 todo 工具写出完整步骤清单。",
+        "- 开始做某一步之前，先把该步标为 in_progress；同一时刻恰好一条 in_progress。",
+        "- 每完成一步立即标 completed，禁止攒到最后一起标。",
+        "- 测试未过、实现不完整、或有未解决错误时，绝不把该步标 completed。",
+        "- 每次调用 todo 都重写全量清单（不用 merge），执行中发现的新步骤随时补进清单。",
+        "- 少于 3 步的琐碎任务或纯问答不要用 todo 工具。",
+    ]
+)
+
+
+def _todo_tool_available(enabled_toolsets: Any, disabled_toolsets: Any) -> bool:
+    """True only when the run's FINAL tool surface provably contains ``todo``.
+
+    Instructing the model to call a tool absent from its schema causes failed
+    tool calls (review HIGH finding), so this resolves composite toolset names
+    through core's ``toolsets`` registry instead of naive name matching. Fails
+    closed: unresolvable → False.
+    """
+    try:
+        from toolsets import resolve_multiple_toolsets  # hermes-agent core
+
+        def _resolve(items: Any) -> set[str]:
+            if not isinstance(items, (list, tuple, set, frozenset)):
+                raise TypeError("toolsets must be a collection")
+            names = {str(item).strip() for item in items if str(item).strip()}
+            return set(resolve_multiple_toolsets(sorted(names)))
+
+        if disabled_toolsets is not None:
+            if not isinstance(disabled_toolsets, (list, tuple, set, frozenset)):
+                return False
+            disabled_names = {
+                str(item).strip() for item in disabled_toolsets if str(item).strip()
+            }
+            if "todo" in disabled_names or "todo" in _resolve(disabled_names):
+                return False
+    except Exception:
+        return False
+    if enabled_toolsets is None:
+        # merge_default / core-default runs keep the core toolset, which
+        # includes ``todo`` (toolsets.py `_HERMES_CORE_TOOLS`).
+        return True
+    try:
+        return "todo" in _resolve(enabled_toolsets)
+    except Exception:
+        return False
+
+
+def _todo_progress_rules_block(
+    enabled_toolsets: Any = None, disabled_toolsets: Any = None
+) -> Optional[str]:
+    """Return the todo hard rules only when the todo tool is actually available."""
+    if not _todo_tool_available(enabled_toolsets, disabled_toolsets):
+        return None
+    return _TODO_PROGRESS_RULES
+
+
 def _installed_profile_skill_names(profile_home: Path) -> set[str]:
     """Best-effort fail-closed skill list for expert gating errors."""
     personal_manifest = Path(profile_home).expanduser() / "skills" / ".hermes-personal-installs.json"

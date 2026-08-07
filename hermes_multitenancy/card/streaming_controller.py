@@ -65,6 +65,7 @@ from .state import (
 )
 from .tool_use_display import (
     _extract_raw_tool_call_intents,
+    _format_todo_progress,
     _merge_raw_tool_intents,
     _render_tool_calls_section,
 )
@@ -525,14 +526,36 @@ async def _update_streaming_card_tool_started(
     async with _card_write_lock(state):
         if _is_terminal_state(state):
             return _result(True, message_id=str(message_id))
-        state["tools"].append(
-            {
-                "name": str(tool_name or "tool"),
-                "status": "running",
-                "preview": str(preview or "")[:240],
-                "args": args,
-            }
-        )
+        name = str(tool_name or "tool")
+        row = {
+            "name": name,
+            "status": "running",
+            "preview": str(preview or "")[:240],
+            "args": args,
+        }
+        if name == "todo":
+            progress = _format_todo_progress(args)
+            existing = next(
+                (tool for tool in state["tools"] if tool.get("name") == "todo"),
+                None,
+            )
+            if existing is not None:
+                is_read = args is None or (
+                    isinstance(args, dict)
+                    and (args.get("merge") or "todos" not in args)
+                )
+                if not progress and is_read:
+                    progress = str(existing.get("todo_progress") or "")
+                existing.clear()
+                existing.update(row)
+                if progress:
+                    existing["todo_progress"] = progress
+            else:
+                if progress:
+                    row["todo_progress"] = progress
+                state["tools"].append(row)
+        else:
+            state["tools"].append(row)
     if state.get("card_id"):
         attempted, exc = await _write_cardkit_frame(
             self,
@@ -574,7 +597,9 @@ async def _update_streaming_card_tool_completed(
             return _result(True, message_id=str(message_id))
         name = str(tool_name or "tool")
         for tool in reversed(state["tools"]):
-            if tool.get("name") == name and tool.get("status") == "running":
+            if tool.get("name") == name and (
+                name == "todo" or tool.get("status") == "running"
+            ):
                 tool["status"] = "error" if is_error else "done"
                 tool["duration"] = duration
                 break

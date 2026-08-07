@@ -40,6 +40,7 @@ _LIVE_STATE_OWNERS = {
     "_load_profile_config": _core,
     "_resolve_shared_hermes_home": _core,
     "_role_override_block_for_event": _core,
+    "_todo_progress_rules_block": _core,
     "_run_aiagent_subprocess": _core,
     "real_run_agent": _core,
     "stream_run_agent": _core,
