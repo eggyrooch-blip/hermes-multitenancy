@@ -7,6 +7,7 @@ tool-process body cleanup aligned with the pinned transport contract.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -20,6 +21,41 @@ from .tool_use_config import (
 )
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
+_TODO_PROGRESS_ICONS = {"completed": "✅", "in_progress": "●", "pending": "○", "cancelled": "✕"}
+_TODO_PROGRESS_MAX_CHARS = 120
+logger = logging.getLogger("hermes_multitenancy.feishu_cardkit_compat")
+
+
+def _format_todo_progress(args: Any) -> str:
+    """Return a compact, trusted display string for a full todo-list write."""
+    if not isinstance(args, dict) or args.get("merge") or "todos" not in args:
+        return ""
+    todos = args.get("todos")
+    if not isinstance(todos, list) or not todos:
+        if todos not in (None, []):
+            logger.debug("multitenancy: malformed todo payload (todos=%r)", type(todos))
+        return ""
+    icons: list[str] = []
+    active: list[str] = []
+    completed = 0
+    for item in todos:
+        if not isinstance(item, dict):
+            logger.debug("multitenancy: malformed todo item (%r)", type(item))
+            return ""
+        status = str(item.get("status") or "pending").strip().lower()
+        if status not in _TODO_PROGRESS_ICONS:
+            logger.debug("multitenancy: malformed todo status (%r)", status)
+            return ""
+        completed += status == "completed"
+        if status == "in_progress":
+            content = str(item.get("content") or "").strip()
+            if content:
+                active.append(content)
+        icons.append(_TODO_PROGRESS_ICONS[status])
+    text = f"任务进度 {completed}/{len(todos)} {''.join(icons)}"
+    if active:
+        text += " · " + "；".join(active)
+    return text[:_TODO_PROGRESS_MAX_CHARS]
 
 
 def _render_tool_calls_section(tools: list[Any]) -> str:
@@ -57,6 +93,9 @@ def _live_tools_to_trace_steps(tools: list[Any]) -> list[dict[str, Any]]:
         args = tool.get("args")
         if isinstance(args, dict) and args:
             step["params"] = args
+        todo_progress = tool.get("todo_progress")
+        if isinstance(todo_progress, str) and todo_progress:
+            step["summary"] = todo_progress
         # NOTE: live `preview` is intentionally NOT forwarded as `summary`.
         # The bare-row path never displayed preview text (it only used the
         # "generating arguments" preview as a collapse SIGNAL in
@@ -133,6 +172,9 @@ def _normalize_tool_rows(tools: list[Any]) -> list[dict[str, Any]]:
 
 
 def _render_tool_call_line(tool: dict[str, Any]) -> str:
+    todo_progress = tool.get("todo_progress")
+    if isinstance(todo_progress, str) and todo_progress:
+        return redact_inline_secrets(f"- {todo_progress}")
     name = str(tool.get("name") or "tool")
     status = str(tool.get("status") or "running")
     extra = " running" if status == "running" else " failed" if status == "error" else ""
@@ -143,9 +185,13 @@ def _render_tool_call_line(tool: dict[str, Any]) -> str:
 
 
 def _apply_tool_row_cap(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if _TOOL_ROW_MAX <= 0:
+    if _TOOL_ROW_MAX <= 0 or len(tools) <= _TOOL_ROW_MAX:
         return tools
-    return tools[-_TOOL_ROW_MAX:]
+    capped = tools[-_TOOL_ROW_MAX:]
+    progress = next((tool for tool in reversed(tools) if tool.get("todo_progress")), None)
+    if progress is not None and progress not in capped:
+        capped[0] = progress
+    return capped
 
 
 def _format_tool_duration(value: Any) -> str:

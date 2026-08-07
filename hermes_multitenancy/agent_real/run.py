@@ -450,8 +450,21 @@ def _run_with_aiagent(
         # wired ``identity_override`` kwarg required FORKING core and would RAISE
         # on upstream (see SPEC dead ends); it is gone.
         _role_override = _pkg._role_override_block_for_event(event, profile_home)
-        if _role_override:
-            agent_kwargs["ephemeral_system_prompt"] = _role_override
+        # Todo progress rules ride the SAME kwarg, CONCATENATED after the expert
+        # block — never assigned separately, so expert overlay and todo rules can
+        # never overwrite each other (review red-line R1). A core that lacks the
+        # kwarg drops BOTH via the TypeError fallback below (R2: the live probe
+        # for that is "todo tool fired ≥1 time" in the SPEC Done line).
+        _platform = getattr(getattr(event, "source", None), "platform", None)
+        _platform = str(getattr(_platform, "value", _platform) or "").strip().lower()
+        _todo_rules = (
+            _pkg._todo_progress_rules_block(enabled_toolsets, disabled_toolsets)
+            if _platform == "feishu"
+            else None
+        )
+        _ephemeral_parts = [part for part in (_role_override, _todo_rules) if part]
+        if _ephemeral_parts:
+            agent_kwargs["ephemeral_system_prompt"] = "\n\n".join(_ephemeral_parts)
 
         approval_cleanup = lambda: None
         runtime_env_cleanup = lambda: None

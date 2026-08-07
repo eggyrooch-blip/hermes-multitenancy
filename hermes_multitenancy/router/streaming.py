@@ -774,8 +774,9 @@ async def _stream_into_feishu_shared_consumer(
 
                     if kind == "tool_started":
                         payload = _m._sanitize_tool_event_payload(delta, profile_home)
+                        tool_name = str(payload.get("name") or payload.get("tool_name") or "tool")
                         await consumer.update_streaming_card_tool_started(
-                            str(payload.get("name") or payload.get("tool_name") or "tool"),
+                            tool_name,
                             preview=payload.get("preview"),
                             args=payload.get("args"),
                         )
