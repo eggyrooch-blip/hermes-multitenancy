@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "dde0be3680d6fd5443cab426c8f4b3216266346a",
+  "contract_digest": "5b24153ed4f0f1eeec410028534fbfd8b35ff5af875aa197f9378311bdeb4c15",
+  "contract_entries": [
+    {"contract_entry": "events.core", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "PARITY", "enabled_state": "ENABLED", "production_verified_state": "VERIFIED", "test_id": "contract.events.core"},
+    {"contract_entry": "events.reaction", "local_owner": "hermes_multitenancy/router/commands.py", "capability_state": "PARTIAL", "enabled_state": "DISABLED", "production_verified_state": "VERIFIED", "test_id": "G03.WP01-WP05-WP09"},
+    {"contract_entry": "events.vc", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "PARTIAL", "enabled_state": "UNVERIFIED", "production_verified_state": "NOT_VERIFIED", "test_id": "G05.WP01-WP06-WP09"},
+    {"contract_entry": "events.drive_comment", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "PARTIAL", "enabled_state": "UNVERIFIED", "production_verified_state": "NOT_VERIFIED", "test_id": "G04.WP01-WP06-WP09"},
+    {"contract_entry": "events.card_action", "local_owner": "hermes_multitenancy/__init__.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "VERIFIED", "test_id": "G06.WP01-WP02-WP09"},
+    {"contract_entry": "converters.parity", "local_owner": "hermes_multitenancy/feishu_inbound_richtext.py", "capability_state": "PARITY", "enabled_state": "ENABLED", "production_verified_state": "VERIFIED", "test_id": "contract.converters.primary"},
+    {"contract_entry": "converters.partial", "local_owner": "hermes_multitenancy/feishu_inbound_richtext.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G01-G02-V01.WP04"},
+    {"contract_entry": "actions.partial", "local_owner": "hermes_multitenancy/router/streaming.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G11.WP08-WP09"},
+    {"contract_entry": "actions.gap", "local_owner": "hermes_multitenancy/router/streaming.py", "capability_state": "GAP", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G11.WP08-WP09"},
+    {"contract_entry": "cards.generic", "local_owner": "hermes_multitenancy/card", "capability_state": "PARTIAL", "enabled_state": "UNVERIFIED", "production_verified_state": "NOT_VERIFIED", "test_id": "G23.WP02-WP08-WP09"},
+    {"contract_entry": "cards.actions.gap", "local_owner": "hermes_multitenancy/__init__.py", "capability_state": "GAP", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G06-G07-G08.WP02-WP03"},
+    {"contract_entry": "cards.actions.auth", "local_owner": "hermes_multitenancy/feishu_auth_hub_actions.py", "capability_state": "PARITY", "enabled_state": "ENABLED", "production_verified_state": "VERIFIED", "test_id": "contract.card.auth"},
+    {"contract_entry": "ask_user.schema", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "GAP", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G08.WP03"},
+    {"contract_entry": "workspace_tools.current_map", "local_owner": "hermes_multitenancy/lark_cli_tool.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G28.WP00-WP07"},
+    {"contract_entry": "footer.flags.partial", "local_owner": "hermes_multitenancy/card/footer_config.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G10.WP08"},
+    {"contract_entry": "footer.flags.gap", "local_owner": "hermes_multitenancy/card/footer_config.py", "capability_state": "GAP", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G10.WP08"},
+    {"contract_entry": "footer.metrics", "local_owner": "hermes_multitenancy/card/footer_config.py", "capability_state": "PARTIAL", "enabled_state": "UNVERIFIED", "production_verified_state": "NOT_VERIFIED", "test_id": "G10.WP08"},
+    {"contract_entry": "config.identity", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G13-G20.WP07"},
+    {"contract_entry": "config.policies", "local_owner": "hermes_multitenancy/router", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G17-G19-G20.WP05-WP07"},
+    {"contract_entry": "config.reply_media_thread", "local_owner": "hermes_multitenancy/router/streaming.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G03-G10-G15-G16-G21-G24-G25.WP05-WP08"},
+    {"contract_entry": "config.tool_flags", "local_owner": "hermes_multitenancy/lark_cli_tool.py", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G10-G20-G28.WP07-WP08"},
+    {"contract_entry": "config.runtime", "local_owner": "hermes_multitenancy/cron", "capability_state": "PARTIAL", "enabled_state": "ENABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G20-G29.WP07-WP09"},
+    {"contract_entry": "special.explicit", "local_owner": "hermes_multitenancy/push_registry.py;hermes_multitenancy/feishu_clarify_cards.py", "capability_state": "PARTIAL", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "N01-G08-L-G09"},
+    {"contract_entry": "advantages.hermes", "local_owner": "hermes_multitenancy", "capability_state": "HERMES_SUPERIOR", "enabled_state": "ENABLED", "production_verified_state": "VERIFIED", "test_id": "A01-A07.WP00-WP11"}
+  ],
+  "effective_states": [
+    {"id": "drive_comment", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "PARTIAL", "enabled_state": "UNVERIFIED", "production_verified_state": "NOT_VERIFIED", "test_id": "G04.WP01"},
+    {"id": "webhook", "local_owner": "hermes_multitenancy/router/__init__.py", "capability_state": "GAP", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "N01"},
+    {"id": "business_push_extension", "local_owner": "hermes_multitenancy/push_registry.py", "capability_state": "PARTIAL", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "G09.WP10"},
+    {"id": "legacy_clarify", "local_owner": "hermes_multitenancy/feishu_clarify_cards.py", "capability_state": "PARTIAL", "enabled_state": "DISABLED", "production_verified_state": "VERIFIED", "test_id": "G08-L.WP03"},
+    {"id": "readme_only_confirm_builder", "local_owner": "hermes_multitenancy/__init__.py", "capability_state": "GAP", "enabled_state": "DISABLED", "production_verified_state": "NOT_VERIFIED", "test_id": "contract.confirm_builder"}
+  ]
+}
