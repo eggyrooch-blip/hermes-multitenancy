@@ -108,6 +108,8 @@ def _register(ctx) -> None:
 
     override_pool(_build_runtime_pool(_real_factory))
     install_gateway_ownership_guard()
+    from .trusted_feishu_ingress import install_trusted_feishu_ingress_admission
+    install_trusted_feishu_ingress_admission()
     # Make core skill resolution honor the CURRENT HERMES_HOME (not the frozen
     # import-time value). Unconditional: in the router gateway it fixes
     # cross-profile "skill not found" for cron jobs; in profile-native runtimes
@@ -123,8 +125,6 @@ def _register(ctx) -> None:
         install_feishu_group_topic_session_patch()
         from .group_inviter_hook import install_feishu_bot_added_hook
         install_feishu_bot_added_hook()
-        from .feishu_helpdesk_events import install_feishu_helpdesk_events_patch
-        install_feishu_helpdesk_events_patch()
         from .feishu_media_retry import install_feishu_media_retry_patch
         install_feishu_media_retry_patch()
         from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
@@ -221,6 +221,10 @@ def _start_credential_renewal_subsystem() -> None:
 def _dispatch_with_worker_init(**kwargs: Any) -> dict:
     """Wrap on_pre_gateway_dispatch: lazy-start the multi-profile cron worker."""
     try:
+        from .trusted_feishu_ingress import validate_admitted_feishu_event
+        if not validate_admitted_feishu_event(kwargs.get("event"), kwargs.get("gateway")):
+            logger.warning("[multitenancy] trusted Feishu ingress denied before dispatch")
+            return {"action": "skip", "reason": "trusted Feishu ingress denied"}
         if is_router_profile_runtime():
             webui_broker_server.ensure_run_broker_server_started()
             if not webui_broker_server.run_broker_server_ready():

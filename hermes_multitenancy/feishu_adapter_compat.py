@@ -123,6 +123,25 @@ def load_feishu_module() -> ModuleType:
     raise ModuleNotFoundError("No Feishu adapter module candidates configured")
 
 
+def load_live_feishu_module() -> ModuleType:
+    """Resolve the adapter class the gateway will instantiate, or fail closed."""
+    module = _loaded_synthetic_module()
+    if module is not None:
+        return module
+    try:
+        from gateway.platform_registry import platform_registry
+    except ModuleNotFoundError as exc:
+        if not _is_missing_candidate_module(exc, "gateway.platform_registry"):
+            raise
+        return load_feishu_module()
+
+    platform_registry.get("feishu")
+    module = _loaded_synthetic_module()
+    if module is None:
+        raise RuntimeError("live Feishu adapter module did not materialize")
+    return module
+
+
 def load_feishu_adapter() -> Any:
     return getattr(load_feishu_module(), "FeishuAdapter")
 

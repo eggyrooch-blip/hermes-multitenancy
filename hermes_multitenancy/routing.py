@@ -581,19 +581,19 @@ class RoutingTable:
             "WHERE open_id = ? AND active = 1 AND kind = 'user'",
             (open_id,),
         )
-        row = cur.fetchone()
-        return _row_to_dataclass(row) if row else None
+        rows = cur.fetchmany(2)
+        return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
 
     @_serialized
     def lookup_by_union_id(self, union_id: str) -> Optional[RoutingRow]:
         """Return the active user row whose union_id column matches."""
         cur = self._conn.execute(
             "SELECT * FROM multitenancy_routing "
-            "WHERE union_id = ? AND active = 1 AND kind = 'user' LIMIT 1",
+            "WHERE union_id = ? AND active = 1 AND kind = 'user'",
             (union_id,),
         )
-        row = cur.fetchone()
-        return _row_to_dataclass(row) if row else None
+        rows = cur.fetchmany(2)
+        return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
 
     @_serialized
     def lookup_users_by_union_id(self, union_id: str) -> list[RoutingRow]:
@@ -701,11 +701,11 @@ class RoutingTable:
         """
         cur = self._conn.execute(
             "SELECT * FROM multitenancy_routing "
-            "WHERE chat_id = ? AND active = 1 AND kind = 'group' LIMIT 1",
+            "WHERE chat_id = ? AND active = 1 AND kind = 'group'",
             (chat_id,),
         )
-        row = cur.fetchone()
-        return _row_to_dataclass(row) if row else None
+        rows = cur.fetchmany(2)
+        return _row_to_dataclass(rows[0]) if len(rows) == 1 else None
 
     @_serialized
     def resolve_owner_root(self, open_id: str) -> Optional[RoutingRow]:

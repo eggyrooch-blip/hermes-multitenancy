@@ -683,6 +683,29 @@ def _event_metadata(event: Any) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
+def _trusted_feishu_runtime_identity(event: Any) -> tuple[str, str, str] | None:
+    metadata = _event_metadata(event)
+    if not str(metadata.get("trusted_ticket_fingerprint") or "").strip():
+        return None
+    actor = str(metadata.get("trusted_actor_subject") or "").strip()
+    credential = str(metadata.get("trusted_credential_subject") or "").strip()
+    tool_scope = str(metadata.get("feishu_tool_scope") or "").strip()
+    chat_type = str(metadata.get("trusted_chat_type") or "").strip()
+    if (
+        not actor.startswith("ou_")
+        or str(metadata.get("sender_open_id") or "").strip() != actor
+        or not credential
+        or tool_scope not in {"feishu:user", "feishu:bot"}
+        or chat_type not in {"p2p", "group"}
+        or (tool_scope == "feishu:bot") != (chat_type == "group")
+        or not str(metadata.get("trusted_chat_id") or "").strip()
+        or not str(metadata.get("trusted_profile_name") or "").strip()
+        or (tool_scope == "feishu:user" and credential != actor)
+    ):
+        raise RuntimeError("Trusted Feishu runtime identity is incomplete or inconsistent")
+    return actor, credential, tool_scope
+
+
 def _billing_failure_kind(event: Any, error: Any) -> str:
     metadata = _event_metadata(event)
     if (
@@ -1751,13 +1774,24 @@ def _find_ou_value(obj: Any) -> str:
 
 def _resolve_subprocess_sender_open_id(event: Any) -> str:
     """Resolve sender ou_* for the child process after Feishu batching."""
+    trusted_identity = _trusted_feishu_runtime_identity(event)
+    current = ""
     try:
         from tools.feishu_oapi_client import current_sender_open_id
-        current = current_sender_open_id.get()
-        if current and str(current).startswith("ou_"):
-            return str(current)
+        current = str(current_sender_open_id.get() or "").strip()
     except Exception:
         pass
+
+    if trusted_identity is not None:
+        actor, _credential, _tool_scope = trusted_identity
+        if current and current != actor:
+            raise RuntimeError("Trusted Feishu ambient identity does not match admission")
+        if not current:
+            raise RuntimeError("Trusted Feishu ambient identity is unavailable")
+        return actor
+
+    if current.startswith("ou_"):
+        return current
 
     source = getattr(event, "source", None)
     for candidate in (
@@ -2485,6 +2519,10 @@ def _profile_owner_open_id(profile_home: Path) -> str:
 def _lark_cli_auth_broker_scope(
     profile_home: Path,
     sender_open_id: str,
+    *,
+    tool_scope: str = "",
+    chat_type: str = "",
+    chat_id: str = "",
 ) -> Iterator[dict[str, str]]:
     """Start a per-run lark-cli auth broker and return child env overrides."""
     app_id = _resolve_lark_cli_app_id(profile_home)
@@ -2499,12 +2537,21 @@ def _lark_cli_auth_broker_scope(
 
     default_as = _lark_cli_default_identity(profile_home, sender_open_id)
     allowed_bot_chat_ids = _owner_mapped_bot_chat_ids(profile_home, sender_open_id)
-    # Always permit the bot identity: the broker is the authoritative gate and now
-    # live-re-checks routing per send (see _personal_bot_identity_policy_error), so a
-    # sender's freshly-created own group works even when the turn-start cache was
-    # empty. Restricting identities to {"user"} here would reject `--as bot` at the
-    # broker identity gate before that policy check ever runs (freshness race).
-    allowed_identities = frozenset({"user", "bot"})
+    trusted_profile_kind = ""
+    if tool_scope:
+        identity = tool_scope.removeprefix("feishu:")
+        if (
+            identity not in {"user", "bot"}
+            or chat_type not in {"p2p", "group"}
+            or (identity == "bot") != (chat_type == "group")
+            or not chat_id
+        ):
+            raise RuntimeError("Trusted Feishu tool scope does not match sealed chat context")
+        default_as = identity
+        allowed_identities = frozenset({identity})
+        trusted_profile_kind = "group" if chat_type == "group" else "user"
+    else:
+        allowed_identities = frozenset({"user", "bot"})
     key = secrets.token_urlsafe(32)
     expiry_signal = _CREDENTIAL_EXPIRY_SIGNAL.get(None)
     permission_signal = _PERMISSION_AUTH_SIGNAL.get(None)
@@ -2515,8 +2562,12 @@ def _lark_cli_auth_broker_scope(
             user_open_id=sender_open_id,
             hmac_key=key,
             allowed_identities=allowed_identities,
-            profile_kind="group" if is_group_profile else "user",
-            current_chat_id=_group_profile_chat_id(profile_home) if is_group_profile else "",
+            profile_kind=trusted_profile_kind or ("group" if is_group_profile else "user"),
+            current_chat_id=(
+                chat_id
+                if trusted_profile_kind == "group"
+                else (_group_profile_chat_id(profile_home) if is_group_profile else "")
+            ),
             allowed_bot_chat_ids=allowed_bot_chat_ids,
             credential_expiry_sink=expiry_signal.set if expiry_signal is not None else None,
             permission_denied_sink=permission_signal.set if permission_signal is not None else None,
@@ -2560,6 +2611,7 @@ def _aiagent_subprocess_env_scope(
         unregister_session_search_broker_token,
     )
 
+    trusted_identity = _trusted_feishu_runtime_identity(event)
     sender_open_id = _resolve_subprocess_sender_open_id(event)
     merged_extra = dict(extra or {})
     merged_extra.update(_ingest_secret_env_from_event(event))
@@ -2570,6 +2622,15 @@ def _aiagent_subprocess_env_scope(
     merged_extra.update(runtime_env_for_billing_metadata(_event_metadata(event)))
     if sender_open_id and "HERMES_FEISHU_USER_OPEN_ID" not in merged_extra:
         merged_extra["HERMES_FEISHU_USER_OPEN_ID"] = sender_open_id
+    trusted_tool_scope = ""
+    trusted_chat_type = ""
+    trusted_chat_id = ""
+    if trusted_identity is not None:
+        trusted_actor, _trusted_credential, trusted_tool_scope = trusted_identity
+        merged_extra["HERMES_TRUSTED_FEISHU_ACTOR"] = trusted_actor
+        metadata = _event_metadata(event)
+        trusted_chat_type = str(metadata.get("trusted_chat_type") or "").strip()
+        trusted_chat_id = str(metadata.get("trusted_chat_id") or "").strip()
     share_context = _agent_share_context_from_event(event)
     share_role = str(share_context.get("share_role") or "").strip()
     shared_agent_run = share_role in _AGENT_SHARED_ROLES
@@ -2662,6 +2723,15 @@ def _aiagent_subprocess_env_scope(
     with _lark_cli_auth_broker_scope(
         profile_home,
         str(merged_extra.get("HERMES_FEISHU_USER_OPEN_ID") or sender_open_id),
+        **(
+            {
+                "tool_scope": trusted_tool_scope,
+                "chat_type": trusted_chat_type,
+                "chat_id": trusted_chat_id,
+            }
+            if trusted_tool_scope
+            else {}
+        ),
     ) as lark_cli_env:
         try:
             merged_extra.update(lark_cli_env)

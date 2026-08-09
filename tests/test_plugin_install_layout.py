@@ -38,6 +38,11 @@ def test_root_directory_plugin_shim_registers_hook(monkeypatch, tmp_path):
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
+        trusted_ingress = __import__(
+            f"{module_name}.hermes_multitenancy.trusted_feishu_ingress",
+            fromlist=["install_trusted_feishu_ingress_admission"],
+        )
+        monkeypatch.setattr(trusted_ingress, "install_trusted_feishu_ingress_admission", lambda: None)
         hooks = []
 
         class FakeCtx:

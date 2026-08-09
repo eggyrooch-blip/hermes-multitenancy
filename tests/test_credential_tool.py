@@ -173,6 +173,7 @@ def test_credential_status_tool_rejects_cross_profile_query(monkeypatch, tmp_pat
 def test_register_adds_credential_status_tool_without_raw_secret_access(monkeypatch):
     import builtins
     import hermes_multitenancy
+    from hermes_multitenancy import trusted_feishu_ingress
 
     real_import = builtins.__import__
 
@@ -191,6 +192,7 @@ def test_register_adds_credential_status_tool_without_raw_secret_access(monkeypa
             calls.append(kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(trusted_feishu_ingress, "install_trusted_feishu_ingress_admission", lambda: None)
     hermes_multitenancy.register(FakeCtx())
 
     tool = next(call for call in calls if call["name"] == "multitenancy_credential_status")

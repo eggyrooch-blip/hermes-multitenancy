@@ -9,7 +9,7 @@ HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_LABEL ?= Image \#1
 HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_REASON ?= lark_group_invite_qr_not_feedback_screenshot
 
 test:
-	uv run --extra test pytest -q
+	scripts/run_tests.sh
 
 skills-uat:
 	@mkdir -p "$(HERMES_SKILLS_UAT_EVIDENCE_DIR)"

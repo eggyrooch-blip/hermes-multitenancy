@@ -56,6 +56,28 @@ def _install_billing_delegation_guard(enabled: bool):
     return cleanup
 
 
+def _validate_trusted_feishu_tool_scope(event: Any, profile_home: Path) -> None:
+    trusted_identity = _trusted_feishu_runtime_identity(event)
+    if trusted_identity is None:
+        return
+    _actor, _credential, _tool_scope = trusted_identity
+    metadata = _event_metadata(event)
+    if str(metadata.get("trusted_profile_name") or "").strip() != profile_home.name:
+        raise RuntimeError("Trusted Feishu profile does not match the routed profile")
+
+
+def _trusted_feishu_child_sender(event: Any, current_sender_open_id: Any) -> str | None:
+    trusted_identity = _trusted_feishu_runtime_identity(event)
+    if trusted_identity is None:
+        return None
+    actor, _credential, _tool_scope = trusted_identity
+    current = str(current_sender_open_id.get() or "").strip()
+    sealed_child_actor = str(os.environ.get("HERMES_TRUSTED_FEISHU_ACTOR") or "").strip()
+    if (current and current != actor) or sealed_child_actor != actor:
+        raise RuntimeError("Trusted Feishu child identity does not match admission")
+    return actor
+
+
 def _run_with_aiagent(
     event: Any,
     profile_home: Path,
@@ -75,6 +97,8 @@ def _run_with_aiagent(
     """
     # 1) Anchor HERMES_HOME so any module that reads it sees the profile.
     os.environ["HERMES_HOME"] = str(profile_home)
+    event_metadata = _event_metadata(event)
+    _validate_trusted_feishu_tool_scope(event, profile_home)
 
     # 2) Read profile LLM config + credentials (mirrors the spike loader).
     config = _pkg._load_profile_config(profile_home)
@@ -98,7 +122,6 @@ def _run_with_aiagent(
     )
     api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
     base_url = _resolve_base_url(provider, True, config, env_overrides)
-    event_metadata = _event_metadata(event)
     from ..billing_identity import (
         billing_endpoint_allowed,
         billing_runtime_from_environment,
@@ -149,7 +172,9 @@ def _run_with_aiagent(
     # because it comes straight from sender_id.open_id (the SDK gives the
     # ou_* form). Only fall back to event.source on weird code paths
     # (e.g., synthetic events constructed without going through the adapter).
-    sender_open_id = (current_sender_open_id.get() or "") or _resolve_sender_open_id(event)
+    sender_open_id = _trusted_feishu_child_sender(event, current_sender_open_id)
+    if sender_open_id is None:
+        sender_open_id = (current_sender_open_id.get() or "") or _resolve_sender_open_id(event)
 
     try:
         enabled_toolsets = _pkg._resolve_enabled_toolsets(

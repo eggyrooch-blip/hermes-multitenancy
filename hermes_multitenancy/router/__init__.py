@@ -619,17 +619,41 @@ def _run_request_for_routed_event(
     from ..run_models import RunRequest
     from ..billing_identity import canonical_sync_open_id
 
-    canonical_sender = sender
-    if not _is_feishu_open_id(canonical_sender):
-        canonical_sender = canonical_sync_open_id(
-            _get_routing_table(),
-            canonical_sender,
-        )
+    admission = getattr(event, "trusted_feishu_ingress_admission", None)
+    authentic_admission = bool(
+        admission is not None
+        and callable(getattr(admission, "is_authentic", None))
+        and admission.is_authentic()
+    )
+    if authentic_admission:
+        profile_name = admission.profile_name
+        canonical_sender = admission.actor_subject
+        sender_alt = None
+        chat_id = admission.chat_id
+        credential_subject = admission.credential_subject
+    else:
+        canonical_sender = sender
+        if not _is_feishu_open_id(canonical_sender):
+            canonical_sender = canonical_sync_open_id(
+                _get_routing_table(),
+                canonical_sender,
+            )
+        credential_subject = canonical_sender or sender
     user_key = _tenant_user_key(canonical_sender or sender, sender_alt)
     metadata = {
         "sender_open_id": canonical_sender,
         "chat_type": _extract_chat_type(event),
     }
+    if authentic_admission:
+        metadata.update({
+            "feishu_tool_scope": admission.tool_scope,
+            "trusted_actor_subject": admission.actor_subject,
+            "trusted_chat_id": admission.chat_id,
+            "trusted_chat_type": admission.chat_type,
+            "trusted_credential_subject": admission.credential_subject,
+            "trusted_profile_name": admission.profile_name,
+            "trusted_ticket_fingerprint": admission.ticket_fingerprint,
+        })
     if sender_alt:
         metadata["sender_alt"] = sender_alt
     return RunRequest(
@@ -639,7 +663,7 @@ def _run_request_for_routed_event(
         content=text,
         chat_id=chat_id,
         message_id=_event_message_id(event),
-        credential_subject=user_key,
+        credential_subject=credential_subject,
         requires_host_tools=_host_tools_require_sandbox(),
         metadata=metadata,
     )
