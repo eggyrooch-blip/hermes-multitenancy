@@ -12,6 +12,7 @@ are `.needs_reauth` markers (idempotent — same reason + same day is a no-op).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -35,6 +36,14 @@ from .credential_renewal_common import (
 logger = logging.getLogger(__name__)
 
 _AUDIT_IDENTITY_LOCK_TIMEOUT_SECONDS = 0.05
+
+
+def _fingerprint(value: Any) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _collection_fingerprint(values: list[str]) -> str:
+    return _fingerprint("\x1f".join(sorted(values)))
 
 
 @dataclass
@@ -63,13 +72,16 @@ def run_startup_audit(shared_home: Path) -> AuditReport:
     logger.info(report.summary_line())
     if report.orphan_profiles:
         logger.warning(
-            "[credential_audit] orphan profiles (running but no active routing row): %s",
-            ",".join(report.orphan_profiles),
+            "[credential_audit] orphan profiles count=%d fingerprint=%s",
+            len(report.orphan_profiles),
+            _collection_fingerprint(report.orphan_profiles),
         )
     if report.missing_uat_for_routing:
         logger.warning(
-            "[credential_audit] routing rows without any usable UAT on disk: %s",
-            ",".join(report.missing_uat_for_routing),
+            "[credential_audit] routing rows without any usable UAT on disk "
+            "count=%d fingerprint=%s",
+            len(report.missing_uat_for_routing),
+            _collection_fingerprint(report.missing_uat_for_routing),
         )
     return report
 
@@ -99,8 +111,9 @@ def _audit_uat_files(shared_home: Path, report: AuditReport) -> None:
     for loc, reason, detail in broken:
         if loc.open_id in usable_open_ids:
             logger.info(
-                "[credential_audit] stale UAT copy ignored (usable UAT exists elsewhere): %s reason=%s",
-                loc.path,
+                "[credential_audit] stale UAT copy ignored "
+                "identity_fingerprint=%s reason=%s",
+                _fingerprint(f"{loc.profile_name}:{loc.open_id}"),
                 reason,
             )
             continue
@@ -208,10 +221,11 @@ def _maybe_write_marker(
     if profile and active_profile and profile != active_profile:
         logger.info(
             "[credential_audit] stale profile UAT ignored after route move "
-            "profile=%s active_profile=%s open_id=%s",
-            profile,
-            active_profile,
-            open_id,
+            "profile_fingerprint=%s active_profile_fingerprint=%s "
+            "subject_fingerprint=%s",
+            _fingerprint(profile),
+            _fingerprint(active_profile),
+            _fingerprint(open_id),
         )
         return
     lock_profile = active_profile or profile
@@ -230,9 +244,9 @@ def _maybe_write_marker(
     except CredentialIdentityLockTimeout:
         logger.warning(
             "[credential_audit] identity busy; marker audit skipped "
-            "profile=%s open_id=%s",
-            lock_profile,
-            open_id,
+            "profile_fingerprint=%s subject_fingerprint=%s",
+            _fingerprint(lock_profile),
+            _fingerprint(open_id),
         )
     except ValueError:
         # A malformed leftover profile/UAT filename must not abort gateway
@@ -240,8 +254,8 @@ def _maybe_write_marker(
         # audit's historical unlocked write is fail-closed for that artifact.
         logger.warning(
             "[credential_audit] unsafe marker identity cannot use shared lock "
-            "profile=%r open_id=%r",
-            lock_profile,
-            open_id,
+            "profile_fingerprint=%s subject_fingerprint=%s",
+            _fingerprint(lock_profile),
+            _fingerprint(open_id),
         )
         write_if_changed()
