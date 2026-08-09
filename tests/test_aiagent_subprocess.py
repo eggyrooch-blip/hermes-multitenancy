@@ -8416,8 +8416,8 @@ def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
 
     profile = tmp_path / "profiles" / "alice"
     profile.mkdir(parents=True)
-    base_python = tmp_path / "base" / "python3"
-    base_python.parent.mkdir()
+    base_python = tmp_path / "base" / "bin" / "python3"
+    base_python.parent.mkdir(parents=True)
     base_python.write_text("#!/bin/sh\n")
     real_venv = tmp_path / "venvs" / "v019"
     (real_venv / "bin").mkdir(parents=True)
@@ -8439,6 +8439,65 @@ def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
     resolved_launcher = str(real_venv.resolve() / "bin" / "python")
     assert wrapped[sep_idx + 1:] == [resolved_launcher, "child.py"]
     assert resolved_launcher != str(base_python.resolve())
+    runtime_root = str(base_python.parent.parent.resolve())
+    assert any(
+        wrapped[index:index + 3] == ["--ro-bind", runtime_root, runtime_root]
+        for index in range(len(wrapped) - 2)
+    )
+
+
+def test_interpreter_runtime_bwrap_args_covered_root_adds_nothing(tmp_path: Path):
+    """Launcher resolving inside an already-mounted root must not add a bind."""
+    from hermes_multitenancy import agent_real
+
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    launcher = venv / "bin" / "python"
+    launcher.write_text("#!/bin/sh\n")
+
+    assert agent_real._interpreter_runtime_bwrap_args(str(launcher), [venv], []) == []
+
+
+def test_interpreter_runtime_bwrap_args_missing_launcher_adds_nothing(tmp_path: Path):
+    """Dangling/missing launcher must not raise nor add binds."""
+    from hermes_multitenancy import agent_real
+
+    missing = tmp_path / "venv" / "bin" / "python"
+    assert agent_real._interpreter_runtime_bwrap_args(str(missing), [], []) == []
+
+
+def test_interpreter_runtime_bwrap_args_refuses_wide_roots(tmp_path: Path):
+    """runtime-root-trust-boundary: a shallow launcher must never mount a root
+    that contains user home / shared home / profile home (tenant isolation)."""
+    from hermes_multitenancy import agent_real
+
+    user_home = tmp_path / "home" / "hermes"
+    shared_home = user_home / ".hermes"
+    profile_home = shared_home / "profiles" / "alice"
+    profile_home.mkdir(parents=True)
+    # Launcher directly under $HOME/bin → derived runtime root would be $HOME.
+    (user_home / "bin").mkdir(parents=True)
+    shallow = user_home / "bin" / "python"
+    shallow.write_text("#!/bin/sh\n")
+
+    forbidden = [user_home, shared_home, profile_home]
+    assert agent_real._interpreter_runtime_bwrap_args(str(shallow), [], forbidden) == []
+
+    # Even shallower: runtime root would be an ancestor of $HOME.
+    (tmp_path / "home" / "bin").mkdir(parents=True)
+    shallower = tmp_path / "home" / "bin" / "python"
+    shallower.write_text("#!/bin/sh\n")
+    assert agent_real._interpreter_runtime_bwrap_args(str(shallower), [], forbidden) == []
+
+    # Deep release-style runtime stays allowed.
+    deep = user_home / "releases" / "r1" / ".hermes-runtime" / "python" / "cpython" / "bin"
+    deep.mkdir(parents=True)
+    deep_launcher = deep / "python3.11"
+    deep_launcher.write_text("#!/bin/sh\n")
+    runtime_root = str(deep.parent.resolve())
+    assert agent_real._interpreter_runtime_bwrap_args(str(deep_launcher), [], forbidden) == [
+        "--ro-bind", runtime_root, runtime_root,
+    ]
 
 
 def test_wrap_linux_bwrap_per_profile_gate_excludes_others(monkeypatch, tmp_path: Path):

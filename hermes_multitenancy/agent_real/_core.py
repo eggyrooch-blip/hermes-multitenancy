@@ -3797,6 +3797,48 @@ def _is_sandbox_secret_skill_file(rel_path: str | Path) -> bool:
     return any(part in name for part in _SANDBOX_SKILL_SECRET_NAME_PARTS)
 
 
+def _interpreter_runtime_bwrap_args(
+    launcher: str, covered_roots: list[Path], forbidden_ancestors: list[Path]
+) -> list[str]:
+    """Expose the launcher's real interpreter runtime inside bwrap.
+
+    uv-managed venvs symlink ``bin/python`` to a runtime that can live outside
+    every mounted tree (prod 2026-08-10: a sibling agent release's
+    ``.hermes-runtime``, so every spawn died at ``execvp: No such file or
+    directory`` before the model ran). Bind the resolved runtime root
+    read-only unless an existing mount already covers it. ``pyvenv.cfg``
+    ``home`` points into the same runtime root, so one bind covers both
+    execvp and stdlib resolution.
+
+    Fail-closed upper bound (review finding runtime-root-trust-boundary):
+    a shallow launcher like ``$HOME/bin/python`` would derive ``$HOME`` as
+    runtime root and mount every tenant profile read-only. Never bind a root
+    that contains any forbidden ancestor (user home, shared home, profile
+    home) or ``/`` — skipping means at worst the pre-fix ENOENT, never a
+    tenant-isolation break.
+    """
+    try:
+        real = Path(launcher).resolve(strict=True)
+    except OSError:
+        return []
+    runtime_root = real.parent.parent if real.parent.name == "bin" else real.parent
+    if runtime_root == Path("/"):
+        return []
+    for root in covered_roots:
+        try:
+            if runtime_root == root or runtime_root.is_relative_to(root):
+                return []
+        except (TypeError, ValueError):
+            continue
+    for sensitive in forbidden_ancestors:
+        try:
+            if sensitive == runtime_root or sensitive.is_relative_to(runtime_root):
+                return []
+        except (TypeError, ValueError):
+            continue
+    return ["--ro-bind", str(runtime_root), str(runtime_root)]
+
+
 def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
     """Linux backend: wrap with /usr/bin/bwrap + bwrap-default.args.
 
@@ -3850,6 +3892,21 @@ def _wrap_linux_bwrap(cmd: list[str], profile_home: Path) -> list[str]:
     }
     bwrap_args = _render_bwrap_args(_BWRAP_ARGS_FILE.read_text(), substitutions)
     bwrap_args.extend(_shared_skill_symlink_bwrap_args(profile_home_resolved, shared_home))
+    if cmd:
+        bwrap_args.extend(
+            _interpreter_runtime_bwrap_args(
+                cmd[0],
+                [
+                    venv,
+                    agent_install,
+                    agent_repo,
+                    mt_repo,
+                    Path("/usr"),
+                    user_home / ".local" / "share" / "uv",
+                ],
+                [user_home, shared_home, profile_home_resolved],
+            )
+        )
     wrapped = [_BWRAP_EXEC, *bwrap_args, "--", *cmd]
     logger.info(
         "[multitenancy] bwrap wrap: policy=%s profile=%s agent_repo=%s",
