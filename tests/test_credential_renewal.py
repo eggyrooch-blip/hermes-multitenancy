@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -704,6 +705,55 @@ def _seed_uat(shared: Path, profile: str | None, open_id: str, payload: dict[str
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload), encoding="utf-8")
     return target
+
+
+def test_l5_audit_logs_only_counts_and_fingerprints(tmp_path: Path, caplog):
+    routed_profile = "raw_employee_profile"
+    routed_open_id = "ou_raw_employee_identity"
+    orphan_profile = "raw_orphan_profile"
+    _seed_active_route(tmp_path, routed_profile, routed_open_id)
+    orphan_home = tmp_path / "profiles" / orphan_profile
+    orphan_home.mkdir(parents=True)
+    (orphan_home / "gateway.pid").write_text("1", encoding="utf-8")
+
+    caplog.set_level(logging.INFO, logger=credential_audit.__name__)
+    report = credential_audit.run_startup_audit(tmp_path)
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+
+    assert report.orphan_profiles == [orphan_profile]
+    assert report.missing_uat_for_routing == [f"{routed_profile}:{routed_open_id}"]
+    assert "orphan profiles count=1 fingerprint=" in rendered
+    assert "routing rows without any usable UAT on disk count=1 fingerprint=" in rendered
+    for raw in (routed_profile, routed_open_id, orphan_profile, str(orphan_home)):
+        assert raw not in rendered
+
+
+def test_l5_marker_recovery_logs_only_fingerprints(tmp_path: Path, caplog):
+    raw_open_id = "ou_raw_route_moved"
+    raw_old_profile = "raw_old_profile"
+    raw_active_profile = "raw_active_profile"
+    _seed_active_route(tmp_path, raw_active_profile, raw_open_id)
+    marker_dir = tmp_path / "profiles" / raw_old_profile / "feishu_uat"
+    marker_dir.mkdir(parents=True)
+
+    caplog.set_level(logging.INFO, logger=credential_audit.__name__)
+    credential_audit._maybe_write_marker(
+        tmp_path,
+        marker_dir,
+        raw_open_id,
+        reason=common.REASON_REFRESH_TOKEN_EXPIRED,
+        detail="broken token",
+        report=credential_audit.AuditReport(),
+        profile=raw_old_profile,
+    )
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+
+    assert "stale profile UAT ignored after route move" in rendered
+    assert "profile_fingerprint=" in rendered
+    assert "active_profile_fingerprint=" in rendered
+    assert "subject_fingerprint=" in rendered
+    for raw in (raw_open_id, raw_old_profile, raw_active_profile, str(marker_dir)):
+        assert raw not in rendered
 
 
 def test_l5_audit_classifies_broken_uat(tmp_path: Path):
