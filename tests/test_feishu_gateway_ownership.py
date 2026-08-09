@@ -163,6 +163,7 @@ def test_fixed_expert_owns_feishu_but_does_NOT_run_router_sidecars(monkeypatch, 
     running cron does not flip is_router_profile_runtime True."""
     import hermes_multitenancy
     import hermes_multitenancy.group_inviter_hook as group_inviter_hook
+    from hermes_multitenancy import trusted_feishu_ingress
 
     calls = []
 
@@ -174,6 +175,7 @@ def test_fixed_expert_owns_feishu_but_does_NOT_run_router_sidecars(monkeypatch, 
     monkeypatch.delenv("HERMES_MULTITENANCY_ROUTER_PROFILE", raising=False)
     monkeypatch.setenv("HERMES_MULTITENANCY_FIXED_EXPERT", "kep-trevi-resource-delivery-expert")  # owns Feishu
     monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(trusted_feishu_ingress, "install_trusted_feishu_ingress_admission", lambda: None)
     monkeypatch.setattr(hermes_multitenancy, "install_cron_runtime_patches", lambda: calls.append(("cron_patches", None)))
     monkeypatch.setattr(hermes_multitenancy, "install_gateway_startup_watcher", lambda: calls.append(("cron_watcher", None)))
     monkeypatch.setattr(
@@ -200,6 +202,7 @@ def test_register_does_not_start_router_only_sidecars_on_non_router(monkeypatch,
     """Profile-local gateways should not start router-owned sidecars."""
     import hermes_multitenancy
     import hermes_multitenancy.group_inviter_hook as group_inviter_hook
+    from hermes_multitenancy import trusted_feishu_ingress
 
     calls = []
 
@@ -209,6 +212,7 @@ def test_register_does_not_start_router_only_sidecars_on_non_router(monkeypatch,
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "user_profile"))
     monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_SERVER", "1")
+    monkeypatch.setattr(trusted_feishu_ingress, "install_trusted_feishu_ingress_admission", lambda: None)
     monkeypatch.setattr(hermes_multitenancy, "install_cron_runtime_patches", lambda: calls.append(("cron_patches", None)))
     monkeypatch.setattr(hermes_multitenancy, "install_gateway_startup_watcher", lambda: calls.append(("cron_watcher", None)))
     monkeypatch.setattr(

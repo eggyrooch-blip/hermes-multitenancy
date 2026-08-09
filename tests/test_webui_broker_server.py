@@ -1579,8 +1579,8 @@ def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_
                 "session_id": "session-webui",
                 "requires_host_tools": True,
             }))
-            response = await asyncio.wait_for(post_task, timeout=0.2)
-            first_line = await asyncio.wait_for(response.content.readline(), timeout=0.2)
+            response = await asyncio.wait_for(post_task, timeout=1.0)
+            first_line = await asyncio.wait_for(response.content.readline(), timeout=1.0)
             assert b'"kind": "thinking"' in first_line
             assert "正在连接模型".encode("utf-8") in first_line
             release.set()

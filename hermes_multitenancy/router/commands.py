@@ -37,8 +37,28 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
 
     trace_tokens = None
     try:
+        trusted_admission = getattr(event, "trusted_feishu_ingress_admission", None)
+        if trusted_admission is not None:
+            from ..trusted_feishu_ingress import validate_admitted_feishu_event
+
+            if not validate_admitted_feishu_event(event, gateway):
+                _m.logger.warning("multitenancy: trusted Feishu context changed before execution")
+                return
+            trusted_profile_name = trusted_admission.profile_name
+            trusted_profile_home = _m._profile_name_to_home(trusted_profile_name)
+            if not trusted_profile_home.is_dir():
+                _m.logger.warning("multitenancy: trusted Feishu profile became unavailable")
+                return
+        else:
+            trusted_profile_name = None
+            trusted_profile_home = None
+
         source = getattr(event, "source", None)
-        chat_id = getattr(source, "chat_id", "unknown") if source else "unknown"
+        chat_id = (
+            trusted_admission.chat_id
+            if trusted_admission is not None
+            else (getattr(source, "chat_id", "unknown") if source else "unknown")
+        )
         try:
             # Trace setup must never affect message handling: a raw_event whose
             # "event" is truthy-but-not-a-dict would AttributeError in
@@ -47,11 +67,21 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         except Exception:
             pass
         fallback_sender = getattr(source, "user_id", "unknown") if source else "unknown"
-        sender = _m._resolve_sender_for_routing(event, fallback=fallback_sender)
+        sender = (
+            trusted_admission.actor_subject
+            if trusted_admission is not None
+            else _m._resolve_sender_for_routing(event, fallback=fallback_sender)
+        )
         if _m._is_feishu_open_id(sender):
             setattr(event, "sender_open_id", sender)
         text = getattr(event, "text", "") or ""
-        chat_type = _m._extract_chat_type(event)
+        chat_type = (
+            trusted_admission.chat_type
+            if trusted_admission is not None
+            else (
+                _m._extract_chat_type(event)
+            )
+        )
         fixed_context: expert_bot_route.FixedExpertContext | None = None
         fixed_expert_id = expert_bot_route.fixed_expert_id_from_env()
         if fixed_expert_id:
@@ -76,6 +106,12 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                     await _m._safe_call(adapter.send, chat_id, fixed_result.message)
                 return
             fixed_context = fixed_result
+            if trusted_admission is not None and (
+                fixed_context.profile_name != trusted_profile_name
+                or fixed_context.canonical_open_id != trusted_admission.actor_subject
+            ):
+                _m.logger.warning("multitenancy: fixed expert route disagrees with trusted admission")
+                return
             expert_bot_route.apply_fixed_expert_context(event, fixed_context)
             sender = fixed_context.canonical_open_id
 
@@ -111,7 +147,12 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
         is_group_chat = _m._is_group_chat_type(chat_type)
         group_profile_name: Optional[str] = None
         group_profile_home: Optional[Path] = None
-        if fixed_context is None and is_group_chat and chat_id and chat_id != "unknown":
+        if trusted_admission is not None and is_group_chat:
+            group_profile_name, group_profile_home = (
+                trusted_profile_name,
+                trusted_profile_home,
+            )
+        elif fixed_context is None and is_group_chat and chat_id and chat_id != "unknown":
             group_profile_name, group_profile_home = (
                 await _m.resolve_or_auto_provision_group_route(
                     chat_id=chat_id, gateway=gateway,
@@ -175,9 +216,15 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             from ..cron_trigger_direct import try_route_cron_trigger
             from ..push_card_matcher import _YOLO_ROUTED_ATTR
 
-            trigger_profile_name, trigger_profile_home = _m._resolve_route(
-                sender, alt_id=sender_alt
-            )
+            if trusted_admission is not None:
+                trigger_profile_name, trigger_profile_home = (
+                    trusted_profile_name,
+                    trusted_profile_home,
+                )
+            else:
+                trigger_profile_name, trigger_profile_home = _m._resolve_route(
+                    sender, alt_id=sender_alt
+                )
             if (
                 trigger_profile_home is not None
                 and fixed_context is None
@@ -230,6 +277,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
             if is_group_chat:
                 cmd_profile_name = group_profile_name
                 cmd_profile_home = group_profile_home
+            elif trusted_admission is not None:
+                cmd_profile_name = trusted_profile_name
+                cmd_profile_home = trusted_profile_home
             elif fixed_context is not None:
                 cmd_profile_name = fixed_context.profile_name
                 cmd_profile_home = fixed_context.profile_home
@@ -279,7 +329,9 @@ async def handle_async(*, event: Any, gateway: Any) -> None:
                 return
 
         # Routing: group already resolved above; sender-based path for p2p.
-        if fixed_context is not None:
+        if trusted_admission is not None:
+            profile_name, profile_home = trusted_profile_name, trusted_profile_home
+        elif fixed_context is not None:
             profile_name, profile_home = fixed_context.profile_name, fixed_context.profile_home
         elif is_group_chat:
             profile_name, profile_home = group_profile_name, group_profile_home

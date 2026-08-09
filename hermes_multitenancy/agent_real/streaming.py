@@ -187,14 +187,7 @@ async def _stream_aiagent_subprocess(
     # gateway loop; lazy-import it so this module still imports if
     # tools.feishu_oapi_client is unavailable in tests / non-feishu
     # deployments.
-    sender_open_id = ""
-    try:
-        from tools.feishu_oapi_client import current_sender_open_id as _cv
-        sender_open_id = _cv.get() or ""
-    except Exception:
-        pass
-    if not sender_open_id:
-        sender_open_id = _resolve_subprocess_sender_open_id(event)
+    sender_open_id = _resolve_subprocess_sender_open_id(event)
     _canonical_session_id = _resolve_aiagent_session_id(event, profile_home, sender_open_id)
     user_text = getattr(event, "text", "") or ""
     _state_db_path = profile_home / "state.db"
