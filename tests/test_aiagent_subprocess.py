@@ -140,6 +140,31 @@ def _install_fake_approval(monkeypatch):
     return registered, resolved
 
 
+def test_trusted_sender_uses_sealed_actor_when_ambient_context_is_absent(monkeypatch):
+    from hermes_multitenancy import agent_real
+
+    _install_fake_feishu_oapi(monkeypatch)
+    event = _event()
+    event.raw_event = {"metadata": {
+        "sender_open_id": "ou_test",
+        "trusted_actor_subject": "ou_test",
+        "trusted_chat_id": "oc_test",
+        "trusted_chat_type": "p2p",
+        "trusted_credential_subject": "ou_test",
+        "trusted_profile_name": "profile_test",
+        "trusted_ticket_fingerprint": "fingerprint",
+        "feishu_tool_scope": "feishu:user",
+    }}
+
+    assert agent_real._resolve_subprocess_sender_open_id(event) == "ou_test"
+
+    from tools.feishu_oapi_client import sender_open_id_scope
+
+    with sender_open_id_scope("ou_other"):
+        with pytest.raises(RuntimeError, match="ambient identity does not match"):
+            agent_real._resolve_subprocess_sender_open_id(event)
+
+
 @pytest.mark.asyncio
 async def test_real_run_agent_uses_subprocess_runner(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real

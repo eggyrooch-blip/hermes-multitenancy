@@ -580,8 +580,10 @@ def test_real_agent_ticket_crosses_mt_runtime_boundary(routes, tmp_path, monkeyp
     monkeypatch.setenv("HERMES_TRUSTED_FEISHU_ACTOR", "ou_a")
     with sender_open_id_scope(None):
         root._dispatch_with_worker_init(event=missing_event, gateway=NS())
-    assert len(broker_contexts) == 1
-    assert "ambient identity is unavailable" in caplog.text
+    assert len(broker_contexts) == 2
+    assert broker_contexts[-1].user_open_id == "ou_a"
+    assert broker_contexts[-1].allowed_identities == frozenset({"user"})
+    assert "ambient identity is unavailable" not in caplog.text
 def replace_event(event, ticket, admission):
     return NS(
         **{
