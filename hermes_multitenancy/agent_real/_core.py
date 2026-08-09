@@ -1786,8 +1786,6 @@ def _resolve_subprocess_sender_open_id(event: Any) -> str:
         actor, _credential, _tool_scope = trusted_identity
         if current and current != actor:
             raise RuntimeError("Trusted Feishu ambient identity does not match admission")
-        if not current:
-            raise RuntimeError("Trusted Feishu ambient identity is unavailable")
         return actor
 
     if current.startswith("ou_"):
