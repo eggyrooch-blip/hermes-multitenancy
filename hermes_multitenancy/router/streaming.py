@@ -50,13 +50,57 @@ def _clean_stream_delta_text(text: str, profile_home: Optional[Path] = None) -> 
     return cleaned
 
 
-def _stream_failure_content(text: str, profile_home: Optional[Path] = None) -> str:
+_BUDGET_EXCEEDED_NOTICE = (
+    "⚠️ 你本月的 AI 使用额度已用完，这次请求没有执行。"
+    "额度每月 1 日自动恢复；如需提前恢复或调整额度，请联系 IT。"
+)
+_RATE_LIMIT_NOTICE = "⚠️ AI 网关当前请求过于频繁，这次没有执行成功。请稍等几分钟再试。"
+
+
+def _billing_failure_stream_notice(exc: BaseException | None) -> Optional[str]:
+    """Map a stream failure to a user-ready LiteLLM billing notice, if it is one.
+
+    The generic handlers below discard the exception text, which buried the
+    429 budget_exceeded cause behind _PARTIAL_FAILURE_NOTICE (jiaomeijia
+    2026-08-10: 9 users over the $120 cap all saw "中途出错" and re-sent).
+    Classification is text-based over the whole cause chain because
+    ``_finalize_aiagent_result``/``_core`` re-wrap the original 429 error.
+    """
+    if exc is None:
+        return None
+    from ..billing_identity import classify_litellm_error
+
+    texts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(seen) < 10:
+        seen.add(id(cur))
+        texts.append(str(cur))
+        cur = cur.__cause__ or cur.__context__
+    blob = " | ".join(texts)
+    kind = classify_litellm_error(blob)
+    # _core's _billing_failure_message strings are Chinese product copy the
+    # English-keyword classifier can't see; match them directly so this path
+    # doesn't depend on the raw 429 surviving on __cause__ (grok review #p1).
+    if kind == "budget_exceeded" or "额度已用尽" in blob:
+        return _BUDGET_EXCEEDED_NOTICE
+    if kind == "rate_limit" or "请求过于频繁" in blob:
+        return _RATE_LIMIT_NOTICE
+    return None
+
+
+def _stream_failure_content(
+    text: str,
+    profile_home: Optional[Path] = None,
+    exc: BaseException | None = None,
+) -> str:
     from ..agent_real import _PARTIAL_FAILURE_NOTICE
 
+    notice = _billing_failure_stream_notice(exc) or _PARTIAL_FAILURE_NOTICE
     partial = _clean_stream_display_text(text, profile_home).rstrip()
-    if _PARTIAL_FAILURE_NOTICE in partial:
+    if notice in partial:
         return partial
-    return f"{partial}\n\n{_PARTIAL_FAILURE_NOTICE}" if partial else _PARTIAL_FAILURE_NOTICE
+    return f"{partial}\n\n{notice}" if partial else notice
 
 
 def _start_hub_flow_poll(
@@ -868,7 +912,7 @@ async def _stream_into_feishu_shared_consumer(
                         "multitenancy: shared streaming recovery exhausted (%s)",
                         type(exc).__name__,
                     )
-                    content = _stream_failure_content(content, profile_home)
+                    content = _stream_failure_content(content, profile_home, exc=exc)
                     stream_failed = True
         finally:
             _PROFILE_HOME_VAR.reset(token)
@@ -1430,8 +1474,9 @@ async def _stream_into_feishu(
                     full_content = _stream_failure_content(
                         full_content or content,
                         profile_home,
+                        exc=exc,
                     )
-                    content = _stream_failure_content(content, profile_home)
+                    content = _stream_failure_content(content, profile_home, exc=exc)
                     stream_failed = True
         finally:
             _PROFILE_HOME_VAR.reset(token)
