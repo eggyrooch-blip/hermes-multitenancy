@@ -50,11 +50,10 @@ def _clean_stream_delta_text(text: str, profile_home: Optional[Path] = None) -> 
     return cleaned
 
 
-_BUDGET_EXCEEDED_NOTICE = (
-    "⚠️ 你本月的 AI 使用额度已用完，这次请求没有执行。"
-    "额度每月 1 日自动恢复；如需提前恢复或调整额度，请联系 IT。"
+from ..billing_notices import (
+    BUDGET_EXCEEDED_NOTICE as _BUDGET_EXCEEDED_NOTICE,
+    RATE_LIMIT_NOTICE as _RATE_LIMIT_NOTICE,
 )
-_RATE_LIMIT_NOTICE = "⚠️ AI 网关当前请求过于频繁，这次没有执行成功。请稍等几分钟再试。"
 
 
 def _billing_failure_stream_notice(exc: BaseException | None) -> Optional[str]:

@@ -76,3 +76,65 @@ def test_self_referential_context_chain_terminates() -> None:
     exc = RuntimeError("outer")
     exc.__context__ = exc  # pathological loop must not hang
     assert _stream_failure_content("", None, exc=exc) == _PARTIAL_FAILURE_NOTICE
+
+
+def _errored_card(content: str) -> dict:
+    import time
+
+    from hermes_multitenancy.card.builder import _render_message_card
+
+    state = {
+        "status": "",
+        "reasoning": "",
+        "content": content,
+        "tools": [],
+        "started_at": time.monotonic(),
+        "finalized": True,
+        "aborted": False,
+        "errored": True,
+    }
+    return _render_message_card(state)
+
+
+def test_budget_card_header_is_orange_quota() -> None:
+    header = _errored_card(_BUDGET_EXCEEDED_NOTICE)["header"]
+    assert header["template"] == "orange"
+    assert header["title"]["content"] == "额度已用完"
+
+
+def test_rate_limit_card_header_is_orange() -> None:
+    header = _errored_card(_RATE_LIMIT_NOTICE)["header"]
+    assert header["template"] == "orange"
+    assert header["title"]["content"] == "请求过于频繁"
+
+
+def test_generic_error_card_header_stays_red() -> None:
+    header = _errored_card("partial answer\n\n" + _PARTIAL_FAILURE_NOTICE)["header"]
+    assert header["template"] == "red"
+    assert header["title"]["content"] == "执行出错"
+
+
+def test_partial_plus_budget_notice_still_gets_quota_header() -> None:
+    header = _errored_card("写了一半的回答\n\n" + _BUDGET_EXCEEDED_NOTICE)["header"]
+    assert header["template"] == "orange"
+    assert header["title"]["content"] == "额度已用完"
+
+
+def test_non_errored_card_has_no_header() -> None:
+    import time
+
+    from hermes_multitenancy.card.builder import _render_message_card
+
+    card = _render_message_card(
+        {
+            "status": "",
+            "reasoning": "",
+            "content": "正常回答",
+            "tools": [],
+            "started_at": time.monotonic(),
+            "finalized": True,
+            "aborted": False,
+            "errored": False,
+        }
+    )
+    assert "header" not in card
