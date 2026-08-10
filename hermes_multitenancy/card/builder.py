@@ -164,9 +164,20 @@ def _render_message_card(state: dict[str, Any]) -> dict[str, Any]:
         "elements": elements,
     }
     if state.get("errored"):
+        # Billing outcomes are not system errors: sniff the body (single writer,
+        # router/streaming) so the header explains instead of alarming.
+        from ..billing_notices import BUDGET_EXCEEDED_NOTICE, RATE_LIMIT_NOTICE
+
+        body = content or ""
+        if BUDGET_EXCEEDED_NOTICE in body:
+            template, title = "orange", "额度已用完"
+        elif RATE_LIMIT_NOTICE in body:
+            template, title = "orange", "请求过于频繁"
+        else:
+            template, title = "red", "执行出错"
         card["header"] = {
-            "template": "red",
-            "title": {"tag": "plain_text", "content": "执行出错"},
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
         }
     return card
 
