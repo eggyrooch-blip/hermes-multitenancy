@@ -304,33 +304,26 @@ def _patch_should_accept_group_message(FeishuAdapter: Any) -> None:
     logger.info("[multitenancy] installed group reply valve on FeishuAdapter")
 
 
+GROUP_REPLY_MODE_NAMESPACE = "group_reply_mode"
+
+
+def _handle_group_reply_mode_card_action(adapter: Any, cb: Any) -> Any:
+    """Registered business handler for the one card-action dispatcher."""
+    return _handle_group_reply_mode_action(adapter, cb.event, cb.value)
+
+
 def _patch_on_card_action_trigger(FeishuAdapter: Any) -> None:
-    original = getattr(FeishuAdapter, "_on_card_action_trigger", None)
-    if original is None or getattr(original, _CARD_ACTION_FLAG, False):
-        return
+    """Retired wrapper entry point — registers the business action and installs
+    THE dispatcher instead of stacking a fourth wrapper."""
+    from .feishu_card_action_dispatcher import (
+        install_feishu_card_action_dispatcher,
+        register_business_action,
+    )
 
-    @functools.wraps(original)
-    def wrapped(self: Any, data: Any) -> Any:
-        try:
-            event = _read_value(data, "event")
-            action = _read_value(event, "action")
-            action_value = _read_value(action, "value") or {}
-            if not isinstance(action_value, dict):
-                action_value = {}
-            hermes_action = action_value.get("hermes_action")
-            if hermes_action != "group_reply_mode":
-                return original(self, data)
-            return _handle_group_reply_mode_action(self, event, action_value)
-        except Exception:
-            logger.debug(
-                "[multitenancy] group reply mode card action failed; delegating to original",
-                exc_info=True,
-            )
-            return original(self, data)
-
-    setattr(wrapped, _CARD_ACTION_FLAG, True)
-    FeishuAdapter._on_card_action_trigger = wrapped
-    logger.info("[multitenancy] installed group reply mode card-action hook")
+    register_business_action(
+        GROUP_REPLY_MODE_NAMESPACE, _handle_group_reply_mode_card_action
+    )
+    install_feishu_card_action_dispatcher(FeishuAdapter)
 
 
 def _handle_group_reply_mode_action(

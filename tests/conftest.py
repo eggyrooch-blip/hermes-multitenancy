@@ -7,7 +7,105 @@ when an earlier test writes the same DB.
 """
 from __future__ import annotations
 
+import json
+import itertools
+from types import SimpleNamespace
+
 import pytest
+
+
+_CARD_MESSAGES = itertools.count()
+
+
+class _CardTicket:
+    def __init__(self, *, actor_id, actor_id_type, account_id, chat_id, message_id, thread_id):
+        self.actor_id = actor_id
+        self.actor_id_type = actor_id_type
+        self.account_id = account_id
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.thread_id = thread_id
+
+    def is_valid(self, *, account_id):
+        return account_id == self.account_id
+
+
+def admit_card_callback(data, *, account_id="", chat_type="p2p"):
+    """Attach the trusted edge result omitted by older business-action tests."""
+    from hermes_multitenancy.trusted_feishu_ingress import TrustedFeishuAdmission
+
+    event = data.event
+    context = event.context
+    if not hasattr(context, "open_chat_id"):
+        context.open_chat_id = "oc_test"
+    if not hasattr(context, "open_message_id"):
+        context.open_message_id = f"om_test_{next(_CARD_MESSAGES)}"
+    operator = event.operator
+    actor_id_type, actor_id = next(
+        ((key, getattr(operator, key, None)) for key in ("open_id", "union_id", "user_id")
+         if getattr(operator, key, None)),
+        ("open_id", ""),
+    )
+    thread_id = str(getattr(context, "open_thread_id", "") or "")
+    ticket = _CardTicket(
+        actor_id=actor_id,
+        actor_id_type=actor_id_type,
+        account_id=account_id,
+        chat_id=context.open_chat_id,
+        message_id=context.open_message_id,
+        thread_id=thread_id,
+    )
+    data.trusted_feishu_ingress_ticket = ticket
+    data.trusted_feishu_ingress_admission = TrustedFeishuAdmission(
+        profile_name="profile_test",
+        route_version=1,
+        actor_id=actor_id,
+        actor_id_type=actor_id_type,
+        actor_subject=actor_id,
+        chat_type=chat_type,
+        chat_id=ticket.chat_id,
+        message_id=ticket.message_id,
+        credential_subject=actor_id,
+        tool_scope="feishu:bot" if chat_type == "group" else "feishu:user",
+        ticket_fingerprint="fp_test",
+    )
+    return data
+
+
+# --- card-action response shape ------------------------------------------------
+#
+# `_toast_response` answers a card click with a plain dict when `lark_oapi` is
+# absent (this venv / CI) and with a real `P2CardActionTriggerResponse` when it
+# is installed (the gateway runtime, and the hermes-agent companion shipped as
+# `71cb1a351`). Both are the same contract; a test that subscripts the response
+# is asserting on which of the two it happened to get, and goes red the moment
+# the SDK is present. These two readers are the shape-agnostic way to look.
+
+
+def card_toast(response) -> dict:
+    """The toast this card-action response carries, whichever shape it wears."""
+    if isinstance(response, dict):
+        assert response.get("kind") == "toast", f"not a toast response: {response!r}"
+        return response["toast"]
+    toast = getattr(response, "toast", None)
+    assert toast is not None, f"not a toast response: {response!r}"
+    return toast
+
+
+def card_response_bytes(response) -> str:
+    """Everything a caller can observe of a response, as one comparable string.
+
+    Needed because two `P2CardActionTriggerResponse` instances are never `==`
+    (the SDK class defines no `__eq__`), so "these two answers are
+    indistinguishable" has to be asserted on the wire form, not on identity.
+    """
+    payload = response if isinstance(response, dict) else vars(response)
+    return json.dumps(
+        dict(payload, __type__=type(response).__name__),
+        sort_keys=True,
+        ensure_ascii=False,
+        default=repr,
+    )
 
 
 @pytest.fixture(autouse=True)

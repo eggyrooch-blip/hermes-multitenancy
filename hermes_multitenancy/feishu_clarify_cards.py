@@ -1,7 +1,6 @@
 """Feishu CardKit bridge for the core AIAgent clarify callback."""
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import os
@@ -203,49 +202,37 @@ def install_feishu_clarify_card_action_patch() -> None:
     _HOOK_INSTALLED = _patch_card_action(adapter_class)
 
 
+def handle_clarify_card_action(adapter: Any, cb: Any) -> Any:
+    """Built-in clarify handler, owned by the one card-action dispatcher.
+
+    Every outcome is CONSUMED: an invalid/stale/cross-chat submit answers with a
+    toast instead of falling back to the core generic handler (which would
+    synthesize a ``/card`` command out of the callback JSON)."""
+    del adapter
+    clarify_id = str(cb.value.get("clarify_id") or "")
+    answer = _clarify_answer(cb.form_value)
+    if not _CLARIFY_ID_RE.fullmatch(clarify_id) or not answer:
+        return _toast_response("回答无效，请重新提交。", level="error")
+    issued_chat = _CLARIFY_CHAT_BY_ID.get(clarify_id)
+    signed_chat = cb.chat_id
+    if issued_chat and signed_chat and signed_chat != issued_chat:
+        # Feishu signs event.context — a click can't spoof it (same trust anchor
+        # as feishu_auth_hub_actions._signed_chat_id). Cross-chat submits with a
+        # leaked clarify id are rejected; unknown ids (process restart) or
+        # missing context stay permissive.
+        return _toast_response("该卡片不属于当前会话。", level="error")
+    if _is_stale_clarify(clarify_id):
+        return _toast_response("该卡片已过期，请在最新的卡片上回答。", level="error")
+    if not _write_clarify_response(clarify_id, answer):
+        return _toast_response("已提交，请勿重复操作。", level="info")
+    return _toast_response("已提交，正在继续。")
+
+
 def _patch_card_action(adapter_class: Any) -> bool:
-    original = getattr(adapter_class, "_on_card_action_trigger", None)
-    if original is None:
-        return False
-    if getattr(original, _CARD_ACTION_FLAG, False):
-        return True
+    """Retired wrapper entry point — installs THE dispatcher instead."""
+    from .feishu_card_action_dispatcher import install_feishu_card_action_dispatcher
 
-    @functools.wraps(original)
-    def wrapped(self: Any, data: Any) -> Any:
-        try:
-            event = _read_value(data, "event")
-            action = _read_value(event, "action")
-            value = _read_action_value(_read_value(action, "value"))
-            if not isinstance(value, dict) or value.get("hermes_action") != "clarify":
-                return original(self, data)
-            clarify_id = str(value.get("clarify_id") or "")
-            answer = _clarify_answer(_read_value(action, "form_value"))
-            if not _CLARIFY_ID_RE.fullmatch(clarify_id) or not answer:
-                return _toast_response("回答无效，请重新提交。", level="error")
-            issued_chat = _CLARIFY_CHAT_BY_ID.get(clarify_id)
-            signed_chat = str(_read_value(_read_value(event, "context"), "open_chat_id") or "").strip()
-            if issued_chat and signed_chat and signed_chat != issued_chat:
-                # Feishu signs event.context — a click can't spoof it (same trust
-                # anchor as feishu_auth_hub_actions._signed_chat_id). Cross-chat
-                # submits with a leaked clarify id are rejected; unknown ids
-                # (process restart) or missing context stay fail-open.
-                return _toast_response("该卡片不属于当前会话。", level="error")
-            if _is_stale_clarify(clarify_id):
-                return _toast_response("该卡片已过期，请在最新的卡片上回答。", level="error")
-            if not _write_clarify_response(clarify_id, answer):
-                return _toast_response("已提交，请勿重复操作。", level="info")
-            return _toast_response("已提交，正在继续。")
-        except Exception:
-            logger.debug(
-                "[multitenancy] clarify card action failed; delegating to original",
-                exc_info=True,
-            )
-            return original(self, data)
-
-    setattr(wrapped, _CARD_ACTION_FLAG, True)
-    adapter_class._on_card_action_trigger = wrapped
-    logger.info("[multitenancy] installed clarify card-action hook on %s.FeishuAdapter", adapter_class.__module__)
-    return True
+    return install_feishu_card_action_dispatcher(adapter_class)
 
 
 def _read_value(value: Any, name: str) -> Any:

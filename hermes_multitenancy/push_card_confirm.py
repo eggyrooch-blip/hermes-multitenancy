@@ -1,10 +1,10 @@
 """Confirm callback + idempotent backend write (SPEC P5, design §2.5).
 
-The 5th ``card.action.trigger`` patch on ``FeishuAdapter`` (after clarify /
-auth_hub / group_valve / credential_hub). Like its siblings it is a chained
-monkeypatch: a callback whose ``value.hermes_action`` is not ``push_confirm`` is
-delegated **unchanged** to the original — the new patch must never吞 the other
-four's events (SPEC regression guard).
+Push-confirm is a NAMESPACED BUSINESS ACTION of the one card-action dispatcher
+(``feishu_card_action_dispatcher``), which owns the live
+``_on_card_action_trigger``. It no longer stacks a 5th wrapper: the dispatcher
+routes ``push_confirm`` here (and only here) after its built-ins have had their
+fixed turn, so it can never吞 clarify / auth_hub / group_valve events.
 
 The write path is the only place the backend is ever touched, and it stands on
 three defences so kep holds **exactly one** record per confirmed card (design
@@ -30,7 +30,6 @@ the card then guides re-auth and the row stays writable for a retry — kep gets
 """
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import os
@@ -732,35 +731,35 @@ def install_feishu_push_card_confirm_patch(FeishuAdapter: Any = None) -> None:
     _patch_card_action(FeishuAdapter)
 
 
+PUSH_CONFIRM_NAMESPACE = "push_confirm"
+
+
+def _handle_push_confirm_card_action(adapter: Any, cb: Any) -> Any:
+    """Registered business handler for the one card-action dispatcher."""
+    return _dispatch_confirm(adapter, cb.event, cb.action, cb.value, cb.form_value)
+
+
+def _match_push_confirm_card_action(cb: Any) -> bool:
+    """A FORM submit arrives with the button value stripped — only
+    ``form_value`` + ``action.name`` survive, so the namespace lookup misses and
+    the dispatcher falls through to this matcher."""
+    return _is_push_confirm_action(cb.value, cb.form_value, cb.action)
+
+
 def _patch_card_action(FeishuAdapter: Any) -> bool:
-    original = getattr(FeishuAdapter, "_on_card_action_trigger", None)
-    if original is None or getattr(original, _CARD_ACTION_FLAG, False):
-        return bool(original is not None)
+    """Retired wrapper entry point — registers the business action and installs
+    THE dispatcher instead of stacking a fifth wrapper."""
+    from .feishu_card_action_dispatcher import (
+        install_feishu_card_action_dispatcher,
+        register_business_action,
+    )
 
-    @functools.wraps(original)
-    def wrapped(self: Any, data: Any) -> Any:
-        try:
-            from . import push_send_queue as _sendq
-            _sendq.note_live_adapter(self)  # capture adapter for proactive sends
-            event = _read(data, "event")
-            action = _read(event, "action")
-            value = _read_action_value(_read(action, "value"))
-            form_value = _read(action, "form_value")
-            # undefined放行: not ours → delegate unchanged (never吞 the other 4).
-            if not _is_push_confirm_action(value, form_value, action):
-                return original(self, data)
-            return _dispatch_confirm(
-                self, event, action, value if isinstance(value, dict) else {}, form_value
-            )
-        except Exception:
-            logger.debug("[push_card] confirm card action failed; delegating to original", exc_info=True)
-            return original(self, data)
-
-    setattr(wrapped, _CARD_ACTION_FLAG, True)
-    FeishuAdapter._on_card_action_trigger = wrapped
-    logger.info("[push_card] installed push-confirm card-action hook on %s.FeishuAdapter",
-                FeishuAdapter.__module__)
-    return True
+    register_business_action(
+        PUSH_CONFIRM_NAMESPACE,
+        _handle_push_confirm_card_action,
+        matcher=_match_push_confirm_card_action,
+    )
+    return install_feishu_card_action_dispatcher(FeishuAdapter)
 
 
 def _is_push_confirm_action(value: Any, form_value: Any, action: Any) -> bool:

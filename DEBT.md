@@ -410,3 +410,81 @@ midnight 前扩大 diff 不值得。两个分支都已改成**不能签发**（�
 **触发条件**：下次碰 `billing_identity.py` 时，确认无人调用后直接删这两个函数 +
 `repair_billing_metadata` 包装 + 只测它们的用例；同时把 `CREDENTIAL_SOURCE` 分支判断
 一起清掉。
+
+## 2026-08-10 feishu-card-action-dispatcher (WP02) · 收编四个 wrapper 后的残留
+
+**现状**：`_on_card_action_trigger` 上原本叠了 4 个独立 class 补丁
+（clarify / auth_hub / group_valve / push_confirm），装载顺序会改行为，且每个都在
+自己的 handler 抛错时 `return original(...)` —— 一个**已识别**的按钮失败仍会掉进核心
+generic 路径合成 `/card` 喂给模型。现已收敛成 `feishu_card_action_dispatcher` 一个
+固定 dispatcher：built-in 固定顺序 → 显式 Agent core 白名单委托一次 → 注册的
+namespaced business action → 其余一律 unsupported 消费。四个旧安装入口保留为 shim，
+都只安装同一个 dispatcher（幂等 flag 全部照旧标在方法对象上）。
+
+**D1 — ~~`hermes_update_prompt_action` 委托~~（2026-08-10 已删除，结论：那个 handler 不存在）**
+本包一度在 SPEC 白名单（`feishu_auth` / `approve_once` / `approve_session` / `deny`）之外
+多委托了第五个 key `hermes_update_prompt_action`，理由写的是「核心的 update-prompt 卡片
+用这个顶层 value key，按字面 fail-closed 会把它一起消掉 = 线上按钮点了没反应」。
+**该理由经对抗评审取证证伪**：`_handle_update_prompt_card_action` 和
+`hermes_update_prompt_action` 在 `be5a764d0:gateway/platforms/feishu.py` 零命中、
+hermes-agent 全仓零命中（`update_prompt` 只出现在 `hermes_cli/main.py` 的
+`.update_prompt.json` 文件路径、以及 telegram/discord 的 `send_update_prompt`——
+Feishu adapter 根本没有这个方法），MT 侧也没有任何地方发出它。
+也就是说该 key **只可能由伪造 callback 到达**，而委托会让它穿过
+`feishu.py:2981-2990` 落到 `_handle_card_action_event`，被 `feishu.py:3499` 合成
+`synthetic_text = f"/card {action_tag}"` —— 原始 callback JSON 直接进模型，
+正是本包 Done 线要关掉的那个洞。
+**处置：删除 `_AGENT_CORE_VALUE_KEYS` 与 `dispatch_card_action` 里的 `any(...)` 分支，
+删除把该行为钉成预期的用例，改为断言它被 unsupported 消费**
+（`tests/test_feishu_card_action_dispatcher.py::test_an_unbacked_top_level_value_key_does_not_delegate`
++ `::test_the_agent_core_allowlist_is_exactly_the_backed_core_actions`）。
+委托面 = **有核心 handler 兜底的那几个**，无残留。
+
+**D1b — 委托面补 `approve_always`，并钉死「只认 `hermes_action` 这一种写法」（2026-08-10 对抗评审后）**
+① SPEC 字面只列了四个名字，但核心的审批卡片发的是**五个**：`approve_once` /
+`approve_session` / **`approve_always`** / `deny`（`feishu.py:2455-2458` 的
+`_btn("✅ Always", "approve_always")`），`_APPROVAL_CHOICE_MAP`（`:229`）也认它。
+按四个名字消费 = 线上点「✅ Always」得到「该操作暂不支持」、被阻塞的 agent 线程永远等下去，
+直接违反本 SPEC 自己的 approval 回归护栏。已补进白名单（它有真 handler 兜底，
+不违反「没有核心 handler 就不委托」那条）。
+② 核心只读 `value["hermes_action"]`（`feishu.py:3272`）。同一个名字换成 `value["action"]` /
+`action.name` / `form_name` 送进来，核心认不出，直接掉进 `_handle_card_action_event`
+合成 `/card` 喂模型 —— 与被删掉的第五个 key 是同一个 P0、另一扇门。现在只有
+`hermes_action` 这一种写法才委托，其余写法在 core 分支内当场 unsupported 消费
+（不落到 business matcher，否则一个贪婪 matcher 就能接走伪造的 `approve_once`）。
+
+**D2 — register 期类补丁仍可能落在克隆类上（沿用 2026-07-30 那条已知债）**
+dispatcher 和它取代的四个 wrapper 一样在 register 期按类安装，同样受
+`hermes_plugins.feishu_platform.adapter` 合成模块尚不存在的影响。缓解比之前**更好**：
+`push_send_queue` 的 on-dispatch re-arm 现在传的是**运行时真类**，而它安装的就是同一个
+dispatcher —— 于是 clarify / auth_hub / group_valve 也一起被补活，不再各自漏装。
+根治仍是那条「启动期统一重跑类补丁」的入口。
+
+**D3 / D4 — `inject_prompt` 的两条债随实现一起移出本包（2026-08-10 sunke 拍板拆分）**
+原 D3（投递路径）和 D4（身份来源）都是在描述 `feishu_card_inject_prompt.py` 里的代码。
+该模块已从本包**删除**，实现移交独立 slug `feishu-card-inject-prompt`，两条债跟着走。
+移出的理由不是工作量，是实测缺陷：两轮跨模型评审都确认它在调度前**没有把 callback 的
+点击者绑定到 ticket 的 actor**，也**没有校验 admission 的 profile** —— 给 `ou_alice` 的
+合法 ticket 配上 `ou_mallory` 的点击者，仍然得到 `toast=info, scheduled=1`，
+即一张泄漏出去的卡片被别人点击会以原主人身份运行。D4 当时写的那串检查
+（account / chat / message / 封印）看着密，唯独漏了「谁在点」这一维，所以它当时被记成
+「已修」是**误判**：ticket 证明了卡片属于哪条消息，从没证明点击者是谁。
+正确做法是把身份绑定做成不可伪造的凭据，而不是再补一层字符串比较 —— 那是新 slug 的
+第一条 Done 线，不是本包再补一个 `if`。
+本包留下的只是那个**优先级槽位**：`_UNSUPPORTED_KINDS = {"inject_prompt"}`，
+占位是为了不让任何 business namespace 认领这个名字偷偷实现它；
+它的应答与任意未知 action **逐字节相同**（同一个 `unsupported_response()`，
+且**不领 at-most-once 号** —— 领了号的重投会答 `error`，未识别的重投答 `unsupported`，
+那个差异本身就是攻击者要的 oracle）。零模型、零工具、零 turn。
+判据见 `tests/test_feishu_card_action_dispatcher.py::test_inject_prompt_is_byte_identical_to_an_arbitrary_unknown_action`
+（含 `leaked_card_clicked_by_a_stranger` 这一档，正是当年那个攻击载荷）。
+
+**D5 — at-most-once 只是进程内的（WP09 才是根治）**
+dispatcher 现在对每个**已识别**动作（built-in + 注册的 business；核心委托不管，
+那边有 `_is_card_action_duplicate` 和审批态）按 callback 自身身份（飞书按次投递的 token，
+没有就用签名的 `(message_id, chat_id, operator, kind)`）领一次号，上限 4096 条 LRU。
+买到的是：同一次投递被 SDK 重投也只执行一次。买不到的是：重启/淘汰会重开窗口，
+而两次点击是两个 token = 两次执行；既没 token 也没 message_id 的回调无法编号，
+放行但仍然消费。跨重启的持久 at-most-once 归 WP09 的 inbound/effect ledger；
+今天真正拦住「重复点击重复写后端」的仍是各功能自己的幂等
+（push-confirm 的 CAS + `write_idempotency_key`、WP01 的 per-ticket `_claim_once`）。

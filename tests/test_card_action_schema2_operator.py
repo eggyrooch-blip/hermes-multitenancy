@@ -22,6 +22,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.conftest import admit_card_callback
+
 
 @pytest.fixture
 def routing():
@@ -54,7 +56,7 @@ def _card_data(*, operator, mode="all", chat_id="oc_group"):
     ``operator`` is a SimpleNamespace carrying any subset of
     open_id / union_id / user_id (Schema 2 omits open_id).
     """
-    return SimpleNamespace(
+    return admit_card_callback(SimpleNamespace(
         event=SimpleNamespace(
             action=SimpleNamespace(
                 value={
@@ -66,7 +68,7 @@ def _card_data(*, operator, mode="all", chat_id="oc_group"):
             operator=operator,
             context=SimpleNamespace(open_chat_id=chat_id),
         )
-    )
+    ), chat_type="group")
 
 
 def _seed_owner_user_row(table, *, open_id, union_id, user_id):
