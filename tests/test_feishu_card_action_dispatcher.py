@@ -1118,3 +1118,87 @@ def test_builtin_precedence_over_a_smuggled_update_prompt_key_stays_out_of_core(
     assert calls["update_prompt"] == 0
     assert calls["turns"] == []
     assert response is not None
+
+
+# --- re-review findings: freeze the value, don't merely inspect it ---------------
+
+class _StatefulDict(dict):
+    """Answers one way to the dispatcher and another to core. The shape behind
+    every remaining TOCTOU finding: no amount of CHECKING defeats it, because
+    core re-reads the object after the dispatcher decides."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.bool_calls = 0
+
+    def __bool__(self):
+        self.bool_calls += 1
+        return self.bool_calls == 1  # truthy to whoever asks first, falsy after
+
+
+class _ExplodingBoolDict(dict):
+    def __bool__(self):
+        raise RuntimeError("truthiness detonates")
+
+
+def test_a_stateful_value_is_refused_rather_than_inspected():
+    """The dispatcher must not hand core an object that can change its answer.
+    Requiring a PLAIN dict refuses the whole class up front — and `bool_calls`
+    proves the hostile hook was never even called."""
+    adapter, calls = _release_shaped()
+    payload = _StatefulDict(hermes_update_prompt_action="y", update_prompt_id=7)
+
+    adapter._on_card_action_trigger(_data(payload, token=_token()))
+
+    assert calls["original"] == 0, "a mapping that can change its answer must not be delegated"
+    assert calls["card_event"] == 0, "a second answer must never reach the /card path"
+    assert payload.bool_calls == 0, "a hostile __bool__ must never be invoked"
+
+
+def test_a_stateful_hermes_action_cannot_smuggle_an_unlisted_name_into_core():
+    """PREV-4: `.get("hermes_action")` falsy for the companion guard, then a
+    non-allowlisted name when core rereads. Against a frozen snapshot both reads
+    return the same thing, so the smuggling window is gone."""
+    seen = {"n": 0}
+
+    class _SmugglingDict(dict):
+        def get(self, k, default=None):
+            if k == "hermes_action":
+                seen["n"] += 1
+                return None if seen["n"] == 1 else "bogus_not_allowlisted"
+            return super().get(k, default)
+
+    adapter, calls = _release_shaped()
+    adapter._on_card_action_trigger(
+        _data(_SmugglingDict(hermes_update_prompt_action="y", update_prompt_id=7), token=_token())
+    )
+
+    assert calls["approval"] == 0, "an unallowlisted name reached core's approval handler"
+    assert calls["card_event"] == 0
+
+
+def test_a_value_whose_truthiness_raises_is_consumed_not_propagated():
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(
+        _data(_ExplodingBoolDict(hermes_update_prompt_action="y"), token=_token())
+    )
+
+    assert calls["original"] == 0
+    assert calls["card_event"] == 0
+    assert _kind(response) == "toast"
+    assert card_response_bytes(response) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "zz_unknown_9f"}, token=_token()))
+    ), "an exploding value must be indistinguishable from an unknown action"
+
+
+def test_plain_dicts_still_delegate_untouched():
+    """Real traffic is unaffected: the SDK yields plain dicts (verified on the
+    production host), so they pass the type test and core keeps the very object
+    it was given."""
+    adapter, calls = _release_shaped()
+    payload = _update_prompt_value()
+    env = _data(payload, token=_token())
+    adapter._on_card_action_trigger(env)
+
+    assert calls["update_prompt"] == 1
+    assert env.event.action.value is payload, "a plain dict must not be replaced"
