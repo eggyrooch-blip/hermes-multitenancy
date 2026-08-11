@@ -65,6 +65,22 @@ _AGENT_CORE_ACTIONS = frozenset(
 # crafted callback, and delegating it opens the same `/card` model path.
 _AGENT_CORE_VALUE_KEY = "hermes_action"
 
+# Core actions that arrive under their OWN top-level `value` key instead of
+# `hermes_action` — core reads each key directly, so they never carry a `kind`.
+#
+# WHICH of these the running core implements differs by core LINE, so an entry
+# names the adapter method to probe for at dispatch time rather than asserting
+# the capability exists. A static list is right on whichever line it was
+# measured against and wrong on the other: on 2026-08-11 this package removed
+# `hermes_update_prompt_action` on evidence gathered from `main` (no handler,
+# no card) while the production release line both emits the card and defines
+# `_handle_update_prompt_card_action` — every production update-prompt card
+# started answering "该操作暂不支持". Probing the LIVE adapter is correct on
+# both lines without anyone having to remember there are two.
+_AGENT_CORE_VALUE_KEY_HANDLERS: tuple[tuple[str, str], ...] = (
+    ("hermes_update_prompt_action", "_handle_update_prompt_card_action"),
+)
+
 # Reserved but NOT implemented by this package. `inject_prompt` keeps the first
 # precedence slot so no business namespace can claim the name and quietly
 # implement it here; the slot itself answers exactly like a genuinely unknown
@@ -368,6 +384,26 @@ def _run_builtin(name: str, module_name: str, func_name: str, adapter: Any, cb: 
     return getattr(module, func_name)(adapter, cb)
 
 
+def _core_reads_value_as_dict(cb: CardCallback) -> bool:
+    """Whether core will see this callback's ``value`` as a routable mapping.
+
+    The precondition for EVERY delegation: core guards both of its routing reads
+    with ``isinstance(action_value, dict)``, so if the raw value is not a dict
+    core reaches no handler at all — it falls into `_handle_card_action_event`,
+    synthesizes `/card`, and feeds the raw callback JSON to the model. That is
+    the P0.
+
+    MT parses more liberally than core reads: `_as_dict` decodes a JSON STRING
+    value into a dict, which is right for MT's own business handlers (they run
+    here, not in core) and wrong as a basis for handing the callback to core.
+    `{"action": {"value": '{"hermes_action": "approve_once"}'}}` — a string, not
+    a dict — was delegated on the strength of MT's parse while core dropped it
+    straight down the model path. Delegation must be decided on the object core
+    will actually read, not on ours.
+    """
+    return isinstance(_read(cb.action, "value"), dict)
+
+
 def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any], Any]) -> Any:
     """Route one callback. Logs carry action kind + outcome only."""
     _note_live_adapter(adapter)
@@ -395,9 +431,52 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
         # Core reads ONE spelling. Any other spelling of an allowlisted name
         # would reach core's generic `/card` model path instead of its handler,
         # so it is consumed here — the P0 through a different door.
+        if not _core_reads_value_as_dict(cb):
+            logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
+            return unsupported_response()
         if _text(cb.value.get(_AGENT_CORE_VALUE_KEY)) != cb.kind:
             logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
             return unsupported_response()
+        try:
+            return original(adapter, data)
+        except Exception:
+            logger.warning("[card_action] kind=agent_core outcome=error")
+            logger.debug("[card_action] handler traceback", exc_info=True)
+            return error_response()
+
+    for value_key, handler_attr in _AGENT_CORE_VALUE_KEY_HANDLERS:
+        if not _core_reads_value_as_dict(cb):
+            continue
+        # Raw truthiness, NOT `_text(...)`, and the invariant is exact:
+        # delegating must imply core routes to the handler. Core tests these two
+        # keys with bare `if`, while `_text` is `str(value).strip()` — so
+        # `{value_key: 0}` reads as the non-empty string "0" here and as falsy
+        # there. Under `_text` that callback would be delegated and then fall
+        # through core's routing into `_handle_card_action_event`, which
+        # synthesizes `/card` and feeds the raw callback JSON to the model: the
+        # P0, reachable only through this path. Same for False/[]/{}/0.0.
+        if not cb.value.get(value_key):
+            continue
+        if cb.value.get(_AGENT_CORE_VALUE_KEY):
+            # Core reads `hermes_action` FIRST. Anything still here carries one
+            # that ISN'T allowlisted (an allowlisted name returned above), so
+            # delegating would hand core's approval handler exactly the name the
+            # allowlist keeps out — smuggled in as this key's companion.
+            logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
+            return unsupported_response()
+        if not callable(_read(adapter, handler_attr)):
+            # This core line doesn't implement it. Delegating would fall through
+            # core's own routing into `_handle_card_action_event`, which
+            # synthesizes `/card` and feeds the raw callback JSON to the model —
+            # the P0. The response is byte-identical to a genuinely unknown
+            # action so it can't be used to fingerprint which core line runs;
+            # only the log line distinguishes them, for operators.
+            logger.info("[card_action] kind=agent_core outcome=unsupported_capability")
+            return unsupported_response()
+        # No `_run_once` claim — same as the allowlist path above, and for the
+        # same reason: core owns its duplicate guard, and claiming here would
+        # make a REPLAY answer `error_response()` while a replayed unknown
+        # answers `unsupported_response()`.
         try:
             return original(adapter, data)
         except Exception:
