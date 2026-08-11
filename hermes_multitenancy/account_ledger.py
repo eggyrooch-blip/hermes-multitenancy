@@ -8,6 +8,7 @@ import hmac
 import json
 import re
 import stat
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -22,6 +23,7 @@ from .billing_identity import _is_canonical_employee_id
 
 _PUBLIC_KEY_PATH = Path("/etc/hermes/account-ledger-public.pem")
 _FINGERPRINT_KEY_PATH = Path("/etc/hermes/account-ledger-fingerprint.key")
+_TRUST_ROOT = Path("/")
 _AUDIENCE = "hermes-1"
 _SNAPSHOT_ID = re.compile(r"[0-9a-f]{32}")
 
@@ -30,13 +32,89 @@ class InvalidLedgerInput(ValueError):
     pass
 
 
+def _check_ancestor_chain(parent: Path, anchor: Path) -> None:
+    current = parent
+    while True:
+        try:
+            metadata = os.stat(current, follow_symlinks=False)
+        except OSError as exc:
+            raise InvalidLedgerInput from exc
+        is_root_symlink = stat.S_ISLNK(metadata.st_mode) and metadata.st_uid == 0
+        if (
+            (not stat.S_ISDIR(metadata.st_mode) and not is_root_symlink)
+            or metadata.st_uid not in {0, os.geteuid()}
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise InvalidLedgerInput
+        if current == anchor:
+            return
+        if current.parent == current:
+            raise InvalidLedgerInput
+        current = current.parent
+
+
+def _assert_trusted_ancestors(path: Path) -> None:
+    absolute = path.absolute()
+    anchor = _TRUST_ROOT.absolute()
+    try:
+        absolute.relative_to(anchor)
+    except ValueError as exc:
+        raise InvalidLedgerInput from exc
+    _check_ancestor_chain(absolute.parent, anchor)
+    try:
+        resolved_parent = absolute.parent.resolve(strict=True)
+        resolved_anchor = anchor.resolve(strict=True)
+        resolved_parent.relative_to(resolved_anchor)
+    except (OSError, ValueError) as exc:
+        raise InvalidLedgerInput from exc
+    _check_ancestor_chain(resolved_parent, resolved_anchor)
+
+
+def _read_pinned(path: Path, *, max_bytes: int, private: bool) -> bytes:
+    _assert_trusted_ancestors(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise InvalidLedgerInput from exc
+    try:
+        before = os.fstat(fd)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_size <= 0
+            or before.st_size > max_bytes
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (private and mode != 0o600)
+        ):
+            raise InvalidLedgerInput
+        raw = bytearray()
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(fd)
+        locator = os.stat(path, follow_symlinks=False)
+        if (
+            len(raw) > max_bytes
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (locator.st_dev, locator.st_ino)
+        ):
+            raise InvalidLedgerInput
+        return bytes(raw)
+    finally:
+        os.close(fd)
+
+
 def _load(
     path: Path, layer: str, public_key: Ed25519PublicKey
 ) -> tuple[list[dict[str, Any]], str]:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 20 * 1024 * 1024:
-        raise InvalidLedgerInput
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            _read_pinned(path, max_bytes=20 * 1024 * 1024, private=True)
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise InvalidLedgerInput from exc
     if not isinstance(value, dict) or set(value) != {
@@ -219,6 +297,9 @@ def audit(
     report = {
         "status": "PASS",
         "employee_count": len(expected),
+        "route_count": len(route_rows),
+        "account_count": len(account_rows),
+        "current_key_count": len(key_rows),
         "missing_route": sum(not route_by.get(subject) for subject in expected),
         "missing_account": sum(not account_by.get(subject) for subject in expected),
         "missing_current_key": sum(not key_by.get(subject) for subject in expected),
@@ -244,33 +325,40 @@ def audit(
     return report
 
 
+def verify_snapshot(paths: dict[str, Path]) -> dict[str, Any]:
+    """Verify and audit one four-layer snapshot with the pinned trust roots."""
+    try:
+        fingerprint_key = _read_pinned(
+            _FINGERPRINT_KEY_PATH, max_bytes=4096, private=True
+        )
+        if len(fingerprint_key) < 16 or len(fingerprint_key) > 4096:
+            raise InvalidLedgerInput
+        public_key = serialization.load_pem_public_key(
+            _read_pinned(_PUBLIC_KEY_PATH, max_bytes=16 * 1024, private=False)
+        )
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise InvalidLedgerInput
+        loaded = [
+            _load(paths[layer], layer, public_key)
+            for layer in ("employees", "routes", "accounts", "keys")
+        ]
+        if len({snapshot_id for _rows, snapshot_id in loaded}) != 1:
+            raise InvalidLedgerInput
+        return audit(*(rows for rows, _snapshot_id in loaded), fingerprint_key)
+    except KeyError as exc:
+        raise InvalidLedgerInput from exc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit frozen employee billing snapshots")
     for name in ("employees", "routes", "accounts", "keys"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     args = parser.parse_args()
     try:
-        if _PUBLIC_KEY_PATH.is_symlink() or not _PUBLIC_KEY_PATH.is_file():
-            raise InvalidLedgerInput
-        if (
-            _FINGERPRINT_KEY_PATH.is_symlink()
-            or not _FINGERPRINT_KEY_PATH.is_file()
-            or _FINGERPRINT_KEY_PATH.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO)
-        ):
-            raise InvalidLedgerInput
-        fingerprint_key = _FINGERPRINT_KEY_PATH.read_bytes()
-        if len(fingerprint_key) < 16 or len(fingerprint_key) > 4096:
-            raise InvalidLedgerInput
-        public_key = serialization.load_pem_public_key(_PUBLIC_KEY_PATH.read_bytes())
-        if not isinstance(public_key, Ed25519PublicKey):
-            raise InvalidLedgerInput
-        loaded = [
-            _load(getattr(args, layer), layer, public_key)
+        report = verify_snapshot({
+            layer: getattr(args, layer)
             for layer in ("employees", "routes", "accounts", "keys")
-        ]
-        if len({snapshot_id for _rows, snapshot_id in loaded}) != 1:
-            raise InvalidLedgerInput
-        report = audit(*(rows for rows, _snapshot_id in loaded), fingerprint_key)
+        })
     except (InvalidLedgerInput, OSError, ValueError, TypeError):
         print(json.dumps({"status": "ERROR", "error": "invalid_input"}))
         return 2
