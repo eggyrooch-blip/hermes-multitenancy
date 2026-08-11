@@ -41,8 +41,10 @@ from hermes_multitenancy import router
 
 
 class _FakeClient:
-    def __init__(self, base_url):
+    def __init__(self, base_url, api_key=None, main_runtime=None):
         self.base_url = base_url
+        self.api_key = api_key
+        self.main_runtime = main_runtime
 
 
 _RUNTIME = {
@@ -69,12 +71,20 @@ def _install_fake_aux(monkeypatch):
             return provider, model, base_url, api_key, None
         return "auto", model, None, None, None
 
-    def resolve_vision_provider_client(provider=None, model=None, *, base_url=None, api_key=None, async_mode=False):
+    def resolve_vision_provider_client(
+        provider=None,
+        model=None,
+        *,
+        base_url=None,
+        api_key=None,
+        async_mode=False,
+        main_runtime=None,
+    ):
         requested, resolved_model, resolved_base_url, _resolved_api_key, _api_mode = fake._resolve_task_provider_model(
             "vision", provider, model, base_url, api_key
         )
         if resolved_base_url:
-            return requested, _FakeClient(resolved_base_url), resolved_model
+            return requested, _FakeClient(resolved_base_url, _resolved_api_key, main_runtime), resolved_model
         # No base_url resolved: real core falls through the openrouter/nous
         # aggregators, which are also unavailable in the reproduced bug →
         # None (matches the observed prod symptom).
@@ -138,6 +148,29 @@ def test_vision_endpoint_override_respects_caller_supplied_base_url(monkeypatch)
             base_url="https://caller-owned.example/v1", async_mode=True
         )
         assert client_after.base_url == "https://caller-owned.example/v1"
+    finally:
+        router._restore_auxiliary_main_runtime_patch(client, saved)
+
+
+def test_vision_endpoint_override_forwards_main_runtime_without_replacing_billing_route(monkeypatch):
+    """Production passes ``main_runtime`` after billing has already resolved
+    the employee key and approved endpoint.  The profile override must accept
+    and forward that argument without replacing the billed route."""
+    fake = _install_fake_aux(monkeypatch)
+    client, saved = router._install_vision_task_endpoint_override(_RUNTIME)
+    billed_runtime = {"provider": "custom", "source": "employee-billing"}
+    try:
+        _, client_after, _ = fake.resolve_vision_provider_client(
+            provider="custom",
+            model="kimi/k3[1m]",
+            base_url="https://billing-approved.example/v1",
+            api_key="employee-billing-key",
+            async_mode=True,
+            main_runtime=billed_runtime,
+        )
+        assert client_after.base_url == "https://billing-approved.example/v1"
+        assert client_after.api_key == "employee-billing-key"
+        assert client_after.main_runtime is billed_runtime
     finally:
         router._restore_auxiliary_main_runtime_patch(client, saved)
 
