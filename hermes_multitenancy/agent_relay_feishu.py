@@ -9,7 +9,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
+
+EVENT_STREAM_START_TIMEOUT_SECONDS = 10
+
 
 def _valid_actor_id(value: str) -> bool:
     return value.startswith("ou_") and 4 <= len(value) <= 128 and not any(ch.isspace() for ch in value)
@@ -279,7 +282,9 @@ class FeishuRelayClient:
             )
         return False
 
-    def start_event_stream(self, events: "RelayEvents", loop: asyncio.AbstractEventLoop) -> None:
+    def start_event_stream(
+        self, events: "RelayEvents", loop: asyncio.AbstractEventLoop
+    ) -> Callable[[], None]:
         import lark_oapi as lark
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 
@@ -311,13 +316,86 @@ class FeishuRelayClient:
             .register_p2_card_action_trigger(card_action)
             .build()
         )
-        client = lark.ws.Client(
-            self.app_id,
-            self.app_secret,
-            event_handler=handler,
-            log_level=lark.LogLevel.ERROR,
+        ready = threading.Event()
+        stopping = threading.Event()
+        errors: list[Exception] = []
+        state: dict[str, Any] = {}
+
+        def run_event_stream() -> None:
+            thread_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(thread_loop)
+            from lark_oapi.ws import client as ws_client
+
+            ws_client.loop = thread_loop
+            client = lark.ws.Client(
+                self.app_id,
+                self.app_secret,
+                event_handler=handler,
+                log_level=lark.LogLevel.ERROR,
+                auto_reconnect=False,
+            )
+            state.update(loop=thread_loop, client=client)
+            connect = client._connect
+
+            async def connect_and_signal() -> None:
+                await connect()
+                client._auto_reconnect = True
+                ready.set()
+
+            client._connect = connect_and_signal
+            try:
+                client.start()
+            except Exception as exc:
+                if not stopping.is_set():
+                    errors.append(exc)
+            finally:
+                ready.set()
+                pending = asyncio.all_tasks(thread_loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    thread_loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                thread_loop.close()
+
+        thread = threading.Thread(
+            target=run_event_stream,
+            name="agent-relay-feishu-ws",
+            daemon=True,
         )
-        threading.Thread(target=client.start, name="agent-relay-feishu-ws", daemon=True).start()
+        thread.start()
+
+        def stop_event_stream() -> None:
+            stopping.set()
+            thread_loop = state.get("loop")
+            client = state.get("client")
+            shutdown_error: Exception | None = None
+            try:
+                if thread_loop is not None and not thread_loop.is_closed():
+                    if client is not None and client._conn is not None:
+                        client._auto_reconnect = False
+                        future = asyncio.run_coroutine_threadsafe(
+                            client._disconnect(), thread_loop
+                        )
+                        try:
+                            future.result(timeout=5)
+                        except Exception as exc:
+                            shutdown_error = exc
+                    thread_loop.call_soon_threadsafe(thread_loop.stop)
+            finally:
+                thread.join(timeout=5)
+            if thread.is_alive() or shutdown_error is not None:
+                raise RuntimeError("Feishu event stream failed to stop") from None
+
+        if (
+            not ready.wait(EVENT_STREAM_START_TIMEOUT_SECONDS)
+            or errors
+            or getattr(state.get("client"), "_conn", None) is None
+        ):
+            stop_event_stream()
+            raise RuntimeError("Feishu event stream failed to start") from None
+        return stop_event_stream
 
     @staticmethod
     def _toast(content: str, level: str) -> Any:
