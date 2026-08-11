@@ -1174,19 +1174,20 @@ def _install_vision_task_endpoint_override(runtime: Optional[dict[str, str]]) ->
     rt_api_key = runtime.get("api_key", "")
     rt_model = runtime.get("model", "")
 
-    def _patched(provider=None, model=None, *, base_url=None, api_key=None, async_mode=False):
+    def _patched(provider=None, model=None, *, base_url=None, api_key=None, async_mode=False, **kwargs):
         caller_provider = str(provider or "").strip().lower()
         if base_url or caller_provider not in {"", "auto", runtime_provider}:
             # Caller already has its own endpoint, or explicitly resolved a
             # DIFFERENT provider (e.g. auxiliary.vision.provider: openrouter)
             # — respect it, don't clobber with this profile's runtime.
-            return original(provider, model, base_url=base_url, api_key=api_key, async_mode=async_mode)
+            return original(provider, model, base_url=base_url, api_key=api_key, async_mode=async_mode, **kwargs)
         return original(
             provider,
             model or rt_model,
             base_url=rt_base_url,
             api_key=rt_api_key,
             async_mode=async_mode,
+            **kwargs,
         )
 
     setattr(auxiliary_client, "resolve_vision_provider_client", _patched)

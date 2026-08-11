@@ -5,7 +5,10 @@ restores it afterwards. Uses a fake agent.auxiliary_client (no core in test env)
 import sys
 import types
 
+import pytest
+
 from hermes_multitenancy import router
+from hermes_multitenancy.run_broker import RunRejected
 
 
 def _install_fake_aux(monkeypatch, vision_map):
@@ -80,6 +83,24 @@ def test_image_prep_runtime_uses_employee_key_without_callback_headers(monkeypat
     fake = _install_fake_aux(monkeypatch, {})
     fake._RUNTIME_MAIN = {"previous": True}
     captured = {}
+    original_task_resolver = fake._resolve_task_provider_model
+
+    def resolve_vision_provider_client(
+        provider=None,
+        model=None,
+        *,
+        base_url=None,
+        api_key=None,
+        async_mode=False,
+        main_runtime=None,
+    ):
+        return provider, types.SimpleNamespace(
+            base_url=base_url,
+            api_key=api_key,
+            main_runtime=main_runtime,
+        ), model
+
+    fake.resolve_vision_provider_client = resolve_vision_provider_client
 
     def set_runtime_main(provider, model, **kwargs):
         captured.update({"provider": provider, "model": model, **kwargs})
@@ -125,8 +146,62 @@ def test_image_prep_runtime_uses_employee_key_without_callback_headers(monkeypat
                 "employee-key",
                 "openai",
             )
+            resolved = fake._resolve_task_provider_model("vision")
+            runtime_marker = {"provider": "custom", "source": "employee-billing"}
+            _, client, _ = fake.resolve_vision_provider_client(
+                provider=resolved[0],
+                model=resolved[1],
+                base_url=resolved[2],
+                api_key=resolved[3],
+                async_mode=True,
+                main_runtime=runtime_marker,
+            )
+            assert client.base_url == "https://litellm.example/v1"
+            assert client.api_key == "employee-key"
+            assert client.main_runtime is runtime_marker
 
     asyncio.run(drive())
 
     assert captured["api_key"] == "employee-key"
     assert fake._RUNTIME_MAIN == {"previous": True}
+    assert fake._resolve_task_provider_model is original_task_resolver
+    assert fake.resolve_vision_provider_client is resolve_vision_provider_client
+
+
+def test_image_prep_runtime_rejects_unapproved_billing_endpoint_before_yield(monkeypatch, tmp_path):
+    import asyncio
+    from hermes_multitenancy import billing_identity
+
+    _install_fake_aux(monkeypatch, {})
+    monkeypatch.setattr(
+        router,
+        "_profile_main_runtime_for_image_prep",
+        lambda _home: {
+            "provider": "custom:litellm",
+            "model": "vision-model",
+            "base_url": "https://profile-shared.example/v1",
+            "api_key": "shared-key",
+            "api_mode": "openai",
+        },
+    )
+    monkeypatch.setattr(
+        billing_identity,
+        "billing_runtime_for_image_prep",
+        lambda _metadata: {
+            "api_key": "employee-key",
+            "base_url": "https://billing-approved.example/v1",
+        },
+    )
+    entered = False
+
+    async def drive():
+        nonlocal entered
+        async with router._profile_image_prep_runtime(
+            tmp_path,
+            billing_metadata={"litellm_billing_enforced": True},
+        ):
+            entered = True
+
+    with pytest.raises(RunRejected, match="unapproved endpoint"):
+        asyncio.run(drive())
+    assert entered is False
