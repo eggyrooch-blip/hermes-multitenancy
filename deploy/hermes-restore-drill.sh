@@ -16,11 +16,14 @@ HERMES_WEBUI_DIR="${HERMES_WEBUI_DIR:-$HOME/.hermes-web-ui}"
 DRILL_ROOT="${DRILL_ROOT:-/tmp}"
 REPORT_DIR="${REPORT_DIR:-$BACKUP_ROOT/drill-reports}"
 KEEP_RESTORE="${KEEP_RESTORE:-0}"   # 1 = 演练后保留还原目录（排障用）
+MAX_RPO_SECONDS="${MAX_RPO_SECONDS:-86400}"
+MAX_RTO_SECONDS="${MAX_RTO_SECONDS:-14400}"
+RESTORE_HEADROOM_GB="${RESTORE_HEADROOM_GB:-5}"
 
 STATE_ROOT="$BACKUP_ROOT/state"
 TS="$(date +%Y%m%dT%H%M%S)"
-WORK="$DRILL_ROOT/hermes-drill-$TS"
-REPORT="$REPORT_DIR/drill-$TS.md"
+WORK=""
+WORK_PROBE="$DRILL_ROOT/hermes-drill-$TS.probe"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -43,7 +46,8 @@ SRC="${SRC%/}"
 # 必须比较「真实路径」而不是字符串前缀：/tmp/../home/hermes/.hermes 或一条软链
 # 都能骗过字符串比较，然后把生产覆盖掉。realpath -m 允许目标还不存在。
 canon() { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
-WORK_REAL="$(canon "$WORK")"
+WORK_REAL="$(canon "$WORK_PROBE")"
+DRILL_ROOT_REAL="$(canon "$DRILL_ROOT")"
 for guarded in "$HERMES_HOME_DIR" "$HERMES_WEBUI_DIR"; do
   [ -e "$guarded" ] || continue
   G_REAL="$(canon "$guarded")"
@@ -53,16 +57,36 @@ for guarded in "$HERMES_HOME_DIR" "$HERMES_WEBUI_DIR"; do
   [ "$WORK_REAL" = "$G_REAL" ] && die "还原目标就是生产目录本身，拒绝执行：$WORK_REAL"
 done
 
-# 守卫过了才动手建目录
-mkdir -p "$REPORT_DIR" "$WORK"
+# 守卫过了才动手建目录；mktemp 避免可预测 /tmp 名被预建或软链劫持。
+mkdir -p "$REPORT_DIR" "$DRILL_ROOT"
+WORK="$(mktemp -d "$DRILL_ROOT/hermes-drill-$TS.XXXXXX")" \
+  || die "无法创建隔离恢复目录"
+WORK_REAL="$(canon "$WORK")"
+REPORT="$REPORT_DIR/drill-$(basename "$WORK").md"
 chmod 700 "$WORK"
+cleanup_work() {
+  if [ "$KEEP_RESTORE" != "1" ]; then
+    case "$WORK_REAL" in "$DRILL_ROOT_REAL"/hermes-drill-*) rm -rf "$WORK_REAL" ;; esac
+  fi
+}
+trap cleanup_work EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 backup_ts="$(grep '^backup_ts=' "$SRC/MANIFEST.txt" | cut -d= -f2)"
 started=$(date +%s)
+backup_epoch="$(python3 - "$backup_ts" <<'PY'
+from datetime import datetime
+import sys
+print(int(datetime.strptime(sys.argv[1], "%Y%m%dT%H%M%S").timestamp()))
+PY
+)" || die "MANIFEST backup_ts 无法解析：$backup_ts"
+rpo_seconds=$((started - backup_epoch))
+rpo_fail=0
+[ "$rpo_seconds" -ge 0 ] && [ "$rpo_seconds" -le "$MAX_RPO_SECONDS" ] || rpo_fail=1
 
 # ── 还原 ────────────────────────────────────────────────────────────
 cp -a "$SRC/." "$WORK/"
-restore_secs=$(( $(date +%s) - started ))
 
 # ── 校验 1:文件完整性 ───────────────────────────────────────────────
 sha_result="通过"
@@ -73,7 +97,7 @@ else
 fi
 
 # ── 校验 2+3:每库 integrity_check,每表行数对账 ──────────────────────
-fail=0
+fail="$rpo_fail"
 db_rows=""
 for db in "$WORK"/db/*.db; do
   dbn="$(basename "$db")"
@@ -128,7 +152,12 @@ prof_line=""
 pinned="$(grep '^profiles_snapshot=' "$SRC/COMPLETE" 2>/dev/null | cut -d= -f2- || true)"
 PSRC=""
 if [ -n "$pinned" ] && [ "$pinned" != "(skipped)" ]; then
-  [ -d "$pinned" ] && PSRC="$pinned"
+  PINNED_REAL="$(canon "$pinned")"
+  PROFILES_REAL="$(canon "$PROFILES_ROOT")"
+  if [ "$(dirname "$PINNED_REAL")" != "$PROFILES_REAL" ] || [ -L "$pinned" ]; then
+    die "配套快照路径越界，拒绝读取"
+  fi
+  [ -d "$PINNED_REAL" ] && PSRC="$PINNED_REAL"
   if [ -z "$PSRC" ]; then
     prof_line="| **配套快照丢失** | 哨兵记的是 \`$(basename "$pinned")\`，现已不存在 | — |"
     fail=1
@@ -143,13 +172,33 @@ if [ -z "$PSRC" ] && [ -z "$prof_line" ]; then
   fi
 elif [ -n "$PSRC" ]; then
   PSRC="${PSRC%/}"
+  [ -s "$WORK/PROFILE_SHA256SUMS" ] || die "备份缺少 profiles 内容校验清单"
+  [ -f "$WORK/PROFILE_SYMLINKS.json" ] || die "备份缺少 profiles 软链清单"
+  set +e
+  profile_kb="$(du -sk "$PSRC" 2>/dev/null | awk '{print $1}')"
+  profile_size_rc=$?
+  set -e
+  [ "$profile_size_rc" -eq 0 ] && [ -n "$profile_kb" ] \
+    || die "无法安全计算 profile 快照规模"
+  free_kb="$(df -Pk "$WORK" | awk 'NR==2{print $4}')"
+  need_kb=$((profile_kb + RESTORE_HEADROOM_GB * 1024 * 1024))
+  [ "$free_kb" -ge "$need_kb" ] \
+    || die "恢复空间不足：可用空间低于 profile 快照加 ${RESTORE_HEADROOM_GB}G 余量"
+  mkdir -p "$WORK/profiles"
+  if ! rsync -a "$PSRC/" "$WORK/profiles/"; then
+    prof_line="| **恢复失败** | rsync 无法完整读取配套快照 | — |"
+    fail=1
+  fi
   # `2>/dev/null` 只吞掉了消息，没吞掉退出码：38 万个文件里只要有一个 find 读不动，
   # 它就返回非零，pipefail 把整条管道判失败，set -e 直接把脚本踢出去 ——
   # 生产上第一次跑就是死在这一行，而且一声不吭。统计类命令一律不参与 -e 判定。
   set +e +o pipefail
   pfiles=$(find "$PSRC" -type f 2>/dev/null | wc -l | tr -d ' ')
+  restored_files=$(find "$WORK/profiles" -type f 2>/dev/null | wc -l | tr -d ' ')
+  expected_profile_files=$(wc -l < "$WORK/PROFILE_SHA256SUMS" | tr -d ' ')
   set -e -o pipefail
-  [ "${pfiles:-0}" -gt 0 ] || fail=1
+  [ "${expected_profile_files:-0}" -gt 0 ] \
+    && [ "$restored_files" = "$expected_profile_files" ] || fail=1
   # 抽 5 个文件跟源比内容。
   # 注意 `set -o pipefail` + `head` 的经典坑：head 读够就关管道，find 收到 SIGPIPE
   # 退出非零，pipefail 把整条管道判失败，再被 set -e 一脚踢出去 —— 生产上就是
@@ -162,15 +211,43 @@ elif [ -n "$PSRC" ]; then
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     sample_n=$((sample_n + 1))
-    if [ -f "$HERMES_HOME_DIR/profiles/$rel" ] \
-       && cmp -s "$PSRC/$rel" "$HERMES_HOME_DIR/profiles/$rel"; then
+    if [ -f "$WORK/profiles/$rel" ] \
+       && cmp -s "$PSRC/$rel" "$WORK/profiles/$rel"; then
       sample_ok=$((sample_ok + 1))
     fi
   done <<< "$sample_list"
-  # 抽样只作信息，不判失败：快照拍完之后员工继续改文件，内容不一致是正常的。
-  # 真正的失败条件只有两个 —— 快照缺失、或快照 0 个文件（上面已置 fail=1）。
-  prof_line="| \`$(basename "$PSRC")\` | ${pfiles} 个文件 | 抽样 ${sample_ok}/${sample_n} 内容一致（仅供参考） |"
+  [ "$sample_ok" = "$sample_n" ] || fail=1
+  set +e
+  profile_delta="$(rsync -a -n -c --delete --out-format='%i' "$PSRC/" "$WORK/profiles/" 2>/dev/null | sed -n '1p')"
+  profile_check_rc=$?
+  set -e
+  set +e
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$WORK/profiles" && sha256sum -c "$WORK/PROFILE_SHA256SUMS" >/dev/null 2>&1 )
+  else
+    ( cd "$WORK/profiles" && shasum -a 256 -c "$WORK/PROFILE_SHA256SUMS" >/dev/null 2>&1 )
+  fi
+  manifest_check_rc=$?
+  set -e
+  python3 - "$WORK/profiles" > "$WORK/PROFILE_SYMLINKS.current.json" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+links = []
+for base, dirs, files in os.walk(root, followlinks=False):
+    for name in dirs + files:
+        path = os.path.join(base, name)
+        if os.path.islink(path):
+            links.append([os.path.relpath(path, root), os.readlink(path)])
+json.dump(sorted(links), sys.stdout, ensure_ascii=False, separators=(",", ":"))
+PY
+  link_check_rc=0
+  cmp -s "$WORK/PROFILE_SYMLINKS.json" "$WORK/PROFILE_SYMLINKS.current.json" || link_check_rc=$?
+  [ "$profile_check_rc" -eq 0 ] && [ -z "$profile_delta" ] \
+    && [ "$manifest_check_rc" -eq 0 ] && [ "$link_check_rc" -eq 0 ] || fail=1
+  prof_line="| \`$(basename "$PSRC")\` | ${restored_files}/${expected_profile_files} 个文件 | 固化 manifest $([ "$manifest_check_rc" -eq 0 ] && [ "$link_check_rc" -eq 0 ] && echo 通过 || echo 失败)；恢复副本 checksum $([ "$profile_check_rc" -eq 0 ] && [ -z "$profile_delta" ] && echo 通过 || echo 失败) |"
 fi
+
+restore_secs=$(( $(date +%s) - started ))
 
 # ── 信息项:与当下生产的漂移(不参与判定) ─────────────────────────────
 drift=""
@@ -189,6 +266,7 @@ done
 [ -n "$drift" ] || drift="| （无差异） | | |
 "
 
+[ "$restore_secs" -le "$MAX_RTO_SECONDS" ] || fail=1
 verdict=$([ "$fail" = 0 ] && [ "$sha_result" = "通过" ] && echo "✅ 通过" || echo "❌ 未通过")
 
 # ── 报告 ────────────────────────────────────────────────────────────
@@ -204,6 +282,8 @@ cat > "$REPORT" <<EOF
 |---|---|
 | 备份是什么时候的？ | **$backup_ts**（源目录 \`$(basename "$SRC")\`） |
 | 恢复花了多久？ | **${restore_secs} 秒** |
+| RPO 是否达标？ | **${rpo_seconds} 秒 / 上限 ${MAX_RPO_SECONDS} 秒** |
+| RTO 是否达标？ | **${restore_secs} 秒 / 上限 ${MAX_RTO_SECONDS} 秒** |
 | 恢复出来的数据对不对？ | 文件校验 **$sha_result**；逐库结果见下表 |
 
 ## 逐库核对
@@ -227,8 +307,8 @@ $inventory
 | 快照 | 规模 | 抽样内容核对 |
 |---|---|---|
 $prof_line
-> 抽样是拿快照里的文件跟当前源文件逐字节比。有差异不一定是错（备份之后员工又改了），
-> 但**快照缺失或 0 个文件一定是错**，会直接判失败。
+> profiles 会真实还原到隔离演练目录，再与快照逐字节抽样核对；
+> **快照缺失、文件数不符或抽样不符都会直接判失败**。
 
 ## 参考：这份备份比当下生产落后多少
 
@@ -241,8 +321,8 @@ $drift
 演练目录：\`$WORK\`（$([ "$KEEP_RESTORE" = 1 ] && echo "已保留" || echo "已清理")）
 EOF
 
-[ "$KEEP_RESTORE" = 1 ] || rm -rf "$WORK"
-
 echo "演练完成：$verdict"
 echo "报告：$REPORT"
-[ "$fail" = 0 ] && [ "$sha_result" = "通过" ] || exit 1
+status=$([ "$fail" = 0 ] && [ "$sha_result" = "通过" ] && echo PASS || echo FAIL)
+echo "RESULT status=$status rpo_seconds=$rpo_seconds rto_seconds=$restore_secs"
+[ "$status" = PASS ] || exit 1
