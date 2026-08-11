@@ -10,6 +10,17 @@ from tests.conftest import card_toast
 
 
 class _CardAdapter:
+    # Models the `main` core line, which has both card-action handlers.
+    # Delegation is gated on the handler EXISTING, so a double without them is
+    # claiming a capability no real adapter has — the exact defect this package
+    # fixes (`feishu_auth` was delegated to a release line that has no handler
+    # for it, where it resolved to a silent DENIAL of an approval).
+    def _handle_approval_card_action(self, **kw):
+        raise AssertionError("routing is core's job")
+
+    def _handle_feishu_auth_card_action(self, **kw):
+        raise AssertionError("routing is core's job")
+
     def __init__(self) -> None:
         self.original_calls: list[object] = []
 

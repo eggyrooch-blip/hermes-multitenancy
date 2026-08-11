@@ -47,12 +47,25 @@ def _adapter_class():
     calls = {"original": 0, "turns": []}
 
     class FakeFeishuAdapter:
+        """Shaped like the `main` core line: it has both card-action handlers.
+
+        Delegation is now gated on the handler EXISTING, so a double that lacks
+        it is claiming a capability no real adapter would have — which is the
+        whole defect this package fixes, and would make these tests assert
+        against a core that cannot exist."""
+
         _app_id = "cli_test"
         _loop = None
 
         def _on_card_action_trigger(self, data):
             calls["original"] += 1
             return {"kind": "delegated"}
+
+        def _handle_approval_card_action(self, **kw):  # both core lines have it
+            raise AssertionError("routing is core's job; the double answers via _on_card_action_trigger")
+
+        def _handle_feishu_auth_card_action(self, **kw):  # `main` only
+            raise AssertionError("routing is core's job; the double answers via _on_card_action_trigger")
 
         def _handle_message_with_guards(self, event):
             # ponytail: sync on purpose. Production awaits this, but recording
@@ -61,6 +74,31 @@ def _adapter_class():
             calls["turns"].append(event)
 
     return FakeFeishuAdapter, calls
+
+
+def _core_double(having):
+    """A core double that has EXACTLY the named handler (or none of them).
+
+    `having=None` models a core line that lacks the capability — the shape that
+    made `feishu_auth` a silent denial in production."""
+    calls = {"original": 0, "turns": []}
+
+    class Core:
+        _app_id = "cli_test"
+        _loop = None
+
+        def _on_card_action_trigger(self, data):
+            calls["original"] += 1
+            return {"kind": "delegated"}
+
+        def _handle_message_with_guards(self, event):
+            calls["turns"].append(event)
+
+    if having:
+        setattr(Core, having, lambda self, **kw: (_ for _ in ()).throw(
+            AssertionError("routing is core's job")))
+    assert dispatcher.install_feishu_card_action_dispatcher(Core) is True
+    return Core(), calls
 
 
 def _installed():
@@ -368,15 +406,43 @@ def test_an_unbacked_top_level_value_key_does_not_delegate():
     assert _toast_type(response) == "info"  # unsupported, not a handler failure
 
 
-def test_the_agent_core_allowlist_is_exactly_the_backed_core_actions():
-    """Every entry must be BACKED by a real core handler; an unbacked one is the
-    P0 this package exists to close. ``approve_always`` is backed — core's
-    approval card emits it ("✅ Always", feishu.py:2457) and
-    ``_APPROVAL_CHOICE_MAP`` (:229) resolves it — so consuming it here would
-    leave a blocked agent waiting forever."""
-    assert dispatcher._AGENT_CORE_ACTIONS == frozenset(_CORE_ACTIONS)
-    assert dispatcher._AGENT_CORE_VALUE_KEY == "hermes_action"
-    assert not hasattr(dispatcher, "_AGENT_CORE_VALUE_KEYS")
+@pytest.mark.parametrize("name,handler", sorted(dispatcher._AGENT_CORE_ACTION_HANDLERS.items()))
+def test_each_core_action_delegates_only_when_the_running_core_implements_it(name, handler):
+    """Replaces a forbidden change-detector.
+
+    The old test asserted `_AGENT_CORE_ACTIONS == frozenset(<a copy of the same
+    literal list>)` — green no matter what any name actually routed to, which is
+    precisely why `feishu_auth` sat in the allowlist while the production
+    release line had no handler for it and resolved it to a DENIAL of an
+    approval. A list compared against a copy of itself proves nothing; each name
+    is now driven through both core shapes.
+    """
+    with_handler, calls_with = _core_double(having=handler)
+    r1 = with_handler._on_card_action_trigger(_data({"hermes_action": name}, token=_token()))
+    assert calls_with["original"] == 1, f"{name} must delegate when {handler} exists"
+
+    without, calls_without = _core_double(having=None)
+    r2 = without._on_card_action_trigger(_data({"hermes_action": name}, token=_token()))
+    assert calls_without["original"] == 0, f"{name} must NOT delegate when {handler} is absent"
+    assert calls_without["turns"] == [], "and must not become a model turn either"
+    assert card_response_bytes(r2) == card_response_bytes(
+        without._on_card_action_trigger(_data({"action": "zz_unknown_cap"}, token=_token()))
+    ), "the refusal must be indistinguishable from an unknown action"
+
+
+def test_feishu_auth_is_consumed_on_a_release_shaped_core():
+    """The concrete defect. The release line has no
+    `_handle_feishu_auth_card_action`, so delegating sent the callback to
+    `_handle_approval_card_action`, where `_APPROVAL_CHOICE_MAP.get(name,
+    "deny")` silently resolved it to a denial of whatever approval the crafted
+    id named."""
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(_data({"hermes_action": "feishu_auth"}, token=_token()))
+
+    assert calls["original"] == 0
+    assert calls["approval"] == 0, "it must not reach the approval handler and resolve as deny"
+    assert calls["card_event"] == 0
+    assert _kind(response) == "toast"
 
 
 def test_agent_core_delegate_exception_is_consumed():
@@ -384,6 +450,9 @@ def test_agent_core_delegate_exception_is_consumed():
 
     class ExplodingAdapter:
         _app_id = "cli_test"
+
+        def _handle_approval_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
 
         def _on_card_action_trigger(self, data):
             calls["original"] += 1
@@ -781,9 +850,14 @@ def _release_shaped():
             calls["update_prompt"] += 1
             return {"kind": "update_prompt"}
 
+        def _handle_approval_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
         def _handle_message_with_guards(self, event):
             calls["turns"].append(event)
 
+    # Deliberately NO _handle_feishu_auth_card_action: the production release
+    # line does not have one, which is exactly why that name must not delegate.
     assert dispatcher.install_feishu_card_action_dispatcher(ReleaseShapedAdapter) is True
     return ReleaseShapedAdapter(), calls
 
@@ -1269,6 +1343,12 @@ def test_a_core_handler_that_raises_answers_like_an_unknown_action(payload):
         _app_id = "cli_test"
         _loop = None
 
+        def _handle_approval_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
+        def _handle_update_prompt_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
         def _on_card_action_trigger(self, data):
             calls["n"] += 1
             raise RuntimeError("core exploded")
@@ -1293,6 +1373,12 @@ def test_a_core_handler_returning_none_does_not_announce_recognition():
         _app_id = "cli_test"
         _loop = None
 
+        def _handle_approval_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
+        def _handle_update_prompt_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
         def _on_card_action_trigger(self, data):
             return None
 
@@ -1311,9 +1397,39 @@ def test_a_core_success_response_is_still_passed_through_unchanged():
         _app_id = "cli_test"
         _loop = None
 
+        def _handle_approval_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
+        def _handle_update_prompt_card_action(self, **kw):
+            raise AssertionError("routing is core's job")
+
         def _on_card_action_trigger(self, data):
             return {"kind": "core-said-ok"}
 
     assert dispatcher.install_feishu_card_action_dispatcher(Working) is True
     r = Working()._on_card_action_trigger(_data({"hermes_action": "approve_once"}, token=_token()))
     assert r == {"kind": "core-said-ok"}
+
+
+@pytest.mark.parametrize("padded", [" approve_once", "approve_once ", " approve_once ",
+                                    "\tapprove_once", "approve_once\n"])
+def test_a_padded_core_action_name_is_not_delegated(padded):
+    """`cb.kind` is stripped at parse time, so a gate comparing two STRIPPED
+    values accepts " approve_once ". Core then looks the RAW value up in
+    `_APPROVAL_CHOICE_MAP.get(name, "deny")`, misses, and silently DENIES the
+    approval the callback names. Delegating must imply core can route it — and
+    core routes on the raw bytes."""
+    adapter, calls = _core_double(having="_handle_approval_card_action")
+    response = adapter._on_card_action_trigger(_data({"hermes_action": padded, "approval_id": "v"}, token=_token()))
+
+    assert calls["original"] == 0, f"{padded!r} delegated; core would resolve it to deny"
+    assert calls["turns"] == []
+    assert _kind(response) == "toast"
+
+
+def test_the_exact_core_action_name_still_delegates():
+    """Negative control for the rule above: tightening the gate must not refuse
+    the real thing."""
+    adapter, calls = _core_double(having="_handle_approval_card_action")
+    adapter._on_card_action_trigger(_data({"hermes_action": "approve_once", "approval_id": "v"}, token=_token()))
+    assert calls["original"] == 1
