@@ -52,10 +52,33 @@ def _card_with_actions(
 
 
 class FeishuApiError(RuntimeError):
-    def __init__(self, status: int, retry_after: int | None = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        retry_after: int | None = None,
+        *,
+        code: Any = None,
+        message: Any = None,
+    ) -> None:
         super().__init__(f"Feishu HTTP error {status}")
         self.status = status
         self.retry_after = retry_after
+        self.code = (
+            code
+            if isinstance(code, int) or code is None
+            else " ".join(str(code).split())[:64]
+        )
+        self.message = " ".join(str(message).split())[:512] if message is not None else ""
+
+
+def _error_details(payload: Any) -> tuple[Any, Any]:
+    if not isinstance(payload, dict):
+        return None, None
+    error = payload.get("error")
+    nested = error if isinstance(error, dict) else {}
+    code = payload.get("code", nested.get("code"))
+    message = payload.get("msg") or payload.get("message") or nested.get("msg") or nested.get("message")
+    return code, message or (error if isinstance(error, str) else None)
 
 
 class FeishuRelayClient:
@@ -224,15 +247,23 @@ class FeishuRelayClient:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             retry = str(exc.headers.get("Retry-After") or "").strip()
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+            except Exception:
+                error_payload = None
+            code, message = _error_details(error_payload)
             raise FeishuApiError(
                 exc.code,
                 int(retry) if retry.isdigit() else None,
+                code=code,
+                message=message,
             ) from exc
         if not isinstance(payload, dict):
             raise RuntimeError("Feishu response is not an object")
         if payload.get("code") not in {None, 0} or payload.get("error"):
             status = 400 if "/open-apis/im/v1/messages" in url else 502
-            raise FeishuApiError(status)
+            code, message = _error_details(payload)
+            raise FeishuApiError(status, code=code, message=message)
         return payload
 
     async def ingest_event_payload(

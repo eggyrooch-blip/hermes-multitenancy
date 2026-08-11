@@ -30,6 +30,19 @@ FORBIDDEN_IDENTITY_FIELDS = frozenset(
 )
 
 
+def _feishu_uuid(value: str) -> str:
+    return _sha(value)[:50]
+
+
+def _feishu_error_message(fallback: str, exc: FeishuApiError) -> str:
+    details = []
+    if exc.code is not None:
+        details.append(f"code={exc.code}")
+    if exc.message:
+        details.append(f"msg={exc.message}")
+    return f"{fallback}: Feishu {', '.join(details)}" if details else fallback
+
+
 def _contains_forbidden_identity(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
@@ -218,7 +231,7 @@ def create_agent_relay_app(
         existing = store.message_result(row)
         if existing is not None:
             return web.json_response(existing, status=200)
-        uuid = _sha(f"{actor['token_id']}:{key}")
+        uuid = _feishu_uuid(f"{actor['token_id']}:{key}")
         try:
             result = await asyncio.wait_for(
                 _await(
@@ -237,12 +250,25 @@ def create_agent_relay_app(
         except FeishuApiError as exc:
             if exc.status == 429:
                 logger.warning("relay_audit event=send status=rate_limited actor=%s", actor["identity_fingerprint"])
-                return _error("rate_limited", "Feishu rate limited the request", 429, exc.retry_after or 1)
+                return _error(
+                    "rate_limited",
+                    _feishu_error_message("Feishu rate limited the request", exc),
+                    429,
+                    exc.retry_after or 1,
+                )
             if exc.status == 400:
                 logger.warning("relay_audit event=send status=rejected actor=%s", actor["identity_fingerprint"])
-                return _error("invalid_message", "Feishu rejected the payload", 400)
+                return _error(
+                    "invalid_message",
+                    _feishu_error_message("Feishu rejected the payload", exc),
+                    400,
+                )
             logger.warning("relay_audit event=send status=upstream_error actor=%s", actor["identity_fingerprint"])
-            return _error("upstream_unavailable", "Feishu send failed", 502)
+            return _error(
+                "upstream_unavailable",
+                _feishu_error_message("Feishu send failed", exc),
+                502,
+            )
         except Exception:
             logger.warning("relay_audit event=send status=upstream_error actor=%s", actor["identity_fingerprint"])
             return _error("upstream_unavailable", "Feishu send failed", 502)
@@ -317,7 +343,9 @@ def create_agent_relay_app(
         content = payload.get("content")
         actions = payload.get("actions")
         key = str(payload.get("idempotency_key") or "").strip()
-        expires_in = payload.get("expires_in")
+        if "expires_in" in payload and "expiry" in payload:
+            return _error("invalid_card", "use only one of expires_in or expiry", 400)
+        expires_in = payload.get("expires_in", payload.get("expiry"))
         valid_actions = (
             isinstance(actions, list)
             and 1 <= len(actions) <= 5
@@ -331,15 +359,24 @@ def create_agent_relay_app(
                 for action in actions
             )
         )
-        if (
-            not isinstance(content, dict)
-            or not valid_actions
-            or not key
-            or not isinstance(expires_in, int)
-            or not 300 <= expires_in <= 1800
-            or len(json.dumps(content, ensure_ascii=False).encode("utf-8")) > MAX_CONTENT_BYTES
-        ):
-            return _error("invalid_card", "invalid content, actions, expiry, or idempotency key", 400)
+        if not isinstance(content, dict):
+            return _error("invalid_card", "content must be a card object", 400)
+        if len(json.dumps(content, ensure_ascii=False).encode("utf-8")) > MAX_CONTENT_BYTES:
+            return _error("invalid_card", "content exceeds 30720 bytes", 400)
+        if not valid_actions:
+            return _error(
+                "invalid_card",
+                "actions must be 1..5 objects with exactly string id and label fields of 1..64 characters",
+                400,
+            )
+        if not key:
+            return _error("invalid_card", "idempotency_key is required", 400)
+        if type(expires_in) is not int or not 300 <= expires_in <= 1800:
+            return _error(
+                "invalid_card",
+                "expires_in or expiry must be integer TTL seconds from 300 to 1800",
+                400,
+            )
         try:
             _card_with_actions(content, actions, "validation", "validation")
         except ValueError as exc:
@@ -347,11 +384,13 @@ def create_agent_relay_app(
         action_ids = [action["id"] for action in actions]
         if len(set(action_ids)) != len(action_ids):
             return _error("invalid_card", "action ids must be unique", 400)
+        normalized_payload = {**payload, "expires_in": expires_in}
+        normalized_payload.pop("expiry", None)
         try:
             row, nonce, created = store.reserve_card(
                 token_id=actor["token_id"],
                 idempotency_key=key,
-                request_hash=_request_hash(payload),
+                request_hash=_request_hash(normalized_payload),
                 action_ids=action_ids,
                 expires_at=_now_ms() + expires_in * 1000,
             )
@@ -368,7 +407,7 @@ def create_agent_relay_app(
                         actions=actions,
                         card_id=row["card_id"],
                         nonce=nonce,
-                        uuid=_sha(f"{actor['token_id']}:{key}"),
+                        uuid=_feishu_uuid(f"{actor['token_id']}:{key}"),
                     )
                 ),
                 timeout=5,
@@ -379,13 +418,26 @@ def create_agent_relay_app(
         except FeishuApiError as exc:
             if exc.status == 429:
                 logger.warning("relay_audit event=card status=rate_limited actor=%s", actor["identity_fingerprint"])
-                return _error("rate_limited", "Feishu rate limited the request", 429, exc.retry_after or 1)
+                return _error(
+                    "rate_limited",
+                    _feishu_error_message("Feishu rate limited the request", exc),
+                    429,
+                    exc.retry_after or 1,
+                )
             if exc.status == 400:
                 store.fail_card(str(row["card_id"]))
                 logger.warning("relay_audit event=card status=rejected actor=%s", actor["identity_fingerprint"])
-                return _error("invalid_card", "Feishu rejected the payload", 400)
+                return _error(
+                    "invalid_card",
+                    _feishu_error_message("Feishu rejected the payload", exc),
+                    400,
+                )
             logger.warning("relay_audit event=card status=upstream_error actor=%s", actor["identity_fingerprint"])
-            return _error("upstream_unavailable", "Feishu send failed", 502)
+            return _error(
+                "upstream_unavailable",
+                _feishu_error_message("Feishu send failed", exc),
+                502,
+            )
         except Exception:
             logger.warning("relay_audit event=card status=upstream_error actor=%s", actor["identity_fingerprint"])
             return _error("upstream_unavailable", "Feishu send failed", 502)
