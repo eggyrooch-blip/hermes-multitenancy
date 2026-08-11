@@ -384,6 +384,23 @@ def _run_builtin(name: str, module_name: str, func_name: str, adapter: Any, cb: 
     return getattr(module, func_name)(adapter, cb)
 
 
+def _adapter_implements(adapter: Any, handler_attr: str) -> bool:
+    """Whether the LIVE adapter carries this core handler. Never raises.
+
+    Reading the attribute can execute code — a property, a `__getattr__`, a
+    descriptor — and `getattr(obj, name, None)` only swallows `AttributeError`,
+    so anything else would escape `dispatch_card_action` into the SDK. That
+    turns a refusal that is supposed to be indistinguishable from an unknown
+    action into a crash a caller can provoke and observe. Absent, unreadable and
+    non-callable all collapse to the same answer: not implemented, consume.
+    """
+    try:
+        return callable(_read(adapter, handler_attr))
+    except Exception:
+        logger.debug("[card_action] handler probe raised for %s", handler_attr, exc_info=True)
+        return False
+
+
 def _core_reads_value_as_dict(cb: CardCallback) -> bool:
     """Whether core will see this callback's ``value`` as a routable mapping.
 
@@ -400,8 +417,24 @@ def _core_reads_value_as_dict(cb: CardCallback) -> bool:
     a dict — was delegated on the strength of MT's parse while core dropped it
     straight down the model path. Delegation must be decided on the object core
     will actually read, not on ours.
+
+    TRUTHINESS matters as much as the type. Core's read is
+    ``action_value = getattr(action, "value", {}) or {}`` — a FALSY dict is
+    replaced by an empty one, so its keys are gone before core ever looks, and
+    core routes nothing. `isinstance` alone would pass a `dict` subclass whose
+    ``__bool__`` is False while it still answers `.get(key)` truthfully to us:
+    MT delegates, core sees `{}`, and the callback lands on the model path.
+    Mirror the `or {}` exactly.
+
+    Known and accepted: a STATEFUL mapping that answers `.get` differently on
+    our read and on core's re-read defeats any check made here, because core
+    re-reads from the same object after we decide. It is not reachable from the
+    wire — the Feishu SDK deserializes JSON into plain dicts — and defending it
+    would mean distrusting in-process object identity generally, which is a much
+    bigger posture than this package.
     """
-    return isinstance(_read(cb.action, "value"), dict)
+    raw = _read(cb.action, "value")
+    return isinstance(raw, dict) and bool(raw)
 
 
 def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any], Any]) -> Any:
@@ -464,7 +497,7 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
             # allowlist keeps out — smuggled in as this key's companion.
             logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
             return unsupported_response()
-        if not callable(_read(adapter, handler_attr)):
+        if not _adapter_implements(adapter, handler_attr):
             # This core line doesn't implement it. Delegating would fall through
             # core's own routing into `_handle_card_action_event`, which
             # synthesizes `/card` and feeds the raw callback JSON to the model —
