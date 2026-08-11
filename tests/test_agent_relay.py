@@ -216,13 +216,13 @@ class FakeFailures(FakeFeishu):
     async def send_message(self, **request) -> dict[str, str]:
         from hermes_multitenancy.agent_relay import FeishuApiError
 
-        raise FeishuApiError(429, 7)
+        raise FeishuApiError(429, 7, code=99991400, message="MESSAGE-UPSTREAM-CANARY")
 
     async def send_card(self, **request) -> dict[str, str]:
         from hermes_multitenancy.agent_relay import FeishuApiError
 
         self.cards.append(request)
-        raise FeishuApiError(400)
+        raise FeishuApiError(400, code=230099, message="CARD-UPSTREAM-CANARY")
 
 
 async def enroll(client) -> tuple[str, str]:
@@ -336,6 +336,7 @@ def test_enrollment_binds_message_delivery_to_self_and_rejects_target_fields(tmp
             }
             assert len(feishu.messages) == 1
             assert feishu.messages[0]["actor_id"] == "ou_alice"
+            assert len(feishu.messages[0]["uuid"]) <= 50
             assert "actor_id" not in (await sent.json())
             cross_kind = await client.post(
                 "/v1/cards",
@@ -579,6 +580,7 @@ def test_replies_reactions_and_cards_are_isolated_and_deterministic(tmp_path):
             card_body = await card.json()
             card_id = card_body["card_id"]
             sent_card = feishu.cards[0]
+            assert len(sent_card["uuid"]) <= 50
             assert "nonce" not in str(card_body)
             assert not await events.ingest_card_action(
                 actor_id="ou_bob",
@@ -805,7 +807,10 @@ def test_rate_limit_failed_card_and_logs_do_not_leak_payloads(tmp_path, caplog, 
             )
             assert limited.status == 429
             assert limited.headers["Retry-After"] == "7"
-            assert (await limited.json())["error"]["retry_after"] == 7
+            limited_error = (await limited.json())["error"]
+            assert limited_error["retry_after"] == 7
+            assert "code=99991400" in limited_error["message"]
+            assert "MESSAGE-UPSTREAM-CANARY" in limited_error["message"]
 
             request = {
                 "content": {"elements": []},
@@ -815,14 +820,141 @@ def test_rate_limit_failed_card_and_logs_do_not_leak_payloads(tmp_path, caplog, 
             }
             failed = await client.post("/v1/cards", headers=auth, json=request)
             assert failed.status == 400
+            failed_error = (await failed.json())["error"]
+            assert "code=230099" in failed_error["message"]
+            assert "CARD-UPSTREAM-CANARY" in failed_error["message"]
             repeated = await client.post("/v1/cards", headers=auth, json=request)
             assert repeated.status == 200
             assert (await repeated.json())["status"] == "failed"
             assert len(feishu.cards) == 1
             assert "BODY-CANARY-DO-NOT-LOG" not in caplog.text
+            assert "MESSAGE-UPSTREAM-CANARY" not in caplog.text
+            assert "CARD-UPSTREAM-CANARY" not in caplog.text
             assert token not in caplog.text
             assert "ou_alice" not in caplog.text
         finally:
             await client.close()
 
     asyncio.run(runner())
+
+
+def test_card_expiry_alias_normalizes_idempotency_and_validation_is_specific(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import create_agent_relay_app
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=FakeOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            token, _ = await enroll(client)
+            auth = {"Authorization": f"Bearer {token}"}
+            base = {
+                "content": {"elements": []},
+                "actions": [{"id": "approve", "label": "Approve"}],
+                "idempotency_key": "expiry-alias-1",
+            }
+
+            invalid_actions = await client.post(
+                "/v1/cards", headers=auth, json={**base, "actions": ["approve"], "expiry": 600}
+            )
+            assert invalid_actions.status == 400
+            assert (await invalid_actions.json())["error"]["message"] == (
+                "actions must be 1..5 objects with exactly string id and label fields of 1..64 characters"
+            )
+
+            invalid_expiry = await client.post(
+                "/v1/cards", headers=auth, json={**base, "expiry": "600"}
+            )
+            assert invalid_expiry.status == 400
+            assert (await invalid_expiry.json())["error"]["message"] == (
+                "expires_in or expiry must be integer TTL seconds from 300 to 1800"
+            )
+
+            duplicate_expiry = await client.post(
+                "/v1/cards", headers=auth, json={**base, "expires_in": 600, "expiry": 600}
+            )
+            assert duplicate_expiry.status == 400
+            assert (await duplicate_expiry.json())["error"]["message"] == (
+                "use only one of expires_in or expiry"
+            )
+
+            alias = await client.post("/v1/cards", headers=auth, json={**base, "expiry": 600})
+            assert alias.status == 201
+            canonical = await client.post(
+                "/v1/cards", headers=auth, json={**base, "expires_in": 600}
+            )
+            assert canonical.status == 200
+            assert len(feishu.cards) == 1
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_feishu_transport_preserves_application_error_details(monkeypatch):
+    import io
+    import urllib.error
+    import urllib.request
+
+    from hermes_multitenancy.agent_relay_feishu import FeishuApiError, FeishuRelayClient
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"code":230099,"msg":"bad card shape"}'
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    with pytest.raises(FeishuApiError) as raised:
+        FeishuRelayClient._request_json("https://open.feishu.cn/open-apis/im/v1/messages")
+    assert raised.value.code == 230099
+    assert raised.value.message == "bad card shape"
+
+    def fail_with(error):
+        def raise_error(*_args, **_kwargs):
+            raise error
+
+        monkeypatch.setattr(urllib.request, "urlopen", raise_error)
+        with pytest.raises(FeishuApiError) as caught:
+            FeishuRelayClient._request_json("https://open.feishu.cn/open-apis/im/v1/messages")
+        return caught.value
+
+    http_error = urllib.error.HTTPError(
+        "https://open.feishu.cn/open-apis/im/v1/messages",
+        429,
+        "rate limited",
+        {"Retry-After": "7"},
+        io.BytesIO(b'{"code":99991400,"msg":"slow down"}'),
+    )
+    caught = fail_with(http_error)
+    assert (caught.status, caught.retry_after, caught.code, caught.message) == (
+        429,
+        7,
+        99991400,
+        "slow down",
+    )
+
+    class BrokenBody:
+        def read(self):
+            raise OSError
+
+        def close(self):
+            return None
+
+    for body in (io.BytesIO(b"not-json"), BrokenBody()):
+        caught = fail_with(
+            urllib.error.HTTPError("https://open.feishu.cn", 503, "unavailable", {}, body)
+        )
+        assert (caught.status, caught.code, caught.message) == (503, None, "")
