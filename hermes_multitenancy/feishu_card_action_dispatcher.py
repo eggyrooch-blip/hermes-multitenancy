@@ -65,6 +65,22 @@ _AGENT_CORE_ACTIONS = frozenset(
 # crafted callback, and delegating it opens the same `/card` model path.
 _AGENT_CORE_VALUE_KEY = "hermes_action"
 
+# Core actions that arrive under their OWN top-level `value` key instead of
+# `hermes_action` — core reads each key directly, so they never carry a `kind`.
+#
+# WHICH of these the running core implements differs by core LINE, so an entry
+# names the adapter method to probe for at dispatch time rather than asserting
+# the capability exists. A static list is right on whichever line it was
+# measured against and wrong on the other: on 2026-08-11 this package removed
+# `hermes_update_prompt_action` on evidence gathered from `main` (no handler,
+# no card) while the production release line both emits the card and defines
+# `_handle_update_prompt_card_action` — every production update-prompt card
+# started answering "该操作暂不支持". Probing the LIVE adapter is correct on
+# both lines without anyone having to remember there are two.
+_AGENT_CORE_VALUE_KEY_HANDLERS: tuple[tuple[str, str], ...] = (
+    ("hermes_update_prompt_action", "_handle_update_prompt_card_action"),
+)
+
 # Reserved but NOT implemented by this package. `inject_prompt` keeps the first
 # precedence slot so no business namespace can claim the name and quietly
 # implement it here; the slot itself answers exactly like a genuinely unknown
@@ -368,6 +384,79 @@ def _run_builtin(name: str, module_name: str, func_name: str, adapter: Any, cb: 
     return getattr(module, func_name)(adapter, cb)
 
 
+def _adapter_implements(adapter: Any, handler_attr: str) -> bool:
+    """Whether the LIVE adapter carries this core handler. Never raises.
+
+    Reading the attribute can execute code — a property, a `__getattr__`, a
+    descriptor — and `getattr(obj, name, None)` only swallows `AttributeError`,
+    so anything else would escape `dispatch_card_action` into the SDK. That
+    turns a refusal that is supposed to be indistinguishable from an unknown
+    action into a crash a caller can provoke and observe. Absent, unreadable and
+    non-callable all collapse to the same answer: not implemented, consume.
+    """
+    try:
+        return callable(_read(adapter, handler_attr))
+    except Exception:
+        logger.debug("[card_action] handler probe raised for %s", handler_attr, exc_info=True)
+        return False
+
+
+def _core_routable_value(cb: CardCallback) -> Optional[dict]:
+    """Whether core will see this callback's ``value`` as a routable mapping.
+
+    The precondition for EVERY delegation: core guards both of its routing reads
+    with ``isinstance(action_value, dict)``, so if the raw value is not a dict
+    core reaches no handler at all — it falls into `_handle_card_action_event`,
+    synthesizes `/card`, and feeds the raw callback JSON to the model. That is
+    the P0.
+
+    MT parses more liberally than core reads: `_as_dict` decodes a JSON STRING
+    value into a dict, which is right for MT's own business handlers (they run
+    here, not in core) and wrong as a basis for handing the callback to core.
+    `{"action": {"value": '{"hermes_action": "approve_once"}'}}` — a string, not
+    a dict — was delegated on the strength of MT's parse while core dropped it
+    straight down the model path. Delegation must be decided on the object core
+    will actually read, not on ours.
+
+    TRUTHINESS matters as much as the type. Core's read is
+    ``action_value = getattr(action, "value", {}) or {}`` — a FALSY dict is
+    replaced by an empty one, so its keys are gone before core ever looks, and
+    core routes nothing. `isinstance` alone would pass a `dict` subclass whose
+    ``__bool__`` is False while it still answers `.get(key)` truthfully to us:
+    MT delegates, core sees `{}`, and the callback lands on the model path.
+    Mirror the `or {}` exactly.
+
+    A CHECK IS NOT ENOUGH ON ITS OWN if the object can change its answer. Core
+    re-reads `value` after we decide, so a mapping with a stateful `__bool__` or
+    `.get` — or one that raises — beats any amount of inspection. That is a
+    time-of-check/time-of-use gap, not a missing condition, and it cannot be
+    closed by looking harder.
+
+    So require a PLAIN dict, exactly, and refuse everything else. A plain dict
+    has no hooks: `.get` and truthiness are inert, our read and core's read
+    cannot disagree, and the whole class of adversarial mappings — falsy,
+    stateful, exploding — is gone in one condition rather than one patch per
+    trick. The type test comes FIRST so a hostile `__bool__` is never invoked.
+
+    Refusing rather than normalizing is deliberate. Coercing a hostile mapping
+    into a valid plain dict would make core act on input it would otherwise have
+    ignored; consuming it is the fail-closed direction and the simpler rule.
+
+    Real traffic is unaffected: the SDK deserializes the webhook body with
+    `dict_obj = loads(json_str)` (`lark_oapi/core/json.py`, verified on the
+    production host 2026-08-11), and `json.loads` yields exactly `dict`.
+
+    Emptiness needs no test of its own here. Core's `or {}` only matters for a
+    FALSY dict, and the sole falsy plain dict is `{}` — whose keys the callers
+    read right after this, finding nothing and refusing to delegate. An explicit
+    truthiness check would be unfalsifiable: no input can distinguish it.
+
+    Returns the value core will route on, or ``None`` when it must not delegate.
+    """
+    raw = _read(cb.action, "value")
+    return raw if type(raw) is dict else None
+
+
 def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any], Any]) -> Any:
     """Route one callback. Logs carry action kind + outcome only."""
     _note_live_adapter(adapter)
@@ -391,11 +480,18 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
         if cb.kind in kinds:
             return _run_once(cb, name, lambda: _run_builtin(name, module_name, func_name, adapter, cb))
 
+    # The one object core will route on: frozen, judged once, and handed to core
+    # as-is. `None` means core would reach no handler, so nothing may delegate.
+    routable = _core_routable_value(cb)
+
     if cb.kind in _AGENT_CORE_ACTIONS:
         # Core reads ONE spelling. Any other spelling of an allowlisted name
         # would reach core's generic `/card` model path instead of its handler,
         # so it is consumed here — the P0 through a different door.
-        if _text(cb.value.get(_AGENT_CORE_VALUE_KEY)) != cb.kind:
+        if routable is None:
+            logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
+            return unsupported_response()
+        if _text(routable.get(_AGENT_CORE_VALUE_KEY)) != cb.kind:
             logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
             return unsupported_response()
         try:
@@ -405,12 +501,56 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
             logger.debug("[card_action] handler traceback", exc_info=True)
             return error_response()
 
+    for value_key, handler_attr in _AGENT_CORE_VALUE_KEY_HANDLERS:
+        if routable is None:
+            continue
+        # Raw truthiness, NOT `_text(...)`, and the invariant is exact:
+        # delegating must imply core routes to the handler. Core tests these two
+        # keys with bare `if`, while `_text` is `str(value).strip()` — so
+        # `{value_key: 0}` reads as the non-empty string "0" here and as falsy
+        # there. Under `_text` that callback would be delegated and then fall
+        # through core's routing into `_handle_card_action_event`, which
+        # synthesizes `/card` and feeds the raw callback JSON to the model: the
+        # P0, reachable only through this path. Same for False/[]/{}/0.0.
+        if not routable.get(value_key):
+            continue
+        if routable.get(_AGENT_CORE_VALUE_KEY):
+            # Core reads `hermes_action` FIRST. Anything still here carries one
+            # that ISN'T allowlisted (an allowlisted name returned above), so
+            # delegating would hand core's approval handler exactly the name the
+            # allowlist keeps out — smuggled in as this key's companion.
+            logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
+            return unsupported_response()
+        if not _adapter_implements(adapter, handler_attr):
+            # This core line doesn't implement it. Delegating would fall through
+            # core's own routing into `_handle_card_action_event`, which
+            # synthesizes `/card` and feeds the raw callback JSON to the model —
+            # the P0. The response is byte-identical to a genuinely unknown
+            # action so it can't be used to fingerprint which core line runs;
+            # only the log line distinguishes them, for operators.
+            logger.info("[card_action] kind=agent_core outcome=unsupported_capability")
+            return unsupported_response()
+        # No `_run_once` claim — same as the allowlist path above, and for the
+        # same reason: core owns its duplicate guard, and claiming here would
+        # make a REPLAY answer `error_response()` while a replayed unknown
+        # answers `unsupported_response()`.
+        try:
+            return original(adapter, data)
+        except Exception:
+            logger.warning("[card_action] kind=agent_core outcome=error")
+            logger.debug("[card_action] handler traceback", exc_info=True)
+            return error_response()
+
     _ensure_default_business_registered()
     entry = _BUSINESS.get(cb.kind)
-    if entry is None and not any(
-        isinstance(cb.value.get(key), str) and cb.value[key].strip()
-        for key in ("action", "hermes_action")
-    ):
+    def _spelled(key: str) -> str:
+        # ONE read per key. This used to be `.get(key)` for the type test and
+        # `[key]` for the value; two reads of the same key can disagree, and the
+        # second one raising escapes the dispatcher entirely.
+        value = cb.value.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    if entry is None and not any(_spelled(key) for key in ("action", "hermes_action")):
         for candidate in _BUSINESS.values():
             if candidate.matcher is not None and _safe_match(candidate, cb):
                 entry = candidate

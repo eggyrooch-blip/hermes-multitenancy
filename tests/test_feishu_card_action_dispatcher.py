@@ -342,11 +342,18 @@ def test_a_mis_spelled_core_action_cannot_be_captured_by_a_greedy_business_match
 
 
 def test_an_unbacked_top_level_value_key_does_not_delegate():
-    """``hermes_update_prompt_action`` was once delegated on the theory that core
-    owns it. It does not: zero hits in ``be5a764d0:gateway/platforms/feishu.py``,
-    the hermes-agent checkout, or this repo. Nothing emits it, so the only way to
-    produce one is a crafted callback — and delegating would drop it into core's
-    generic ``/card`` path with the raw JSON as the model prompt. Consumed."""
+    """A top-level value key the RUNNING core does not implement is consumed —
+    delegating would drop it into core's generic ``/card`` path with the raw
+    callback JSON as the model prompt.
+
+    The adapter here is `main`-shaped: no ``_handle_update_prompt_card_action``.
+    Read the docstring this one replaced before trusting a claim like it again —
+    it said the key was unbacked *everywhere* ("zero hits in the hermes-agent
+    checkout, or this repo"), which was true of `main` and false of the
+    production release line, where core both emits the card and handles it.
+    Acting on it broke the live card. "Unbacked" is a property of the adapter in
+    front of you, never of the name; the release-shaped counterpart of this test
+    is `test_update_prompt_reaches_core_when_the_running_core_implements_it`."""
     adapter, calls = _installed()
     response = adapter._on_card_action_trigger(_data({"hermes_update_prompt_action": "yes"}))
     assert calls["original"] == 0
@@ -703,3 +710,495 @@ def test_registered_business_namespaces_are_not_enumerable_by_response():
         f"{ {k: v for k, v in probes.items()} }"
     )
     assert calls["original"] == 0
+
+
+# --- delegation follows the RUNNING core, not a static list -----------------------
+#
+# `hermes_update_prompt_action` arrives under its OWN top-level `value` key, and
+# WHICH core line implements it differs: the production release line defines
+# `_handle_update_prompt_card_action` and emits the card; `main` has neither. A
+# list measured on one line is wrong on the other — that mistake shipped on
+# 2026-08-11 and made every production update-prompt card answer "该操作暂不支持".
+# These tests drive BOTH shapes through the same dispatcher.
+
+def _release_shaped():
+    """An adapter shaped like the production release line.
+
+    Its ``_on_card_action_trigger`` REPRODUCES core's routing rather than just
+    counting: `hermes_action` first, then the update-prompt key, else the
+    generic `_handle_card_action_event` path. That last branch is the P0 — a
+    synthetic `/card` carrying the raw callback JSON to the model — so
+    ``calls["card_event"]`` is the observable that actually matters. An earlier
+    version of this fixture only counted `original` and defined the handler
+    without ever routing to it, which made "it delegates" provable while
+    "it reaches the handler" was not tested at all.
+    """
+    calls = {"original": 0, "turns": [], "update_prompt": 0, "approval": 0, "card_event": 0}
+
+    class ReleaseShapedAdapter:
+        _app_id = "cli_test"
+        _loop = None
+
+        def _on_card_action_trigger(self, data):
+            calls["original"] += 1
+            event = getattr(data, "event", None)
+            action = getattr(event, "action", None)
+            # Core's read, verbatim — including the `or {}` that empties a falsy value.
+            action_value = getattr(action, "value", {}) or {}
+            hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+            update_prompt = (
+                action_value.get("hermes_update_prompt_action")
+                if isinstance(action_value, dict) else None
+            )
+            if hermes_action:
+                calls["approval"] += 1
+                return {"kind": "approval"}
+            if update_prompt:
+                return self._handle_update_prompt_card_action(
+                    event=event,
+                    action_value=action_value,
+                    loop=self._loop,
+                    ticket=getattr(data, "trusted_feishu_ingress_ticket", None),
+                    admission=getattr(data, "trusted_feishu_ingress_admission", None),
+                )
+            calls["card_event"] += 1  # <-- the P0: raw callback JSON becomes a model turn
+            return {"kind": "card_event"}
+
+        def _handle_update_prompt_card_action(self, **kwargs):
+            calls["update_prompt"] += 1
+            return {"kind": "update_prompt"}
+
+        def _handle_message_with_guards(self, event):
+            calls["turns"].append(event)
+
+    assert dispatcher.install_feishu_card_action_dispatcher(ReleaseShapedAdapter) is True
+    return ReleaseShapedAdapter(), calls
+
+
+def _update_prompt_value(answer="y", **extra):
+    return dict({"hermes_update_prompt_action": answer, "update_prompt_id": 7}, **extra)
+
+
+def test_update_prompt_reaches_core_when_the_running_core_implements_it():
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
+
+    assert calls["original"] == 1, "release-shaped core must receive the callback"
+    assert calls["update_prompt"] == 1, "core must reach the update-prompt HANDLER, not just be called"
+    assert calls["card_event"] == 0, "must not land on the generic /card model path"
+    assert response == {"kind": "update_prompt"}, "the handler's own answer must pass through"
+    assert calls["turns"] == [], "must not also become a model turn"
+
+
+def test_update_prompt_is_consumed_when_the_running_core_lacks_the_handler():
+    """`main`'s shape. Delegating here would drop the callback into core's
+    generic `/card` path and feed the raw JSON to the model — the P0."""
+    adapter, calls = _installed()
+    response = adapter._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
+
+    assert calls["original"] == 0
+    assert calls["turns"] == []
+    assert _kind(response) == "toast"
+
+
+def test_update_prompt_refusal_is_indistinguishable_from_an_unknown_action():
+    """Otherwise the response tells a crafted caller which core line is running."""
+    adapter, calls = _installed()
+    probes = {
+        "update_prompt": card_response_bytes(
+            adapter._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
+        ),
+        "unknown_a": card_response_bytes(
+            adapter._on_card_action_trigger(_data({"action": "totally_unknown_xyz"}, token=_token()))
+        ),
+        "unknown_b": card_response_bytes(
+            adapter._on_card_action_trigger(_data({"action": "zz_another_unknown_5f1a"}, token=_token()))
+        ),
+        "no_value": card_response_bytes(
+            adapter._on_card_action_trigger(_data(None, name="", token=_token()))
+        ),
+    }
+    assert len(set(probes.values())) == 1, probes
+    assert calls["original"] == 0
+
+
+@pytest.mark.parametrize("spelling", [
+    {"action": "hermes_update_prompt_action"},
+    {"hermes_action": "hermes_update_prompt_action"},
+])
+def test_update_prompt_name_under_a_non_core_spelling_is_consumed(spelling):
+    """Core reads the top-level `value` key only. The NAME arriving as some
+    other action's value is not the same callback and must not delegate."""
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(_data(dict(spelling), token=_token()))
+
+    assert calls["original"] == 0
+    assert calls["update_prompt"] == 0
+    assert _kind(response) == "toast"
+
+
+def test_update_prompt_paired_with_an_unlisted_hermes_action_is_consumed():
+    """The crafted pairing that matters. Core routes `hermes_action` FIRST, so
+    delegating `{"hermes_action": "bogus", "hermes_update_prompt_action": "y"}`
+    would reach `_handle_approval_card_action("bogus")` — a name the allowlist
+    exists to keep out, smuggled in as the update-prompt key's travelling
+    companion."""
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(
+        _data(_update_prompt_value(hermes_action="bogus_not_allowlisted"), token=_token())
+    )
+
+    assert calls["original"] == 0
+    assert calls["update_prompt"] == 0
+    assert _kind(response) == "toast"
+
+
+def test_allowlisted_approval_carrying_the_update_prompt_key_still_approves():
+    """The negative control for the test above: an allowlisted `hermes_action`
+    is a genuine approval callback and keeps delegating, extra keys or not.
+    Consuming it here would break approvals to close a hole that isn't one."""
+    adapter, calls = _release_shaped()
+    adapter._on_card_action_trigger(
+        _data(_update_prompt_value(hermes_action="approve_once"), token=_token())
+    )
+
+    assert calls["approval"] == 1, "core routes hermes_action first — it is a genuine approval"
+    assert calls["update_prompt"] == 0
+    assert calls["card_event"] == 0
+
+
+def test_empty_update_prompt_answer_does_not_delegate():
+    adapter, calls = _release_shaped()
+    for empty in ("", None):
+        adapter._on_card_action_trigger(_data(_update_prompt_value(empty), token=_token()))
+    assert calls["original"] == 0
+
+
+@pytest.mark.parametrize("crafted", [0, False, [], {}, 0.0])
+def test_a_value_core_reads_as_falsy_is_never_delegated(crafted):
+    """The invariant: DELEGATING MUST IMPLY CORE ROUTES TO THE HANDLER.
+
+    Core tests this key with a bare `if`. `_text()` — used everywhere else in
+    this module — is `str(value).strip()`, so `0` reads as the non-empty string
+    "0". Deciding with `_text` would delegate a callback that core then treats
+    as falsy, dropping it through core's routing into
+    `_handle_card_action_event`: synthetic `/card` carrying the raw callback
+    JSON to the model. That is the P0 this package exists to close, reachable
+    only through the delegation path added here.
+    """
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(
+        _data(_update_prompt_value(crafted), token=_token())
+    )
+
+    assert calls["original"] == 0, f"{crafted!r} delegated but core reads it as falsy"
+    assert calls["card_event"] == 0
+    assert calls["turns"] == []
+    assert _kind(response) == "toast"
+
+
+@pytest.mark.parametrize("crafted", [0, False, [], {}, 0.0])
+def test_a_falsy_hermes_action_does_not_divert_the_update_prompt_callback(crafted):
+    """Mirror of the above on the guard key. Core reads `hermes_action` with a
+    bare `if` too, so a falsy one means core routes to the update-prompt
+    handler — the dispatcher must agree rather than consume on `_text`'s "0"."""
+    adapter, calls = _release_shaped()
+    adapter._on_card_action_trigger(
+        _data(_update_prompt_value(hermes_action=crafted), token=_token())
+    )
+
+    assert calls["update_prompt"] == 1, f"{crafted!r} is falsy to core; it must still reach the handler"
+    assert calls["card_event"] == 0
+
+
+def test_update_prompt_delegation_does_not_claim_the_callback():
+    """Core owns its own duplicate guard (`_is_card_action_duplicate`) and
+    resolves `_update_prompt_state` by popping it. Claiming here would make a
+    REPLAY answer `error_response()` while a replayed unknown answers
+    `unsupported_response()` — exactly the oracle this package removes.
+
+    The observable is that BOTH deliveries reach core and neither is turned into
+    a model turn. Comparing the two response objects would prove nothing: this
+    fixture's handler returns a constant, so the equality would hold whatever
+    the dispatcher did. What a real core answers on a redelivery is core's
+    business, and is asserted where core's guard lives.
+    """
+    adapter, calls = _release_shaped()
+    token = _token()
+    adapter._on_card_action_trigger(_data(_update_prompt_value(), token=token))
+    adapter._on_card_action_trigger(_data(_update_prompt_value(), token=token))
+
+    assert calls["original"] == 2, "core must see the redelivery and judge it itself"
+    assert calls["update_prompt"] == 2, "both deliveries must reach the handler, unclaimed"
+    assert calls["card_event"] == 0
+    assert calls["turns"] == []
+
+
+def test_core_handler_failure_is_consumed_not_raised():
+    cls, calls = _adapter_class()
+    cls._handle_update_prompt_card_action = lambda self, **kw: None
+
+    def _boom(self, data):
+        calls["original"] += 1
+        raise RuntimeError("core blew up")
+
+    cls._on_card_action_trigger = _boom
+    assert dispatcher.install_feishu_card_action_dispatcher(cls) is True
+    response = cls()._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
+
+    assert calls["original"] == 1
+    assert _toast_type(response) == "error"
+
+
+def test_delegation_surface_probes_the_adapter_rather_than_naming_a_core_line():
+    """The anti-regression for the actual root cause: every entry in the
+    value-key delegation surface must name a handler ATTRIBUTE to probe for, and
+    the dispatcher must consume when the live adapter lacks it. A future entry
+    added as a bare name with no probe would pass the two shape tests above only
+    by accident on whichever line CI runs."""
+    surface = dispatcher._AGENT_CORE_VALUE_KEY_HANDLERS
+    assert surface, "fixture is vacuous if the surface is empty"
+    for value_key, handler_attr in surface:
+        assert value_key and handler_attr
+        bare, _calls = _installed()          # no handler of any name
+        assert not hasattr(bare, handler_attr), handler_attr
+        response = bare._on_card_action_trigger(
+            _data({value_key: "y", "update_prompt_id": 7}, token=_token())
+        )
+        assert _calls["original"] == 0, f"{value_key} delegated without a live handler"
+        assert _kind(response) == "toast"
+
+
+# --- the delegation precondition: core must be able to READ the value ------------
+
+@pytest.mark.parametrize("value_key,extra", [
+    ("hermes_update_prompt_action", {"update_prompt_id": 7}),
+    ("hermes_action", {}),
+])
+def test_a_json_string_value_is_never_delegated(value_key, extra):
+    """Core guards BOTH routing reads with `isinstance(action_value, dict)`, so a
+    JSON-STRING value reaches no core handler at all — it falls into
+    `_handle_card_action_event`, becomes a synthetic `/card`, and carries the raw
+    callback JSON to the model. The P0.
+
+    MT parses more liberally than core reads: `_as_dict` decodes a JSON string
+    into a dict. Deciding delegation on MT's parse rather than on the object core
+    will read delegated exactly these payloads. Applies to the pre-existing
+    allowlist path as much as to the update-prompt path added here.
+    """
+    import json as _json
+
+    answer = "approve_once" if value_key == "hermes_action" else "y"
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(
+        _data(_json.dumps(dict({value_key: answer}, **extra)), token=_token())
+    )
+
+    assert calls["original"] == 0, "core cannot route a non-dict value; delegating hits the model path"
+    assert calls["card_event"] == 0, "the P0 path must never be reached"
+    assert calls["turns"] == []
+    assert _kind(response) == "toast"
+
+
+@pytest.mark.parametrize("value", [
+    "not json at all",
+    "[1, 2, 3]",
+    12345,
+    ["hermes_update_prompt_action"],
+])
+def test_non_dict_values_are_consumed_not_delegated(value):
+    adapter, calls = _release_shaped()
+    adapter._on_card_action_trigger(_data(value, token=_token()))
+    assert calls["original"] == 0
+    assert calls["card_event"] == 0
+    assert calls["turns"] == []
+
+
+def test_a_real_dict_value_still_delegates_on_both_core_paths():
+    """Negative control for the guard above: it must reject only what core cannot
+    read. A genuine dict value keeps working on BOTH delegation paths — otherwise
+    the guard closes the hole by breaking approvals and update prompts alike."""
+    adapter, calls = _release_shaped()
+    adapter._on_card_action_trigger(_data({"hermes_action": "approve_once"}, token=_token()))
+    assert calls["approval"] == 1 and calls["card_event"] == 0
+
+    adapter2, calls2 = _release_shaped()
+    adapter2._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
+    assert calls2["update_prompt"] == 1 and calls2["card_event"] == 0
+
+
+# --- findings from the cross-family review (codex, 2026-08-11) -------------------
+
+class _FalsyDict(dict):
+    """A dict that is False. Core's `getattr(action, "value", {}) or {}` swaps it
+    for an empty dict, so its keys never reach core's routing."""
+
+    def __bool__(self):
+        return False
+
+
+def test_a_falsy_dict_value_is_never_delegated():
+    """`isinstance(value, dict)` is not the whole of core's read — core does
+    `action_value = getattr(action, "value", {}) or {}`, so a FALSY dict is
+    replaced by `{}` and routes nothing, landing on the `/card` model path.
+
+    A dict subclass with `__bool__ = False` answers `.get(key)` truthfully to
+    the dispatcher while vanishing for core: exactly the delegate-but-core-won't
+    -route shape, one type-check away from the JSON-string case.
+    """
+    adapter, calls = _release_shaped()
+    payload = _FalsyDict(hermes_update_prompt_action="y", update_prompt_id=7)
+    assert payload.get("hermes_update_prompt_action") == "y" and not payload  # fixture is real
+
+    response = adapter._on_card_action_trigger(_data(payload, token=_token()))
+
+    assert calls["original"] == 0, "core would see {} here; delegating hits the model path"
+    assert calls["card_event"] == 0
+    assert calls["update_prompt"] == 0
+    assert _kind(response) == "toast"
+
+
+def test_a_falsy_dict_value_is_never_delegated_on_the_allowlist_path_either():
+    adapter, calls = _release_shaped()
+    payload = _FalsyDict(hermes_action="approve_once")
+    adapter._on_card_action_trigger(_data(payload, token=_token()))
+
+    assert calls["original"] == 0
+    assert calls["approval"] == 0
+    assert calls["card_event"] == 0
+
+
+def test_a_handler_probe_that_raises_is_treated_as_absent_not_propagated():
+    """Reading the attribute can execute code. `getattr(obj, name, None)` only
+    swallows `AttributeError`, so a property raising anything else would escape
+    the dispatcher into the SDK — turning a refusal that must look exactly like
+    an unknown action into a crash a caller can provoke and observe."""
+    calls = {"original": 0}
+
+    class ExplodingProbeAdapter:
+        _app_id = "cli_test"
+        _loop = None
+
+        def _on_card_action_trigger(self, data):
+            calls["original"] += 1
+            return {"kind": "delegated"}
+
+        @property
+        def _handle_update_prompt_card_action(self):
+            raise RuntimeError("probing me detonates")
+
+    assert dispatcher.install_feishu_card_action_dispatcher(ExplodingProbeAdapter) is True
+    adapter = ExplodingProbeAdapter()
+
+    response = adapter._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
+
+    assert calls["original"] == 0
+    assert _kind(response) == "toast"
+    assert card_response_bytes(response) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "totally_unknown_xyz"}, token=_token()))
+    ), "an exploding probe must be indistinguishable from an unknown action"
+
+
+def test_builtin_precedence_over_a_smuggled_update_prompt_key_stays_out_of_core():
+    """Accepted divergence, pinned so it cannot drift into the P0.
+
+    `{"action": "clarify", "hermes_update_prompt_action": "y"}` routes to MT's
+    clarify built-in here, while core (which ignores `action`) would route
+    update-prompt. MT's built-ins taking precedence is deliberate — they run
+    here, not in core. What must never happen is this callback reaching core's
+    generic `/card` path, and it does not: it is handled or consumed in MT.
+    """
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(
+        _data({"action": "clarify", "hermes_update_prompt_action": "y", "update_prompt_id": 7},
+              token=_token())
+    )
+
+    assert calls["card_event"] == 0, "must never become a synthetic /card model turn"
+    assert calls["update_prompt"] == 0
+    assert calls["turns"] == []
+    assert response is not None
+
+
+# --- re-review findings: freeze the value, don't merely inspect it ---------------
+
+class _StatefulDict(dict):
+    """Answers one way to the dispatcher and another to core. The shape behind
+    every remaining TOCTOU finding: no amount of CHECKING defeats it, because
+    core re-reads the object after the dispatcher decides."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.bool_calls = 0
+
+    def __bool__(self):
+        self.bool_calls += 1
+        return self.bool_calls == 1  # truthy to whoever asks first, falsy after
+
+
+class _ExplodingBoolDict(dict):
+    def __bool__(self):
+        raise RuntimeError("truthiness detonates")
+
+
+def test_a_stateful_value_is_refused_rather_than_inspected():
+    """The dispatcher must not hand core an object that can change its answer.
+    Requiring a PLAIN dict refuses the whole class up front — and `bool_calls`
+    proves the hostile hook was never even called."""
+    adapter, calls = _release_shaped()
+    payload = _StatefulDict(hermes_update_prompt_action="y", update_prompt_id=7)
+
+    adapter._on_card_action_trigger(_data(payload, token=_token()))
+
+    assert calls["original"] == 0, "a mapping that can change its answer must not be delegated"
+    assert calls["card_event"] == 0, "a second answer must never reach the /card path"
+    assert payload.bool_calls == 0, "a hostile __bool__ must never be invoked"
+
+
+def test_a_stateful_hermes_action_cannot_smuggle_an_unlisted_name_into_core():
+    """PREV-4: `.get("hermes_action")` falsy for the companion guard, then a
+    non-allowlisted name when core rereads. Against a frozen snapshot both reads
+    return the same thing, so the smuggling window is gone."""
+    seen = {"n": 0}
+
+    class _SmugglingDict(dict):
+        def get(self, k, default=None):
+            if k == "hermes_action":
+                seen["n"] += 1
+                return None if seen["n"] == 1 else "bogus_not_allowlisted"
+            return super().get(k, default)
+
+    adapter, calls = _release_shaped()
+    adapter._on_card_action_trigger(
+        _data(_SmugglingDict(hermes_update_prompt_action="y", update_prompt_id=7), token=_token())
+    )
+
+    assert calls["approval"] == 0, "an unallowlisted name reached core's approval handler"
+    assert calls["card_event"] == 0
+
+
+def test_a_value_whose_truthiness_raises_is_consumed_not_propagated():
+    adapter, calls = _release_shaped()
+    response = adapter._on_card_action_trigger(
+        _data(_ExplodingBoolDict(hermes_update_prompt_action="y"), token=_token())
+    )
+
+    assert calls["original"] == 0
+    assert calls["card_event"] == 0
+    assert _kind(response) == "toast"
+    assert card_response_bytes(response) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "zz_unknown_9f"}, token=_token()))
+    ), "an exploding value must be indistinguishable from an unknown action"
+
+
+def test_plain_dicts_still_delegate_untouched():
+    """Real traffic is unaffected: the SDK yields plain dicts (verified on the
+    production host), so they pass the type test and core keeps the very object
+    it was given."""
+    adapter, calls = _release_shaped()
+    payload = _update_prompt_value()
+    env = _data(payload, token=_token())
+    adapter._on_card_action_trigger(env)
+
+    assert calls["update_prompt"] == 1
+    assert env.event.action.value is payload, "a plain dict must not be replaced"
