@@ -212,8 +212,12 @@ def test_known_handler_exception_is_consumed_with_a_data_free_error(monkeypatch)
         _data({"hermes_action": "cred_auth", "cred": "lark-cli"})
     )
     assert calls["original"] == 0
-    assert _toast_type(response) == "error"
     assert "12345" not in str(response)
+    # The crash must not be readable from the response either: "this name is
+    # known here, and it broke" is itself the recognised-vs-unknown signal.
+    assert card_response_bytes(response) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "zz_unknown_9c"}))
+    )
     assert "cred" not in str(response)
 
 
@@ -226,7 +230,9 @@ def test_business_handler_exception_is_consumed():
     dispatcher.register_business_action("acme_thing", boom)
     response = adapter._on_card_action_trigger(_data({"action": "acme_thing"}))
     assert calls["original"] == 0
-    assert _toast_type(response) == "error"
+    assert card_response_bytes(response) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "zz_unknown_9d"}))
+    )
 
 
 def test_registered_business_action_requires_the_admitted_callback_identity():
@@ -384,9 +390,12 @@ def test_agent_core_delegate_exception_is_consumed():
             raise RuntimeError("core blew up")
 
     assert dispatcher.install_feishu_card_action_dispatcher(ExplodingAdapter) is True
-    response = ExplodingAdapter()._on_card_action_trigger(_data({"hermes_action": "deny"}))
+    a = ExplodingAdapter()
+    response = a._on_card_action_trigger(_data({"hermes_action": "deny"}))
     assert calls["original"] == 1
-    assert _toast_type(response) == "error"
+    assert card_response_bytes(response) == card_response_bytes(
+        a._on_card_action_trigger(_data({"action": "zz_unknown_9e"}))
+    )
 
 
 # --- fixed precedence + namespaced registration ----------------------------------
@@ -499,7 +508,11 @@ def test_a_redelivered_business_callback_runs_its_handler_at_most_once():
 
     assert ran == [1]
     assert first == {"kind": "acme"}
-    assert _toast_type(second) == "error"
+    # At-most-once still holds; what changed is that the SECOND answer no longer
+    # announces that "acme" is a name this dispatcher knows.
+    assert card_response_bytes(second) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "zz_unknown_9f"}, token="tk_other"))
+    )
 
 
 def test_at_most_once_falls_back_to_the_signed_callback_tuple_without_a_token():
@@ -947,7 +960,9 @@ def test_core_handler_failure_is_consumed_not_raised():
     response = cls()._on_card_action_trigger(_data(_update_prompt_value(), token=_token()))
 
     assert calls["original"] == 1
-    assert _toast_type(response) == "error"
+    assert card_response_bytes(response) == card_response_bytes(
+        cls()._on_card_action_trigger(_data({"action": "zz_unknown_9g"}, token=_token()))
+    )
 
 
 def test_delegation_surface_probes_the_adapter_rather_than_naming_a_core_line():
@@ -1202,3 +1217,103 @@ def test_plain_dicts_still_delegate_untouched():
 
     assert calls["update_prompt"] == 1
     assert env.event.action.value is payload, "a plain dict must not be replaced"
+
+
+# --- the replay oracle: "recognised" must not be readable from the response ----
+#
+# Every path that answers something OTHER than `unsupported_response()` tells the
+# caller "this name is known here". Replaying a callback is not an exotic attack:
+# Feishu itself redelivers, so anyone can send one twice and watch whether the
+# second answer changes.
+
+def _registered_namespaces():
+    """Every name this dispatcher currently claims — read at RUNTIME, never a
+    copied literal list, so a namespace added later cannot quietly reopen this."""
+    dispatcher._ensure_default_business_registered()
+    return sorted(set(dispatcher._BUSINESS) | set(dispatcher._BUILTIN_NAMESPACES))
+
+
+def test_replaying_a_known_name_is_indistinguishable_from_replaying_an_unknown_one():
+    adapter, calls = _installed()
+    seen = {}
+    for name in _registered_namespaces() + ["zz_unknown_a1", "zz_unknown_b2", "zz_unknown_c3"]:
+        tok = _token()
+        adapter._on_card_action_trigger(_data({"action": name}, token=tok))
+        seen[name] = card_response_bytes(
+            adapter._on_card_action_trigger(_data({"action": name}, token=tok))
+        )
+    assert len(set(seen.values())) == 1, (
+        "the second delivery reveals which names are registered: "
+        f"{ {k: v[:60] for k, v in seen.items()} }"
+    )
+
+
+def test_a_business_handler_that_raises_answers_like_an_unknown_action():
+    adapter, calls = _installed()
+    dispatcher.register_business_action("zz_boom", lambda a, cb: (_ for _ in ()).throw(RuntimeError("x")))
+    boom = card_response_bytes(adapter._on_card_action_trigger(_data({"action": "zz_boom"}, token=_token())))
+    unknown = card_response_bytes(adapter._on_card_action_trigger(_data({"action": "zz_nope_44"}, token=_token())))
+    assert boom == unknown, "a crashing handler announces that the name was recognised"
+
+
+@pytest.mark.parametrize("payload", [
+    {"hermes_action": "approve_once"},
+    {"hermes_update_prompt_action": "y", "update_prompt_id": 7},
+])
+def test_a_core_handler_that_raises_answers_like_an_unknown_action(payload):
+    """The two CORE delegation paths have their own error branch. Same oracle,
+    one door over: make core's handler raise and the answer changes."""
+    calls = {"n": 0}
+
+    class Boom:
+        _app_id = "cli_test"
+        _loop = None
+
+        def _on_card_action_trigger(self, data):
+            calls["n"] += 1
+            raise RuntimeError("core exploded")
+
+        def _handle_update_prompt_card_action(self, **kw):  # release-line shape
+            raise RuntimeError("core exploded")
+
+    assert dispatcher.install_feishu_card_action_dispatcher(Boom) is True
+    a = Boom()
+    raised = card_response_bytes(a._on_card_action_trigger(_data(payload, token=_token())))
+    unknown = card_response_bytes(a._on_card_action_trigger(_data({"action": "zz_nope_77"}, token=_token())))
+    assert calls["n"] >= 1, "fixture is vacuous if core was never reached"
+    assert raised == unknown, "a crashing core handler announces that the action was recognised"
+
+
+def test_a_core_handler_returning_none_does_not_announce_recognition():
+    """Core answers `P2CardActionTriggerResponse() if ... else None`, so a bare
+    None means the SDK class was missing — never a real outcome. Letting it out
+    while an unknown action answers a toast makes "recognised" readable again,
+    one layer above the branches this package collapsed."""
+    class Quiet:
+        _app_id = "cli_test"
+        _loop = None
+
+        def _on_card_action_trigger(self, data):
+            return None
+
+    assert dispatcher.install_feishu_card_action_dispatcher(Quiet) is True
+    a = Quiet()
+    known = card_response_bytes(a._on_card_action_trigger(_data({"hermes_action": "approve_once"}, token=_token())))
+    unknown = card_response_bytes(a._on_card_action_trigger(_data({"action": "zz_never_reg_5b"}, token=_token())))
+    assert known == unknown
+
+
+def test_a_core_success_response_is_still_passed_through_unchanged():
+    """The other half of the same rule: normalising None must not flatten a real
+    answer. A successful action necessarily looks different from a refusal —
+    that is the feature working, not an oracle."""
+    class Working:
+        _app_id = "cli_test"
+        _loop = None
+
+        def _on_card_action_trigger(self, data):
+            return {"kind": "core-said-ok"}
+
+    assert dispatcher.install_feishu_card_action_dispatcher(Working) is True
+    r = Working()._on_card_action_trigger(_data({"hermes_action": "approve_once"}, token=_token()))
+    assert r == {"kind": "core-said-ok"}

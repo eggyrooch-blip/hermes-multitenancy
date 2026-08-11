@@ -311,11 +311,6 @@ def unsupported_response() -> Any:
     return _toast_response("该操作暂不支持。", level="info")
 
 
-def error_response() -> Any:
-    """A recognized action that failed. No reason, no identity, no payload."""
-    return _toast_response("操作失败，请稍后重试。", level="error")
-
-
 # --- at-most-once ---------------------------------------------------------------
 
 # ponytail: process-local bounded claim. One delivery of one callback runs its
@@ -457,6 +452,26 @@ def _core_routable_value(cb: CardCallback) -> Optional[dict]:
     return raw if type(raw) is dict else None
 
 
+def _delegate(original: Callable[[Any, Any], Any], adapter: Any, data: Any) -> Any:
+    """Hand the callback to core, and never let a bare ``None`` come back out.
+
+    Core answers `P2CardActionTriggerResponse() if P2CardActionTriggerResponse
+    else None`, so `None` means the SDK class was unavailable — never a real
+    outcome. Returning it while an unknown action returns a toast would make
+    "this name is recognised" readable again, one layer up from the branches
+    this package just collapsed.
+
+    WHAT THIS CANNOT DO, stated rather than implied: core's SUCCESS response is
+    core's own, and it necessarily differs from a refusal — if a working button
+    answered "该操作暂不支持" the feature would be broken. So the property this
+    dispatcher can hold is "every REFUSAL looks alike", not "every response
+    looks alike". Distinguishing a successful action from an unknown one is
+    inherent to the feature working at all.
+    """
+    result = original(adapter, data)
+    return unsupported_response() if result is None else result
+
+
 def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any], Any]) -> Any:
     """Route one callback. Logs carry action kind + outcome only."""
     _note_live_adapter(adapter)
@@ -469,10 +484,10 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
 
     if cb.kind in _UNSUPPORTED_KINDS:
         # Reserved slot, no implementation. Deliberately identical to the
-        # unknown-action path below: same response object, and NO `_run_once`
-        # claim — a claimed replay would answer `error_response()` while a
-        # replayed unknown answers `unsupported_response()`, which is exactly
-        # the signal a crafted callback must not be able to read.
+        # unknown-action path below: same response object, and no `_run_once`
+        # claim. (Historically the claim mattered here because a claimed replay
+        # answered differently; every exit now answers the same, so this is
+        # belt-and-braces rather than the load-bearing part.)
         logger.info("[card_action] kind=unknown outcome=unsupported")
         return unsupported_response()
 
@@ -495,11 +510,11 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
             logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
             return unsupported_response()
         try:
-            return original(adapter, data)
+            return _delegate(original, adapter, data)
         except Exception:
             logger.warning("[card_action] kind=agent_core outcome=error")
             logger.debug("[card_action] handler traceback", exc_info=True)
-            return error_response()
+            return unsupported_response()
 
     for value_key, handler_attr in _AGENT_CORE_VALUE_KEY_HANDLERS:
         if routable is None:
@@ -531,15 +546,14 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
             logger.info("[card_action] kind=agent_core outcome=unsupported_capability")
             return unsupported_response()
         # No `_run_once` claim — same as the allowlist path above, and for the
-        # same reason: core owns its duplicate guard, and claiming here would
-        # make a REPLAY answer `error_response()` while a replayed unknown
-        # answers `unsupported_response()`.
+        # same reason: core owns its own duplicate guard
+        # (`_is_card_action_duplicate`) and its approval/prompt state.
         try:
-            return original(adapter, data)
+            return _delegate(original, adapter, data)
         except Exception:
             logger.warning("[card_action] kind=agent_core outcome=error")
             logger.debug("[card_action] handler traceback", exc_info=True)
-            return error_response()
+            return unsupported_response()
 
     _ensure_default_business_registered()
     entry = _BUSINESS.get(cb.kind)
@@ -557,12 +571,10 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
                 break
     if entry is not None:
         if not _business_admission_is_valid(adapter, cb):
-            # Answer exactly as an unrecognised action does. An `error_response()`
-            # here would differ from the `unsupported_response()` below, and that
-            # difference lets a crafted caller enumerate registered business
-            # namespaces by watching which names answer "error" — the same
-            # recognised-vs-unknown oracle this package exists to remove, one door
-            # over. The rejection stays visible to operators in the log line.
+            # Answer exactly as an unrecognised action does. Any distinct
+            # response here would let a crafted caller enumerate registered
+            # business namespaces by watching which names answer differently.
+            # The rejection stays visible to operators in the log line.
             logger.info("[card_action] kind=business outcome=rejected")
             return unsupported_response()
         return _run_once(cb, entry.namespace, lambda: entry.handler(adapter, cb))
@@ -626,13 +638,13 @@ def _run_once(cb: CardCallback, name: str, run: Callable[[], Any]) -> Any:
     ``_is_card_action_duplicate`` token guard and approval state."""
     if not _claim_once(callback_identity(cb)):
         logger.info("[card_action] kind=%s outcome=duplicate", name)
-        return error_response()
+        return unsupported_response()
     try:
         return run()
     except Exception:
         logger.warning("[card_action] kind=%s outcome=error", name)
         logger.debug("[card_action] handler traceback", exc_info=True)
-        return error_response()
+        return unsupported_response()
 
 
 def _safe_match(candidate: _Business, cb: CardCallback) -> bool:
