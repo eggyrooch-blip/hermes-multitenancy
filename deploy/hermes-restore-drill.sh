@@ -65,9 +65,28 @@ WORK_REAL="$(canon "$WORK")"
 REPORT="$REPORT_DIR/drill-$(basename "$WORK").md"
 chmod 700 "$WORK"
 cleanup_work() {
-  if [ "$KEEP_RESTORE" != "1" ]; then
-    case "$WORK_REAL" in "$DRILL_ROOT_REAL"/hermes-drill-*) rm -rf "$WORK_REAL" ;; esac
+  main_rc=$?
+  trap - EXIT
+  [ "$KEEP_RESTORE" = "1" ] && exit "$main_rc"
+
+  # rsync -a 会把只读目录的 mode 一起还原；删除子项前只给隔离 scratch
+  # 的目录恢复 owner 权限。先重验 realpath 的父目录和 basename，绝不碰源快照。
+  set +e
+  cleanup_rc=0
+  work_parent="$(dirname -- "$WORK_REAL")"
+  work_name="$(basename -- "$WORK_REAL")"
+  case "$work_name" in
+    hermes-drill-*) ;;
+    *) cleanup_rc=1 ;;
+  esac
+  [ "$work_parent" = "$DRILL_ROOT_REAL" ] || cleanup_rc=1
+  if [ "$cleanup_rc" -eq 0 ]; then
+    find "$WORK_REAL" -type d -exec chmod u+rwx {} \; >/dev/null 2>&1 || cleanup_rc=1
+    rm -rf -- "$WORK_REAL" >/dev/null 2>&1 || cleanup_rc=1
+    [ ! -e "$WORK_REAL" ] || cleanup_rc=1
   fi
+  [ "$cleanup_rc" -eq 0 ] || printf 'WARN: restore scratch cleanup failed\n' >&2
+  exit "$main_rc"
 }
 trap cleanup_work EXIT
 trap 'exit 143' TERM

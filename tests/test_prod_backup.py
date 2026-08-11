@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -87,6 +88,16 @@ def _run(script: Path, env: dict[str, str], **overrides: str) -> subprocess.Comp
 def _state_snapshots(env: dict[str, str]) -> list[Path]:
     root = Path(env["BACKUP_ROOT"]) / "state"
     return sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
+
+
+def _readonly_profile(env: dict[str, str]) -> tuple[Path, Path]:
+    readonly = Path(env["HERMES_HOME_DIR"]) / "profiles" / "u1" / "readonly"
+    nested = readonly / "nested"
+    nested.mkdir(parents=True)
+    (nested / "value.txt").write_text("immutable fixture\n")
+    nested.chmod(0o555)
+    readonly.chmod(0o555)
+    return readonly, nested
 
 
 # ── 1. 磁盘前置检查 ────────────────────────────────────────────────
@@ -347,6 +358,128 @@ def test_drill_restores_profiles_into_the_isolated_directory(env):
     assert result.returncode == 0, result.stdout + result.stderr
     work = next(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
     assert (work / "profiles" / "u1" / "f.txt").read_text() == "hello\n"
+
+
+def test_drill_cleans_readonly_nested_profile_without_touching_snapshot(env):
+    live_readonly, live_nested = _readonly_profile(env)
+    snapshot_readonly = None
+    snapshot_nested = None
+    try:
+        assert _run(BACKUP_SH, env).returncode == 0
+        state = _state_snapshots(env)[-1]
+        pinned = next(
+            line.split("=", 1)[1]
+            for line in (state / "COMPLETE").read_text().splitlines()
+            if line.startswith("profiles_snapshot=")
+        )
+        snapshot_readonly = Path(pinned) / "u1" / "readonly"
+        snapshot_nested = snapshot_readonly / "nested"
+        before_modes = (
+            snapshot_readonly.stat().st_mode & 0o777,
+            snapshot_nested.stat().st_mode & 0o777,
+        )
+        before_hash = hashlib.sha256(
+            (snapshot_nested / "value.txt").read_bytes()
+        ).hexdigest()
+
+        result = _run(DRILL_SH, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "RESULT status=PASS" in result.stdout
+        assert not list(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+        assert (
+            snapshot_readonly.stat().st_mode & 0o777,
+            snapshot_nested.stat().st_mode & 0o777,
+        ) == before_modes
+        assert hashlib.sha256(
+            (snapshot_nested / "value.txt").read_bytes()
+        ).hexdigest() == before_hash
+        assert "u1" not in result.stdout + result.stderr
+    finally:
+        for directory in (live_nested, live_readonly, snapshot_nested, snapshot_readonly):
+            if directory is not None and directory.exists():
+                directory.chmod(0o755)
+
+
+def test_drill_failure_still_cleans_readonly_scratch_without_permission_noise(env):
+    live_readonly, live_nested = _readonly_profile(env)
+    snapshot_readonly = None
+    snapshot_nested = None
+    try:
+        assert _run(BACKUP_SH, env).returncode == 0
+        pinned = next(
+            line.split("=", 1)[1]
+            for line in (_state_snapshots(env)[-1] / "COMPLETE").read_text().splitlines()
+            if line.startswith("profiles_snapshot=")
+        )
+        snapshot_readonly = Path(pinned) / "u1" / "readonly"
+        snapshot_nested = snapshot_readonly / "nested"
+
+        result = _run(DRILL_SH, env, MAX_RPO_SECONDS="-1")
+
+        assert result.returncode != 0
+        assert "RESULT status=FAIL" in result.stdout
+        assert not list(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+        assert "Permission denied" not in result.stdout + result.stderr
+        assert "u1" not in result.stdout + result.stderr
+    finally:
+        for directory in (live_nested, live_readonly, snapshot_nested, snapshot_readonly):
+            if directory is not None and directory.exists():
+                directory.chmod(0o755)
+
+
+def test_keep_restore_does_not_chmod_or_delete_readonly_scratch(env):
+    live_readonly, live_nested = _readonly_profile(env)
+    work = None
+    try:
+        assert _run(BACKUP_SH, env).returncode == 0
+
+        result = _run(DRILL_SH, env, KEEP_RESTORE="1")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        work = next(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+        assert (work / "profiles" / "u1" / "readonly").stat().st_mode & 0o777 == 0o555
+        assert (work / "profiles" / "u1" / "readonly" / "nested").stat().st_mode & 0o777 == 0o555
+    finally:
+        if work is not None and work.exists():
+            for directory in work.rglob("*"):
+                if directory.is_dir():
+                    directory.chmod(0o755)
+            shutil.rmtree(work)
+        for directory in (live_nested, live_readonly):
+            if directory.exists():
+                directory.chmod(0o755)
+
+
+def test_cleanup_error_does_not_override_success_or_expose_profile_path(env, tmp_path):
+    live_readonly, live_nested = _readonly_profile(env)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        '#!/bin/sh\ncase "$*" in *hermes-drill-*) exit 77;; esac\nexec /bin/rm "$@"\n'
+    )
+    fake_rm.chmod(0o755)
+    work = None
+    try:
+        assert _run(BACKUP_SH, env).returncode == 0
+
+        result = _run(DRILL_SH, env, PATH=f"{fake_bin}:{env['PATH']}")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "RESULT status=PASS" in result.stdout
+        assert "restore scratch cleanup failed" in result.stderr
+        assert "u1" not in result.stdout + result.stderr
+        work = next(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+    finally:
+        if work is not None and work.exists():
+            for directory in work.rglob("*"):
+                if directory.is_dir():
+                    directory.chmod(0o755)
+            shutil.rmtree(work)
+        for directory in (live_nested, live_readonly):
+            if directory.exists():
+                directory.chmod(0o755)
 
 
 def test_drill_fails_when_profiles_snapshot_is_missing(env):
