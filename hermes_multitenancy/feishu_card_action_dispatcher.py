@@ -45,14 +45,30 @@ _LEGACY_FLAGS = (
     "_hermes_multitenancy_push_confirm_card_action_patched",
 )
 
-# Agent core actions we may hand to the original handler exactly once. Every one
-# is BACKED by a real handler in `be5a764d0:gateway/platforms/feishu.py`:
-# `feishu_auth` → `_handle_feishu_auth_card_action`; the four approval choices →
-# `_handle_approval_card_action` via `_APPROVAL_CHOICE_MAP` (:229) — including
-# `approve_always`, which the approval card emits as "✅ Always" (:2457).
-_AGENT_CORE_ACTIONS = frozenset(
-    {"feishu_auth", "approve_once", "approve_session", "approve_always", "deny"}
-)
+# Agent core actions we may hand to the original handler exactly once, each with
+# the adapter method that must EXIST for it to be routable.
+#
+# The handler is named rather than assumed, because "which of these the running
+# core implements" differs by core LINE and this MT code is shared by two that
+# have diverged ~14k commits. Measured 2026-08-11 with a 58-cell sweep:
+# `feishu_auth` has `_handle_feishu_auth_card_action` on `main` and NOT on the
+# production release line, where it instead falls into
+# `_handle_approval_card_action` and `_APPROVAL_CHOICE_MAP.get(..., "deny")`
+# resolves it to a DENIAL of an approval. The same static-list mistake already
+# broke the update-prompt card in production once; this is its mirror image, and
+# the same fix applies — ask the live adapter.
+#
+# The four approval choices name `_handle_approval_card_action`, which both
+# lines have today. Writing it out anyway is the point: the next divergence
+# should be caught by the probe, not by an outage.
+_AGENT_CORE_ACTION_HANDLERS: dict[str, str] = {
+    "feishu_auth": "_handle_feishu_auth_card_action",
+    "approve_once": "_handle_approval_card_action",
+    "approve_session": "_handle_approval_card_action",
+    "approve_always": "_handle_approval_card_action",
+    "deny": "_handle_approval_card_action",
+}
+_AGENT_CORE_ACTIONS = frozenset(_AGENT_CORE_ACTION_HANDLERS)
 
 # The allowlist above is the WHOLE delegation surface, and it delegates ONLY the
 # spelling core actually reads — `value["hermes_action"]` (feishu.py:3272). Core
@@ -506,8 +522,22 @@ def dispatch_card_action(adapter: Any, data: Any, original: Callable[[Any, Any],
         if routable is None:
             logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
             return unsupported_response()
-        if _text(routable.get(_AGENT_CORE_VALUE_KEY)) != cb.kind:
+        # RAW equality, not `_text(...)`. `cb.kind` is stripped during parsing, so
+        # comparing two stripped values accepts " approve_once " — and core then
+        # looks the RAW value up in `_APPROVAL_CHOICE_MAP.get(name, "deny")`,
+        # which misses and silently DENIES the named approval. Measured
+        # 2026-08-12: padded value delegated, core resolved choice=deny.
+        # Same shape as every other defect in this package: MT must not read the
+        # value more liberally than the core it is handing it to.
+        if routable.get(_AGENT_CORE_VALUE_KEY) != cb.kind:
             logger.info("[card_action] kind=agent_core outcome=unsupported_spelling")
+            return unsupported_response()
+        if not _adapter_implements(adapter, _AGENT_CORE_ACTION_HANDLERS[cb.kind]):
+            # This core line does not implement this name. Delegating anyway is
+            # how `feishu_auth` became a silent DENIAL of an approval on the
+            # release line. Answer exactly as an unknown action does; only the
+            # log line distinguishes them, for operators.
+            logger.info("[card_action] kind=agent_core outcome=unsupported_capability")
             return unsupported_response()
         try:
             return _delegate(original, adapter, data)
