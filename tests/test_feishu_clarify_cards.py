@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+from tests.conftest import card_toast
+
 
 class _CardAdapter:
     def __init__(self) -> None:
@@ -79,7 +81,11 @@ def test_feishu_clarify_callback_card_submit_writes_webui_protocol(monkeypatch, 
     assert _read_clarify_response(response_files[0]) == "brief"
 
 
-def test_clarify_patch_passes_auth_and_unknown_actions_through_in_both_install_orders(monkeypatch):
+def test_dispatcher_routing_is_identical_in_both_install_orders(monkeypatch):
+    """WP02: whichever retired installer runs first, ONE dispatcher is live and
+    routing is identical — a truly unknown action is consumed as unsupported
+    (never handed to the core generic ``/card`` path), an allowlisted Agent core
+    action delegates exactly once, and cred_auth reaches its built-in."""
     from hermes_multitenancy import feishu_auth_hub_actions
     from hermes_multitenancy.feishu_auth_hub_actions import _patch_card_action as patch_auth
     from hermes_multitenancy.feishu_clarify_cards import _patch_card_action as patch_clarify
@@ -97,8 +103,14 @@ def test_clarify_patch_passes_auth_and_unknown_actions_through_in_both_install_o
         for patch in patches:
             patch(Adapter)
         adapter = Adapter()
-        assert adapter._on_card_action_trigger(_card_data(action_value={"hermes_action": "third_party"})) == "ORIGINAL_CALLED"
+        unknown = adapter._on_card_action_trigger(_card_data(action_value={"hermes_action": "third_party"}))
+        # The DISPATCHER's own unsupported answer — SDK-shaped when lark_oapi is
+        # installed, a plain dict when it is not.
+        assert card_toast(unknown)["type"] == "info"
+        assert adapter.original_calls == []
         assert adapter._on_card_action_trigger(_card_data(action_value={"hermes_action": "cred_auth"})) == "AUTH_HUB_CALLED"
+        assert adapter.original_calls == []
+        assert adapter._on_card_action_trigger(_card_data(action_value={"hermes_action": "feishu_auth"})) == "ORIGINAL_CALLED"
         assert len(adapter.original_calls) == 1
         assert getattr(Adapter._on_card_action_trigger, "_hermes_multitenancy_clarify_card_action_patched")
         assert getattr(Adapter._on_card_action_trigger, "_hermes_multitenancy_cred_auth_card_action_patched")
@@ -131,7 +143,10 @@ def test_feishu_clarify_timeout_reuses_core_response(monkeypatch, tmp_path):
     assert _configure_feishu_clarify_bridge(lambda *_args, **_kwargs: None, "s")("Which?") == _clarify_timeout_response(0)
 
 
-def test_clarify_patch_error_delegates_to_original(monkeypatch):
+def test_clarify_handler_failure_is_consumed_never_delegated(monkeypatch):
+    """WP02 P0: a RECOGNIZED handler that raises returns a generic error and is
+    CONSUMED. It must not fall back to the original — that path synthesizes a
+    ``/card`` command out of the callback JSON and feeds it to the model."""
     from hermes_multitenancy import feishu_clarify_cards
 
     _patch = feishu_clarify_cards._patch_card_action
@@ -139,13 +154,16 @@ def test_clarify_patch_error_delegates_to_original(monkeypatch):
     monkeypatch.setattr(feishu_clarify_cards, "_write_clarify_response", lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")))
     adapter = _CardAdapter()
 
-    assert adapter._on_card_action_trigger(
+    response = adapter._on_card_action_trigger(
         _card_data(
             action_value={"hermes_action": "clarify", "clarify_id": "clarify_0123456789abcdef0123456789abcdef"},
             answer="answer",
         )
-    ) == "ORIGINAL_CALLED"
-    assert len(adapter.original_calls) == 1
+    )
+    # The DISPATCHER's own error answer (the clarify handler never returned),
+    # so this is the SDK-shaped response whenever lark_oapi is installed.
+    assert card_toast(response)["type"] == "error"
+    assert adapter.original_calls == []
 
 
 def test_clarify_invalid_submit_is_not_a_success_toast():

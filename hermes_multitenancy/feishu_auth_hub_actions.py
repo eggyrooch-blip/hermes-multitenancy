@@ -8,16 +8,17 @@ per credential, nothing pre-generated (see router.commands._handle_auth_command
   kep login) → expand that row in place (QR/URL shown, others stay collapsed
   buttons) → background-poll that one flow → on success flip its row to ✅.
 
-Same class-level ``_on_card_action_trigger`` monkeypatch mechanism as
-``feishu_group_valve`` (chained: non-``cred_auth`` actions delegate to the
-original, which the core routes to its own handlers). Installed at plugin
-register time via ``__init__``. The patch lands on the module the gateway
-actually runs because ``load_feishu_adapter`` resolves the plugin-loader's
-synthetic module (see feishu_adapter_compat)."""
+``cred_auth`` / ``gitlab_token`` are BUILT-INS of the one card-action dispatcher
+(``feishu_card_action_dispatcher``), which owns the live
+``_on_card_action_trigger`` and calls ``handle_auth_hub_card_action`` below. This
+module no longer installs a wrapper of its own — the retired ``_patch_card_action``
+entry point just installs the dispatcher, so any install order converges. The
+dispatcher lands on the module the gateway actually runs because
+``load_feishu_adapter`` resolves the plugin-loader's synthetic module (see
+feishu_adapter_compat)."""
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import threading
@@ -98,35 +99,22 @@ def install_feishu_auth_hub_actions() -> None:
     _HOOK_INSTALLED = True
 
 
+def handle_auth_hub_card_action(adapter: Any, cb: Any) -> Any:
+    """Built-in auth/credential handler, owned by the one card-action dispatcher.
+
+    A raise here is CONSUMED by the dispatcher as a generic error — it is never
+    handed back to the core generic handler, which would turn a failed
+    credential click into a synthetic ``/card`` model turn."""
+    if cb.kind == "gitlab_token":
+        return _handle_gitlab_token_submit(adapter, cb.event, cb.action)
+    return _handle_cred_auth_action(adapter, cb.event, cb.value)
+
+
 def _patch_card_action(FeishuAdapter: Any) -> None:
-    original = getattr(FeishuAdapter, "_on_card_action_trigger", None)
-    if original is None or getattr(original, _CARD_ACTION_FLAG, False):
-        return
+    """Retired wrapper entry point — installs THE dispatcher instead."""
+    from .feishu_card_action_dispatcher import install_feishu_card_action_dispatcher
 
-    @functools.wraps(original)
-    def wrapped(self: Any, data: Any) -> Any:
-        try:
-            event = _read_value(data, "event")
-            action = _read_value(event, "action")
-            action_value = _read_value(action, "value") or {}
-            if not isinstance(action_value, dict):
-                action_value = {}
-            hermes_action = action_value.get("hermes_action")
-            if hermes_action == "gitlab_token":
-                return _handle_gitlab_token_submit(self, event, action)
-            if hermes_action != "cred_auth":
-                return original(self, data)
-            return _handle_cred_auth_action(self, event, action_value)
-        except Exception:
-            logger.debug(
-                "[multitenancy] cred_auth card action failed; delegating to original",
-                exc_info=True,
-            )
-            return original(self, data)
-
-    setattr(wrapped, _CARD_ACTION_FLAG, True)
-    FeishuAdapter._on_card_action_trigger = wrapped
-    logger.info("[multitenancy] installed cred_auth card-action hook on %s.FeishuAdapter", FeishuAdapter.__module__)
+    install_feishu_card_action_dispatcher(FeishuAdapter)
 
 
 def _handle_cred_auth_action(adapter: Any, event: Any, action_value: dict[str, Any]) -> Any:

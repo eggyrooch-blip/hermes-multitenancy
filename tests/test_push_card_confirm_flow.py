@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.conftest import admit_card_callback
+
 from hermes_multitenancy import push_card_confirm as confirm
 from hermes_multitenancy import push_fill_form as fill
 from hermes_multitenancy import push_registry as reg
@@ -630,7 +632,7 @@ def _make_form_submit(*, open_id="ou_alice", op="op1", form=None, value=None,
         operator=SimpleNamespace(open_id=open_id, union_id=None, user_id=None),
         context=SimpleNamespace(open_message_id=message_id),
     )
-    return SimpleNamespace(event=event)
+    return admit_card_callback(SimpleNamespace(event=event))
 
 
 def _install_confirm_wrapper():
@@ -698,7 +700,7 @@ def test_router_plain_button_uses_value_routing(store, monkeypatch):
             operator=SimpleNamespace(open_id="ou_alice", union_id=None, user_id=None),
             context=SimpleNamespace(open_message_id="om_card_1"),
         )
-        adapter._on_card_action_trigger(SimpleNamespace(event=event))
+        adapter._on_card_action_trigger(admit_card_callback(SimpleNamespace(event=event)))
         assert calls["original"] == 0
         assert writer.write_calls == 1
         assert store.get(rid)["status"] == reg.STATUS_COMMITTED
@@ -706,10 +708,16 @@ def test_router_plain_button_uses_value_routing(store, monkeypatch):
         confirm.override_writer(SCENE.writer, None)
 
 
-def test_router_non_push_confirm_still_delegates(store, monkeypatch):
-    # Regression guard: a sibling card action (cred_auth) must pass through
-    # unchanged — the confirm wrapper must never吞 the other four hooks.
+def test_router_sibling_action_reaches_its_builtin_not_the_original(store, monkeypatch):
+    # WP02: a sibling card action (cred_auth) is now a BUILT-IN of the one
+    # dispatcher, which outranks every registered business action. It reaches the
+    # auth-hub handler and is consumed there — the confirm handler never sees it,
+    # and neither does the core generic "/card" path.
     monkeypatch.setattr(reg, "get_registry_store", lambda: store)
+    from hermes_multitenancy import feishu_auth_hub_actions
+    monkeypatch.setattr(
+        feishu_auth_hub_actions, "_handle_cred_auth_action", lambda *_a: {"kind": "auth_hub"}
+    )
     Adapter, calls = _install_confirm_wrapper()
     adapter = Adapter()
     action = SimpleNamespace(
@@ -722,8 +730,8 @@ def test_router_non_push_confirm_still_delegates(store, monkeypatch):
         context=SimpleNamespace(open_message_id="om_x"),
     )
     resp = adapter._on_card_action_trigger(SimpleNamespace(event=event))
-    assert calls["original"] == 1
-    assert resp == {"kind": "delegated"}
+    assert calls["original"] == 0
+    assert resp == {"kind": "auth_hub"}
 
 
 # ===== LIVE gateway: card button routed as a synthetic /card COMMAND event =====

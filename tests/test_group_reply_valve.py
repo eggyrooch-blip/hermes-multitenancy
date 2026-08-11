@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.conftest import admit_card_callback
+
 
 @pytest.fixture
 def table():
@@ -579,7 +581,7 @@ class _CardAdapter:
 
 
 def _card_data(*, operator_open_id: str, mode: str = "all", chat_id: str = "oc_group"):
-    return SimpleNamespace(
+    return admit_card_callback(SimpleNamespace(
         event=SimpleNamespace(
             action=SimpleNamespace(
                 value={
@@ -591,7 +593,7 @@ def _card_data(*, operator_open_id: str, mode: str = "all", chat_id: str = "oc_g
             operator=SimpleNamespace(open_id=operator_open_id),
             context=SimpleNamespace(open_chat_id=chat_id),
         )
-    )
+    ), chat_type="group")
 
 
 def test_card_action_owner_can_switch_via_provisioned_row():
@@ -698,4 +700,14 @@ def test_card_action_missing_chat_or_table_returns_toast(chat_id, table_factory,
         _card_data(operator_open_id="ou_owner", chat_id=chat_id)
     )
     assert _resp_kind(response) == "toast"
-    assert "暂时无法保存设置" in _resp_toast_content(response)
+    # Two different rejections, and which one fires is the point:
+    #   - empty chat_id  -> the dispatcher's admission gate refuses before the
+    #     handler runs (the card cannot be proven to belong to any chat), and
+    #     that refusal is deliberately WORD-FOR-WORD the unknown-action answer,
+    #     so a caller cannot tell a registered namespace from a bogus one
+    #     (sunke's ruling, 2026-08-11; see
+    #     test_registered_business_namespaces_are_not_enumerable_by_response).
+    #   - non-empty chat_id -> identity is provable, the handler runs and fails
+    #     on its own missing table, keeping its own product wording.
+    expected = "该操作暂不支持" if not chat_id else "暂时无法保存设置"
+    assert expected in _resp_toast_content(response)

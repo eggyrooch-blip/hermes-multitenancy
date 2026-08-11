@@ -127,6 +127,10 @@ def _register(ctx) -> None:
         install_feishu_bot_added_hook()
         from .feishu_media_retry import install_feishu_media_retry_patch
         install_feishu_media_retry_patch()
+        # ONE card-action dispatcher owns the live callback; the feature
+        # installers below only register/reuse their business handlers.
+        from .feishu_card_action_dispatcher import install_feishu_card_action_dispatcher
+        install_feishu_card_action_dispatcher()
         from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
         install_feishu_clarify_card_action_patch()
         try:
