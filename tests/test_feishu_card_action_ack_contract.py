@@ -146,8 +146,13 @@ def test_error_response_is_deterministic_and_carries_no_data(monkeypatch):
     ]
 
     assert len({card_response_bytes(r) for r in responses}) == 1
+    # ...and that one answer is also what a genuinely UNKNOWN action gets, so the
+    # response cannot be read as "this name is known here, and it broke".
+    assert card_response_bytes(responses[0]) == card_response_bytes(
+        adapter._on_card_action_trigger(_data({"action": "zz_never_registered"}))
+    )
     toasts = [card_toast(r) for r in responses]
-    assert toasts[0]["type"] == "error"
+    assert toasts[0]["type"] == "info"
     for toast in toasts:
         assert SECRET not in toast["content"]
         assert "acme" not in toast["content"]
@@ -183,16 +188,22 @@ def test_the_reserved_inject_prompt_slot_answers_like_any_unknown_action():
     assert calls["turns"] == []
 
 
-def test_the_error_and_unsupported_answers_are_distinct_from_each_other():
-    """Negative control for the byte-identity assertions above: they would pass
-    vacuously if every dispatcher answer were the same string."""
+def test_card_response_bytes_can_still_tell_answers_apart():
+    """Anti-vacuity control for every byte-identity assertion in this suite.
+
+    Those assertions are only meaningful if `card_response_bytes` CAN
+    distinguish two answers. This used to be anchored on "a failed action
+    answers differently from an unknown one" — which is exactly the
+    recognised-vs-unknown oracle that slug `feishu-card-replay-oracle` removed,
+    so every REFUSAL is now byte-identical by design. Re-anchor on a SUCCESS:
+    a handler that returns its own card must still be distinguishable from a
+    refusal, otherwise the comparison proves nothing anywhere.
+    """
     adapter, _calls = _installed()
-    dispatcher.register_business_action(
-        "acme", lambda _a, _cb: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
-    failed = card_response_bytes(adapter._on_card_action_trigger(_data({"action": "acme"})))
+    dispatcher.register_business_action("acme_ok", lambda _a, _cb: {"kind": "acme-card"})
+    succeeded = card_response_bytes(adapter._on_card_action_trigger(_data({"action": "acme_ok"})))
     unknown = card_response_bytes(adapter._on_card_action_trigger(_data({"action": "nope"})))
-    assert failed != unknown
+    assert succeeded != unknown
 
 
 @pytest.mark.parametrize(

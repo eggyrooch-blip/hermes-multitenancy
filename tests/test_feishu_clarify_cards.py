@@ -162,7 +162,9 @@ def test_clarify_handler_failure_is_consumed_never_delegated(monkeypatch):
     )
     # The DISPATCHER's own error answer (the clarify handler never returned),
     # so this is the SDK-shaped response whenever lark_oapi is installed.
-    assert card_toast(response)["type"] == "error"
+    # Consumed, and indistinguishable from an unknown action: a crash must not
+    # announce that "clarify" is a name this dispatcher knows.
+    assert card_toast(response)["type"] == "info"
     assert adapter.original_calls == []
 
 
