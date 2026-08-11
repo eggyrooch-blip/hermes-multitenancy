@@ -156,11 +156,15 @@ for src in "${DBS[@]}"; do
 done
 [ "$backed_up" -gt 0 ] || die "一个库都没备份到，检查 HERMES_HOME_DIR/HERMES_WEBUI_DIR"
 
-# 配置与凭证（缺哪个都不算致命，逐个尽力拷）
+# 配置与凭证属于恢复关键资产；缺失时不能产出“完整”哨兵。
 for f in "$HERMES_HOME_DIR/config.yaml" "$HERMES_HOME_DIR/.env" "$HERMES_HOME_DIR/auth.json"; do
-  [ -f "$f" ] && cp -p "$f" "$STAGING/config/" || true
+  [ -s "$f" ] || die "关键配置缺失或为空：$(basename "$f")"
+  cp -p "$f" "$STAGING/config/"
 done
-[ -d "$HERMES_HOME_DIR/feishu_uat" ] && cp -rp "$HERMES_HOME_DIR/feishu_uat" "$STAGING/config/" || true
+[ -d "$HERMES_HOME_DIR/feishu_uat" ] \
+  && [ -n "$(find "$HERMES_HOME_DIR/feishu_uat" -type f -print -quit 2>/dev/null)" ] \
+  || die "关键凭证目录 feishu_uat 缺失或为空"
+cp -rp "$HERMES_HOME_DIR/feishu_uat" "$STAGING/config/"
 
 # MANIFEST + 校验和：演练时靠它判断“恢复出来的是不是当初那份”
 {
@@ -241,20 +245,42 @@ else
   # 备份进程读不到的文件会被 rsync 悄悄跳过 —— 这是备份系统最阴险的漏数据方式。
   # 这台机器上历史反复出现 root 跑出来的文件落在 profiles 里（2026-08-01 修过 276 个），
   # 所以每次都先数一遍，有就大声报出来，绝不让它静默通过。
-  # `-readable` 是 GNU find 扩展（生产是 Linux，有）。macOS 的 BSD find 没有，
-  # 本地跑测试时直接跳过这项检查，而不是让脚本报错。
-  if find /dev/null -readable >/dev/null 2>&1; then
-    unreadable=$(find "$HERMES_HOME_DIR/profiles" -type f ! -readable 2>/dev/null | wc -l | tr -d ' ')
-  else
-    unreadable=0
-  fi
-  if [ "$unreadable" -gt 0 ]; then
-    log "⚠️  profiles 下有 ${unreadable} 个文件当前用户读不到，它们不会进备份："
-    # 同样的 pipefail+head 坑：head 提前关管道会让 find 拿 SIGPIPE，整条判失败
-    set +e +o pipefail
-    find "$HERMES_HOME_DIR/profiles" -type f ! -readable 2>/dev/null | head -5 | sed 's/^/      /'
-    set -e -o pipefail
-    log "    修法：sudo chown -R hermes:hermes $HERMES_HOME_DIR/profiles"
+  # `test -r` 由 POSIX find 的 -exec 调用，Linux/macOS 行为一致；不能在开发机
+  # 因 BSD find 缺少 GNU 的 -readable 就跳过这条数据完整性门禁。
+  set +e
+  unreadable_items="$(find "$HERMES_HOME_DIR/profiles" \
+    \( \( -type f ! -exec test -r {} \; \) -o \
+    \( -type d \( ! -exec test -r {} \; -o ! -exec test -x {} \; \) \) \) \
+    -print 2>/dev/null)"
+  scan_rc=$?
+  set -e
+  unreadable=0
+  [ -z "$unreadable_items" ] || unreadable="$(printf '%s\n' "$unreadable_items" | wc -l | tr -d ' ')"
+  if [ "$scan_rc" -ne 0 ] || [ "$unreadable" -gt 0 ]; then
+    log "⚠️  profiles 下有 ${unreadable} 个项目当前用户读不到，它们不会进备份："
+    [ "$scan_rc" -eq 0 ] || log "    reason=traversal_incomplete"
+    locator_map="$(mktemp "$BACKUP_ROOT/unreadable-items-$TS.XXXXXX")"
+    chmod 600 "$locator_map"
+    shown=0
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      case "$path" in
+        "$HERMES_HOME_DIR/profiles") rel="." ;;
+        "$HERMES_HOME_DIR/profiles"/*) rel="${path#"$HERMES_HOME_DIR/profiles/"}" ;;
+        *) continue ;;
+      esac
+      handle="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+      python3 - "$locator_map" "$handle" "$rel" <<'PY'
+import json, sys
+with open(sys.argv[1], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"handle": sys.argv[2], "relative_path": sys.argv[3]}, ensure_ascii=False) + "\n")
+PY
+      log "    safe_locator=unreadable:${handle} reason=not_readable"
+      shown=$((shown + 1))
+      [ "$shown" -ge 5 ] && break
+    done <<< "$unreadable_items"
+    log "    locator_map=$locator_map mode=0600"
+    log "    仅修对应单文件的属主/读权限；禁止对 profiles 递归 chown"
     # 只警告不拦是不够的：一份"成功"但静默漏了几百个文件的备份，
     # 会在真要恢复的那天才暴露。默认硬拦；确实要带病跑就显式 ALLOW_UNREADABLE=1。
     [ "$ALLOW_UNREADABLE" = "1" ] \
@@ -264,7 +290,7 @@ else
   STAGING_PROF="$PROFILES_ROOT/.staging-$TS"
   set +e
   rsync -a --delete ${link_arg[@]+"${link_arg[@]}"} ${excl_arg[@]+"${excl_arg[@]}"} \
-    "$HERMES_HOME_DIR/profiles/" "$STAGING_PROF/"
+    "$HERMES_HOME_DIR/profiles/" "$STAGING_PROF/" >/dev/null 2>&1
   rc=$?
   set -e
   # rsync 退出码：0=全好；24=传输中有文件消失（agent 在跑，属正常）；其余都当失败。
@@ -281,6 +307,22 @@ else
   nprof=$(find "$PROF_DEST" -type f 2>/dev/null | wc -l | tr -d ' ')
   set -e -o pipefail
   [ "$nprof" -gt 0 ] || die "profiles 快照产出 0 个文件 —— 空备份不算成功"
+  # 内容清单必须在备份时刻固化。恢复时若快照后来被改坏，不能拿“坏后的源”跟
+  # “刚从坏源复制出的副本”互相比较后假绿。
+  ( cd "$PROF_DEST" && find . -type f -print0 | xargs -0 "${SUM[@]}" ) \
+    > "$STATE_DEST/PROFILE_SHA256SUMS"
+  python3 - "$PROF_DEST" > "$STATE_DEST/PROFILE_SYMLINKS.json" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+links = []
+for base, dirs, files in os.walk(root, followlinks=False):
+    for name in dirs + files:
+        path = os.path.join(base, name)
+        if os.path.islink(path):
+            links.append([os.path.relpath(path, root), os.readlink(path)])
+json.dump(sorted(links), sys.stdout, ensure_ascii=False, separators=(",", ":"))
+PY
+  ( cd "$STATE_DEST" && "${SUM[@]}" PROFILE_SHA256SUMS PROFILE_SYMLINKS.json >> SHA256SUMS )
   log "profiles 快照完成 → ${PROF_DEST}（${nprof} 个文件$([ -n "$prev" ] && echo "，增量，基于 $(basename "${prev%/}")" || echo "，首次全量")）"
 fi
 

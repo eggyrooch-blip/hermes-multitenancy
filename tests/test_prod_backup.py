@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -67,6 +69,7 @@ def env(tmp_path: Path) -> dict[str, str]:
         # 于是测试变成「取决于这台机器还剩多少盘」—— 26G 以下就全红。
         # 2026-08-01 在只剩 25G 的 Mac 上真的踩到了。磁盘门槛另有专门的测试覆盖。
         "FIRST_FULL_GB": "0",
+        "RESTORE_HEADROOM_GB": "0",
         "HOME": str(tmp_path / "home"),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     }
@@ -123,6 +126,16 @@ def test_backup_produces_selfcontained_dbs_manifest_and_checksums(env):
     assert (snap / "SHA256SUMS").exists()
     assert (snap / "config" / ".env").exists(), "凭证文件必须一并备份"
     assert oct(snap.stat().st_mode)[-3:] == "700", "备份目录含密钥，权限必须 700"
+
+
+def test_missing_critical_credential_blocks_complete_backup(env):
+    (Path(env["HERMES_HOME_DIR"]) / "auth.json").unlink()
+
+    result = _run(BACKUP_SH, env)
+
+    assert result.returncode != 0
+    assert "关键配置缺失" in result.stderr
+    assert _state_snapshots(env) == []
 
 
 def test_backed_up_db_survives_being_moved_alone(env, tmp_path):
@@ -189,6 +202,25 @@ def test_drill_passes_on_intact_backup_and_reports_live_drift(env):
     assert "| `multitenancy.db.t_mt` | 3 | 4 |" in report, "与生产的漂移应作为信息列出"
 
 
+def test_drill_fails_when_backup_exceeds_rpo(env):
+    """超过 24 小时的快照即使数据完整也不能算恢复演练通过。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+    manifest = _state_snapshots(env)[-1] / "MANIFEST.txt"
+    stale = (datetime.now() - timedelta(hours=25)).strftime("%Y%m%dT%H%M%S")
+    manifest.write_text(
+        manifest.read_text().replace(
+            next(line for line in manifest.read_text().splitlines() if line.startswith("backup_ts=")),
+            f"backup_ts={stale}",
+        )
+    )
+
+    result = _run(DRILL_SH, env)
+
+    assert result.returncode != 0
+    assert "RESULT status=FAIL" in result.stdout
+    assert "rpo_seconds=" in result.stdout
+
+
 def test_drill_fails_when_backup_rows_were_tampered(env):
     """负控制：备份里少了行，演练必须报失败。没有这条，演练就只是橡皮图章。"""
     assert _run(BACKUP_SH, env).returncode == 0
@@ -252,23 +284,33 @@ def test_missing_profiles_dir_is_fatal(env):
 
 def test_unreadable_profile_file_blocks_backup(env):
     """读不到的文件会被 rsync 静默跳过——默认必须硬拦，不能只警告。"""
-    if shutil.which("find") is None:
-        pytest.skip("需要 find")
     victim = Path(env["HERMES_HOME_DIR"]) / "profiles" / "u1" / "secret.txt"
     victim.write_text("x\n")
     victim.chmod(0o000)
     try:
         result = _run(BACKUP_SH, env)
-        # GNU find 才有 -readable；BSD find（macOS）下脚本会跳过这项检查
-        probe = subprocess.run(["find", "/dev/null", "-readable"], capture_output=True)
-        if probe.returncode != 0:
-            pytest.skip("BSD find 不支持 -readable，该检查只在 Linux 生效")
         assert result.returncode != 0
         assert "静默漏数据" in result.stderr
-        # 显式放行时应当能继续
-        assert _run(BACKUP_SH, env, ALLOW_UNREADABLE="1").returncode == 0
+        assert "safe_locator=unreadable:" in result.stdout
+        assert env["HERMES_HOME_DIR"] not in result.stdout
+        assert "chown -R" not in result.stdout
+        locator_map = next(Path(env["BACKUP_ROOT"]).glob("unreadable-items-*"))
+        assert locator_map.stat().st_mode & 0o777 == 0o600
+        assert json.loads(locator_map.read_text().splitlines()[0])["relative_path"] == "u1/secret.txt"
     finally:
         victim.chmod(0o644)
+
+
+def test_unreadable_profile_directory_blocks_with_safe_error(env):
+    victim = Path(env["HERMES_HOME_DIR"]) / "profiles" / "u1"
+    victim.chmod(0o000)
+    try:
+        result = _run(BACKUP_SH, env)
+        assert result.returncode != 0
+        assert "静默漏数据" in result.stderr
+        assert env["HERMES_HOME_DIR"] not in result.stdout + result.stderr
+    finally:
+        victim.chmod(0o755)
 
 
 def test_drill_rejects_symlink_into_production(env, tmp_path):
@@ -296,6 +338,17 @@ def test_drill_report_covers_profiles_layer(env):
     assert "个文件" in report
 
 
+def test_drill_restores_profiles_into_the_isolated_directory(env):
+    """恢复演练必须真的还原 profiles，不能只在原快照上抽样检查。"""
+    assert _run(BACKUP_SH, env).returncode == 0
+
+    result = _run(DRILL_SH, env, KEEP_RESTORE="1")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    work = next(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+    assert (work / "profiles" / "u1" / "f.txt").read_text() == "hello\n"
+
+
 def test_drill_fails_when_profiles_snapshot_is_missing(env):
     """有 state 备份却没有 profiles 快照 = 半份备份，演练必须判失败。"""
     assert _run(BACKUP_SH, env).returncode == 0
@@ -305,6 +358,33 @@ def test_drill_fails_when_profiles_snapshot_is_missing(env):
     assert result.returncode != 0
     report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
     assert "缺失" in report
+
+
+def test_drill_fails_when_profile_snapshot_was_corrupted_after_backup(env):
+    assert _run(BACKUP_SH, env).returncode == 0
+    profile = next((Path(env["BACKUP_ROOT"]) / "profiles").glob("*/u1/f.txt"))
+    profile.write_text("corrupted after backup\n")
+
+    result = _run(DRILL_SH, env)
+
+    assert result.returncode != 0
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert "固化 manifest 失败" in report
+
+
+def test_drill_fails_when_profile_symlink_target_changed_after_backup(env):
+    live = Path(env["HERMES_HOME_DIR"]) / "profiles" / "u1"
+    (live / "link").symlink_to("f.txt")
+    assert _run(BACKUP_SH, env).returncode == 0
+    link = next((Path(env["BACKUP_ROOT"]) / "profiles").glob("*/u1/link"))
+    link.unlink()
+    link.symlink_to("missing.txt")
+
+    result = _run(DRILL_SH, env)
+
+    assert result.returncode != 0
+    report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
+    assert "固化 manifest 失败" in report
 
 
 def test_first_full_profiles_run_raises_the_disk_floor(env):
@@ -415,3 +495,25 @@ def test_drill_uses_the_profiles_snapshot_pinned_in_sentinel(env):
     report = sorted((Path(env["BACKUP_ROOT"]) / "drill-reports").glob("*.md"))[-1].read_text()
     assert pinned.name in report, "演练应当用哨兵钉住的那一份"
     assert "29991231" not in report, "孤儿快照不能被选中"
+
+
+def test_drill_rejects_profiles_snapshot_outside_backup_root(env, tmp_path):
+    assert _run(BACKUP_SH, env).returncode == 0
+    sentinel = _state_snapshots(env)[-1] / "COMPLETE"
+    sentinel.write_text(f"completed_at=x\nprofiles_snapshot={tmp_path}\n")
+
+    result = _run(DRILL_SH, env)
+
+    assert result.returncode != 0
+    assert "配套快照路径越界" in result.stderr
+    assert not list(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
+
+
+def test_drill_refuses_when_scratch_space_cannot_hold_restore(env):
+    assert _run(BACKUP_SH, env).returncode == 0
+
+    result = _run(DRILL_SH, env, RESTORE_HEADROOM_GB="999999999")
+
+    assert result.returncode != 0
+    assert "恢复空间不足" in result.stderr
+    assert not list(Path(env["DRILL_ROOT"]).glob("hermes-drill-*"))
