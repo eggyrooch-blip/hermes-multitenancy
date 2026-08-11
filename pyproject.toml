@@ -62,6 +62,7 @@ hermes-multitenancy-ingest = "hermes_multitenancy.ingest_key_admin_cli:main"
 hermes-multitenancy-update-center = "hermes_multitenancy.update_center_cli:main"
 hermes-multitenancy-billing-shadow = "hermes_multitenancy.billing_shadow:main"
 hermes-multitenancy-billing-refresh = "hermes_multitenancy.billing_employee_key:refresh_main"
+hermes-multitenancy-account-ledger-export = "hermes_multitenancy.account_ledger_export:main"
 hermes-agent-relay = "hermes_multitenancy.agent_relay:main"
 
 [project.entry-points."hermes_agent.plugins"]

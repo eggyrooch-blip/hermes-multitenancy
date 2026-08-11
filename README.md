@@ -354,8 +354,11 @@ LiteLLM `user_id + team_id` membership. Multitenancy resolves the canonical
 payer before Run Broker admission, stores the one-time key response in the
 existing encrypted `CredentialStore`, and forces that key across main,
 title/compression, vision/media, warm-worker and delegated-agent model calls.
-It never holds a LiteLLM management key, calls LiteLLM admin APIs, injects
-billing headers, or installs a LiteLLM callback.
+The online plugin/runtime never holds a LiteLLM management key, calls LiteLLM
+admin APIs, injects billing headers, or installs a LiteLLM callback. The separate
+root-only cold-path account-ledger exporter has an explicit two-GET allowlist and
+file-backed audit credential; see
+[`docs/account-ledger-production-runbook.md`](docs/account-ledger-production-runbook.md).
 
 AI Gateway is the sole account/key control plane. Configure its private TLS
 broker endpoint and a dedicated service Bearer in the gateway systemd

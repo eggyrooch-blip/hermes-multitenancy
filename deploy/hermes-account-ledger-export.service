@@ -1,0 +1,29 @@
+[Unit]
+Description=Hermes signed account-ledger snapshot exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/hermes/account-ledger-export.env
+WorkingDirectory=/opt/hermes/account-ledger-export
+ExecStart=/opt/hermes/account-ledger-export/venv/bin/python -m hermes_multitenancy.account_ledger_export --org-snapshot ${HERMES_ACCOUNT_LEDGER_ORG_SNAPSHOT} --database ${HERMES_ACCOUNT_LEDGER_DATABASE} --litellm-base-url ${HERMES_ACCOUNT_LEDGER_LITELLM_BASE_URL} --litellm-admin-key-file ${HERMES_ACCOUNT_LEDGER_LITELLM_KEY_FILE} --output-dir ${HERMES_ACCOUNT_LEDGER_OUTPUT_DIR}
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hermes/account-ledger
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+# Deliberately no timer or WantedBy: every frozen snapshot path and output target
+# is selected and reviewed explicitly before this root-only oneshot is started.
