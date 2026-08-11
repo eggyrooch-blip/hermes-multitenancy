@@ -29,6 +29,7 @@ dependencies = [
     # this aligned with the published Hermes Agent line; 0.14.0 is the current
     # upgrade target, while 1.x has not been published yet.
     "hermes-agent>=0.14,<1.0",
+    "aiohttp>=3.9",
     "openai>=1.0",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
@@ -60,6 +61,7 @@ hermes-multitenancy-ingest = "hermes_multitenancy.ingest_key_admin_cli:main"
 hermes-multitenancy-update-center = "hermes_multitenancy.update_center_cli:main"
 hermes-multitenancy-billing-shadow = "hermes_multitenancy.billing_shadow:main"
 hermes-multitenancy-billing-refresh = "hermes_multitenancy.billing_employee_key:refresh_main"
+hermes-agent-relay = "hermes_multitenancy.agent_relay:main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"

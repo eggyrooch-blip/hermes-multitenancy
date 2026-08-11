@@ -1,0 +1,28 @@
+[Unit]
+Description=Hermes local-agent Feishu relay (dedicated app and database)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+UMask=0077
+StateDirectory=hermes-agent-relay
+Environment=HERMES_AGENT_RELAY_HOST=127.0.0.1
+Environment=HERMES_AGENT_RELAY_PORT=8770
+Environment=HERMES_AGENT_RELAY_DB=/var/lib/hermes-agent-relay/relay.db
+# Required 0600 file: dedicated app ID/secret, fixed OAuth redirect URI, and
+# HERMES_AGENT_RELAY_ENCRYPTION_KEY. Do not reuse Hermes/UAT/profile secrets.
+EnvironmentFile=/etc/hermes-agent-relay.env
+ExecStart=@PYTHON@ -m hermes_multitenancy.agent_relay
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hermes-agent-relay
+
+[Install]
+WantedBy=multi-user.target
