@@ -645,6 +645,36 @@ def test_feishu_project_needs_auth_when_not_authed(monkeypatch, tmp_path):
     assert row.installed is True
 
 
+def test_feishu_project_needs_auth_for_structured_no_local_token(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = json.dumps({"authenticated": False, "reason": "no local token"})
+        stderr = ""
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "needs_auth"
+
+
+def test_feishu_project_non_object_json_is_error(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.setattr(credential_hub, "_meegle_invocation", lambda **k: ["meegle"])
+
+    class _Proc:
+        returncode = 1
+        stdout = "null"
+        stderr = ""
+
+    monkeypatch.setattr(credential_hub, "_run", lambda *a, **k: _Proc())
+    row = credential_hub.feishu_project_status(profile_dir=tmp_path, profile_name="p")
+    assert row.status == "error"
+
+
 def test_feishu_project_transient_error_is_not_needs_auth(monkeypatch, tmp_path):
     # A transient npx/network failure must NOT be collapsed to needs_auth (finding [5]).
     from hermes_multitenancy import credential_hub

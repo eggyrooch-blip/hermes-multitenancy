@@ -117,6 +117,12 @@ def feishu_project_status(
     })
     cmd = [*inv, "--profile", _hub._meegle_profile(profile_name), "auth", "status", "--format", "json"]
     proc = _hub._run(cmd, cwd=profile_dir, env=env)
+    try:
+        parsed = json.loads((getattr(proc, "stdout", "") or "{}"))
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
     if proc is None or proc.returncode not in (0, None):
         # Binary present but status errored. Classify instead of collapsing EVERY
         # non-zero to needs_auth: a transient npx/node/network error must NOT tell
@@ -129,17 +135,13 @@ def feishu_project_status(
         stderr_tail = (getattr(proc, "stderr", "") or "")[-500:] if proc is not None else ""
         verdict = classify_connector_failure("feishu-project", exit_code=rc, stderr=stderr_tail)
         row.installed = True
-        if is_needs_reauth(verdict):
+        if parsed.get("reason") == "no local token" or is_needs_reauth(verdict):
             row.status = S_NEEDS_AUTH
             row.detail = "飞书项目需要授权后才能查询和更新工作项。"
         else:
             row.status = S_ERROR
             row.detail = "飞书项目状态暂时不可用（临时错误，可稍后重试）。"
         return row
-    try:
-        parsed = json.loads(proc.stdout or "{}")
-    except (json.JSONDecodeError, TypeError):
-        parsed = {}
     row.installed = True
     if parsed.get("authenticated") is True:
         row.status = S_AUTHENTICATED
