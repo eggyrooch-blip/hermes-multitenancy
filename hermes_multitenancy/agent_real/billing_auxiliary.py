@@ -46,6 +46,8 @@ def install_billing_auxiliary_runtime(
     )
 
     def resolve_provider(provider, selected_model=None, *args, **kwargs):
+        if selected_model is None and "model" in kwargs:
+            selected_model = kwargs.pop("model")
         bound = provider_signature.bind_partial(
             provider, selected_model, *args, **kwargs
         )

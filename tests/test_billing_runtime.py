@@ -294,6 +294,69 @@ def test_auxiliary_tasks_force_employee_key_and_restore_after_run():
     assert evicted == ["custom"]
 
 
+def test_billed_vision_accepts_keyword_model_without_duplicate_binding():
+    from hermes_multitenancy.agent_real.billing_auxiliary import (
+        install_billing_auxiliary_runtime,
+    )
+
+    calls = []
+
+    def task_resolver(*_args, **_kwargs):
+        return "custom", "vision-model", None, None, None
+
+    def provider_resolver(
+        provider,
+        model=None,
+        async_mode=False,
+        *,
+        explicit_base_url=None,
+        explicit_api_key=None,
+        main_runtime=None,
+    ):
+        calls.append(
+            {
+                "provider": provider,
+                "model": model,
+                "async_mode": async_mode,
+                "base_url": explicit_base_url,
+                "api_key": explicit_api_key,
+                "main_runtime": main_runtime,
+            }
+        )
+        return object(), model
+
+    fake = SimpleNamespace(
+        _resolve_task_provider_model=task_resolver,
+        resolve_provider_client=provider_resolver,
+    )
+    cleanup = install_billing_auxiliary_runtime(
+        fake,
+        model="main-model",
+        base_url="https://billing-approved.example/v1",
+        api_key="employee-key",
+    )
+    runtime = {"source": "employee-billing"}
+
+    fake.resolve_provider_client(
+        "custom",
+        model="vision-model",
+        async_mode=True,
+        main_runtime=runtime,
+    )
+
+    assert calls == [
+        {
+            "provider": "custom",
+            "model": "vision-model",
+            "async_mode": True,
+            "base_url": "https://billing-approved.example/v1",
+            "api_key": "employee-key",
+            "main_runtime": runtime,
+        }
+    ]
+    cleanup()
+
+
 def test_billing_delegation_guard_allows_model_only_and_rejects_credentials(
     monkeypatch,
 ):
