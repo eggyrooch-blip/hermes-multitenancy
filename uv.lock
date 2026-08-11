@@ -583,6 +583,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "cryptography" },
     { name = "hermes-agent" },
     { name = "openai" },
     { name = "python-dotenv" },
@@ -605,6 +606,7 @@ test = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "aiohttp", marker = "extra == 'test'", specifier = ">=3.9" },
+    { name = "cryptography", specifier = ">=43.0" },
     { name = "hermes-agent", specifier = ">=0.14,<1.0" },
     { name = "openai", specifier = ">=1.0" },
     { name = "openpyxl", marker = "extra == 'test'", specifier = ">=3.1" },
