@@ -110,7 +110,11 @@ def feishu_project_status(
     host = os.environ.get("HERMES_MEEGLE_HOST", _MEEGLE_DEFAULT_HOST).strip() or _MEEGLE_DEFAULT_HOST
     # Child PATH includes the resolved command's own dir so a found npx can locate
     # the sibling node binary (parity with the TS meegleEnv child PATH).
-    env = _hub.build_status_subprocess_env({"MEEGLE_HOST": host, "PATH": _hub._meegle_search_path(os.path.dirname(inv[0]))})
+    env = _hub.build_status_subprocess_env({
+        "HOME": str(Path(profile_dir) / "home"),
+        "MEEGLE_HOST": host,
+        "PATH": _hub._meegle_search_path(os.path.dirname(inv[0])),
+    })
     cmd = [*inv, "--profile", _hub._meegle_profile(profile_name), "auth", "status", "--format", "json"]
     proc = _hub._run(cmd, cwd=profile_dir, env=env)
     if proc is None or proc.returncode not in (0, None):

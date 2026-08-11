@@ -593,6 +593,42 @@ def test_feishu_project_authenticated(monkeypatch, tmp_path):
     assert row.account_hint == "owner"
 
 
+def test_feishu_project_status_uses_only_each_profile_home(monkeypatch, tmp_path):
+    from hermes_multitenancy import credential_hub
+
+    router_home = tmp_path / "router-home"
+    alice = tmp_path / "profiles" / "alice"
+    bob = tmp_path / "profiles" / "bob"
+    for home in (router_home, alice / "home", bob / "home"):
+        (home / ".meegle").mkdir(parents=True)
+    (router_home / ".meegle" / "authenticated").touch()
+    (bob / "home" / ".meegle" / "authenticated").touch()
+
+    meegle = tmp_path / "meegle"
+    meegle.write_text(
+        "#!/bin/sh\n"
+        "if [ -f \"$HOME/.meegle/authenticated\" ]; then\n"
+        "  printf '%s\\n' '{\"authenticated\":true}'\n"
+        "else\n"
+        "  printf '%s\\n' '{\"authenticated\":false}'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    meegle.chmod(0o755)
+    monkeypatch.setenv("HOME", str(router_home))
+    monkeypatch.setenv("HERMES_MEEGLE_BIN", str(meegle))
+
+    alice_status = credential_hub.feishu_project_status(
+        profile_dir=alice, profile_name="alice"
+    )
+    bob_status = credential_hub.feishu_project_status(
+        profile_dir=bob, profile_name="bob"
+    )
+
+    assert alice_status.status == "needs_auth"
+    assert bob_status.status == "authenticated"
+
+
 def test_feishu_project_needs_auth_when_not_authed(monkeypatch, tmp_path):
     from hermes_multitenancy import credential_hub
 
