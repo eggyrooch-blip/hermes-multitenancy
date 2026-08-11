@@ -24,6 +24,7 @@ MAX_CONTENT_BYTES = 30 * 1024
 RELAY_STORE_KEY = AppKey("relay_store", object)
 RELAY_EVENTS_KEY = AppKey("relay_events", object)
 RELAY_RETENTION_TASK_KEY = AppKey("relay_retention_task", asyncio.Task)
+RELAY_EVENT_STREAM_STOP_KEY = AppKey("relay_event_stream_stop", object)
 FORBIDDEN_IDENTITY_FIELDS = frozenset(
     {"target", "recipient", "open_id", "user_id", "email", "employee_id", "profile", "profile_name", "agent"}
 )
@@ -460,6 +461,9 @@ def create_agent_relay_app(
                 await task
             except asyncio.CancelledError:
                 pass
+        stop = app.get(RELAY_EVENT_STREAM_STOP_KEY)
+        if callable(stop):
+            await _await(stop())
         store.close()
 
     events = RelayEvents(store, feishu)
@@ -467,7 +471,9 @@ def create_agent_relay_app(
     async def startup(_app):
         start = getattr(feishu, "start_event_stream", None)
         if callable(start):
-            start(events, asyncio.get_running_loop())
+            _app[RELAY_EVENT_STREAM_STOP_KEY] = start(
+                events, asyncio.get_running_loop()
+            )
 
         async def retention() -> None:
             while True:

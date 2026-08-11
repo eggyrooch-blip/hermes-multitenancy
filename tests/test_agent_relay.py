@@ -4,7 +4,12 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import stat
+import sys
+import threading
+import types
 from urllib.parse import parse_qs, urlparse
+
+import pytest
 
 
 class FakeOAuth:
@@ -83,6 +88,128 @@ class FakeTimeoutAfterAccept:
         if self.card_calls == 1:
             raise TimeoutError
         return result
+
+
+def _install_fake_lark(monkeypatch, client_type, sdk_ws_client):
+    class Dispatcher:
+        @classmethod
+        def builder(cls, *_args):
+            return cls()
+
+        def __getattr__(self, name):
+            if name.startswith("register_"):
+                return lambda _handler: self
+            raise AttributeError(name)
+
+        def build(self):
+            return object()
+
+    lark = types.ModuleType("lark_oapi")
+    lark.__path__ = []
+    lark.JSON = types.SimpleNamespace(marshal=lambda value: value)
+    lark.LogLevel = types.SimpleNamespace(ERROR="ERROR")
+    lark_ws = types.ModuleType("lark_oapi.ws")
+    lark_ws.__path__ = []
+    lark_ws.Client = client_type
+    lark_ws.client = sdk_ws_client
+    lark.ws = lark_ws
+    lark_event = types.ModuleType("lark_oapi.event")
+    lark_event.__path__ = []
+    dispatcher = types.ModuleType("lark_oapi.event.dispatcher_handler")
+    dispatcher.EventDispatcherHandler = Dispatcher
+    monkeypatch.setitem(sys.modules, "lark_oapi", lark)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws", lark_ws)
+    monkeypatch.setitem(sys.modules, "lark_oapi.ws.client", sdk_ws_client)
+    monkeypatch.setitem(sys.modules, "lark_oapi.event", lark_event)
+    monkeypatch.setitem(sys.modules, "lark_oapi.event.dispatcher_handler", dispatcher)
+
+
+def test_event_stream_uses_a_thread_private_event_loop(monkeypatch):
+    """The SDK's module-global loop must not reuse aiohttp's running loop."""
+
+    connected = threading.Event()
+    drained = threading.Event()
+    finished = threading.Event()
+    failures: list[str] = []
+    sdk_ws_client = types.ModuleType("lark_oapi.ws.client")
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            self._auto_reconnect = True
+            self._conn = None
+
+        async def _connect(self):
+            self._conn = object()
+
+        async def _disconnect(self):
+            self._conn = None
+
+        def start(self):
+            async def stay_connected():
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    drained.set()
+
+            try:
+                sdk_ws_client.loop.run_until_complete(self._connect())
+                connected.set()
+                sdk_ws_client.loop.run_until_complete(stay_connected())
+            except RuntimeError as exc:
+                if str(exc) != "Event loop stopped before Future completed.":
+                    failures.append(str(exc))
+            finally:
+                finished.set()
+
+    _install_fake_lark(monkeypatch, Client, sdk_ws_client)
+
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    async def runner():
+        running_loop = asyncio.get_running_loop()
+        sdk_ws_client.loop = running_loop
+        relay = FeishuRelayClient("cli_test", "secret", "https://relay/callback")
+        stop = relay.start_event_stream(object(), running_loop)
+        assert await asyncio.to_thread(connected.wait, 2)
+        assert failures == []
+        assert sdk_ws_client.loop is not running_loop
+        assert callable(stop)
+        stop()
+        assert await asyncio.to_thread(finished.wait, 2)
+        assert drained.is_set()
+
+    asyncio.run(runner())
+
+
+def test_event_stream_startup_failure_is_raised(monkeypatch):
+    sdk_ws_client = types.ModuleType("lark_oapi.ws.client")
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            self._auto_reconnect = False
+            self._conn = None
+
+        async def _connect(self):
+            raise RuntimeError("ws connect failed")
+
+        async def _disconnect(self):
+            return None
+
+        def start(self):
+            sdk_ws_client.loop.run_until_complete(self._connect())
+
+    _install_fake_lark(monkeypatch, Client, sdk_ws_client)
+
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    async def runner():
+        running_loop = asyncio.get_running_loop()
+        sdk_ws_client.loop = running_loop
+        relay = FeishuRelayClient("cli_test", "secret", "https://relay/callback")
+        with pytest.raises(RuntimeError, match="event stream failed to start"):
+            relay.start_event_stream(object(), running_loop)
+
+    asyncio.run(runner())
 
 
 class FakeFailures(FakeFeishu):
