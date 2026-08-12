@@ -461,8 +461,9 @@ def test_build_kep_systems_from_registry_maps_install_and_update() -> None:
     from hermes_multitenancy.update_center import build_kep_systems_from_registry
 
     registry = [
-        {"name": "hades", "bin_name": "hades-cli", "status": "active", "installed": True},
+        {"name": "hades", "bin_name": "hades-cli", "skill_name": "kep-hades-custom", "status": "active", "installed": True},
         {"name": "dune", "bin_name": "dune-cli", "status": "active", "installed": False},
+        {"name": "sharetemplate-cli", "bin_name": "sharetemplate-cli", "status": "active", "installed": False},
         {"name": "wip", "bin_name": "wip-cli", "status": "developing", "installed": False},
     ]
 
@@ -480,15 +481,188 @@ def test_build_kep_systems_from_registry_maps_install_and_update() -> None:
     assert ["kep-cli", "list", "--json"] in calls
     by_name = {s.system: s for s in systems}
     # developing filtered out by default
-    assert set(by_name) == {"hades", "dune"}
+    assert set(by_name) == {"hades", "dune", "sharetemplate-cli"}
     # installed system -> update candidate (target 'latest' never equals installed version)
     assert by_name["hades"].binary == "hades-cli"
     assert by_name["hades"].installed_version == "1.1.0"
     assert by_name["hades"].target_version == "latest"
     assert by_name["hades"].needs_update is True
+    assert by_name["hades"].skill_name == "kep-hades-custom"
     # newly registered system -> install candidate
     assert by_name["dune"].installed_version is None
     assert by_name["dune"].needs_install is True
+    assert by_name["dune"].skill_name == "kep-dune-cli"
+    assert by_name["sharetemplate-cli"].skill_name == "kep-sharetemplate-cli"
+
+
+def test_kep_cli_self_update_uses_sha_even_when_version_is_unchanged(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, refresh_kep_cli
+
+    binary = tmp_path / "kep-cli"
+    binary.write_bytes(b"old-0.1.0")
+    binary.chmod(0o755)
+    candidate = b"new-build-same-version"
+    import hashlib
+
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> object:
+        calls.append(argv)
+        if argv[-1] == "--version":
+            return {"returncode": 0, "stdout": "kep-cli version 0.1.0\n", "stderr": ""}
+        return {"returncode": 0, "stdout": json.dumps([
+            {"name": "hades", "bin_name": "hades-cli", "status": "active", "installed": True},
+        ]), "stderr": ""}
+
+    report = refresh_kep_cli(
+        binary_path=binary,
+        ledger=UpdateLedger(tmp_path / "ledger.jsonl"),
+        platform="linux-amd64",
+        metadata_fetcher=lambda _url: {
+            "schema_version": 1,
+            "system": "kep-cli",
+            "bin_name": "kep-cli",
+            "version": "0.1.0",
+            "sha256": hashlib.sha256(candidate).hexdigest(),
+            "size": len(candidate),
+            "released_at": "2026-08-12T04:22:13Z",
+        },
+        binary_fetcher=lambda _url: candidate,
+        runner=runner,
+    )
+
+    assert report["action"] == "updated"
+    assert binary.read_bytes() == candidate
+    assert binary.stat().st_mode & 0o777 == 0o755
+    assert [call[-1] for call in calls] == ["--version", "--json"]
+    assert report["old_sha256"] != report["new_sha256"]
+
+
+def test_kep_cli_self_update_keeps_old_binary_when_candidate_preflight_fails(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, refresh_kep_cli
+
+    binary = tmp_path / "kep-cli"
+    binary.write_bytes(b"known-good")
+    binary.chmod(0o755)
+    candidate = b"broken-candidate"
+    import hashlib
+
+    def runner(argv: list[str]) -> object:
+        return {"returncode": 1, "stdout": "", "stderr": "broken"}
+
+    try:
+        refresh_kep_cli(
+            binary_path=binary,
+            ledger=UpdateLedger(tmp_path / "ledger.jsonl"),
+            platform="linux-amd64",
+            metadata_fetcher=lambda _url: {
+                "schema_version": 1,
+                "system": "kep-cli",
+                "bin_name": "kep-cli",
+                "version": "0.1.0",
+                "sha256": hashlib.sha256(candidate).hexdigest(),
+                "size": len(candidate),
+                "released_at": "2026-08-12T04:22:13Z",
+            },
+            binary_fetcher=lambda _url: candidate,
+            runner=runner,
+        )
+    except ValueError as exc:
+        assert "preflight" in str(exc)
+    else:
+        raise AssertionError("broken candidate must fail closed")
+
+    assert binary.read_bytes() == b"known-good"
+    assert binary.stat().st_mode & 0o777 == 0o755
+
+
+def test_kep_metadata_fetch_reads_fixed_official_origin(monkeypatch) -> None:
+    from hermes_multitenancy import update_center
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, limit):
+            assert limit == 50 * 1024 * 1024 + 1
+            return b'{"schema_version":1}'
+
+    class Opener:
+        def open(self, request, timeout):
+            assert request.full_url == update_center.KEP_CLI_COS_ORIGIN + "/public/online/linux-amd64/kep-cli/latest.json"
+            assert timeout == 30
+            return Response()
+
+    monkeypatch.setattr(update_center.urllib.request, "build_opener", lambda handler: Opener())
+
+    assert update_center._fetch_kep_metadata(
+        update_center.KEP_CLI_COS_ORIGIN + "/public/online/linux-amd64/kep-cli/latest.json"
+    ) == {"schema_version": 1}
+
+
+def test_kep_fetch_rejects_payload_over_hard_cap(monkeypatch) -> None:
+    from hermes_multitenancy import update_center
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, limit):
+            return b"x" * limit
+
+    class Opener:
+        def open(self, _request, timeout):
+            assert timeout == 30
+            return Response()
+
+    monkeypatch.setattr(update_center.urllib.request, "build_opener", lambda _handler: Opener())
+    try:
+        update_center._fetch_kep_bytes(
+            update_center.KEP_CLI_COS_ORIGIN + "/public/online/linux-amd64/kep-cli/0.1.0/kep-cli",
+            max_bytes=8,
+        )
+    except ValueError as exc:
+        assert "size limit" in str(exc)
+    else:
+        raise AssertionError("oversized official payload must fail closed")
+
+
+def test_kep_maintain_stops_before_registry_when_self_refresh_fails(monkeypatch, tmp_path: Path) -> None:
+    from hermes_multitenancy import update_center_cli
+
+    monkeypatch.setattr(update_center_cli, "refresh_kep_cli", lambda **_kwargs: (_ for _ in ()).throw(ValueError("bad candidate")))
+    monkeypatch.setattr(
+        update_center_cli,
+        "build_kep_systems_from_registry",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("registry must not run")),
+    )
+
+    assert update_center_cli.main([
+        "--shared-home", str(tmp_path / ".hermes"),
+        "kep-maintain", "--kep-cli", str(tmp_path / "kep-cli"),
+    ]) == 1
+
+
+def test_kep_sync_deploy_installer_replaces_legacy_timer() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    installer = (repo / "deploy" / "install-kep-sync.sh").read_text(encoding="utf-8")
+    service = (repo / "deploy" / "hermes-kep-sync.service").read_text(encoding="utf-8")
+
+    assert "disable --now hermes-update-center-kep.timer" in installer
+    assert "systemctl --user cat hermes-update-center-kep.timer" in installer
+    assert "is-active --quiet hermes-update-center-kep.timer" in installer
+    assert "is-enabled --quiet hermes-update-center-kep.timer" in installer
+    assert "enable --now hermes-kep-sync.timer" in installer
+    assert "is-enabled --quiet hermes-kep-sync.timer" in installer
+    assert "kep-maintain" in service
+    assert "KEP_NO_AUTO_LOGIN=1" in service
+    assert "/.hermes/hermes-agent/venv/bin/python" in installer
 
 
 def test_build_kep_systems_from_registry_include_developing_excludes_other_statuses() -> None:
@@ -508,6 +682,133 @@ def test_build_kep_systems_from_registry_include_developing_excludes_other_statu
     assert names == {"act", "dev"}
     default = {s.system for s in build_kep_systems_from_registry(runner=runner)}
     assert default == {"act"}
+
+
+def test_build_kep_systems_from_registry_excludes_kep_auth_by_all_identifiers() -> None:
+    from hermes_multitenancy.update_center import build_kep_systems_from_registry
+
+    registry = [
+        {"name": "kep-auth", "bin_name": "auth", "skill_name": "kep-safe", "status": "active", "installed": True},
+        {"name": "auth", "bin_name": "kep-auth", "skill_name": "kep-safe", "status": "active", "installed": True},
+        {"name": "auth", "bin_name": "auth", "skill_name": "kep-kep-auth", "status": "active", "installed": True},
+        {"name": "hades", "bin_name": "hades-cli", "status": "active", "installed": True},
+    ]
+    systems = build_kep_systems_from_registry(
+        runner=lambda _argv: {"returncode": 0, "stdout": json.dumps(registry), "stderr": ""},
+        version_reader=lambda _name: "1.0.0",
+    )
+
+    assert [system.system for system in systems] == ["hades"]
+
+
+def test_build_kep_systems_from_registry_rejects_invalid_active_row() -> None:
+    from hermes_multitenancy.update_center import build_kep_systems_from_registry
+
+    registry = [
+        {"name": "broken", "bin_name": "../../escape", "status": "active", "installed": False},
+        {"name": "hades", "bin_name": "hades-cli", "status": "active", "installed": True},
+    ]
+    try:
+        build_kep_systems_from_registry(
+            runner=lambda _argv: {"returncode": 0, "stdout": json.dumps(registry), "stderr": ""},
+        )
+    except ValueError as exc:
+        assert "invalid active" in str(exc)
+    else:
+        raise AssertionError("invalid active registry rows must fail the whole sync")
+
+
+def test_kep_cli_self_update_rejects_empty_candidate_registry(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import UpdateLedger, refresh_kep_cli
+    import hashlib
+
+    binary = tmp_path / "kep-cli"
+    binary.write_bytes(b"old")
+    binary.chmod(0o755)
+    candidate = b"candidate"
+
+    def runner(argv: list[str]) -> object:
+        if argv[-1] == "--version":
+            return {"returncode": 0, "stdout": "kep-cli version 0.1.0", "stderr": ""}
+        return {"returncode": 0, "stdout": "[]", "stderr": ""}
+
+    try:
+        refresh_kep_cli(
+            binary_path=binary,
+            ledger=UpdateLedger(tmp_path / "ledger.jsonl"),
+            metadata_fetcher=lambda _url: {
+                "schema_version": 1, "system": "kep-cli", "bin_name": "kep-cli", "version": "0.1.0",
+                "sha256": hashlib.sha256(candidate).hexdigest(), "size": len(candidate),
+                "released_at": "2026-08-12T04:22:13Z",
+            },
+            binary_fetcher=lambda _url: candidate,
+            runner=runner,
+        )
+    except ValueError as exc:
+        assert "active system" in str(exc)
+    else:
+        raise AssertionError("empty candidate registry must not replace the active kep-cli")
+    assert binary.read_bytes() == b"old"
+
+
+def test_build_kep_systems_from_registry_rejects_unsafe_skill_name() -> None:
+    from hermes_multitenancy.update_center import build_kep_systems_from_registry
+
+    registry = [
+        {"name": "safe", "bin_name": "safe-cli", "skill_name": "../../escape", "status": "active", "installed": False},
+        {"name": "valid", "bin_name": "valid-cli", "skill_name": "kep-valid-cli", "status": "active", "installed": False},
+    ]
+    try:
+        build_kep_systems_from_registry(
+            runner=lambda _argv: {"returncode": 0, "stdout": json.dumps(registry), "stderr": ""},
+        )
+    except ValueError as exc:
+        assert "invalid active" in str(exc)
+    else:
+        raise AssertionError("unsafe active skill names must fail closed")
+
+
+def test_kep_skill_sync_archives_only_managed_double_cli_legacy_source(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    legacy = shared / "skills" / "Keep" / "kep-sharetemplate-cli-cli"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("legacy", encoding="utf-8")
+    (legacy / ".kep-cli-managed").write_text("", encoding="utf-8")
+
+    rows = ensure_kep_cli_skills(
+        [KepCliSystem(system="sharetemplate-cli", binary="sharetemplate-cli", skill_name="kep-sharetemplate-cli")],
+        shared_home=shared,
+        profiles=[],
+        runner=_kep_skill_runner({"sharetemplate-cli": {"SKILL.md": "correct"}}),
+    )
+
+    correct = shared / "skills" / "Keep" / "kep-sharetemplate-cli"
+    assert correct.joinpath("SKILL.md").read_text(encoding="utf-8") == "correct"
+    assert not legacy.exists()
+    archives = list((shared / "update-center" / "adopt-archive").glob("kep-sharetemplate-cli-cli-*"))
+    assert len(archives) == 1
+    assert archives[0].joinpath(".kep-cli-managed").exists()
+    assert any(row.get("action") == "legacy-archived" for row in rows)
+
+
+def test_kep_skill_sync_does_not_move_unmanaged_double_cli_source(tmp_path: Path) -> None:
+    from hermes_multitenancy.update_center import KepCliSystem, ensure_kep_cli_skills
+
+    shared = tmp_path / ".hermes"
+    legacy = shared / "skills" / "Keep" / "kep-sharetemplate-cli-cli"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("curated", encoding="utf-8")
+
+    ensure_kep_cli_skills(
+        [KepCliSystem(system="sharetemplate-cli", binary="sharetemplate-cli", skill_name="kep-sharetemplate-cli")],
+        shared_home=shared,
+        profiles=[],
+        runner=_kep_skill_runner({"sharetemplate-cli": {"SKILL.md": "correct"}}),
+    )
+
+    assert legacy.joinpath("SKILL.md").read_text(encoding="utf-8") == "curated"
 
 
 def test_build_kep_systems_from_registry_raises_on_cli_failure() -> None:

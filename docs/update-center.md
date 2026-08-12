@@ -1,5 +1,23 @@
 # Multitenancy Update Center
 
+## kep-cli platform refresh
+
+Production uses the single `hermes-kep-sync.timer` lane. Its `kep-maintain`
+command first reads the fixed official `online/linux-amd64/kep-cli/latest.json`,
+compares SHA-256 (not only the version string), validates a no-redirect download,
+and runs the candidate's `--version` plus `list --json` before an atomic replace.
+Any failure preserves the current binary and stops before system updates.
+
+After that preflight it discovers active systems and refreshes their binaries and
+shared Skill sources. Registry `skill_name` is authoritative when present; older
+clients fall back to `kep-<bin_name>`, avoiding duplicate `-cli` suffixes.
+`kep-auth` is deliberately excluded because unattended replacement would change
+the identity/login boundary.
+
+Install or reconcile the user units with `deploy/install-kep-sync.sh`. It disables
+the legacy `hermes-update-center-kep.timer`, keeps its reports/ledger on disk, and
+enables only `hermes-kep-sync.timer`.
+
 Update Center is the controlled update lane for Multitenancy-owned skills and
 host CLI capabilities. Its first MVP is intentionally conservative:
 
@@ -46,10 +64,9 @@ deployment needs an explicit, reviewed system set.
 If `kep-cli list --json` fails (e.g. not logged in), `--from-registry` aborts
 with a non-zero exit and syncs nothing, leaving active binaries untouched.
 
-The timer should keep full JSON output in an internal report file and print
-only a short summary to the journal, for example system action counts, skill
-action counts, and quarantined system names. Do not print tokens, signed
-download URLs, or per-profile credential material.
+The timer writes the redacted JSON result to its private user journal and the
+secret-free JSONL decision ledger. Do not print tokens, signed download URLs,
+or per-profile credential material.
 
 `kep-systems.json` accepts a list or `{ "systems": [...] }`:
 
