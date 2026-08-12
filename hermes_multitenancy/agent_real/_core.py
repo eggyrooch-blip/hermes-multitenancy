@@ -1102,8 +1102,34 @@ def _compose_system_text(event: Any, profile_home: Path, soul_text: str) -> str:
     return f"{block}\n\n---\n\n{soul_text}"
 
 
-def _model_spec_for_event(default_spec: str, event: Any) -> str:
-    """Return per-run model override from WebUI broker metadata when present."""
+def _registered_custom_models(config: dict[str, Any]) -> set[str]:
+    """Model names declared under ``custom_providers`` in the profile config."""
+    names: set[str] = set()
+    for cp in config.get("custom_providers") or []:
+        if not isinstance(cp, dict):
+            continue
+        # Only the ``models`` registry counts: operators delist a model there,
+        # while the legacy ``model`` default field may keep a stale name.
+        models = cp.get("models")
+        if isinstance(models, dict):
+            names.update(str(key).strip() for key in models if str(key).strip())
+    return names
+
+
+def _model_spec_for_event(
+    default_spec: str,
+    event: Any,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return per-run model override from WebUI broker metadata when present.
+
+    When *config* is given, a ``custom:*`` override whose model is not in the
+    profile's ``custom_providers`` registry is discarded in favor of
+    ``default_spec``. Old sessions pin the model they were created with; once
+    that model is delisted upstream (e.g. LiteLLM blocked tencent-sonnet-4-6)
+    every turn on such a session fails 403 forever. The registry only lists
+    live models, so falling back at read time self-heals those sessions.
+    """
     metadata = _event_metadata(event)
     model = str(metadata.get("model") or "").strip()
     if not model:
@@ -1112,12 +1138,39 @@ def _model_spec_for_event(default_spec: str, event: Any) -> str:
     if provider:
         provider_prefix = f"{provider}/"
         if model.startswith(provider_prefix):
-            return model
-        return f"{provider}/{model}"
-    if "/" in model:
-        return model
-    default_provider, _default_model = _split_model_spec(default_spec)
-    return f"{default_provider}/{model}"
+            spec = model
+        else:
+            spec = f"{provider}/{model}"
+    elif "/" in model:
+        spec = model
+    else:
+        default_provider, _default_model = _split_model_spec(default_spec)
+        spec = f"{default_provider}/{model}"
+    if config is None or spec == default_spec:
+        return spec
+    try:
+        spec_provider, spec_model = _split_model_spec(
+            spec, strip_custom_context_suffix=True
+        )
+    except Exception:
+        logger.warning(
+            "model override %r unparsable; falling back to profile default %r",
+            spec,
+            default_spec,
+        )
+        return default_spec
+    if spec_provider.lower().startswith("custom:"):
+        registered = _registered_custom_models(config)
+        if spec_model not in registered:
+            logger.warning(
+                "session model %r not in custom_providers registry %s; "
+                "falling back to profile default %r",
+                spec,
+                sorted(registered),
+                default_spec,
+            )
+            return default_spec
+    return spec
 
 
 def _resolve_api_key(

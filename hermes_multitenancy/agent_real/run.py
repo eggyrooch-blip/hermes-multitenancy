@@ -113,7 +113,7 @@ def _run_with_aiagent(
     primary = (config.get("model") or {}).get("default")
     if not primary:
         raise RuntimeError("profile config missing model.default")
-    primary = _model_spec_for_event(str(primary), event)
+    primary = _model_spec_for_event(str(primary), event, config)
     fallback_models = config.get("fallback") or []
 
     provider, model_only = _split_model_spec(
