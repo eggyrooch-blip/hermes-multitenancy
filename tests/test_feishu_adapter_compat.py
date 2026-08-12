@@ -298,12 +298,17 @@ def test_inbound_richtext_patch_installs_with_plugin_adapter_layout(monkeypatch)
     install_feishu_inbound_richtext_patch()
 
     assert getattr(fake_module.normalize_feishu_message, "_hermes_multitenancy_inbound_patched", False)
+    # 观测点必须是本层**仍然拥有**的类型。`email` 等 17 类已交还 core（那一批
+    # 曾经的"富化"实测为原样返回的死代码），拿它当观测点等于测一个已不存在的行为。
     result = fake_module.normalize_feishu_message(
-        message_type="email",
-        raw_content=json.dumps({"subject": "告警", "body": "支付失败"}, ensure_ascii=False),
+        message_type="interactive",
+        raw_content=json.dumps(
+            {"card": {"elements": [{"tag": "div", "text": {"content": "申请人: 张三"}}]}},
+            ensure_ascii=False,
+        ),
     )
-    assert "告警" in result.text_content
-    assert "支付失败" in result.text_content
+    assert "申请人" in result.text_content
+    assert "张三" in result.text_content
 
 
 def test_cron_feishu_patches_install_with_plugin_adapter_layout(monkeypatch) -> None:

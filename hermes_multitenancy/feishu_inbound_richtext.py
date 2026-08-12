@@ -19,7 +19,17 @@ logger = logging.getLogger(__name__)
 _WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _LABEL_SPLIT_RE = re.compile(r"\s*[:：]\s*", re.UNICODE)
 _MERGE_FORWARD_ENV = "HERMES_FEISHU_MERGE_FORWARD_MAX"
-_ENRICH_ALWAYS_TYPES = frozenset({"merge_forward", "interactive", "card"})
+# The only inbound types this layer still owns.  Every other type is produced by
+# the core converters and MUST be handed back untouched: against the core release
+# deployed 2026-08-12 (v0.19.1 line), 17 types were measured to round-trip through
+# here byte-for-byte, and 4 media types (audio/file/image/media) were being
+# *overwritten* with "<file_key>\n<filename>" on top of core's deliberate
+# empty-body + structured-refs contract.
+#
+# `interactive`/`card` stay because core renders a card generically (title + body
+# lines + Actions) while this extracts Chinese approval-card fields
+# (申请人 / 审批人 / 状态 / 正文 / 主题) that core has zero coverage for.
+_MT_OWNED_TYPES = frozenset({"merge_forward", "interactive", "card"})
 _APPLICANT_LABELS = ("申请人", "发起人", "applicant", "requester")
 _STATUS_LABELS = ("状态", "result", "status")
 _BODY_LABELS = ("正文", "内容", "body", "reason", "摘要", "说明")
@@ -72,19 +82,10 @@ def _enrich_normalized_message(
 ) -> Any:
     del mentions, bot
     normalized_type = str(getattr(result, "raw_type", "") or message_type or "").strip().lower()
-    existing_text = str(getattr(result, "text_content", "") or "")
-    if existing_text.strip() and normalized_type not in _ENRICH_ALWAYS_TYPES:
+    if normalized_type not in _MT_OWNED_TYPES:
         return result
 
     payload = _safe_load_feishu_payload(raw_content)
-    if normalized_type == "email":
-        return _replace_text_content(result, _extract_email_text(payload))
-    if normalized_type == "share_user":
-        return _replace_text_content(result, _extract_share_user_text(payload))
-    if normalized_type == "todo":
-        return _replace_text_content(result, _extract_todo_text(payload))
-    if normalized_type == "vote":
-        return _replace_text_content(result, _extract_vote_text(payload))
     if normalized_type == "merge_forward":
         text_content, image_keys, metadata = _extract_merge_forward_enrichment(payload, result=result)
         return _replace_normalized_message(
@@ -93,9 +94,7 @@ def _enrich_normalized_message(
             image_keys=image_keys,
             metadata=metadata,
         )
-    if normalized_type in {"interactive", "card"}:
-        return _replace_text_content(result, _extract_interactive_card_text(payload))
-    return _replace_text_content(result, _extract_generic_text(payload, normalized_type))
+    return _replace_text_content(result, _extract_interactive_card_text(payload))
 
 
 def _replace_text_content(result: Any, text_content: str) -> Any:
@@ -130,71 +129,24 @@ def _replace_normalized_message(
 
 
 def _safe_load_feishu_payload(raw_content: str) -> dict[str, Any]:
+    """Parse a Feishu payload, refusing to pass parse debris off as content.
+
+    The previous `{"text": raw_content}` fallback put the WHOLE unparseable
+    payload where a message body belongs.  The agent core stopped doing exactly
+    that (`_SYNTHESIZED_TEXT_FLAG`, shipped to prod 2026-08-12) — and this layer
+    silently undid the fix, because it runs after core and re-filled the body.
+    Measured before the change:
+
+        core alone     -> text_content = ''
+        core + this    -> text_content = '{"text": "SENTINEL...", BROKEN'
+
+    An empty mapping is the honest answer: no fields were recovered.
+    """
     try:
         parsed = json.loads(raw_content) if raw_content else {}
     except json.JSONDecodeError:
-        return {"text": raw_content}
+        return {}
     return parsed if isinstance(parsed, dict) else {"content": parsed}
-
-
-def _extract_email_text(payload: dict[str, Any]) -> str:
-    subject = _find_first_text(payload, keys=("subject", "title", "mail_subject"))
-    body = _find_first_text(
-        payload,
-        keys=("body", "content", "text", "summary", "preview", "plain_text"),
-    )
-    fallback = _join_lines(_collect_text_segments(payload))
-    return _join_lines([subject, body, fallback])
-
-
-def _extract_share_user_text(payload: dict[str, Any]) -> str:
-    name = _find_first_text(payload, keys=("name", "user_name", "en_name", "chat_name"))
-    user_id = _find_first_text(payload, keys=("user_id", "open_id", "union_id"))
-    if name:
-        return _join_lines([f"联系人: {name}", user_id and f"ID: {user_id}"])
-    if user_id:
-        return f"联系人: {user_id}"
-    return "[Contact card]"
-
-
-def _extract_todo_text(payload: dict[str, Any]) -> str:
-    summary = payload.get("summary")
-    title = ""
-    content = ""
-    if isinstance(summary, dict):
-        title = _normalize_whitespace(str(summary.get("title", "") or ""))
-        content = _join_lines(_collect_text_segments(summary.get("content")))
-    title = title or _find_first_text(payload, keys=("title", "task_title", "summary"))
-    due_time = _find_first_text(payload, keys=("due_time", "due_at", "deadline", "expire_time"))
-    remainder = _join_lines(_collect_text_segments(payload))
-    return _join_lines(
-        [
-            title,
-            content,
-            due_time and f"截止时间: {due_time}",
-            remainder,
-        ]
-    )
-
-
-def _extract_vote_text(payload: dict[str, Any]) -> str:
-    topic = _find_first_text(payload, keys=("topic", "title", "subject", "question"))
-    options_value = payload.get("options")
-    options: list[str] = []
-    if isinstance(options_value, list):
-        for item in options_value:
-            option_text = _extract_option_text(item)
-            if option_text:
-                options.append(f"• {option_text}")
-    if not options:
-        fallback_options = _collect_option_lines(payload)
-        options = [f"• {line}" for line in fallback_options]
-    return _join_lines([topic, *options])
-
-
-def _extract_generic_text(payload: dict[str, Any], raw_type: str) -> str:
-    text = _join_lines(_collect_text_segments(payload))
-    return text or f"[{raw_type or 'unknown'} 消息]"
 
 
 def _extract_merge_forward_enrichment(
@@ -421,24 +373,6 @@ def _iter_merge_forward_items(payload: dict[str, Any]) -> Iterable[Any]:
         if isinstance(value, list):
             for item in value:
                 yield item
-
-
-def _collect_option_lines(payload: Any) -> list[str]:
-    options: list[str] = []
-    for node in _walk_nodes(payload):
-        if isinstance(node, dict) and str(node.get("tag", "") or "").lower() == "option":
-            option_text = _extract_option_text(node)
-            if option_text:
-                options.append(option_text)
-    return _unique_strings(options)
-
-
-def _extract_option_text(value: Any) -> str:
-    if isinstance(value, str):
-        return _normalize_whitespace(value)
-    if isinstance(value, dict):
-        return _find_first_text(value, keys=("text", "name", "content", "title", "option"))
-    return _normalize_whitespace(str(value or ""))
 
 
 def _find_first_text(payload: Any, *, keys: tuple[str, ...]) -> str:
