@@ -736,6 +736,21 @@ def test_which_meegle_resolves_npx_via_extra_path(monkeypatch, tmp_path):
     assert credential_hub._which_meegle("npx") == str(npx)
 
 
+def test_meegle_npx_fallback_is_version_pinned(monkeypatch):
+    from hermes_multitenancy import credential_hub
+
+    monkeypatch.delenv("HERMES_MEEGLE_BIN", raising=False)
+    monkeypatch.setattr(
+        credential_hub,
+        "_which_meegle",
+        lambda name: "/usr/bin/npx" if name == "npx" else None,
+    )
+
+    assert credential_hub._meegle_invocation() == [
+        "/usr/bin/npx", "-y", "@lark-project/meegle@1.0.19"
+    ]
+
+
 # -- gitlab reader -----------------------------------------------------------
 
 

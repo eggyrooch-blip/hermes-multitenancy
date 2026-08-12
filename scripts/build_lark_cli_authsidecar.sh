@@ -3,8 +3,8 @@ set -euo pipefail
 
 SOURCE_DIR="${LARK_CLI_SOURCE_DIR:-${1:-/tmp/codex-feishu-uat-compare/larksuite-cli}}"
 OUTPUT_BIN="${HERMES_LARK_CLI_BIN:-${HOME}/.hermes/bin/lark-cli-authsidecar}"
-EXPECTED_VERSION="${LARK_CLI_EXPECTED_VERSION:-1.0.31}"
-EXPECTED_SOURCE_HEAD="${LARK_CLI_EXPECTED_SOURCE_HEAD:-4a45e00}"
+EXPECTED_VERSION="${LARK_CLI_EXPECTED_VERSION:-1.0.86}"
+EXPECTED_SOURCE_HEAD="${LARK_CLI_EXPECTED_SOURCE_HEAD:-defd27b9d2f976fe35337b83071d7f11ee0cb1d3}"
 
 if [[ ! -d "${SOURCE_DIR}" ]]; then
   cat >&2 <<EOF
@@ -21,17 +21,26 @@ if [[ ! -f "${SOURCE_DIR}/go.mod" ]]; then
   exit 2
 fi
 
+actual_source_head="$(git -C "${SOURCE_DIR}" rev-parse HEAD 2>/dev/null || true)"
+if [[ -z "${EXPECTED_SOURCE_HEAD}" || "${actual_source_head}" != "${EXPECTED_SOURCE_HEAD}" ]]; then
+  echo "lark-cli source HEAD mismatch" >&2
+  exit 3
+fi
+
 mkdir -p "$(dirname "${OUTPUT_BIN}")"
 
 (
   cd "${SOURCE_DIR}"
-  go build -tags authsidecar -o "${OUTPUT_BIN}" .
+  version="${EXPECTED_VERSION:-${EXPECTED_SOURCE_HEAD:-DEV}}"
+  go build -trimpath -tags authsidecar \
+    -ldflags "-s -w -X github.com/larksuite/cli/internal/build.Version=${version}" \
+    -o "${OUTPUT_BIN}" .
 )
 
 chmod 0755 "${OUTPUT_BIN}"
 
 version_output="$("${OUTPUT_BIN}" --version 2>&1 || true)"
-if [[ -n "${EXPECTED_VERSION}" && "${version_output}" != *"${EXPECTED_VERSION}"* && "${version_output}" != *"${EXPECTED_SOURCE_HEAD}"* ]]; then
+if [[ -n "${EXPECTED_VERSION}" && "${version_output}" != *"${EXPECTED_VERSION}"* ]]; then
   echo "built lark-cli version mismatch: expected ${EXPECTED_VERSION} or source ${EXPECTED_SOURCE_HEAD}, got: ${version_output}" >&2
   exit 3
 fi

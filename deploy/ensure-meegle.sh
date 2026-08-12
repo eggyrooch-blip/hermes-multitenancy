@@ -21,13 +21,13 @@ set -u
 
 PREFIX="${HERMES_MEEGLE_PREFIX:-${HOME}/.local}"
 BIN="${PREFIX}/bin/meegle"
-PKG="@lark-project/meegle"
+PKG="@lark-project/meegle@1.0.19"
 
-if [ -x "${BIN}" ]; then
+if npm ls -g --prefix "${PREFIX}" --depth=0 "${PKG}" >/dev/null 2>&1 && [ -x "${BIN}" ]; then
   exit 0
 fi
 
-echo "ensure-meegle: ${BIN} missing — installing ${PKG} into ${PREFIX} ..."
+echo "ensure-meegle: installing ${PKG} into ${PREFIX} ..."
 if ! npm i -g --prefix "${PREFIX}" "${PKG}" >/dev/null 2>&1; then
   echo "ensure-meegle: install failed (non-fatal) — reader falls back to npx -y" >&2
   exit 0

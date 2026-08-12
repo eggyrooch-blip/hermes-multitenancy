@@ -23,6 +23,7 @@ from ..model import (
 )
 
 _MEEGLE_DEFAULT_HOST = "project.feishu.cn"
+_MEEGLE_PACKAGE = "@lark-project/meegle@1.0.19"
 
 
 def _meegle_allow_npx_status() -> bool:
@@ -77,7 +78,7 @@ def _meegle_invocation(*, allow_npx: bool = True) -> Optional[list[str]]:
         return None
     npx = _hub._which_meegle("npx")
     if npx:
-        return [npx, "-y", "@lark-project/meegle"]
+        return [npx, "-y", _MEEGLE_PACKAGE]
     return None
 
 
