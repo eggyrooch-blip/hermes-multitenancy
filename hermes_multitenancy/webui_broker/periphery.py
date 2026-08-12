@@ -2289,6 +2289,7 @@ def _build_webui_event(request: RunRequest) -> Any:
         raw_event={
             "channel": request.channel,
             "session_id": request.session_id,
+            "workspace": request.workspace,
             "metadata": metadata,
         },
     )

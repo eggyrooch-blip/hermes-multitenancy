@@ -69,6 +69,62 @@ def test_webui_run_broker_endpoint_streams_channel_neutral_events():
     asyncio.run(runner())
 
 
+def test_webui_workspace_is_profile_relative_and_invalid_paths_never_dispatch(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    (profile_home / "workspace" / "project-a").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (profile_home / "workspace" / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda _profile: profile_home)
+    seen = []
+
+    async def dispatch(request):
+        seen.append(request)
+        return "ok"
+
+    async def runner():
+        app = create_run_broker_app(
+            dispatch_agent=dispatch,
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            valid = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_owner",
+                "content": "hello",
+                "workspace": "project-a",
+            })
+            await valid.text()
+            invalid_statuses = []
+            for workspace in ["../outside", str(outside), "escape", "missing"]:
+                response = await client.post("/api/run-broker/runs", json={
+                    "channel": "webui",
+                    "profile_name": "owner",
+                    "user_key": "ou_owner",
+                    "content": "hello",
+                    "workspace": workspace,
+                })
+                invalid_statuses.append(response.status)
+                await response.text()
+        finally:
+            await client.close()
+        assert valid.status == 200
+        assert invalid_statuses == [400, 400, 400, 400]
+
+    asyncio.run(runner())
+    assert len(seen) == 1
+    assert seen[0].workspace == "project-a"
+
+
 def test_webui_and_ingest_execution_brokers_prepare_billing(monkeypatch):
     from dataclasses import replace
     from aiohttp.test_utils import TestClient, TestServer

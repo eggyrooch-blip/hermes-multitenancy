@@ -503,8 +503,15 @@ def _run_with_aiagent(
                 event_sink,
                 str(gateway_session_key),
             )
+            raw_event = getattr(event, "raw_event", {})
+            workspace = raw_event.get("workspace") if isinstance(raw_event, dict) else None
+            _normalized_workspace, run_cwd = resolve_profile_workspace(profile_home, workspace)
             runtime_env_cleanup = _apply_runtime_env_for_aiagent(
                 profile_home,
+                extra_env={
+                    "TERMINAL_CWD": str(run_cwd),
+                    "_HERMES_FORCE_TERMINAL_CWD": str(run_cwd),
+                },
                 blocked_env_names=(
                     _MODEL_ENV_ALLOWLIST if billing_enforced else frozenset()
                 ),
@@ -559,6 +566,8 @@ def _run_with_aiagent(
             profile_anchor_env, forced_profile_anchor_env = (
                 _profile_anchor_env_layers_for_aiagent(profile_home)
             )
+            profile_anchor_env["TERMINAL_CWD"] = str(run_cwd)
+            forced_profile_anchor_env["_HERMES_FORCE_TERMINAL_CWD"] = str(run_cwd)
             os.environ.update(profile_anchor_env)
             os.environ.update(forced_profile_anchor_env)
             result = agent.run_conversation(**run_kwargs)

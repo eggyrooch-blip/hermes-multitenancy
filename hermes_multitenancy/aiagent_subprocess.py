@@ -131,8 +131,14 @@ def _run_payload(
             fields["retryable"] = retryable
         return fields
 
+    previous_cwd = Path.cwd()
     try:
         sys.stdout = sys.stderr
+        selected_cwd = os.environ.get("TERMINAL_CWD") or os.environ.get("WORKSPACE")
+        run_cwd = Path(selected_cwd) if selected_cwd else profile_home / "workspace"
+        if not selected_cwd:
+            run_cwd.mkdir(parents=True, exist_ok=True)
+        os.chdir(run_cwd)
         usage: dict = {}
         run_kwargs = {"usage_sink": usage}
         if supports_event_sink:
@@ -173,6 +179,7 @@ def _run_payload(
                 **typed_failure_fields(exc),
             }
     finally:
+        os.chdir(previous_cwd)
         sys.stdout = protocol_stdout
 
     protocol_stdout.write(json.dumps(out, ensure_ascii=False))
