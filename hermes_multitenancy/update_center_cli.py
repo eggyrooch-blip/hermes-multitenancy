@@ -13,6 +13,7 @@ from .update_center import (
     build_kep_systems_from_registry,
     check_lark_cli_candidate,
     default_shared_home,
+    refresh_kep_cli,
     scan_lark_cli_notice,
     sync_kep_cli_systems,
     sync_lark_cli_skills,
@@ -49,7 +50,7 @@ def _load_systems(path: Path) -> list[KepCliSystem]:
     rows = payload.get("systems") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
         raise ValueError("systems file must be a list or {'systems': [...]}")
-    allowed = {"system", "binary", "target_version", "installed_version"}
+    allowed = {"system", "binary", "skill_name", "target_version", "installed_version"}
     out: list[KepCliSystem] = []
     for item in rows:
         if not isinstance(item, dict):
@@ -93,6 +94,25 @@ def _command_kep_sync(args: argparse.Namespace) -> int:
     quarantined = [item for item in report["systems"] if item.get("action") == "quarantined"]
     # A real embedded-skill mirror failure must also fail the run so ops automation
     # notices; benign profile-guard quarantines ("already exists") are NOT failures.
+    quarantined += [
+        item for item in report.get("skills", [])
+        if item.get("action") == "quarantined" and str(item.get("reason", "")).startswith("skill-refresh-failed")
+    ]
+    return 2 if quarantined else 0
+
+
+def _command_kep_maintain(args: argparse.Namespace) -> int:
+    self_report = refresh_kep_cli(binary_path=args.kep_cli, ledger=_ledger(args))
+    systems = build_kep_systems_from_registry(include_developing=False)
+    report = sync_kep_cli_systems(
+        systems=systems,
+        shared_home=args.shared_home,
+        ledger=_ledger(args),
+        profiles=[],
+    )
+    output = {"self": self_report, **report}
+    print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
+    quarantined = [item for item in report["systems"] if item.get("action") == "quarantined"]
     quarantined += [
         item for item in report.get("skills", [])
         if item.get("action") == "quarantined" and str(item.get("reason", "")).startswith("skill-refresh-failed")
@@ -149,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_kep.add_argument("--no-profile-sync", action="store_true", help="Only sync shared binaries and shared skill sources")
     p_kep.add_argument("--adopt", action="store_true", help="Take over un-managed existing shared skill sources (archives the old tree, materializes symlinks, stamps .kep-cli-managed)")
     p_kep.set_defaults(func=_command_kep_sync)
+
+    p_maintain = sub.add_parser("kep-maintain", help="SHA-refresh kep-cli, then sync all active systems")
+    p_maintain.add_argument("--kep-cli", type=Path, default=Path.home() / ".local/bin/kep-cli")
+    p_maintain.set_defaults(func=_command_kep_maintain)
 
     p_lark_skills = sub.add_parser("lark-skill-sync", help="Mirror lark-cli embedded skills into shared skill sources (pool-only; binaries untouched)")
     p_lark_skills.add_argument("--skill", action="append", default=[], help="Sync only these skills; default = all embedded skills from `lark-cli skills list`")

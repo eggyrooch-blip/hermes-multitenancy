@@ -1,7 +1,7 @@
 # 每日从 kep-cli 注册表现生成清单并 install/update 所有接入系统，同步到共享沙箱 bin。
 # 安装到 hermes-1（跑 hermes 用户）。占位符（@...@ / <...>）部署时按 README 替换。
 [Unit]
-Description=Hermes kep-cli registry sync (install/update systems from `kep-cli list --json`)
+Description=Hermes kep-cli self refresh and active-system sync
 After=network-online.target
 Wants=network-online.target
 # 失败即告警：模板单元读 prod 环境文件里的飞书群 webhook（URL 不入库）。
@@ -21,7 +21,8 @@ Environment=PATH=/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin
 # 绝不把 skill 铺给 profile。谁拿哪些 skill 由既有分发层决定（profile-skill-defaults /
 # skill-distribution → _sync_default_profile_skills）与专家 role-override（按角色精简）。
 # 这样能力池永远最新，而每个 profile/专家的上下文保持精简、不被全量 CLI skill 稀释。
-ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_cli kep-sync --from-registry --no-profile-sync
+Environment=KEP_NO_AUTO_LOGIN=1
+ExecStart=@PYTHON@ -m hermes_multitenancy.update_center_cli kep-maintain --kep-cli /home/hermes/.local/bin/kep-cli
 Nice=10
 IOSchedulingClass=idle
 

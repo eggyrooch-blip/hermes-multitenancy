@@ -14,7 +14,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -28,6 +31,11 @@ from .skill_registry import list_installed_skills, list_profile_skill_slash_comm
 UPDATE_CENTER_DIR = "update-center"
 DEFAULT_LEDGER_NAME = "ledger.jsonl"
 ENV_KEP_NO_AUTO_LOGIN = {"KEP_NO_AUTO_LOGIN": "1"}
+KEP_CLI_COS_ORIGIN = "https://kep-cli-1252363965.cos.ap-beijing.myqcloud.com"
+KEP_CLI_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+_KEP_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_KEP_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+_KEP_SLUG_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 _LARK_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+)\b")
 _UPDATE_NOTICE_PATTERNS = [
@@ -127,6 +135,7 @@ class KepCliSystem:
     binary: str
     target_version: str = ""
     installed_version: str | None = None
+    skill_name: str = ""
 
     @property
     def needs_install(self) -> bool:
@@ -139,6 +148,112 @@ class KepCliSystem:
 
 Runner = Callable[[list[str]], Any]
 BinaryResolver = Callable[[str], Path | None]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+def _fetch_kep_bytes(url: str, *, max_bytes: int = KEP_CLI_MAX_DOWNLOAD_BYTES) -> bytes:
+    if not url.startswith(f"{KEP_CLI_COS_ORIGIN}/public/online/"):
+        raise ValueError("kep-cli update URL is outside the fixed official origin")
+    request = urllib.request.Request(url, headers={"User-Agent": "hermes-update-center/1"})
+    with urllib.request.build_opener(_NoRedirect()).open(request, timeout=30) as response:
+        payload = response.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError("kep-cli download exceeds the fixed size limit")
+    return payload
+
+
+def _fetch_kep_metadata(url: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(_fetch_kep_bytes(url).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"kep-cli metadata is invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("kep-cli metadata must be an object")
+    return payload
+
+
+def refresh_kep_cli(
+    *,
+    binary_path: Path,
+    ledger: UpdateLedger,
+    platform: str = "linux-amd64",
+    metadata_fetcher: Callable[[str], Mapping[str, Any]] | None = None,
+    binary_fetcher: Callable[[str], bytes] | None = None,
+    runner: Runner | None = None,
+) -> dict[str, Any]:
+    """SHA-pin and atomically replace kep-cli after candidate-only read checks."""
+
+    if platform != "linux-amd64":
+        raise ValueError("automatic kep-cli refresh only supports linux-amd64")
+    binary_path = binary_path.expanduser().resolve()
+    if not binary_path.is_file():
+        raise ValueError("current kep-cli binary is unavailable")
+    metadata_url = f"{KEP_CLI_COS_ORIGIN}/public/online/{platform}/kep-cli/latest.json"
+    metadata = dict((metadata_fetcher or _fetch_kep_metadata)(metadata_url))
+    expected_keys = {"schema_version", "system", "bin_name", "version", "sha256", "size", "released_at"}
+    if set(metadata) != expected_keys:
+        raise ValueError("kep-cli metadata fields do not match the fixed schema")
+    version = str(metadata["version"])
+    expected_sha = str(metadata["sha256"])
+    size = metadata["size"]
+    if (
+        metadata["schema_version"] != 1
+        or metadata["system"] != "kep-cli"
+        or metadata["bin_name"] != "kep-cli"
+        or not _KEP_VERSION_RE.fullmatch(version)
+        or not _KEP_SHA_RE.fullmatch(expected_sha)
+        or not isinstance(size, int)
+        or size <= 0
+        or size > KEP_CLI_MAX_DOWNLOAD_BYTES
+    ):
+        raise ValueError("kep-cli metadata failed validation")
+    old_sha = _sha256(binary_path)
+    if old_sha == expected_sha:
+        return {"component": "kep-cli-self", "action": "up-to-date", "version": version, "sha256": old_sha}
+
+    candidate_url = f"{KEP_CLI_COS_ORIGIN}/public/online/{platform}/kep-cli/{version}/kep-cli"
+    candidate = binary_fetcher(candidate_url) if binary_fetcher else _fetch_kep_bytes(candidate_url, max_bytes=size)
+    if len(candidate) != size or hashlib.sha256(candidate).hexdigest() != expected_sha:
+        raise ValueError("kep-cli candidate SHA or size mismatch")
+    run = runner or _run_kep_cli
+    fd, raw_tmp = tempfile.mkstemp(prefix=".kep-cli.candidate-", dir=binary_path.parent)
+    os.close(fd)
+    tmp = Path(raw_tmp)
+    try:
+        tmp.write_bytes(candidate)
+        tmp.chmod(0o755)
+        results = []
+        for args in ([str(tmp), "--version"], [str(tmp), "list", "--json"]):
+            result = _coerce_result(run(args))
+            if result["returncode"] != 0:
+                raise ValueError("kep-cli candidate preflight failed")
+            results.append(result)
+        if version not in results[0]["stdout"]:
+            raise ValueError("kep-cli candidate version does not match metadata")
+        try:
+            registry = json.loads(results[1]["stdout"])
+        except json.JSONDecodeError as exc:
+            raise ValueError("kep-cli candidate registry preflight returned invalid JSON") from exc
+        if not isinstance(registry, list):
+            raise ValueError("kep-cli candidate registry preflight must return an array")
+        _validated_kep_registry_rows(registry, allowed_statuses={"active"})
+        os.replace(tmp, binary_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    report = {
+        "component": "kep-cli-self",
+        "action": "updated",
+        "version": version,
+        "old_sha256": old_sha,
+        "new_sha256": expected_sha,
+    }
+    ledger.append("kep_cli_self_updated", **report)
+    return report
 
 
 def scan_lark_cli_notice(text: str, *, ledger: UpdateLedger, current_version: str = "") -> dict[str, Any]:
@@ -407,7 +522,7 @@ def ensure_kep_cli_skills(
 
     rows: list[dict[str, Any]] = []
     for system in systems:
-        skill_path = f"{category}/kep-{system.system}-cli"
+        skill_path = f"{category}/{system.skill_name or f'kep-{system.binary}'}"
         try:
             source, lint_flags = _ensure_kep_cli_skill_source(shared_home, skill_path=skill_path, system=system, runner=runner, adopt=adopt, ledger=ledger)
         except ValueError as exc:
@@ -415,6 +530,11 @@ def ensure_kep_cli_skills(
             # existing skill untouched, and keep syncing other systems.
             rows.append({"skill_path": skill_path, "action": "quarantined", "reason": f"skill-refresh-failed: {exc}"})
             continue
+        legacy_archive = _archive_managed_legacy_kep_skill(shared_home, system=system, current_source=source)
+        if legacy_archive:
+            rows.append({"skill_path": f"{category}/kep-{system.system}-cli", "action": "legacy-archived", "archive": legacy_archive})
+            if ledger is not None:
+                ledger.append("skill_legacy_archived", component="kep-cli", system=system.system, archive=legacy_archive)
         # First-party lint hit is advisory: content is already written byte-exact
         # above; here we only record + notify (never quarantine, never exit 2).
         if lint_flags:
@@ -474,6 +594,21 @@ def _read_profile_skill_manifest(path: Path) -> dict[str, Any]:
 
 
 KEP_CLI_MANAGED_MARKER = ".kep-cli-managed"
+
+
+def _archive_managed_legacy_kep_skill(shared_home: Path, *, system: KepCliSystem, current_source: Path) -> str | None:
+    """Move only the old managed ``kep-<system>-cli`` duplicate after its replacement exists."""
+
+    legacy_name = f"kep-{system.system}-cli"
+    legacy = shared_home / "skills" / "Keep" / legacy_name
+    if legacy == current_source or not _is_kep_cli_managed(current_source):
+        return None
+    if legacy.is_symlink() or not legacy.is_dir() or not _is_kep_cli_managed(legacy):
+        return None
+    archive = shared_home / UPDATE_CENTER_DIR / "adopt-archive" / f"{legacy_name}-{_now()}"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(legacy), str(archive))
+    return str(archive)
 
 
 def read_kep_cli_skill_files(system: str, *, runner: Runner | None = None) -> list[dict[str, str]] | None:
@@ -696,7 +831,7 @@ def _write_stub_skill_source(source: Path, system: KepCliSystem) -> None:
         "\n".join(
             [
                 "---",
-                f"name: kep-{system.system}-cli",
+                f"name: {system.skill_name or f'kep-{system.binary}'}",
                 f"title: {title}",
                 f"description: Run {system.binary} from the Hermes managed kep-cli sandbox path.",
                 "---",
@@ -856,27 +991,55 @@ def build_kep_systems_from_registry(
         raise ValueError("kep-cli list --json must return a JSON array")
 
     allowed_statuses = {"active"} | ({"developing"} if include_developing else set())
+    eligible = _validated_kep_registry_rows(rows, allowed_statuses=allowed_statuses)
     systems: list[KepCliSystem] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
+    for row in eligible:
         name = str(row.get("name") or "").strip()
         binary = str(row.get("bin_name") or "").strip()
-        if not name or not binary:
-            continue
-        status = str(row.get("status") or "").strip()
-        if status not in allowed_statuses:  # never touch deprecated/disabled rows
+        skill_name = str(row.get("skill_name") or f"kep-{binary}").strip()
+        if any(_represents_kep_auth(value) for value in (name, binary, skill_name)):
             continue
         installed = bool(row.get("installed"))
         systems.append(
             KepCliSystem(
                 system=name,
                 binary=binary,
+                skill_name=skill_name,
                 target_version=target_marker,
                 installed_version=read_version(name) if installed else None,
             )
         )
     return systems
+
+
+def _represents_kep_auth(value: str) -> bool:
+    return value in {"kep-auth", "kep-auth-cli", "kep-kep-auth", "kep-kep-auth-cli"}
+
+
+def _validated_kep_registry_rows(rows: list[Any], *, allowed_statuses: set[str]) -> list[dict[str, Any]]:
+    eligible: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"kep-cli registry row {index} must be an object")
+        status = str(row.get("status") or "").strip()
+        if status not in allowed_statuses:
+            continue
+        name = str(row.get("name") or "").strip()
+        binary = str(row.get("bin_name") or "").strip()
+        skill_name = str(row.get("skill_name") or f"kep-{binary}").strip()
+        if (
+            not _KEP_SLUG_RE.fullmatch(name)
+            or not _KEP_SLUG_RE.fullmatch(binary)
+            or not _KEP_SLUG_RE.fullmatch(skill_name)
+            or not isinstance(row.get("installed"), bool)
+        ):
+            raise ValueError(f"kep-cli registry contains invalid active row {index}")
+        if any(_represents_kep_auth(value) for value in (name, binary, skill_name)):
+            continue
+        eligible.append(row)
+    if not eligible:
+        raise ValueError("kep-cli registry contains no valid active system")
+    return eligible
 
 
 LARK_CLI_MANAGED_MARKER = ".lark-cli-managed"
