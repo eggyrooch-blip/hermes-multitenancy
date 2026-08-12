@@ -506,6 +506,23 @@ policy ... is missing` lines.
 
 ---
 
+### 8.5 WebUI session workspace binding
+
+WebUI may optionally send a normalized POSIX-relative `workspace` on a `RunRequest`.
+The value is resolved only after the trusted owner has mapped to exactly one profile,
+and only beneath `<profile_home>/workspace`. The directory must already exist; absolute
+paths, `..`, missing directories, a symlinked root, and symlinks escaping the root fail
+before idempotency admission, credential setup, model dispatch, or tool execution.
+
+`WORKSPACE` remains the profile workspace root. The selected directory is exposed as
+`TERMINAL_CWD` (including the forced terminal passthrough key), and the one-shot/warm
+AIAgent child temporarily changes its real process cwd for that run and restores it
+afterward. The runtime re-applies the profile anchors after `AIAgent` construction, but
+keeps those two cwd values pinned to the validated selection so lazy core initialization
+cannot reset tool execution to the profile root. Requests from Feishu, cron, and kanban
+omit the field and keep the root cwd.
+There is no fallback to another profile, the shared router, or an ambient host cwd.
+
 ## 9. References
 
 * Commits implementing档 A:

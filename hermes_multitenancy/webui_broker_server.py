@@ -34,7 +34,7 @@ from .credential_broker import (
     verify_lease,
 )
 from .run_broker import RunBroker, RunRejected
-from .run_models import RunEvent, RunRequest, RunResult
+from .run_models import RunEvent, RunRequest, RunResult, resolve_profile_workspace
 from .security_audit import append_security_event
 
 logger = logging.getLogger(__name__)
@@ -317,6 +317,11 @@ def create_run_broker_app(
             )
             if share_context:
                 metadata[_AGENT_SHARE_CONTEXT_METADATA_KEY] = share_context
+            from . import router as router_mod
+            resolved_workspace, _workspace_cwd = resolve_profile_workspace(
+                router_mod._profile_name_to_home(str(resolved_profile_name or "")),
+                payload.get("workspace"),
+            )
             run_request = RunRequest(
                 channel=payload.get("channel"),
                 profile_name=resolved_profile_name or payload.get("profile_name") or payload.get("profile"),
@@ -329,6 +334,7 @@ def create_run_broker_app(
                 delivery_mode=payload.get("delivery_mode") or "socket",
                 credential_subject=trusted_owner or payload.get("credential_subject"),
                 requires_host_tools=bool(payload.get("requires_host_tools")),
+                workspace=resolved_workspace,
                 metadata=metadata,
                 messages=payload.get("messages") or [],
             )

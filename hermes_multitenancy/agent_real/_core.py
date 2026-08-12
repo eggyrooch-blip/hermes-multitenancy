@@ -62,6 +62,7 @@ from ..runtime import (
 )
 from ..security_audit import DEFAULT_AUDIT_PATH as DEFAULT_SECURITY_AUDIT_PATH
 from ..security_audit import append_security_event
+from ..run_models import resolve_profile_workspace
 from .. import lark_cli_tool as _lark_cli_tool  # noqa: F401 - registers lark_cli toolset
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,7 @@ _EXECUTE_CODE_PROFILE_CHILD_ENV_PATCH_REFS = 0
 _PROFILE_ANCHOR_ENV_KEYS = frozenset({
     "HOME",
     "WORKSPACE",
+    "TERMINAL_CWD",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
@@ -2254,6 +2256,7 @@ def _profile_anchor_env_for_aiagent(profile_home: Path) -> dict[str, str]:
     _install_keep_login_compat(profile_home)
     return {
         **{key: str(path) for key, path in pivot.items()},
+        "TERMINAL_CWD":     str(pivot["WORKSPACE"]),
         "HERMES_HOME":        str(profile_home),
         "HERMES_SHARED_HOME": str(_resolve_shared_hermes_home(profile_home)),
         "HERMES_PROFILE":     profile_home.name,
@@ -2652,6 +2655,9 @@ def _aiagent_subprocess_env_scope(
     extra: Optional[dict[str, str]] = None,
 ) -> Iterator[dict[str, str]]:
     """Build child env while keeping per-run broker lifetime scoped to spawn."""
+    raw_event = getattr(event, "raw_event", {})
+    workspace = raw_event.get("workspace") if isinstance(raw_event, dict) else None
+    _normalized_workspace, run_cwd = resolve_profile_workspace(profile_home, workspace)
     from ..webui_broker_server import (
         credential_broker_url,
         register_credential_broker_token,
@@ -2665,6 +2671,8 @@ def _aiagent_subprocess_env_scope(
     trusted_identity = _trusted_feishu_runtime_identity(event)
     sender_open_id = _resolve_subprocess_sender_open_id(event)
     merged_extra = dict(extra or {})
+    merged_extra["TERMINAL_CWD"] = str(run_cwd)
+    merged_extra["_HERMES_FORCE_TERMINAL_CWD"] = str(run_cwd)
     merged_extra.update(_ingest_secret_env_from_event(event))
     from ..billing_identity import runtime_env_for_billing_metadata
 

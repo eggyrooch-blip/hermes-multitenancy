@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Optional
 
 RunChannel = Literal["feishu", "webui", "cron", "kanban"]
@@ -31,6 +32,45 @@ def _content_key(content: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def resolve_profile_workspace(
+    profile_home: Path,
+    workspace: Optional[str],
+) -> tuple[Optional[str], Path]:
+    """Resolve one untrusted relative workspace inside a routed profile."""
+    root = profile_home / "workspace"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ValueError("invalid workspace")
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("invalid workspace")
+
+    if workspace is None or workspace == "":
+        return None, root.resolve(strict=True)
+    if not isinstance(workspace, str):
+        raise ValueError("invalid workspace")
+    raw = workspace.strip()
+    path = PurePosixPath(raw)
+    if (
+        not raw
+        or "\\" in raw
+        or "\0" in raw
+        or path.is_absolute()
+        or any(part in {".", ".."} for part in raw.split("/"))
+    ):
+        raise ValueError("invalid workspace")
+    try:
+        root_real = root.resolve(strict=True)
+        target = (root / path).resolve(strict=True)
+        relative = target.relative_to(root_real)
+    except (OSError, ValueError):
+        raise ValueError("invalid workspace") from None
+    if not target.is_dir():
+        raise ValueError("invalid workspace")
+    normalized = relative.as_posix()
+    return (normalized if normalized != "." else None), target
+
+
 @dataclass(frozen=True)
 class RunRequest:
     """A tenant-scoped executable agent run request from any channel."""
@@ -46,6 +86,7 @@ class RunRequest:
     delivery_mode: str = "stream"
     credential_subject: Optional[str] = None
     requires_host_tools: bool = False
+    workspace: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
     messages: list[dict[str, Any]] = field(default_factory=list)
 
@@ -67,6 +108,8 @@ class RunRequest:
         object.__setattr__(self, "user_key", user_key)
         object.__setattr__(self, "content", content)
         object.__setattr__(self, "delivery_mode", _clean(self.delivery_mode) or "stream")
+        if self.workspace is not None:
+            object.__setattr__(self, "workspace", _clean(self.workspace) or None)
         object.__setattr__(
             self,
             "messages",

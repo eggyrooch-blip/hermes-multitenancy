@@ -405,6 +405,67 @@ def test_aiagent_subprocess_serializes_typed_failure_fields(
     assert data.get("event") == ("done" if event_stream else None)
 
 
+def test_aiagent_subprocess_runs_in_terminal_cwd_and_restores(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import aiagent_subprocess
+
+    selected = tmp_path / "workspace" / "project-a"
+    selected.mkdir(parents=True)
+    monkeypatch.setenv("TERMINAL_CWD", str(selected))
+    original = Path.cwd()
+    seen = []
+
+    def run(*_args, **_kwargs):
+        seen.append(Path.cwd())
+        return "ok"
+
+    payload = {
+        "event": {"text": "hello", "source": {"platform": "webui"}},
+        "profile_home": str(tmp_path),
+    }
+    aiagent_subprocess._run_payload(payload, run, io.StringIO())
+
+    assert seen == [selected]
+    assert Path.cwd() == original
+
+
+def test_run_with_aiagent_keeps_selected_workspace_for_tools(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    selected = profile_home / "workspace" / "project-a"
+    selected.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    seen: dict[str, str] = {}
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **_kwargs):
+            seen["terminal_cwd"] = os.environ["TERMINAL_CWD"]
+            seen["forced_terminal_cwd"] = os.environ["_HERMES_FORCE_TERMINAL_CWD"]
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+    _install_fake_gateway_session_context(monkeypatch)
+    event = _event()
+    event.raw_event = {"workspace": "project-a"}
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert seen == {
+        "terminal_cwd": str(selected),
+        "forced_terminal_cwd": str(selected),
+    }
+
+
 @pytest.mark.asyncio
 async def test_real_child_expert_failure_never_calls_legacy(
     monkeypatch,
@@ -7816,9 +7877,12 @@ def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatc
     from hermes_multitenancy import agent_real
 
     profile = tmp_path / "profiles" / "alice"
+    selected = profile / "workspace" / "project-a"
+    selected.mkdir(parents=True)
     approval_dir = tmp_path / "approval"
     approval_dir.mkdir(parents=True)
     event = _event()
+    event.raw_event = {"workspace": "project-a"}
     seen: dict[str, object] = {}
 
     @contextmanager
@@ -7843,6 +7907,9 @@ def test_aiagent_subprocess_env_scope_adds_sender_and_lark_broker_env(monkeypatc
         assert seen["profile_home"] == profile
         assert seen["sender_open_id"] == "ou_test"
         assert env["HERMES_FEISHU_USER_OPEN_ID"] == "ou_test"
+        assert env["WORKSPACE"] == str(profile / "workspace")
+        assert env["TERMINAL_CWD"] == str(selected)
+        assert env["_HERMES_FORCE_TERMINAL_CWD"] == str(selected)
         assert env["HERMES_LARK_CLI_BIN"] == "/tmp/lark-cli-authsidecar"
         assert env["LARKSUITE_CLI_AUTH_PROXY"] == "http://127.0.0.1:19090"
         assert env["LARKSUITE_CLI_PROXY_KEY"] == "short-lived"
