@@ -75,6 +75,7 @@ class RelayEvents:
         parent_message_id: str | None = None,
     ) -> bool:
         if not event_id or not _valid_actor_id(actor_id) or not text or create_time <= 0:
+            logger.info("relay_audit event=reply status=invalid")
             return False
         assigned, ambiguous = self.store.assign_reply(
             event_id=event_id,
@@ -84,8 +85,16 @@ class RelayEvents:
             parent_message_id=parent_message_id,
         )
         if ambiguous:
-            logger.info("relay_audit event=reply status=ambiguous actor=%s", _sha(actor_id)[:12])
+            logger.info(
+                "relay_audit event=reply status=ambiguous actor=%s", _sha(actor_id)[:12]
+            )
             await _await(self.feishu.send_ambiguity_notice(actor_id))
+        else:
+            logger.info(
+                "relay_audit event=reply status=%s actor=%s",
+                "assigned" if assigned else "unmatched",
+                _sha(actor_id)[:12],
+            )
         return assigned
 
     async def ingest_reaction(self, **event: Any) -> bool:
@@ -556,6 +565,7 @@ def create_agent_relay_app(
 def main() -> None:
     from aiohttp import web
 
+    logging.basicConfig(level=logging.INFO)
     app_id = os.environ.get("HERMES_AGENT_RELAY_FEISHU_APP_ID", "").strip()
     app_secret = os.environ.get("HERMES_AGENT_RELAY_FEISHU_APP_SECRET", "").strip()
     redirect_uri = os.environ.get("HERMES_AGENT_RELAY_OAUTH_REDIRECT_URI", "").strip()

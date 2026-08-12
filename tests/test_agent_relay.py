@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import sqlite3
 import stat
 import sys
@@ -92,17 +94,24 @@ class FakeTimeoutAfterAccept:
 
 def _install_fake_lark(monkeypatch, client_type, sdk_ws_client):
     class Dispatcher:
+        def __init__(self):
+            self.handlers = {}
+
         @classmethod
         def builder(cls, *_args):
             return cls()
 
         def __getattr__(self, name):
             if name.startswith("register_"):
-                return lambda _handler: self
+                def register(handler):
+                    self.handlers[name] = handler
+                    return self
+
+                return register
             raise AttributeError(name)
 
         def build(self):
-            return object()
+            return self
 
     lark = types.ModuleType("lark_oapi")
     lark.__path__ = []
@@ -210,6 +219,104 @@ def test_event_stream_startup_failure_is_raised(monkeypatch):
             relay.start_event_stream(object(), running_loop)
 
     asyncio.run(runner())
+
+
+def test_event_stream_logs_background_message_failure(monkeypatch, caplog):
+    sdk_ws_client = types.ModuleType("lark_oapi.ws.client")
+
+    class Client:
+        def __init__(self, *_args, **kwargs):
+            self._auto_reconnect = True
+            self._conn = None
+            self.event_handler = kwargs["event_handler"]
+
+        async def _connect(self):
+            self._conn = object()
+
+        async def _disconnect(self):
+            self._conn = None
+
+        def start(self):
+            sdk_ws_client.loop.run_until_complete(self._connect())
+            self.event_handler.handlers["register_p2_im_message_receive_v1"](
+                json.dumps(
+                    {
+                        "header": {"event_id": "event-canary"},
+                        "event": {
+                            "sender": {"sender_id": {"open_id": "ou_actor_canary"}},
+                            "message": {
+                                "chat_type": "p2p",
+                                "message_type": "text",
+                                "content": '{"text":"MESSAGE-CANARY-DO-NOT-LOG"}',
+                                "create_time": "1",
+                            },
+                        },
+                    }
+                )
+            )
+            sdk_ws_client.loop.run_forever()
+
+    _install_fake_lark(monkeypatch, Client, sdk_ws_client)
+
+    from hermes_multitenancy.agent_relay import RelayEvents
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    class Store:
+        def assign_reply(self, **_event):
+            return False, True
+
+    class FailingFeishu:
+        async def send_ambiguity_notice(self, _actor_id):
+            raise RuntimeError("TEXT-CANARY-DO-NOT-LOG")
+
+    async def runner():
+        relay = FeishuRelayClient("cli_test", "secret", "https://relay/callback")
+        stop = relay.start_event_stream(
+            RelayEvents(Store(), FailingFeishu()), asyncio.get_running_loop()
+        )
+        try:
+            for _ in range(20):
+                if "event=message status=failed" in caplog.text:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            stop()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(runner())
+    assert caplog.text.count("event=message status=failed") == 1
+    assert "TEXT-CANARY-DO-NOT-LOG" not in caplog.text
+    assert "event-canary" not in caplog.text
+
+
+def test_text_ingress_logs_every_redacted_outcome(caplog):
+    class Store:
+        outcomes = iter([(False, False), (False, True), (True, False)])
+
+        def assign_reply(self, **_event):
+            return next(self.outcomes)
+
+    from hermes_multitenancy.agent_relay import RelayEvents
+
+    async def runner():
+        events = RelayEvents(Store(), FakeFeishu())
+        assert not await events.ingest_text(
+            event_id="", actor_id="ou_actor_canary", text="MESSAGE-CANARY", create_time=1
+        )
+        for event_id in ("zero-window", "ambiguous", "assigned"):
+            await events.ingest_text(
+                event_id=event_id,
+                actor_id="ou_actor_canary",
+                text="MESSAGE-CANARY",
+                create_time=1,
+            )
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(runner())
+    for status in ("invalid", "unmatched", "ambiguous", "assigned"):
+        assert caplog.text.count(f"event=reply status={status}") == 1
+    assert "ou_actor_canary" not in caplog.text
+    assert "MESSAGE-CANARY" not in caplog.text
 
 
 class FakeFailures(FakeFeishu):

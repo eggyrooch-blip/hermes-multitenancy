@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import threading
 import time
@@ -12,6 +13,7 @@ import urllib.request
 from typing import Any, Callable
 
 EVENT_STREAM_START_TIMEOUT_SECONDS = 10
+logger = logging.getLogger(__name__)
 
 
 def _valid_actor_id(value: str) -> bool:
@@ -319,24 +321,33 @@ class FeishuRelayClient:
         import lark_oapi as lark
         from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 
-        def submit(coro: Any) -> Any:
-            return asyncio.run_coroutine_threadsafe(coro, loop)
+        def submit(coro: Any, event_type: str) -> Any:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+
+            def log_failure(done: Any) -> None:
+                if not done.cancelled() and done.exception() is not None:
+                    logger.error("relay_audit event=%s status=failed", event_type)
+
+            future.add_done_callback(log_failure)
+            return future
 
         def message(data: Any) -> None:
             payload = json.loads(lark.JSON.marshal(data))
-            submit(self.ingest_event_payload(events, "message", payload))
+            submit(self.ingest_event_payload(events, "message", payload), "message")
 
         def reaction(operation: str):
             def handle(data: Any) -> None:
                 payload = json.loads(lark.JSON.marshal(data))
                 event_type = "reaction_created" if operation == "create" else "reaction_deleted"
-                submit(self.ingest_event_payload(events, event_type, payload))
+                submit(self.ingest_event_payload(events, event_type, payload), event_type)
 
             return handle
 
         def card_action(data: Any) -> Any:
             payload = json.loads(lark.JSON.marshal(data))
-            accepted = submit(self.ingest_event_payload(events, "card_action", payload)).result(timeout=2)
+            accepted = submit(
+                self.ingest_event_payload(events, "card_action", payload), "card_action"
+            ).result(timeout=2)
             return self._toast("Recorded" if accepted else "Already resolved", "success" if accepted else "info")
 
         handler = (
