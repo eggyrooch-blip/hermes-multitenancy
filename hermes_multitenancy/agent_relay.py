@@ -234,6 +234,7 @@ def create_agent_relay_app(
                 idempotency_key=key,
                 request_hash=digest,
                 reply_expires_at=_now_ms() + reply_window * 1000 if reply_window else None,
+                msg_type=msg_type,
             )
         except RelayConflict as exc:
             return _error("idempotency_conflict", str(exc), 409)
@@ -295,6 +296,70 @@ def create_agent_relay_app(
             actor["identity_fingerprint"],
         )
         return web.json_response(public_result, status=201 if created else 200)
+
+    async def update_message(request):
+        actor = authenticate(request)
+        if actor is None:
+            return _error("unauthorized", "invalid or revoked token", 401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error("invalid_json", "body must be a JSON object", 400)
+        if not isinstance(payload, dict):
+            return _error("invalid_body", "body must be a JSON object", 400)
+        if _contains_forbidden_identity(payload):
+            logger.warning("relay_audit event=identity_reject status=denied actor=%s", actor["identity_fingerprint"])
+            return _error("identity_field_forbidden", "recipient and identity fields are not accepted", 400)
+        message_id = str(request.match_info["message_id"])
+        row = store.owned_sent_message(actor["token_id"], message_id)
+        if row is None:
+            return _error("not_found", "message not found", 404)
+        content = payload.get("content")
+        if not isinstance(content, dict):
+            return _error("invalid_message", "content is required", 400)
+        if row.get("kind") != "card":
+            return _error("invalid_message", "only card messages can be updated", 400)
+        if len(json.dumps(content, ensure_ascii=False).encode("utf-8")) > MAX_CONTENT_BYTES:
+            return _error("content_too_large", "content exceeds 30720 bytes", 400)
+        try:
+            _card_with_actions(content, [], "", "")
+        except ValueError as exc:
+            return _error("invalid_card", str(exc), 400)
+        try:
+            await asyncio.wait_for(
+                _await(feishu.update_card(message_id=message_id, content=content)),
+                timeout=5,
+            )
+        except TimeoutError:
+            logger.warning("relay_audit event=update status=timeout actor=%s", actor["identity_fingerprint"])
+            return _error("upstream_timeout", "Feishu update timed out", 504)
+        except FeishuApiError as exc:
+            if exc.status == 429:
+                logger.warning("relay_audit event=update status=rate_limited actor=%s", actor["identity_fingerprint"])
+                return _error(
+                    "rate_limited",
+                    _feishu_error_message("Feishu rate limited the request", exc),
+                    429,
+                    exc.retry_after or 1,
+                )
+            if exc.status == 400:
+                logger.warning("relay_audit event=update status=rejected actor=%s", actor["identity_fingerprint"])
+                return _error(
+                    "invalid_message",
+                    _feishu_error_message("Feishu rejected the payload", exc),
+                    400,
+                )
+            logger.warning("relay_audit event=update status=upstream_error actor=%s", actor["identity_fingerprint"])
+            return _error(
+                "upstream_unavailable",
+                _feishu_error_message("Feishu update failed", exc),
+                502,
+            )
+        except Exception:
+            logger.warning("relay_audit event=update status=upstream_error actor=%s", actor["identity_fingerprint"])
+            return _error("upstream_unavailable", "Feishu update failed", 502)
+        logger.info("relay_audit event=update status=updated actor=%s", actor["identity_fingerprint"])
+        return web.json_response({"message_id": message_id})
 
     async def revoke_token(request):
         actor = authenticate(request)
@@ -551,6 +616,7 @@ def create_agent_relay_app(
     app.router.add_get("/v1/enroll/sessions/{enroll_id}", poll_enrollment)
     app.router.add_get("/v1/whoami", whoami)
     app.router.add_post("/v1/messages", send_message)
+    app.router.add_patch("/v1/messages/{message_id}", update_message)
     app.router.add_get("/v1/messages/{message_id}/replies", get_replies)
     app.router.add_get("/v1/messages/{message_id}/reactions", get_reactions)
     app.router.add_post("/v1/cards", create_card)

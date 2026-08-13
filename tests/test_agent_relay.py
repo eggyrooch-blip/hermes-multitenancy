@@ -1065,3 +1065,113 @@ def test_feishu_transport_preserves_application_error_details(monkeypatch):
             urllib.error.HTTPError("https://open.feishu.cn", 503, "unavailable", {}, body)
         )
         assert (caught.status, caught.code, caught.message) == (503, None, "")
+
+
+def test_card_message_content_update_is_verbatim_and_owner_bound(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import create_agent_relay_app
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            bob = {"Authorization": f"Bearer {await enroll_as(client, 'bob')}"}
+
+            schema_two = {
+                "schema": "2.0",
+                "body": {"elements": [{"tag": "markdown", "content": "step 1"}]},
+            }
+            posted = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "card",
+                    "content": schema_two,
+                    "idempotency_key": "alice-progress",
+                },
+            )
+            assert posted.status == 201
+            message_id = (await posted.json())["message_id"]
+
+            updated_content = {
+                "schema": "2.0",
+                "body": {"elements": [{"tag": "markdown", "content": "step 2 of 9"}]},
+            }
+            updated = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=alice,
+                json={"content": updated_content},
+            )
+            assert updated.status == 200
+            assert feishu.card_updates[-1]["content"] == updated_content
+            assert "elements" not in feishu.card_updates[-1]["content"]
+
+            stranger = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=bob,
+                json={"content": updated_content},
+            )
+            assert stranger.status == 404
+
+            texted = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "hi"},
+                    "idempotency_key": "alice-text",
+                },
+            )
+            text_id = (await texted.json())["message_id"]
+            refused = await client.patch(
+                f"/v1/messages/{text_id}",
+                headers=alice,
+                json={"content": {"elements": []}},
+            )
+            assert refused.status == 400
+            assert (await refused.json())["error"]["code"] == "invalid_message"
+
+            identity = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=alice,
+                json={"content": {"elements": [{"open_id": "ou_bob"}]}},
+            )
+            assert identity.status == 400
+            assert (await identity.json())["error"]["code"] == "identity_field_forbidden"
+
+            oversized = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=alice,
+                json={"content": {"elements": [{"tag": "markdown", "content": "x" * 32000}]}},
+            )
+            assert oversized.status == 400
+            assert (await oversized.json())["error"]["code"] == "content_too_large"
+
+            unauth = await client.patch(
+                f"/v1/messages/{message_id}", json={"content": updated_content}
+            )
+            assert unauth.status == 401
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
