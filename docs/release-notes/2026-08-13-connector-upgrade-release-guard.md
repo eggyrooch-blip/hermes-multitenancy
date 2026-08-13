@@ -11,7 +11,15 @@ failed service start as rollback, restores editable installs using the physical
 previous release path, and rolls back failed `SessionStore` transactions with a
 10s SQLite busy timeout.
 
-Production remains on `release-20260812-06`; `hermes-release.timer` is disabled
-until this guard is shipped and a new protected release succeeds. Focused tests
-are 61/61, final simulation is 4/4, and the second independent T2 review closed
-both release-boundary P1 findings. The candidate is reviewed but not shipped.
+The guard shipped through MR !73 and is contained in production
+`release-20260813-04` at multitenancy
+`2f46bf2822363072e776ec3a2133ed3c2ed878a6`. Focused tests are 61/61, final
+simulation is 4/4, and the second independent T2 review closed both
+release-boundary P1 findings. The production executor passed 12/12 probes and
+the rollback anchor records SUCCESS. Post-restart logs contain zero database
+lock, durable admission, traceback, isolation, or credential-identity errors.
+
+After the lark-cli 1.0.86 / Meegle 1.0.19 rollout, a read-only registered-tool
+canary for the unique sunke route passed self=1/cross=0 through the run-scoped
+auth broker. The remote latest tag and deployed marker both read
+`release-20260813-04`, so `hermes-release.timer` is restored enabled/active.
