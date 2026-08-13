@@ -4125,13 +4125,16 @@ def _write_token_ledger_from_child(event: Any, profile_home: Path, usage: Any) -
         append_token_usage(
             sender_open_id=_resolve_subprocess_sender_open_id(event),
             profile=profile_home.name,
-            platform=_resolve_platform_value(source),
+            platform=_resolve_token_ledger_platform(source),
             chat_type=_extract_chat_type(event),
             chat_id=_extract_chat_id(event),
             model=usage.get("model"),
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
             total_tokens=usage.get("total_tokens"),
+            cache_read_tokens=usage.get("cache_read_tokens"),
+            cache_write_tokens=usage.get("cache_write_tokens"),
+            api_calls=usage.get("api_calls"),
         )
     except Exception:
         logger.debug("[multitenancy] token usage ledger (parent) skipped", exc_info=True)
@@ -4347,6 +4350,19 @@ def _session_part(value: Any, default: str = "unknown") -> str:
     text = str(value or "").strip() or default
     safe = "".join(ch if (ch.isalnum() or ch in "._:-") else "_" for ch in text)
     return safe[:160] or default
+
+
+def _resolve_token_ledger_platform(source: Any) -> str:
+    """台账专用的 platform 解析：定时任务回合记 ``"cron"``，其余沿用通用解析。
+
+    ``HERMES_CRON_JOB`` 由 ``cron/execution._run_job_for_profile_subprocess`` 为每个 cron
+    job 的独立子进程设置，所以「本进程 = cron 回合」无歧义。只在台账这一条路径上覆盖，
+    不动 ``_resolve_platform_value`` 本身——它还被投递/展示逻辑用着（streaming 用它判
+    是否保留 reasoning），改默认值会波及回复行为。
+    """
+    if os.getenv("HERMES_CRON_JOB", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "cron"
+    return _resolve_platform_value(source)
 
 
 def _resolve_platform_value(source: Any, default: str = "feishu") -> str:

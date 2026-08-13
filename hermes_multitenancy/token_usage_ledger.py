@@ -11,8 +11,14 @@
 台账契约（工件 2 的 uploader 依赖，勿擅改字段名）::
 
     {"ts": "<上海时区 ISO,秒>", "sender_open_id": "ou_...", "profile": "<name>",
-     "platform": "feishu", "chat_type": "p2p|group", "model": "<裸模型名>",
-     "input_tokens": int, "output_tokens": int, "total_tokens": int}
+     "platform": "feishu|webui|cron", "chat_type": "p2p|group", "model": "<裸模型名>",
+     "input_tokens": int, "output_tokens": int, "total_tokens": int,
+     "cache_read_tokens": int, "cache_write_tokens": int, "api_calls": int}
+
+后三个字段是「尺子」（2026-08-13 加）：缓存命中率与每轮模型调用次数。没有它们，
+「换个便宜模型到底省不省」只能靠估算——缓存读价是输入价的 0.1x，换模型打掉前缀缓存的
+代价可能反超降级省下的差价；而小模型能力弱导致多绕几轮，也只有 ``api_calls`` 能看见。
+既有字段名与语义逐字不变，新增字段对下游 uploader 是可忽略的额外 key。
 
 token 来源：上游核心 ``AIAgent`` 实例的累计计数器
 ``session_input_tokens / session_output_tokens / session_total_tokens``
@@ -72,11 +78,23 @@ def _int(value: Any) -> int:
 
 
 def read_agent_session_tokens(agent: Any) -> dict[str, int]:
-    """从 AIAgent 实例安全读出本回合 token 累计。属性缺失一律兜底 0，不抛。"""
+    """从 AIAgent 实例安全读出本回合 token 累计与调用次数。属性缺失一律兜底 0，不抛。
+
+    ``cache_read_tokens`` / ``cache_write_tokens`` 来自核心的
+    ``session_cache_read_tokens`` / ``session_cache_write_tokens``（``run_agent.py`` 约
+    751-752 定义），``api_calls`` 来自 ``_api_call_count``（``agent/agent_init.py`` 初始化、
+    ``agent/conversation_loop.py`` 每次模型调用后更新）。这三项是判断「换模型是否划算」
+    的判据：缓存读价只有输入价的 0.1x，换模型打掉前缀缓存的代价可能反超降级省下的差价；
+    而每轮调用次数决定了「小模型多绕几轮反而更慢/更贵」能不能被观测到。
+    核心版本不同可能缺这些属性（MT 测试环境与生产跑的不是同一条 core 线），故一律 getattr 兜底。
+    """
     return {
         "input_tokens": _int(getattr(agent, "session_input_tokens", 0)),
         "output_tokens": _int(getattr(agent, "session_output_tokens", 0)),
         "total_tokens": _int(getattr(agent, "session_total_tokens", 0)),
+        "cache_read_tokens": _int(getattr(agent, "session_cache_read_tokens", 0)),
+        "cache_write_tokens": _int(getattr(agent, "session_cache_write_tokens", 0)),
+        "api_calls": _int(getattr(agent, "_api_call_count", 0)),
     }
 
 
@@ -92,6 +110,9 @@ def append_token_usage(
     total_tokens: Any,
     chat_id: str | None = None,
     timestamp: str | None = None,
+    cache_read_tokens: Any = 0,
+    cache_write_tokens: Any = 0,
+    api_calls: Any = 0,
 ) -> None:
     """追加一行 token 台账。开关关 / token 非正 / 任何异常 → 静默 no-op。
 
@@ -119,6 +140,9 @@ def append_token_usage(
         "input_tokens": it,
         "output_tokens": ot,
         "total_tokens": tt,
+        "cache_read_tokens": _int(cache_read_tokens),
+        "cache_write_tokens": _int(cache_write_tokens),
+        "api_calls": _int(api_calls),
     }
 
     try:
