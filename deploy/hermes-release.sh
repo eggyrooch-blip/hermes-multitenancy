@@ -340,6 +340,18 @@ reinstall_editable() {  # $1=目标 mt 版本目录（绝对路径）
   [ -x "$VENV_PY" ] || { log "  ✗ 找不到 gateway venv python（$VENV_PY）"; return 1; }
   ( cd /tmp && "$UV_BIN" pip install -p "$VENV_PY" --no-deps -q -e "$target" ) \
     || { log "  ✗ editable 重装失败（目标 $target）"; return 1; }
+  # --no-deps 是刻意的漂移控制（不让发布顺手升级无关依赖），但它也意味着
+  # pyproject 新增的运行时依赖永远装不上：tencentcloud-sdk-python-vod 就这样
+  # 缺了 19 天，生图全挂而发布次次报绿。装完做一次依赖体检，缺了自愈一次，
+  # 仍缺就让本次发布红——发布当场红，好过用户来报。
+  if ! ( cd /tmp && "$UV_BIN" pip check -p "$VENV_PY" >/dev/null 2>&1 ); then
+    log "  依赖体检未过 —— 带依赖重装一次自愈"
+    ( cd /tmp && "$UV_BIN" pip install -p "$VENV_PY" -q -e "$target" ) \
+      || { log "  ✗ 依赖自愈重装失败（目标 $target）"; return 1; }
+    ( cd /tmp && "$UV_BIN" pip check -p "$VENV_PY" ) \
+      || { log "  ✗ 依赖体检仍未过 —— 放弃本次发布"; return 1; }
+    log "  依赖自愈完成（uv pip check 通过）"
+  fi
   "$VENV_PY" - "$target" <<'PY' || { log "  ✗ editable 读回核对失败（import 未指向 $target）"; return 1; }
 import importlib, sys
 m = importlib.import_module("hermes_multitenancy")
