@@ -389,6 +389,12 @@ print(json.dumps(result, ensure_ascii=False))
 '''
     env = os.environ.copy()
     env["HERMES_HOME"] = str(profile_home)
+    # 每个 cron job 都跑在这个独立子进程里，所以这里的标记 = 「本进程内的每个回合都是定时
+    # 任务触发的」，是唯一无歧义的判别点。token 台账读它把 platform 记成 "cron"：在此之前
+    # cron 的合成 event 没有 platform，被 _resolve_platform_value 的 "feishu" 默认值吞掉，
+    # 台账里的 cron 回合全部戴着飞书的帽子（生产近 7 天：3632 行 chat_type 为空的"飞书"行
+    # 其实是 cron，真实飞书 DM 只有 486 行），成本按平台归因因此完全失真。
+    env["HERMES_CRON_JOB"] = "1"
     timeout_s = _cw._cron_job_timeout_seconds()
     # start_new_session=True → the child leads its own process group so a timeout
     # can kill the ENTIRE job tree. A cron job runs an agent that may spawn

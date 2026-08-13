@@ -586,6 +586,9 @@ def _run_with_aiagent(
                         "input_tokens": _ut["input_tokens"],
                         "output_tokens": _ut["output_tokens"],
                         "total_tokens": _ut["total_tokens"],
+                        "cache_read_tokens": _ut["cache_read_tokens"],
+                        "cache_write_tokens": _ut["cache_write_tokens"],
+                        "api_calls": _ut["api_calls"],
                     })
                 except Exception:
                     logger.debug("[multitenancy] token usage capture skipped", exc_info=True)
