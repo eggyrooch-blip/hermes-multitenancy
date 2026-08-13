@@ -316,7 +316,7 @@ class RelayStore:
             )
             self._conn.execute(
                 """
-                INSERT INTO relay_messages
+                INSERT OR IGNORE INTO relay_messages
                     (resource_id, token_id, idempotency_key, request_hash, kind, status,
                      reply_expires_at, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, 'sending', ?, ?, ?)
@@ -559,6 +559,35 @@ class RelayStore:
                 "SELECT * FROM relay_cards WHERE card_id=?", (card_id,)
             ).fetchone()
         return dict(row), nonce, True
+
+    def register_card_message(
+        self, token_id: str, idempotency_key: str, message_id: str, reply_expires_at: int
+    ) -> None:
+        """Give a button card a text-reply fallback by also listing it as a message.
+
+        ponytail: the reply matcher only reads relay_messages, so without this row a
+        typed reply to a card is either dropped or misattributed to another message.
+        """
+        now = _now_ms()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO relay_messages
+                    (resource_id, token_id, idempotency_key, request_hash, kind, status,
+                     message_id, reply_expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, '', 'card', 'sent', ?, ?, ?, ?)
+                """,
+                (
+                    "msg_" + secrets.token_hex(12),
+                    token_id,
+                    idempotency_key,
+                    message_id,
+                    reply_expires_at,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
 
     def finish_card(self, card_id: str, message_id: str, conversation_id: str) -> None:
         with self._lock:
