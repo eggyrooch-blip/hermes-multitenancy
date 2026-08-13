@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import types
 from urllib.parse import parse_qs, urlparse
 
@@ -1171,6 +1172,112 @@ def test_card_message_content_update_is_verbatim_and_owner_bound(tmp_path):
                 f"/v1/messages/{message_id}", json={"content": updated_content}
             )
             assert unauth.status == 401
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_reply_window_can_be_closed_on_arrival(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        RELAY_STORE_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        events = app[RELAY_EVENTS_KEY]
+        store = app[RELAY_STORE_KEY]
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            first = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "round 1?"},
+                    "idempotency_key": "round-1",
+                    "reply_window_seconds": 300,
+                },
+            )
+            first_id = (await first.json())["message_id"]
+
+            closed = await client.patch(
+                f"/v1/messages/{first_id}",
+                headers=alice,
+                json={"reply_window_seconds": 0},
+            )
+            assert closed.status == 200
+
+            # the window is shut: a plain reply no longer lands anywhere
+            assert not await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-late",
+                text="too late",
+                create_time=int(time.time() * 1000),
+            )
+            replies = await client.get(f"/v1/messages/{first_id}/replies", headers=alice)
+            assert (await replies.json())["replies"] == []
+
+            # retention still works: the stamp is a real timestamp, never NULL
+            with store._lock:
+                stamp = store._conn.execute(
+                    "SELECT reply_expires_at FROM relay_messages WHERE message_id=?",
+                    (first_id,),
+                ).fetchone()["reply_expires_at"]
+            assert stamp is not None and stamp <= int(time.time() * 1000)
+
+            # closing again is a 409, not a silent success
+            again = await client.patch(
+                f"/v1/messages/{first_id}",
+                headers=alice,
+                json={"reply_window_seconds": 0},
+            )
+            assert again.status == 409
+
+            # round 2 opens a fresh window and is unambiguous again
+            second = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "round 2?"},
+                    "idempotency_key": "round-2",
+                    "reply_window_seconds": 300,
+                },
+            )
+            second_id = (await second.json())["message_id"]
+            assert await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-round-2",
+                text="批准",
+                create_time=int(time.time() * 1000),
+            )
+            assert feishu.ambiguity_notices == []
+            landed = await client.get(f"/v1/messages/{second_id}/replies", headers=alice)
+            assert [r["text"] for r in (await landed.json())["replies"]] == ["批准"]
         finally:
             await client.close()
 
