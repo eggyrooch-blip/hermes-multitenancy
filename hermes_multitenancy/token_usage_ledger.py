@@ -158,3 +158,96 @@ def append_token_usage(
         # debug-only：台账是 best-effort 旁路，写失败绝不该污染用户可见的 ERROR 日志，
         # 更不能影响主回合。exc_info 保留堆栈供排障。
         logger.debug("[multitenancy] token usage ledger append failed", exc_info=True)
+
+
+# ── 只读聚合（Done 线的"能算出来"那一半）────────────────────────────────────
+# 埋点只是把数写下来；判断"分级路由到底省不省"要的是这两个比率。放在本模块里而不是
+# 单开脚本，是因为字段契约就在上面几十行，改字段时一眼能看到消费侧。
+#   python -m hermes_multitenancy.token_usage_ledger [--date YYYY-MM-DD] [--path ...]
+
+
+def summarize_rows(rows: Any) -> dict[str, dict[str, float]]:
+    """按 platform 聚合出「每轮平均模型调用次数」与「缓存命中率」。
+
+    缓存命中率 = cache_read / (cache_read + input)：分母是"本可以按全价付的输入量"，
+    所以这个比率直接就是"换模型会打掉多少便宜 token"的上界。分母为 0 时记 0.0 而非
+    抛除零 —— 老行没有这些字段，值一律读作 0。
+    """
+    acc: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        bucket = acc.setdefault(
+            str(row.get("platform") or "<unknown>"),
+            {"turns": 0, "api_calls": 0, "cache_read_tokens": 0,
+             "cache_write_tokens": 0, "input_tokens": 0, "output_tokens": 0},
+        )
+        bucket["turns"] += 1
+        for key in ("api_calls", "cache_read_tokens", "cache_write_tokens",
+                    "input_tokens", "output_tokens"):
+            bucket[key] += _int(row.get(key))
+
+    out: dict[str, dict[str, float]] = {}
+    for platform, b in acc.items():
+        turns = b["turns"]
+        cacheable = b["cache_read_tokens"] + b["input_tokens"]
+        out[platform] = dict(
+            b,
+            calls_per_turn=(b["api_calls"] / turns) if turns else 0.0,
+            cache_hit_rate=(b["cache_read_tokens"] / cacheable) if cacheable else 0.0,
+        )
+    return out
+
+
+def iter_ledger_rows(path: Path, date_prefix: str = "") -> Any:
+    """逐行读台账，坏行跳过（台账是 append-only 旁路，半行/脏行不该让统计整个失败）。"""
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            if date_prefix and not str(row.get("ts") or "").startswith(date_prefix):
+                continue
+            yield row
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python -m hermes_multitenancy.token_usage_ledger",
+        description="只读聚合 token 台账：每轮平均模型调用次数 + 缓存命中率，按平台分组。",
+    )
+    ap.add_argument("--date", default="", help="只看某天，YYYY-MM-DD（默认全部）")
+    ap.add_argument("--path", default="", help="台账路径（默认取 env / 内置默认）")
+    args = ap.parse_args(argv)
+
+    path = Path(args.path).expanduser() if args.path else token_usage_ledger_path()
+    if not path.exists():
+        print(f"台账不存在: {path}")
+        return 1
+
+    stats = summarize_rows(iter_ledger_rows(path, args.date))
+    if not stats:
+        print(f"{path} 在该范围内没有数据（--date={args.date or '全部'}）")
+        return 1
+
+    print(f"{path}  range={args.date or 'all'}")
+    print(f"{'platform':<12}{'turns':>8}{'calls/turn':>12}{'cache_hit':>11}"
+          f"{'input':>16}{'cache_read':>16}")
+    for platform in sorted(stats, key=lambda k: -stats[k]["turns"]):
+        s = stats[platform]
+        print(f"{platform:<12}{int(s['turns']):>8}{s['calls_per_turn']:>12.1f}"
+              f"{s['cache_hit_rate'] * 100:>10.1f}%{int(s['input_tokens']):>16,}"
+              f"{int(s['cache_read_tokens']):>16,}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    raise SystemExit(_main())

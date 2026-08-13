@@ -250,3 +250,96 @@ def test_cron_subprocess_env_carries_the_marker(monkeypatch, tmp_path: Path) -> 
 
     assert seen.get("HERMES_CRON_JOB") == "1"
     assert seen.get("HERMES_HOME") == str(tmp_path.resolve())
+
+
+# ── 只读聚合 CLI ───────────────────────────────────────────────────────────
+# 埋点写下来的数要能被算出来，Done 线的后半句就是这个。
+
+def _write_ledger(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_summarize_groups_three_platforms_separately() -> None:
+    from hermes_multitenancy.token_usage_ledger import summarize_rows
+
+    rows = [
+        # cron：两轮，共 30 次调用，缓存 900/(900+100)=90%
+        {"platform": "cron", "api_calls": 10, "cache_read_tokens": 400, "input_tokens": 50},
+        {"platform": "cron", "api_calls": 20, "cache_read_tokens": 500, "input_tokens": 50},
+        # feishu：一轮 2 次调用，缓存 0
+        {"platform": "feishu", "api_calls": 2, "cache_read_tokens": 0, "input_tokens": 1000},
+        {"platform": "webui", "api_calls": 6, "cache_read_tokens": 300, "input_tokens": 100},
+    ]
+    got = summarize_rows(rows)
+
+    assert set(got) == {"cron", "feishu", "webui"}
+    assert got["cron"]["turns"] == 2
+    assert got["cron"]["calls_per_turn"] == 15.0
+    assert got["cron"]["cache_hit_rate"] == 0.9
+    assert got["feishu"]["calls_per_turn"] == 2.0
+    assert got["feishu"]["cache_hit_rate"] == 0.0
+    assert got["webui"]["cache_hit_rate"] == 0.75
+
+
+def test_summarize_handles_zero_denominator_and_legacy_rows() -> None:
+    """老行没有新字段；全 0 的行不能除零，必须记 0.0。"""
+    from hermes_multitenancy.token_usage_ledger import summarize_rows
+
+    got = summarize_rows([
+        {"platform": "feishu"},                       # 老行：三字段全缺
+        {"platform": "feishu", "input_tokens": 0},     # 分母为 0
+    ])
+    assert got["feishu"]["turns"] == 2
+    assert got["feishu"]["calls_per_turn"] == 0.0
+    assert got["feishu"]["cache_hit_rate"] == 0.0
+
+
+def test_iter_ledger_rows_skips_malformed_lines(tmp_path: Path) -> None:
+    from hermes_multitenancy.token_usage_ledger import iter_ledger_rows
+
+    ledger = tmp_path / "t.jsonl"
+    ledger.write_text(
+        '{"ts":"2026-08-13T10:00:00+08:00","platform":"cron","api_calls":3}\n'
+        "\n"
+        "{ this is not json\n"          # 半行/脏行：跳过，不能让统计整个失败
+        '"a bare string"\n'             # 合法 JSON 但不是 dict
+        '{"ts":"2026-08-12T10:00:00+08:00","platform":"feishu","api_calls":1}\n',
+        encoding="utf-8",
+    )
+    assert [r["platform"] for r in iter_ledger_rows(ledger)] == ["cron", "feishu"]
+    # --date 过滤只看那一天
+    assert [r["platform"] for r in iter_ledger_rows(ledger, "2026-08-13")] == ["cron"]
+
+
+def test_cli_prints_both_ratios_per_platform(tmp_path: Path, capsys) -> None:
+    from hermes_multitenancy.token_usage_ledger import _main
+
+    ledger = tmp_path / "t.jsonl"
+    _write_ledger(ledger, [
+        {"ts": "2026-08-13T10:00:00+08:00", "platform": "cron",
+         "api_calls": 12, "cache_read_tokens": 900, "input_tokens": 100},
+        {"ts": "2026-08-13T10:01:00+08:00", "platform": "feishu",
+         "api_calls": 2, "cache_read_tokens": 0, "input_tokens": 500},
+    ])
+    assert _main(["--path", str(ledger), "--date", "2026-08-13"]) == 0
+
+    out = capsys.readouterr().out
+    assert "cron" in out and "feishu" in out
+    assert "12.0" in out          # cron calls/turn
+    assert "90.0%" in out         # cron cache hit
+    assert "2.0" in out           # feishu calls/turn
+
+
+def test_cli_reports_missing_or_empty_ledger(tmp_path: Path, capsys) -> None:
+    from hermes_multitenancy.token_usage_ledger import _main
+
+    assert _main(["--path", str(tmp_path / "nope.jsonl")]) == 1
+    assert "台账不存在" in capsys.readouterr().out
+
+    empty = tmp_path / "e.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert _main(["--path", str(empty)]) == 1
+    assert "没有数据" in capsys.readouterr().out
