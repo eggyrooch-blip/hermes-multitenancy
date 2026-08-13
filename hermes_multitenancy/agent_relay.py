@@ -481,6 +481,18 @@ def create_agent_relay_app(
         except RelayConflict as exc:
             return _error("idempotency_conflict", str(exc), 409)
         if row["status"] != "sending":
+            # ponytail: heal a missing text fallback on replay — the first attempt may
+            # have died between finish_card and the register below.
+            if str(row["message_id"] or ""):
+                try:
+                    store.register_card_message(
+                        actor["token_id"], key, str(row["message_id"]), int(row["expires_at"])
+                    )
+                except Exception:
+                    logger.warning(
+                        "relay_audit event=card status=fallback_register_failed actor=%s",
+                        actor["identity_fingerprint"],
+                    )
             return web.json_response(store._public_card(row))
         try:
             result = await asyncio.wait_for(
@@ -534,6 +546,18 @@ def create_agent_relay_app(
         store.finish_card(
             str(row["card_id"]), message_id, str(result.get("conversation_id") or "")
         )
+        try:
+            # ponytail: the window is the card's OWN expiry, not a fresh clock read —
+            # a slow send would otherwise leave the text window alive past the card.
+            store.register_card_message(
+                actor["token_id"], key, message_id, int(row["expires_at"])
+            )
+        except Exception:
+            # ponytail: the text fallback is a bonus — never fail a delivered card over it.
+            logger.warning(
+                "relay_audit event=card status=fallback_register_failed actor=%s",
+                actor["identity_fingerprint"],
+            )
         state = store.card_state(actor["token_id"], str(row["card_id"]))
         logger.info("relay_audit event=card status=pending actor=%s", actor["identity_fingerprint"])
         return web.json_response(state, status=201 if created else 200)

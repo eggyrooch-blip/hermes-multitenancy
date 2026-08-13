@@ -1282,3 +1282,175 @@ def test_reply_window_can_be_closed_on_arrival(tmp_path):
             await client.close()
 
     asyncio.run(runner())
+
+
+def test_button_card_gets_a_text_reply_fallback(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        events = app[RELAY_EVENTS_KEY]
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            posted = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "card-fallback",
+                },
+            )
+            assert posted.status == 201
+            body = await posted.json()
+            assert set(body) == {"card_id", "status", "message_id", "expires_at"}
+            card_message_id = body["message_id"]
+
+            assert await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-card-reply",
+                text="批准",
+                create_time=int(time.time() * 1000),
+                parent_message_id=card_message_id,
+            )
+            replies = await client.get(
+                f"/v1/messages/{card_message_id}/replies", headers=alice
+            )
+            assert replies.status == 200
+            assert [r["text"] for r in (await replies.json())["replies"]] == ["批准"]
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_card_fallback_row_carries_the_card_ttl_and_never_breaks_the_card(tmp_path, caplog):
+    """The registered row must expire WITH the card, and its failure must stay invisible."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        RELAY_STORE_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        store = app[RELAY_STORE_KEY]
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            made = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "ttl-card",
+                },
+            )
+            body = await made.json()
+            with store._lock:
+                row = store._conn.execute(
+                    "SELECT reply_expires_at, idempotency_key FROM relay_messages WHERE message_id=?",
+                    (body["message_id"],),
+                ).fetchone()
+            # window ends exactly WITH the card, not a fresh clock read after the send
+            assert row["reply_expires_at"] == body["expires_at"]
+            # raw key: a later POST /v1/messages reusing it must 409, never 500
+            reused = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "hi"},
+                    "idempotency_key": "ttl-card",
+                },
+            )
+            assert reused.status == 409
+            assert (await reused.json())["error"]["code"] == "idempotency_conflict"
+
+            # a live card + a live message = two windows → unreferenced replies are ambiguous
+            await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "and?"},
+                    "idempotency_key": "second-window",
+                    "reply_window_seconds": 300,
+                },
+            )
+            events = app[RELAY_EVENTS_KEY]
+            assert not await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-ambiguous",
+                text="哪个?",
+                create_time=int(time.time() * 1000),
+            )
+            assert feishu.ambiguity_notices == ["ou_alice"]
+
+            # registration failure must not touch the card's own response
+            store.register_card_message = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down"))
+            broken = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "card-register-broken",
+                },
+            )
+            assert broken.status == 201
+            assert (await broken.json())["status"] == "pending"
+        finally:
+            await client.close()
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(runner())
+    assert "fallback_register_failed" in caplog.text
