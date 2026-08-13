@@ -177,3 +177,41 @@ def test_mark_event_processed_is_thread_safe_on_shared_connection(store):
         results = list(pool.map(mark, range(8)))
     assert results.count(True) == 1
     assert results.count(False) == 7
+
+
+def test_failed_processed_event_transaction_is_rolled_back(tmp_path):
+    """A cleanup failure must not leave the failed claim pending for a later commit."""
+    import sqlite3
+    from hermes_multitenancy.sessions import SessionStore
+
+    db_path = tmp_path / "sessions.db"
+    setup = SessionStore(db_path)
+    setup.close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO multitenancy_processed_events"
+            " (event_key, profile_name, user_key, ts) VALUES ('old', 'p', 'u', 1)"
+        )
+        conn.execute(
+            "CREATE TRIGGER reject_event_cleanup BEFORE DELETE"
+            " ON multitenancy_processed_events BEGIN"
+            " SELECT RAISE(ABORT, 'cleanup failed'); END"
+        )
+
+    candidate = SessionStore(db_path)
+    with pytest.raises(sqlite3.IntegrityError, match="cleanup failed"):
+        candidate.mark_event_processed(
+            "failed-claim", profile_name="p", user_key="u",
+            message_id=None, content_hash=None, ttl_seconds=0,
+        )
+    candidate.append("p", "u", "user", "subsequent write")
+    candidate.close()
+
+    check = SessionStore(db_path)
+    try:
+        assert check.is_event_processed("failed-claim", 3600) is False
+        assert check.load_recent("p", "u", 10) == [
+            {"role": "user", "content": "subsequent write"}
+        ]
+    finally:
+        check.close()

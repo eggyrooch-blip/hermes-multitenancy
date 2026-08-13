@@ -61,6 +61,7 @@ class SessionStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
@@ -68,12 +69,16 @@ class SessionStore:
         """Append one message to a user's history. Microsecond ts dedups bursts."""
         ts = time.monotonic_ns()
         with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO multitenancy_sessions"
-                " (profile_name, user_key, ts, role, content) VALUES (?, ?, ?, ?, ?)",
-                (profile_name, user_key, ts, role, content),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO multitenancy_sessions"
+                    " (profile_name, user_key, ts, role, content) VALUES (?, ?, ?, ?, ?)",
+                    (profile_name, user_key, ts, role, content),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def load_recent(self, profile_name: str, user_key: str, limit: int) -> list[dict]:
         """Return the last ``limit`` messages oldest-first (LLM order)."""
@@ -91,12 +96,16 @@ class SessionStore:
     def clear(self, profile_name: str, user_key: str) -> int:
         """Hard-delete a user's history. Returns rows removed."""
         with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM multitenancy_sessions WHERE profile_name = ? AND user_key = ?",
-                (profile_name, user_key),
-            )
-            self._conn.commit()
-            return cur.rowcount
+            try:
+                cur = self._conn.execute(
+                    "DELETE FROM multitenancy_sessions WHERE profile_name = ? AND user_key = ?",
+                    (profile_name, user_key),
+                )
+                self._conn.commit()
+                return cur.rowcount
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def count(self, profile_name: str, user_key: str) -> int:
         """Number of messages stored for a (profile, user). Diagnostic only."""
@@ -123,7 +132,8 @@ class SessionStore:
             now = int(time.time())
             ttl = max(0, int(ttl_seconds))
             cutoff = now - ttl
-            cur = self._conn.execute(
+            try:
+                cur = self._conn.execute(
                 "INSERT INTO multitenancy_processed_events"
                 " (event_key, profile_name, user_key, message_id, content_hash, ts)"
                 " VALUES (?, ?, ?, ?, ?, ?)"
@@ -144,14 +154,17 @@ class SessionStore:
                     cutoff,
                 ),
             )
-            accepted = cur.rowcount == 1
-            if accepted:
-                self._conn.execute(
-                    "DELETE FROM multitenancy_processed_events WHERE ts < ?",
-                    (now - max(ttl, 86400),),
-                )
-            self._conn.commit()
-            return accepted
+                accepted = cur.rowcount == 1
+                if accepted:
+                    self._conn.execute(
+                        "DELETE FROM multitenancy_processed_events WHERE ts < ?",
+                        (now - max(ttl, 86400),),
+                    )
+                self._conn.commit()
+                return accepted
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def is_event_processed(self, event_key: str, ttl_seconds: int) -> bool:
         """Return whether an event key is recent without changing stored state."""

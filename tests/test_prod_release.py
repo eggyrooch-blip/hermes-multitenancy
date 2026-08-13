@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -52,6 +53,9 @@ def _make_repo(path: Path, with_probes: bool, probe_exit: int = 0, prebuilt: boo
         probe = d / "hermes-release-probes.sh"
         probe.write_text(f"#!/usr/bin/env bash\necho 'PROBES stub'\nexit {probe_exit}\n")
         probe.chmod(0o755)
+        installer = d / "install-gateway-dropins.sh"
+        installer.write_text("#!/usr/bin/env bash\nexit 0\n")
+        installer.chmod(0o755)
     _git(path, "add", "-A")
     _git(path, "commit", "-q", "-m", "init")
     return _git(path, "rev-parse", "HEAD")
@@ -65,6 +69,7 @@ def env(tmp_path: Path):
     code = home / "code"
     for d in (releases, code, home / ".hermes"):
         d.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(home / ".hermes" / "multitenancy.db").close()
 
     mt_src = tmp_path / "src-mt"
     webui_src = tmp_path / "src-webui"
@@ -98,7 +103,15 @@ def env(tmp_path: Path):
 
     # 桩 systemctl：只记调用，不真动服务
     stub = tmp_path / "systemctl-stub.sh"
-    stub.write_text("#!/usr/bin/env bash\necho \"$@\" >> \"$SYSTEMCTL_LOG\"\nexit 0\n")
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo \"$@\" >> \"$SYSTEMCTL_LOG\"\n"
+        'if [ "$1" = "start" ] && [ -f "$SYSTEMCTL_FAIL_NEXT_START" ]; then\n'
+        '  rm -f "$SYSTEMCTL_FAIL_NEXT_START"\n'
+        "  exit 1\n"
+        "fi\n"
+        "exit 0\n"
+    )
     stub.chmod(0o755)
 
     # 桩 uv + venv python：editable 重装是每次切换的硬步骤（release-editable-reinstall）。
@@ -127,6 +140,7 @@ def env(tmp_path: Path):
         "HOME": str(home), "RELEASES": str(releases), "CODE": str(code),
         "STATE_FILE": str(home / ".hermes" / "deployed-release"),
         "BACKUP_ROOT": str(home / "backups" / "pre-release"),
+        "SESSION_DB": str(home / ".hermes" / "multitenancy.db"),
         "LOCK": str(home / ".hermes" / ".release.lock"),
         "SYSTEMCTL": str(stub), "SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "BACKUP_SH": str(bstub),           # 备份本体另有测试覆盖，这里只要它存在
@@ -134,6 +148,7 @@ def env(tmp_path: Path):
         "UV_BIN": str(uv_stub), "VENV_PY": str(venv_stub),
         "UV_STATE": str(tmp_path / "uv-state"),
         "UV_FAIL_FLAG": str(tmp_path / "uv-fail-flag"),
+        "SYSTEMCTL_FAIL_NEXT_START": str(tmp_path / "fail-next-start"),
         "PATH": os.environ["PATH"],
         "_mt_sha": mt_sha, "_webui_sha": webui_sha,
         "_releases": releases, "_code": code, "_mt_src": mt_src,
@@ -543,6 +558,70 @@ def test_release_reinstalls_editable_before_start(env):
     assert i_stop < i_uv < i_start, f"顺序必须 stop→重装→start：{lines}"
 
 
+def test_release_installs_gateway_dropins_before_start(env):
+    src = env["_mt_src"]
+    installer = src / "deploy/install-gateway-dropins.sh"
+    installer.write_text(
+        '#!/usr/bin/env bash\n'
+        '[ "$HERMES_MEEGLE_PREPARED" = "1" ] || exit 9\n'
+        'echo dropin-install >> "$SYSTEMCTL_LOG"\n'
+    )
+    installer.chmod(0o755)
+    (src / "extra-dropin.txt").write_text("new\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "dropin")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-dropin", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    r = _run(env)
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = Path(env["SYSTEMCTL_LOG"]).read_text().splitlines()
+    assert lines.index("dropin-install") < min(
+        i for i, line in enumerate(lines) if line.startswith("start")
+    )
+
+
+def test_probe_rollback_restores_previous_gateway_dropins(env):
+    current = Path(env["RELEASES"]) / "mt-current/deploy"
+    current.mkdir(parents=True, exist_ok=True)
+    old_installer = current / "install-gateway-dropins.sh"
+    old_installer.write_text('#!/usr/bin/env bash\necho old-dropin-install >> "$SYSTEMCTL_LOG"\n')
+    old_installer.chmod(0o755)
+    src = env["_mt_src"]
+    new_installer = src / "deploy/install-gateway-dropins.sh"
+    new_installer.write_text('#!/usr/bin/env bash\necho new-dropin-install >> "$SYSTEMCTL_LOG"\n')
+    new_installer.chmod(0o755)
+    (src / "deploy/hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (src / "deploy/hermes-release-probes.sh").chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "bad probe with dropin")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-dropinrb", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    r = _run(env)
+
+    assert r.returncode != 0
+    lines = Path(env["SYSTEMCTL_LOG"]).read_text().splitlines()
+    assert lines.index("new-dropin-install") < lines.index("old-dropin-install")
+
+
+def test_probe_rollback_missing_previous_dropin_installer_needs_human(env):
+    old_installer = Path(env["RELEASES"]) / "mt-current/deploy/install-gateway-dropins.sh"
+    old_installer.unlink()
+    src = env["_mt_src"]
+    (src / "deploy/hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (src / "deploy/hermes-release-probes.sh").chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "bad probe")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-missingoldinstaller", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    r = _run(env)
+
+    assert r.returncode != 0
+    rb = (Path(env["BACKUP_ROOT"]) / "release-missingoldinstaller" / "ROLLBACK.txt").read_text()
+    assert "outcome=NEEDS_HUMAN" in rb
+    assert "outcome=ROLLED_BACK" not in rb
+
+
 def test_editable_reinstall_failure_rolls_back(env):
     """重装/读回失败 = 新版本没真生效，必须按切换失败处理：翻回、重启、记 outcome。"""
     src = env["_mt_src"]
@@ -576,9 +655,68 @@ def test_probe_rollback_reinstalls_editable_to_prev(env):
     assert r.returncode != 0
     installed = Path(env["UV_STATE"]).read_text().strip()
     prev = str((Path(env["RELEASES"]) / "mt-current").resolve())
-    assert Path(installed).resolve() == Path(prev).resolve(), (
+    assert installed == prev, (
         f"回滚后 editable 最终必须指向上一版：installed={installed}"
     )
+
+
+def test_gateway_start_failure_rolls_back_instead_of_running_probes_as_green(env):
+    src = env["_mt_src"]
+    (src / "extra.txt").write_text("new\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "green probe")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-startfail", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+    Path(env["SYSTEMCTL_FAIL_NEXT_START"]).write_text("fail once\n")
+
+    before = _links(env)
+    r = _run(env)
+
+    assert r.returncode != 0
+    assert _links(env) == before
+    assert not Path(env["STATE_FILE"]).exists()
+    rb = (Path(env["BACKUP_ROOT"]) / "release-startfail" / "ROLLBACK.txt").read_text()
+    assert "outcome=ROLLED_BACK" in rb
+
+
+def test_connector_prepare_failure_happens_before_service_stop(env):
+    src = env["_mt_src"]
+    prepare = src / "deploy/ensure-meegle.sh"
+    prepare.write_text("#!/usr/bin/env bash\nexit 1\n")
+    prepare.chmod(0o755)
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "bad connector")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-connectorfail", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+
+    before = _links(env)
+    r = _run(env)
+
+    assert r.returncode != 0
+    assert "未停止服务" in r.stderr
+    assert _links(env) == before
+    log = Path(env["SYSTEMCTL_LOG"])
+    assert not log.exists() or "stop" not in log.read_text()
+
+
+def test_session_write_lock_probe_failure_happens_before_service_stop(env, tmp_path):
+    src = env["_mt_src"]
+    (src / "extra-db-lock.txt").write_text("new\n")
+    _git(src, "add", "-A"); _git(src, "commit", "-q", "-m", "db lock")
+    sha = _git(src, "rev-parse", "HEAD")
+    _tag(env, "release-dblock", f"multitenancy: {sha}\nwebui: {env['_webui_sha']}")
+    fake_bin = tmp_path / "fake-sqlite"
+    fake_bin.mkdir()
+    sqlite = fake_bin / "sqlite3"
+    sqlite.write_text("#!/usr/bin/env bash\nexit 1\n")
+    sqlite.chmod(0o755)
+
+    before = _links(env)
+    r = _run({**env, "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}"})
+
+    assert r.returncode != 0
+    assert "session DB 写锁探针失败" in r.stderr
+    assert _links(env) == before
+    log = Path(env["SYSTEMCTL_LOG"])
+    assert not log.exists() or "stop" not in log.read_text()
 
 
 def test_env_hash_survives_a_release(env):
