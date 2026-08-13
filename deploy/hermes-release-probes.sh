@@ -36,10 +36,19 @@ bad() { printf '  ✗ %s\n' "$*"; fail=$((fail+1)); }
 # ── 1. systemd 单元 ──────────────────────────────────────────────────
 # 探针本来就要跑 systemctl，这里展开无所谓；专家 bot 的 gateway 也必须探 ——
 # 它跑着同一份代码，发布后没起来就是发布没成功。
+# activating 是「还在起」不是「起不来」：2026-08-13 release-20260813-02 首次发布
+# 就因为 gateway 恰好还在 activating 被判死并自动回滚，重跑同一版本 12/12 全绿。
+# 和 webui 一样轮询等待，只有等满 BOOT_WAIT 仍不 active 才算失败。
 USER_UNITS="${USER_UNITS:-hermes-gateway.service hermes-web-ui.service ai-gateway-broker.service $(_expert_units)}"
 for u in $USER_UNITS; do
-  st=$($SYSTEMCTL is-active "$u" 2>/dev/null)
-  [ "$st" = "active" ] && ok "$u = active" || bad "$u = ${st:-unknown}"
+  st=""
+  for _ in $(seq 1 $((BOOT_WAIT / 5))); do
+    st=$($SYSTEMCTL is-active "$u" 2>/dev/null)
+    # failed/inactive 是终态，等下去也不会变好 —— 立刻判死，别白等 90 秒
+    [ "$st" = "active" ] || [ "$st" = "failed" ] || [ "$st" = "inactive" ] && break
+    sleep 5
+  done
+  [ "$st" = "active" ] && ok "$u = active" || bad "$u = ${st:-unknown}（等了最多 ${BOOT_WAIT}s）"
 done
 
 # ── 2. webui：轮询等它起来，别一次就判死 ─────────────────────────────
