@@ -210,6 +210,8 @@ class FeishuRelayClient:
         else:
             text = f"Status: {status}" + (f" ({action_id})" if action_id else "")
             card = {"elements": [{"tag": "markdown", "content": text}]}
+        # ponytail: keep the server-composed fallback. The card_action click path has
+        # no caller content; without this the card keeps live-looking buttons forever.
         self._request_json(
             f"https://open.feishu.cn/open-apis/im/v1/messages/{urllib.parse.quote(message_id)}",
             method="PATCH",

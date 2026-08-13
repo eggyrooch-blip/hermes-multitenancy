@@ -113,14 +113,9 @@ class RelayEvents:
             return False
         changed = self.store.action_card(**event)
         if changed:
-            await _await(
-                self.feishu.update_card(
-                    card_id=event["card_id"],
-                    message_id=event["message_id"],
-                    status="actioned",
-                    action_id=event["action_id"],
-                )
-            )
+            # 不在这里改卡片外观：调用方拿到 action_id 后会用自己手里的原文做局部替换
+            # （只换按钮那一块、正文保留）。服务端拼不出那个内容，硬拼只会把仓库、
+            # 命令、意图全抹成一行状态，对用户是负收益。
             logger.info(
                 "relay_audit event=card_action status=actioned action=%s actor=%s",
                 event["action_id"],
@@ -577,40 +572,87 @@ def create_agent_relay_app(
             payload = await request.json()
         except Exception:
             return _error("invalid_json", "body must be a JSON object", 400)
-        reason = str((payload or {}).get("reason") or "") if isinstance(payload, dict) else ""
-        if not isinstance(payload, dict) or payload.get("status") != "closed" or reason not in {
-            "local_resumed",
-            "client_timeout",
-            "cancelled",
-        }:
-            return _error("invalid_close", "status and a valid close reason are required", 400)
-        state, changed = store.close_card(
-            actor["token_id"], str(request.match_info["card_id"]), reason
-        )
-        if state is None:
-            return _error("not_found", "card not found", 404)
-        if not changed and not (
-            state.get("status") == "closed" and state.get("reason") == reason
-        ):
-            return web.json_response(state, status=409)
-        try:
-            await asyncio.wait_for(
-                _await(
-                    feishu.update_card(
-                        card_id=state["card_id"],
-                        message_id=state["message_id"],
-                        status="closed",
-                    )
-                ),
-                timeout=5,
+        if not isinstance(payload, dict):
+            return _error("invalid_json", "body must be a JSON object", 400)
+        if _contains_forbidden_identity(payload):
+            logger.warning("relay_audit event=identity_reject status=denied actor=%s", actor["identity_fingerprint"])
+            return _error("identity_field_forbidden", "recipient and identity fields are not accepted", 400)
+
+        card_id = str(request.match_info["card_id"])
+        content = payload.get("content")
+        wants_close = "status" in payload or "reason" in payload
+
+        # 两件事可以各自单独做，也可以一次做完（超时那一次就是「关闭 + 改成已超时」）
+        if content is None and not wants_close:
+            return _error("invalid_close",
+                          "provide content, or status with a close reason, or both", 400)
+
+        if content is not None:
+            if not isinstance(content, dict):
+                return _error("invalid_card", "content must be a card object", 400)
+            if len(json.dumps(content, ensure_ascii=False).encode("utf-8")) > MAX_CONTENT_BYTES:
+                return _error("content_too_large", "content exceeds 30720 bytes", 400)
+            try:
+                _card_with_actions(content, [], "", "")
+            except ValueError as exc:
+                return _error("invalid_card", str(exc), 400)
+
+        if wants_close:
+            reason = str(payload.get("reason") or "")
+            if payload.get("status") != "closed" or reason not in {
+                "local_resumed",
+                "client_timeout",
+                "cancelled",
+            }:
+                return _error("invalid_close", "status and a valid close reason are required", 400)
+            state, changed = store.close_card(actor["token_id"], card_id, reason)
+            if state is None:
+                return _error("not_found", "card not found", 404)
+            if not changed and not (
+                state.get("status") == "closed" and state.get("reason") == reason
+            ):
+                return web.json_response(state, status=409)
+        else:
+            # 只改外观：卡片可能已经是 actioned（用户点过按钮），那时没有状态要改
+            state = store.card_state(actor["token_id"], card_id)
+            if state is None:
+                return _error("not_found", "card not found", 404)
+
+        if content is not None or wants_close:
+            if not state.get("message_id"):
+                return _error("not_delivered", "card has no delivered message to update", 409)
+            # ponytail: no caller content on a close → server-composed terminal look,
+            # which is what every pre-existing client relies on.
+            update = (
+                {"content": content}
+                if content is not None
+                else {"status": "closed"}
             )
-        except FeishuApiError as exc:
-            if exc.status == 429:
-                return _error("rate_limited", "Feishu rate limited the request", 429, exc.retry_after or 1)
-            return _error("upstream_unavailable", "card closed but Feishu update failed", 502)
-        except Exception:
-            return _error("upstream_unavailable", "card closed but Feishu update failed", 502)
-        logger.info("relay_audit event=card status=closed actor=%s", actor["identity_fingerprint"])
+            try:
+                await asyncio.wait_for(
+                    _await(feishu.update_card(message_id=state["message_id"], **update)),
+                    timeout=5,
+                )
+            except TimeoutError:
+                return _error("upstream_timeout", "Feishu update timed out", 504)
+            except FeishuApiError as exc:
+                if exc.status == 429:
+                    return _error("rate_limited",
+                                  _feishu_error_message("Feishu rate limited the request", exc),
+                                  429, exc.retry_after or 1)
+                if exc.status == 400:
+                    return _error("invalid_card",
+                                  _feishu_error_message("Feishu rejected the payload", exc), 400)
+                return _error("upstream_unavailable",
+                              _feishu_error_message("card state updated but Feishu update failed", exc),
+                              502)
+            except Exception:
+                return _error("upstream_unavailable",
+                              "card state updated but Feishu update failed", 502)
+
+        logger.info("relay_audit event=card status=%s content=%s actor=%s",
+                    state.get("status"), "yes" if content is not None else "no",
+                    actor["identity_fingerprint"])
         return web.json_response(state)
 
     async def cleanup(app):
