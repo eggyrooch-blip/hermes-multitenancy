@@ -14,28 +14,62 @@
 # PATH. So installing meegle there makes the reader use it automatically, with
 # NO code change.
 #
-# Idempotent: a no-op when the binary already exists. Non-fatal by design — a
-# failed/slow install must NEVER block gateway start, so this always exits 0 and
-# is wired as a `ExecStartPre=-` (leading dash) in the gateway drop-in.
+# Install mode downloads into a staging prefix and atomically replaces only the
+# current platform binary. `--check` is network-free and is the only mode used
+# by gateway ExecStartPre.
 set -u
 
 PREFIX="${HERMES_MEEGLE_PREFIX:-${HOME}/.local}"
 BIN="${PREFIX}/bin/meegle"
 PKG="@lark-project/meegle@1.0.19"
+CHECK_ONLY=0
+[ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
-if npm ls -g --prefix "${PREFIX}" --depth=0 "${PKG}" >/dev/null 2>&1 && [ -x "${BIN}" ]; then
+if [ -x "${BIN}" ] && [ "$("${BIN}" version 2>/dev/null | head -1)" = "1.0.19" ]; then
   exit 0
 fi
 
+if [ "$CHECK_ONLY" = "1" ]; then
+  echo "ensure-meegle: ${PKG} is not ready in ${PREFIX}" >&2
+  exit 1
+fi
+
 echo "ensure-meegle: installing ${PKG} into ${PREFIX} ..."
-if ! npm i -g --prefix "${PREFIX}" "${PKG}" >/dev/null 2>&1; then
+OWN_STAGE=0
+if [ -n "${HERMES_MEEGLE_STAGE:-}" ]; then
+  STAGE="$HERMES_MEEGLE_STAGE"
+  mkdir -p "$STAGE"
+else
+  TMP_BASE="${TMPDIR:-/tmp}"
+  [ -d "$TMP_BASE" ] || TMP_BASE=/tmp
+  STAGE=$(mktemp -d "${TMP_BASE}/hermes-meegle.XXXXXX") || exit 1
+  OWN_STAGE=1
+fi
+cleanup() { [ "$OWN_STAGE" = "1" ] && rm -rf "$STAGE"; }
+trap cleanup EXIT
+
+if ! npm i -g --prefix "${STAGE}" "${PKG}" >/dev/null 2>&1; then
   echo "ensure-meegle: install failed (non-fatal) — reader falls back to npx -y" >&2
   exit 0
 fi
 
-if [ -x "${BIN}" ]; then
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) NATIVE="meegle-linux-x64" ;;
+  Linux-aarch64|Linux-arm64) NATIVE="meegle-linux-arm64" ;;
+  Darwin-x86_64) NATIVE="meegle-darwin-x64" ;;
+  Darwin-arm64) NATIVE="meegle-darwin-arm64" ;;
+  *) echo "ensure-meegle: unsupported platform" >&2; exit 0 ;;
+esac
+SOURCE="${STAGE}/lib/node_modules/@lark-project/meegle/bin/${NATIVE}"
+mkdir -p "${PREFIX}/bin"
+if [ -x "$SOURCE" ] && [ "$("${SOURCE}" version 2>/dev/null | head -1)" = "1.0.19" ]; then
+  install -m 0755 "$SOURCE" "${PREFIX}/bin/.meegle.tmp.$$" &&
+    mv -f "${PREFIX}/bin/.meegle.tmp.$$" "$BIN"
+fi
+
+if [ -x "${BIN}" ] && [ "$("${BIN}" version 2>/dev/null | head -1)" = "1.0.19" ]; then
   echo "ensure-meegle: installed ${BIN}"
 else
-  echo "ensure-meegle: ${BIN} still missing after install (non-fatal)" >&2
+  echo "ensure-meegle: exact binary still missing after install (non-fatal)" >&2
 fi
 exit 0

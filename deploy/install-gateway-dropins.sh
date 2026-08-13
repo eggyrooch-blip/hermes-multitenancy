@@ -49,9 +49,13 @@ sed "s#@REPO@#${REPO}#g" "$REPO/deploy/hermes-gateway-meegle.conf" \
   > "$DROPIN_DIR/45-meegle-bin.conf"
 echo "install-gateway-dropins: wrote ${DROPIN_DIR}/45-meegle-bin.conf"
 
-# Ensure the pinned binary exists now (non-fatal — the drop-in's ExecStartPre also
-# self-heals it on every gateway start).
-"$REPO/deploy/ensure-meegle.sh" || true
+# Provisioning installs while the gateway remains online. Release sets
+# HERMES_MEEGLE_PREPARED=1 after its pre-stop prepare, so this post-stop phase
+# can only perform the network-free exact-version check.
+if [ "${HERMES_MEEGLE_PREPARED:-0}" != "1" ]; then
+  "$REPO/deploy/ensure-meegle.sh"
+fi
+"$REPO/deploy/ensure-meegle.sh" --check
 
 # --- make systemd aware of the new/changed drop-ins -------------------------
 if command -v systemctl >/dev/null 2>&1; then

@@ -207,7 +207,7 @@ PREV_WEBUI=$(readlink "$CODE/hermes-web-ui" || true)
 # 指到不存在的目录上 —— 比不回滚还糟。要拒就在动任何东西之前拒。
 [ -d "$CODE/hermes-multitenancy/." ] || die "当前 multitenancy 软链悬空（$PREV_MT）—— 没有可用的回滚目标，拒绝发布"
 [ -d "$CODE/hermes-web-ui/." ] || die "当前 webui 软链悬空（$PREV_WEBUI）—— 没有可用的回滚目标，拒绝发布"
-PREV_MT_ABS=$(cd "$CODE/hermes-multitenancy/." && pwd)
+PREV_MT_ABS=$(cd "$CODE/hermes-multitenancy/." && pwd -P)
 
 # ── 发布前回滚包（不是灾备，是「这次发错了能退回去」）────────────────
 SNAP="$BACKUP_ROOT/$TAG"
@@ -281,6 +281,25 @@ NEW_PROBES="$MT_DIR/deploy/$(basename "$PROBES")"
 [ -x "$NEW_PROBES" ] || die "新版本 $MT_DIR 里没有可执行的探针（$NEW_PROBES）—— 拒绝切换，当前版本继续跑"
 log "  两个版本目录都就绪且自带探针（此刻生产仍跑旧版）"
 
+# Connector packages are prepared while the old gateway is still serving.
+# Gateway ExecStartPre is check-only, so no network/package extraction can turn
+# a routine restart into downtime.
+CONNECTOR_PREPARE="$MT_DIR/deploy/ensure-meegle.sh"
+if [ -x "$CONNECTOR_PREPARE" ]; then
+  log "准备 connector CLI（旧版服务仍在线）"
+  "$CONNECTOR_PREPARE" || die "connector CLI 准备失败 —— 未停止服务"
+  "$CONNECTOR_PREPARE" --check || die "connector CLI readiness 未通过 —— 未停止服务"
+fi
+
+# Admission must be writable before stopping a healthy gateway. This transaction
+# changes no rows; a stale writer fails the release while the current service is
+# still online instead of surfacing only after restart.
+SESSION_DB="${SESSION_DB:-$HOME/.hermes/multitenancy.db}"
+[ -f "$SESSION_DB" ] || die "session DB 不存在 —— 未停止服务"
+sqlite3 -cmd '.timeout 10000' "$SESSION_DB" 'BEGIN IMMEDIATE; ROLLBACK;' \
+  || die "session DB 写锁探针失败 —— 未停止服务"
+log "session DB 写锁探针通过（未改数据）"
+
 # ── 原子切换 ─────────────────────────────────────────────────────────
 # `ln -sfn` 是「先 unlink 再 symlink」——中间有一瞬间这个路径根本不存在。
 # 而 editable 导入(MAPPING 写死 /home/hermes/code/hermes-multitenancy/...)和
@@ -330,6 +349,13 @@ PY
   log "  editable -> $target（读回核对通过）"
 }
 
+install_dropins() {  # $1=目标 mt 版本目录（绝对路径）
+  local target="$1" installer
+  installer="${DROPIN_INSTALLER:-$target/deploy/install-gateway-dropins.sh}"
+  [ -x "$installer" ] || { log "  ✗ 缺少可执行 drop-in installer（$installer）"; return 1; }
+  HERMES_MEEGLE_PREPARED=1 HERMES_PYTHON="$VENV_PY" "$installer"
+}
+
 log "停服务 → 翻软链 → 重装 editable → 起服务"
 $SYSTEMCTL stop $(_units) 2>/dev/null || true
 if ! flip "../releases/$(basename "$MT_DIR")" "../releases/$(basename "$WEBUI_DIR")"; then
@@ -347,12 +373,24 @@ if ! reinstall_editable "$MT_DIR"; then
   outcome EDITABLE_FAILED
   die "editable 重装/读回失败，当前版本继续跑"
 fi
-$SYSTEMCTL start $(_units) 2>/dev/null || true
+if ! install_dropins "$MT_DIR"; then
+  log "gateway drop-in 安装失败 —— 翻回原样并放弃本次发布"
+  flip "$PREV_MT" "$PREV_WEBUI" || true
+  reinstall_editable "$PREV_MT_ABS" || true
+  install_dropins "$PREV_MT_ABS" || true
+  $SYSTEMCTL start $(_units) 2>/dev/null || true
+  outcome DROPIN_FAILED
+  die "gateway drop-in 安装失败，当前版本继续跑"
+fi
+$SYSTEMCTL start $(_units) 2>/dev/null
+NEW_START_OK=$?
 log "  已切到 $TAG，开始跑探针"
 
 # ── 探针决定去留 ─────────────────────────────────────────────────────
 # 用新版本自带的那份探针：判据要跟着被验的版本走
-if [ ! -x "$NEW_PROBES" ]; then
+if [ "$NEW_START_OK" != "0" ]; then
+  log "新版本服务启动失败 —— 不跑新版本探针，立即回滚"
+elif [ ! -x "$NEW_PROBES" ]; then
   log "探针脚本消失了（$NEW_PROBES）—— 无法验证，按最坏情况回滚"
 elif "$NEW_PROBES"; then
   echo "$TAG" > "$STATE_FILE"
@@ -406,6 +444,7 @@ fi
 # 回滚方向同样要重装 editable —— 软链回去了、import 还钉在坏版本上，回滚就是假的
 EDITABLE_ROLLBACK_OK=1
 reinstall_editable "$PREV_MT_ABS" || EDITABLE_ROLLBACK_OK=0
+install_dropins "$PREV_MT_ABS" || EDITABLE_ROLLBACK_OK=0
 $SYSTEMCTL start $(_units) 2>/dev/null || true
 # 回滚校验要用【旧版本自带】的探针 —— 现在跑的是旧版，判据就该跟着旧版走。
 # （用新版的探针去验旧版是张冠李戴：新版可能改了期望值。）

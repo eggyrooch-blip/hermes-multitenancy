@@ -11,7 +11,7 @@ PATH 上、且在 `_meegle_search_path()` 里），reader 自动改用它，**�
 
 ## 两个部件
 
-1. **`ensure-meegle.sh`** — 幂等安装脚本：固定 `@lark-project/meegle@1.0.19`，仅版本缺失或漂移时安装；
+1. **`ensure-meegle.sh`** — 幂等安装脚本：固定 `@lark-project/meegle@1.0.19`，先装到临时 prefix，再只把当前平台二进制原子替换；`--check` 不联网，只校验精确版本；
    安装失败也 `exit 0`（绝不阻塞网关启动）。
 2. **`hermes-gateway-meegle.conf`** — gateway drop-in，两件事：
    - `Environment=HERMES_MEEGLE_EXTRA_PATHS=%h/.local/bin` —— 把 `~/.local/bin` 加进
