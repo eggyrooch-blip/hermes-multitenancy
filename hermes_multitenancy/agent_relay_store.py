@@ -287,7 +287,13 @@ class RelayStore:
         }
 
     def reserve_message(
-        self, *, token_id: str, idempotency_key: str, request_hash: str, reply_expires_at: int | None
+        self,
+        *,
+        token_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        reply_expires_at: int | None,
+        msg_type: str = "message",
     ) -> tuple[dict[str, Any], bool]:
         now = _now_ms()
         with self._lock:
@@ -313,9 +319,18 @@ class RelayStore:
                 INSERT INTO relay_messages
                     (resource_id, token_id, idempotency_key, request_hash, kind, status,
                      reply_expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'message', 'sending', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'sending', ?, ?, ?)
                 """,
-                (resource_id, token_id, idempotency_key, request_hash, reply_expires_at, now, now),
+                (
+                    resource_id,
+                    token_id,
+                    idempotency_key,
+                    request_hash,
+                    msg_type,
+                    reply_expires_at,
+                    now,
+                    now,
+                ),
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -406,6 +421,14 @@ class RelayStore:
             )
             self._conn.commit()
         return True, False
+
+    def owned_sent_message(self, token_id: str, message_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM relay_messages WHERE token_id=? AND message_id=? AND status='sent'",
+                (token_id, message_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def message_replies(
         self, token_id: str, message_id: str, since_ts: int, limit: int

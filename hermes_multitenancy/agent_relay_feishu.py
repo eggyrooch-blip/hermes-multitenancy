@@ -195,10 +195,21 @@ class FeishuRelayClient:
         )
 
     def _update_card(
-        self, *, message_id: str, status: str, action_id: str = "", **_ignored: Any
+        self,
+        *,
+        message_id: str,
+        status: str = "",
+        action_id: str = "",
+        content: dict[str, Any] | None = None,
+        **_ignored: Any,
     ) -> None:
-        text = f"Status: {status}" + (f" ({action_id})" if action_id else "")
-        card = {"elements": [{"tag": "markdown", "content": text}]}
+        if content is not None:
+            # ponytail: caller-supplied content goes out verbatim — wrapping it would
+            # break schema 2.0 cards, whose elements live under body.elements.
+            card = content
+        else:
+            text = f"Status: {status}" + (f" ({action_id})" if action_id else "")
+            card = {"elements": [{"tag": "markdown", "content": text}]}
         self._request_json(
             f"https://open.feishu.cn/open-apis/im/v1/messages/{urllib.parse.quote(message_id)}",
             method="PATCH",
