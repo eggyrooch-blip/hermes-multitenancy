@@ -732,7 +732,9 @@ def test_replies_reactions_and_cards_are_isolated_and_deterministic(tmp_path):
             )
             assert raced.status == 409
             assert (await raced.json())["status"] == "actioned"
-            assert len(feishu.card_updates) == 1
+            # 点击不再由服务端重绘：调用方拿着原文做局部替换，服务端拼不出那个内容。
+            # 状态保护不依赖重绘 —— 第二次点击 409 且飞书弹 Already resolved。
+            assert feishu.card_updates == []
 
             closeable = await client.post(
                 "/v1/cards",
@@ -752,7 +754,7 @@ def test_replies_reactions_and_cards_are_isolated_and_deterministic(tmp_path):
             )
             assert closed.status == 200
             assert (await closed.json())["status"] == "closed"
-            assert len(feishu.card_updates) == 2
+            assert len(feishu.card_updates) == 1
 
             await client.close()
             app = create_agent_relay_app(
@@ -1454,3 +1456,142 @@ def test_card_fallback_row_carries_the_card_ttl_and_never_breaks_the_card(tmp_pa
     with caplog.at_level("WARNING"):
         asyncio.run(runner())
     assert "fallback_register_failed" in caplog.text
+
+
+def test_card_content_patch_keeps_the_guards_the_other_routes_have(tmp_path):
+    """The content route must not be a softer door than POST /v1/cards."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import create_agent_relay_app
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            made = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "guard-card",
+                },
+            )
+            card_id = (await made.json())["card_id"]
+            before = len(feishu.card_updates)
+
+            # identity keys are rejected at ANY depth, exactly like POST /v1/cards
+            identity = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": [{"tag": "markdown", "open_id": "ou_bob"}]}},
+            )
+            assert identity.status == 400
+            assert (await identity.json())["error"]["code"] == "identity_field_forbidden"
+
+            oversized = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": [{"tag": "markdown", "content": "x" * 32000}]}},
+            )
+            assert oversized.status == 400
+            assert (await oversized.json())["error"]["code"] == "content_too_large"
+
+            # neither rejection may reach Feishu
+            assert len(feishu.card_updates) == before
+
+            # p1: the empty body must keep its historical error code
+            empty = await client.patch(f"/v1/cards/{card_id}", headers=alice, json={})
+            assert empty.status == 400
+            assert (await empty.json())["error"]["code"] == "invalid_close"
+
+            # p1: Feishu transport failures map like the sibling routes do
+            real_update = feishu.update_card
+
+            async def hang(**kw):
+                raise TimeoutError
+
+            feishu.update_card = hang
+            timed_out = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": []}},
+            )
+            assert timed_out.status == 504
+            assert (await timed_out.json())["error"]["code"] == "upstream_timeout"
+
+            from hermes_multitenancy.agent_relay import FeishuApiError
+
+            async def rejected(**kw):
+                raise FeishuApiError(400, None, code=230001, message="bad card")
+
+            feishu.update_card = rejected
+            refused = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": []}},
+            )
+            assert refused.status == 400
+            assert (await refused.json())["error"]["code"] == "invalid_card"
+            feishu.update_card = real_update
+
+            # a close with NO content still drives the card to its terminal look —
+            # this is the shape every pre-existing client sends
+            closed = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"status": "closed", "reason": "client_timeout"},
+            )
+            assert closed.status == 200
+            assert (await closed.json())["status"] == "closed"
+            assert len(feishu.card_updates) == before + 1
+            assert feishu.card_updates[-1].get("status") == "closed"
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_update_card_ships_the_composed_card_not_the_raw_argument():
+    """Transport-level: FakeFeishu only records kwargs, so the HTTP body needs its own test."""
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    client = FeishuRelayClient.__new__(FeishuRelayClient)
+    sent: list[dict] = []
+    client._tenant_access = lambda: "t-token"
+    client._request_json = lambda url, **kw: sent.append({"url": url, **kw}) or {}
+
+    # no caller content → the server-composed terminal card must go out, never "null"
+    client._update_card(message_id="om_x", status="closed")
+    body = json.loads(sent[-1]["body"]["content"])
+    assert body == {"elements": [{"tag": "markdown", "content": "Status: closed"}]}
+
+    client._update_card(message_id="om_x", status="actioned", action_id="approve")
+    assert json.loads(sent[-1]["body"]["content"])["elements"][0]["content"] == (
+        "Status: actioned (approve)"
+    )
+
+    # caller content → verbatim, not re-wrapped
+    caller = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "done"}]}}
+    client._update_card(message_id="om_x", content=caller)
+    assert json.loads(sent[-1]["body"]["content"]) == caller
