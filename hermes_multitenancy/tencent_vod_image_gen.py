@@ -711,7 +711,18 @@ def _raise_if_detail_failed(detail: dict[str, Any]) -> None:
 # broken). The same object is reachable over https on these hosts, so upgrade
 # the scheme before the URL ever leaves the provider. Scoped to Tencent's own
 # CDN domains so we never force https onto an http-only third party.
-_TENCENT_TLS_HOST_SUFFIXES = (".myqcloud.com", ".qcloud.com", ".tencentcos.cn")
+#
+# ``.vod-qcloud.com`` is NOT covered by ``.qcloud.com`` — the label before
+# "qcloud.com" is "vod-", so the suffix match needs its own entry. Production
+# AIGC images come back on ``store.vod-qcloud.com`` (verified 2026-08-13: the
+# same object answers 200 image/jpeg over https), and without this entry the
+# WebUI got an http URL and rendered a broken image.
+_TENCENT_TLS_HOST_SUFFIXES = (
+    ".myqcloud.com",
+    ".qcloud.com",
+    ".vod-qcloud.com",
+    ".tencentcos.cn",
+)
 
 
 def _https_upgrade_tencent_url(url: str) -> str:

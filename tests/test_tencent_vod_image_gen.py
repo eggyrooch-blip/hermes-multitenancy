@@ -359,3 +359,26 @@ def test_already_https_tencent_url_unchanged():
 
     u = "https://251000800.vod2.myqcloud.com/x/y/aigcImageGenFile.jpg"
     assert _https_upgrade_tencent_url(u) == u
+
+
+def test_store_vod_qcloud_host_upgraded_to_https():
+    from hermes_multitenancy.tencent_vod_image_gen import _https_upgrade_tencent_url
+
+    # The host production actually returns. ".qcloud.com" does NOT match it
+    # (the label is "vod-qcloud.com"), so it needs its own suffix entry —
+    # without it the WebUI renders a broken image on its https page.
+    assert _https_upgrade_tencent_url(
+        "http://store.vod-qcloud.com/1a168d62vodcq/abc/aigcImageGenFile.jpg"
+    ) == "https://store.vod-qcloud.com/1a168d62vodcq/abc/aigcImageGenFile.jpg"
+
+
+def test_lookalike_vod_qcloud_host_not_upgraded():
+    from hermes_multitenancy.tencent_vod_image_gen import _https_upgrade_tencent_url
+
+    # Negative control: the new suffix must not swallow an unrelated host that
+    # merely ends with the same letters.
+    for url in (
+        "http://evilvod-qcloud.com/x.jpg",
+        "http://vod-qcloud.com.attacker.net/x.jpg",
+    ):
+        assert _https_upgrade_tencent_url(url) == url
