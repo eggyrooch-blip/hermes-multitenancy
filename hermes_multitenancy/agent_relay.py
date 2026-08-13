@@ -314,6 +314,16 @@ def create_agent_relay_app(
         row = store.owned_sent_message(actor["token_id"], message_id)
         if row is None:
             return _error("not_found", "message not found", 404)
+        window = payload.get("reply_window_seconds")
+        # ponytail: `False == 0` in Python — take the int 0 only, never a bool.
+        if window == 0 and not isinstance(window, bool):
+            if not store.close_reply_window(actor["token_id"], message_id):
+                return _error("window_not_open", "no open reply window for this message", 409)
+            logger.info(
+                "relay_audit event=reply_window status=closed actor=%s",
+                actor["identity_fingerprint"],
+            )
+            return web.json_response({"message_id": message_id, "reply_window_seconds": 0})
         content = payload.get("content")
         if not isinstance(content, dict):
             return _error("invalid_message", "content is required", 400)

@@ -648,6 +648,23 @@ class RelayStore:
             self._conn.commit()
         return changed == 1
 
+    def close_reply_window(self, token_id: str, message_id: str) -> bool:
+        """Expire an open reply window now so the next window is unambiguous.
+
+        ponytail: writes _now_ms() rather than NULL/0 — prune keys retention off
+        `reply_expires_at + 24h`, and a NULL there would strand reply plaintext
+        forever.
+        """
+        now = _now_ms()
+        with self._lock:
+            changed = self._conn.execute(
+                "UPDATE relay_messages SET reply_expires_at=?, updated_at=? "
+                "WHERE token_id=? AND message_id=? AND status='sent' AND reply_expires_at>?",
+                (now, now, token_id, message_id, now),
+            ).rowcount
+            self._conn.commit()
+        return changed == 1
+
     def close_card(self, token_id: str, card_id: str, reason: str) -> tuple[dict[str, Any] | None, bool]:
         now = _now_ms()
         with self._lock:
