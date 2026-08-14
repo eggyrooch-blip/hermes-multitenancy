@@ -685,6 +685,22 @@ def _event_metadata(event: Any) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
+def _event_delegation_id(event: Any) -> str:
+    """The credential-delegation grant this event is the replay of, if any.
+
+    Set by ``_dispatch_synthetic_auth_complete`` on the synthetic replay event
+    (attribute + raw_event metadata, so it survives either carrier). Binds a
+    ``once`` lease to the exact run it was granted for.
+    """
+    try:
+        direct = str(getattr(event, "hermes_delegation_id", "") or "").strip()
+        if direct:
+            return direct
+        return str(_event_metadata(event).get("delegation_id") or "").strip()
+    except Exception:
+        return ""
+
+
 def _trusted_feishu_runtime_identity(event: Any) -> tuple[str, str, str] | None:
     metadata = _event_metadata(event)
     if not str(metadata.get("trusted_ticket_fingerprint") or "").strip():
@@ -2674,6 +2690,17 @@ def _aiagent_subprocess_env_scope(
     merged_extra["TERMINAL_CWD"] = str(run_cwd)
     merged_extra["_HERMES_FORCE_TERMINAL_CWD"] = str(run_cwd)
     merged_extra.update(_ingest_secret_env_from_event(event))
+    # Credential delegation, per run (NOT gated on strict context — the marker
+    # collision and the once-lease binding it fixes exist in every mode):
+    #   NONCE — names this run's auth-required marker file, so two concurrent
+    #           runs of the same group profile cannot steal each other's.
+    #   ID    — the grant this run replays; a once-lease only unlocks for it.
+    from ..credential_delegation import DELEGATION_ID_ENV, DELEGATION_NONCE_ENV
+
+    merged_extra.setdefault(DELEGATION_NONCE_ENV, secrets.token_urlsafe(16))
+    _delegation_id = _event_delegation_id(event)
+    if _delegation_id:
+        merged_extra.setdefault(DELEGATION_ID_ENV, _delegation_id)
     from ..billing_identity import runtime_env_for_billing_metadata
 
     # The plaintext employee key exists only in this per-run child env.  The

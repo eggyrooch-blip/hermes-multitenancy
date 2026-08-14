@@ -525,6 +525,7 @@ async def _stream_aiagent_subprocess(
     cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     started_at = time.monotonic()
+    wall_started_at = time.time()
     proc = None
     stderr_task = None
     using_warm_worker = False
@@ -830,6 +831,31 @@ async def _stream_aiagent_subprocess(
                     )
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
+        # GitLab credential-delegation marker: the child (credential_tool) writes
+        # into the profile's own tmp/ because the parent's mkdtemp approval dir is
+        # invisible inside bwrap. Surface it as the standard auth_required delta so
+        # the Feishu router pushes the delegation card to the initiator's DM.
+        try:
+            from ..credential_delegation import (
+                DELEGATION_NONCE_ENV,
+                take_auth_required_marker,
+            )
+
+            # Only THIS run's marker — the nonce was minted for this spawn, so a
+            # sibling run of the same group profile can neither be read nor
+            # unlinked here.
+            _delegation_signal = take_auth_required_marker(
+                profile_home,
+                since=wall_started_at,
+                nonce=env.get(DELEGATION_NONCE_ENV, ""),
+            )
+        except Exception:
+            _delegation_signal = None
+            logger.debug(
+                "[multitenancy] delegation marker read failed", exc_info=True
+            )
+        if _delegation_signal:
+            yield "auth_required", _delegation_signal
     except asyncio.TimeoutError as exc:
         if using_warm_worker:
             await _discard_aiagent_warm_worker(profile_home)

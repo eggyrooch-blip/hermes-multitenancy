@@ -127,6 +127,12 @@ _BUILTINS: tuple[tuple[str, frozenset[str], str, str], ...] = (
         "feishu_auth_hub_actions",
         "handle_auth_hub_card_action",
     ),
+    (
+        "cred_delegation",
+        frozenset({"cred_delegation"}),
+        "feishu_cred_delegation",
+        "handle_delegation_card_action",
+    ),
 )
 
 _BUILTIN_NAMESPACES = frozenset(
