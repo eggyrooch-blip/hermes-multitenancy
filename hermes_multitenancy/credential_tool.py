@@ -54,6 +54,11 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
 
         provider = str(args.get("provider") or "feishu").strip()
         secret_kind = str(args.get("credential_kind") or args.get("secret_kind") or "uat").strip()
+        if provider == "gitlab" and secret_kind == "uat":
+            # GitLab has exactly one credential kind; the schema default of
+            # "uat" would otherwise dodge the provider-adapter branch (and the
+            # delegation trigger) whenever the model omits credential_kind.
+            secret_kind = "token"
         required_scopes = args.get("required_scopes") or []
         if isinstance(required_scopes, str):
             required_scopes = [required_scopes]
@@ -61,8 +66,14 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
         if provider and provider != "feishu" and secret_kind in {"api_key", "token"}:
             adapter_status = _provider_adapter_status(provider)
             if adapter_status is not None:
+                delegation_note = _maybe_signal_gitlab_delegation(
+                    profile_name=profile_name,
+                    provider=provider,
+                    adapter_status=adapter_status,
+                )
                 return json.dumps(
                     {
+                        **({"delegation": delegation_note} if delegation_note else {}),
                         "profile": profile_name,
                         "provider": provider,
                         "subject_id": adapter_status.get("subject_id") or provider,
@@ -126,6 +137,47 @@ def credential_status(args: dict[str, Any] | None = None, **_kwargs: Any) -> str
         )
     except Exception as exc:
         return _error(str(exc))
+
+
+def _maybe_signal_gitlab_delegation(
+    *,
+    profile_name: str,
+    provider: str,
+    adapter_status: dict[str, Any],
+) -> str:
+    """GROUP profile missing a GitLab credential → drop the auth-required marker.
+
+    Runs inside the AIAgent CHILD process; the marker lands in the profile's own
+    tmp/ (shared rw with the parent even under bwrap), where the parent stream
+    reader converts it into an ``auth_required`` delta after the run. Personal
+    profiles never signal — their GitLab lane is unchanged by design.
+    """
+    try:
+        from .credential_delegation import (
+            DELEGATION_NONCE_ENV,
+            is_delegatable_profile,
+            write_auth_required_marker,
+        )
+
+        if provider != "gitlab" or not is_delegatable_profile(profile_name):
+            return ""
+        if adapter_status.get("has_credential"):
+            return ""
+        write_auth_required_marker(
+            _current_profile_home(),
+            {
+                "provider": "gitlab",
+                "reason": "missing_credential",
+                "profile": profile_name,
+            },
+            nonce=os.getenv(DELEGATION_NONCE_ENV, ""),
+        )
+        return (
+            "已向发起人私聊推送 GitLab 凭证委托授权卡；获授权后原操作会自动续接。"
+            "请告知用户等待授权，不要重试。"
+        )
+    except Exception:
+        return ""
 
 
 def _status_payload(

@@ -912,7 +912,7 @@ async def _handle_jit_auth_required(
     different account authorizing (group anti-spoof, free via the existing
     mismatch card). ``payload`` (broker scope_status) is unused for now — a
     full-grant card is enough (precise scope mapping is a follow-up slug)."""
-    del payload, profile_home
+    del profile_home
     from .. import feishu_uat_auth
     from ..feishu_auth_cards import (
         auth_text_fallback,
@@ -923,6 +923,24 @@ async def _handle_jit_auth_required(
 
     if adapter is None or not profile_name:
         return
+    # GitLab credential delegation: a GROUP profile missing a GitLab credential
+    # asks the INITIATOR (DM) to lend their personal token — never the Feishu
+    # UAT device flow. Personal profiles keep their existing GitLab lane
+    # unchanged (return without action).
+    if isinstance(payload, dict) and str(payload.get("provider") or "") == "gitlab":
+        if _m.is_group_profile_name(profile_name):
+            from ..feishu_cred_delegation import handle_gitlab_delegation_required
+
+            await handle_gitlab_delegation_required(
+                gateway=gateway,
+                adapter=adapter,
+                chat_id=chat_id,
+                profile_name=profile_name,
+                event=event,
+                payload=payload,
+            )
+        return
+    del payload
     # 群/智能体 profile 只用应用(bot)身份——群里不弹「授权你个人 lark-cli」的卡
     # (sunke 设定)。双保险：broker 的 permission sink 已按 identity!=user 拦下，
     # 这里再从 profile 维度挡一次(防其它信号源/未来改动漏进群)。
@@ -1066,6 +1084,7 @@ async def _dispatch_synthetic_auth_complete(
     profile_name: str,
     open_id: str,
     text: str = _m.SYNTHETIC_AUTH_COMPLETE_TEXT,
+    delegation_id: str = "",
 ) -> bool:
     try:
         clean_chat_id = str(chat_id or "").strip()
@@ -1109,12 +1128,18 @@ async def _dispatch_synthetic_auth_complete(
             hermes_raw_thread_id=getattr(source, "hermes_raw_thread_id", None) if source is not None else None,
             hermes_root_id=getattr(source, "hermes_root_id", None) if source is not None else None,
         )
+        # Credential delegation: a 允许一次 grant is bound to THIS replay. Carried
+        # both as an attribute and in raw_event metadata so it survives whichever
+        # carrier the downstream run path reads.
+        delegation_id = str(delegation_id or "").strip()
         synthetic_event = SimpleNamespace(
             text=text,
             message_id=synthetic_message_id,
             sender_open_id=sender_open_id or sender_id,
             source=synthetic_source,
+            hermes_delegation_id=delegation_id,
             raw_event={
+                **({"metadata": {"delegation_id": delegation_id}} if delegation_id else {}),
                 "event": {
                     "message": {
                         "message_id": synthetic_message_id,

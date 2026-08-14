@@ -29,8 +29,14 @@ def _build_subprocess_env(
     approval_dir: Path,
     event_stream: bool = False,
     extra: Optional[dict[str, str]] = None,
+    delegation_enabled: bool = True,
 ) -> dict[str, str]:
     """Build a sanitized env for the AIAgent subprocess (档 A isolation).
+
+    ``delegation_enabled=False`` is for env builds that are NOT one user's run —
+    notably the warm worker's long-lived base env, which is shared by every
+    subsequent run of the profile and must therefore never contain any user's
+    borrowed credential.
 
     Two guarantees enforced here:
 
@@ -153,6 +159,47 @@ def _build_subprocess_env(
     # is checked BEFORE the bypass in approval.py and remains in effect.
     if extra:
         env.update(extra)
+
+    # GitLab credential delegation (group profiles only): inject the initiator's
+    # leased personal token at RUN level. Env-only by contract — never written to
+    # the shared profile's config/, vault, or workspace/credentials/.
+    #
+    # The sender comes ONLY from this spawn's explicit `extra`. There is
+    # deliberately NO ambient-ContextVar fallback: env builds that are not a
+    # user's run (the warm worker's shared base env) pass no `extra`, so an
+    # ambient identity would have baked whoever ran last into a long-lived
+    # process env — readable by the NEXT user's tool children through
+    # /proc/<pid>/environ, and it silently burned that user's once-lease.
+    # `delegation_enabled=False` closes the same hole positively rather than by
+    # name-blacklisting the resulting variables.
+    if delegation_enabled and not shared_agent_run:
+        try:
+            from ..credential_delegation import (
+                DELEGATION_ID_ENV,
+                delegation_env_for_run,
+            )
+
+            _delegation_sender = str((extra or {}).get("HERMES_FEISHU_USER_OPEN_ID") or "")
+            delegation_env = delegation_env_for_run(
+                profile_home,
+                sender_open_id=_delegation_sender,
+                delegation_id=str((extra or {}).get(DELEGATION_ID_ENV) or ""),
+                existing_env_names=env,  # mapping: an empty GITLAB_TOKEN= is NOT a token
+            )
+            delegation_env = {
+                key: value
+                for key, value in delegation_env.items()
+                # An EMPTY existing value is not a value: a bare `GITLAB_TOKEN=`
+                # in the group .env must not shadow the delegated token.
+                if not str(env.get(key) or "").strip()
+            }
+            if delegation_env:
+                env.update(delegation_env)
+                env.update(_force_env_for_terminal_passthrough(delegation_env))
+        except Exception:
+            logger.debug(
+                "[multitenancy] delegation env injection failed", exc_info=True
+            )
 
     if sandboxed_profile:
         env["HERMES_SANDBOX_HOST"] = "1"

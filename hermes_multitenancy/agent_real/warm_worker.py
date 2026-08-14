@@ -25,6 +25,12 @@ _AIAGENT_WARM_WORKERS: dict[tuple[str, Any], "_AiagentWarmWorker"] = {}
 _AIAGENT_WARM_PROFILE_LOCKS: dict[str, threading.Lock] = {}
 _AIAGENT_WARM_WORKERS_GUARD = threading.RLock()
 _AIAGENT_WARM_WORKER_BASE_ENV_DROP: frozenset[str] = frozenset({
+    # Pre-existing leak (predates credential delegation): subprocess_env writes
+    # this from the ambient sender ContextVar, so the FIRST run's initiator got
+    # baked into the long-lived warm base env and stayed readable by every later
+    # user's children via /proc/<pid>/environ. Delegation now makes identity a
+    # credential decision input, so it must be per-run only.
+    "HERMES_FEISHU_USER_OPEN_ID",
     "HERMES_MULTITENANCY_APPROVAL_DIR",
     "HERMES_MULTITENANCY_CRED_BROKER_TOKEN",
     "HERMES_MULTITENANCY_CRED_LEASE",
@@ -68,7 +74,16 @@ def _get_aiagent_warm_profile_lock(profile_key: str) -> threading.Lock:
 def _build_aiagent_warm_worker_base_env(profile_home: Path) -> dict[str, str]:
     approval_dir = profile_home / "tmp" / "aiagent-warm-worker-base-approval"
     approval_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    env = _build_subprocess_env(profile_home, approval_dir=approval_dir, event_stream=True)
+    # delegation_enabled=False: this env outlives every individual run and is
+    # visible to every later run's children via /proc/<pid>/environ. No user's
+    # borrowed credential may be resolved into it — the per-run env built by
+    # _aiagent_subprocess_env_scope is the only place delegation belongs.
+    env = _build_subprocess_env(
+        profile_home,
+        approval_dir=approval_dir,
+        event_stream=True,
+        delegation_enabled=False,
+    )
     for key in _AIAGENT_WARM_WORKER_BASE_ENV_DROP:
         env.pop(key, None)
     env["HERMES_AIAGENT_WARM_WORKER_CHILD"] = "1"
