@@ -48,6 +48,11 @@ def _make_repo(path: Path, with_probes: bool, probe_exit: int = 0, prebuilt: boo
         (path / "dist" / "server").mkdir(parents=True, exist_ok=True)
         (path / "dist" / "server" / "index.js").write_text("//\n")
     if with_probes:
+        # mt 仓才带 relay 源码：relay 是唯一不走软链的组件，发布器要从这里拷。
+        m = path / "hermes_multitenancy"
+        m.mkdir(exist_ok=True)
+        for f in ("agent_relay.py", "agent_relay_feishu.py", "agent_relay_store.py", "credentials.py"):
+            (m / f).write_text(f"# NEW {f}\n")
         d = path / "deploy"
         d.mkdir(exist_ok=True)
         probe = d / "hermes-release-probes.sh"
@@ -118,11 +123,17 @@ def env(tmp_path: Path):
     # uv 桩记录最后一个参数（editable 目标目录）；venv 桩模拟「读回真实 import 路径」——
     # 与 uv 桩落盘的最后安装目标比对，一致才 0。UV_FAIL_FLAG 文件存在时 uv 装败。
     uv_stub = tmp_path / "uv-stub.sh"
+    # 只有 `install -e <target>` 才更新 UV_STATE。reinstall_editable 里还会跑
+    # `uv pip check -p <venv-python>`（依赖体检自愈，vod SDK 缺 19 天那次加的），
+    # 它的最后一个参数是 venv python 而不是目标目录 —— 一起记就把 UV_STATE 冲成
+    # python 路径，读回核对必然失败。这个桩没跟上，让整份文件红了 25 条。
     uv_stub.write_text(
         "#!/usr/bin/env bash\n"
         '[ -f "$UV_FAIL_FLAG" ] && exit 1\n'
-        'echo "uv-install ${@: -1}" >> "$SYSTEMCTL_LOG"\n'
-        'echo "${@: -1}" > "$UV_STATE"\n'
+        'case " $* " in *" -e "*)\n'
+        '  echo "uv-install ${@: -1}" >> "$SYSTEMCTL_LOG"\n'
+        '  echo "${@: -1}" > "$UV_STATE"\n'
+        ";; esac\n"
         "exit 0\n"
     )
     uv_stub.chmod(0o755)
@@ -136,7 +147,36 @@ def env(tmp_path: Path):
     )
     venv_stub.chmod(0o755)
 
+    # relay：假的 /opt 包目录 + 桩重启 + 桩探针。
+    # 生产上这一步要 sudo，测试里全部换成可注入的桩，所以这套测试不需要任何权限。
+    relay_pkg = tmp_path / "relay-pkg"
+    relay_pkg.mkdir()
+    for f in ("agent_relay.py", "agent_relay_feishu.py", "agent_relay_store.py", "credentials.py"):
+        (relay_pkg / f).write_text(f"# OLD {f}\n")
+    relay_restart = tmp_path / "relay-restart-stub.sh"
+    relay_restart.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo restart >> "$RELAY_LOG"\n'
+        '[ -f "$RELAY_RESTART_FAIL" ] && exit 1\n'
+        "exit 0\n"
+    )
+    relay_restart.chmod(0o755)
+    relay_probe = tmp_path / "relay-probe-stub.sh"
+    relay_probe.write_text(
+        "#!/usr/bin/env bash\n"
+        'cat "$RELAY_PROBE_CODE" 2>/dev/null || echo 401\n'
+    )
+    relay_probe.chmod(0o755)
+
     return {
+        "RELAY_PKG_DIR": str(relay_pkg),
+        "RELAY_RESTART": str(relay_restart),
+        "RELAY_IS_ACTIVE": "true",
+        "RELAY_PROBE_CMD": str(relay_probe),
+        "RELAY_LOG": str(tmp_path / "relay.log"),
+        "RELAY_RESTART_FAIL": str(tmp_path / "relay-restart-fail"),
+        "RELAY_PROBE_CODE": str(tmp_path / "relay-probe-code"),
+        "_relay_pkg": relay_pkg,
         "HOME": str(home), "RELEASES": str(releases), "CODE": str(code),
         "STATE_FILE": str(home / ".hermes" / "deployed-release"),
         "BACKUP_ROOT": str(home / "backups" / "pre-release"),
@@ -855,3 +895,75 @@ def test_deploy_scripts_are_executable_in_git():
               "deploy/hermes_patch_probe.py", "deploy/install-hermes-release.sh",
               "deploy/hermes-backup.sh", "deploy/hermes-restore-drill.sh"):
         assert modes.get(f) == "100755", f"{f} 在 git 里是 {modes.get(f)}，必须是 100755"
+
+
+# ── 6. relay：唯一不走软链的组件，必须跟着发布一起动 ──────────────────
+#
+# 2026-08-13 合进 main 的四个 relay 提交在生产上整整两天没生效 —— 因为
+# hermes-release.sh 里根本没有 relay。这几条守住它不再掉队。
+
+
+def _relay_text(env, name: str) -> str:
+    return (env["_relay_pkg"] / name).read_text()
+
+
+def test_relay_files_synced_and_restarted_on_success(env):
+    _deploy_once(env, "release-relay-1")
+    for f in ("agent_relay.py", "agent_relay_feishu.py", "agent_relay_store.py", "credentials.py"):
+        assert _relay_text(env, f) == f"# NEW {f}\n", f"{f} 没被同步到新版本"
+    assert "restart" in Path(env["RELAY_LOG"]).read_text(), "relay 没被重启 = 换了文件也没生效"
+
+
+def test_relay_not_touched_when_probes_fail(env):
+    """探针失败要回滚 mt/webui —— relay 此时抢先升级就是反向漂移。"""
+    mt_src = env["_mt_src"]
+    (mt_src / "deploy" / "hermes-release-probes.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (mt_src / "deploy" / "hermes-release-probes.sh").chmod(0o755)
+    _git(mt_src, "add", "-A")
+    _git(mt_src, "commit", "-q", "-m", "bad probes")
+    env["_mt_sha"] = _git(mt_src, "rev-parse", "HEAD")
+    _tag(env, "release-relay-bad", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert _relay_text(env, "agent_relay.py") == "# OLD agent_relay.py\n", "回滚的发布不该动 relay"
+    assert not Path(env["RELAY_LOG"]).exists(), "回滚的发布不该重启 relay"
+
+
+def test_relay_restart_failure_restores_and_reports(env):
+    """缺 sudoers（sudo -n 当场失败）→ 还原 relay、记 RELAY_FAILED、非零退出，
+    但 mt/webui 保持在新版本：不为一个独立进程让 1259 人再吃一次重启。"""
+    Path(env["RELAY_RESTART_FAIL"]).write_text("x")
+    _tag(env, "release-relay-2", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert "RELAY FAILED" in r.stdout
+    assert _relay_text(env, "agent_relay.py") == "# OLD agent_relay.py\n", "失败必须还原到发布前的字节"
+    mt_link, webui_link = _links(env)
+    assert env["_mt_sha"][:7] in mt_link, "relay 失败不该把 mt 连坐回滚"
+    assert env["_webui_sha"][:8] in webui_link, "relay 失败不该把 webui 连坐回滚"
+    snap = Path(env["BACKUP_ROOT"]) / "release-relay-2" / "ROLLBACK.txt"
+    assert "outcome=RELAY_FAILED" in snap.read_text()
+
+
+def test_relay_probe_failure_restores(env):
+    """文件拷对了、进程也起来了，但路由没注册（404）—— 照样算没跟上。"""
+    Path(env["RELAY_PROBE_CODE"]).write_text("404\n")
+    _tag(env, "release-relay-3", f"multitenancy: {env['_mt_sha']}\nwebui: {env['_webui_sha']}")
+    r = _run(env)
+    assert r.returncode != 0
+    assert "存活探针未过" in r.stdout and "实得 404" in r.stdout
+    assert _relay_text(env, "agent_relay.py") == "# OLD agent_relay.py\n"
+
+
+def test_relay_file_list_is_globbed_not_hardcoded(env):
+    """新增一个 relay 模块，不改发布器也要被拷过去。
+
+    写死清单会静默漏拷单个模块 —— 比漏拷全部更难发现，正是本次要根治的类型。
+    """
+    mt_src = env["_mt_src"]
+    (mt_src / "hermes_multitenancy" / "agent_relay_newthing.py").write_text("# NEW agent_relay_newthing.py\n")
+    _git(mt_src, "add", "-A")
+    _git(mt_src, "commit", "-q", "-m", "new relay module")
+    env["_mt_sha"] = _git(mt_src, "rev-parse", "HEAD")
+    _deploy_once(env, "release-relay-4")
+    assert _relay_text(env, "agent_relay_newthing.py") == "# NEW agent_relay_newthing.py\n"

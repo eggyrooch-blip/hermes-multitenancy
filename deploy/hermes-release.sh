@@ -34,6 +34,26 @@ _expert_units() { $SYSTEMCTL list-units --type=service --all --no-pager 2>/dev/n
   | grep -oE 'hermes-gateway@[A-Za-z0-9_-]+\.service' | sort -u | tr '\n' ' '; }
 _units() { printf '%s' "${UNITS:-hermes-gateway.service hermes-web-ui.service $(_expert_units)}"; }
 DRY_RUN="${DRY_RUN:-0}"
+# ── relay：唯一不走软链的组件 ────────────────────────────────────────
+# hermes-agent-relay 是 root 装的【系统级】unit，代码被拷成另一个包名
+# hermes_agent_relay_runtime 装进 /opt 下自己的 venv，跟 mt/webui 的
+# releases/<sha> + 软链形态完全不同，所以它必须在这里被显式地跟一次。
+# 在此之前它根本不在流水线里：2026-08-13 合进 main 的四个 relay 提交在生产上
+# 整整两天没生效，进程还是 8-12 起的那个，靠人手拷文件才止血。
+# relay 的 User=hermes，所以把包目录交给 hermes 不产生任何提权；唯一需要 root
+# 的只有重启，用一条无参 sudoers drop-in 放行（见 .ftask SPEC 的部署前置）。
+RELAY_PKG_DIR="${RELAY_PKG_DIR:-/opt/hermes-agent-relay/venv/lib/python3.11/site-packages/hermes_agent_relay_runtime}"
+RELAY_RESTART="${RELAY_RESTART:-sudo -n systemctl restart hermes-agent-relay.service}"
+RELAY_IS_ACTIVE="${RELAY_IS_ACTIVE:-systemctl is-active --quiet hermes-agent-relay.service}"
+RELAY_PROBE_URL="${RELAY_PROBE_URL:-http://127.0.0.1:8770/v1/messages/__release_probe__}"
+# 打一次已注册的路由，把 HTTP 状态码打到 stdout。--noproxy 是硬性的：
+# 本机的 http_proxy 已经把这类探针坑成 000 好几次了。
+_relay_curl_probe() {
+  curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 5 \
+    -X PATCH "$RELAY_PROBE_URL" -H 'Content-Type: application/json' \
+    -d '{"reply_window_seconds":0}' 2>/dev/null || echo 000
+}
+RELAY_PROBE_CMD="${RELAY_PROBE_CMD:-_relay_curl_probe}"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -361,6 +381,86 @@ PY
   log "  editable -> $target（读回核对通过）"
 }
 
+# ── relay 同步：拷文件 + 重启 + 读回核对 ─────────────────────────────
+# 文件清单用通配枚举，不写死。写死的清单在下次新增 relay 模块时会静默漏拷 ——
+# 那正是本次要根治的失败类型（漏发一个模块比漏发全部更难发现）。
+_relay_files() {  # $1=源目录（$MT_DIR/hermes_multitenancy）
+  local src="$1" f out=""
+  for f in "$src"/agent_relay*.py "$src"/credentials.py; do
+    [ -f "$f" ] && out="$out $(basename "$f")"
+  done
+  printf '%s' "${out# }"
+}
+
+# 返回 0 = relay 已确认跟上；1 = 失败（调用方负责记 outcome 并非零退出）。
+sync_relay() {  # $1=目标 mt 版本目录（绝对路径）  $2=备份目录
+  # 分开写：同一条 `local` 里的后一个赋值看不见前一个（整行先展开再赋值），
+  # `src="$mt/…"` 写在同一行会在 set -u 下直接炸 unbound variable。
+  local mt="$1" bak="$2" files f restarted=0
+  local src="$mt/hermes_multitenancy"
+  [ -d "$RELAY_PKG_DIR" ] || { log "  relay 包目录不存在（$RELAY_PKG_DIR）—— 跳过 relay 同步"; return 0; }
+  files=$(_relay_files "$src")
+  [ -n "$files" ] || { log "  ✗ 新版本里找不到 relay 源文件（$src）"; return 1; }
+
+  mkdir -p "$bak" || return 1
+  for f in $files; do
+    [ -f "$RELAY_PKG_DIR/$f" ] && { cp -p "$RELAY_PKG_DIR/$f" "$bak/$f" || return 1; }
+  done
+
+  _relay_restore() {
+    local f
+    for f in $files; do
+      [ -f "$bak/$f" ] && cp -p "$bak/$f" "$RELAY_PKG_DIR/$f"
+    done
+    rm -rf "$RELAY_PKG_DIR/__pycache__"
+    # sudo 被拒时老进程根本没停过：还原了文件 + 老进程还在跑 = 已经自洽，
+    # 不该再多踢一脚。只有它真的 down、或本次已经重启成功过，才需要再起一次。
+    if [ "$restarted" = "1" ] || ! $RELAY_IS_ACTIVE 2>/dev/null; then
+      $RELAY_RESTART 2>/dev/null || log "  ✗ relay 还原后重启失败 —— 需要人工介入"
+    fi
+  }
+
+  for f in $files; do
+    cp -p "$src/$f" "$RELAY_PKG_DIR/$f" || { _relay_restore; return 1; }
+  done
+  rm -rf "$RELAY_PKG_DIR/__pycache__"
+
+  # `sudo -n` 是刻意的：缺 sudoers drop-in 时当场红，绝不能挂在密码提示上把
+  # 每天 18:00 的定时器吊死。
+  if ! $RELAY_RESTART; then
+    log "  ✗ relay 重启失败（$RELAY_RESTART）—— 还原并放弃 relay 同步"
+    _relay_restore
+    return 1
+  fi
+  restarted=1
+
+  # 读回核对：跟 reinstall_editable 同一套哲学，「拷过了」不算数。
+  for f in $files; do
+    if ! cmp -s "$src/$f" "$RELAY_PKG_DIR/$f"; then
+      log "  ✗ relay 读回核对失败（$f 与新版本不一致）"
+      _relay_restore
+      return 1
+    fi
+  done
+
+  # 活体判据：路由注册过 → 撞鉴权返回 401；没注册 → aiohttp 纯文本 404。
+  if [ "$RELAY_PROBE_CMD" = "_relay_curl_probe" ] && ! command -v curl >/dev/null 2>&1; then
+    # 静默降级会让「探针没跑」看起来跟「探针过了」一样。
+    log "  ! 没有 curl，跳过 relay 存活探针（只做了文件读回核对）"
+  else
+    local code
+    code=$($RELAY_PROBE_CMD 2>/dev/null || echo 000)
+    if [ "$code" != "401" ]; then
+      log "  ✗ relay 存活探针未过（期望 401，实得 $code）"
+      _relay_restore
+      return 1
+    fi
+    log "  relay 探针通过（401 = 路由已注册且鉴权在位）"
+  fi
+
+  log "  relay -> $mt（$files，已重启并读回核对）"
+}
+
 install_dropins() {  # $1=目标 mt 版本目录（绝对路径）
   local target="$1" installer
   installer="${DROPIN_INSTALLER:-$target/deploy/install-gateway-dropins.sh}"
@@ -440,6 +540,16 @@ elif "$NEW_PROBES"; then
       log "  裁剪旧版本 $(basename "$abs")"
     done
   done
+  # relay 放在【探针通过之后】，不是翻软链之后：mt/webui 一旦回滚，抢先升级的
+  # relay 就成了反向漂移 —— 生产跑着比主线更新的 relay，而没有任何东西记得。
+  log "同步 relay（不走软链，单独一套）"
+  if ! sync_relay "$MT_DIR" "$SNAP/relay"; then
+    # 刻意不回滚 mt/webui：relay 是独立进程，为它让 1259 个人再吃一次重启
+    # 不成比例。relay 已还原到发布前的字节，本次发布对 mt/webui 仍然有效。
+    outcome RELAY_FAILED
+    log "RELAY FAILED — $TAG 的 mt/webui 已生效，relay 未跟上（已还原，需人工介入）"
+    exit 1
+  fi
   exit 0
 fi
 
