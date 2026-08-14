@@ -1835,3 +1835,127 @@ def test_request_path_degrades_on_a_probe_pending_row(tmp_path):
 
     # And the row is left exactly as maintenance will find it.
     assert manager._load_payload("sunke", "sunke")["probe_pending"] is True
+
+
+# ------------------------------------------------- @routing cohort sentinel
+
+
+def _routing_db(tmp_path, rows):
+    import sqlite3
+
+    db = tmp_path / "routing.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE multitenancy_routing (user_id TEXT, profile_name TEXT, "
+        "active INTEGER, kind TEXT, provenance TEXT)"
+    )
+    conn.executemany("INSERT INTO multitenancy_routing VALUES (?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _refresh_env(monkeypatch, db, payer_ids):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", payer_ids)
+    monkeypatch.setenv("HERMES_MULTITENANCY_DB", str(db))
+    monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
+    monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-vault-key")
+    import hermes_multitenancy.billing_identity as bi
+
+    monkeypatch.setattr(
+        bi, "_default_preparer",
+        lambda: type("P", (), {"_credentials": type("C", (), {
+            "employee_key_needed": lambda self, p: True})()})(),
+    )
+
+
+def test_routing_sentinel_enrolls_whoever_sync_routes(monkeypatch, tmp_path):
+    """The 2026-08-14 gap: chenjunjiang joined, feishu-sync routed him, and the
+    frozen HERMES_LITELLM_BILLING_PAYER_IDS list still didn't know him — so the
+    sweep never minted. With "@routing" the routing table IS the cohort."""
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("sunke", "sunke", 1, "user", "sync"),
+        ("chenjunjiang", "chenjunjiang", 1, "user", "sync"),
+        ("departed", "departed", 0, "user", "sync"),      # inactive: retired
+        ("svc-bot", "svc-bot", 1, "user", "manual"),      # not sync: excluded
+        ("grp", "grp", 1, "group", "sync"),               # not a user: excluded
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == ["chenjunjiang", "sunke"]
+    assert out["cohort"] == 2
+
+
+def test_routing_sentinel_reports_noncanonical_ids_instead_of_minting(
+    monkeypatch, tmp_path
+):
+    """A synthetic ou_* row in routing is a chat identity, not a billing
+    subject — the shape guard must file it under unrouted, never mint."""
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("sunke", "sunke", 1, "user", "sync"),
+        ("ou_6aac8c2e4550daa891df4b22ea6b98fd", "ghost", 1, "user", "sync"),
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == ["sunke"]
+    assert out["unrouted"] == ["ou_6aac8c2e4550daa891df4b22ea6b98fd"]
+
+
+def test_a_list_containing_the_sentinel_stays_static(monkeypatch, tmp_path):
+    """"sunke,@routing" is a static list with a bogus member, not auto mode —
+    the bogus member is reported unrouted and nobody else sneaks in."""
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("sunke", "sunke", 1, "user", "sync"),
+        ("chenjunjiang", "chenjunjiang", 1, "user", "sync"),
+    ])
+    _refresh_env(monkeypatch, db, "sunke,@routing")
+
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == ["sunke"]
+    assert "chenjunjiang" not in out["would_issue"]
+    assert out["unrouted"] == ["@routing"]
+
+
+def test_routing_sentinel_refuses_an_empty_routing_table(monkeypatch, tmp_path):
+    """Static mode refuses an empty cohort (billing_canary_cohort_invalid);
+    auto mode must refuse too, or an empty/unreadable routing table becomes a
+    quiet zero-member sweep and 1291 keys age toward expiry with exit 0."""
+    import pytest
+
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("departed", "departed", 0, "user", "sync"),  # nobody active
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    with pytest.raises(bek.EmployeeKeyError, match="routing_cohort_empty"):
+        bek.run_refresh(dry_run=True)
+
+
+def test_routing_sentinel_refuses_a_cohort_with_no_mintable_member(
+    monkeypatch, tmp_path
+):
+    """grok review #p1: rows can exist yet ALL fail the canonical-shape gate
+    (mass ou_* subjects after a sync bug) — that is the same silent zero-member
+    sweep, so the refusal keys on post-filter payers, not raw row count."""
+    import pytest
+
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("ou_6aac8c2e4550daa891df4b22ea6b98fd", "ghost", 1, "user", "sync"),
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    with pytest.raises(bek.EmployeeKeyError, match="routing_cohort_empty"):
+        bek.run_refresh(dry_run=True)
