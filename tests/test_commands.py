@@ -11,6 +11,8 @@ from urllib.parse import unquote
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 def _build_event(text: str, user_id: str = "ou_cmd", chat_id: str = "chat-cmd"):
     return SimpleNamespace(
@@ -269,7 +271,7 @@ def test_lark_cli_history_sanitizer_removes_stale_bot_identity_note():
         "测试标记：CALENDAR\n\n"
         "命令执行成功，但今天日程数量为 0。\n"
         "当前 bot 身份下的 primary 日历今日无日程。",
-        Path("/Users/kite/.hermes/profiles/feishu_g41a5b5g"),
+        Path("/Users/dev/.hermes/profiles/feishu_g41a5b5g"),
     )
     assert "bot 身份" not in display
     assert "今天日程数量为 0" in display
@@ -422,7 +424,7 @@ async def test_stop_cancels_inflight_task(monkeypatch):
         await handle_async(event=_build_event("/stop", user_id="ou_stop"), gateway=gateway)
 
         # The slow runner's CancelledError handler must have fired
-        await asyncio.wait_for(cancelled_evt.wait(), timeout=1.0)
+        await asyncio.wait_for(cancelled_evt.wait(), timeout=SYNC_TIMEOUT)
         with pytest.raises(asyncio.CancelledError):
             await slow_task
 
@@ -1587,8 +1589,8 @@ async def test_second_message_cancels_first(monkeypatch):
         second = asyncio.create_task(
             handle_async(event=_build_event("second", user_id="ou_replace"), gateway=gateway)
         )
-        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
-        await asyncio.wait_for(second_done.wait(), timeout=1.0)
+        await asyncio.wait_for(cancelled.wait(), timeout=SYNC_TIMEOUT)
+        await asyncio.wait_for(second_done.wait(), timeout=SYNC_TIMEOUT)
         with pytest.raises(asyncio.CancelledError):
             await first
         await second
@@ -1680,11 +1682,11 @@ async def _run_inflight_replacement_is_scoped_to_profile_and_chat(monkeypatch):
         dm_task = asyncio.create_task(
             handle_async(event=_build_event("private slow", user_id="ou_same_owner", chat_id="dm-chat"), gateway=gateway)
         )
-        await asyncio.wait_for(dm_started.wait(), timeout=1.0)
+        await asyncio.wait_for(dm_started.wait(), timeout=SYNC_TIMEOUT)
         group_event = _build_event("group slow", user_id="ou_same_owner", chat_id="oc_sales")
         group_event.source.chat_type = "group"
         group_task = asyncio.create_task(handle_async(event=group_event, gateway=gateway))
-        await asyncio.wait_for(group_started.wait(), timeout=1.0)
+        await asyncio.wait_for(group_started.wait(), timeout=SYNC_TIMEOUT)
 
         await asyncio.sleep(0.05)
         assert not dm_cancelled.is_set()
@@ -1754,12 +1756,12 @@ async def _run_replacement_cancel_writes_single_interruption_marker(monkeypatch)
         first = asyncio.create_task(
             handle_async(event=_build_event("first", user_id="ou_late_cancel"), gateway=gateway)
         )
-        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await asyncio.wait_for(first_started.wait(), timeout=SYNC_TIMEOUT)
         second = asyncio.create_task(
             handle_async(event=_build_event("second", user_id="ou_late_cancel"), gateway=gateway)
         )
-        await asyncio.wait_for(first_cancel_seen.wait(), timeout=1.0)
-        await asyncio.wait_for(second_done.wait(), timeout=1.0)
+        await asyncio.wait_for(first_cancel_seen.wait(), timeout=SYNC_TIMEOUT)
+        await asyncio.wait_for(second_done.wait(), timeout=SYNC_TIMEOUT)
         await second
         release_first_cancel.set()
         with pytest.raises(asyncio.CancelledError):
@@ -1825,9 +1827,9 @@ async def _run_new_command_cancels_without_resume_marker(monkeypatch):
         first = asyncio.create_task(
             handle_async(event=_build_event("old work", user_id="ou_new_reset"), gateway=gateway)
         )
-        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.wait_for(started.wait(), timeout=SYNC_TIMEOUT)
         await handle_async(event=_build_event("/new", user_id="ou_new_reset"), gateway=gateway)
-        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(cancelled.wait(), timeout=SYNC_TIMEOUT)
         with pytest.raises(asyncio.CancelledError):
             await first
 
@@ -1884,12 +1886,12 @@ async def _run_replacement_streaming_turn_receives_interrupted_context(monkeypat
         first = asyncio.create_task(
             handle_async(event=_build_event("first", user_id="ou_stream_replace"), gateway=gateway)
         )
-        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await asyncio.wait_for(first_started.wait(), timeout=SYNC_TIMEOUT)
 
         second = asyncio.create_task(
             handle_async(event=_build_event("second", user_id="ou_stream_replace"), gateway=gateway)
         )
-        await asyncio.wait_for(first_cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(first_cancelled.wait(), timeout=SYNC_TIMEOUT)
         with pytest.raises(asyncio.CancelledError):
             await first
         await second
@@ -1948,7 +1950,7 @@ async def _run_interrupted_request_is_available_to_continue_turn(monkeypatch):
         first = asyncio.create_task(
             handle_async(event=_build_event("生成天气报告并发给我", user_id="ou_resume"), gateway=gateway)
         )
-        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.wait_for(started.wait(), timeout=SYNC_TIMEOUT)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first

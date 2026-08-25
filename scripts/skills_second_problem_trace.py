@@ -33,8 +33,8 @@ DEFAULT_ARTIFACT_MANIFEST_NAMES = {"feedback-artifacts.json", "feedback-artifact
 DEFAULT_FEEDBACK_TRANSCRIPT_NAME = "current-production-feedback.txt"
 DEFAULT_ROOTS = [
     Path(__file__).resolve().parents[1],
-    Path("/Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"),
-    Path("/Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/OpenClaw"),
+    Path("/Users/dev/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"),
+    Path("/Users/dev/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/OpenClaw"),
 ]
 AGENT_HISTORY_ROOTS = [
     Path.home() / ".codex" / "sessions",

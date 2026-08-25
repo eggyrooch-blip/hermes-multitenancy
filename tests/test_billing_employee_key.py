@@ -11,7 +11,7 @@ from hermes_multitenancy.billing_employee_key import (
 
 BASE = "https://itsms.example.com"
 TOKEN = "hks_test_token"
-EMAIL = "sunke@keep.com"
+EMAIL = "sunke@example.com"
 # Real shape observed in production 2026-08-06.
 ALIAS = "auto-sunke-20260806-012059-f60f9a"
 
@@ -368,7 +368,7 @@ def _manager(tmp_path):
 def _payer(employee_id="sunke"):
     from hermes_multitenancy.billing_identity import _ResolvedPayer
 
-    return _ResolvedPayer(employee_id, employee_id, f"{employee_id}@keep.com", "FD")
+    return _ResolvedPayer(employee_id, employee_id, f"{employee_id}@example.com", "FD")
 
 
 def _metadata(binding):
@@ -578,7 +578,7 @@ def test_adopt_layer_refuses_a_below_floor_key_even_when_hand_built(tmp_path):
     original = manager.adopt_employee_key(_payer(), _issued())
 
     short = IssuedKey(
-        employee_id="sunke", email="sunke@keep.com", api_key="sk-2-hour",
+        employee_id="sunke", email="sunke@example.com", api_key="sk-2-hour",
         base_url="https://litellm.example/v1",
         key_alias="auto-sunke-20260806-050000-short", team_alias="技术平台部",
         expires_at_ms=_NOW_MS + 2 * 60 * 60 * 1000,  # 2 hours: below the floor
@@ -927,7 +927,7 @@ def test_prefix_colliding_employee_ids_cannot_borrow_each_others_key(
     with pytest.raises(EmployeeKeyError) as excinfo:
         client.issue(
             employee_id=asked_for,
-            enterprise_email=f"{asked_for}@keep.com",
+            enterprise_email=f"{asked_for}@example.com",
             idempotency_key="prefix-collision-01",
         )
     assert excinfo.value.code == "employee_key_response_subject_mismatch"
@@ -1165,7 +1165,7 @@ def test_hyphenated_ids_cannot_borrow_each_others_key(alias_owner, asked_for, ok
     client, _ = _client(_Response(_body(key_alias=alias)))
     call = lambda: client.issue(  # noqa: E731
         employee_id=asked_for,
-        enterprise_email=f"{asked_for}@keep.com",
+        enterprise_email=f"{asked_for}@example.com",
         idempotency_key="hyphen-collision-01",
     )
     if ok:
@@ -1276,7 +1276,7 @@ def test_401_repair_never_mints_on_the_employee_request_path(monkeypatch, tmp_pa
     metadata = {
         "litellm_billing_employee_user_id": "sunke",
         "litellm_billing_profile_name": "sunke",
-        "litellm_billing_email": "sunke@keep.com",
+        "litellm_billing_email": "sunke@example.com",
     }
     with pytest.raises(BillingUnavailable):
         preparer.repair_metadata(metadata)
@@ -1301,7 +1301,7 @@ def test_degrade_billing_metadata_strips_attribution_and_audits(caplog):
         "litellm_billing_enforced": True,
         "litellm_billing_employee_user_id": "sunke",
         "litellm_billing_profile_name": "sunke",
-        "litellm_billing_email": "sunke@keep.com",
+        "litellm_billing_email": "sunke@example.com",
         "litellm_billing_key_id": "key-dead",
         "chat_type": "p2p",
     }
@@ -1343,9 +1343,9 @@ def test_401_repair_rejects_a_non_canonical_identity(monkeypatch, tmp_path):
     # has no shape guard of its own (it never resolved this id through the
     # live routing path), so this succeeds exactly like a real
     # store_binding() would for a legitimately-resolved payer.
-    bad_payer = _ResolvedPayer("ou_synthetic", "ou_synthetic", "ou_synthetic@keep.com")
+    bad_payer = _ResolvedPayer("ou_synthetic", "ou_synthetic", "ou_synthetic@example.com")
     seed = IssuedKey(
-        employee_id="ou_synthetic", email="ou_synthetic@keep.com",
+        employee_id="ou_synthetic", email="ou_synthetic@example.com",
         api_key="sk-seed", base_url="https://litellm.example/v1",
         key_alias="auto-ou_synthetic-20260806-040000-seed", team_alias="技术平台部",
         expires_at_ms=_NOW_MS + 30 * _DAY, litellm_user_id="llm-ou-synthetic",
@@ -1369,7 +1369,7 @@ def test_401_repair_rejects_a_non_canonical_identity(monkeypatch, tmp_path):
     metadata = {
         "litellm_billing_employee_user_id": "ou_synthetic",
         "litellm_billing_profile_name": "ou_synthetic",
-        "litellm_billing_email": "ou_synthetic@keep.com",
+        "litellm_billing_email": "ou_synthetic@example.com",
     }
     with pytest.raises(RunRejected):
         preparer.repair_metadata(metadata)
@@ -1453,12 +1453,12 @@ def test_run_refresh_uses_the_snapshot_email_and_writes_both_stores(
     conn.close()
 
     # A snapshot email that deliberately differs from the fabricated fallback
-    # (sunke@keep.com) so the assertion cannot pass by accident.
+    # (sunke@example.com) so the assertion cannot pass by accident.
     snap_dir = tmp_path / "org-snapshots"
     snap_dir.mkdir()
     (snap_dir / "org-1.json").write_text(json.dumps({
         "employees": {
-            "sunke": {"user_id": "sunke", "enterprise_email": "sun.ke@keep.com",
+            "sunke": {"user_id": "sunke", "enterprise_email": "sun.ke@example.com",
                       "dept_id": "d1"},
         },
         "departments": [{"dept_id": "d1", "name": "技术平台部", "parent_id": "0"}],
@@ -1506,7 +1506,7 @@ def test_run_refresh_uses_the_snapshot_email_and_writes_both_stores(
 
     out = bek.run_refresh(dry_run=False)
 
-    assert seen_emails == ["sun.ke@keep.com"], (
+    assert seen_emails == ["sun.ke@example.com"], (
         "must use the org snapshot's canonical email, not the fabricated one"
     )
     assert out["issued"] == 1
@@ -1835,3 +1835,127 @@ def test_request_path_degrades_on_a_probe_pending_row(tmp_path):
 
     # And the row is left exactly as maintenance will find it.
     assert manager._load_payload("sunke", "sunke")["probe_pending"] is True
+
+
+# ------------------------------------------------- @routing cohort sentinel
+
+
+def _routing_db(tmp_path, rows):
+    import sqlite3
+
+    db = tmp_path / "routing.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE multitenancy_routing (user_id TEXT, profile_name TEXT, "
+        "active INTEGER, kind TEXT, provenance TEXT)"
+    )
+    conn.executemany("INSERT INTO multitenancy_routing VALUES (?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _refresh_env(monkeypatch, db, payer_ids):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", payer_ids)
+    monkeypatch.setenv("HERMES_MULTITENANCY_DB", str(db))
+    monkeypatch.setenv("HERMES_EMPLOYEE_KEY_SILENT_TOKEN", "tok")
+    monkeypatch.setenv("HERMES_EMPLOYEE_KEY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-vault-key")
+    import hermes_multitenancy.billing_identity as bi
+
+    monkeypatch.setattr(
+        bi, "_default_preparer",
+        lambda: type("P", (), {"_credentials": type("C", (), {
+            "employee_key_needed": lambda self, p: True})()})(),
+    )
+
+
+def test_routing_sentinel_enrolls_whoever_sync_routes(monkeypatch, tmp_path):
+    """The 2026-08-14 gap: lisi joined, feishu-sync routed him, and the
+    frozen HERMES_LITELLM_BILLING_PAYER_IDS list still didn't know him — so the
+    sweep never minted. With "@routing" the routing table IS the cohort."""
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("sunke", "sunke", 1, "user", "sync"),
+        ("lisi", "lisi", 1, "user", "sync"),
+        ("departed", "departed", 0, "user", "sync"),      # inactive: retired
+        ("svc-bot", "svc-bot", 1, "user", "manual"),      # not sync: excluded
+        ("grp", "grp", 1, "group", "sync"),               # not a user: excluded
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == ["lisi", "sunke"]
+    assert out["cohort"] == 2
+
+
+def test_routing_sentinel_reports_noncanonical_ids_instead_of_minting(
+    monkeypatch, tmp_path
+):
+    """A synthetic ou_* row in routing is a chat identity, not a billing
+    subject — the shape guard must file it under unrouted, never mint."""
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("sunke", "sunke", 1, "user", "sync"),
+        ("ou_eeeeeeeeeeeeeeee0000000000000001", "ghost", 1, "user", "sync"),
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == ["sunke"]
+    assert out["unrouted"] == ["ou_eeeeeeeeeeeeeeee0000000000000001"]
+
+
+def test_a_list_containing_the_sentinel_stays_static(monkeypatch, tmp_path):
+    """"sunke,@routing" is a static list with a bogus member, not auto mode —
+    the bogus member is reported unrouted and nobody else sneaks in."""
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("sunke", "sunke", 1, "user", "sync"),
+        ("lisi", "lisi", 1, "user", "sync"),
+    ])
+    _refresh_env(monkeypatch, db, "sunke,@routing")
+
+    out = bek.run_refresh(dry_run=True)
+    assert out["would_issue"] == ["sunke"]
+    assert "lisi" not in out["would_issue"]
+    assert out["unrouted"] == ["@routing"]
+
+
+def test_routing_sentinel_refuses_an_empty_routing_table(monkeypatch, tmp_path):
+    """Static mode refuses an empty cohort (billing_canary_cohort_invalid);
+    auto mode must refuse too, or an empty/unreadable routing table becomes a
+    quiet zero-member sweep and 1291 keys age toward expiry with exit 0."""
+    import pytest
+
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("departed", "departed", 0, "user", "sync"),  # nobody active
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    with pytest.raises(bek.EmployeeKeyError, match="routing_cohort_empty"):
+        bek.run_refresh(dry_run=True)
+
+
+def test_routing_sentinel_refuses_a_cohort_with_no_mintable_member(
+    monkeypatch, tmp_path
+):
+    """grok review #p1: rows can exist yet ALL fail the canonical-shape gate
+    (mass ou_* subjects after a sync bug) — that is the same silent zero-member
+    sweep, so the refusal keys on post-filter payers, not raw row count."""
+    import pytest
+
+    from hermes_multitenancy import billing_employee_key as bek
+
+    db = _routing_db(tmp_path, [
+        ("ou_eeeeeeeeeeeeeeee0000000000000001", "ghost", 1, "user", "sync"),
+    ])
+    _refresh_env(monkeypatch, db, "@routing")
+
+    with pytest.raises(bek.EmployeeKeyError, match="routing_cohort_empty"):
+        bek.run_refresh(dry_run=True)

@@ -456,12 +456,12 @@ def test_enforced_state_never_reverts_when_global_switch_turns_off(tmp_path, mon
 
     db_path = tmp_path / "multitenancy.db"
     store = BillingIdentityStore(db_path)
-    store.put(BillingIdentity("actor", "actor", "actor@keep.com", "llm-actor"))
+    store.put(BillingIdentity("actor", "actor", "actor@example.com", "llm-actor"))
     store.put(BillingIdentity(
-        "actor", "actor", "actor@keep.com", "llm-actor", "team-fd", "FD",
+        "actor", "actor", "actor@example.com", "llm-actor", "team-fd", "FD",
         "key-1", 1, FIXTURE["ensure_issued_response"]["expires_at"], "enforced",
     ))
-    store.put(BillingIdentity("actor", "actor", "actor@keep.com", "llm-other"))
+    store.put(BillingIdentity("actor", "actor", "actor@example.com", "llm-other"))
     monkeypatch.delenv("HERMES_LITELLM_BILLING_ENABLED", raising=False)
     credentials = _FakeCredentials()
     preparer = __import__(
@@ -491,7 +491,7 @@ def test_enforced_profile_identity_mismatch_stops_at_run_broker_when_billing_off
     store.put(BillingIdentity(
         "actor",
         "actor",
-        "actor@keep.com",
+        "actor@example.com",
         "llm-actor",
         "team-fd",
         "FD",
@@ -543,7 +543,7 @@ def test_enforced_group_missing_owner_route_stops_when_billing_off(
     store.put(BillingIdentity(
         "owner",
         "owner",
-        "owner@keep.com",
+        "owner@example.com",
         "llm-owner",
         "team-fd",
         "FD",
@@ -657,7 +657,7 @@ def test_noncohort_group_ignores_stale_billing_profile_binding(
     store.put(BillingIdentity(
         "stale-employee",
         "group_oc_group",
-        "stale@keep.com",
+        "stale@example.com",
         "llm-stale",
         "team-stale",
         "FD",
@@ -725,7 +725,7 @@ def _manager(tmp_path, gateway, *, probe=None):
 def _payer():
     from hermes_multitenancy.billing_identity import _ResolvedPayer
 
-    return _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    return _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
 
 def _metadata(binding):
@@ -955,7 +955,7 @@ def test_gateway_client_matches_shared_fixture_and_ack_hash():
     )
     issued = client.ensure(**{
         "employee_id": "alice",
-        "enterprise_email": "alice@keep.com",
+        "enterprise_email": "alice@example.com",
         "department_alias": "FD",
         "reason": "missing",
     })
@@ -981,7 +981,7 @@ def test_gateway_rejects_unknown_major_and_error_envelope():
     with pytest.raises(_GatewayError, match="unsupported_contract_version"):
         client.ensure(
             employee_id="alice",
-            enterprise_email="alice@keep.com",
+            enterprise_email="alice@example.com",
             department_alias="FD",
             reason="missing",
         )
@@ -1001,7 +1001,7 @@ def test_gateway_rejects_unknown_major_and_error_envelope():
     with pytest.raises(_GatewayError) as caught:
         client.ensure(
             employee_id="alice",
-            enterprise_email="alice@keep.com",
+            enterprise_email="alice@example.com",
             department_alias="FD",
             reason="missing",
         )
@@ -1025,7 +1025,7 @@ def test_gateway_rejects_credential_or_query_in_control_plane_url():
         with pytest.raises(_GatewayError, match="broker_not_configured"):
             client.ensure(
                 employee_id="alice",
-                enterprise_email="alice@keep.com",
+                enterprise_email="alice@example.com",
                 department_alias="FD",
                 reason="missing",
             )
@@ -1054,7 +1054,7 @@ def test_gateway_rejects_error_envelope_without_message():
     with pytest.raises(_GatewayError, match="invalid_error_envelope"):
         client.ensure(
             employee_id="alice",
-            enterprise_email="alice@keep.com",
+            enterprise_email="alice@example.com",
             department_alias="FD",
             reason="missing",
         )
@@ -1107,7 +1107,7 @@ def test_401_repair_of_a_legacy_credential_still_uses_ensure_available(tmp_path)
     credentials = _FakeCredentials()  # .source == "" : legacy owns this row
     preparer = _identity_preparer(tmp_path, credentials)
     existing = BillingIdentity(
-        employee_user_id="actor", profile_name="actor", email="actor@keep.com",
+        employee_user_id="actor", profile_name="actor", email="actor@example.com",
         litellm_user_id="llm-actor", team_id="team-fd", team_alias="FD",
         key_id="key-actor", credential_version=1,
         expires_at=FIXTURE["ensure_issued_response"]["expires_at"],
@@ -1118,7 +1118,7 @@ def test_401_repair_of_a_legacy_credential_still_uses_ensure_available(tmp_path)
     metadata = {
         "litellm_billing_employee_user_id": "actor",
         "litellm_billing_profile_name": "actor",
-        "litellm_billing_email": "actor@keep.com",
+        "litellm_billing_email": "actor@example.com",
     }
     preparer.repair_metadata(metadata)
 

@@ -194,7 +194,7 @@ bytes. Example shape:
 ```ini
 HERMES_ACCOUNT_LEDGER_ORG_SNAPSHOT=/home/hermes/.hermes/org-snapshots/org-EXPLICIT-FROZEN.json
 HERMES_ACCOUNT_LEDGER_DATABASE=/home/hermes/.hermes/multitenancy.db
-HERMES_ACCOUNT_LEDGER_LITELLM_BASE_URL=https://litellm.sre.gotokeep.com
+HERMES_ACCOUNT_LEDGER_LITELLM_BASE_URL=https://litellm.sre.example.com
 HERMES_ACCOUNT_LEDGER_LITELLM_KEY_FILE=/etc/hermes/account-ledger-litellm-readonly.key
 HERMES_ACCOUNT_LEDGER_OUTPUT_DIR=/var/lib/hermes/account-ledger/EXPLICIT-RUN-ID
 ```

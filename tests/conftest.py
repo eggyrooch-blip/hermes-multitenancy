@@ -9,9 +9,42 @@ from __future__ import annotations
 
 import json
 import itertools
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+def _cgroup_cpu_quota() -> int | None:
+    """容器 CPU 配额(向上取整),读不到返回 None。
+
+    CI runner(rootless podman)里 os.cpu_count() 报宿主机核数,xdist `-n auto`
+    据此开 32+ worker 挤在几核配额上,线程/子进程饿死到 30s 预算都不够
+    (2026-08-14 pipeline 538416)。cgroup v2 cpu.max 才是真实可用算力。
+    """
+    try:
+        text = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if text and text[0] != "max":
+            quota = int(text[0])
+            period = int(text[1]) if len(text) > 1 else 100000
+            if quota > 0 and period > 0:
+                return max(1, -(-quota // period))
+    except Exception:
+        pass
+    return None
+
+
+_quota = _cgroup_cpu_quota()
+if _quota is None and os.environ.get("CI"):
+    # 配额读不到(cpu.max="max" 或 cgroup v1)但在共享 runner 上:host nproc
+    # 永远不是正确答案 —— 别的 pipeline 在同机竞争。钉一个保守值。
+    _quota = 8
+if _quota is not None and not os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
+    os.environ["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(_quota)
+    import sys as _sys
+
+    print(f"[conftest] xdist workers capped: quota={_quota}", file=_sys.stderr)
 
 
 _CARD_MESSAGES = itertools.count()

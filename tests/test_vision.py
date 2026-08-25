@@ -190,7 +190,7 @@ def test_local_fallback_surfaces_vision_provider_failure(monkeypatch):
 
     event = _make_event(
         text="我该如何在这个web页面中给你发送截图呢?",
-        media_urls=["/Users/kite/.hermes/profiles/coder/images/clip.png"],
+        media_urls=["/Users/dev/.hermes/profiles/coder/images/clip.png"],
         media_types=["image/png"],
     )
     result = asyncio.run(_local_enrich_with_vision_only(event))

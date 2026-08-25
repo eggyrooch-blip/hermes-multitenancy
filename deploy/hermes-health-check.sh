@@ -20,6 +20,8 @@ KANBAN_DB="${HERMES_HOME}/kanban/current"
 MULTITENANCY_DB="${HERMES_HOME}/multitenancy.db"
 GATEWAY_LOGS_GLOB="${HERMES_HOME}/profiles/*/logs/gateway.log"
 
+UNIT_DIR="${HERMES_UNIT_DIR:-$HOME/.config/systemd/user}"
+
 STATE_DIR="${HERMES_HOME}/health-check"
 LOG_FILE="${STATE_DIR}/health-check.log"
 DEDUP_WINDOW_SEC=1800  # 30 minutes
@@ -60,6 +62,7 @@ PROBE_JSON=$("$PYTHON" "$PROBES_SCRIPT" \
     --kanban-db "$KANBAN_DB" \
     --multitenancy-db "$MULTITENANCY_DB" \
     $GATEWAY_LOGS \
+    --unit-dir "$UNIT_DIR" \
     --json 2>>"$LOG_FILE")
 
 if [ $? -ne 0 ]; then
@@ -119,21 +122,34 @@ value: $VALUE (threshold: $THRESHOLD)
 detail: $DETAIL
 time: $(ts)"
 
+        SEND_OK=1
         if [ -n "$WEBHOOK_URL" ]; then
             "$PYTHON" -c "
 import json, urllib.request, sys
 payload = json.dumps({'msg_type': 'text', 'content': {'text': sys.argv[1]}}, ensure_ascii=False).encode('utf-8')
 req = urllib.request.Request(sys.argv[2], data=payload, headers={'Content-Type': 'application/json'})
 try:
-    urllib.request.urlopen(req, timeout=10)
+    resp = urllib.request.urlopen(req, timeout=10)
+    body = json.loads(resp.read().decode('utf-8'))
 except Exception as e:
     print(f'webhook post failed: {e}', file=sys.stderr)
-" "$ALERT_TEXT" "$WEBHOOK_URL" 2>>"$LOG_FILE"
+    sys.exit(1)
+# 飞书 webhook 拒收也返回 HTTP 200，成功判据是 body 的 code/StatusCode 为 0
+if body.get('code', 0) != 0 or body.get('StatusCode', 0) != 0:
+    print(f'webhook rejected: {body}', file=sys.stderr)
+    sys.exit(1)
+" "$ALERT_TEXT" "$WEBHOOK_URL" 2>>"$LOG_FILE" || SEND_OK=0
         fi
 
-        echo "$NOW_EPOCH" > "$STATE_FILE"
-        echo "$(ts) ALERT $NAME: value=$VALUE threshold=$THRESHOLD — alert sent" >> "$LOG_FILE"
-        ALERTS_SENT=$((ALERTS_SENT + 1))
+        # 只有确认送达（或未配置 webhook 的纯日志模式）才盖 dedup 章；
+        # 发送失败不 stamp，下一轮 5 分钟重试，绝不静默压制告警
+        if [ "$SEND_OK" = "1" ]; then
+            echo "$NOW_EPOCH" > "$STATE_FILE"
+            echo "$(ts) ALERT $NAME: value=$VALUE threshold=$THRESHOLD — alert sent" >> "$LOG_FILE"
+            ALERTS_SENT=$((ALERTS_SENT + 1))
+        else
+            echo "$(ts) ALERT $NAME: value=$VALUE threshold=$THRESHOLD — webhook FAILED, dedup not stamped" >> "$LOG_FILE"
+        fi
 
     else
         # Probe is passing — check if it was previously alerting
@@ -143,20 +159,32 @@ except Exception as e:
 host: $HOST
 time: $(ts)"
 
+            SEND_OK=1
             if [ -n "$WEBHOOK_URL" ]; then
                 "$PYTHON" -c "
 import json, urllib.request, sys
 payload = json.dumps({'msg_type': 'text', 'content': {'text': sys.argv[1]}}, ensure_ascii=False).encode('utf-8')
 req = urllib.request.Request(sys.argv[2], data=payload, headers={'Content-Type': 'application/json'})
 try:
-    urllib.request.urlopen(req, timeout=10)
+    resp = urllib.request.urlopen(req, timeout=10)
+    body = json.loads(resp.read().decode('utf-8'))
 except Exception as e:
     print(f'webhook post failed: {e}', file=sys.stderr)
-" "$RECOVERY_TEXT" "$WEBHOOK_URL" 2>>"$LOG_FILE"
+    sys.exit(1)
+# 飞书 webhook 拒收也返回 HTTP 200，成功判据是 body 的 code/StatusCode 为 0
+if body.get('code', 0) != 0 or body.get('StatusCode', 0) != 0:
+    print(f'webhook rejected: {body}', file=sys.stderr)
+    sys.exit(1)
+" "$RECOVERY_TEXT" "$WEBHOOK_URL" 2>>"$LOG_FILE" || SEND_OK=0
             fi
 
-            rm -f "$STATE_FILE"
-            echo "$(ts) RECOVERED $NAME — recovery notification sent" >> "$LOG_FILE"
+            # 同 alert：恢复播报没送达就保留状态文件，下一轮重试
+            if [ "$SEND_OK" = "1" ]; then
+                rm -f "$STATE_FILE"
+                echo "$(ts) RECOVERED $NAME — recovery notification sent" >> "$LOG_FILE"
+            else
+                echo "$(ts) RECOVERED $NAME — webhook FAILED, state kept for retry" >> "$LOG_FILE"
+            fi
         fi
     fi
 done

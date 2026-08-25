@@ -68,7 +68,7 @@ HERMES_TOKEN_NAME = "hermes"
 #: scope hid an admin credential).
 SCOPE_BINDING_UNVERIFIED = "gitlab:scope-binding-unverified"
 
-DEFAULT_HOST = "gitlab.gotokeep.com"
+DEFAULT_HOST = "gitlab.example.com"
 
 #: The two tiers an employee picks between on the card.
 #:
@@ -257,7 +257,7 @@ def assert_runtime_contract_live(shared_home: Path, *, profile_name: str) -> dic
     """
     from .credential_materializer import (
         SELF_PROFILE_MARKER,
-        _target_profiles,
+        entry_targets_profile,
     )
 
     shared_home = Path(shared_home)
@@ -275,10 +275,12 @@ def assert_runtime_contract_live(shared_home: Path, *, profile_name: str) -> dic
             "服务端 GitLab 凭据条目没有配置环境变量名，token 不会被注入，因此没有保存。请联系管理员。"
         )
     try:
-        targeted = _target_profiles(entry, shared_home=shared_home)
+        targeted = entry_targets_profile(
+            entry, shared_home=shared_home, profile_name=profile_name
+        )
     except Exception:
         raise TokenRejected("服务端 GitLab 凭据条目的适用范围读不出来，请联系管理员。") from None
-    if profile_name not in targeted:
+    if not targeted:
         raise TokenRejected(
             "你的账号不在服务端 GitLab 凭据的适用范围里，提交不会生效，因此没有保存。请联系管理员。"
         )
@@ -320,6 +322,7 @@ def submit_personal_token(
     host: str = DEFAULT_HOST,
     db_path: Optional[Path] = None,
     prober: Any = None,
+    group_owner_open_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Validate an employee's token and store it under their own profile.
 
@@ -343,6 +346,28 @@ def submit_personal_token(
 
     entry = assert_runtime_contract_live(shared_home, profile_name=profile_name)
     subject_id = str(entry["subject_id"]).strip()
+
+    # Defense in depth (grok round-1 #3): a GROUP profile's token may only be
+    # banked when the caller proves it acts for the group owner. The broker is
+    # the normal enforcer; this keeps any direct/future intake caller from
+    # quietly binding a token onto a group by naming its profile.
+    _row = None
+    _routing_db = Path(db_path or shared_home / "multitenancy.db")
+    if _routing_db.exists():  # never CREATE the db from a validation guard
+        try:
+            from .routing import RoutingTable
+
+            _table = RoutingTable(_routing_db)
+            try:
+                _row = _table.lookup_by_profile_name(profile_name)
+            finally:
+                _table.close()
+        except Exception:
+            _row = None
+    if _row is not None and _row.kind == "group":
+        claimed = str(group_owner_open_id or "").strip()
+        if not claimed or claimed != str(_row.owner_open_id or ""):
+            raise TokenRejected("这个 profile 属于一个群，只有群主能为它绑定 GitLab token。")
 
     probe = prober or probe_token
     verdict, scopes, expiry_raw = probe(cleaned, host=host)

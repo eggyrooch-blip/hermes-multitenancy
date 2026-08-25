@@ -12,9 +12,9 @@ Type=oneshot
 # 上报 Bearer（与员工 Mac MDM 同一把，收集端 COLLECTOR_API_TOKENS 之一）。
 Environment=HERMES_TOKSCALE_REPORT_KEY=<tokscale-report-key>
 # 邮箱域名（必填）：email = <user_id>@<域名>，全公司排行榜统一身份键。
-Environment=HERMES_TOKEN_USAGE_EMAIL_DOMAIN=keep.com
+Environment=HERMES_TOKEN_USAGE_EMAIL_DOMAIN=example.com
 # 以下有默认值，按需覆盖：
-# Environment=HERMES_TOKSCALE_COLLECTOR=https://tokscale.gotokeep.com
+# Environment=HERMES_TOKSCALE_COLLECTOR=https://tokscale.example.com
 # Environment=HERMES_TOKEN_USAGE_LEDGER_PATH=/var/log/hermes/token-usage.jsonl
 # Environment=HERMES_MULTITENANCY_DB=/home/hermes/.hermes/multitenancy.db
 ExecStart=@PYTHON@ -m hermes_multitenancy.token_usage_uploader

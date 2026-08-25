@@ -24,8 +24,10 @@ from health_probes import (  # noqa: E402
     probe_billing_drift,
     probe_notify_failures,
     probe_queue_backlog,
+    probe_unit_exec_paths,
     probe_zombie_tasks,
     run_all_probes,
+    UNIT_EXEC_DETAIL_MAX,
     format_alert_text,
     ProbeResult,
 )
@@ -92,7 +94,7 @@ def _make_multitenancy_db(
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     bi["user_id"],
-                    f"{bi['user_id']}@keep.com",
+                    f"{bi['user_id']}@example.com",
                     bi.get("litellm_user_id", "llm-" + bi["user_id"]),
                     bi.get("key_id", "sk-xxx"),
                     bi.get("migration_state", "enforced"),
@@ -317,3 +319,258 @@ def test_format_alert_text():
     assert "42.0" in text
     assert "hermes-1" in text
     assert "something broke" in text
+
+
+# ---------------------------------------------------------------------------
+# Probe 6: unit_exec_paths
+# ---------------------------------------------------------------------------
+
+
+def _make_unit_dir(tmp_path: Path) -> Path:
+    unit_dir = tmp_path / "systemd-user"
+    unit_dir.mkdir()
+    return unit_dir
+
+
+def test_unit_exec_paths_dead_path_alerts(tmp_path):
+    """A unit whose ExecStart argv[0] doesn't exist → alert, detail names it."""
+    unit_dir = _make_unit_dir(tmp_path)
+    (unit_dir / "broken.service").write_text(
+        "[Service]\nExecStart=/nonexistent/venv/bin/python -m foo bar\n"
+    )
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert r.value == 1.0
+    assert "broken.service → /nonexistent/venv/bin/python" in r.detail
+
+
+def test_unit_exec_paths_all_alive_passes(tmp_path):
+    """Units (incl. drop-in ExecStartPre) pointing at real executables → pass."""
+    unit_dir = _make_unit_dir(tmp_path)
+    exe = tmp_path / "bin" / "runner"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+
+    exe2 = tmp_path / "bin" / "pre-runner"
+    exe2.write_text("#!/bin/sh\n")
+    exe2.chmod(0o755)
+
+    (unit_dir / "good.service").write_text(f"[Service]\nExecStart={exe} --flag\n")
+    dropin = unit_dir / "good.service.d"
+    dropin.mkdir()
+    (dropin / "10-pre.conf").write_text(f"[Service]\nExecStartPre={exe2} pre\n")
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "pass"
+    assert r.value == 0.0
+    assert "checked 2 exec paths" in r.detail
+
+
+def test_unit_exec_paths_prefixes_and_relative_skipped(tmp_path):
+    """systemd prefixes are stripped; non-absolute argv[0] and reset lines are skipped."""
+    unit_dir = _make_unit_dir(tmp_path)
+    exe = tmp_path / "ok.sh"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+
+    (unit_dir / "mixed.service").write_text(
+        "[Service]\n"
+        f"ExecStartPre=-@{exe} probe\n"   # prefixes stripped → alive
+        "ExecStart=node server.js\n"      # relative → $PATH lookup, skipped
+        "ExecStop=\n"                     # drop-in reset syntax, skipped
+        "ExecReload=!/missing/reloader\n"  # prefix stripped → dead
+        "ExecSearchPath=/some/dir:/other/dir\n"  # directory list, not a command → skipped
+        "ExecStart=%h/bin/tool run\n"           # specifier → skipped, not expanded
+    )
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert r.value == 1.0
+    assert "mixed.service → /missing/reloader" in r.detail
+    assert str(exe) not in r.detail
+
+
+def test_unit_exec_paths_missing_dir_passes(tmp_path):
+    """No unit dir at all (fresh host) → pass, not a crash."""
+    r = probe_unit_exec_paths(tmp_path / "nope")
+    assert r.status == "pass"
+
+
+def test_run_all_probes_includes_unit_dir_when_given(tmp_path):
+    """unit_dir opt-in: omitted → 5 results (back-compat); given → 6th probe present."""
+    kanban_db = tmp_path / "kanban.db"
+    mt_db = tmp_path / "multitenancy.db"
+    log = tmp_path / "gateway.log"
+    now = int(time.time())
+    _make_kanban_db(kanban_db, [{"id": "t1", "status": "done", "created_at": now}])
+    _make_multitenancy_db(mt_db, [{"user_id": "u1", "key_id": "sk-x", "migration_state": "enforced"}])
+    _write_log(log, [f"{_ts(10)} INFO gateway: ok"])
+    unit_dir = _make_unit_dir(tmp_path)
+
+    five = run_all_probes(gateway_log_paths=[log], kanban_db_path=kanban_db, multitenancy_db_path=mt_db)
+    six = run_all_probes(
+        gateway_log_paths=[log], kanban_db_path=kanban_db,
+        multitenancy_db_path=mt_db, unit_dir=unit_dir,
+    )
+    assert len(five) == 5
+    assert [r.name for r in six][-1] == "unit_exec_paths"
+    assert six[-1].status == "pass"
+
+
+def test_unit_exec_paths_quoted_and_continued_lines(tmp_path):
+    """Quoted argv[0] and backslash-continued lines are real systemd syntax —
+    both must be tokenized, dead and alive alike (review P1: naive tokenization)."""
+    unit_dir = _make_unit_dir(tmp_path)
+    exe = tmp_path / "spaced dir" / "runner"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+
+    (unit_dir / "quoted-live.service").write_text(
+        f'[Service]\nExecStart="{exe}" --flag\n'
+    )
+    (unit_dir / "quoted-dead.service").write_text(
+        '[Service]\nExecStart="/definitely/missing/python" -m foo\n'
+    )
+    (unit_dir / "continued-dead.service").write_text(
+        "[Service]\nExecStart=\\\n  /also/missing/tool \\\n  --opt\n"
+    )
+    (unit_dir / "prefixed-quoted-dead.service").write_text(
+        '[Service]\nExecStart=-"/missing/prefixed"\n'
+    )
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert r.value == 3.0
+    assert "quoted-dead.service → /definitely/missing/python" in r.detail
+    assert "continued-dead.service → /also/missing/tool" in r.detail
+    assert "prefixed-quoted-dead.service → /missing/prefixed" in r.detail
+    assert str(exe) not in r.detail
+
+
+def test_unit_exec_paths_unreadable_unit_alerts(tmp_path):
+    """An unreadable unit may hide a dead executable — fail closed, not open
+    (review P1: scan-errors-fail-open)."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads through 0o000")
+    unit_dir = _make_unit_dir(tmp_path)
+    secret = unit_dir / "secret.service"
+    secret.write_text("[Service]\nExecStart=/definitely/missing/python\n")
+    secret.chmod(0o000)
+    try:
+        r = probe_unit_exec_paths(unit_dir)
+    finally:
+        secret.chmod(0o644)
+
+    assert r.status == "alert"
+    assert "secret.service → unreadable" in r.detail
+
+
+def test_unit_exec_paths_dropin_owner_named(tmp_path):
+    """Drop-ins report their owning unit; identical basename+path across units
+    must not collapse (review P1: drop-in-owner-identity-lost)."""
+    unit_dir = _make_unit_dir(tmp_path)
+    for unit in ("alpha.service", "beta.service"):
+        d = unit_dir / f"{unit}.d"
+        d.mkdir()
+        (d / "override.conf").write_text("[Service]\nExecStart=/missing/shared\n")
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.value == 2.0
+    assert "alpha.service → /missing/shared" in r.detail
+    assert "beta.service → /missing/shared" in r.detail
+    assert "override.conf" not in r.detail
+
+
+def test_unit_exec_paths_detail_capped(tmp_path):
+    """Dead-entry detail is bounded with an omitted-count suffix
+    (review P1: unbounded-unit-input-and-alert-detail)."""
+    unit_dir = _make_unit_dir(tmp_path)
+    lines = "".join(f"ExecStartPre=/missing/bin{i}\n" for i in range(30))
+    (unit_dir / "many.service").write_text("[Service]\n" + lines)
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert r.value == 30.0
+    assert r.detail.count(";") == UNIT_EXEC_DETAIL_MAX - 1
+    assert "+10 more" in r.detail
+
+
+def test_unit_exec_paths_oversized_file_fails_closed(tmp_path, monkeypatch):
+    """A file past the read bound is flagged as dead, NOT silently truncated —
+    a late dead ExecStart must never yield pass (review P1 round 2)."""
+    import health_probes
+
+    monkeypatch.setattr(health_probes, "UNIT_EXEC_MAX_BYTES", 64)
+    unit_dir = _make_unit_dir(tmp_path)
+    (unit_dir / "huge.service").write_text(
+        "[Service]\n" + "# pad\n" * 50 + "ExecStart=/missing/late\n"
+    )
+
+    r = health_probes.probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert "huge.service → oversized" in r.detail
+    assert "/missing/late" not in r.detail
+
+
+def test_unit_exec_paths_systemd_escapes_decoded(tmp_path):
+    """C-style escapes (\\s = space) decode in quoted AND unquoted tokens;
+    embedded quotes concatenate (review P1 round 2: naive tokenization)."""
+    unit_dir = _make_unit_dir(tmp_path)
+    exe = tmp_path / "sp ace" / "runner"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    escaped = str(exe).replace(" ", "\\s")
+
+    (unit_dir / "escaped-live.service").write_text(
+        f"[Service]\nExecStart={escaped} --flag\n"
+    )
+    (unit_dir / "escaped-dead.service").write_text(
+        "[Service]\nExecStart=/missing/dir\\swith/binary --x\n"
+    )
+    (unit_dir / "quoted-escape-live.service").write_text(
+        f'[Service]\nExecStart="{escaped}" --flag\n'
+    )
+    (unit_dir / "embedded-quote-live.service").write_text(
+        f'[Service]\nExecStart={exe.parent.parent}/"sp ace"/runner --flag\n'
+    )
+
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert r.value == 1.0
+    assert "escaped-dead.service → /missing/dir with/binary" in r.detail
+    assert "escaped-live" not in r.detail
+    assert "quoted-escape-live" not in r.detail
+    assert "embedded-quote-live" not in r.detail
+
+
+def test_unit_exec_paths_scan_error_alerts(tmp_path, monkeypatch):
+    """Directory enumeration failing (permissions/IO) alerts instead of raising
+    (review P1 round 2: scan-errors-fail-open)."""
+    unit_dir = _make_unit_dir(tmp_path)
+
+    def boom(self, pattern):
+        raise PermissionError("scan denied")
+
+    monkeypatch.setattr(type(unit_dir), "glob", boom)
+    r = probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert "unit scan → unreadable" in r.detail
+
+
+def test_unit_exec_paths_too_many_files_fails_closed(tmp_path, monkeypatch):
+    """Past the file-count bound the rest is flagged unscanned, never silently
+    skipped (review P1 round 2: unbounded input)."""
+    import health_probes
+
+    monkeypatch.setattr(health_probes, "UNIT_EXEC_MAX_FILES", 2)
+    unit_dir = _make_unit_dir(tmp_path)
+    for i in range(3):
+        (unit_dir / f"u{i}.service").write_text("[Service]\nExecStart=/bin/ls\n")
+
+    r = health_probes.probe_unit_exec_paths(unit_dir)
+    assert r.status == "alert"
+    assert "3 files exceeds 2" in r.detail

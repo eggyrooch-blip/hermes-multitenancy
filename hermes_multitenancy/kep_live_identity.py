@@ -7,8 +7,8 @@ import urllib.request
 from typing import Any
 
 _IDENTITY_URLS = {
-    "online": "https://auth.gotokeep.com/ldap/authjwt",
-    "pre": "https://auth.pre.gotokeep.com/ldap/authjwt",
+    "online": "https://auth.example.com/ldap/authjwt",
+    "pre": "https://auth.pre.example.com/ldap/authjwt",
 }
 _TIMEOUT_SECONDS = 3
 _MAX_BYTES = 64 * 1024

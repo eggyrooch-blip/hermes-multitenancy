@@ -221,7 +221,7 @@ def test_kep_cli_authenticated_when_token_live(monkeypatch, tmp_path):
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600  # +1h
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
     _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
@@ -240,7 +240,7 @@ def test_kep_cli_needs_auth_when_server_rejects_locally_valid_token(monkeypatch,
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
 
@@ -275,7 +275,7 @@ def test_kep_cli_unknown_when_live_identity_mismatches_profile(monkeypatch, tmp_
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
     _mock_kep_identity(monkeypatch, profile_name="another-person", expires_at=future)
@@ -308,7 +308,7 @@ def test_kep_cli_unknown_when_live_identity_cannot_be_proven(
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
     _mock_kep_identity(monkeypatch, body=body, error=error)
@@ -333,12 +333,12 @@ def test_kep_cli_rate_limit_is_unknown_not_needs_auth(monkeypatch, tmp_path):
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
     _mock_kep_identity(
         monkeypatch,
-        error=HTTPError("https://auth.gotokeep.com/ldap/authjwt", 429, "rate limited", {}, None),
+        error=HTTPError("https://auth.example.com/ldap/authjwt", 429, "rate limited", {}, None),
     )
 
     row = credential_hub.kep_cli_status(
@@ -370,7 +370,7 @@ def test_kep_cli_pre_required_reports_pre_gap_without_hiding_online_login(monkey
             return _Proc(_make_jwt(future) + "\n")
         env = cmd[cmd.index("--env") + 1]
         if env == "online":
-            return _Proc("state: valid\noperator: dengwenhui <dengwenhui@keep.com>\n")
+            return _Proc("state: valid\noperator: dengwenhui <dengwenhui@example.com>\n")
         if env == "pre":
             return _Proc("state: not logged in\n", returncode=3)
         raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
@@ -415,7 +415,7 @@ def test_kep_auth_state_line_reports_pre_and_online(monkeypatch, tmp_path):
             return _Proc(_make_jwt(future) + "\n")
         env_name = cmd[cmd.index("--env") + 1]
         if env_name == "pre":
-            return _Proc("state: valid\noperator: owner <owner@keep.com>\n")
+            return _Proc("state: valid\noperator: owner <owner@example.com>\n")
         if env_name == "online":
             return _Proc("state: not logged in\n", returncode=3)
         raise AssertionError(f"unexpected kep-auth env in {cmd!r}")
@@ -445,7 +445,7 @@ def test_kep_auth_state_line_preserves_live_unknown(monkeypatch, tmp_path):
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(future) + "\n",
     ))
     _mock_kep_identity(monkeypatch, error=TimeoutError())
@@ -486,7 +486,7 @@ def test_kep_cli_needs_auth_when_token_expired(monkeypatch, tmp_path):
     _kep_bin(monkeypatch, tmp_path)
     past = int(credential_hub._now_ms() / 1000) - 3600  # expired 1h ago
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=_make_jwt(past) + "\n",
     ))
     _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=past)
@@ -504,7 +504,7 @@ def test_kep_cli_needs_auth_when_token_cannot_be_fetched(monkeypatch, tmp_path):
 
     _kep_bin(monkeypatch, tmp_path)
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out="", token_rc=1,
     ))
     row = credential_hub.kep_cli_status(
@@ -520,7 +520,7 @@ def test_kep_cli_token_whitespace_only_needs_auth(monkeypatch, tmp_path):
 
     _kep_bin(monkeypatch, tmp_path)
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out="   \n\n", token_rc=0,
     ))
     row = credential_hub.kep_cli_status(
@@ -537,7 +537,7 @@ def test_kep_cli_token_with_banner_lines(monkeypatch, tmp_path):
     _kep_bin(monkeypatch, tmp_path)
     future = int(credential_hub._now_ms() / 1000) + 3600
     monkeypatch.setattr(credential_hub, "_run", _kep_run_stub(
-        status_out="state: valid\noperator: owner <owner@keep.com>\n",
+        status_out="state: valid\noperator: owner <owner@example.com>\n",
         token_out=f"WARNING: using cached key\n{_make_jwt(future)}\n",
     ))
     _mock_kep_identity(monkeypatch, profile_name="owner", expires_at=future)
@@ -1051,7 +1051,7 @@ def test_resource_delivery_plain_skills_default_kep_cli_to_pre(monkeypatch, tmp_
             return _Proc(_make_jwt(future) + "\n")
         env = cmd[cmd.index("--env") + 1]
         if env == "online":
-            return _Proc("state: valid\noperator: owner <owner@keep.com>\n")
+            return _Proc("state: valid\noperator: owner <owner@example.com>\n")
         if env == "pre":
             return _Proc("state: not logged in\n", returncode=3)
         raise AssertionError(f"unexpected env in {cmd!r}")
@@ -1315,3 +1315,65 @@ def test_collect_credential_rows_preserves_order_under_parallelism(monkeypatch, 
 
     rows = ch._collect_credential_rows(profile_name="owner", open_id="o", shared_home=tmp_path)
     assert [r.id for r in rows] == list(ch.CREDENTIAL_ORDER)
+
+
+def _gitlab_group_home(tmp_path, monkeypatch, *, bound):
+    """A shared home whose 'grp' profile is a routed GROUP profile."""
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.routing import RoutingTable
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profile_dir = shared / "profiles" / "grp"
+    profile_dir.mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        "credentials:\n  - subject_id: kep-prd-skills\n    provider: gitlab\n"
+        "    secret_kind: token\n    vault_profile: __self__\n    profiles: ['*']\n",
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared / "multitenancy.db")
+    try:
+        table.upsert_group(chat_id="oc_grp", profile_name="grp", owner_open_id="ou_owner")
+    finally:
+        table.close()
+    if bound:
+        store = CredentialStore(shared / "multitenancy.db")
+        try:
+            store.put_credential(
+                profile_name="grp", subject_id="kep-prd-skills",
+                provider="gitlab", secret_kind="token",
+                payload={"token": "group-token"}, expires_at=4102444800000,
+            )
+        finally:
+            store.close()
+    return profile_dir
+
+
+def test_gitlab_group_profile_unbound_speaks_group_language(tmp_path, monkeypatch):
+    profile_dir = _gitlab_group_home(tmp_path, monkeypatch, bound=False)
+
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.status == "needs_auth"
+    assert "群主" in personal_row.detail
+    assert personal_row.action.get("label") == "群主绑定 GitLab"
+
+
+def test_gitlab_group_profile_bound_says_the_whole_group_shares_it(tmp_path, monkeypatch):
+    profile_dir = _gitlab_group_home(tmp_path, monkeypatch, bound=True)
+
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.status == "configured"
+    assert "本群所有会话共用" in personal_row.detail
+    assert personal_row.action.get("label") == "更换"
+
+
+def test_gitlab_user_profile_texts_unchanged_by_group_feature(tmp_path, monkeypatch):
+    """个人 profile 的文案一字不变（回归护栏）。"""
+    future = 4102444800000
+    profile_dir = _gitlab_personal_home(tmp_path, monkeypatch, expires_at=future)
+
+    _global_row, personal_row = _gitlab_rows(profile_dir)
+
+    assert personal_row.detail.startswith("使用你本人提供的 GitLab token")

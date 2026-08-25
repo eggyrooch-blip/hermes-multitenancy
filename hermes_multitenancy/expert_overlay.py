@@ -103,17 +103,19 @@ def _shared_home_for(profile_home: Path) -> Path:
 def _managed_manifest_dirs(profile_home: Path) -> list[Path]:
     """Dirs that may hold ``.hermes-plugin-managed/*.json`` manifests.
 
-    Both the shared root (where the ingester writes today) and a per-profile dir
-    are honored, so a future per-profile manifest layout works without a code
-    change. Order is dedup-stable; missing dirs are simply skipped by the reader.
+    ONLY the shared root — where the ingester / skillhub installer write — is a
+    trusted manifest source. The per-``PROFILE_HOME`` dir is deliberately NOT
+    read: PROFILE_HOME is bwrap RW-mounted (tenant-writable), so honoring a
+    manifest there let a tenant plant a forged expert (empty audience → bypass
+    the audience gate) with an attacker-chosen ``repo``/``agent_md`` that
+    ``_read_agent_md`` would then read PARENT-side (gateway, outside the sandbox)
+    — a host-file disclosure. Prod manifests live only in shared-home; the
+    per-profile layout was an unused "future" hook. If per-profile manifests are
+    ever needed, store them outside the RW mount and validate repo against a
+    trusted registry — never re-add PROFILE_HOME here.
     """
     profile_home = Path(profile_home).expanduser()
-    dirs: list[Path] = []
-    for base in (_shared_home_for(profile_home), profile_home):
-        d = base / MANAGED_DIR
-        if d not in dirs:
-            dirs.append(d)
-    return dirs
+    return [_shared_home_for(profile_home) / MANAGED_DIR]
 
 
 def _iter_managed_manifests(profile_home: Path, *, strict: bool = False):
@@ -164,6 +166,12 @@ def _read_agent_md(manifest: dict[str, Any], expert: dict[str, Any]) -> Optional
     try:
         resolved = candidate.resolve()
         repo_resolved = repo.resolve()
+        # Defense-in-depth: a repo root of "/" (or any filesystem root) makes the
+        # commonpath containment check below vacuously true, turning agent_md into
+        # an arbitrary-host-file read. A real plugin repo is never the fs root.
+        if repo_resolved.parent == repo_resolved:
+            logger.warning("[multitenancy] expert repo root is a filesystem root; refusing: %r", repo_raw)
+            return None
         if os.path.commonpath([str(resolved), str(repo_resolved)]) != str(repo_resolved):
             logger.warning("[multitenancy] expert agent_md escapes repo: %r", rel)
             return None
@@ -227,6 +235,116 @@ def _caller_profile_name(profile_home: Path) -> str:
     return Path(profile_home).expanduser().name
 
 
+# ─────────────────────────── group-agent owner mirroring ─────────────────────
+# A group/agent profile (Feishu group or WebUI group-chat agent) is not an
+# employee: it has no org-snapshot record (department-scoped audiences fail
+# closed) and profile-scoped audiences name the owner's PERSONAL profile, never
+# the group profile dir. Per sunke's 2026-08-24 decision the group agent
+# mirrors its OWNER's expert entitlements (visibility + activation + skills,
+# credentials excluded), so every audience check ALSO admits the group's owner.
+#
+# SECURITY (F1): the owner identity is read ONLY from the TRUSTED routing table
+# (multitenancy.db), NEVER from ``group_profile.json``. That marker lives in
+# tenant-writable profile storage — bwrap binds ``PROFILE_HOME`` read-WRITE and
+# does not mask the marker — so any agent run with a file tool can forge one.
+# Reading the owner from the marker would let any profile (a plain personal
+# profile included) plant ``{"owner_open_id": "<victim>"}`` and inherit that
+# employee's expert visibility, activation, persona, and skill materialization:
+# a cross-tenant authorization bypass. The routing DB is deliberately NOT mounted
+# into the sandbox and records the owner written at provisioning from a trusted
+# signal (Feishu ``bot_added`` inviter / owner-asserted WebUI agent creation), so
+# it is the only safe source for OWNER identity. An unresolvable owner (no
+# routing table, a non-mirroring ``kind``, or an empty ``owner_open_id``) keeps
+# the fail-closed personal identity.
+#
+# CAVEAT (tracked separately, pre-existing — see this slug's DEBT.md "manifest
+# source"): this hardens only OWNER resolution. Expert DEFINITIONS (audience,
+# agent_md) are still read by ``_iter_managed_manifests`` from BOTH shared-home
+# and the tenant-writable ``<PROFILE_HOME>/.hermes-plugin-managed`` — a separate
+# trust hole not introduced here and out of this task's scope.
+
+
+def _routing_row_for_profile(profile_home: Path):
+    """Trusted routing row for this profile, or None. Never raises.
+
+    Function-local import keeps ``expert_overlay`` import-light and avoids a
+    module-load cycle with ``router`` (same lazy-import style feishu_org uses).
+    """
+    try:
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return None
+        return table.lookup_by_profile_name(Path(profile_home).expanduser().name)
+    except Exception:
+        logger.debug("[multitenancy] routing lookup failed for %s", profile_home, exc_info=True)
+        return None
+
+
+# Routing kinds whose rows carry a trusted ``owner_open_id`` and therefore
+# mirror that owner's expert entitlements: Feishu group chats (``group``, keyed
+# by chat_id) and WebUI-owned agents (``agent``, keyed by agent_id). ``user``
+# rows never mirror. Both are provisioned server-side from a trusted signal
+# (bot_added inviter / owner-asserted agent creation), so the owner they record
+# is authoritative — unlike the tenant-writable ``group_profile.json`` marker.
+_OWNER_MIRRORING_KINDS = frozenset({"group", "agent"})
+
+
+def _routing_group_owner_open_id(profile_home: Path) -> Optional[str]:
+    """The group/agent profile's OWNER open_id from the TRUSTED routing table.
+
+    Covers BOTH mirroring kinds — Feishu ``group`` and WebUI ``agent`` — since
+    the SPEC Done line spans both surfaces. Returns None for a ``user`` profile
+    (or any non-mirroring kind), a row with no owner, or when routing is
+    unavailable (e.g. the sandboxed child) — owner-mirroring then does not apply.
+    NEVER reads the tenant-writable ``group_profile.json`` (security F1).
+    """
+    row = _routing_row_for_profile(profile_home)
+    if row is None:
+        return None
+    if str(getattr(row, "kind", "") or "").strip().lower() not in _OWNER_MIRRORING_KINDS:
+        return None
+    oid = str(getattr(row, "owner_open_id", "") or "").strip()
+    return oid or None
+
+
+def _group_owner_profile_name(profile_home: Path) -> Optional[str]:
+    """The OWNER's personal profile_name for a group profile, from routing."""
+    owner_oid = _routing_group_owner_open_id(profile_home)
+    if not owner_oid:
+        return None
+    try:
+        from . import router as router_mod
+
+        table = router_mod._get_routing_table()
+        if table is None:
+            return None
+        owner = table.resolve_owner_root(owner_oid) or table.lookup_by_open_id(owner_oid)
+    except Exception:
+        logger.debug("[multitenancy] owner profile lookup failed for %s", profile_home, exc_info=True)
+        return None
+    if owner is None:
+        return None
+    pname = str(getattr(owner, "profile_name", "") or "").strip()
+    return pname or None
+
+
+def _audience_profile_names(profile_home: Path) -> set[str]:
+    """profile_names an audience check admits for this caller.
+
+    The profile's OWN dir name is always included so a profile-mode audience
+    naming the group directly still matches (F2 — union, not replace); a group
+    profile ADDS its trusted owner's personal profile name so it mirrors the
+    owner's profile-scoped grants.
+    """
+    names = {_caller_profile_name(profile_home)}
+    owner_pname = _group_owner_profile_name(profile_home)
+    if owner_pname:
+        names.add(owner_pname)
+    return names
+
+
 def resolve_expert(
     profile_home: Path,
     expert_id: str,
@@ -252,7 +370,8 @@ def resolve_expert(
     eid = str(expert_id or "").strip()
     if not eid:
         return None
-    profile_name = _caller_profile_name(profile_home)
+    profile_names = _audience_profile_names(profile_home)
+    resolved: Optional[ExpertOverlay] = None
     try:
         for manifest, _path in _iter_managed_manifests(profile_home):
             if not _manifest_is_active(manifest):
@@ -267,11 +386,13 @@ def resolve_expert(
                 if not _effective_audience_allows(
                     manifest_audience,
                     expert.get("audience"),
-                    profile_name=profile_name,
+                    profile_names=profile_names,
                     department_ids=department_ids,
                 ):
                     logger.info(
-                        "[multitenancy] expert %r denied for profile %r (audience)", eid, profile_name
+                        "[multitenancy] expert %r denied for profiles %r (audience)",
+                        eid,
+                        sorted(profile_names),
                     )
                     return None
                 agent_md = _read_agent_md(manifest, expert)
@@ -284,7 +405,7 @@ def resolve_expert(
                 gov = expert.get("governance")
                 aud = expert.get("audience")
                 skill_names = [str(s) for s in skills] if isinstance(skills, list) else []
-                return ExpertOverlay(
+                overlay = ExpertOverlay(
                     expert_id=eid,
                     name=str(expert.get("name") or expert.get("title") or eid),
                     agent_md=agent_md,
@@ -294,10 +415,14 @@ def resolve_expert(
                     governance=dict(gov) if isinstance(gov, dict) else {},
                     audience=dict(aud) if isinstance(aud, dict) else {},
                 )
+                if resolved is not None:
+                    logger.warning("[multitenancy] duplicate visible expert id %r", eid)
+                    return None
+                resolved = overlay
     except Exception:  # absolute fail-safe — overlay must never break a run
         logger.warning("[multitenancy] resolve_expert(%r) failed; running without overlay", eid, exc_info=True)
         return None
-    return None
+    return resolved
 
 
 def build_role_override_block(overlay: ExpertOverlay) -> str:
@@ -316,6 +441,7 @@ def _audience_allows(
     audience: Any,
     *,
     profile_name: Optional[str] = None,
+    profile_names: Optional[set[str]] = None,
     department_ids: Optional[list[str]] = None,
 ) -> bool:
     """Audience filter for ONE audience scope — covers BOTH persisted modes.
@@ -327,8 +453,10 @@ def _audience_allows(
 
       * No audience / empty ``profiles`` AND empty ``department_ids`` → this scope
         admits everyone (it imposes no restriction of its own).
-      * ``profiles`` non-empty → allowed ONLY if the caller's ``profile_name`` is
-        in it. A None/unknown caller profile fails closed.
+      * ``profiles`` non-empty → allowed ONLY if ANY of the caller's identity
+        profile names is in it. ``profile_names`` (a set) is the general form; the
+        singular ``profile_name`` is a convenience that folds into it. Empty/None
+        identities fail closed.
       * ``department_ids`` non-empty → allowed ONLY if the caller's resolved
         departments intersect it. Unknown caller departments (None) fail closed.
 
@@ -345,11 +473,14 @@ def _audience_allows(
     """
     if not isinstance(audience, dict):
         return True
+    have_profiles = {str(p) for p in (profile_names or set()) if str(p).strip()}
+    if profile_name and str(profile_name).strip():
+        have_profiles.add(str(profile_name))
     want_profiles = {str(p) for p in (audience.get("profiles") or []) if str(p).strip()}
     want_depts = {str(d) for d in (audience.get("department_ids") or []) if str(d).strip()}
     if not want_profiles and not want_depts:  # this scope imposes no restriction
         return True
-    if want_profiles and profile_name and str(profile_name) in want_profiles:
+    if want_profiles and (want_profiles & have_profiles):
         return True
     if want_depts and department_ids:
         have = {str(d) for d in department_ids}
@@ -363,6 +494,7 @@ def _effective_audience_allows(
     expert_audience: Any,
     *,
     profile_name: Optional[str] = None,
+    profile_names: Optional[set[str]] = None,
     department_ids: Optional[list[str]] = None,
 ) -> bool:
     """Fail-CLOSED visibility gate combining BOTH audience levels.
@@ -389,11 +521,17 @@ def _effective_audience_allows(
     two scopes yields exactly the inheritance + further-narrowing semantics above.
     """
     if not _audience_allows(
-        manifest_audience, profile_name=profile_name, department_ids=department_ids
+        manifest_audience,
+        profile_name=profile_name,
+        profile_names=profile_names,
+        department_ids=department_ids,
     ):
         return False
     return _audience_allows(
-        expert_audience, profile_name=profile_name, department_ids=department_ids
+        expert_audience,
+        profile_name=profile_name,
+        profile_names=profile_names,
+        department_ids=department_ids,
     )
 
 
@@ -414,7 +552,7 @@ def list_experts(
     """
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    profile_name = _caller_profile_name(profile_home)
+    profile_names = _audience_profile_names(profile_home)
     try:
         for manifest, _path in _iter_managed_manifests(profile_home):
             if not _manifest_is_active(manifest):
@@ -441,7 +579,7 @@ def list_experts(
                 if not _effective_audience_allows(
                     manifest_audience,
                     ex.get("audience"),
-                    profile_name=profile_name,
+                    profile_names=profile_names,
                     department_ids=department_ids,
                 ):
                     continue
@@ -472,6 +610,38 @@ def list_experts(
     return sorted(rows, key=lambda r: (not r["featured"], r["category"], r["name"]))
 
 
+def active_expert_declared_skills(profile_home: Path, expert_id: str) -> set[str]:
+    """Declared skill names of ONE expert by id, WITHOUT audience filtering.
+
+    Used by the disabled-skill scope inside the sandboxed child, where the
+    trusted routing table is unavailable so owner/audience cannot be re-resolved.
+    Callers MUST gate this on the parent's authorization (the presence of a valid
+    ``broker_role_override`` for this ``expert_id``, resolved gateway-side against
+    the routing table) — this only un-hides that already-authorized expert's OWN
+    skills so the run can use them. It is not an authorization surface on its own:
+    un-hiding a skill whose directory was never materialized (materialization is
+    routing-gated in the parent/sync) still cannot load it.
+    """
+    eid = str(expert_id or "").strip()
+    if not eid:
+        return set()
+    names: set[str] = set()
+    for manifest, _path in _iter_managed_manifests(profile_home):
+        if not _manifest_is_active(manifest):
+            continue
+        experts = manifest.get("experts")
+        if not isinstance(experts, list):
+            continue
+        for ex in experts:
+            if not isinstance(ex, dict) or str(ex.get("id") or "").strip() != eid:
+                continue
+            for skill in ex.get("skills") or []:
+                name = str(skill).strip()
+                if name:
+                    names.add(name)
+    return names
+
+
 def all_expert_skill_names(profile_home: Path) -> set[str]:
     """Return every skill declared by installed expert manifests.
 
@@ -492,6 +662,61 @@ def all_expert_skill_names(profile_home: Path) -> set[str]:
                 if name:
                     names.add(name)
     return names
+
+
+def expert_skill_sync_specs(profile_home: Path) -> list[dict[str, Any]]:
+    """Skill-sync specs for every expert visible to this profile's audience identity.
+
+    Consumed by the group-profile skill sync (``feishu_org._profile_skill_specs``)
+    to materialize owner-visible expert skills into the group profile's
+    ``skills/`` scan root — expert runs resolve their skills from there
+    (``expert_scope`` only HIDES, never adds). Rows use the profile-skill-spec
+    shape ``{"path", "install_mode", "source_path", "share_with_children"}``;
+    secret filtering and manifest bookkeeping stay with that sync (copies always
+    drop secret-named files, so credentials never travel). Fail-safe: [] on any
+    resolution error.
+    """
+    specs: dict[str, dict[str, Any]] = {}
+    try:
+        profile_names = _audience_profile_names(profile_home)
+        department_ids = resolve_caller_departments(profile_home)
+        for manifest, _path in _iter_managed_manifests(profile_home):
+            if not _manifest_is_active(manifest):
+                continue
+            experts = manifest.get("experts")
+            if not isinstance(experts, list):
+                continue
+            manifest_audience = manifest.get("audience")
+            install_mode = str(manifest.get("install_mode") or "copy").strip().lower()
+            if install_mode not in {"copy", "symlink"}:
+                install_mode = "copy"
+            for ex in experts:
+                if not isinstance(ex, dict):
+                    continue
+                if not _effective_audience_allows(
+                    manifest_audience,
+                    ex.get("audience"),
+                    profile_names=profile_names,
+                    department_ids=department_ids,
+                ):
+                    continue
+                skill_names = [str(s) for s in ex.get("skills") or []]
+                for skill_dir in _expert_skill_dirs(manifest, skill_names):
+                    specs.setdefault(
+                        skill_dir.name,
+                        {
+                            "path": Path(skill_dir.name),
+                            "install_mode": install_mode,
+                            "source_path": skill_dir,
+                            "share_with_children": False,
+                        },
+                    )
+    except Exception:
+        logger.warning(
+            "[multitenancy] expert skill sync specs failed for %s", profile_home, exc_info=True
+        )
+        return []
+    return sorted(specs.values(), key=lambda spec: str(spec["path"]))
 
 
 def readable_expert_skill_names(profile_home: Path) -> set[str]:
@@ -569,13 +794,29 @@ def resolve_caller_departments(
 ) -> Optional[list[str]]:
     """Resolve the CALLER's real departments from the trusted org snapshot.
 
-    Returns a list of department identifiers (``dept_id`` + ``dept_name``) for the
-    employee matching ``profile_name`` (preferred) or ``open_id``. Returns ``None``
-    when no snapshot exists or the caller can't be found — department-scoped
-    experts then fail CLOSED. Never raises.
+    Returns a list of department identifiers (``dept_id`` + ``dept_name``).
+    An explicitly supplied ``open_id`` is a TRUSTED caller identity and matches
+    EXCLUSIVELY: a shared-Agent run resolves departments against its profile
+    home, whose derived profile name is the AGENT's — an unrelated employee
+    record matching that name must never supply the caller's departments (codex
+    review: explicit-open-id-is-not-authoritative). ``profile_name`` matching is
+    the fallback only when no open_id is available. Returns ``None`` when no
+    snapshot exists or the caller can't be found — department-scoped experts
+    then fail CLOSED. Never raises.
+
+    Group/agent profiles always resolve as their OWNER, whose open_id comes from
+    the TRUSTED routing table (never the tenant-writable marker — see
+    ``_routing_group_owner_open_id``). The supplied ``open_id`` (e.g. the
+    group-message sender) is deliberately ignored so the group agent mirrors
+    exactly the owner's entitlements, no more (a sender's departments must not
+    widen the group's expert set) and no less. When routing is unavailable (the
+    sandboxed child) the owner is unresolvable and this fails CLOSED.
     """
     pname = str(profile_name or _caller_profile_name(profile_home)).strip()
     oid = str(open_id or "").strip()
+    owner_oid = _routing_group_owner_open_id(profile_home)
+    if owner_oid:
+        oid = owner_oid
     try:
         snap = _latest_org_snapshot(profile_home)
         if not snap:
@@ -586,9 +827,11 @@ def resolve_caller_departments(
         for emp in employees.values():
             if not isinstance(emp, dict):
                 continue
-            if (pname and str(emp.get("profile_name") or "") == pname) or (
-                oid and str(emp.get("open_id") or "") == oid
-            ):
+            if oid:
+                matched = str(emp.get("open_id") or "") == oid
+            else:
+                matched = bool(pname) and str(emp.get("profile_name") or "") == pname
+            if matched:
                 depts = [
                     str(v).strip()
                     for v in (emp.get("dept_id"), emp.get("dept_name"))

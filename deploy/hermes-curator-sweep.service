@@ -1,0 +1,27 @@
+# 每周把 Hermes curator 按租户跑一遍。
+# 为什么需要它：gateway 的 housekeeping 每小时轮询 curator，但用的是 gateway 进程
+# 自己的 HERMES_HOME（= profiles/multitenancy_router），所以多租户下没有任何东西
+# 给租户 profile 跑 curator。这个 oneshot 就是那个缺失的派发者。
+# 边界：只调 curator，不改任何 profile 的 config.yaml；每个 profile 是否真跑由
+# 上游自己的闸门（curator.enabled / paused / interval_hours）决定。
+[Unit]
+Description=Hermes per-tenant curator sweep (dispatch only; upstream gates decide)
+After=network-online.target
+Wants=network-online.target
+OnFailure=hermes-update-center-alert@%n.service
+
+[Service]
+Type=oneshot
+# 作为 hermes 用户的 user unit 安装（systemctl --user）。
+Environment=HERMES_HOME=/home/hermes/.hermes
+Environment=HERMES_SHARED_HOME=/home/hermes/.hermes
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.hermes/hermes-agent/venv/bin:/home/hermes/.local/bin:/home/hermes/.hermes/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@PYTHON@ -m hermes_multitenancy.curator_sweep
+# consolidation 会 fork 一个真的 aux agent（分钟级），别和在线流量抢资源。
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=default.target

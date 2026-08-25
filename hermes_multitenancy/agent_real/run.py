@@ -99,6 +99,9 @@ def _run_with_aiagent(
     os.environ["HERMES_HOME"] = str(profile_home)
     event_metadata = _event_metadata(event)
     _validate_trusted_feishu_tool_scope(event, profile_home)
+    from ..source_envelope import MAX_SOURCE_REFS, normalize_tool_source_refs
+
+    source_refs: list[dict[str, str]] = []
 
     # 2) Read profile LLM config + credentials (mirrors the spike loader).
     config = _pkg._load_profile_config(profile_home)
@@ -392,6 +395,20 @@ def _run_with_aiagent(
                 # otherwise the UI shows duplicated/extra reasoning bubbles.
                 return
 
+        def _tool_complete_event_callback(
+            _tool_call_id: Any,
+            _tool_name: Any,
+            _tool_args: Any,
+            tool_result: Any,
+        ) -> None:
+            seen_ids = {ref["id"] for ref in source_refs}
+            for ref in normalize_tool_source_refs(tool_result, profile_home):
+                if len(source_refs) >= MAX_SOURCE_REFS:
+                    break
+                if ref["id"] not in seen_ids:
+                    source_refs.append(ref)
+                    seen_ids.add(ref["id"])
+
         def _stream_delta_event_callback(text: Any) -> None:
             if text is None:
                 return
@@ -439,6 +456,7 @@ def _run_with_aiagent(
             "chat_type": str(getattr(source, "chat_type", "") or "") if source else "",
             "gateway_session_key": str(gateway_session_key),
             "tool_progress_callback": _tool_progress_event_callback,
+            "tool_complete_callback": _tool_complete_event_callback,
             "stream_delta_callback": _stream_delta_event_callback if event_sink is not None else None,
             "reasoning_callback": _reasoning_event_callback if event_sink is not None else None,
             "clarify_callback": clarify_callback,
@@ -633,7 +651,10 @@ def _run_with_aiagent(
             bool(isinstance(_r.get("final_response"), str) and _r["final_response"].strip()),
             redact_runtime_text(_r.get("error")),
         )
-    return _finalize_aiagent_result(
+    final_response = _finalize_aiagent_result(
         result,
         redact=lambda value: _redact_ingest_runtime_text(value, event),
     )
+    if source_refs and final_response.strip() and not (_r.get("failed") or _r.get("partial")):
+        _emit("source_refs", source_refs=source_refs)
+    return final_response

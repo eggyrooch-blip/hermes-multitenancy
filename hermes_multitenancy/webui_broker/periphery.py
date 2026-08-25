@@ -2015,13 +2015,46 @@ def _resolve_owner_scoped_profile(
     return owner_root.profile_name, None
 
 
-def _owner_scoped_tenant(request: Any, payload: Optional[dict[str, Any]] = None) -> tuple[str, str]:
-    """Return (profile_name, user_key) bound to a server-asserted owner.
+def _owner_scoped_tenant(
+    request: Any,
+    payload: Optional[dict[str, Any]] = None,
+    *,
+    require_write: bool = False,
+) -> tuple[str, str]:
+    """Compatibility wrapper over ``_owner_scoped_tenant_resolved`` (2-tuple)."""
+    profile, user_key, _agent_id = _owner_scoped_tenant_resolved(
+        request, payload, require_write=require_write
+    )
+    return profile, user_key
+
+
+def _owner_scoped_tenant_resolved(
+    request: Any,
+    payload: Optional[dict[str, Any]] = None,
+    *,
+    require_write: bool = False,
+) -> tuple[str, str, str]:
+    """Return (profile_name, user_key, agent_id) bound to a server-asserted owner.
 
     Raises PermissionError (caller maps to HTTP 403) when the owner is missing
     or the requested profile is not owned by / shared to that owner. Fail-closed:
     a trusted-owner assertion that cannot be verified against routing state never
     falls back to the client-supplied profile_name.
+
+    ``agent_id`` is the executor identity of the profile the caller was JUST
+    authorized on, taken from the same routing rows the authorization read —
+    one table snapshot, no second lookup a concurrent routing change could
+    desynchronize (codex review: agent-derivation-fails-open). '' means the
+    profile is not an agent profile (a personal job). Ambiguity — more than
+    one matching owned agent row, or an agent row colliding with the owner's
+    sync root — raises instead of guessing.
+
+    ``require_write=True`` additionally rejects share-granted access whose role
+    is read-only (viewer). The run-scoped token path already enforced this
+    (RBOS-SHARED-VIEWER-JOBS-WRITE); the master-key/BFF path reached the same
+    handlers with no role check at all, so a viewer share could mutate the
+    owner's cron store. Mutating jobs handlers pass True; read handlers and
+    every non-jobs caller keep the default and are unchanged.
     """
     payload = payload or {}
     trusted_owner = ""
@@ -2059,9 +2092,17 @@ def _owner_scoped_tenant(request: Any, payload: Optional[dict[str, Any]] = None)
         conflict = _run_scoped_assertion_conflict(run_scope, trusted_owner, asserted_profile)
         if conflict:
             raise PermissionError(conflict)
+        bound_profile = cron_api.validate_profile_name(
+            str(run_scope.get("profile_name") or "").strip()
+        )
+        # The run-scope BINDING is authoritative for executor identity too —
+        # it was minted with the agent_id of the profile it is bound to, so no
+        # routing lookup (which could race or return a same-named non-agent
+        # row) is consulted (codex review round 3: agent-derivation-fails-open).
         return (
-            cron_api.validate_profile_name(str(run_scope.get("profile_name") or "").strip()),
+            bound_profile,
             str(run_scope.get("open_id") or "").strip(),
+            str(run_scope.get("agent_id") or "").strip(),
         )
 
     if not trusted_owner:
@@ -2089,25 +2130,78 @@ def _owner_scoped_tenant(request: Any, payload: Optional[dict[str, Any]] = None)
 
     owner_root = table.resolve_owner_root(trusted_owner)
     owned = set()
+    owned_agent_matches: list[Any] = []
     if owner_root is not None:
         owned.add(owner_root.profile_name)
     for row in table.list_agents_for_owner(trusted_owner):
         owned.add(row.profile_name)
+        if (
+            requested_profile
+            and getattr(row, "kind", None) == "agent"
+            and row.profile_name == requested_profile
+        ):
+            owned_agent_matches.append(row)
 
+    agent_id = ""
     if requested_profile:
         if requested_profile in owned:
             profile = requested_profile
+            # Executor identity from the SAME rows the ownership check read.
+            if len(owned_agent_matches) > 1:
+                raise PermissionError(
+                    f"profile_name '{requested_profile}' matches multiple agent rows"
+                )
+            if owned_agent_matches:
+                if owner_root is not None and requested_profile == owner_root.profile_name:
+                    raise PermissionError(
+                        f"profile_name '{requested_profile}' is both a sync root and an agent"
+                    )
+                agent_id = str(getattr(owned_agent_matches[0], "agent_id", "") or "").strip()
+                if not agent_id:
+                    raise PermissionError("agent routing row is missing agent_id")
         else:
             row = table.lookup_by_profile_name(requested_profile)
             shared_ok = False
+            role = None
             if row is not None and getattr(row, "agent_id", None):
+                # Shares granted to a PRINCIPAL (grant_agent_share_principal)
+                # take precedence over open-id shares — the principal is the
+                # canonical actor identity; a stale open-id grant must not
+                # widen or narrow it (codex review: principal-shares-ignored).
                 try:
-                    role = table.get_agent_share_role(row.agent_id, trusted_owner)
+                    principal_id = _actor_principal_id_for_request(
+                        table, request, trusted_owner
+                    )
+                    if principal_id:
+                        role = table.get_agent_share_role_for_principal(
+                            row.agent_id, principal_id
+                        )
                 except Exception:
                     role = None
+                if not role:
+                    try:
+                        role = table.get_agent_share_role(row.agent_id, trusted_owner)
+                    except Exception:
+                        role = None
                 shared_ok = bool(role)
             if shared_ok:
+                if require_write and str(role or "").strip().lower() in _RUN_SCOPED_READONLY_SHARE_ROLES:
+                    raise PermissionError(
+                        f"share role '{role}' is read-only for this operation"
+                    )
                 profile = requested_profile
+                # The row we just authorized against IS the executor — but only
+                # an AGENT row is an executor identity. A shared row of another
+                # kind that happens to carry an agent_id (e.g. a group) must
+                # fail closed rather than stamp a non-agent id (codex review
+                # round 3: agent-derivation-fails-open).
+                if getattr(row, "kind", None) != "agent":
+                    raise PermissionError(
+                        f"profile_name '{requested_profile}' is share-granted but not an agent profile"
+                    )
+                agent_id = str(getattr(row, "agent_id", "") or "").strip()
+                if not agent_id:
+                    raise PermissionError("agent routing row is missing agent_id")
             else:
                 raise PermissionError(
                     f"profile_name '{requested_profile}' is not accessible for asserted owner"
@@ -2117,7 +2211,7 @@ def _owner_scoped_tenant(request: Any, payload: Optional[dict[str, Any]] = None)
             raise PermissionError(f"asserted owner '{trusted_owner}' has no sync-root profile")
         profile = owner_root.profile_name
 
-    return profile, trusted_owner
+    return profile, trusted_owner, agent_id
 
 
 def _agent_share_context_for_request(
@@ -2205,6 +2299,8 @@ def _event_to_sse(event: RunEvent) -> str:
         "name": event.name,
         "payload": event.payload,
     }
+    if event.source_refs:
+        data["source_refs"] = event.source_refs
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 

@@ -24,10 +24,10 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SHARED_HOME = Path("/Users/kite/.hermes")
+SHARED_HOME = Path("/Users/dev/.hermes")
 PROFILE = "feishu_g41a5b5g"
-OPEN_ID = "ou_cf23e7c262afa4b7a006baa75f863ed5"
-CHAT_ID = "oc_1914a6e2c17a197aa24c1b79a57ab45f"
+OPEN_ID = "ou_aaaaaaaaaaaaaaaa0000000000000001"
+CHAT_ID = "oc_bbbbbbbbbbbbbbbb0000000000000001"
 PROFILE_HOME = SHARED_HOME / "profiles" / PROFILE
 RESULT_ROOT = Path("/tmp/hermes-feishu-media-matrix")
 
@@ -384,7 +384,7 @@ def _unsupported(text: str) -> bool:
 
 
 def _path_leaked(text: str) -> bool:
-    return "/Users/kite/.hermes/profiles" in text
+    return "/Users/dev/.hermes/profiles" in text
 
 
 def _write_jsonl(path: Path, record: dict[str, Any]) -> None:

@@ -64,21 +64,69 @@ def _cron_user_key(job: dict, profile_name: str) -> str:
     return owner_open_id
 
 
-def _expert_id_for_cron_job(job: dict) -> str:
-    """Expert-overlay id for a scheduled run — derived from the OWNING gateway.
+def _expert_id_for_cron_job(job: dict, *, profile_home: Optional[Path] = None) -> str:
+    """Return the authoritative expert overlay for a scheduled run.
 
-    An expert job carries a ``source_app`` routing label and is only ever executed
-    on the expert bot that owns that app (orchestrator._job_belongs_to_this_gateway),
-    so the trusted expert id is THIS gateway's own fixed-expert env — available in
-    the cron execute subprocess via os.environ.copy, not the (deliberately
-    FIXED_EXPERT-free) AIAgent env allowlist. Empty on the router / for untagged
-    jobs. Never trusted from a spoofable job field.
+    Existing expert-bot jobs keep deriving the id from the gateway's trusted env.
+    WebUI jobs have no ``source_app``; their server-bound persisted id is accepted
+    only after re-resolving it against the current owner/profile catalog. Empty for
+    ordinary jobs, and unavailable/revoked WebUI experts fail before RunRequest.
     """
-    if not str(job.get("source_app") or "").strip():
-        return ""
-    from ..expert_bot_route import fixed_expert_id_from_env
+    if str(job.get("source_app") or "").strip():
+        from ..expert_bot_route import fixed_expert_id_from_env
 
-    return fixed_expert_id_from_env()
+        return fixed_expert_id_from_env()
+
+    expert_id = str(job.get("expert_id") or "").strip()
+    if not expert_id:
+        return ""
+
+    from .. import expert_overlay
+
+    home = Path(profile_home or _cw._current_profile_home()).expanduser().resolve()
+    profile_name = str(job.get("owner_profile") or "").strip() or home.name
+    owner_open_id = str(job.get("owner_open_id") or "").strip()
+    department_ids = expert_overlay.resolve_caller_departments(
+        home,
+        profile_name=profile_name,
+        open_id=owner_open_id,
+    )
+    overlay = expert_overlay.resolve_expert(
+        home,
+        expert_id,
+        department_ids=department_ids,
+    )
+    if overlay is None:
+        raise ValueError("cron expert is no longer available")
+    return overlay.expert_id
+
+
+def _assert_webui_expert_cron_dependencies(
+    job: dict,
+    *,
+    profile_home: Path,
+    profile_name: str,
+    user_key: str,
+) -> None:
+    """Read-only admission for owner delivery and the cron session mirror."""
+    if not profile_home.is_dir():
+        raise ValueError("cron owner profile is unavailable")
+    if str(job.get("deliver") or "feishu").strip().lower() != "feishu":
+        raise ValueError("scheduled expert delivery must use feishu")
+    target = _cw._cron_deliver_target(job, user_key)
+    if target is None or not _cw._cron_delivery_identity_is_bound(job, target):
+        raise ValueError("cron delivery identity is unavailable or ambiguous")
+
+    from .. import router
+
+    key = router._history_key(profile_name, user_key, None, channel="cron")
+    store = router._get_session_store()
+    if store is None:
+        raise ValueError("cron session mirror is unavailable")
+    try:
+        store.count(key[0], key[1])
+    except Exception as exc:
+        raise ValueError("cron session mirror is unavailable") from exc
 
 
 def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> RunRequest:
@@ -88,10 +136,19 @@ def _build_cron_run_request(job: dict, *, profile_home: Path, prompt: str) -> Ru
         raise ValueError("cron owner_profile must not be multitenancy_router")
     user_key = _cw._cron_user_key(job, profile_name)
     job_id = str(job.get("id") or "").strip()
+    expert_id = _cw._expert_id_for_cron_job(job, profile_home=profile_home)
+    if expert_id and not str(job.get("source_app") or "").strip():
+        _cw._assert_webui_expert_cron_dependencies(
+            job,
+            profile_home=profile_home,
+            profile_name=profile_name,
+            user_key=user_key,
+        )
     metadata = {
         "job_id": job_id,
         "job_name": str(job.get("name") or job_id or "scheduled task"),
-        "expert_id": _cw._expert_id_for_cron_job(job),
+        "agent_id": str(job.get("agent_id") or "").strip(),
+        "expert_id": expert_id,
         "deliver": job.get("deliver"),
         "profile_home": str(profile_home),
         "model": job.get("model"),
@@ -162,7 +219,26 @@ def plan_cron_bridge_run(
         problems.append("cron deliver target could not be resolved")
         would_execute = False
 
-    return {
+    # Executor identity in the plan mirrors EXECUTION, not storage: when the
+    # RunRequest was built, its metadata is authoritative (a dirty stored
+    # expert_id on a source_app job is ignored at execution and must not be
+    # reported here). Stored fields are only consulted when request
+    # construction failed. Keys are added conditionally so legacy plans keep
+    # their exact key set.
+    if request is not None:
+        request_metadata = dict(request.metadata or {})
+        plan_agent_id = str(request_metadata.get("agent_id") or "").strip()
+        plan_expert_id = str(request_metadata.get("expert_id") or "").strip()
+    else:
+        # Construction failed: still derive the expert the way EXECUTION would
+        # (source_app jobs resolve via the gateway env, never the stored field),
+        # so a failed plan cannot report an expert the run would not use.
+        plan_agent_id = str(planned_job.get("agent_id") or "").strip()
+        try:
+            plan_expert_id = str(_cw._expert_id_for_cron_job(planned_job) or "").strip()
+        except Exception:
+            plan_expert_id = ""
+    plan = {
         "mode": "shadow" if shadow else "execute",
         "job_id": job_id,
         "job_name": str(job.get("name") or job_id or "scheduled task"),
@@ -183,6 +259,11 @@ def plan_cron_bridge_run(
         "problems": problems,
         "secret_free": True,
     }
+    if plan_agent_id:
+        plan["agent_id"] = plan_agent_id
+    if plan_expert_id:
+        plan["expert_id"] = plan_expert_id
+    return plan
 
 
 def _build_cron_event(request: RunRequest) -> Any:

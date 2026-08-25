@@ -365,6 +365,15 @@ def needs_new_key(stored: dict[str, Any] | None, now_ms: int) -> bool:
     return expires_at - now_ms <= _REFRESH_LEAD_MS
 
 
+def _cohort_is_routing(raw: str) -> bool:
+    """True when HERMES_LITELLM_BILLING_PAYER_IDS is exactly the "@routing"
+    sentinel (one token, case-insensitive): the cohort is then whoever
+    feishu-sync currently routes — new hires enroll and departures retire
+    without an env edit. Anything else keeps the frozen static-list
+    semantics, including a list that merely CONTAINS "@routing"."""
+    return raw.strip().casefold() == "@routing"
+
+
 @dataclass
 class SweepResult:
     """What one maintenance pass did. Printed by the timer, kept in the audit."""
@@ -507,9 +516,11 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
     from .billing_readiness import _cohort_ids
     from .credentials import _resolve_optional_key
 
-    cohort_ids = _cohort_ids(os.environ.get("HERMES_LITELLM_BILLING_PAYER_IDS", ""))
+    payer_ids_raw = os.environ.get("HERMES_LITELLM_BILLING_PAYER_IDS", "")
+    cohort_from_routing = _cohort_is_routing(payer_ids_raw)
+    cohort_ids = [] if cohort_from_routing else _cohort_ids(payer_ids_raw)
     domain = str(
-        os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
+        os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "example.com")
     ).strip()
     db_path = str(os.environ.get("HERMES_MULTITENANCY_DB", "")).strip()
     if not db_path:
@@ -523,6 +534,10 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
                 "WHERE kind='user' AND active=1 AND provenance='sync'"
             )
         }
+    if cohort_from_routing:
+        # The per-member loop below still applies the canonical-shape guard,
+        # so a synthetic ou_* routing row lands in `unrouted`, never a mint.
+        cohort_ids = sorted(profiles)
 
     from .billing_identity import _employee_org_fields
 
@@ -557,6 +572,13 @@ def run_refresh(*, dry_run: bool = False, max_issues: int = 200) -> dict[str, An
         if not email:
             email = f"{employee_id}@{domain}"
         payers.append(_ResolvedPayer(employee_id, profile, email, ""))
+
+    if cohort_from_routing and not payers:
+        # Static mode refuses an empty cohort (billing_canary_cohort_invalid);
+        # auto mode must refuse a MINTABLE-empty one, keyed after the shape
+        # gate (grok review #p1): a routing table full of ou_*/junk rows would
+        # otherwise sweep nobody, exit 0, and let every live key age to expiry.
+        raise EmployeeKeyError("employee_key_refresh_routing_cohort_empty")
 
     # Both modes need the vault key, for different reasons, so this guards both:
     #   * the sweep ENDS each payer in a vault write (CredentialStore._require_key).

@@ -45,7 +45,7 @@ from .reply_dispatcher import (
     _can_update_interactive_message,
     _can_use_cardkit,
 )
-from .sanitization import _format, _plain_summary
+from .sanitization import _format, _plain_summary, _unescape_display_whitespace
 from .state import (
     _INSTALLED_ATTR,
     _STATE_ATTR,
@@ -347,7 +347,7 @@ async def _update_streaming_card(
         _merge_raw_tool_intents(state, raw_tool_intents)
         answer_text, reasoning_text = _split_reasoning_text(visible_text)
         if reasoning_text:
-            state["reasoning"] = reasoning_text
+            state["reasoning"] = _unescape_display_whitespace(reasoning_text)
         if state.get("reasoning_started_at") and not state.get("reasoning_elapsed"):
             state["reasoning_elapsed"] = max(0.0, time.monotonic() - float(state["reasoning_started_at"]))
         state["content"] = answer_text
@@ -461,7 +461,10 @@ async def _update_streaming_card_reasoning(
         if not state.get("reasoning_started_at"):
             state["reasoning_started_at"] = time.monotonic()
         answer_text, reasoning_text = _split_reasoning_text(_format(self, content))
-        state["reasoning"] = reasoning_text or answer_text
+        # ``or answer_text``: a structured ``reasoning_content`` payload carries no
+        # <think> tags, so the whole thing IS the reasoning. Unescape before it
+        # reaches the panel — raw model text escapes its own newlines (2026-08-20).
+        state["reasoning"] = _unescape_display_whitespace(reasoning_text or answer_text)
     # issue #4: route reasoning through the throttled _flush_state (it pushes the
     # same _render_stream_text content) so rapid thinking tokens coalesce into a
     # smooth typewriter instead of one blocking round-trip per token.

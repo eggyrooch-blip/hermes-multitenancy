@@ -9,6 +9,7 @@ routed AIAgent runtime imports this module.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -43,6 +44,8 @@ except ModuleNotFoundError:
 
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 120
+logger = logging.getLogger(__name__)
+
 POLICY_PATH = Path(__file__).resolve().parents[1] / "config" / "lark_cli_policy.yaml"
 _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED = (
     "飞书个人消息读取需要先完成本人授权。"
@@ -242,6 +245,17 @@ def _check_lark_cli() -> bool:
 
 def _has_format_flag(argv: list[str]) -> bool:
     return any(item == "--format" or item.startswith("--format=") for item in argv)
+
+
+def _requested_json_format(argv: list[str]) -> bool:
+    for idx, item in enumerate(argv):
+        if item == "--format":
+            if idx + 1 < len(argv) and argv[idx + 1].strip().lower() == "json":
+                return True
+        elif item.startswith("--format="):
+            if item.split("=", 1)[1].strip().lower() == "json":
+                return True
+    return False
 
 
 def _argv_with_json_format(argv: list[str], mode: str = "api") -> list[str]:
@@ -588,6 +602,10 @@ def _safe_env() -> dict[str, str]:
     env = {name: value for name, value in os.environ.items() if name in _SAFE_ENV_NAMES and value}
     if "PATH" not in env:
         env["PATH"] = os.defpath
+    # lark-cli embeds an `_notice` update block inside its JSON stdout when its
+    # notifiers are on; suppress at the source so payloads stay pure business.
+    env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+    env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
     return env
 
 
@@ -884,14 +902,43 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             risk=risk,
         )
 
-    stdout = _strip_non_business_notices(_redact(completed.stdout))
+    stdout = _redact(completed.stdout)
     stderr = _strip_non_business_notices(_redact(completed.stderr))
     parsed = _parse_json_output(stdout)
+    if parsed is None:
+        # The notice-strip patterns delete whole lines; on valid JSON they cut
+        # lark-cli's embedded `_notice` lines and leave a trailing comma, so
+        # they may only run on output that already failed to parse as JSON.
+        stdout = _strip_non_business_notices(stdout)
+        parsed = _parse_json_output(stdout)
+    if isinstance(parsed, dict):
+        parsed.pop("_notice", None)
+    json_parse_failed = (
+        parsed is None
+        and completed.returncode == 0
+        and bool(stdout.strip())
+        and _requested_json_format(command)
+    )
     fields = _failure_fields(
         exit_code=completed.returncode,
         stderr=stderr,
         business_payload=parsed if isinstance(parsed, dict) else None,
+        failure_hint="output_unparseable" if json_parse_failed else None,
     )
+    # Live assertion for the run-scoped auth broker: a refused dial to our own
+    # localhost proxy means the broker died before the run that owns it did.
+    # Silent until it happens, greppable/alertable when it does — this counter
+    # is what proves the fix is holding in production, and the first thing to
+    # watch on rollback. The proxy URL is host:port only; the key stays
+    # redacted by _SECRET_PATTERNS.
+    if "connection refused" in (stderr or "").lower():
+        logger.warning(
+            "[multitenancy] lark_cli auth broker dial refused proxy=%s mode=%s command=%s "
+            "— broker closed before its run finished",
+            env.get("LARKSUITE_CLI_AUTH_PROXY") or "<unset>",
+            mode,
+            argv[:3],
+        )
     result = {
         "ok": fields["error_code"] is None,
         "approval_required": False,
@@ -905,6 +952,8 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         "files": _existing_output_files(output_paths),
         **fields,
     }
+    if json_parse_failed:
+        result["json_parse_failed"] = True
     result = annotate_permission_error(result, app_id=env.get("LARKSUITE_CLI_APP_ID"))
     return tool_result(**result)
 

@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 def _prepare_shared_home(tmp_path, monkeypatch):
     shared = tmp_path / ".hermes"
@@ -921,14 +923,14 @@ def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path
     def hold_identity_lock() -> None:
         try:
             with common.credential_identity_lock(shared, "owner", "ou_owner"):
-                entered.wait(timeout=2)
-                release.wait(timeout=1)
+                entered.wait(timeout=SYNC_TIMEOUT)
+                release.wait(timeout=SYNC_TIMEOUT)
         except BaseException as exc:  # pragma: no cover - surfaced below
             holder_errors.append(exc)
 
     holder = threading.Thread(target=hold_identity_lock)
     holder.start()
-    entered.wait(timeout=2)
+    entered.wait(timeout=SYNC_TIMEOUT)
     started = time.monotonic()
     try:
         first = feishu_uat_auth.poll_session(
@@ -939,12 +941,16 @@ def test_poll_session_keeps_exchanged_token_while_identity_lock_is_busy(tmp_path
         )
         elapsed = time.monotonic() - started
         assert first["status"] == "pending"
-        assert elapsed < 0.5
+        # 事件化不变量:poll 返回时锁仍被占(release 未发、holder 活着)= poll
+        # 没有等锁。秒表只留宽松上界抓"内部长等";0.5s 硬上界在满载 CI 上假红
+        # (2026-08-14 实测 0.67s)。
+        assert not release.is_set() and holder.is_alive()
+        assert elapsed < SYNC_TIMEOUT / 3
         assert poll_calls == ["device-busy"]
         assert "one-time-access" not in str(first)
     finally:
         release.set()
-        holder.join(timeout=2)
+        holder.join(timeout=SYNC_TIMEOUT)
 
     assert not holder.is_alive()
     assert holder_errors == []
@@ -1015,7 +1021,7 @@ def test_poll_session_revalidates_route_after_waiting_for_identity_lock(
     with credential_renewal_common.credential_identity_lock(shared, "owner", "ou_owner"):
         worker = threading.Thread(target=run_poll)
         worker.start()
-        assert exchanged.wait(timeout=2)
+        assert exchanged.wait(timeout=SYNC_TIMEOUT)
         with sqlite3.connect(shared / "multitenancy.db") as conn:
             conn.execute(
                 "UPDATE multitenancy_routing SET profile_name = 'replacement' "
@@ -1023,7 +1029,7 @@ def test_poll_session_revalidates_route_after_waiting_for_identity_lock(
             )
             conn.commit()
 
-    worker.join(timeout=2)
+    worker.join(timeout=SYNC_TIMEOUT)
     assert not worker.is_alive()
     assert results == []
     assert len(errors) == 1
@@ -1069,7 +1075,7 @@ def test_store_uat_serializes_route_mutation_after_in_lock_validation(
     def pause_after_route_check(*args, **kwargs):
         real_assert_route(*args, **kwargs)
         route_checked.set()
-        if not release_store.wait(timeout=2):
+        if not release_store.wait(timeout=SYNC_TIMEOUT):
             raise TimeoutError("timed out waiting to release credential store")
 
     monkeypatch.setattr(feishu_uat_auth, "_assert_route", pause_after_route_check)
@@ -1112,15 +1118,15 @@ def test_store_uat_serializes_route_mutation_after_in_lock_validation(
     store_worker = threading.Thread(target=store_uat)
     route_worker = threading.Thread(target=mutate_route)
     store_worker.start()
-    assert route_checked.wait(timeout=2)
+    assert route_checked.wait(timeout=SYNC_TIMEOUT)
     route_worker.start()
     try:
-        assert route_started.wait(timeout=2)
+        assert route_started.wait(timeout=SYNC_TIMEOUT)
         assert not route_finished.wait(timeout=0.2)
     finally:
         release_store.set()
-        store_worker.join(timeout=2)
-        route_worker.join(timeout=2)
+        store_worker.join(timeout=SYNC_TIMEOUT)
+        route_worker.join(timeout=SYNC_TIMEOUT)
 
     try:
         assert not store_worker.is_alive()
@@ -1161,6 +1167,7 @@ def test_store_uat_rechecks_route_in_vault_transaction_when_profile_was_missing(
     route_go = tmp_path / "route-go"
     child_code = """
 import contextlib
+import os
 import sys
 import time
 import types
@@ -1176,7 +1183,7 @@ original = table._credential_identity_locks
 def pause_after_missing_profile_check(_self, identities):
     with original(identities):
         ready.write_text("ready", encoding="utf-8")
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + float(os.environ.get("HERMES_TEST_SYNC_TIMEOUT", "30"))
         while not go.exists():
             if time.monotonic() >= deadline:
                 raise TimeoutError("parent did not release route update")
@@ -1215,7 +1222,7 @@ table.close()
 
     def pause_before_vault_insert(self, **kwargs):
         store_entered.set()
-        if not release_store.wait(timeout=5):
+        if not release_store.wait(timeout=SYNC_TIMEOUT):
             raise TimeoutError("route update did not release credential store")
         return real_put(self, **kwargs)
 
@@ -1239,7 +1246,7 @@ table.close()
 
     worker: threading.Thread | None = None
     try:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + SYNC_TIMEOUT
         while not route_ready.exists():
             if child.poll() is not None:
                 _stdout, stderr = child.communicate()
@@ -1250,12 +1257,12 @@ table.close()
 
         worker = threading.Thread(target=store_uat)
         worker.start()
-        assert store_entered.wait(timeout=3)
+        assert store_entered.wait(timeout=SYNC_TIMEOUT)
         route_go.write_text("go", encoding="utf-8")
-        _stdout, stderr = child.communicate(timeout=3)
+        _stdout, stderr = child.communicate(timeout=SYNC_TIMEOUT)
         assert child.returncode == 0, stderr
         release_store.set()
-        worker.join(timeout=3)
+        worker.join(timeout=SYNC_TIMEOUT)
         assert not worker.is_alive()
     finally:
         route_go.write_text("go", encoding="utf-8")
@@ -1304,7 +1311,7 @@ def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeyp
         poll_calls.append(device_code)
         if len(poll_calls) == 1:
             exchange_started.set()
-            assert release_exchange.wait(timeout=2)
+            assert release_exchange.wait(timeout=SYNC_TIMEOUT)
         return {
             "access_token": "one-time-access",
             "refresh_token": "one-time-refresh",
@@ -1335,7 +1342,7 @@ def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeyp
     monkeypatch.setattr(feishu_uat_auth, "_store_uat", store_uat)
     worker = threading.Thread(target=poll_in_worker)
     worker.start()
-    assert exchange_started.wait(timeout=2)
+    assert exchange_started.wait(timeout=SYNC_TIMEOUT)
     started = time.monotonic()
     try:
         duplicate = feishu_uat_auth.poll_session(
@@ -1349,7 +1356,7 @@ def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeyp
         assert "one-time-access" not in str(duplicate)
     finally:
         release_exchange.set()
-        worker.join(timeout=2)
+        worker.join(timeout=SYNC_TIMEOUT)
 
     assert not worker.is_alive()
     assert worker_errors == []

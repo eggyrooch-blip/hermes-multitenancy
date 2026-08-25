@@ -930,9 +930,33 @@ def _profile_skill_specs(
         upstream_profile_home, shared_home=shared_home
     ):
         specs_by_path[str(spec["path"])] = spec
+    # Group/agent profiles additionally mirror their OWNER's visible experts:
+    # the expert's own skills must live in the profile scan root for expert
+    # runs to load them (expert_scope only hides, never adds). Last-wins so an
+    # expert's plugin copy beats a same-named default on path conflict —
+    # matching plugin_ingest's displacement semantics for personal installs.
+    for spec in _expert_skill_specs_for_group(profile_home):
+        specs_by_path[str(spec["path"])] = spec
     for path in _inactive_plugin_skill_paths(shared_home):
         specs_by_path.pop(path, None)
     return sorted(specs_by_path.values(), key=lambda item: str(item["path"]))
+
+
+def _expert_skill_specs_for_group(profile_home: Path) -> list[dict[str, Any]]:
+    """Owner-visible expert skill specs for a group/agent profile (else [])."""
+    try:
+        from ..expert_overlay import _routing_group_owner_open_id, expert_skill_sync_specs
+
+        if not _routing_group_owner_open_id(profile_home):
+            return []
+        return expert_skill_sync_specs(profile_home)
+    except Exception:
+        logger.warning(
+            "feishu-org sync: group expert skill specs failed for %s",
+            profile_home,
+            exc_info=True,
+        )
+        return []
 
 
 def _inactive_plugin_skill_paths(shared_home: Path) -> set[str]:

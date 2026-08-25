@@ -141,6 +141,7 @@ class RunEvent:
     text: str = ""
     name: Optional[str] = None
     payload: dict[str, Any] = field(default_factory=dict)
+    source_refs: Optional[list[dict[str, str]]] = None
 
 
 @dataclass(frozen=True)

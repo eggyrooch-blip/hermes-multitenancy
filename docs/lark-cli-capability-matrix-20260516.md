@@ -80,7 +80,7 @@ All four paths are full 25-capability matrices. T2 and T4 are real Feishu messag
 | Path | User-facing request shape | Verified result |
 |---|---|---|
 | T2 group Feishu -> group profile bot | Create a Feishu doc through `docs +create --api-version v2` | Created doc `YoKqdGHzfoJi2MxVf5Nc6pIln1e` through bot identity |
-| T2 group Feishu -> group profile bot | Search group chat through `im +chat-search` | Found `群聊 P1 测试`, `oc_dfe8bc83167b092e138e4b4e6ac9ade5` |
+| T2 group Feishu -> group profile bot | Search group chat through `im +chat-search` | Found `群聊 P1 测试`, `oc_cccccccccccccccc0000000000000001` |
 | T2 group Feishu -> group profile bot | Read today's agenda through `calendar +agenda` | Returned 0 bot calendar events |
 | T2 group Feishu -> group profile bot | Run standup workflow via calendar + task | Calendar succeeded, task blocked because `task +get-my-tasks` only supports user identity |
 | T2 group Feishu -> group profile bot | Create Base / Markdown / Sheets / Slides artifacts | Created disposable Feishu resources through bot identity |
@@ -158,7 +158,7 @@ During `restore-feishu-cardkit-output`, T4 was rerun through real Feishu private
 
 Representative evidence:
 
-- `contact/3` originally failed because the auth broker used profile short id `g41a5b5g` instead of raw Feishu `ou_cf23e7c262afa4b7a006baa75f863ed5`. After `_aiagent_subprocess_env_scope()` switched to raw sender open_id, all contact rows passed.
+- `contact/3` originally failed because the auth broker used profile short id `g41a5b5g` instead of raw Feishu `ou_aaaaaaaaaaaaaaaa0000000000000001`. After `_aiagent_subprocess_env_scope()` switched to raw sender open_id, all contact rows passed.
 - `slides/1` originally failed because default `--as user` was injected into a help command. After help/auth/schema/event commands stopped receiving identity injection, slides rows passed.
 - Real disposable artifacts created by user identity include docx `Z30LdY1UmoTr0bxnhFtcyqSDnid`, sheet `FfTpsCfKmhz7AbtodhVcoCMOncf`, and slide deck `KXaFsqWW4l1yXpdgjWacIYopn3s`.
 - `shared/auth status` remains an expected blocked row: Hermes injects credentials externally, so profile-local interactive `lark-cli auth` management is intentionally unavailable.

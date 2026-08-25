@@ -230,6 +230,12 @@ def _target_profiles(entry: dict[str, Any], *, shared_home: Path) -> list[str]:
     for item in raw_profiles:
         if str(item or "").strip().lower() in _ALL_ACTIVE_PROFILE_MARKERS:
             profiles.extend(_active_route_profiles(shared_home))
+            # Self-lane entries additionally target group profiles that bound
+            # their OWN row (group-agent-gitlab-binding). Only those: a blanket
+            # group expansion would make the __self__→__shared__ fallback
+            # materialize the shared secret into every group workspace.
+            if str(entry.get("vault_profile") or "").strip() == SELF_PROFILE_MARKER:
+                profiles.extend(_self_bound_group_profiles(entry, shared_home))
             continue
         cleaned = _safe_profile_name(item)
         if cleaned:
@@ -246,6 +252,80 @@ def _target_profiles(entry: dict[str, Any], *, shared_home: Path) -> list[str]:
             if cleaned:
                 profiles.append(cleaned)
     return sorted(set(profiles))
+
+
+def _self_bound_group_profiles(entry: dict[str, Any], shared_home: Path) -> list[str]:
+    """Active GROUP profiles that vaulted their OWN row for this entry.
+
+    Used only for self-lane marker expansion: a group becomes a materialization
+    target the moment its owner binds a token, and drops out when the group
+    route deactivates — no admin list edit either way.
+    """
+    db_path = shared_home / "multitenancy.db"
+    if not db_path.exists():
+        return []
+    subject_id = str(entry.get("subject_id") or "").strip()
+    provider = str(entry.get("provider") or "").strip()
+    secret_kind = str(entry.get("secret_kind") or "").strip()
+    if not (subject_id and provider and secret_kind):
+        return []
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT DISTINCT c.profile_name FROM multitenancy_credentials c "
+            "JOIN multitenancy_routing r ON r.profile_name = c.profile_name "
+            "AND r.active = 1 AND r.kind = 'group' "
+            "WHERE c.active = 1 AND c.provider = ? AND c.secret_kind = ? AND c.subject_id = ?",
+            (provider, secret_kind, subject_id),
+        )
+        return [
+            cleaned
+            for row in cur.fetchall()
+            if (cleaned := _safe_profile_name(row[0]))
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def entry_targets_profile(entry: dict[str, Any], *, shared_home: Path, profile_name: str) -> bool:
+    """Would the deployed config USE this profile's token once it exists?
+
+    The intake gate's membership question. For self-lane entries with an
+    all-active marker, an active GROUP profile passes even before its first
+    row exists — binding creates the row and `_target_profiles` picks the
+    group up on the next materialization, so 'banked but never injected'
+    cannot happen for it.
+    """
+    if profile_name in _target_profiles(entry, shared_home=shared_home):
+        return True
+    if str(entry.get("vault_profile") or "").strip() != SELF_PROFILE_MARKER:
+        return False
+    raw_profiles = entry.get("profiles") or []
+    if isinstance(raw_profiles, str):
+        raw_profiles = [raw_profiles]
+    has_marker = any(
+        str(item or "").strip().lower() in _ALL_ACTIVE_PROFILE_MARKERS
+        for item in raw_profiles
+    )
+    if not has_marker:
+        return False
+    db_path = shared_home / "multitenancy.db"
+    if not db_path.exists():
+        return False
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM multitenancy_routing "
+            "WHERE active = 1 AND kind = 'group' AND profile_name = ? LIMIT 1",
+            (profile_name,),
+        )
+        return cur.fetchone() is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
 
 
 def _active_route_profiles(shared_home: Path) -> list[str]:

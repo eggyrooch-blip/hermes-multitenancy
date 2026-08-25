@@ -210,13 +210,13 @@ def test_email_dept_for_open_id_derives_company_key():
         "ou_empty": SimpleNamespace(user_id="", display_label=""),
     })
     # real user_id -> <user_id>@domain (the company-wide leaderboard key)
-    assert r.email_dept_for_open_id("ou_sunke", "keep.com") == {"email": "sunke@keep.com", "dept": "IT 组"}
+    assert r.email_dept_for_open_id("ou_sunke", "example.com") == {"email": "sunke@example.com", "dept": "IT 组"}
     # synthetic (ou_*) user_id -> None (can't map to a real employee email)
-    assert r.email_dept_for_open_id("ou_synth", "keep.com") is None
+    assert r.email_dept_for_open_id("ou_synth", "example.com") is None
     # empty user_id -> None
-    assert r.email_dept_for_open_id("ou_empty", "keep.com") is None
+    assert r.email_dept_for_open_id("ou_empty", "example.com") is None
     # unknown open_id -> None
-    assert r.email_dept_for_open_id("ou_missing", "keep.com") is None
+    assert r.email_dept_for_open_id("ou_missing", "example.com") is None
 
 
 def test_email_dept_dept_falls_back_to_unknown():
@@ -225,7 +225,7 @@ def test_email_dept_dept_falls_back_to_unknown():
 
     r = RoutingOwnerLookup.__new__(RoutingOwnerLookup)
     r._table = _FakeRoutingTable({"ou_x": SimpleNamespace(user_id="x", display_label="")})
-    assert r.email_dept_for_open_id("ou_x", "keep.com") == {"email": "x@keep.com", "dept": "unknown"}
+    assert r.email_dept_for_open_id("ou_x", "example.com") == {"email": "x@example.com", "dept": "unknown"}
 
 
 class _FakeRoutingDupRows:
@@ -254,7 +254,7 @@ def test_email_prefers_sync_root_over_synthetic_sibling():
         sibling=SimpleNamespace(user_id="ou_7576abcd", display_label=""),
     )
     # resolve_owner_root (sync) wins -> real LDAP, not the synthetic sibling.
-    assert r.email_dept_for_open_id("ou_sunke", "keep.com") == {"email": "sunke@keep.com", "dept": "IT 组"}
+    assert r.email_dept_for_open_id("ou_sunke", "example.com") == {"email": "sunke@example.com", "dept": "IT 组"}
 
 
 def test_email_falls_back_to_lookup_when_no_sync_root():
@@ -267,4 +267,4 @@ def test_email_falls_back_to_lookup_when_no_sync_root():
         root=None,
         sibling=SimpleNamespace(user_id="bob", display_label="Eng"),
     )
-    assert r.email_dept_for_open_id("ou_bob", "keep.com") == {"email": "bob@keep.com", "dept": "Eng"}
+    assert r.email_dept_for_open_id("ou_bob", "example.com") == {"email": "bob@example.com", "dept": "Eng"}

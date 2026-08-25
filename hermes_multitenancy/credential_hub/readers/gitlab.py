@@ -53,6 +53,30 @@ def _personal_record(profile_dir: Path) -> Optional[dict[str, Any]]:
         return None
 
 
+def _is_group_profile(profile_dir: Path) -> bool:
+    """True when this profile is a routed GROUP profile (kind='group').
+
+    The panel texts must speak in group terms there — the token is the group
+    owner's and every session in the chat uses it — or the card reads like a
+    personal bind that never takes effect (the 2026-08-14 zhaozhiguang bug).
+    """
+    try:
+        from ...routing import RoutingTable
+
+        profile_dir = Path(profile_dir)
+        db_path = profile_dir.parent.parent / "multitenancy.db"
+        if not db_path.exists():
+            return False
+        table = RoutingTable(db_path)
+        try:
+            row = table.lookup_by_profile_name(profile_dir.name)
+        finally:
+            table.close()
+        return bool(row is not None and row.kind == "group")
+    except Exception:
+        return False
+
+
 def gitlab_status(*, profile_dir: Path, installed: bool = False) -> list[CredentialRow]:
     """gitlab — 两行：管理员放的全局 token，和员工自己绑的个人 token。
 
@@ -66,6 +90,7 @@ def gitlab_status(*, profile_dir: Path, installed: bool = False) -> list[Credent
     token_path = Path(profile_dir) / "workspace" / "credentials" / "gitlab.token"
     can_read = bool(_hub._read_small_text(token_path).strip())
     personal = _personal_record(profile_dir)
+    is_group = _is_group_profile(profile_dir)
     # 任一来源可用即算"装了"，两行共享这个判断：个人卡在没有全局 token 时也要能显示成
     # "未绑定"而不是"未安装"，否则员工连绑定按钮都看不到。
     is_installed = installed or can_read or personal is not None
@@ -89,7 +114,7 @@ def gitlab_status(*, profile_dir: Path, installed: bool = False) -> list[Credent
     personal_row = CredentialRow(
         id=GITLAB_PERSONAL, title=_TITLES[GITLAB_PERSONAL], provider="gitlab",
         installed=is_installed, status=S_NEEDS_AUTH,
-        action={"kind": "manual", "label": "绑定我的 GitLab"},
+        action={"kind": "manual", "label": "群主绑定 GitLab" if is_group else "绑定我的 GitLab"},
     )
     if personal is not None:
         expires_at = personal.get("expires_at")
@@ -97,16 +122,28 @@ def gitlab_status(*, profile_dir: Path, installed: bool = False) -> list[Credent
         personal_row.expires_at = expires_at
         personal_row.default_identity = "user"
         window = human_expiry(expires_at)
-        personal_row.detail = "使用你本人提供的 GitLab token（不展示内容）。"
+        personal_row.detail = (
+            "使用群主提供的 GitLab token（不展示内容），本群所有会话共用。"
+            if is_group
+            else "使用你本人提供的 GitLab token（不展示内容）。"
+        )
         if window:
             personal_row.detail += f"{window}。"
         if personal.get("status") == "expired":
             # Still "configured" in the WebUI's vocabulary — there IS a token —
             # but it will fail every call until replaced, so say so plainly.
             personal_row.status = S_NEEDS_AUTH
-            personal_row.detail = "你的 GitLab token 已过期，请重新提交一个。"
+            personal_row.detail = (
+                "本群绑定的 GitLab token 已过期，请群主重新提交一个。"
+                if is_group
+                else "你的 GitLab token 已过期，请重新提交一个。"
+            )
         personal_row.action["label"] = "更换"
     else:
-        personal_row.detail = "绑定后 hermes 用你本人的权限操作仓库；不绑就一直用全局那个。"
+        personal_row.detail = (
+            "群主绑定后，本群所有会话都会用群主的权限操作仓库；不绑就一直用全局那个。"
+            if is_group
+            else "绑定后 hermes 用你本人的权限操作仓库；不绑就一直用全局那个。"
+        )
 
     return [global_row, personal_row]

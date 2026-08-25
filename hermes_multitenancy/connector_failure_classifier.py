@@ -70,6 +70,7 @@ _FEISHU_HINTS = {
     "permission_denied": ("permission", "FEISHU_PERMISSION_DENIED", False),
     "request_invalid": ("lark_api", "FEISHU_REQUEST_INVALID", False),
     "dependency_unavailable": ("transport", "FEISHU_DEPENDENCY_UNAVAILABLE", False),
+    "output_unparseable": ("lark_api", "FEISHU_OUTPUT_UNPARSEABLE", False),
 }
 _FEISHU_RATE_LIMIT_RE = re.compile(
     r"\b(?:http|status|statuscode|code)\b\W{0,4}429\b|\btoo many requests\b|\brate[ _-]?limit(?:ed)?\b",

@@ -722,3 +722,28 @@ def test_card_action_missing_chat_or_table_returns_toast(chat_id, table_factory,
     #     on its own missing table, keeping its own product wording.
     expected = "该操作暂不支持" if not chat_id else "暂时无法保存设置"
     assert expected in _resp_toast_content(response)
+
+
+def test_bot_senders_ride_the_same_mode_valve():
+    """mt-trusted-ingress-bot-actor: bot 消息过了 trusted ingress 之后，走的
+    是与人类完全相同的模式闸 —— core `_admit` 第 4 步 `require_mention and not
+    mentions_self(...)`。bot 永远 @ 不了自己人，所以:
+      mention 群 → require_mention=True → 非 @ 消息(含一切 bot 消息)不进路由、不起 run；
+      all 群     → require_mention=False → bot 消息进路由起 run。
+    这里钉死 valve 对两种模式的输出（sender 无关，正是 bot 也适用的原因）。"""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.feishu_group_valve import _patch_require_mention_for
+
+    class FakeAdapter:
+        def _require_mention_for(self, chat_id=""):
+            return True  # core default
+
+    _patch_require_mention_for(FakeAdapter)
+    router_mod.override_routing_table(":memory:")
+    table = router_mod._get_routing_table()
+    assert table is not None
+    table.set_group_reply_mode("oc_bot_all", "all")
+    table.set_group_reply_mode("oc_bot_mention", "mention")
+
+    assert FakeAdapter()._require_mention_for("oc_bot_all") is False
+    assert FakeAdapter()._require_mention_for("oc_bot_mention") is True

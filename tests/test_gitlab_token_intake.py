@@ -700,3 +700,69 @@ def test_stored_scopes_are_marked_unverified_so_they_are_never_audit_evidence(mo
     finally:
         conn.close()
     assert SCOPE_BINDING_UNVERIFIED in stored
+
+
+# -- group-profile intake (group-agent-gitlab-binding) ------------------------
+
+
+def _group_home(tmp_path, profile="feishu_group_x"):
+    """Shared home with a wildcard self-lane entry and one routed group."""
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared = tmp_path / ".hermes"
+    (shared / "profiles" / profile).mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        "credentials:\n  - subject_id: kep-prd-skills\n    provider: gitlab\n"
+        "    secret_kind: token\n    target: workspace/credentials/gitlab.token\n"
+        "    env: GITLAB_TOKEN\n    vault_profile: __self__\n    profiles: ['*']\n",
+        encoding="utf-8",
+    )
+    table = RoutingTable(shared / "multitenancy.db")
+    try:
+        table.upsert_group(chat_id="oc_g", profile_name=profile, owner_open_id="ou_owner")
+    finally:
+        table.close()
+    return shared
+
+
+def test_group_profile_passes_the_targeting_gate_before_first_row(monkeypatch, tmp_path):
+    """A routed group is targetable the moment its owner binds: the row it
+    creates is exactly what makes `_target_profiles` pick the group up, so the
+    banked-but-never-injected failure the gate exists for cannot happen."""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _group_home(tmp_path)
+
+    result = submit_personal_token(
+        profile_name="feishu_group_x", token="glpat-group-token",
+        tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
+        group_owner_open_id="ou_owner",
+    )
+
+    assert result["stored"] is True
+    assert result["profile_name"] == "feishu_group_x"
+
+
+def test_unrouted_group_shaped_profile_is_still_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _group_home(tmp_path)
+
+    with pytest.raises(TokenRejected, match="适用范围"):
+        submit_personal_token(
+            profile_name="feishu_group_missing", token="glpat-x",
+            tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
+        )
+
+
+def test_group_profile_without_owner_proof_is_refused(monkeypatch, tmp_path):
+    """grok round-1 #3 采纳：intake 层自己也验群主 —— broker 之外的任何直连
+    调用方都不能只报 profile 名就把 token 银行进群。"""
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = _group_home(tmp_path)
+
+    for claimed in (None, "", "ou_not_the_owner"):
+        with pytest.raises(TokenRejected, match="群主"):
+            submit_personal_token(
+                profile_name="feishu_group_x", token="glpat-x",
+                tier=TIER_READ, shared_home=shared, prober=_ok(READ_SCOPES),
+                group_owner_open_id=claimed,
+            )

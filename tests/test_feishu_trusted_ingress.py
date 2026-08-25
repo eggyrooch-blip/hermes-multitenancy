@@ -638,3 +638,318 @@ def test_installation_rejects_adapter_clone(monkeypatch):
 
     with pytest.raises(RuntimeError, match="live Feishu adapter"):
         ingress.install_trusted_feishu_ingress_admission()
+
+
+# ---------------------------------------------------------------------------
+# Bot-actor controlled path (mt-trusted-ingress-bot-actor)
+# ---------------------------------------------------------------------------
+
+
+def _bot_group(routes, tmp_path, chat_id="oc_botgrp", profile="profile_botgrp"):
+    routes.upsert_group(
+        chat_id=chat_id,
+        profile_name=profile,
+        owner_open_id="ou_a",
+        display_label="botgrp",
+    )
+    home = tmp_path / profile
+    if not home.exists():
+        home.mkdir()
+    return routes.lookup_by_chat_id(chat_id)
+
+
+def test_bot_message_in_routed_group_binds_group_profile(routes, tmp_path):
+    row = _bot_group(routes, tmp_path)
+    admission = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_1", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    )
+
+    assert admission is not None
+    assert admission.actor_kind == "bot"
+    assert admission.profile_name == "profile_botgrp"
+    assert admission.route_version == int(row.version)
+    assert admission.actor_subject == "bot:ou_alertbot"
+    assert admission.credential_subject == "cli_trusted"
+    assert admission.tool_scope == "feishu:bot"
+    assert admission.chat_type == "group"
+
+
+def test_bot_with_empty_actor_id_uses_unknown_sentinel(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    admission = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("", "evt_bot_noid", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    )
+
+    assert admission is not None
+    assert admission.actor_subject == "bot:unknown"
+
+
+def test_bot_unrouted_chat_and_dm_stay_fail_closed(routes):
+    # No group row for the chat (covers both DMs and unrouted groups).
+    assert ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_dm", principal_kind="bot", chat_id="oc_dm"),
+        adapter=FakeAdapter(),
+    ) is None
+
+
+def test_bot_non_message_event_kinds_denied(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    for kind in ("reaction", "button", "form"):
+        assert ingress.admit_trusted_feishu_ingress(
+            ticket=FakeTicket(
+                "ou_alertbot",
+                f"evt_bot_{kind}",
+                principal_kind="bot",
+                event_kind=kind,
+                chat_id="oc_botgrp",
+            ),
+            adapter=FakeAdapter(),
+        ) is None
+
+
+def test_bot_per_chat_floor_throttles_second_message(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    _bot_group(routes, tmp_path, chat_id="oc_botgrp2", profile="profile_botgrp2")
+
+    first = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_t1", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    )
+    second = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_t2", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    )
+    other_chat = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_t3", principal_kind="bot", chat_id="oc_botgrp2"),
+        adapter=FakeAdapter(),
+    )
+
+    assert first is not None
+    assert second is None  # within the per-chat floor
+    assert other_chat is not None  # floor is per chat, not global
+
+    # Aged past the floor → admitted again.
+    with ingress._seen_lock:
+        ingress._bot_last_admit["oc_botgrp"] -= ingress._BOT_MIN_INTERVAL_SECONDS + 1
+    third = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_t4", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    )
+    assert third is not None
+
+
+def test_bot_duplicate_event_key_still_claim_once(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    assert ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_dup", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    ) is not None
+    with ingress._seen_lock:
+        ingress._bot_last_admit["oc_botgrp"] -= ingress._BOT_MIN_INTERVAL_SECONDS + 1
+    assert ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_bot_dup", principal_kind="bot", chat_id="oc_botgrp"),
+        adapter=FakeAdapter(),
+    ) is None
+
+
+def _bot_event(ticket, admission, chat_type="group"):
+    return NS(
+        source=NS(
+            platform="feishu",
+            user_id=None,
+            user_id_alt=None,
+            chat_id=ticket.chat_id,
+            chat_type=chat_type,
+        ),
+        message_id=ticket.message_id,
+        trusted_feishu_ingress_ticket=ticket,
+        trusted_feishu_ingress_admission=admission,
+    )
+
+
+def test_bot_admission_validates_end_to_end(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    ticket = FakeTicket("ou_alertbot", "evt_bot_v1", principal_kind="bot", chat_id="oc_botgrp")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=FakeAdapter())
+
+    assert admission is not None
+    assert ingress.validate_admitted_feishu_event(_bot_event(ticket, admission))
+
+
+def test_bot_validation_fails_closed_on_route_change_or_mismatch(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    ticket = FakeTicket("ou_alertbot", "evt_bot_v2", principal_kind="bot", chat_id="oc_botgrp")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=FakeAdapter())
+    assert admission is not None
+
+    # DM-shaped event can't ride a group admission.
+    assert not ingress.validate_admitted_feishu_event(_bot_event(ticket, admission, chat_type="p2p"))
+
+    # Wrong message pinning.
+    swapped = replace(ticket, message_id="om_other")
+    assert not ingress.validate_admitted_feishu_event(_bot_event(swapped, admission))
+
+    # Route re-pointed to another profile after admission → stale admission dies.
+    routes.upsert_group(
+        chat_id="oc_botgrp",
+        profile_name="profile_botgrp_repointed",
+        owner_open_id="ou_a",
+        display_label="botgrp",
+    )
+    assert not ingress.validate_admitted_feishu_event(_bot_event(ticket, admission))
+
+
+def test_human_ticket_cannot_ride_bot_branch(routes, tmp_path):
+    _bot_group(routes, tmp_path)
+    bot_ticket = FakeTicket("ou_alertbot", "evt_bot_v3", principal_kind="bot", chat_id="oc_botgrp")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=bot_ticket, adapter=FakeAdapter())
+    assert admission is not None
+
+    human_ticket = replace(bot_ticket, principal_kind="human")
+    assert not ingress.validate_admitted_feishu_event(_bot_event(human_ticket, admission))
+
+
+def test_bot_run_request_attribution_never_names_an_employee(routes, tmp_path):
+    _bot_group(routes, tmp_path, chat_id="oc_botreq", profile="profile_botreq")
+    ticket = FakeTicket("ou_alertbot", "evt_bot_req", principal_kind="bot", chat_id="oc_botreq")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=FakeAdapter())
+    event = NS(
+        source=NS(platform="feishu"),
+        message_id=ticket.message_id,
+        trusted_feishu_ingress_ticket=ticket,
+        trusted_feishu_ingress_admission=admission,
+    )
+
+    request = router._run_request_for_routed_event(
+        event=event,
+        profile_name="profile_a",
+        sender="ou_a",
+        sender_alt=None,
+        chat_id="oc_other",
+        text="alert card",
+    )
+
+    assert request.profile_name == "profile_botreq"
+    assert request.user_key == "bot:ou_alertbot"
+    assert request.credential_subject == "cli_trusted"
+    assert request.metadata["sender_open_id"] == "bot:ou_alertbot"
+    assert "ou_a" not in (request.user_key, request.credential_subject)
+
+
+def _runtime_event_from_admission(ticket, admission):
+    """Metadata exactly as `_run_request_for_routed_event` seals it, wrapped in
+    the raw_event shape `_event_metadata` reads on the run path."""
+    request = router._run_request_for_routed_event(
+        event=NS(
+            source=NS(platform="feishu"),
+            message_id=ticket.message_id,
+            trusted_feishu_ingress_ticket=ticket,
+            trusted_feishu_ingress_admission=admission,
+        ),
+        profile_name="ignored",
+        sender="ou_ignored",
+        sender_alt=None,
+        chat_id="oc_ignored",
+        text="alert card",
+    )
+    return NS(raw_event={"metadata": dict(request.metadata)})
+
+
+def test_bot_trusted_runtime_identity_accepts_bot_subject(routes, tmp_path):
+    """P0 (grok round 1): agent_real's runtime seal must accept the bot actor
+    shape — otherwise every bot-admitted run aborts before model work."""
+    from hermes_multitenancy.agent_real._core import _trusted_feishu_runtime_identity
+
+    _bot_group(routes, tmp_path, chat_id="oc_rt", profile="profile_rt")
+    ticket = FakeTicket("ou_alertbot", "evt_rt_1", principal_kind="bot", chat_id="oc_rt")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=FakeAdapter())
+    event = _runtime_event_from_admission(ticket, admission)
+
+    actor, credential, tool_scope = _trusted_feishu_runtime_identity(event)
+
+    assert actor == "bot:ou_alertbot"
+    assert credential == "cli_trusted"
+    assert tool_scope == "feishu:bot"
+
+
+def test_bot_runtime_identity_tool_scope_gate_passes_group_profile(routes, tmp_path):
+    from hermes_multitenancy.agent_real.run import _validate_trusted_feishu_tool_scope
+
+    _bot_group(routes, tmp_path, chat_id="oc_rt2", profile="profile_rt2")
+    ticket = FakeTicket("ou_alertbot", "evt_rt_2", principal_kind="bot", chat_id="oc_rt2")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=FakeAdapter())
+    event = _runtime_event_from_admission(ticket, admission)
+
+    # Right profile: returns silently. Wrong profile: refuses.
+    _validate_trusted_feishu_tool_scope(event, tmp_path / "profile_rt2")
+    with pytest.raises(RuntimeError, match="profile"):
+        _validate_trusted_feishu_tool_scope(event, tmp_path / "profile_other")
+
+
+def test_bot_runtime_identity_rejects_bot_shape_outside_group_bot_scope(routes, tmp_path):
+    """双向负控制：bot: 形状只在 (feishu:bot, group) 封印下合法；
+    冒充 feishu:user 或 p2p 或带员工 credential 的一律拒。"""
+    from hermes_multitenancy.agent_real._core import _trusted_feishu_runtime_identity
+
+    _bot_group(routes, tmp_path, chat_id="oc_rt3", profile="profile_rt3")
+    ticket = FakeTicket("ou_alertbot", "evt_rt_3", principal_kind="bot", chat_id="oc_rt3")
+    admission = ingress.admit_trusted_feishu_ingress(ticket=ticket, adapter=FakeAdapter())
+    good = _runtime_event_from_admission(ticket, admission).raw_event["metadata"]
+
+    for corrupt in (
+        {"feishu_tool_scope": "feishu:user"},
+        {"trusted_chat_type": "p2p"},
+        {"trusted_credential_subject": "ou_employee"},
+        {"sender_open_id": "ou_someone"},
+    ):
+        meta = {**good, **corrupt}
+        with pytest.raises(RuntimeError):
+            _trusted_feishu_runtime_identity(NS(raw_event={"metadata": meta}))
+
+
+def test_bot_self_echo_never_burns_the_throttle_slot(routes, tmp_path):
+    """自家 bot 的回声在 ingress 就拒（reason=self_echo），且不占用该群的
+    节流窗口 —— 否则每次 Hermes 自己回复都会饿死 30s 内的真实告警。"""
+
+    class SelfAwareAdapter(FakeAdapter):
+        _bot_open_id = "ou_hermes_self"
+
+    _bot_group(routes, tmp_path, chat_id="oc_echo", profile="profile_echo")
+
+    echo = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_hermes_self", "evt_echo_1", principal_kind="bot", chat_id="oc_echo"),
+        adapter=SelfAwareAdapter(),
+    )
+    real = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_echo_2", principal_kind="bot", chat_id="oc_echo"),
+        adapter=SelfAwareAdapter(),
+    )
+
+    assert echo is None  # own reply refused at ingress
+    assert real is not None  # and it did not consume the chat's floor
+
+
+def test_bot_throttle_map_is_ttl_and_size_bounded(routes, tmp_path):
+    """P1 (grok round 1)：节流表必须像 _seen 一样有 TTL/容量上界。"""
+    _bot_group(routes, tmp_path, chat_id="oc_ttl", profile="profile_ttl")
+
+    with ingress._seen_lock:
+        ingress._bot_last_admit.clear()
+        # expired entry → pruned on next claim
+        ingress._bot_last_admit["oc_stale"] = time.time() - ingress._BOT_ADMIT_TTL_SECONDS - 1
+        # overflow beyond the cap → oldest evicted
+        base = time.time()
+        for i in range(ingress._BOT_ADMIT_MAX):
+            ingress._bot_last_admit[f"oc_bulk_{i}"] = base + i * 1e-6
+
+    admission = ingress.admit_trusted_feishu_ingress(
+        ticket=FakeTicket("ou_alertbot", "evt_ttl_1", principal_kind="bot", chat_id="oc_ttl"),
+        adapter=FakeAdapter(),
+    )
+
+    assert admission is not None
+    with ingress._seen_lock:
+        assert "oc_stale" not in ingress._bot_last_admit
+        assert len(ingress._bot_last_admit) <= ingress._BOT_ADMIT_MAX

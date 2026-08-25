@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from hermes_multitenancy import cron_worker
 
 
@@ -190,6 +192,118 @@ def test_build_cron_run_request_threads_expert_id_into_event_metadata(tmp_path, 
 
     assert request.metadata["expert_id"] == "expert-123"
     assert agent_real._expert_id_for_event(cron_worker._build_cron_event(request)) == "expert-123"
+
+
+def test_webui_expert_job_revalidates_catalog_before_run_request(tmp_path, monkeypatch):
+    from hermes_multitenancy import expert_overlay
+
+    profile = _profile(tmp_path / "profiles", "alice")
+    visible = {"value": True}
+    monkeypatch.setattr(
+        expert_overlay,
+        "resolve_caller_departments",
+        lambda profile_home, **kwargs: ["42"],
+    )
+    monkeypatch.setattr(
+        expert_overlay,
+        "resolve_expert",
+        lambda profile_home, expert_id, **kwargs: (
+            SimpleNamespace(expert_id=expert_id) if visible["value"] else None
+        ),
+    )
+    dependency_checks = []
+    monkeypatch.setattr(
+        cron_worker,
+        "_assert_webui_expert_cron_dependencies",
+        lambda job, **kwargs: dependency_checks.append((job, kwargs)),
+    )
+    job = {
+        "id": "job1",
+        "name": "Daily",
+        "deliver": "feishu",
+        "owner_profile": "alice",
+        "owner_open_id": "ou_owner",
+        "expert_id": "expert-webui",
+    }
+
+    request = cron_worker._build_cron_run_request(job, profile_home=profile, prompt="run now")
+
+    assert request.metadata["expert_id"] == "expert-webui"
+    assert request.profile_name == "alice"
+    assert request.user_key == "ou_owner"
+    assert request.session_id == "cron:job1"
+    assert request.delivery_mode == "feishu"
+    assert dependency_checks[0][1]["profile_name"] == "alice"
+    assert dependency_checks[0][1]["user_key"] == "ou_owner"
+
+    visible["value"] = False
+    with pytest.raises(ValueError, match="cron expert is no longer available"):
+        cron_worker._build_cron_run_request(job, profile_home=profile, prompt="must not run")
+
+
+def test_webui_expert_job_preflights_delivery_and_session_mirror(tmp_path, monkeypatch):
+    from hermes_multitenancy import router
+
+    profile = _profile(tmp_path / "profiles", "alice")
+    reads = []
+    store = SimpleNamespace(count=lambda profile_name, user_key: reads.append((profile_name, user_key)))
+    monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda job, target: True)
+    monkeypatch.setattr(router, "_history_key", lambda *a, **k: ("alice", "ou_owner"))
+    monkeypatch.setattr(router, "_get_session_store", lambda: store)
+    job = {
+        "id": "job1",
+        "deliver": "feishu",
+        "owner_profile": "alice",
+        "owner_open_id": "ou_owner",
+        "expert_id": "expert-webui",
+    }
+
+    cron_worker._assert_webui_expert_cron_dependencies(
+        job,
+        profile_home=profile,
+        profile_name="alice",
+        user_key="ou_owner",
+    )
+    assert reads == [("alice", "ou_owner")]
+
+    monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda job, target: False)
+    with pytest.raises(ValueError, match="delivery identity"):
+        cron_worker._assert_webui_expert_cron_dependencies(
+            job,
+            profile_home=profile,
+            profile_name="alice",
+            user_key="ou_owner",
+        )
+
+    monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda job, target: True)
+    monkeypatch.setattr(router, "_get_session_store", lambda: None)
+    with pytest.raises(ValueError, match="session mirror"):
+        cron_worker._assert_webui_expert_cron_dependencies(
+            job,
+            profile_home=profile,
+            profile_name="alice",
+            user_key="ou_owner",
+        )
+
+    with pytest.raises(ValueError, match="must use feishu"):
+        cron_worker._assert_webui_expert_cron_dependencies(
+            {**job, "deliver": "local"},
+            profile_home=profile,
+            profile_name="alice",
+            user_key="ou_owner",
+        )
+
+
+def test_webui_expert_job_never_falls_back_around_run_broker(monkeypatch):
+    calls = []
+    scheduler = SimpleNamespace(run_job=lambda job: calls.append(job))
+    monkeypatch.setattr(cron_worker, "_l4_check_needs_reauth_and_defer", lambda _job: None)
+    monkeypatch.setattr(cron_worker, "_cron_run_broker_enabled", lambda: False)
+
+    result = cron_worker._run_cron_job_body({"id": "job1", "expert_id": "expert-webui"}, scheduler)
+
+    assert result == (False, "", "", "scheduled expert execution requires RunBroker")
+    assert calls == []
 
 
 def test_run_job_for_profile_current_process_temporarily_disables_readonly_for_authorized_jobs(

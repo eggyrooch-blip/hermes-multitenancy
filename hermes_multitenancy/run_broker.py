@@ -19,6 +19,7 @@ import uuid
 from typing import Awaitable, Callable, Optional
 
 from .run_models import RunEvent, RunRequest, RunResult
+from .source_envelope import MAX_SOURCE_REFS
 from .skill_slash import rewrite_skill_slash_text
 
 
@@ -55,6 +56,10 @@ _RUN_OUTPUT_INCOMPLETE: ContextVar[bool] = ContextVar(
     "hermes_run_output_incomplete",
     default=False,
 )
+_RUN_SOURCE_REFS: ContextVar[tuple[dict[str, str], ...]] = ContextVar(
+    "hermes_run_source_refs",
+    default=(),
+)
 
 
 def mark_current_run_retried() -> None:
@@ -76,6 +81,20 @@ def record_current_run_failure(
 
 def mark_current_run_output_incomplete() -> None:
     _RUN_OUTPUT_INCOMPLETE.set(True)
+
+
+def record_current_run_source_refs(source_refs: list[dict[str, str]]) -> None:
+    """Attach already-normalized refs to this run's terminal success event."""
+    existing = list(_RUN_SOURCE_REFS.get())
+    seen_ids = {ref.get("id") for ref in existing}
+    for source_ref in source_refs:
+        if len(existing) >= MAX_SOURCE_REFS:
+            break
+        ref = dict(source_ref)
+        if ref.get("id") and ref.get("id") not in seen_ids:
+            existing.append(ref)
+            seen_ids.add(ref.get("id"))
+    _RUN_SOURCE_REFS.set(tuple(existing))
 
 
 def _execution_terminal_event_id(request: RunRequest) -> str:
@@ -485,6 +504,7 @@ class RunBroker:
         retry_token = _RUN_RETRIED.set(False)
         failure_fields_token = _RUN_FAILURE_FIELDS.set(None)
         output_incomplete_token = _RUN_OUTPUT_INCOMPLETE.set(False)
+        source_refs_token = _RUN_SOURCE_REFS.set(())
         expert_id = str((request.metadata or {}).get("expert_id") or "").strip()
         expert_requested = bool(expert_id)
         terminal_status = "completed"
@@ -497,8 +517,13 @@ class RunBroker:
             content = str(response or "")
             if content:
                 await self._emit_to(RunEvent(kind="content", text=content), emit_event)
-            await self._emit_to(RunEvent(kind="done"), emit_event)
-            if _RUN_OUTPUT_INCOMPLETE.get():
+            output_incomplete = _RUN_OUTPUT_INCOMPLETE.get()
+            source_refs = list(_RUN_SOURCE_REFS.get()) if not output_incomplete else None
+            await self._emit_to(
+                RunEvent(kind="done", source_refs=source_refs or None),
+                emit_event,
+            )
+            if output_incomplete:
                 terminal_status = "failed"
                 failure_subsystem = "output"
                 error_code = "OUTPUT_INCOMPLETE"
@@ -532,6 +557,7 @@ class RunBroker:
             _RUN_RETRIED.reset(retry_token)
             _RUN_FAILURE_FIELDS.reset(failure_fields_token)
             _RUN_OUTPUT_INCOMPLETE.reset(output_incomplete_token)
+            _RUN_SOURCE_REFS.reset(source_refs_token)
             try:
                 from .conversation_audit import (
                     _FAILURE_SUBSYSTEMS,

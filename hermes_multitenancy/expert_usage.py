@@ -34,8 +34,11 @@ CREATE TABLE IF NOT EXISTS expert_usage (
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=5.0)
-    conn.execute("PRAGMA busy_timeout=5000")
+    # 30s(不是 5s):满载机器上 5s busy timeout 会被真实超过,bump 把
+    # OperationalError 吞成 False = 计数静默丢失(CI 2026-08-14 实测 40 丢 16)。
+    # 计数是对账口径,宁可等也不丢;真死锁场景这里本来就不该发生(单条 UPSERT)。
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         # WAL is a persistent DB property; switching can hit SQLITE_BUSY during
         # concurrent first-connect — non-fatal, this call just runs non-WAL once

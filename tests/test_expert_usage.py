@@ -53,3 +53,13 @@ def test_counts_ignores_foreign_tables(tmp_path):
     assert eu.counts(db) == {}
     assert eu.bump("kep-server-expert", db) is True
     assert eu.counts(db) == {"kep-server-expert": 1}
+
+
+def test_connect_busy_timeout_is_30s(tmp_path):
+    # 对账口径:满载下 5s busy timeout 被超过时 bump 静默丢计数(CI 2026-08-14
+    # 实测 40 丢 16)。锁定 30s,防止无声回退。
+    conn = eu._connect(tmp_path / "mt.db")
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        conn.close()

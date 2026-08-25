@@ -343,7 +343,7 @@ def _local_bindings(env: Mapping[str, str]) -> dict[str, Any]:
         if not isinstance(org_rows, Mapping) or not org_rows:
             raise BillingReadinessError("readiness_org_snapshot_invalid")
         domain = str(
-            env.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com")
+            env.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "example.com")
         ).strip().casefold()
         if not domain or "@" in domain or "/" in domain:
             raise BillingReadinessError("readiness_employee_email_domain_invalid")

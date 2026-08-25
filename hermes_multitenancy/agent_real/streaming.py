@@ -525,6 +525,7 @@ async def _stream_aiagent_subprocess(
     cmd = _wrap_with_sandbox([sys.executable, str(child_script)], profile_home)
 
     started_at = time.monotonic()
+    wall_started_at = time.time()
     proc = None
     stderr_task = None
     using_warm_worker = False
@@ -720,6 +721,16 @@ async def _stream_aiagent_subprocess(
                 if content_text:
                     _mirror.upsert_assistant(content_text, "")
                     yield "content", content_text
+            elif event_name == "source_refs":
+                from ..run_broker import record_current_run_source_refs
+                from ..source_envelope import normalize_tool_source_refs
+
+                source_refs = normalize_tool_source_refs(
+                    {"source_refs": data.get("source_refs")},
+                    profile_home,
+                )
+                if source_refs:
+                    record_current_run_source_refs(source_refs)
             elif event_name == "thinking":
                 thinking_text = _redact_billing_runtime_text(
                     data.get("text"), event, env
@@ -830,6 +841,31 @@ async def _stream_aiagent_subprocess(
                     )
         if not saw_done:
             raise RuntimeError("AIAgent subprocess stream ended without done event")
+        # GitLab credential-delegation marker: the child (credential_tool) writes
+        # into the profile's own tmp/ because the parent's mkdtemp approval dir is
+        # invisible inside bwrap. Surface it as the standard auth_required delta so
+        # the Feishu router pushes the delegation card to the initiator's DM.
+        try:
+            from ..credential_delegation import (
+                DELEGATION_NONCE_ENV,
+                take_auth_required_marker,
+            )
+
+            # Only THIS run's marker — the nonce was minted for this spawn, so a
+            # sibling run of the same group profile can neither be read nor
+            # unlinked here.
+            _delegation_signal = take_auth_required_marker(
+                profile_home,
+                since=wall_started_at,
+                nonce=env.get(DELEGATION_NONCE_ENV, ""),
+            )
+        except Exception:
+            _delegation_signal = None
+            logger.debug(
+                "[multitenancy] delegation marker read failed", exc_info=True
+            )
+        if _delegation_signal:
+            yield "auth_required", _delegation_signal
     except asyncio.TimeoutError as exc:
         if using_warm_worker:
             await _discard_aiagent_warm_worker(profile_home)
@@ -855,8 +891,36 @@ async def _stream_aiagent_subprocess(
         raise
     finally:
         try:
-            if env_scope_entered:
-                env_scope.__exit__(*sys.exc_info())
+            # A run that never reported done has lost its consumer, but the warm
+            # worker keeps executing it: GeneratorExit from an abandoned stream
+            # (the user sends a new message, or the generator is GC-aclosed)
+            # skips every except branch above and lands straight here. Exiting
+            # the env scope below closes this turn's lark-cli auth broker — a
+            # random-port localhost server — so an orphan run would keep calling
+            # lark-cli against a dead port for the rest of its life and surface
+            # as `dial tcp 127.0.0.1:<port>: connect: connection refused`.
+            #
+            # Kill the orphan instead of keeping its broker alive: the broker
+            # carries the turn's frozen identity (sender open_id, allowed bot
+            # chats), so outliving the run it was minted for would widen that
+            # authorization window. Slot release still happens after the scope
+            # exits, so a profile never has two live scopes at once — and the
+            # profile lock is still held here, so the worker being discarded is
+            # necessarily this run's own (no timeout/steal path to acquire it).
+            #
+            # The discard sits in its own try/finally: if it raises (a cancelled
+            # teardown, a dead loop), the scope must still exit, or the broker
+            # leaks and the authorization window survives with no owner — worse
+            # than the orphan. Shielded so a cancel landing mid-teardown cannot
+            # leave the run half-killed.
+            try:
+                if using_warm_worker and not saw_done:
+                    await asyncio.shield(
+                        _discard_aiagent_warm_worker(profile_home)
+                    )
+            finally:
+                if env_scope_entered:
+                    env_scope.__exit__(*sys.exc_info())
         finally:
             if proc is not None and proc.returncode is None:
                 proc.kill()

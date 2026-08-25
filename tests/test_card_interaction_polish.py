@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 from hermes_multitenancy.card import ensure_feishu_cardkit_streaming
 from hermes_multitenancy.card import tool_use_config, tool_use_display
 
@@ -245,7 +247,7 @@ async def test_flush_controller_reflush_preserves_latest_streamed_content():
             content="first token",
         )
     )
-    await asyncio.wait_for(adapter.first_content_entered.wait(), timeout=2)
+    await asyncio.wait_for(adapter.first_content_entered.wait(), timeout=SYNC_TIMEOUT)
 
     # Second event arrives WHILE the first flush is in flight. The controller
     # must coalesce this (needs_reflush) rather than run a second flush now.

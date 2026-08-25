@@ -34,8 +34,8 @@ or upstream changes:
 
 | Threat | Status |
 |---|---|
-| Compromised skill calls `cat /Users/kite/.ssh/id_rsa` | open — file-system reads outside the profile are still permitted by the kernel. Closes under档 B |
-| Compromised skill opens a TCP socket to `10.2.14.249:443` (internal lateral) | open — no egress controls. Closes under档 B with the `network` profile |
+| Compromised skill calls `cat /Users/dev/.ssh/id_rsa` | open — file-system reads outside the profile are still permitted by the kernel. Closes under档 B |
+| Compromised skill opens a TCP socket to `10.0.0.249:443` (internal lateral) | open — no egress controls. Closes under档 B with the `network` profile |
 | OAuth callback handler (in upstream hermes-agent) writes a new UAT to `<shared>/feishu_uat/<ou>.json` instead of `<profile>/feishu_uat/<ou>.json` | open — write side still shared. Bridged by sync-pass migration (see §4). Real fix needs an upstream change to route callbacks through the multitenancy router |
 | macOS Keychain access by the subprocess | open — Keychain is user-scoped (same `kite` uid); a tenant subprocess can read Keychain entries that another tenant captured. Mitigation: store secrets in `<profile>/tokens/` (see §5), not in Keychain |
 | Memory isolation between concurrent subprocesses | open — process boundaries only; no cgroup / mem-limit |

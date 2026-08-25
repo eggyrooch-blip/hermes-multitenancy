@@ -75,7 +75,7 @@ def _resign(artifact: dict) -> None:
 def _environment(tmp_path, monkeypatch) -> tuple[dict[str, str], dict]:
     employees = [{
         "employee_id": "employee-a",
-        "email": "employee-a@keep.com",
+        "email": "employee-a@example.com",
         "cohort": True,
     }]
     employee_input = tmp_path / "employees.json"

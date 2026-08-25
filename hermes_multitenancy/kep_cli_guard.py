@@ -22,8 +22,8 @@ KEP_SHIM_NAMES: tuple[str, ...] = (
     "kep-auth",
 )
 _KEP_IDENTITY_URLS = {
-    "online": "https://auth.gotokeep.com/ldap/authjwt",
-    "pre": "https://auth.pre.gotokeep.com/ldap/authjwt",
+    "online": "https://auth.example.com/ldap/authjwt",
+    "pre": "https://auth.pre.example.com/ldap/authjwt",
 }
 
 

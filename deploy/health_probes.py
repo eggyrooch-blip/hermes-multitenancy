@@ -326,6 +326,179 @@ def probe_billing_drift(
 
 
 # ---------------------------------------------------------------------------
+# Probe 6: systemd user-unit Exec* paths
+# ---------------------------------------------------------------------------
+
+#: Any Exec* line whose absolute argv[0] is missing/non-executable alerts.
+UNIT_EXEC_THRESHOLD = 0
+#: Alert detail keeps at most this many entries (Feishu payload / argv budget).
+UNIT_EXEC_DETAIL_MAX = 20
+#: Per-entry display bound inside detail (paths are ~100 chars in practice).
+UNIT_EXEC_ENTRY_MAX = 256
+#: Per-file read bound. Unit files are KBs; a bigger file is flagged, not scanned.
+UNIT_EXEC_MAX_BYTES = 1_000_000
+#: Directory bound. Past this we flag and stop — keeps seen/dead bounded.
+UNIT_EXEC_MAX_FILES = 1000
+
+# 只匹配「值是命令行」的 Exec 指令；ExecSearchPath= 的值是目录列表，会假红。
+_EXEC_LINE_PATTERN = re.compile(
+    r"^Exec(?:Start|StartPre|StartPost|Condition|Reload|Stop|StopPost)\s*=\s*(.*)$"
+)
+
+
+def _unit_logical_lines(text: str):
+    """systemd joins lines ending with ``\\`` into one logical line."""
+    buf: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.endswith("\\"):
+            buf.append(line[:-1].strip())
+            continue
+        if buf:
+            buf.append(line)
+            line = " ".join(part for part in buf if part)
+            buf = []
+        yield line
+    if buf:
+        yield " ".join(part for part in buf if part)
+
+
+#: systemd C-style escapes we decode (systemd.syntax(7)); unknown escapes keep
+#: the escaped char literally, matching "best effort, never crash".
+_EXEC_ESCAPES = {"s": " ", "t": "\t", "n": "\n", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
+
+
+def _exec_argv0(rest: str) -> str:
+    """First token of an Exec command line, decoded like systemd would.
+
+    Strips executable prefixes (``@-:+!``), then walks a small state machine:
+    double/single quotes may wrap the whole token or part of it, C-style
+    escapes (``\\s`` → space, ``\\t``, ``\\xHH``, …) are decoded inside and
+    outside quotes, and an unquoted token ends at the first unescaped
+    whitespace.
+    """
+    rest = rest.lstrip()
+    i = 0
+    while i < len(rest) and rest[i] in "@-:+!":
+        i += 1
+    out: list[str] = []
+    quote = ""
+    j = i
+    while j < len(rest):
+        c = rest[j]
+        if c == "\\" and j + 1 < len(rest):
+            nxt = rest[j + 1]
+            if nxt == "x" and j + 3 < len(rest):
+                try:
+                    out.append(chr(int(rest[j + 2 : j + 4], 16)))
+                    j += 4
+                    continue
+                except ValueError:
+                    pass
+            out.append(_EXEC_ESCAPES.get(nxt, nxt))
+            j += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = ""
+            else:
+                out.append(c)
+        elif c in "\"'":
+            quote = c
+        elif c.isspace():
+            break
+        else:
+            out.append(c)
+        j += 1
+    return "".join(out)
+
+
+def _owning_unit(f: Path) -> str:
+    """``foo.service.d/override.conf`` belongs to ``foo.service``."""
+    return f.parent.name[:-2] if f.parent.name.endswith(".service.d") else f.name
+
+
+def probe_unit_exec_paths(
+    unit_dir: Path,
+    *,
+    threshold: float = UNIT_EXEC_THRESHOLD,
+) -> ProbeResult:
+    """Check that every user unit's Exec* argv[0] points at a real executable.
+
+    2026-08-15: hermes-lark-skill-sync.service 的 ExecStart 指向 release 换布局后
+    消失的 venv python，203/EXEC 静默失败数周才被发现。这里扫 ``*.service`` 与
+    ``*.service.d/*.conf`` 的每条 ``Exec*=`` 行，取 argv[0]（剥掉 systemd 的
+    ``@-:+!`` 前缀）；绝对路径必须存在且可执行，非绝对路径（走 $PATH 解析）跳过。
+    只读探测：open/stat，绝无写入。
+    """
+    dead: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    checked = 0
+    # fail closed：列目录本身炸了（权限/IO）也必须变成告警，而不是探针崩掉
+    # 只留一行本地日志——那正是 203/EXEC 静默数周的形状
+    try:
+        if not unit_dir.is_dir():
+            return ProbeResult("unit_exec_paths", "pass", 0, threshold, "unit dir not found")
+        files = sorted(unit_dir.glob("*.service")) + sorted(unit_dir.glob("*.service.d/*.conf"))
+    except OSError as e:
+        return ProbeResult(
+            "unit_exec_paths", "alert", 1.0, threshold,
+            f"unit scan → unreadable ({e.__class__.__name__})",
+        )
+    if len(files) > UNIT_EXEC_MAX_FILES:
+        dead.append(f"unit scan → {len(files)} files exceeds {UNIT_EXEC_MAX_FILES}, rest unscanned")
+        files = files[:UNIT_EXEC_MAX_FILES]
+    for f in files:
+        unit = _owning_unit(f)
+        try:
+            with f.open(encoding="utf-8", errors="replace") as fh:
+                text = fh.read(UNIT_EXEC_MAX_BYTES + 1)
+        except OSError:
+            # fail closed：读不了的单元可能正藏着死路径，必须告警而非跳过
+            key = (unit, "<unreadable>")
+            if key not in seen:
+                seen.add(key)
+                dead.append(f"{unit} → unreadable")
+            continue
+        if len(text) > UNIT_EXEC_MAX_BYTES:
+            # fail closed：超界文件截断后扫，死路径可能恰好在截断点之后
+            dead.append(f"{unit} → oversized (>{UNIT_EXEC_MAX_BYTES} bytes, unscanned)")
+            continue
+        for line in _unit_logical_lines(text):
+            m = _EXEC_LINE_PATTERN.match(line)
+            if not m:
+                continue
+            argv0 = _exec_argv0(m.group(1))
+            if not argv0:
+                continue  # `ExecStart=` 置空是 drop-in 重置语法，不是路径
+            if not argv0.startswith("/") or "%" in argv0:
+                continue  # $PATH 解析 / systemd specifier，本探针不展开
+            key = (unit, argv0)
+            if key in seen:
+                continue
+            seen.add(key)
+            checked += 1
+            if not (os.path.isfile(argv0) and os.access(argv0, os.X_OK)):
+                shown_path = argv0 if len(argv0) <= UNIT_EXEC_ENTRY_MAX else argv0[:UNIT_EXEC_ENTRY_MAX] + "…"
+                dead.append(f"{unit} → {shown_path}")
+
+    status = "alert" if len(dead) > threshold else "pass"
+    if dead:
+        shown = dead[:UNIT_EXEC_DETAIL_MAX]
+        omitted = len(dead) - len(shown)
+        detail = "; ".join(shown) + (f" … +{omitted} more" if omitted else "")
+    else:
+        detail = f"checked {checked} exec paths"
+    return ProbeResult(
+        name="unit_exec_paths",
+        status=status,
+        value=float(len(dead)),
+        threshold=threshold,
+        detail=detail,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator: run all probes
 # ---------------------------------------------------------------------------
 
@@ -335,15 +508,22 @@ def run_all_probes(
     gateway_log_paths: list[Path],
     kanban_db_path: Path,
     multitenancy_db_path: Path,
+    unit_dir: Optional[Path] = None,
 ) -> list[ProbeResult]:
-    """Run all five probes and return results in order."""
-    return [
+    """Run all probes and return results in order.
+
+    ``unit_dir`` is opt-in (None skips probe 6) so existing callers are unchanged.
+    """
+    results = [
         probe_api_error_rate(gateway_log_paths),
         probe_queue_backlog(kanban_db_path),
         probe_zombie_tasks(kanban_db_path),
         probe_notify_failures(gateway_log_paths),
         probe_billing_drift(multitenancy_db_path),
     ]
+    if unit_dir is not None:
+        results.append(probe_unit_exec_paths(unit_dir))
+    return results
 
 
 def format_alert_text(result: ProbeResult, host: str = "") -> str:
@@ -367,6 +547,7 @@ if __name__ == "__main__":
     parser.add_argument("--kanban-db", type=Path, help="Path to kanban.db")
     parser.add_argument("--multitenancy-db", type=Path, help="Path to multitenancy.db")
     parser.add_argument("--gateway-log", action="append", type=Path, help="Gateway log path (repeatable)")
+    parser.add_argument("--unit-dir", type=Path, help="systemd user-unit dir to check Exec* paths (omit to skip)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
@@ -374,6 +555,7 @@ if __name__ == "__main__":
         gateway_log_paths=args.gateway_log or [],
         kanban_db_path=args.kanban_db or Path("/dev/null"),
         multitenancy_db_path=args.multitenancy_db or Path("/dev/null"),
+        unit_dir=args.unit_dir,
     )
 
     if args.json:

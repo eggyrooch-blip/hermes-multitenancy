@@ -110,7 +110,7 @@ def test_malformed_gateway_authority_is_config_error_not_degraded():
         with pytest.raises(_GatewayError) as excinfo:
             client.ensure(
                 employee_id="alice",
-                enterprise_email="alice@keep.com",
+                enterprise_email="alice@example.com",
                 department_alias="FD",
                 reason="missing",
             )
@@ -159,12 +159,12 @@ def test_degraded_run_is_not_marked_enforced(caplog):
     preparer._store = _Store()
     preparer._credentials = _Creds()
     preparer._routing_lock = __import__("threading").Lock()
-    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@keep.com", "")
+    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@example.com", "")
     preparer._payer = lambda *_a, **_k: payer
 
     monkey = pytest.MonkeyPatch()
     monkey.setattr(bi, "_payer_selected", lambda _e: True)
-    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@keep.com", "FD"))
+    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@example.com", "FD"))
     monkey.setattr(bi, "replace", _replace, raising=False)
     try:
         with caplog.at_level(logging.WARNING):
@@ -224,7 +224,7 @@ def test_credential_gone_exhaustion_is_the_degradable_type(tmp_path):
         now_ms=lambda: 1_800_000_000_000,
         probe=lambda _key: None,
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(BillingUnavailable, match="temporarily unavailable"):
         manager.ensure_available(payer, None)
@@ -258,7 +258,7 @@ def test_vault_load_outage_is_the_degradable_type(tmp_path):
         gateway=object(),  # never reached
         model_base_url="https://litellm.example/v1",
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(BillingUnavailable, match="vault is unavailable"):
         manager.ensure_available(payer, None)
@@ -286,7 +286,7 @@ def test_vault_permission_error_stays_rejected_not_degraded(tmp_path):
         gateway=object(),  # never reached
         model_base_url="https://litellm.example/v1",
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(RunRejected) as excinfo:
         manager.ensure_available(payer, None)
@@ -330,7 +330,7 @@ def test_vault_save_outage_is_the_degradable_type(tmp_path):
         now_ms=lambda: 1_800_000_000_000,
         probe=lambda _key: None,
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(BillingUnavailable, match="vault is unavailable"):
         manager.ensure_available(payer, None)
@@ -368,7 +368,7 @@ def test_vault_missing_encryption_key_is_not_degraded(tmp_path, monkeypatch):
         now_ms=lambda: 1_800_000_000_000,
         probe=lambda _key: None,
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(RunRejected) as excinfo:
         manager.ensure_available(payer, None)
@@ -417,7 +417,7 @@ def test_vault_delete_outage_is_the_degradable_type(tmp_path):
         now_ms=lambda: 1_800_000_000_000,
         probe=lambda _key: None,
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(BillingUnavailable, match="vault is unavailable"):
         manager.ensure_available(payer, None)
@@ -456,7 +456,7 @@ def test_profile_drift_after_binding_stays_rejected_not_degraded():
             return BillingIdentity(
                 employee_user_id=employee_id,
                 profile_name="old-profile",
-                email="sunke@keep.com",
+                email="sunke@example.com",
                 litellm_user_id="llm-sunke",
                 team_id="team-fd",
                 migration_state="enforced",
@@ -479,12 +479,12 @@ def test_profile_drift_after_binding_stays_rejected_not_degraded():
     preparer._store = _Store()
     preparer._credentials = _Creds()
     preparer._routing_lock = __import__("threading").Lock()
-    payer = bi._ResolvedPayer("sunke", "new-profile", "sunke@keep.com", "")
+    payer = bi._ResolvedPayer("sunke", "new-profile", "sunke@example.com", "")
     preparer._payer = lambda *_a, **_k: payer
 
     monkey = pytest.MonkeyPatch()
     monkey.setattr(bi, "_payer_selected", lambda _e: True)
-    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@keep.com", "FD"))
+    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@example.com", "FD"))
     try:
         with pytest.raises(RunRejected, match="profile drift") as excinfo:
             preparer.prepare(_Req())
@@ -507,7 +507,7 @@ def test_email_drift_after_binding_stays_rejected_not_degraded():
             return BillingIdentity(
                 employee_user_id=employee_id,
                 profile_name="sunke",
-                email="old@keep.com",
+                email="old@example.com",
                 litellm_user_id="llm-sunke",
                 team_id="team-fd",
                 migration_state="enforced",
@@ -530,12 +530,12 @@ def test_email_drift_after_binding_stays_rejected_not_degraded():
     preparer._store = _Store()
     preparer._credentials = _Creds()
     preparer._routing_lock = __import__("threading").Lock()
-    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@keep.com", "")
+    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@example.com", "")
     preparer._payer = lambda *_a, **_k: payer
 
     monkey = pytest.MonkeyPatch()
     monkey.setattr(bi, "_payer_selected", lambda _e: True)
-    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("new@keep.com", "FD"))
+    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("new@example.com", "FD"))
     try:
         with pytest.raises(RunRejected, match="email drift") as excinfo:
             preparer.prepare(_Req())
@@ -584,12 +584,12 @@ def test_account_identity_drift_from_gateway_stays_rejected_not_degraded(tmp_pat
     existing = BillingIdentity(
         employee_user_id="alice",
         profile_name="alice",
-        email="alice@keep.com",
+        email="alice@example.com",
         litellm_user_id="a-different-litellm-account",
         team_id=issued["team_id"],
         migration_state="enforced",
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(RunRejected, match="LiteLLM identity drift") as excinfo:
         manager.ensure_available(payer, existing)
@@ -626,7 +626,7 @@ def test_vault_key_mismatch_stays_rejected_not_degraded(tmp_path):
         gateway=object(),  # never reached — must fail before touching the gateway
         model_base_url="https://litellm.example/v1",
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(RunRejected) as excinfo:
         manager.ensure_available(payer, None)
@@ -670,12 +670,12 @@ def test_prepare_except_boundary_rejects_plain_consistency_error():
     preparer._store = _Store()
     preparer._credentials = _Creds()
     preparer._routing_lock = __import__("threading").Lock()
-    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@keep.com", "")
+    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@example.com", "")
     preparer._payer = lambda *_a, **_k: payer
 
     monkey = pytest.MonkeyPatch()
     monkey.setattr(bi, "_payer_selected", lambda _e: True)
-    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@keep.com", "FD"))
+    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@example.com", "FD"))
     try:
         with pytest.raises(RunRejected, match="credential drift") as excinfo:
             preparer.prepare(_Req())
@@ -819,7 +819,7 @@ def test_vault_schema_corruption_stays_rejected_not_degraded(tmp_path):
         gateway=object(),  # never reached — must fail before touching the gateway
         model_base_url="https://litellm.example/v1",
     )
-    payer = _ResolvedPayer("alice", "alice", "alice@keep.com", "FD")
+    payer = _ResolvedPayer("alice", "alice", "alice@example.com", "FD")
 
     with pytest.raises(RunRejected) as excinfo:
         manager.ensure_available(payer, None)
@@ -871,7 +871,7 @@ def test_degrade_audit_failure_never_blocks_the_request(capsys):
     preparer._store = _Store()
     preparer._credentials = _Creds()
     preparer._routing_lock = __import__("threading").Lock()
-    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@keep.com", "")
+    payer = bi._ResolvedPayer("sunke", "sunke", "sunke@example.com", "")
     preparer._payer = lambda *_a, **_k: payer
 
     logger = logging.getLogger("hermes_multitenancy.billing_identity")
@@ -880,7 +880,7 @@ def test_degrade_audit_failure_never_blocks_the_request(capsys):
 
     monkey = pytest.MonkeyPatch()
     monkey.setattr(bi, "_payer_selected", lambda _e: True)
-    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@keep.com", "FD"))
+    monkey.setattr(bi, "_employee_org_fields", lambda _e: ("sunke@example.com", "FD"))
     monkey.setattr(bi, "replace", _replace, raising=False)
     try:
         out = preparer.prepare(_Req())  # must not raise
@@ -942,9 +942,9 @@ def test_unverified_account_identity_degrades_the_run_but_stores_nothing(tmp_pat
     from hermes_multitenancy.credentials import CredentialStore
 
     now = 1_800_000_000_000
-    payer = _ResolvedPayer("sunke", "sunke", "sunke@keep.com", "FD")
+    payer = _ResolvedPayer("sunke", "sunke", "sunke@example.com", "FD")
     unverified = IssuedKey(
-        "sunke", "sunke@keep.com", "sk-unverified", "https://llm.example/v1",
+        "sunke", "sunke@example.com", "sk-unverified", "https://llm.example/v1",
         "auto-sunke-20260806-010101-aaaaaa", "FD", now + 30 * 86_400_000,
         "llm-sunke", "team-fd", False,
     )
@@ -963,7 +963,7 @@ def test_unverified_account_identity_degrades_the_run_but_stores_nothing(tmp_pat
 @pytest.mark.parametrize(
     "url,expect_config_error",
     [
-        ("https://hermes.gotokeep.com", False),
+        ("https://hermes.example.com", False),
         ("https://HERMES.GoToKeep.com", False),
         ("https://broker.example:8443/", False),
         ("https://xn--fsq.example", False),        # punycode

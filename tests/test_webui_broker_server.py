@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 async def _read_sse_data_line(response, *, timeout: float = 2.0):
     while True:
@@ -1507,11 +1509,13 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
         def holder():
             with cron_worker._cron_module_patch_lock:
                 held.set()
-                time.sleep(0.4)
+                # 2s(不是 0.4s):给 10ms 采样 sentinel 留 ~200 次机会。满载 CI
+                # runner 上 0.4s 只让它跑了 2 tick,route_ticks >= 5 假红。
+                time.sleep(2.0)
 
         thread = threading.Thread(target=holder, daemon=True)
         thread.start()
-        assert held.wait(timeout=1.0)
+        assert held.wait(timeout=SYNC_TIMEOUT)
         return thread
 
     async def measure_ticks(awaitable_factory):
@@ -1541,7 +1545,7 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
         try:
             _result, direct_ticks = await measure_ticks(call_directly)
         finally:
-            direct_holder.join(timeout=1.0)
+            direct_holder.join(timeout=SYNC_TIMEOUT)
 
         list_jobs_calls: list[tuple[str, bool, int]] = []
         loop_thread = threading.get_ident()
@@ -1576,7 +1580,7 @@ def test_webui_run_broker_job_list_waits_on_cron_patch_lock_off_event_loop(monke
                 )
                 body = await response.json()
             finally:
-                route_holder.join(timeout=1.0)
+                route_holder.join(timeout=SYNC_TIMEOUT)
         finally:
             await client.close()
 
@@ -1635,8 +1639,8 @@ def test_webui_run_broker_flushes_events_before_agent_finishes(monkeypatch, tmp_
                 "session_id": "session-webui",
                 "requires_host_tools": True,
             }))
-            response = await asyncio.wait_for(post_task, timeout=1.0)
-            first_line = await asyncio.wait_for(response.content.readline(), timeout=1.0)
+            response = await asyncio.wait_for(post_task, timeout=SYNC_TIMEOUT)
+            first_line = await asyncio.wait_for(response.content.readline(), timeout=SYNC_TIMEOUT)
             assert b'"kind": "thinking"' in first_line
             assert "正在连接模型".encode("utf-8") in first_line
             release.set()
@@ -1918,7 +1922,7 @@ def test_webui_run_broker_http_client_disconnect_keeps_agent_running(
             response.close()
             client_disconnected.set()
 
-            await asyncio.wait_for(stream_finished.wait(), timeout=1.0)
+            await asyncio.wait_for(stream_finished.wait(), timeout=SYNC_TIMEOUT)
         finally:
             client_disconnected.set()
             if response is not None:
@@ -2251,6 +2255,7 @@ def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
             "Authorization": "Bearer broker-secret",
             "X-Hermes-Profile": "owner",
             "X-Hermes-User-Key": "ou_owner",
+            "X-Hermes-Owner-Open-Id": "ou_owner",
         }
         try:
             created = await client.post("/api/run-broker/jobs", headers=headers, json={
@@ -2289,6 +2294,99 @@ def test_webui_run_broker_jobs_manage_profile_local_cron(monkeypatch, tmp_path):
         assert deleted.status == 200
         assert delete_body == {"ok": True}
         assert store[str(expected_jobs_file)] == []
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_expert_job_is_authoritative_and_idempotent(monkeypatch, tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import expert_overlay, router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    db_path = tmp_path / "routing.db"
+    seeded = RoutingTable(db_path)
+    seeded.upsert(user_id="owner", profile_name="owner", open_id="ou_owner", provenance="sync")
+    seeded.close()
+    router_mod.override_routing_table(db_path)
+    monkeypatch.setattr(expert_overlay, "resolve_caller_departments", lambda *a, **k: ["42"])
+    monkeypatch.setattr(
+        expert_overlay,
+        "resolve_expert",
+        lambda _home, expert_id, **_kwargs: (
+            SimpleNamespace(expert_id="expert-visible")
+            if expert_id == "expert-visible"
+            else None
+        ),
+    )
+
+    async def runner():
+        store = _install_fake_cron(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_MULTITENANCY_RUN_BROKER_KEY", "broker-secret")
+        app = create_run_broker_app(sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        headers = {
+            "Authorization": "Bearer broker-secret",
+            "X-Hermes-Owner-Open-Id": "ou_owner",
+            "X-Hermes-Profile": "owner",
+            "X-Hermes-User-Key": "forged-owner",
+        }
+        payload = {
+            "name": "expert cron",
+            "schedule": "*/5 * * * *",
+            "prompt": "ping",
+            "expert_id": "expert-visible",
+            "idempotency_key": "schedule-session-1",
+            "owner_open_id": "ou_victim",
+            "owner_profile": "victim",
+            "source_app": "cli_forged",
+        }
+        try:
+            first, retry = await asyncio.gather(
+                client.post("/api/run-broker/jobs", headers=headers, json=payload),
+                client.post("/api/run-broker/jobs", headers=headers, json=payload),
+            )
+            first_body, retry_body = await first.json(), await retry.json()
+            rejected = await client.post(
+                "/api/run-broker/jobs",
+                headers=headers,
+                json={**payload, "expert_id": "expert-hidden", "idempotency_key": "hidden"},
+            )
+            rejected_body = await rejected.json()
+            local_delivery = await client.post(
+                "/api/run-broker/jobs",
+                headers=headers,
+                json={**payload, "deliver": "local", "idempotency_key": "local"},
+            )
+            local_delivery_body = await local_delivery.json()
+            changed_delivery = await client.patch(
+                "/api/run-broker/jobs/abc123abc123",
+                headers=headers,
+                json={"deliver": "local"},
+            )
+            changed_delivery_body = await changed_delivery.json()
+        finally:
+            await client.close()
+
+        jobs = next(iter(store.values()))
+        assert first.status == retry.status == 200
+        assert first_body["job"]["id"] == retry_body["job"]["id"]
+        assert len(jobs) == 1
+        assert jobs[0]["owner_open_id"] == "ou_owner"
+        assert jobs[0]["owner_profile"] == "owner"
+        assert jobs[0]["expert_id"] == "expert-visible"
+        assert jobs[0]["create_idempotency_key"] == "schedule-session-1"
+        assert "source_app" not in jobs[0]
+        assert rejected.status == 403
+        assert rejected_body == {"error": "expert not available for this agent"}
+        assert local_delivery.status == 400
+        assert local_delivery_body == {"error": "scheduled expert delivery must use feishu"}
+        assert changed_delivery.status == 400
+        assert changed_delivery_body == {"error": "scheduled expert delivery must use feishu"}
+        assert jobs[0]["deliver"] == "feishu"
 
     asyncio.run(runner())
 
@@ -2333,7 +2431,7 @@ def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path)
     # Owner-scoped resolver verifies the caller owns the requested profile; seed ou_yaojunhua→yaojunhua.
     db_path = tmp_path / "routing.db"
     seeded = RoutingTable(db_path)
-    seeded.upsert(user_id="ou_yaojunhua", profile_name="yaojunhua", open_id="ou_yaojunhua", provenance="sync")
+    seeded.upsert(user_id="yaojunhua", profile_name="yaojunhua", open_id="ou_yaojunhua", provenance="sync")
     seeded.close()
     router_mod.override_routing_table(db_path)
 
@@ -2353,6 +2451,7 @@ def test_webui_run_broker_jobs_default_to_feishu_delivery(monkeypatch, tmp_path)
             "Authorization": "Bearer broker-secret",
             "X-Hermes-Profile": "yaojunhua",
             "X-Hermes-User-Key": "ou_yaojunhua",
+            "X-Hermes-Owner-Open-Id": "ou_yaojunhua",
         }
         try:
             created = await client.post("/api/run-broker/jobs", headers=headers, json={
@@ -2402,6 +2501,7 @@ def test_webui_run_broker_jobs_expose_shadow_plan(monkeypatch, tmp_path):
             "Authorization": "Bearer broker-secret",
             "X-Hermes-Profile": "owner",
             "X-Hermes-User-Key": "ou_owner",
+            "X-Hermes-Owner-Open-Id": "ou_owner",
         }
         try:
             created = await client.post("/api/run-broker/jobs", headers=headers, json={
@@ -5672,3 +5772,4 @@ def test_gitlab_token_endpoint_never_echoes_the_token(monkeypatch):
         assert secret not in text, "响应体里不得出现 token 明文"
 
     _run(runner)
+

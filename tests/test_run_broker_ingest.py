@@ -12,6 +12,8 @@ import logging
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 def _app(
     monkeypatch,
@@ -616,7 +618,7 @@ def test_ingest_sync_concurrent_secret_mismatch_is_rejected_before_shared_billin
             )
         )
         try:
-            await asyncio.wait_for(prepare_started.wait(), timeout=1)
+            await asyncio.wait_for(prepare_started.wait(), timeout=SYNC_TIMEOUT)
             mismatch = await asyncio.wait_for(
                 client.post(
                     "/api/run-broker/ingest",
@@ -632,7 +634,7 @@ def test_ingest_sync_concurrent_secret_mismatch_is_rejected_before_shared_billin
             )
             mismatch_body = await mismatch.json()
             release_prepare.set()
-            first = await asyncio.wait_for(first_task, timeout=1)
+            first = await asyncio.wait_for(first_task, timeout=SYNC_TIMEOUT)
             first_body = await first.json()
             return first.status, first_body, mismatch.status, mismatch_body
         finally:
@@ -1321,7 +1323,7 @@ def test_ingest_sync_timeout_transfers_secret_ownership_and_dedupes_retry(
                 "/api/run-broker/ingest", json=payload, headers=headers
             )
             first_body = await first.json()
-            await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_started.wait(), timeout=SYNC_TIMEOUT)
             secret_dir = Path(captured["secret_dir"])
             retained_after_timeout = secret_dir.is_dir()
 
@@ -1335,7 +1337,7 @@ def test_ingest_sync_timeout_transfers_secret_ownership_and_dedupes_retry(
             retained_after_retry = secret_dir.is_dir()
 
             release_dispatch.set()
-            await asyncio.wait_for(dispatch_finished.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_finished.wait(), timeout=SYNC_TIMEOUT)
             for _ in range(100):
                 if not secret_dir.exists():
                     break
@@ -1472,7 +1474,7 @@ def test_ingest_sync_outer_cancel_after_mark_preserves_secret_until_execution_fi
                     json=payload,
                     headers=headers,
                 )
-            await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_started.wait(), timeout=SYNC_TIMEOUT)
             secret_dir = Path(captured["secret_dir"])
             retained_after_cancel = secret_dir.is_dir()
 
@@ -1487,7 +1489,7 @@ def test_ingest_sync_outer_cancel_after_mark_preserves_secret_until_execution_fi
             retry_body = await retry.json()
 
             release_dispatch.set()
-            await asyncio.wait_for(dispatch_finished.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_finished.wait(), timeout=SYNC_TIMEOUT)
             for _ in range(100):
                 if not secret_dir.exists():
                     break
@@ -1614,7 +1616,7 @@ def test_ingest_sync_stable_task_failure_before_first_step_is_fresh_retry(
                 headers=headers,
             )
             failed_body = await failed.json()
-            await asyncio.wait_for(cleanup_done.wait(), timeout=1)
+            await asyncio.wait_for(cleanup_done.wait(), timeout=SYNC_TIMEOUT)
             retry = await client.post(
                 "/api/run-broker/ingest",
                 json={
@@ -1933,9 +1935,9 @@ def test_ingest_sync_interactive_outer_cancel_keeps_claim_until_waiter_stops(
             )
         )
         try:
-            await asyncio.wait_for(prepare_started.wait(), timeout=1)
+            await asyncio.wait_for(prepare_started.wait(), timeout=SYNC_TIMEOUT)
             outer_handler["task"].cancel()
-            await asyncio.wait_for(prepare_cancelled.wait(), timeout=1)
+            await asyncio.wait_for(prepare_cancelled.wait(), timeout=SYNC_TIMEOUT)
 
             mismatch = await asyncio.wait_for(
                 client.post(
@@ -2089,7 +2091,7 @@ def test_ingest_sync_pre_admission_timeout_keeps_claim_until_shared_task_stops(
             )
             timed_out_body = await timed_out.json()
             monkeypatch.setenv("HERMES_INGEST_TIMEOUT", "60")
-            await asyncio.wait_for(prepare_cancelled.wait(), timeout=1)
+            await asyncio.wait_for(prepare_cancelled.wait(), timeout=SYNC_TIMEOUT)
 
             mismatch = await client.post(
                 "/api/run-broker/ingest",
@@ -2102,7 +2104,7 @@ def test_ingest_sync_pre_admission_timeout_keeps_claim_until_shared_task_stops(
             mismatch_body = await mismatch.json()
 
             release_cancel_cleanup.set()
-            await asyncio.wait_for(prepare_exited.wait(), timeout=1)
+            await asyncio.wait_for(prepare_exited.wait(), timeout=SYNC_TIMEOUT)
             for _ in range(10):
                 await asyncio.sleep(0)
 
@@ -2623,7 +2625,7 @@ def test_ingest_async_running_task_cancel_is_terminal_and_reclaims_capacity(
                 headers=headers,
             )
             first_body = await first.json()
-            await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_started.wait(), timeout=SYNC_TIMEOUT)
             assert job_tasks
             job_tasks[0].cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -2849,7 +2851,7 @@ def test_ingest_async_outer_cancel_after_mark_preserves_handed_off_secrets(
                     headers=headers,
                 )
 
-            await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_started.wait(), timeout=SYNC_TIMEOUT)
             retained_while_running = Path(captured["secret_dir"]).is_dir()
 
             retry = await client.post(
@@ -3002,7 +3004,7 @@ def test_ingest_async_pre_mark_leader_cancel_with_live_peer_uses_one_owned_secre
                     headers=headers,
                 )
             )
-            await asyncio.wait_for(prepare_started.wait(), timeout=1)
+            await asyncio.wait_for(prepare_started.wait(), timeout=SYNC_TIMEOUT)
             peer_request = asyncio.create_task(
                 client.post(
                     "/api/run-broker/ingest/async",
@@ -3031,7 +3033,7 @@ def test_ingest_async_pre_mark_leader_cancel_with_live_peer_uses_one_owned_secre
             release_prepare.set()
             peer = await peer_request
             peer_body = await peer.json()
-            await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+            await asyncio.wait_for(dispatch_started.wait(), timeout=SYNC_TIMEOUT)
 
             retry = await client.post(
                 "/api/run-broker/ingest/async",
@@ -3147,7 +3149,7 @@ def test_ingest_async_concurrent_secret_mismatch_is_rejected_before_shared_billi
                     headers=headers,
                 )
             )
-            await asyncio.wait_for(prepare_started.wait(), timeout=1)
+            await asyncio.wait_for(prepare_started.wait(), timeout=SYNC_TIMEOUT)
             second = await client.post(
                 "/api/run-broker/ingest/async",
                 json=second_payload,
@@ -3308,7 +3310,7 @@ def test_ingest_async_abandoned_claim_does_not_release_same_fingerprint_successo
                     headers=headers,
                 )
             )
-            await asyncio.wait_for(first_prepare_started.wait(), timeout=1)
+            await asyncio.wait_for(first_prepare_started.wait(), timeout=SYNC_TIMEOUT)
 
             successor_request = asyncio.create_task(
                 client.post(
@@ -3317,15 +3319,15 @@ def test_ingest_async_abandoned_claim_does_not_release_same_fingerprint_successo
                     headers=headers,
                 )
             )
-            await asyncio.wait_for(second_before_broker.wait(), timeout=1)
+            await asyncio.wait_for(second_before_broker.wait(), timeout=SYNC_TIMEOUT)
 
             handler_tasks[0].cancel()
             with pytest.raises((ServerDisconnectedError, ClientConnectionError)):
                 await first_request
-            await asyncio.wait_for(first_prepare_cancelled.wait(), timeout=1)
+            await asyncio.wait_for(first_prepare_cancelled.wait(), timeout=SYNC_TIMEOUT)
 
             release_second_broker.set()
-            await asyncio.wait_for(second_prepare_started.wait(), timeout=1)
+            await asyncio.wait_for(second_prepare_started.wait(), timeout=SYNC_TIMEOUT)
             assert materialize_calls == 0
 
             mismatch = await asyncio.wait_for(

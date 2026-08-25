@@ -17,6 +17,8 @@ import yaml
 
 from hermes_multitenancy import plugin_ingest as pi
 
+from tests._sync import SYNC_TIMEOUT
+
 
 # ─────────────────────────── fixtures ────────────────────────────────────
 
@@ -323,13 +325,13 @@ def test_concurrent_reingests_serialize_activation_and_failed_mutation(tmp_path,
         result = original_assert(plugin, *args)
         if Path(plugin["_repo"]) == valid_repo:
             first_paused.set()
-            assert release_first.wait(2)
+            assert release_first.wait(SYNC_TIMEOUT)
         return result
 
     def pause_second(plugin, *args, **kwargs):
         if Path(plugin["_repo"]) == invalid_repo:
             second_mutating.set()
-            assert release_second.wait(2)
+            assert release_second.wait(SYNC_TIMEOUT)
         return original_install(plugin, *args, **kwargs)
 
     monkeypatch.setattr(pi, "assert_profile_governance", pause_first)
@@ -345,13 +347,13 @@ def test_concurrent_reingests_serialize_activation_and_failed_mutation(tmp_path,
     first = threading.Thread(target=run, args=(valid_repo,))
     second = threading.Thread(target=run, args=(invalid_repo,))
     first.start()
-    assert first_paused.wait(2)
+    assert first_paused.wait(SYNC_TIMEOUT)
     assert json.loads(managed_path.read_text(encoding="utf-8"))["status"] == "active"
     second.start()
     assert not second_mutating.wait(0.1)
     release_first.set()
-    first.join(2)
-    second.join(2)
+    first.join(SYNC_TIMEOUT)
+    second.join(SYNC_TIMEOUT)
 
     assert not first.is_alive() and not second.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], pi.PluginIngestError)
@@ -394,7 +396,7 @@ def test_different_plugin_rollback_cannot_clobber_concurrent_commit(tmp_path, mo
         result = original_assert(plugin, *args)
         if Path(plugin["_repo"]) == upgraded_a:
             a_paused.set()
-            assert release_a.wait(2)
+            assert release_a.wait(SYNC_TIMEOUT)
             raise pi.PluginIngestError("forced plugin-a rollback")
         return result
 
@@ -417,12 +419,12 @@ def test_different_plugin_rollback_cannot_clobber_concurrent_commit(tmp_path, mo
     thread_a = threading.Thread(target=run, args=("a", upgraded_a))
     thread_b = threading.Thread(target=run, args=("b", upgraded_b))
     thread_a.start()
-    assert a_paused.wait(2)
+    assert a_paused.wait(SYNC_TIMEOUT)
     thread_b.start()
     assert not b_mutating.wait(0.1)
     release_a.set()
-    thread_a.join(2)
-    thread_b.join(2)
+    thread_a.join(SYNC_TIMEOUT)
+    thread_b.join(SYNC_TIMEOUT)
 
     assert not thread_a.is_alive() and not thread_b.is_alive()
     assert isinstance(outcomes["a"], pi.PluginIngestError)
@@ -1052,7 +1054,7 @@ def test_standalone_install_blocks_until_plugin_transaction_completes(tmp_path, 
 
     def pause(*args, **kwargs):
         paused.set()
-        assert release_evt.wait(5)
+        assert release_evt.wait(SYNC_TIMEOUT)
         return real(*args, **kwargs)
 
     monkeypatch.setattr(pi, "_install_skills_to_profile", pause)
@@ -1077,14 +1079,14 @@ def test_standalone_install_blocks_until_plugin_transaction_completes(tmp_path, 
 
     a = threading.Thread(target=run_plugin)
     a.start()
-    assert paused.wait(5)
+    assert paused.wait(SYNC_TIMEOUT)
     b = threading.Thread(target=run_standalone)
     b.start()
     b.join(0.3)
     assert b.is_alive()  # blocked behind the in-flight plugin transaction
     release_evt.set()
-    a.join(10)
-    b.join(10)
+    a.join(SYNC_TIMEOUT)
+    b.join(SYNC_TIMEOUT)
     assert not a.is_alive() and not b.is_alive()
     assert results["standalone"]["status"] == "skipped-plugin-owned"
 
@@ -1130,7 +1132,7 @@ def test_standalone_install_blocks_during_first_plugin_ingest(tmp_path, monkeypa
 
     def pause(*args, **kwargs):
         paused.set()
-        assert release_evt.wait(5)
+        assert release_evt.wait(SYNC_TIMEOUT)
         return real(*args, **kwargs)
 
     monkeypatch.setattr(pi, "_install_skills_to_profile", pause)
@@ -1155,13 +1157,13 @@ def test_standalone_install_blocks_during_first_plugin_ingest(tmp_path, monkeypa
 
     a = threading.Thread(target=run_first_ingest)
     a.start()
-    assert paused.wait(5)
+    assert paused.wait(SYNC_TIMEOUT)
     b = threading.Thread(target=run_standalone)
     b.start()
     b.join(0.3)
     assert b.is_alive()  # blocked behind the first-install transaction
     release_evt.set()
-    a.join(10)
-    b.join(10)
+    a.join(SYNC_TIMEOUT)
+    b.join(SYNC_TIMEOUT)
     assert not a.is_alive() and not b.is_alive()
     assert results["standalone"]["status"] == "skipped-plugin-owned"

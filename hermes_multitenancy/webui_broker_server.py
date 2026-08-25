@@ -36,6 +36,7 @@ from .credential_broker import (
 from .run_broker import RunBroker, RunRejected
 from .run_models import RunEvent, RunRequest, RunResult, resolve_profile_workspace
 from .security_audit import append_security_event
+from .source_authorization import authorize_private_source_refs
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +343,32 @@ def create_run_broker_app(
             return web.json_response({"error": str(exc)}, status=400)
 
         return await _stream_run_request(request, run_request, stash_payload=payload)
+
+    async def handle_source_refs_authorize(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid request"}, status=400)
+        profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None or not profile_name:
+            return web.json_response({"error": "source authorization unavailable"}, status=403)
+        owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        refs = payload.get("refs")
+        if not owner or not isinstance(refs, list):
+            return web.json_response({"error": "owner identity and refs are required"}, status=403)
+        try:
+            authorized = await asyncio.to_thread(
+                authorize_private_source_refs,
+                _profile_home_for_name(profile_name),
+                owner,
+                refs,
+            )
+        except Exception:
+            logger.warning("[multitenancy] private source authorization unavailable")
+            authorized = []
+        return web.json_response({"refs": authorized})
 
     async def handle_credential_replay(request):
         """Re-run a request that failed on expired lark-cli credentials.
@@ -2261,8 +2288,14 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             payload = await request.json()
-            profile_name, user_key = _owner_scoped_tenant(request, payload)
-            job = await asyncio.to_thread(cron_api.create_job, profile_name, user_key, payload)
+            # One resolution: authorization and executor identity come from the
+            # same routing snapshot (codex review: agent-derivation-fails-open).
+            profile_name, user_key, agent_id = _owner_scoped_tenant_resolved(
+                request, payload, require_write=True
+            )
+            job = await asyncio.to_thread(
+                cron_api.create_job, profile_name, user_key, payload, agent_id=agent_id
+            )
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
@@ -2316,7 +2349,7 @@ def create_run_broker_app(
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             payload = await request.json()
-            profile_name, _user_key = _owner_scoped_tenant(request, payload)
+            profile_name, _user_key = _owner_scoped_tenant(request, payload, require_write=True)
             job = await asyncio.to_thread(
                 cron_api.update_job,
                 profile_name,
@@ -2336,7 +2369,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _owner_scoped_tenant(request)
+            profile_name, _user_key = _owner_scoped_tenant(request, require_write=True)
             await asyncio.to_thread(cron_api.delete_job, profile_name, request.match_info["job_id"])
             return web.json_response({"ok": True})
         except cron_api.CronApiError as exc:
@@ -2351,7 +2384,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _owner_scoped_tenant(request)
+            profile_name, _user_key = _owner_scoped_tenant(request, require_write=True)
             job = await asyncio.to_thread(cron_api.pause_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
@@ -2366,7 +2399,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _owner_scoped_tenant(request)
+            profile_name, _user_key = _owner_scoped_tenant(request, require_write=True)
             job = await asyncio.to_thread(cron_api.resume_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job})
         except cron_api.CronApiError as exc:
@@ -2381,7 +2414,7 @@ def create_run_broker_app(
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
-            profile_name, _user_key = _owner_scoped_tenant(request)
+            profile_name, _user_key = _owner_scoped_tenant(request, require_write=True)
             job = await asyncio.to_thread(cron_api.trigger_job, profile_name, request.match_info["job_id"])
             return web.json_response({"job": job, "queued": True})
         except cron_api.CronApiError as exc:
@@ -2610,6 +2643,13 @@ def create_run_broker_app(
         无法影响身份解析。BFF 侧已经把客户端可能塞的 profile_name/open_id 全丢掉了，
         这里再从 body 取等于把刚建立的边界拆掉。
 
+        ``X-Hermes-Profile`` 是唯一的例外，而且只是**目标提示**不是身份：当它指向一个
+        群 profile 且断言的 owner 正是该群路由行的 owner_open_id（群主）时，token 绑到
+        群 profile —— 群 agent 由此获得自己的 GitLab 凭据。其余一切情况（无头、
+        个人 profile、非群主、行不存在/失活）都保持原行为：落提交者个人 profile。
+        判权完全在本函数（BFF 只转发），失败面 fail-closed 回落个人而非报错，
+        并在回执里说明实际落点，绝不静默错位。
+
         校验逻辑全在 ``gitlab_token_intake.submit_personal_token``（档位与实际 scope
         双向核验、到期日必填、命名核对），本函数只负责鉴权、解析身份、映射错误。
 
@@ -2633,6 +2673,35 @@ def create_run_broker_app(
                 "error": "无法确认你的身份，请重新登录后再试。"
             }, status=403)
 
+        # 群主为群 profile 绑定（group-agent-gitlab-binding）：X-Hermes-Profile 只是
+        # 目标提示，判权在这里 —— 行必须是 active 的群行且 owner 正是断言的 owner。
+        target_profile = str(resolved_profile_name)
+        profile_scope = "personal"
+        scope_note = ""
+        requested_profile = str(request.headers.get("X-Hermes-Profile", "") or "").strip()
+        if requested_profile and requested_profile != target_profile:
+            group_row = None
+            try:
+                from . import router as router_mod
+
+                table = router_mod._get_routing_table()
+                if table is not None:
+                    group_row = table.lookup_by_profile_name(requested_profile)
+            except Exception:
+                group_row = None
+            if (
+                group_row is not None
+                and group_row.active
+                and group_row.kind == "group"
+                and str(group_row.owner_open_id or "") == trusted_owner
+            ):
+                target_profile = requested_profile
+                profile_scope = "group"
+                scope_note = "已绑定到本群：本群所有会话都会使用此 token。"
+            elif group_row is not None and group_row.kind == "group":
+                # 非群主（或行失活）：不报错，按原契约落个人，但把落点说清楚。
+                scope_note = "只有群主能为本群绑定，已绑定到你的个人身份。"
+
         try:
             from .gitlab_token_intake import TokenRejected, submit_personal_token
         except Exception:  # pragma: no cover - import wiring
@@ -2640,12 +2709,14 @@ def create_run_broker_app(
 
         try:
             result = submit_personal_token(
-                profile_name=str(resolved_profile_name),
+                profile_name=target_profile,
                 token=str(payload.get("token") or ""),
                 # 到期日不从请求体取：由 intake 从 GitLab 的 token 行直接读。
                 # 老客户端可能仍在 payload 里带 expires_on，这里静默忽略。
                 tier=str(payload.get("tier") or ""),
                 shared_home=_shared_home_from_env(),
+                # 群 profile 绑定的第二道 owner 证明（intake 侧纵深防御）。
+                group_owner_open_id=trusted_owner if profile_scope == "group" else None,
             )
         except TokenRejected as exc:
             # 员工可自行修正的输入问题 —— 必须把可读理由原样回去，否则他只会看到
@@ -2657,13 +2728,17 @@ def create_run_broker_app(
             return web.json_response({"error": "保存失败，请稍后重试。"}, status=500)
 
         # 回执只带非敏感字段，绝不回 token 本身。
-        return web.json_response({
+        body = {
             "ok": True,
             "stored": bool(result.get("stored")),
             "expires_at": result.get("expires_at"),
             "tier": result.get("tier"),
             "scopes": result.get("scopes") or [],
-        })
+            "profile_scope": profile_scope,
+        }
+        if scope_note:
+            body["note"] = scope_note
+        return web.json_response(body)
 
     async def handle_credential_lease(request):
         header = request.headers.get("Authorization", "")
@@ -3298,6 +3373,7 @@ def create_run_broker_app(
     app.router.add_get("/api/run-broker/health", handle_health)
     app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
+    app.router.add_post("/api/run-broker/source-refs/authorize", handle_source_refs_authorize)
     app.router.add_post(
         "/api/run-broker/credentials/replay/{signal_run_id}", handle_credential_replay
     )

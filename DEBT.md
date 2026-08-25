@@ -11,7 +11,7 @@
 ## 2026-07-30 mt-transient-replay-retry-silence · 部署重启伤亡三条残留(SPEC 明确 out of scope,待 sunke 拍板)
 
 背景:2026-07-30 17:04:24 / 17:05:47 两次 gateway 重启(另一会话部署 mt,prod reflog 17:05:41 pull 到 2603f40),
-in-flight run 随进程组一起吃 SIGTERM。qiaojunlong 那轮 `saw_done=False`、elapsed 34.245s 被打断。
+in-flight run 随进程组一起吃 SIGTERM。wangwu 那轮 `saw_done=False`、elapsed 34.245s 被打断。
 本 slug 只修了"错误文案撒谎"(信号死不再拼陈旧 stderr 尾巴),下列三条**没修**:
 
 **D1 — 无 graceful drain / 在途 run 不会自动重发(需产品拍板)**
@@ -114,10 +114,10 @@ CI（`.gitlab-ci.yml`）首次真跑全量测试时暴露的，逐条记账。�
 ### D1 — 脚本里硬编码开发机绝对路径（**CI 抓出来的真缺陷**，优先级最高）
 
 - `scripts/lark_cli_matrix_runner.mjs:18`
-  `import { io } from '/Users/kite/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
-  另有 4 处 `/Users/kite/.hermes/...`（第 138、158、388、393 行）
+  `import { io } from '/Users/dev/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
+  另有 4 处 `/Users/dev/.hermes/...`（第 138、158、388、393 行）
 - `scripts/feishu_file_media_matrix_runner.py:27`
-  `SHARED_HOME = Path("/Users/kite/.hermes")`，第 387 行 `"/Users/kite/.hermes/profiles" in text`
+  `SHARED_HOME = Path("/Users/dev/.hermes")`，第 387 行 `"/Users/dev/.hermes/profiles" in text`
 
 后果：这 17 条测试**只在 sunke 那台 Mac 上能过**，生产机和任何新同事的机器都会失败
 （容器里直接 `PermissionError: '/Users'`）。这违反 CLAUDE.md 的「Never hardcode paths」。
@@ -488,3 +488,9 @@ dispatcher 现在对每个**已识别**动作（built-in + 注册的 business；
 放行但仍然消费。跨重启的持久 at-most-once 归 WP09 的 inbound/effect ledger；
 今天真正拦住「重复点击重复写后端」的仍是各功能自己的幂等
 （push-confirm 的 CAS + `write_idempotency_key`、WP01 的 per-ticket `_claim_once`）。
+
+## lark-cli auth broker: GC-at-loop-shutdown 时 warm worker 可能未被杀
+- 来源：slug `lark-cli-broker-run-ownership` 的 Fable review（2026-08-20），条件 3 的未覆盖分支。
+- 触发面：**仅**事件循环关停时 `_stream_aiagent_subprocess` 的 finally 里那个 await 可能不被驱动，warm worker 未 discard；进程随即退出。
+- 实际风险：**残留子进程**，不是 broker 泄漏（broker 随进程消亡）。
+- 未做原因：用 GC 时机做断言不稳，写不出可靠的红绿测试。要做就得把 kill 改成同步操作或加进程级收割。

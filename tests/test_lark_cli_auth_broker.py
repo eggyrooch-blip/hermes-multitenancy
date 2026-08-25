@@ -1377,3 +1377,41 @@ def test_localhost_server_strips_hop_by_hop_response_headers(monkeypatch, tmp_pa
     assert response_headers["content-length"] == str(len(body))
     assert "transfer-encoding" not in response_headers
     assert response_headers.get("connection") != "keep-alive"
+
+
+def test_running_auth_broker_close_is_idempotent_and_window_ends_with_close():
+    """Double close must not raise, and the port must be dead afterwards.
+
+    The owning scope can be exited more than once during teardown; a raise
+    there would abort the rest of the cleanup. Equally important: once closed,
+    the turn's frozen identity must no longer be reachable, so a leftover URL
+    has to be refused rather than served.
+    """
+    import socket
+    import urllib.parse
+
+    from hermes_multitenancy.lark_cli_auth_broker import (
+        LarkCliAuthBrokerContext,
+        start_lark_cli_auth_broker_server,
+    )
+
+    server = start_lark_cli_auth_broker_server(
+        LarkCliAuthBrokerContext(
+            shared_home=Path("/nonexistent-shared-home"),
+            profile_name="idempotent-close",
+            user_open_id="ou_test",
+            hmac_key="k" * 32,
+        )
+    )
+    parsed = urllib.parse.urlsplit(server.url)
+    assert server.closed is False
+
+    server.close()
+    assert server.closed is True
+    server.close()  # must not raise
+    assert server.closed is True
+
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        with pytest.raises(OSError):
+            probe.connect((parsed.hostname, parsed.port))

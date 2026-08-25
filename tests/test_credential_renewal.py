@@ -17,6 +17,8 @@ from typing import Any
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 from hermes_multitenancy import (
     credential_audit,
     credential_renewal_common as common,
@@ -477,7 +479,7 @@ def test_authoritative_refresh_failure_cannot_refreeze_concurrent_reauthorizatio
         refresh_calls.append(kwargs)
         if len(refresh_calls) == 1:
             refresh_started.set()
-            assert release_old_refresh.wait(timeout=3)
+            assert release_old_refresh.wait(timeout=SYNC_TIMEOUT)
             raise fua.FeishuUatAuthError(
                 "Feishu rejected the old refresh token",
                 status=401,
@@ -520,18 +522,18 @@ def test_authoritative_refresh_failure_cannot_refreeze_concurrent_reauthorizatio
 
     renewal_thread = threading.Thread(target=run_tick)
     renewal_thread.start()
-    assert refresh_started.wait(timeout=3)
+    assert refresh_started.wait(timeout=SYNC_TIMEOUT)
 
     store_thread = threading.Thread(target=store_fresh_uat)
     store_thread.start()
-    assert store_entered.wait(timeout=1)
+    assert store_entered.wait(timeout=SYNC_TIMEOUT)
     try:
         assert not store_finished.wait(timeout=0.1)
     finally:
         release_old_refresh.set()
 
-    renewal_thread.join(timeout=3)
-    store_thread.join(timeout=3)
+    renewal_thread.join(timeout=SYNC_TIMEOUT)
+    store_thread.join(timeout=SYNC_TIMEOUT)
     assert not renewal_thread.is_alive()
     assert not store_thread.is_alive()
     assert thread_errors == []
@@ -602,6 +604,7 @@ def test_identity_lock_blocks_another_process_for_same_identity(tmp_path: Path):
     held_path = tmp_path / "child-held"
     release_path = tmp_path / "release-child"
     child_code = """
+import os
 import sys
 import time
 from pathlib import Path
@@ -612,7 +615,7 @@ held_path = Path(sys.argv[2])
 release_path = Path(sys.argv[3])
 with credential_identity_lock(shared_home, sys.argv[4], sys.argv[5]):
     held_path.write_text("held", encoding="utf-8")
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + float(os.environ.get("HERMES_TEST_SYNC_TIMEOUT", "30"))
     while not release_path.exists():
         if time.monotonic() >= deadline:
             raise TimeoutError("parent did not release child lock")
@@ -647,7 +650,7 @@ with credential_identity_lock(shared_home, sys.argv[4], sys.argv[5]):
 
     parent_thread: threading.Thread | None = None
     try:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + SYNC_TIMEOUT
         while not held_path.exists():
             if child.poll() is not None:
                 _stdout, stderr = child.communicate()
@@ -671,11 +674,11 @@ with credential_identity_lock(shared_home, sys.argv[4], sys.argv[5]):
         parent_thread.start()
         assert not acquired.wait(timeout=0.1)
         release_path.write_text("release", encoding="utf-8")
-        assert acquired.wait(timeout=3)
-        parent_thread.join(timeout=3)
+        assert acquired.wait(timeout=SYNC_TIMEOUT)
+        parent_thread.join(timeout=SYNC_TIMEOUT)
         assert not parent_thread.is_alive()
         assert parent_errors == []
-        _stdout, stderr = child.communicate(timeout=3)
+        _stdout, stderr = child.communicate(timeout=SYNC_TIMEOUT)
         assert child.returncode == 0, stderr
         lock_files = list(
             (tmp_path / "profiles" / profile_name / "feishu_uat").glob(".*.renewal.lock")
@@ -843,10 +846,10 @@ def test_l5_marker_writer_skips_busy_identity_without_blocking_startup(tmp_path:
     with common.credential_identity_lock(tmp_path, profile_name, open_id):
         worker = threading.Thread(target=write_marker)
         worker.start()
-        assert started.wait(timeout=2)
-        assert finished.wait(timeout=1)
+        assert started.wait(timeout=SYNC_TIMEOUT)
+        assert finished.wait(timeout=SYNC_TIMEOUT)
 
-    worker.join(timeout=2)
+    worker.join(timeout=SYNC_TIMEOUT)
     assert not worker.is_alive()
     assert finished.is_set()
     assert not (marker_dir / f"{open_id}.needs_reauth").exists()
@@ -1303,7 +1306,7 @@ def test_recovery_rechecks_marker_after_identity_locked_writer_swap(tmp_path: Pa
     with common.credential_identity_lock(tmp_path, profile_name, open_id):
         worker = threading.Thread(target=recover)
         worker.start()
-        assert started.wait(timeout=2)
+        assert started.wait(timeout=SYNC_TIMEOUT)
         assert not finished.wait(timeout=0.1)
         common.write_needs_reauth_marker(
             marker,
@@ -1318,7 +1321,7 @@ def test_recovery_rechecks_marker_after_identity_locked_writer_swap(tmp_path: Pa
         future = time.time() + 1
         os.utime(marker, (future, future))
 
-    worker.join(timeout=2)
+    worker.join(timeout=SYNC_TIMEOUT)
     assert not worker.is_alive()
     assert errors == []
     assert results == [False]

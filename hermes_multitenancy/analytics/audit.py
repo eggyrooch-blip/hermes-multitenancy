@@ -204,7 +204,7 @@ def _terminal_themes(command: str) -> set[str]:
         "http/curl": ("curl", "http://", "https://"),
         "file ops": ("ls ", "cat ", "find ", "sed ", "awk ", "cp ", "mv ", "tar "),
         "git/deploy": ("git ", "systemctl", "journalctl", "pytest", "make test"),
-        "keep/internal api": ("kep", "keep", "gotokeep", "proxy.cms", "euler", "ark.gotokeep"),
+        "keep/internal api": ("kep", "keep", "example", "proxy.cms", "euler", "ark.example"),
     }
     for name, needles in checks.items():
         if any(needle in text for needle in needles):

@@ -19,18 +19,18 @@
 | lark-cli | `lark-cli`,`larksuite`,`open.feishu.cn`,`feishu.cn/(docx\|docs\|sheets\|wiki\|base\|minutes\|file)`,`wiki:wiki:readonly`,`(feishu\|lark\|larksuite)…(docx…)`,reverse,`(im:message\|contact:user\|drive:drive\|wiki:wiki)` | identical | ✅ MATCH |
 | feishu-project | `meegle`,`meego`,`feishu-project`,`project.feishu.cn`,`飞书项目` | identical | ✅ MATCH |
 | keep-record | `keep-record`,`keep_auth_token`,`get_qrcode`,`persist_auth` | identical | ✅ MATCH |
-| kep-cli | `kep-cli`,`kep-auth`,`aidock`,`skillhub`,`keep-login`,`proxy-cms`,`skill/zipfile`,`kep_profile`,`kep_no_auto_login` + `HERMES_MT_KEP_DOMAINS` patterns; hubSourced short-circuit | same base + **hardcoded** `proxy.cms.(pre.)?gotokeep.com`, `ark.gotokeep.com/aidock-cms`, **`bearer\s+token.*gotokeep`**; hubSourced short-circuit | ⚠️ DIFF — see D1, D2 |
-| gitlab | `gitlab_token`,`oauth2:${gitlab_token}@` + `HERMES_MT_GITLAB_DOMAINS` patterns | same + **hardcoded** `gitlab.gotokeep.com` | ⚠️ DIFF — see D2 |
+| kep-cli | `kep-cli`,`kep-auth`,`aidock`,`skillhub`,`keep-login`,`proxy-cms`,`skill/zipfile`,`kep_profile`,`kep_no_auto_login` + `HERMES_MT_KEP_DOMAINS` patterns; hubSourced short-circuit | same base + **hardcoded** `proxy.cms.(pre.)?example.com`, `ark.example.com/aidock-cms`, **`bearer\s+token.*example`**; hubSourced short-circuit | ⚠️ DIFF — see D1, D2 |
+| gitlab | `gitlab_token`,`oauth2:${gitlab_token}@` + `HERMES_MT_GITLAB_DOMAINS` patterns | same + **hardcoded** `gitlab.example.com` | ⚠️ DIFF — see D2 |
 
 ## Deltas + decisions
 
-### D1 — TS-only pattern `bearer\s+token.*gotokeep` (kep-cli)
-- **What**: TS flags a skill needing kep-cli if its text matches `bearer token … gotokeep`. Python has no equivalent.
-- **Risk**: LOW. Real kep skills also match `kep-cli`/`kep-auth`/`aidock`/`skillhub`/`proxy-cms` or are SkillHub-sourced (hubSourced short-circuit), all of which Python already catches. A skill that mentions only "bearer token … gotokeep" and none of those is unlikely.
-- **Decision**: TS behavior is the *correct, broader* one. It is internal-domain-coupled (`gotokeep`), so it must NOT be hardcoded into the public-repo Python source. **Convergence plan (Phase 1.5/2)**: add a configurable `bearer\s+token.*<domain>` pattern to `connectors.requirements`, parameterized by `HERMES_MT_KEP_DOMAINS`, and move it into the registry fixture BEFORE the WebUI switches to the registry. Until then, Python detection is unchanged and the delta is documented, not silently dropped.
+### D1 — TS-only pattern `bearer\s+token.*example` (kep-cli)
+- **What**: TS flags a skill needing kep-cli if its text matches `bearer token … example`. Python has no equivalent.
+- **Risk**: LOW. Real kep skills also match `kep-cli`/`kep-auth`/`aidock`/`skillhub`/`proxy-cms` or are SkillHub-sourced (hubSourced short-circuit), all of which Python already catches. A skill that mentions only "bearer token … example" and none of those is unlikely.
+- **Decision**: TS behavior is the *correct, broader* one. It is internal-domain-coupled (`example`), so it must NOT be hardcoded into the public-repo Python source. **Convergence plan (Phase 1.5/2)**: add a configurable `bearer\s+token.*<domain>` pattern to `connectors.requirements`, parameterized by `HERMES_MT_KEP_DOMAINS`, and move it into the registry fixture BEFORE the WebUI switches to the registry. Until then, Python detection is unchanged and the delta is documented, not silently dropped.
 
-### D2 — Hardcoded `*.gotokeep.com` domains (kep-cli + gitlab)
-- **What**: TS hardcodes `proxy.cms.(pre.)?gotokeep.com`, `ark.gotokeep.com/aidock-cms`, `gitlab.gotokeep.com`. Python externalized these to `HERMES_MT_KEP_DOMAINS` / `HERMES_MT_GITLAB_DOMAINS` (the 2026-06-09 public-repo privacy scrub).
+### D2 — Hardcoded `*.example.com` domains (kep-cli + gitlab)
+- **What**: TS hardcodes `proxy.cms.(pre.)?example.com`, `ark.example.com/aidock-cms`, `gitlab.example.com`. Python externalized these to `HERMES_MT_KEP_DOMAINS` / `HERMES_MT_GITLAB_DOMAINS` (the 2026-06-09 public-repo privacy scrub).
 - **Risk**: NONE when the env vars are set; the matched set is then equal. If the env vars are MISSING on a deployment, Python under-detects vs TS.
 - **Decision**: This is an INTENTIONAL divergence (scrub), not a bug. Per memory, `HERMES_MT_*_DOMAINS` were written to prod `.env`. **Gate before Phase 2 flips WebUI traffic to the registry**: verify on prod-hermes (`hermes-1`) that `HERMES_MT_KEP_DOMAINS` and `HERMES_MT_GITLAB_DOMAINS` are present in the run-broker env; if absent, the registry would under-detect relative to today's WebUI. Documented here as a hard pre-Phase-2 check.
 

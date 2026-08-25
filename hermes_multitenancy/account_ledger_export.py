@@ -35,7 +35,7 @@ _MAX_DATABASE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_HTTP_BYTES = 20 * 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 16 * 1024
 _UNBOUND_PROFILE = "__unbound__"
-_LITELLM_HOST = "litellm.sre.gotokeep.com"
+_LITELLM_HOST = "litellm.sre.example.com"
 _LITELLM_ORIGIN = f"https://{_LITELLM_HOST}"
 
 

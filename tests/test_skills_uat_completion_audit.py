@@ -35,7 +35,7 @@ def _write_second_problem_trace(path: Path, *, exact_found: bool = False) -> Non
             "exact_match_count": 1 if exact_found else 0,
             "exact_issue_text_absent_reason": "" if exact_found else "exact_phrase_not_found",
             "searched_files": 42,
-            "searched_roots": [str(ROOT), "/Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"],
+            "searched_roots": [str(ROOT), "/Users/dev/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"],
             "referenced_artifacts": [
                 {"label": "Image #1", "content_available": False, "evidence_path": ""},
                 {"label": "Image #2", "content_available": False, "evidence_path": ""},
@@ -65,7 +65,7 @@ def _write_second_problem_trace_with_available_artifact(
             "exact_match_count": 1 if exact_found else 0,
             "exact_issue_text_absent_reason": "" if exact_found else "phrase_present_but_only_placeholder_followup",
             "searched_files": 42,
-            "searched_roots": [str(ROOT), "/Users/kite/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"],
+            "searched_roots": [str(ROOT), "/Users/dev/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain/hermes"],
             "exact_matches": [
                 {
                     "path": str(path / "Image #1.txt"),

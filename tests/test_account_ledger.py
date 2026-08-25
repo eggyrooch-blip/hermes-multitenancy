@@ -330,7 +330,7 @@ class _InventoryResponse:
 def _run_exporter(
     tmp_path, monkeypatch, *, users=None, keys=None, database_padding_bytes=0,
     signer_mode=0o600, signer_parent_mode=None, mismatched_public_key=False,
-    base_url="https://litellm.sre.gotokeep.com", users_second_read=None,
+    base_url="https://litellm.sre.example.com", users_second_read=None,
     mutate_org_during_inventory=False, database_swap_back=False,
 ):
     from hermes_multitenancy import account_ledger, account_ledger_export
@@ -398,7 +398,7 @@ def _run_exporter(
         )
         connection.execute(
             "INSERT INTO multitenancy_billing_identities VALUES "
-            "('sensitive-employee','private-profile','sensitive@keep.com',"
+            "('sensitive-employee','private-profile','sensitive@example.com',"
             "'ll-private','key-private',4102444800000,'enforced')"
         )
         if database_padding_bytes:
@@ -412,7 +412,7 @@ def _run_exporter(
     if users is None:
         users = [{
             "user_id": "ll-private",
-            "user_email": "sensitive@keep.com",
+            "user_email": "sensitive@example.com",
             "metadata": {"hermes_employee_id": "sensitive-employee"},
         }]
     if keys is None:
@@ -511,7 +511,7 @@ def test_production_exporter_writes_one_verified_private_snapshot(
         raw not in captured.out + captured.err
         for raw in (
             "sensitive-employee", "private-profile", "ou_private",
-            "sensitive@keep.com", "ll-private", "key-private", "test-admin-key",
+            "sensitive@example.com", "ll-private", "key-private", "test-admin-key",
         )
     )
     envelopes = [output_dir / f"{layer}.json" for layer in ("employees", "routes", "accounts", "keys")]
@@ -530,7 +530,7 @@ def test_production_exporter_does_not_pass_a_disabled_upstream_account(
         monkeypatch,
         users=[{
             "user_id": "ll-private",
-            "user_email": "sensitive@keep.com",
+            "user_email": "sensitive@example.com",
             "metadata": {
                 "hermes_employee_id": "sensitive-employee",
                 "hermes_billing_disabled": True,
@@ -557,12 +557,12 @@ def test_production_exporter_rejects_ambiguous_exact_email_before_publish(
         users=[
             {
                 "user_id": "ll-private",
-                "user_email": "sensitive@keep.com",
+                "user_email": "sensitive@example.com",
                 "metadata": {"hermes_employee_id": "sensitive-employee"},
             },
             {
                 "user_id": "ll-collision",
-                "user_email": "SENSITIVE@keep.com",
+                "user_email": "SENSITIVE@example.com",
                 "metadata": {"hermes_employee_id": "another-employee"},
             },
         ],
@@ -575,7 +575,7 @@ def test_production_exporter_rejects_ambiguous_exact_email_before_publish(
     assert {method for method, _url, _timeout in calls} == {"GET"}
     assert all(
         raw not in captured.out + captured.err
-        for raw in ("sensitive-employee", "another-employee", "sensitive@keep.com")
+        for raw in ("sensitive-employee", "another-employee", "sensitive@example.com")
     )
 
 

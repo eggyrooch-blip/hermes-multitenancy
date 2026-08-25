@@ -685,6 +685,22 @@ def _event_metadata(event: Any) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, dict) else {}
 
 
+def _event_delegation_id(event: Any) -> str:
+    """The credential-delegation grant this event is the replay of, if any.
+
+    Set by ``_dispatch_synthetic_auth_complete`` on the synthetic replay event
+    (attribute + raw_event metadata, so it survives either carrier). Binds a
+    ``once`` lease to the exact run it was granted for.
+    """
+    try:
+        direct = str(getattr(event, "hermes_delegation_id", "") or "").strip()
+        if direct:
+            return direct
+        return str(_event_metadata(event).get("delegation_id") or "").strip()
+    except Exception:
+        return ""
+
+
 def _trusted_feishu_runtime_identity(event: Any) -> tuple[str, str, str] | None:
     metadata = _event_metadata(event)
     if not str(metadata.get("trusted_ticket_fingerprint") or "").strip():
@@ -693,8 +709,17 @@ def _trusted_feishu_runtime_identity(event: Any) -> tuple[str, str, str] | None:
     credential = str(metadata.get("trusted_credential_subject") or "").strip()
     tool_scope = str(metadata.get("feishu_tool_scope") or "").strip()
     chat_type = str(metadata.get("trusted_chat_type") or "").strip()
+    # Two sealed actor shapes: an employee open_id, or the bot-actor sentinel
+    # from the trusted-ingress bot path. The bot shape is only legal on the
+    # group bot scope and its credential subject must never be an employee.
+    actor_shape_ok = actor.startswith("ou_") or (
+        actor.startswith("bot:")
+        and tool_scope == "feishu:bot"
+        and chat_type == "group"
+        and not credential.startswith("ou_")
+    )
     if (
-        not actor.startswith("ou_")
+        not actor_shape_ok
         or str(metadata.get("sender_open_id") or "").strip() != actor
         or not credential
         or tool_scope not in {"feishu:user", "feishu:bot"}
@@ -804,6 +829,12 @@ def _expert_id_for_event(event: Any) -> str:
 _BROKER_ROLE_OVERRIDE_EVENT_KEY = "broker_role_override"
 _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY = "expert_id"
 _BROKER_ROLE_OVERRIDE_BLOCK_KEY = "block"
+# The active expert's authorized skill names, resolved gateway-side (routing
+# table available) and threaded to the sandboxed child so its disabled-skill
+# scope can un-hide exactly the active expert's skills WITHOUT re-resolving the
+# owner (routing is unavailable in the child; a tenant-writable marker must
+# never be the authority — see expert_overlay._routing_group_owner_open_id).
+_BROKER_ROLE_OVERRIDE_SKILLS_KEY = "skills"
 
 
 def _broker_role_override_payload_for_event(
@@ -819,10 +850,16 @@ def _broker_role_override_payload_for_event(
         payload_expert_id = str(existing.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or "").strip()
         block = existing.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
         if payload_expert_id == expert_id and isinstance(block, str) and block.strip():
-            return {
+            carried = {
                 _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
                 _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
             }
+            skills = existing.get(_BROKER_ROLE_OVERRIDE_SKILLS_KEY)
+            if isinstance(skills, list):
+                carried[_BROKER_ROLE_OVERRIDE_SKILLS_KEY] = [
+                    str(s).strip() for s in skills if str(s).strip()
+                ]
+            return carried
         raise ExpertUnavailableError()
     try:
         from ..expert_overlay import (
@@ -864,6 +901,9 @@ def _broker_role_override_payload_for_event(
     return {
         _BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY: expert_id,
         _BROKER_ROLE_OVERRIDE_BLOCK_KEY: block,
+        _BROKER_ROLE_OVERRIDE_SKILLS_KEY: [
+            str(s).strip() for s in overlay.skills if str(s).strip()
+        ],
     }
 
 
@@ -1038,26 +1078,60 @@ def _expert_disabled_skill_names_for_event(event: Any, profile_home: Path) -> se
     leak. Returns an empty set when there are no expert manifests at all.
     """
     try:
-        from ..expert_overlay import all_expert_skill_names, resolve_caller_departments, resolve_expert
+        from ..expert_overlay import (
+            active_expert_declared_skills,
+            all_expert_skill_names,
+            resolve_caller_departments,
+            resolve_expert,
+        )
 
         all_expert_skills = all_expert_skill_names(profile_home)
         if not all_expert_skills:
             return set()
 
         active_skills: set[str] = set()
-        expert_id = _expert_id_for_event(event)
-        if expert_id:
-            try:
-                sender_open_id = _resolve_subprocess_sender_open_id(event) or None
-            except Exception:
-                sender_open_id = None
-            overlay = resolve_expert(
-                profile_home,
-                expert_id,
-                department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
-            )
-            if overlay is not None:
-                active_skills = {str(skill).strip() for skill in overlay.skills if str(skill).strip()}
+        # PREFERRED: the gateway PARENT already authorized the active expert
+        # against the TRUSTED routing table and threaded it onto the event as
+        # ``broker_role_override``. Trust that decision directly — it is the only
+        # correct source for a GROUP profile, whose owner cannot be re-resolved in
+        # this sandboxed child (routing is unavailable and the marker is
+        # tenant-writable). Un-hide exactly that expert's declared skills.
+        override = getattr(event, _BROKER_ROLE_OVERRIDE_EVENT_KEY, None)
+        authorized_expert_id = ""
+        if isinstance(override, dict):
+            authorized_expert_id = str(
+                override.get(_BROKER_ROLE_OVERRIDE_EXPERT_ID_KEY) or ""
+            ).strip()
+            block = override.get(_BROKER_ROLE_OVERRIDE_BLOCK_KEY)
+            if authorized_expert_id and isinstance(block, str) and block.strip():
+                carried = override.get(_BROKER_ROLE_OVERRIDE_SKILLS_KEY)
+                if isinstance(carried, list) and carried:
+                    active_skills = {str(s).strip() for s in carried if str(s).strip()}
+                else:
+                    active_skills = active_expert_declared_skills(
+                        profile_home, authorized_expert_id
+                    )
+            else:
+                authorized_expert_id = ""
+
+        # FALLBACK (no broker payload — legacy/direct path): re-resolve with the
+        # audience gate. This works in the child for PERSONAL profiles (owner
+        # resolution is not needed; departments come from the org snapshot, which
+        # IS mounted) and stays fail-closed for anyone the audience denies.
+        if not authorized_expert_id:
+            expert_id = _expert_id_for_event(event)
+            if expert_id:
+                try:
+                    sender_open_id = _resolve_subprocess_sender_open_id(event) or None
+                except Exception:
+                    sender_open_id = None
+                overlay = resolve_expert(
+                    profile_home,
+                    expert_id,
+                    department_ids=resolve_caller_departments(profile_home, open_id=sender_open_id),
+                )
+                if overlay is not None:
+                    active_skills = {str(s).strip() for s in overlay.skills if str(s).strip()}
 
         return all_expert_skills - active_skills
     except Exception:
@@ -2674,6 +2748,17 @@ def _aiagent_subprocess_env_scope(
     merged_extra["TERMINAL_CWD"] = str(run_cwd)
     merged_extra["_HERMES_FORCE_TERMINAL_CWD"] = str(run_cwd)
     merged_extra.update(_ingest_secret_env_from_event(event))
+    # Credential delegation, per run (NOT gated on strict context — the marker
+    # collision and the once-lease binding it fixes exist in every mode):
+    #   NONCE — names this run's auth-required marker file, so two concurrent
+    #           runs of the same group profile cannot steal each other's.
+    #   ID    — the grant this run replays; a once-lease only unlocks for it.
+    from ..credential_delegation import DELEGATION_ID_ENV, DELEGATION_NONCE_ENV
+
+    merged_extra.setdefault(DELEGATION_NONCE_ENV, secrets.token_urlsafe(16))
+    _delegation_id = _event_delegation_id(event)
+    if _delegation_id:
+        merged_extra.setdefault(DELEGATION_ID_ENV, _delegation_id)
     from ..billing_identity import runtime_env_for_billing_metadata
 
     # The plaintext employee key exists only in this per-run child env.  The

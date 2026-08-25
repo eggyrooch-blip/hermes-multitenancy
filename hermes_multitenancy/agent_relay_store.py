@@ -287,7 +287,13 @@ class RelayStore:
         }
 
     def reserve_message(
-        self, *, token_id: str, idempotency_key: str, request_hash: str, reply_expires_at: int | None
+        self,
+        *,
+        token_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        reply_expires_at: int | None,
+        msg_type: str = "message",
     ) -> tuple[dict[str, Any], bool]:
         now = _now_ms()
         with self._lock:
@@ -310,12 +316,21 @@ class RelayStore:
             )
             self._conn.execute(
                 """
-                INSERT INTO relay_messages
+                INSERT OR IGNORE INTO relay_messages
                     (resource_id, token_id, idempotency_key, request_hash, kind, status,
                      reply_expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'message', 'sending', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'sending', ?, ?, ?)
                 """,
-                (resource_id, token_id, idempotency_key, request_hash, reply_expires_at, now, now),
+                (
+                    resource_id,
+                    token_id,
+                    idempotency_key,
+                    request_hash,
+                    msg_type,
+                    reply_expires_at,
+                    now,
+                    now,
+                ),
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -406,6 +421,14 @@ class RelayStore:
             )
             self._conn.commit()
         return True, False
+
+    def owned_sent_message(self, token_id: str, message_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM relay_messages WHERE token_id=? AND message_id=? AND status='sent'",
+                (token_id, message_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def message_replies(
         self, token_id: str, message_id: str, since_ts: int, limit: int
@@ -537,6 +560,35 @@ class RelayStore:
             ).fetchone()
         return dict(row), nonce, True
 
+    def register_card_message(
+        self, token_id: str, idempotency_key: str, message_id: str, reply_expires_at: int
+    ) -> None:
+        """Give a button card a text-reply fallback by also listing it as a message.
+
+        ponytail: the reply matcher only reads relay_messages, so without this row a
+        typed reply to a card is either dropped or misattributed to another message.
+        """
+        now = _now_ms()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO relay_messages
+                    (resource_id, token_id, idempotency_key, request_hash, kind, status,
+                     message_id, reply_expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, '', 'card', 'sent', ?, ?, ?, ?)
+                """,
+                (
+                    "msg_" + secrets.token_hex(12),
+                    token_id,
+                    idempotency_key,
+                    message_id,
+                    reply_expires_at,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
     def finish_card(self, card_id: str, message_id: str, conversation_id: str) -> None:
         with self._lock:
             self._conn.execute(
@@ -621,6 +673,23 @@ class RelayStore:
                 "UPDATE relay_cards SET status='actioned', action_id=?, updated_at=? "
                 "WHERE card_id=? AND status='pending'",
                 (action_id, now, card_id),
+            ).rowcount
+            self._conn.commit()
+        return changed == 1
+
+    def close_reply_window(self, token_id: str, message_id: str) -> bool:
+        """Expire an open reply window now so the next window is unambiguous.
+
+        ponytail: writes _now_ms() rather than NULL/0 — prune keys retention off
+        `reply_expires_at + 24h`, and a NULL there would strand reply plaintext
+        forever.
+        """
+        now = _now_ms()
+        with self._lock:
+            changed = self._conn.execute(
+                "UPDATE relay_messages SET reply_expires_at=?, updated_at=? "
+                "WHERE token_id=? AND message_id=? AND status='sent' AND reply_expires_at>?",
+                (now, now, token_id, message_id, now),
             ).rowcount
             self._conn.commit()
         return changed == 1

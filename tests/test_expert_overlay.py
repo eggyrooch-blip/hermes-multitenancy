@@ -294,6 +294,21 @@ def test_resolve_unknown_expert_is_none(tmp_path, monkeypatch):
     assert eo.role_override_block_for(profile_home, "no-such-expert") is None
 
 
+def test_resolve_duplicate_visible_expert_across_manifests_fails_closed(tmp_path, monkeypatch):
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    managed = shared / pi.MANAGED_DIR / "keep-resource-delivery.json"
+    duplicate = json.loads(managed.read_text(encoding="utf-8"))
+    duplicate["plugin_id"] = "duplicate-plugin"
+    (managed.parent / "duplicate-plugin.json").write_text(
+        json.dumps(duplicate), encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+
+    assert eo.resolve_expert(shared / "profiles" / "feishu_test", EXPERT_ID) is None
+
+
 def test_resolve_failsafe_on_corrupt_manifest(tmp_path, monkeypatch):
     shared = _shared_home(tmp_path)
     monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
@@ -724,3 +739,396 @@ def test_resolve_audience_both_empty_is_public(tmp_path, monkeypatch):
     _set_install_audience(shared, {"mode": "profile", "profiles": [], "department_ids": []})
     assert eo.resolve_expert(stranger_home, EXPERT_ID) is not None
     assert len(eo.list_experts(stranger_home)) == 1
+
+
+# ─────────────────────────── group-agent owner mirroring ─────────────────────
+# A group/agent profile mirrors its OWNER's expert entitlements: visibility,
+# activation, and skill sync — never the sender's, never wider than the owner,
+# credentials never copied. SECURITY (F1): the owner is read ONLY from the
+# TRUSTED routing table, NEVER from the tenant-writable group_profile.json.
+
+
+def _mirror_env(monkeypatch, shared: Path) -> None:
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    monkeypatch.delenv("HERMES_ORG_SNAPSHOT_DIR", raising=False)
+
+
+def _write_org_snapshot(shared: Path, employees: dict) -> None:
+    snap_dir = shared / "org-snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    (snap_dir / "org-2026-08-24.json").write_text(
+        json.dumps({"employees": employees}, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _seed_group_routing(tmp_path, *, group_name, owner_pname, owner_open_id, chat_id="oc_g1"):
+    """Seed a TRUSTED routing DB: owner personal row + group row, point router at it.
+
+    The autouse conftest fixture resets routing back to ':memory:' afterwards.
+    Returns the RoutingTable so a test can add more rows.
+    """
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+
+    db_path = tmp_path / "group_routing.db"
+    t = RoutingTable(db_path)
+    t.upsert(user_id=owner_pname, profile_name=owner_pname, open_id=owner_open_id, provenance="sync")
+    t.upsert_group(chat_id=chat_id, profile_name=group_name, owner_open_id=owner_open_id)
+    t.close()
+    router_mod.override_routing_table(db_path)
+    return db_path
+
+
+def _group_home_dir(shared: Path, *, name, owner, marker_owner=None) -> Path:
+    """Create a group profile home. ``marker_owner`` (default = real ``owner``)
+    lets a test forge a marker naming a DIFFERENT owner to prove it is ignored."""
+    home = shared / "profiles" / name
+    (home / "skills").mkdir(parents=True, exist_ok=True)
+    (home / "group_profile.json").write_text(
+        json.dumps(
+            {
+                "kind": "group",
+                "chat_id": "oc_g1",
+                "owner_open_id": marker_owner if marker_owner is not None else owner,
+                "display_label": "t",
+                "feishu_auth_disabled": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return home
+
+
+def test_group_profile_mirrors_owner_profile_scoped_expert(tmp_path, monkeypatch):
+    """Group agent sees exactly the profile-scoped experts its owner sees."""
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)  # install audience = profiles:[feishu_test]
+    _mirror_env(monkeypatch, shared)
+    _seed_group_routing(
+        tmp_path, group_name="feishu_group_g1", owner_pname="feishu_test", owner_open_id="ou_abc"
+    )
+
+    group_home = _group_home_dir(shared, name="feishu_group_g1", owner="ou_abc")
+    rows = eo.list_experts(group_home, department_ids=eo.resolve_caller_departments(group_home))
+    assert [row["id"] for row in rows] == [EXPERT_ID]
+    assert eo.resolve_expert(group_home, EXPERT_ID) is not None
+
+    # a group whose OWNER is outside the audience mirrors THAT owner: nothing
+    _seed_group_routing(
+        tmp_path, group_name="feishu_group_g2", owner_pname="feishu_other",
+        owner_open_id="ou_out", chat_id="oc_g2",
+    )
+    outsider = _group_home_dir(shared, name="feishu_group_g2", owner="ou_out")
+    assert eo.list_experts(outsider, department_ids=eo.resolve_caller_departments(outsider)) == []
+    assert eo.resolve_expert(outsider, EXPERT_ID) is None
+
+
+def test_group_profile_mirrors_owner_departments_sender_cannot_widen(tmp_path, monkeypatch):
+    """Departments resolve to the OWNER's; a group-message sender never widens them."""
+    repo = _plugin_repo(
+        tmp_path / "plug",
+        audience={"mode": "department_ids", "profiles": [], "department_ids": ["123"]},
+    )
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    _mirror_env(monkeypatch, shared)
+    _seed_group_routing(
+        tmp_path, group_name="feishu_group_g1", owner_pname="feishu_test", owner_open_id="ou_abc"
+    )
+    _write_org_snapshot(
+        shared,
+        {
+            "e1": {"profile_name": "feishu_test", "open_id": "ou_abc", "dept_id": "999", "dept_name": "其他部"},
+            "e2": {"profile_name": "feishu_member", "open_id": "ou_member", "dept_id": "123", "dept_name": "增长部"},
+        },
+    )
+
+    group_home = _group_home_dir(shared, name="feishu_group_g1", owner="ou_abc")
+    # owner is in dept 999 → the dept-123 expert stays hidden…
+    depts = eo.resolve_caller_departments(group_home)
+    assert depts is not None and "999" in depts and "123" not in depts
+    # …even when the SENDER (open_id arg) is in dept 123
+    sender_depts = eo.resolve_caller_departments(group_home, open_id="ou_member")
+    assert sender_depts == depts
+    assert eo.list_experts(group_home, department_ids=sender_depts) == []
+    assert eo.resolve_expert(group_home, EXPERT_ID, department_ids=sender_depts) is None
+
+    # owner actually in dept 123 → visible in the group
+    _write_org_snapshot(
+        shared,
+        {"e1": {"profile_name": "feishu_test", "open_id": "ou_abc", "dept_id": "123", "dept_name": "增长部"}},
+    )
+    depts = eo.resolve_caller_departments(group_home)
+    assert eo.resolve_expert(group_home, EXPERT_ID, department_ids=depts) is not None
+    assert len(eo.list_experts(group_home, department_ids=depts)) == 1
+
+
+def test_forged_marker_cannot_steal_owner_experts(tmp_path, monkeypatch):
+    """F1 (security): a marker forged to name a VICTIM owner grants nothing.
+
+    The attacker profile plants group_profile.json with the victim's open_id.
+    Because the owner is read from the routing table (which has no group row for
+    the attacker, or ties it to the attacker's real identity), the forgery is
+    inert: no visibility, no activation, no departments, no skill specs."""
+    repo = _plugin_repo(tmp_path / "plug")  # install audience = profiles:[feishu_test]
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    _mirror_env(monkeypatch, shared)
+    _write_org_snapshot(
+        shared,
+        {"victim": {"profile_name": "feishu_test", "open_id": "ou_victim", "dept_id": "123", "dept_name": "增长部"}},
+    )
+
+    # (a) a plain PERSONAL profile (no group routing row) forges the marker
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+
+    db_path = tmp_path / "attacker_routing.db"
+    t = RoutingTable(db_path)
+    t.upsert(user_id="feishu_mallory", profile_name="feishu_mallory", open_id="ou_mallory", provenance="sync")
+    t.close()
+    router_mod.override_routing_table(db_path)
+
+    attacker = shared / "profiles" / "feishu_mallory"
+    (attacker / "skills").mkdir(parents=True, exist_ok=True)
+    (attacker / "group_profile.json").write_text(
+        json.dumps({"kind": "group", "owner_open_id": "ou_victim"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert eo.resolve_caller_departments(attacker) is None
+    assert eo.list_experts(attacker, department_ids=eo.resolve_caller_departments(attacker)) == []
+    assert eo.resolve_expert(attacker, EXPERT_ID) is None
+    assert eo.expert_skill_sync_specs(attacker) == []
+
+    # (b) a REAL group profile whose routing owner is the attacker, but whose
+    # marker is rewritten to the victim — still resolves as the real owner only
+    router_mod.override_routing_table(None)
+    _seed_group_routing(
+        tmp_path, group_name="feishu_group_evil", owner_pname="feishu_mallory", owner_open_id="ou_mallory"
+    )
+    evil = _group_home_dir(shared, name="feishu_group_evil", owner="ou_mallory", marker_owner="ou_victim")
+    assert eo.list_experts(evil, department_ids=eo.resolve_caller_departments(evil)) == []
+    assert eo.resolve_expert(evil, EXPERT_ID) is None
+
+
+def test_group_named_directly_in_audience_profiles_keeps_grant(tmp_path, monkeypatch):
+    """F2: a profile-mode audience naming the group's OWN dir still admits it.
+
+    The owner union must not REVOKE a grant that named the group directly."""
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    _mirror_env(monkeypatch, shared)
+    # install audience names the GROUP profile itself, not the owner
+    _set_install_audience(
+        shared, {"mode": "profile", "profiles": ["feishu_group_named"], "department_ids": []}
+    )
+    _seed_group_routing(
+        tmp_path, group_name="feishu_group_named", owner_pname="feishu_owner", owner_open_id="ou_owner"
+    )
+    group_home = _group_home_dir(shared, name="feishu_group_named", owner="ou_owner")
+    assert [r["id"] for r in eo.list_experts(group_home)] == [EXPERT_ID]
+    assert eo.resolve_expert(group_home, EXPERT_ID) is not None
+
+
+def test_group_owner_unresolvable_fails_closed(tmp_path, monkeypatch):
+    """No routing table (e.g. the sandboxed child) → fail-closed, no exception."""
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    _mirror_env(monkeypatch, shared)
+    # deliberately DO NOT seed routing → owner unresolvable
+
+    group_home = _group_home_dir(shared, name="feishu_group_g1", owner="ou_abc")
+    assert eo.resolve_caller_departments(group_home) is None
+    assert eo.list_experts(group_home, department_ids=None) == []
+    assert eo.resolve_expert(group_home, EXPERT_ID) is None
+    assert eo.expert_skill_sync_specs(group_home) == []
+
+
+def test_group_expert_skill_sync_materializes_and_revokes(tmp_path, monkeypatch):
+    """Owner-visible expert skills land in the group scan root; secrets never
+    copied; losing the audience prunes them; personal profiles stay untouched."""
+    from hermes_multitenancy.sync.feishu_org import _sync_default_profile_skills
+
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    _mirror_env(monkeypatch, shared)
+    _seed_group_routing(
+        tmp_path, group_name="feishu_group_g1", owner_pname="feishu_test", owner_open_id="ou_abc"
+    )
+    # a secret-named file in the plugin source must never travel into the profile
+    (repo / "skills" / "using-resource-delivery" / ".env").write_text("SECRET=1", encoding="utf-8")
+
+    group_home = _group_home_dir(shared, name="feishu_group_g1", owner="ou_abc")
+    specs = eo.expert_skill_sync_specs(group_home)
+    assert sorted(str(spec["path"]) for spec in specs) == [
+        "kep-trevi-delivery-orchestrate",
+        "using-resource-delivery",
+    ]
+
+    assert _sync_default_profile_skills(group_home, shared) is True
+    assert (group_home / "skills" / "using-resource-delivery" / "SKILL.md").is_file()
+    assert (group_home / "skills" / "kep-trevi-delivery-orchestrate" / "SKILL.md").is_file()
+    assert not (group_home / "skills" / "using-resource-delivery" / ".env").exists()
+
+    # owner loses the audience → the mirrored skills are pruned on the next sync
+    _set_install_audience(
+        shared, {"mode": "profile", "profiles": ["someone_else"], "department_ids": []}
+    )
+    assert _sync_default_profile_skills(group_home, shared) is True
+    assert not (group_home / "skills" / "using-resource-delivery").exists()
+    assert not (group_home / "skills" / "kep-trevi-delivery-orchestrate").exists()
+
+    # a personal (non-group) profile is untouched by the mirror
+    personal_home = shared / "profiles" / "feishu_bystander"
+    (personal_home / "skills").mkdir(parents=True, exist_ok=True)
+    _sync_default_profile_skills(personal_home, shared)
+    assert not (personal_home / "skills" / "using-resource-delivery").exists()
+
+
+def test_active_expert_declared_skills_is_audience_free(tmp_path, monkeypatch):
+    """The child disabled-scope helper returns an expert's skills by id without
+    any audience/owner resolution (routing is unavailable in the sandbox)."""
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    # NO routing table seeded — proves the helper needs none
+    profile_home = shared / "profiles" / "feishu_test"
+    got = eo.active_expert_declared_skills(profile_home, EXPERT_ID)
+    assert got == {"using-resource-delivery", "kep-trevi-delivery-orchestrate"}
+    assert eo.active_expert_declared_skills(profile_home, "no-such-expert") == set()
+    assert eo.active_expert_declared_skills(profile_home, "") == set()
+
+
+def test_webui_agent_kind_mirrors_owner(tmp_path, monkeypatch):
+    """F2 regression guard: a WebUI-owned agent (routing kind='agent', not
+    'group') also mirrors its owner. The SPEC Done line covers this surface, and
+    the WebUI agent's on-disk marker writes kind:'group' while its trusted
+    routing row is kind:'agent' — owner resolution must key off the routing kind."""
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+
+    repo = _plugin_repo(tmp_path / "plug")  # install audience = profiles:[feishu_test]
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    _mirror_env(monkeypatch, shared)
+    _write_org_snapshot(
+        shared,
+        {"o": {"profile_name": "feishu_test", "open_id": "ou_owner", "dept_id": "123", "dept_name": "增长部"}},
+    )
+
+    db_path = tmp_path / "agent_routing.db"
+    t = RoutingTable(db_path)
+    t.upsert(user_id="feishu_test", profile_name="feishu_test", open_id="ou_owner", provenance="sync")
+    t.upsert_owned_agent(
+        agent_id="agent-xyz",
+        profile_name="webui_agent_xyz",
+        owner_open_id="ou_owner",
+    )
+    t.close()
+    router_mod.override_routing_table(db_path)
+
+    agent_home = shared / "profiles" / "webui_agent_xyz"
+    (agent_home / "skills").mkdir(parents=True, exist_ok=True)
+    # WebUI agent marker says kind:group but the routing row is kind:agent
+    (agent_home / "group_profile.json").write_text(
+        json.dumps({"kind": "group", "owner_open_id": "ou_owner", "source": "webui-agent"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    # owner-mirroring works for the agent kind: expert visible + activatable,
+    # and the owner's departments drive resolution
+    assert eo.resolve_caller_departments(agent_home) == ["123", "增长部"]
+    assert [r["id"] for r in eo.list_experts(agent_home, department_ids=eo.resolve_caller_departments(agent_home))] == [EXPERT_ID]
+    assert eo.resolve_expert(agent_home, EXPERT_ID) is not None
+    assert {str(s["path"]) for s in eo.expert_skill_sync_specs(agent_home)} == {
+        "using-resource-delivery",
+        "kep-trevi-delivery-orchestrate",
+    }
+
+
+# ─────────────────────────── manifest source hardening ───────────────────────
+# Managed manifests are read ONLY from trusted shared-home. A tenant-writable
+# <PROFILE_HOME>/.hermes-plugin-managed is never a source, and a repo root of "/"
+# is refused so agent_md can't become an arbitrary host-file read.
+
+
+def _write_manifest(dir_path: Path, name: str, manifest: dict) -> None:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    (dir_path / f"{name}.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+
+def test_forged_profile_home_manifest_is_not_a_source(tmp_path, monkeypatch):
+    """A manifest planted in the tenant-writable PROFILE_HOME is never read."""
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)  # legit expert in shared-home
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    # attacker plants a forged manifest inside their own profile home:
+    # empty audience (would bypass the gate) + repo="/" + agent_md at a host file.
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("TOP SECRET", encoding="utf-8")
+    _write_manifest(
+        profile_home / eo.MANAGED_DIR,
+        "evil",
+        {
+            "plugin_id": "evil",
+            "status": "active",
+            "repo": "/",
+            "audience": {"mode": "profile", "profiles": [], "department_ids": []},
+            "experts": [
+                {
+                    "id": "evil-expert",
+                    "name": "evil",
+                    "agent_md": str(secret.resolve()).lstrip("/"),
+                    "skills": [],
+                }
+            ],
+        },
+    )
+
+    # the forged expert is invisible and cannot be activated; the legit one is fine
+    ids = {r["id"] for r in eo.list_experts(profile_home)}
+    assert "evil-expert" not in ids
+    assert EXPERT_ID in ids
+    assert eo.resolve_expert(profile_home, "evil-expert") is None
+    assert eo.resolve_expert(profile_home, EXPERT_ID) is not None
+
+
+def test_read_agent_md_refuses_filesystem_root_repo(tmp_path, monkeypatch):
+    """A shared-home manifest whose repo resolves to '/' cannot read host files."""
+    repo = _plugin_repo(tmp_path / "plug")
+    shared = _shared_home(tmp_path)
+    _ingest(repo, shared)
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared))
+    profile_home = shared / "profiles" / "feishu_test"
+
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("TOP SECRET", encoding="utf-8")
+    # even placed in TRUSTED shared-home, repo="/" must be refused (defense-in-depth)
+    _write_manifest(
+        shared / eo.MANAGED_DIR,
+        "rooted",
+        {
+            "plugin_id": "rooted",
+            "status": "active",
+            "repo": "/",
+            "experts": [
+                {
+                    "id": "rooted-expert",
+                    "name": "rooted",
+                    "agent_md": str(secret.resolve()).lstrip("/"),
+                    "skills": [],
+                }
+            ],
+        },
+    )
+    # listed (metadata only) but NOT activatable — agent_md read refused, no host leak
+    overlay = eo.resolve_expert(profile_home, "rooted-expert")
+    assert overlay is None

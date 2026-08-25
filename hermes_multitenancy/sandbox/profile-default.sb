@@ -164,7 +164,7 @@
 ;; Audio cache directory for tts_tool — read AND write because hermes
 ;; populates it at runtime. Verified necessary during sandbox e2e
 ;; probe: ``Could not import tool module tools.tts_tool: [Errno 1]
-;; Operation not permitted: '/Users/kite/.hermes/audio_cache'``.
+;; Operation not permitted: '/Users/dev/.hermes/audio_cache'``.
 (allow file-read* file-write*
     (subpath (string-append (param "SHARED_HOME") "/audio_cache")))
 
@@ -231,7 +231,7 @@
 (allow network-bind (local udp "localhost:*"))
 
 ;; Intranet egress — explicitly denied. Skills should not be able to
-;; reach 10.2.14.249 (Keep production) or any office subnet from inside
+;; reach 10.0.0.249 (Keep production) or any office subnet from inside
 ;; the sandbox. If a legitimate use case shows up, lift this surgically
 ;; under the "trusted" policy variant, not in the default.
 ;;

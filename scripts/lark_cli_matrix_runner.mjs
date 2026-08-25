@@ -15,14 +15,14 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname } from 'node:path';
-import { io } from '/Users/kite/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js';
+import { io } from '/Users/dev/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js';
 
 const SCENARIOS = {
   t1: {
     label: 'group-webui',
     transport: 'webui',
     profile: 'feishu_group_dfe8bc83167b_e18e',
-    openid: 'ou_cf23e7c262afa4b7a006baa75f863ed5',
+    openid: 'ou_aaaaaaaaaaaaaaaa0000000000000001',
     name: 'owner',
   },
   t2: {
@@ -30,9 +30,9 @@ const SCENARIOS = {
     transport: 'feishu',
     profile: 'feishu_group_dfe8bc83167b_e18e',
     senderProfile: 'feishu_g41a5b5g',
-    openid: 'ou_cf23e7c262afa4b7a006baa75f863ed5',
-    chatId: 'oc_dfe8bc83167b092e138e4b4e6ac9ade5',
-    botOpenid: 'ou_fe47573ee830623d3f944797d7359192',
+    openid: 'ou_aaaaaaaaaaaaaaaa0000000000000001',
+    chatId: 'oc_cccccccccccccccc0000000000000001',
+    botOpenid: 'ou_dddddddddddddddd0000000000000001',
     mentionName: '2号 BOT_A',
     chatType: 'group',
   },
@@ -40,7 +40,7 @@ const SCENARIOS = {
     label: 'owner-webui',
     transport: 'webui',
     profile: 'feishu_g41a5b5g',
-    openid: 'ou_cf23e7c262afa4b7a006baa75f863ed5',
+    openid: 'ou_aaaaaaaaaaaaaaaa0000000000000001',
     name: 'owner',
   },
   t4: {
@@ -48,8 +48,8 @@ const SCENARIOS = {
     transport: 'feishu',
     profile: 'feishu_g41a5b5g',
     senderProfile: 'feishu_g41a5b5g',
-    openid: 'ou_cf23e7c262afa4b7a006baa75f863ed5',
-    chatId: 'oc_1914a6e2c17a197aa24c1b79a57ab45f',
+    openid: 'ou_aaaaaaaaaaaaaaaa0000000000000001',
+    chatId: 'oc_bbbbbbbbbbbbbbbb0000000000000001',
     chatType: 'p2p',
   },
 };
@@ -67,7 +67,7 @@ const CAPABILITIES = {
   mail: { skill: 'lark-mail', service: 'mail', schemaCommand: 'mail +triage --help', canary: '请只执行这一条 lark_cli 命令：`mail +triage --max 5 --format json`；只回答邮件数量或真实错误。' },
   markdown: { skill: 'lark-markdown', service: 'markdown', schemaCommand: 'markdown +create --help', canary: '创建一个 Markdown 文件。请只执行这一条 lark_cli 命令：`markdown +create --name HERMES_MATRIX_MARKDOWN_${MARK}.md --content "matrix ${MARK}"`。只回答 file_token 和链接。' },
   minutes: { skill: 'lark-minutes', service: 'minutes', schemaCommand: 'minutes +search --help', canary: '请只执行这一条 lark_cli 命令：`minutes +search --query HERMES_MATRIX --format json`；只回答命中数量或真实错误。' },
-  okr: { skill: 'lark-okr', service: 'okr', schemaCommand: 'okr +cycle-list --help', canary: '请只执行这一条 lark_cli 命令：`okr +cycle-list --user-id ou_cf23e7c262afa4b7a006baa75f863ed5 --format json`；只回答周期数量或真实错误。' },
+  okr: { skill: 'lark-okr', service: 'okr', schemaCommand: 'okr +cycle-list --help', canary: '请只执行这一条 lark_cli 命令：`okr +cycle-list --user-id ou_aaaaaaaaaaaaaaaa0000000000000001 --format json`；只回答周期数量或真实错误。' },
   'openapi-explorer': { skill: 'lark-openapi-explorer', service: 'api', helpCommand: 'api GET /open-apis/bot/v3/info --as bot', schemaCommand: 'api GET /open-apis/bot/v3/info --as bot --format json', canary: '请只执行这一条 lark_cli 命令：`api GET /open-apis/bot/v3/info --as bot`；只回答 app_name 和 open_id。' },
   shared: { skill: 'lark-shared', service: 'auth', schemaCommand: 'auth status --help', canary: '检查 lark-cli 当前身份状态或 auth status 帮助；只回答 user/bot 是否可用。' },
   sheets: { skill: 'lark-sheets', service: 'sheets', schemaCommand: 'sheets +create --help', canary: '创建一个飞书电子表格。请只执行这一条 lark_cli 命令：`sheets +create --title HERMES_MATRIX_SHEET_${MARK}`。只回答 spreadsheet_token 和链接。' },
@@ -135,7 +135,7 @@ function sqliteJson(dbPath, sql, options = {}) {
 }
 
 function collectStateRows({ profile, mark }) {
-  const dbPath = `/Users/kite/.hermes/profiles/${profile}/state.db`;
+  const dbPath = `/Users/dev/.hermes/profiles/${profile}/state.db`;
   const users = sqliteJson(
     dbPath,
     `select id from messages where role='user' and content like '%${mark}%' order by id desc limit 1;`,
@@ -155,7 +155,7 @@ function collectStateRows({ profile, mark }) {
 }
 
 function logToolRows({ profile, platform, startTs, endTs }) {
-  const logPath = `/Users/kite/.hermes/profiles/${profile}/logs/agent.log`;
+  const logPath = `/Users/dev/.hermes/profiles/${profile}/logs/agent.log`;
   if (!existsSync(logPath) || !startTs) return [];
   const effectiveEnd = endTs || '9999-12-31 23:59:59';
   const marker = `[agent:profile:${profile}:platform:${platform}:`;
@@ -385,13 +385,13 @@ function sendFeishuMessage({ scenario, text }) {
   const py = String.raw`
 import json, os, subprocess, sys
 from pathlib import Path
-sys.path.insert(0, "/Users/kite/code/hermes-multitenancy")
+sys.path.insert(0, "/Users/dev/code/hermes-multitenancy")
 from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
 from hermes_multitenancy.agent_real import _lark_cli_auth_broker_scope
 
 payload = json.loads(sys.argv[1])
-load_run_broker_shared_env(Path('/Users/kite/.hermes'))
-profile = Path('/Users/kite/.hermes/profiles') / payload['senderProfile']
+load_run_broker_shared_env(Path('/Users/dev/.hermes'))
+profile = Path('/Users/dev/.hermes/profiles') / payload['senderProfile']
 with _lark_cli_auth_broker_scope(profile, payload['openid']) as extra:
     env = {k: v for k, v in os.environ.items() if k in {'PATH','HOME','LANG','LC_ALL','TERM','TMPDIR'}}
     env.update(extra)
@@ -413,11 +413,11 @@ with _lark_cli_auth_broker_scope(profile, payload['openid']) as extra:
     chatId: scenario.chatId,
     text,
   };
-  const proc = spawnSync('/Users/kite/.hermes/hermes-feishu-uat/venv/bin/python', ['-c', py, JSON.stringify(payload)], {
+  const proc = spawnSync('/Users/dev/.hermes/hermes-feishu-uat/venv/bin/python', ['-c', py, JSON.stringify(payload)], {
     encoding: 'utf8',
     env: {
       ...process.env,
-      PYTHONPATH: '/Users/kite/code/hermes-multitenancy:/Users/kite/.hermes/hermes-feishu-uat',
+      PYTHONPATH: '/Users/dev/code/hermes-multitenancy:/Users/dev/.hermes/hermes-feishu-uat',
     },
     maxBuffer: 1024 * 1024 * 4,
   });
@@ -601,7 +601,7 @@ async function main() {
         mail: 'mail +triage --max 5 --format json',
         markdown: 'markdown +create --name HERMES_MATRIX_MARKDOWN_${MARK}.md',
         minutes: 'minutes +search --query HERMES_MATRIX --format json',
-        okr: 'okr +cycle-list --user-id ou_cf23e7c262afa4b7a006baa75f863ed5 --format json',
+        okr: 'okr +cycle-list --user-id ou_aaaaaaaaaaaaaaaa0000000000000001 --format json',
         task: 'task +get-my-tasks --format json',
         'vc-agent': 'vc +meeting-join --help',
         wiki: 'wiki +space-list --format json',

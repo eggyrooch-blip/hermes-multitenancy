@@ -227,7 +227,7 @@ def test_kep_cli_expired_jwt_collapses_to_needs_auth_through_registry(monkeypatc
         credential_hub,
         "_run",
         _kep_run_stub(
-            status_out="state: valid\noperator: owner <owner@keep.com>\n",
+            status_out="state: valid\noperator: owner <owner@example.com>\n",
             token_out=_make_jwt(past) + "\n",
         ),
     )
@@ -269,7 +269,7 @@ def test_kep_cli_environment_statuses_round_trip_through_registry(monkeypatch, t
             return _Proc(_make_jwt(future) + "\n")
         env = cmd[cmd.index("--env") + 1]
         if env == "online":
-            return _Proc("state: valid\noperator: owner <owner@keep.com>\n")
+            return _Proc("state: valid\noperator: owner <owner@example.com>\n")
         if env == "pre":
             return _Proc("state: not logged in\n", returncode=3)
         raise AssertionError(f"unexpected env in {cmd!r}")

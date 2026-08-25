@@ -50,7 +50,7 @@ class _FakeClient:
 _RUNTIME = {
     "provider": "custom:litellm-sre",
     "model": "tencent-sonnet-4-6",
-    "base_url": "https://litellm.sre.gotokeep.com/v1",
+    "base_url": "https://litellm.sre.example.com/v1",
     "api_key": "sk-test",
     "api_mode": "",
 }

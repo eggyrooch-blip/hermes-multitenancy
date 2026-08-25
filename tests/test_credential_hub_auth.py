@@ -187,7 +187,7 @@ def test_kep_cli_logged_in_checks_requested_env(monkeypatch, tmp_path):
         [str(bin_path), "--profile", "owner", "--env", "pre", "status"],
         [str(bin_path), "--profile", "owner", "--env", "pre", "token"],
     ]
-    assert urls == ["https://auth.pre.gotokeep.com/ldap/authjwt"]
+    assert urls == ["https://auth.pre.example.com/ldap/authjwt"]
 
 
 def test_start_kep_cli_login_uses_requested_env(monkeypatch, tmp_path):

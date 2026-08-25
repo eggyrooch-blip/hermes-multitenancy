@@ -27,7 +27,7 @@ JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){1,2}$")
 
 def _detect_env_from_url(url: str) -> str:
     text = (url or "").strip().lower()
-    if "proxy.cms.pre.gotokeep.com" in text or "auth.pre.gotokeep.com" in text:
+    if "proxy.cms.pre.example.com" in text or "auth.pre.example.com" in text:
         return "pre"
     return "online"
 

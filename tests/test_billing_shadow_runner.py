@@ -77,7 +77,7 @@ def _build_fixture(tmp_path, monkeypatch, *, billing_table=True):
             BillingIdentity(
                 employee_user_id="e-charlie",
                 profile_name="prof-charlie",
-                email="e-charlie@keep.com",
+                email="e-charlie@example.com",
                 litellm_user_id="llm-charlie",
                 team_id="team-1",
                 team_alias="T1",
@@ -173,7 +173,7 @@ def test_full_round_classifies_all_roots_with_zero_writes(
     assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
     detail_text = report_path.read_text()
     summary_text = json.dumps(summary)
-    for secret in _SECRET_STRINGS + ["@keep.com", "ou_"]:
+    for secret in _SECRET_STRINGS + ["@example.com", "ou_"]:
         assert secret not in summary_text
         assert secret not in detail_text
     cases = json.loads(detail_text)["cases"]

@@ -75,7 +75,7 @@ def test_outbound_raw_media_directive_is_not_counted_as_host_path_leak():
     runner = _load_runner()
 
     assert not runner._path_leaked("MEDIA:/workspace/Downloads/out.md")
-    assert runner._path_leaked("MEDIA:/Users/kite/.hermes/profiles/feishu_x/.env")
+    assert runner._path_leaked("MEDIA:/Users/dev/.hermes/profiles/feishu_x/.env")
 
 
 def test_list_messages_retries_transient_feishu_502(monkeypatch):

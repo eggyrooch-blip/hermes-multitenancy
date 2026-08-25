@@ -372,7 +372,7 @@ credentials:
     secret_kind: token
     env: GITLAB_TOKEN
     env_extra:
-      GITLAB_HOST: gitlab.gotokeep.com
+      GITLAB_HOST: gitlab.example.com
       "bad name": ignored
     vault_profile: __self__
     profiles: [alice, bob]
@@ -392,7 +392,7 @@ credentials:
         store.close()
 
     alice = _credential_env_for_aiagent(profiles / "alice")
-    assert alice == {"GITLAB_TOKEN": "personal-alice", "GITLAB_HOST": "gitlab.gotokeep.com"}
+    assert alice == {"GITLAB_TOKEN": "personal-alice", "GITLAB_HOST": "gitlab.example.com"}
 
     # bob has neither a personal record nor a shared one -> no token, and
     # therefore no companion vars either.
@@ -446,3 +446,112 @@ credentials:
     assert (profiles / "alice" / "workspace" / "credentials" / "gitlab.token").read_text(
         encoding="utf-8"
     ) == "global-token\n"
+
+
+def test_self_lane_wildcard_targets_only_groups_with_their_own_row(monkeypatch, tmp_path: Path):
+    """group-agent-gitlab-binding: a group that bound its own token is picked up
+    automatically; a group without one is NOT targeted — otherwise the
+    __self__→__shared__ fallback would materialize the shared secret into every
+    group workspace."""
+    from hermes_multitenancy.credential_materializer import materialize_credentials
+    from hermes_multitenancy.credentials import CredentialStore
+    from hermes_multitenancy.routing import RoutingTable
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_CREDENTIAL_KEY", "test-key")
+    shared = tmp_path / ".hermes"
+    profiles = shared / "profiles"
+    for name in ("alice", "group_bound", "group_empty"):
+        (profiles / name).mkdir(parents=True)
+    (shared / "credential-materialization.yaml").write_text(
+        """
+credentials:
+  - subject_id: kep-prd-skills
+    provider: gitlab
+    secret_kind: token
+    target: workspace/credentials/gitlab.token
+    env: GITLAB_TOKEN
+    vault_profile: __self__
+    profiles: ["*"]
+""",
+        encoding="utf-8",
+    )
+
+    table = RoutingTable(shared / "multitenancy.db")
+    try:
+        table.upsert(user_id="alice", profile_name="alice", open_id="ou_alice")
+        table.upsert_group(chat_id="oc_bound", profile_name="group_bound", owner_open_id="ou_alice")
+        table.upsert_group(chat_id="oc_empty", profile_name="group_empty", owner_open_id="ou_alice")
+    finally:
+        table.close()
+
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        store.put_credential(
+            profile_name="__shared__", subject_id="kep-prd-skills",
+            provider="gitlab", secret_kind="token",
+            payload={"token": "shared-token"},
+        )
+        store.put_credential(
+            profile_name="group_bound", subject_id="kep-prd-skills",
+            provider="gitlab", secret_kind="token",
+            payload={"token": "group-own-token"},
+        )
+    finally:
+        store.close()
+
+    stats = materialize_credentials(shared_home=shared)
+
+    assert stats["profiles_targeted"] == 2  # alice + group_bound
+    # group's OWN token is env-only by construction — no file lands on disk,
+    # the run env assembly resolves it via resolve_runtime_secret instead.
+    assert stats["personal_env_only"] == 1
+    assert not (profiles / "group_bound" / "workspace" / "credentials" / "gitlab.token").exists()
+    from hermes_multitenancy.credential_materializer import resolve_runtime_secret
+    import yaml as _yaml
+    entry = _yaml.safe_load(
+        (shared / "credential-materialization.yaml").read_text(encoding="utf-8")
+    )["credentials"][0]
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        payload, vault_profile = resolve_runtime_secret(store, entry, profile_name="group_bound")
+    finally:
+        store.close()
+    assert vault_profile == "group_bound"
+    assert payload and payload.get("token") == "group-own-token"
+    # alice has no own row → self lane falls back to the shared row (user lane unchanged)
+    alice_file = profiles / "alice" / "workspace" / "credentials" / "gitlab.token"
+    assert alice_file.read_text(encoding="utf-8") == "shared-token\n"
+    # the unbound group must not receive the shared fallback
+    assert not (profiles / "group_empty" / "workspace" / "credentials" / "gitlab.token").exists()
+
+
+def test_entry_targets_profile_gate_matrix(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy.credential_materializer import entry_targets_profile
+    from hermes_multitenancy.routing import RoutingTable
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir(parents=True)
+    table = RoutingTable(shared / "multitenancy.db")
+    try:
+        table.upsert(user_id="alice", profile_name="alice", open_id="ou_alice")
+        table.upsert_group(chat_id="oc_g", profile_name="grp", owner_open_id="ou_alice")
+    finally:
+        table.close()
+
+    self_lane = {
+        "subject_id": "kep-prd-skills", "provider": "gitlab", "secret_kind": "token",
+        "vault_profile": "__self__", "profiles": ["*"],
+    }
+    shared_lane = {**self_lane, "vault_profile": ""}
+    listed_only = {**self_lane, "profiles": ["alice"]}
+
+    # active group before any row: self-lane wildcard admits it
+    assert entry_targets_profile(self_lane, shared_home=shared, profile_name="grp")
+    # user route still admitted via the wildcard expansion
+    assert entry_targets_profile(self_lane, shared_home=shared, profile_name="alice")
+    # shared-lane wildcard never admits a group
+    assert not entry_targets_profile(shared_lane, shared_home=shared, profile_name="grp")
+    # no marker → explicit list only, groups don't ride in
+    assert not entry_targets_profile(listed_only, shared_home=shared, profile_name="grp")
+    # unknown profile stays rejected
+    assert not entry_targets_profile(self_lane, shared_home=shared, profile_name="ghost")

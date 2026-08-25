@@ -372,7 +372,7 @@ export HERMES_LITELLM_BILLING_ALLOWED_PATHS="/v1,/anthropic"
 export HERMES_AI_GATEWAY_BROKER_URL="https://<ai-gateway-private-host>"
 export HERMES_AI_GATEWAY_BROKER_TOKEN="<dedicated-hermes-service-bearer>"
 export HERMES_AI_GATEWAY_BROKER_TIMEOUT="5"
-export HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN="keep.com"
+export HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN="example.com"
 export HERMES_ORG_SNAPSHOT_DIR="$HERMES_HOME/org-snapshots"
 
 # Auto-provisioning path (hermes-multitenancy-billing-refresh). Separate bearer

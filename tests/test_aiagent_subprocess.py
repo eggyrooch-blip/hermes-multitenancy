@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 def _jwt_with_exp(exp_seconds: int) -> str:
     def _b64(payload: dict[str, object]) -> str:
@@ -914,7 +916,7 @@ os._exit(0)
     env["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] = "tok-session"
     env["PYTHONPATH"] = os.pathsep.join([
         str(Path.cwd()),
-        "/Users/kite/.hermes/hermes-feishu-uat",
+        "/Users/dev/.hermes/hermes-feishu-uat",
         env.get("PYTHONPATH", ""),
     ])
     completed = subprocess.run(
@@ -2706,7 +2708,7 @@ def test_stream_aiagent_subprocess_warm_worker_holds_slot_until_env_scope_cleanu
             assert second_task.done() is False
 
             await first.aclose()
-            assert await asyncio.wait_for(second_task, timeout=1) == [
+            assert await asyncio.wait_for(second_task, timeout=SYNC_TIMEOUT) == [
                 ("content", "content-run-2"),
                 ("done", "done-run-2"),
             ]
@@ -7001,7 +7003,7 @@ raise SystemExit(2)
     assert ".keep-login" not in online.stdout + online.stderr
 
     pre_from_url = subprocess.run(
-        [sys.executable, str(script), "--url", "https://proxy.cms.pre.gotokeep.com/api/x"],
+        [sys.executable, str(script), "--url", "https://proxy.cms.pre.example.com/api/x"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -9195,3 +9197,274 @@ def test_profile_dotenv_cannot_reintroduce_master_broker_key(monkeypatch, tmp_pa
     )
     assert env["HERMES_RUN_BROKER_KEY"] == "scoped-token-for-this-run"
     assert "HERMES_MULTITENANCY_RUN_BROKER_KEY" not in env
+
+
+def test_stream_aiagent_subprocess_kills_orphan_run_before_closing_auth_broker(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """An abandoned stream must not leave a run alive past its auth broker.
+
+    Regression for 2026-08-20: sunke's Feishu turns kept reporting
+    `dial tcp 127.0.0.1:<port>: connect: connection refused` from lark-cli.
+    Abandoning this generator raises GeneratorExit, which skips every except
+    branch, so the warm worker's run stayed alive while the finally closed the
+    per-turn lark-cli auth broker it was dialling.
+    """
+    from hermes_multitenancy import agent_real
+
+    reset = getattr(agent_real, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    order: list[str] = []
+
+    @contextmanager
+    def fake_env_scope(_event_, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        try:
+            yield {
+                "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+                "LARKSUITE_CLI_AUTH_PROXY": "http://127.0.0.1:39745",
+                **(extra or {}),
+            }
+        finally:
+            order.append("auth_broker_closed")
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                if json.loads(line).get("type") != "run":
+                    continue
+                # Emit content but never `done`: the run is still mid-flight,
+                # which is the state an abandoned stream leaves behind.
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": "partial"}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = SimpleNamespace()
+            self.pid = 4711
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            # Only the warm-worker discard path kills this process, so the kill
+            # itself is the observable "orphan run stopped" signal.
+            order.append("orphan_run_killed")
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        return FakeWorkerProc()
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario():
+        profile = tmp_path / "profiles" / "orphan-run"
+        stream = agent_real._stream_aiagent_subprocess(_event(), profile)
+        assert await stream.__anext__() == ("content", "partial")
+        # Consumer walks away mid-run (new inbound message / GC aclose).
+        await stream.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if reset is not None:
+            asyncio.run(reset())
+
+    # The run is killed FIRST; only then may the broker it was dialling close.
+    assert order == ["orphan_run_killed", "auth_broker_closed"], order
+
+
+def _orphan_run_harness(monkeypatch, tmp_path: Path):
+    """Warm-worker stream whose run never reports done. Returns (agent_real, order, profile)."""
+    from hermes_multitenancy import agent_real
+
+    monkeypatch.setenv("HERMES_AIAGENT_WARM_WORKER", "1")
+    order: list[str] = []
+
+    @contextmanager
+    def fake_env_scope(_event_, _profile_home, *, approval_dir, event_stream=False, extra=None):
+        try:
+            yield {
+                "HERMES_AIAGENT_EVENT_STREAM": "1" if event_stream else "0",
+                "HERMES_MULTITENANCY_APPROVAL_DIR": str(approval_dir),
+                **(extra or {}),
+            }
+        finally:
+            order.append("auth_broker_closed")
+
+    class FakeWorkerStdout:
+        def __init__(self):
+            self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self.queue.put_nowait(b'{"event": "ready"}\n')
+
+        async def readline(self):
+            return await self.queue.get()
+
+    class FakeWorkerStdin:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def write(self, payload):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            for line in text.splitlines():
+                if json.loads(line).get("type") != "run":
+                    continue
+                self.proc.stdout.queue.put_nowait(
+                    json.dumps({"event": "content", "text": "partial"}).encode() + b"\n"
+                )
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeWorkerProc:
+        def __init__(self):
+            self.stdout = FakeWorkerStdout()
+            self.stdin = FakeWorkerStdin(self)
+            self.stderr = SimpleNamespace()
+            self.pid = 4712
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            order.append("orphan_run_killed")
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        assert "--worker" in args
+        return FakeWorkerProc()
+
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    return agent_real, order, tmp_path / "profiles" / "orphan-run"
+
+
+def test_stream_aiagent_subprocess_closes_auth_broker_even_if_orphan_discard_raises(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A failing discard must never strand the broker.
+
+    Leaking the broker is worse than leaking the run: it leaves the turn's
+    frozen identity reachable with no owner left to end it.
+    """
+    from hermes_multitenancy import agent_real as _ar
+
+    reset = getattr(_ar, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    agent_real, order, profile = _orphan_run_harness(monkeypatch, tmp_path)
+
+    # The discard helper itself must be the thing that raises: worker.close()
+    # swallows its own exceptions, so a raising kill() would never reach the
+    # teardown and the guard would be tested against nothing. CancelledError is
+    # the realistic raiser here (BaseException, so close() cannot swallow it),
+    # and it is raised from the name streaming.py actually resolves.
+    import sys as _sys
+
+    streaming_mod = _sys.modules["hermes_multitenancy.agent_real.streaming"]
+
+    async def boom(_profile_home):
+        order.append("orphan_run_killed")
+        raise asyncio.CancelledError("cancelled mid-discard")
+
+    monkeypatch.setattr(streaming_mod, "_discard_aiagent_warm_worker", boom)
+
+    async def scenario():
+        stream = agent_real._stream_aiagent_subprocess(_event(), profile)
+        assert await stream.__anext__() == ("content", "partial")
+        await stream.aclose()
+
+    import contextlib
+
+    try:
+        with contextlib.suppress(asyncio.CancelledError):
+            asyncio.run(scenario())
+    finally:
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert "orphan_run_killed" in order
+    assert "auth_broker_closed" in order, "broker leaked when discard raised"
+
+
+def test_stream_aiagent_subprocess_orphan_discard_survives_cancel_during_teardown(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A cancel landing while the stream is being closed must not half-kill the run.
+
+    The teardown awaits the discard, so an unshielded cancel could leave the
+    orphan alive with a closed broker — the exact bug this guards.
+    """
+    import contextlib
+
+    from hermes_multitenancy import agent_real as _ar
+
+    reset = getattr(_ar, "_reset_aiagent_warm_workers_for_tests", None)
+    if reset is not None:
+        asyncio.run(reset())
+
+    agent_real, order, profile = _orphan_run_harness(monkeypatch, tmp_path)
+
+    async def scenario():
+        stream = agent_real._stream_aiagent_subprocess(_event(), profile)
+        assert await stream.__anext__() == ("content", "partial")
+        closing_task = asyncio.create_task(stream.aclose())
+        await asyncio.sleep(0)
+        closing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await closing_task
+        # Let a shielded discard finish even though the awaiting task was cancelled.
+        for _ in range(20):
+            if "orphan_run_killed" in order and "auth_broker_closed" in order:
+                break
+            await asyncio.sleep(0.01)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if reset is not None:
+            asyncio.run(reset())
+
+    assert "orphan_run_killed" in order, order
+    assert "auth_broker_closed" in order, order

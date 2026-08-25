@@ -141,6 +141,8 @@ def _run_cron_job_body(job: dict, cron_scheduler: Any) -> tuple[bool, str, str, 
         return deferred
     if _cw._cron_run_broker_enabled():
         return _cw._run_job_through_broker(job, cron_scheduler)
+    if str(job.get("expert_id") or "").strip():
+        return False, "", "", "scheduled expert execution requires RunBroker"
     return cron_scheduler.run_job(job)
 
 
@@ -242,7 +244,7 @@ def _run_job_for_profile_current_process(profile_home: Path, job: dict) -> dict[
                 open_id=job.get("owner_open_id"),
                 profile=job.get("owner_profile"),
                 run_id=job.get("id"),
-                expert_id=_cw._expert_id_for_cron_job(job),
+                expert_id=_cw._expert_id_for_cron_job(job, profile_home=profile_home),
                 decision="writable" if _writable_authorized(job) else "readonly",
                 force=bool(source_app),
             )

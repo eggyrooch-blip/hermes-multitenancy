@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 from hermes_multitenancy import router as router_mod
 
 
@@ -3431,7 +3433,7 @@ async def test_hook_completes_deferred_processing_once_across_admission_outcomes
             gateway=gateway,
             session_store=None,
         )
-        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.wait_for(completed.wait(), timeout=SYNC_TIMEOUT)
         await asyncio.sleep(0.05)
 
         assert result == {
@@ -3544,9 +3546,9 @@ async def test_hook_leader_cancel_with_live_peer_completes_deferred_processing_o
 
     try:
         router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
-        await asyncio.wait_for(prepare_started.wait(), timeout=2)
+        await asyncio.wait_for(prepare_started.wait(), timeout=SYNC_TIMEOUT)
         router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
-        await asyncio.wait_for(wait_for_two_waiters(), timeout=2)
+        await asyncio.wait_for(wait_for_two_waiters(), timeout=SYNC_TIMEOUT)
 
         leader_task = tracked_tasks[0]
         peer_task = tracked_tasks[1]
@@ -3556,8 +3558,8 @@ async def test_hook_leader_cancel_with_live_peer_completes_deferred_processing_o
             await leader_task
 
         release_prepare.set()
-        await asyncio.wait_for(peer_task, timeout=2)
-        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.wait_for(peer_task, timeout=SYNC_TIMEOUT)
+        await asyncio.wait_for(completed.wait(), timeout=SYNC_TIMEOUT)
         await asyncio.sleep(0)
 
         assert [call for call in lifecycle if call[0] == "defer"] == [
@@ -3674,7 +3676,7 @@ async def test_hook_late_defer_after_shared_completion_gets_new_completion(
 
     try:
         router_mod.on_pre_gateway_dispatch(event=event(), gateway=gateway)
-        await asyncio.wait_for(old_finalizer_done.wait(), timeout=2)
+        await asyncio.wait_for(old_finalizer_done.wait(), timeout=SYNC_TIMEOUT)
         assert completions == [
             ("om_late_defer_generation", "ProcessingOutcome.SUCCESS")
         ]

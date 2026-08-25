@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 def _force_reload_hermes_constants():
     """Drop the cached hermes_constants module so a fresh import reads env."""
@@ -41,11 +43,11 @@ async def _run_dispatch_cancellation_does_not_wait_for_runner_cleanup():
                 raise
 
         task = asyncio.create_task(ProfileRuntime(profile_home=profile_home, run_agent_fn=runner).dispatch(None))
-        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.wait_for(started.wait(), timeout=SYNC_TIMEOUT)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1.0)
-        await asyncio.wait_for(cancel_seen.wait(), timeout=1.0)
+            await asyncio.wait_for(task, timeout=SYNC_TIMEOUT)
+        await asyncio.wait_for(cancel_seen.wait(), timeout=SYNC_TIMEOUT)
         release_cleanup.set()
 
 

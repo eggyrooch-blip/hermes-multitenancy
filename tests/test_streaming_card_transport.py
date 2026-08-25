@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 @pytest.fixture(autouse=True)
 def _disable_card_content_throttle(monkeypatch):
@@ -1989,7 +1991,7 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
                 "preview": str(home / "home" / "generated_art.png"),
                 "args": {
                     "path": str(home / "workspace" / "docs" / "plan.md"),
-                    "host_path": "/Users/kite/.ssh/id_rsa",
+                    "host_path": "/Users/dev/.ssh/id_rsa",
                 },
             },
         )
@@ -2586,7 +2588,7 @@ async def test_stream_into_feishu_primes_card_before_waiting_for_agent_stream(
         )
     )
 
-    await asyncio.wait_for(stream_entered.wait(), timeout=1)
+    await asyncio.wait_for(stream_entered.wait(), timeout=SYNC_TIMEOUT)
 
     assert adapter.started == [
         {"chat_id": "chat-1", "reply_to": "om_source_prime", "metadata": None}
@@ -2630,13 +2632,13 @@ async def test_stream_into_feishu_keeps_card_alive_while_agent_is_silent(
         )
     )
 
-    await asyncio.wait_for(stream_entered.wait(), timeout=1)
+    await asyncio.wait_for(stream_entered.wait(), timeout=SYNC_TIMEOUT)
 
     async def wait_for_status_heartbeat():
         while len(adapter.status_updates) < 2:
             await asyncio.sleep(0.005)
 
-    await asyncio.wait_for(wait_for_status_heartbeat(), timeout=1)
+    await asyncio.wait_for(wait_for_status_heartbeat(), timeout=SYNC_TIMEOUT)
     assert [
         router_mod._strip_stream_status_animation_markers(update["content"])
         for update in adapter.status_updates[:2]
@@ -2687,13 +2689,13 @@ async def _run_stream_into_feishu_keeps_status_animating_after_tool_event(
         )
     )
 
-    await asyncio.wait_for(tool_started.wait(), timeout=1)
+    await asyncio.wait_for(tool_started.wait(), timeout=SYNC_TIMEOUT)
 
     async def wait_for_status_heartbeat():
         while len(adapter.status_updates) < 2:
             await asyncio.sleep(0.005)
 
-    await asyncio.wait_for(wait_for_status_heartbeat(), timeout=1)
+    await asyncio.wait_for(wait_for_status_heartbeat(), timeout=SYNC_TIMEOUT)
     assert [
         router_mod._strip_stream_status_animation_markers(update["content"])
         for update in adapter.status_updates[:2]
@@ -2755,7 +2757,7 @@ async def _run_stream_into_feishu_prompts_for_child_approval_and_approve_resolve
         while not adapter.sent:
             await asyncio.sleep(0.005)
 
-    await asyncio.wait_for(wait_for_approval_prompt(), timeout=1)
+    await asyncio.wait_for(wait_for_approval_prompt(), timeout=SYNC_TIMEOUT)
     assert "requires approval" in adapter.sent[0]["content"]
     assert "/approve" in adapter.sent[0]["content"]
 
@@ -2814,7 +2816,7 @@ async def test_stream_into_feishu_aborts_card_when_cancelled(monkeypatch, tmp_pa
         )
     )
 
-    await asyncio.wait_for(stream_waiting.wait(), timeout=1)
+    await asyncio.wait_for(stream_waiting.wait(), timeout=SYNC_TIMEOUT)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -2867,7 +2869,7 @@ async def test_stream_into_feishu_aborts_card_when_cancelled_during_start(
         )
     )
 
-    await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+    await asyncio.wait_for(adapter.start_entered.wait(), timeout=SYNC_TIMEOUT)
     task.cancel()
     adapter.release_start.set()
 
@@ -2923,7 +2925,7 @@ async def test_stream_into_feishu_aborts_card_when_cancelled_during_prime(
         )
     )
 
-    await asyncio.wait_for(adapter.prime_entered.wait(), timeout=1)
+    await asyncio.wait_for(adapter.prime_entered.wait(), timeout=SYNC_TIMEOUT)
     task.cancel()
     adapter.release_prime.set()
 

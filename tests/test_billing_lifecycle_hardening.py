@@ -57,7 +57,7 @@ def _payer(employee_id="alice", profile_name="alice"):
     return _ResolvedPayer(
         employee_id,
         profile_name,
-        f"{employee_id}@keep.com",
+        f"{employee_id}@example.com",
         "FD",
     )
 
@@ -149,7 +149,7 @@ def _provision_as_the_sweep(
     payer = _ResolvedPayer(
         employee_id,
         profile_name or employee_id,
-        email or f"{employee_id}@keep.com",
+        email or f"{employee_id}@example.com",
         "FD",
     )
     binding = manager.ensure_available(payer, None)
@@ -386,7 +386,7 @@ def test_unknown_migration_state_is_rejected_at_the_store(tmp_path: Path):
             BillingIdentity(
                 employee_user_id="alice",
                 profile_name="alice",
-                email="alice@keep.com",
+                email="alice@example.com",
                 litellm_user_id="llm-alice",
                 team_id="team-fd",
                 team_alias="FD",
@@ -497,7 +497,7 @@ def test_profile_conflict_is_rejected_before_credential_issue(
         BillingIdentity(
             employee_user_id="alice",
             profile_name="guest",
-            email="alice@keep.com",
+            email="alice@example.com",
             litellm_user_id="llm-alice",
             team_id="team-fd",
             team_alias="FD",

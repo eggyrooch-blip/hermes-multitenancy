@@ -12,6 +12,8 @@ import yaml
 
 from hermes_multitenancy import plugin_ingest as pi
 
+from tests._sync import SYNC_TIMEOUT
+
 PLUGIN_ID = "keep-resource-delivery"
 PLUGIN_VERSION = "0.1.0"
 PLUGIN_SKILLS = [
@@ -931,13 +933,13 @@ def test_explicit_active_and_failed_ingest_share_one_plugin_transaction(tmp_path
         result = original_assert(plugin, *args)
         if threading.current_thread().name == "active-event":
             first_paused.set()
-            assert release_first.wait(2)
+            assert release_first.wait(SYNC_TIMEOUT)
         return result
 
     def pause_second(plugin, *args, **kwargs):
         if threading.current_thread().name == "invalid-event":
             second_mutating.set()
-            assert release_second.wait(2)
+            assert release_second.wait(SYNC_TIMEOUT)
         return original_install(plugin, *args, **kwargs)
 
     def reject_out_of_transaction_active(shared, plugin_id, status):
@@ -980,13 +982,13 @@ def test_explicit_active_and_failed_ingest_share_one_plugin_transaction(tmp_path
     first = threading.Thread(target=run_active, name="active-event")
     second = threading.Thread(target=run_invalid, name="invalid-event")
     first.start()
-    assert first_paused.wait(2)
+    assert first_paused.wait(SYNC_TIMEOUT)
     assert _managed_manifest(shared_home)["status"] == "inactive"
     second.start()
     assert not second_mutating.wait(0.1)
     release_first.set()
-    first.join(2)
-    second.join(2)
+    first.join(SYNC_TIMEOUT)
+    second.join(SYNC_TIMEOUT)
 
     assert not first.is_alive() and not second.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], si.SkillhubInstallError)
@@ -1017,13 +1019,13 @@ def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path,
         if threading.current_thread().name == "reconcile-event":
             assert _managed_manifest(shared_home)["status"] == "active"
             reconcile_paused.set()
-            assert release_reconcile.wait(2)
+            assert release_reconcile.wait(SYNC_TIMEOUT)
         return original_uninstall(*args, **kwargs)
 
     def pause_invalid(plugin, *args, **kwargs):
         if threading.current_thread().name == "invalid-event":
             invalid_mutating.set()
-            assert release_invalid.wait(2)
+            assert release_invalid.wait(SYNC_TIMEOUT)
         return original_install(plugin, *args, **kwargs)
 
     monkeypatch.setattr(pi, "_uninstall_locked", pause_reconcile)
@@ -1061,12 +1063,12 @@ def test_full_snapshot_reconcile_and_ingest_are_one_plugin_transaction(tmp_path,
     first = threading.Thread(target=run_reconcile, name="reconcile-event")
     second = threading.Thread(target=run_invalid, name="invalid-event")
     first.start()
-    assert reconcile_paused.wait(2)
+    assert reconcile_paused.wait(SYNC_TIMEOUT)
     second.start()
     assert not invalid_mutating.wait(0.1)
     release_reconcile.set()
-    first.join(2)
-    second.join(2)
+    first.join(SYNC_TIMEOUT)
+    second.join(SYNC_TIMEOUT)
 
     assert not first.is_alive() and not second.is_alive()
     assert len(errors) == 1 and isinstance(errors[0], si.SkillhubInstallError)

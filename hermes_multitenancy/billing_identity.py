@@ -690,7 +690,7 @@ def _latest_org_snapshot() -> Optional[dict[str, Any]]:
 
 
 def _employee_org_fields(employee_id: str) -> tuple[str, str]:
-    domain = os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "keep.com").strip().lower()
+    domain = os.environ.get("HERMES_LITELLM_EMPLOYEE_EMAIL_DOMAIN", "example.com").strip().lower()
     if not domain or "@" in domain or "/" in domain:
         raise RunRejected("employee email domain is invalid")
     email = f"{employee_id}@{domain}"

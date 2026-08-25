@@ -36,7 +36,7 @@ def test_run_broker_jobs_are_owner_scoped(monkeypatch, tmp_path: Path):
         list_calls.append(profile_name)
         return []
 
-    def sentinel_create(profile_name, user_key, body):
+    def sentinel_create(profile_name, user_key, body, *, agent_id=""):
         create_calls.append((profile_name, user_key))
         return {"id": "job-1"}
 

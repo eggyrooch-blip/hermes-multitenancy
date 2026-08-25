@@ -1816,7 +1816,7 @@ def case_vision_failure_surfaces_recovery_context() -> dict[str, Any]:
     try:
         event = SimpleNamespace(
             text="我该如何在这个web页面中给你发送截图呢?",
-            media_urls=["/Users/kite/.hermes/profiles/coder/images/clip_20260506_132649_1.png"],
+            media_urls=["/Users/dev/.hermes/profiles/coder/images/clip_20260506_132649_1.png"],
             media_types=["image/png"],
         )
         result = asyncio.run(_local_enrich_with_vision_only(event))

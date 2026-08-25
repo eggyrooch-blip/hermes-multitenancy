@@ -8,6 +8,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests._sync import SYNC_TIMEOUT
+
 
 def test_run_request_requires_profile_user_and_content():
     from hermes_multitenancy.run_models import RunRequest
@@ -1600,7 +1602,7 @@ def test_run_broker_post_mark_redelivery_inherits_shared_entry_completion_owner(
             on_entry_done=lambda failed: retry_completions.append(failed),
         )
         release_dispatch.set()
-        await asyncio.wait_for(first_completed.wait(), timeout=2)
+        await asyncio.wait_for(first_completed.wait(), timeout=SYNC_TIMEOUT)
         for _ in range(10):
             await asyncio.sleep(0)
         return retry

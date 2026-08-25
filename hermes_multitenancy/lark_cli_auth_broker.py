@@ -407,8 +407,20 @@ class RunningLarkCliAuthBrokerServer:
         self._thread = thread
         host, port = server.server_address[:2]
         self.url = f"http://{host}:{port}"
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def close(self) -> None:
+        # Idempotent: the scope that owns this server can be exited more than
+        # once (turn finalization plus the caller's own finally), and a second
+        # server_close() on an already-closed socket must not raise into the
+        # teardown path that still has to release the worker and tmpdirs.
+        if self._closed:
+            return
+        self._closed = True
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)

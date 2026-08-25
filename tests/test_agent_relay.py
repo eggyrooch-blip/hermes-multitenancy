@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import types
 from urllib.parse import parse_qs, urlparse
 
@@ -731,7 +732,9 @@ def test_replies_reactions_and_cards_are_isolated_and_deterministic(tmp_path):
             )
             assert raced.status == 409
             assert (await raced.json())["status"] == "actioned"
-            assert len(feishu.card_updates) == 1
+            # 点击不再由服务端重绘：调用方拿着原文做局部替换，服务端拼不出那个内容。
+            # 状态保护不依赖重绘 —— 第二次点击 409 且飞书弹 Already resolved。
+            assert feishu.card_updates == []
 
             closeable = await client.post(
                 "/v1/cards",
@@ -751,7 +754,7 @@ def test_replies_reactions_and_cards_are_isolated_and_deterministic(tmp_path):
             )
             assert closed.status == 200
             assert (await closed.json())["status"] == "closed"
-            assert len(feishu.card_updates) == 2
+            assert len(feishu.card_updates) == 1
 
             await client.close()
             app = create_agent_relay_app(
@@ -1065,3 +1068,530 @@ def test_feishu_transport_preserves_application_error_details(monkeypatch):
             urllib.error.HTTPError("https://open.feishu.cn", 503, "unavailable", {}, body)
         )
         assert (caught.status, caught.code, caught.message) == (503, None, "")
+
+
+def test_card_message_content_update_is_verbatim_and_owner_bound(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import create_agent_relay_app
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            bob = {"Authorization": f"Bearer {await enroll_as(client, 'bob')}"}
+
+            schema_two = {
+                "schema": "2.0",
+                "body": {"elements": [{"tag": "markdown", "content": "step 1"}]},
+            }
+            posted = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "card",
+                    "content": schema_two,
+                    "idempotency_key": "alice-progress",
+                },
+            )
+            assert posted.status == 201
+            message_id = (await posted.json())["message_id"]
+
+            updated_content = {
+                "schema": "2.0",
+                "body": {"elements": [{"tag": "markdown", "content": "step 2 of 9"}]},
+            }
+            updated = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=alice,
+                json={"content": updated_content},
+            )
+            assert updated.status == 200
+            assert feishu.card_updates[-1]["content"] == updated_content
+            assert "elements" not in feishu.card_updates[-1]["content"]
+
+            stranger = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=bob,
+                json={"content": updated_content},
+            )
+            assert stranger.status == 404
+
+            texted = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "hi"},
+                    "idempotency_key": "alice-text",
+                },
+            )
+            text_id = (await texted.json())["message_id"]
+            refused = await client.patch(
+                f"/v1/messages/{text_id}",
+                headers=alice,
+                json={"content": {"elements": []}},
+            )
+            assert refused.status == 400
+            assert (await refused.json())["error"]["code"] == "invalid_message"
+
+            identity = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=alice,
+                json={"content": {"elements": [{"open_id": "ou_bob"}]}},
+            )
+            assert identity.status == 400
+            assert (await identity.json())["error"]["code"] == "identity_field_forbidden"
+
+            oversized = await client.patch(
+                f"/v1/messages/{message_id}",
+                headers=alice,
+                json={"content": {"elements": [{"tag": "markdown", "content": "x" * 32000}]}},
+            )
+            assert oversized.status == 400
+            assert (await oversized.json())["error"]["code"] == "content_too_large"
+
+            unauth = await client.patch(
+                f"/v1/messages/{message_id}", json={"content": updated_content}
+            )
+            assert unauth.status == 401
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_reply_window_can_be_closed_on_arrival(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        RELAY_STORE_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        events = app[RELAY_EVENTS_KEY]
+        store = app[RELAY_STORE_KEY]
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            first = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "round 1?"},
+                    "idempotency_key": "round-1",
+                    "reply_window_seconds": 300,
+                },
+            )
+            first_id = (await first.json())["message_id"]
+
+            closed = await client.patch(
+                f"/v1/messages/{first_id}",
+                headers=alice,
+                json={"reply_window_seconds": 0},
+            )
+            assert closed.status == 200
+
+            # the window is shut: a plain reply no longer lands anywhere
+            assert not await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-late",
+                text="too late",
+                create_time=int(time.time() * 1000),
+            )
+            replies = await client.get(f"/v1/messages/{first_id}/replies", headers=alice)
+            assert (await replies.json())["replies"] == []
+
+            # retention still works: the stamp is a real timestamp, never NULL
+            with store._lock:
+                stamp = store._conn.execute(
+                    "SELECT reply_expires_at FROM relay_messages WHERE message_id=?",
+                    (first_id,),
+                ).fetchone()["reply_expires_at"]
+            assert stamp is not None and stamp <= int(time.time() * 1000)
+
+            # closing again is a 409, not a silent success
+            again = await client.patch(
+                f"/v1/messages/{first_id}",
+                headers=alice,
+                json={"reply_window_seconds": 0},
+            )
+            assert again.status == 409
+
+            # round 2 opens a fresh window and is unambiguous again
+            second = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "round 2?"},
+                    "idempotency_key": "round-2",
+                    "reply_window_seconds": 300,
+                },
+            )
+            second_id = (await second.json())["message_id"]
+            assert await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-round-2",
+                text="批准",
+                create_time=int(time.time() * 1000),
+            )
+            assert feishu.ambiguity_notices == []
+            landed = await client.get(f"/v1/messages/{second_id}/replies", headers=alice)
+            assert [r["text"] for r in (await landed.json())["replies"]] == ["批准"]
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_button_card_gets_a_text_reply_fallback(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        events = app[RELAY_EVENTS_KEY]
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            posted = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "card-fallback",
+                },
+            )
+            assert posted.status == 201
+            body = await posted.json()
+            assert set(body) == {"card_id", "status", "message_id", "expires_at"}
+            card_message_id = body["message_id"]
+
+            assert await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-card-reply",
+                text="批准",
+                create_time=int(time.time() * 1000),
+                parent_message_id=card_message_id,
+            )
+            replies = await client.get(
+                f"/v1/messages/{card_message_id}/replies", headers=alice
+            )
+            assert replies.status == 200
+            assert [r["text"] for r in (await replies.json())["replies"]] == ["批准"]
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_card_fallback_row_carries_the_card_ttl_and_never_breaks_the_card(tmp_path, caplog):
+    """The registered row must expire WITH the card, and its failure must stay invisible."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        RELAY_STORE_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        store = app[RELAY_STORE_KEY]
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            made = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "ttl-card",
+                },
+            )
+            body = await made.json()
+            with store._lock:
+                row = store._conn.execute(
+                    "SELECT reply_expires_at, idempotency_key FROM relay_messages WHERE message_id=?",
+                    (body["message_id"],),
+                ).fetchone()
+            # window ends exactly WITH the card, not a fresh clock read after the send
+            assert row["reply_expires_at"] == body["expires_at"]
+            # raw key: a later POST /v1/messages reusing it must 409, never 500
+            reused = await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "hi"},
+                    "idempotency_key": "ttl-card",
+                },
+            )
+            assert reused.status == 409
+            assert (await reused.json())["error"]["code"] == "idempotency_conflict"
+
+            # a live card + a live message = two windows → unreferenced replies are ambiguous
+            await client.post(
+                "/v1/messages",
+                headers=alice,
+                json={
+                    "type": "text",
+                    "content": {"text": "and?"},
+                    "idempotency_key": "second-window",
+                    "reply_window_seconds": 300,
+                },
+            )
+            events = app[RELAY_EVENTS_KEY]
+            assert not await events.ingest_text(
+                actor_id="ou_alice",
+                event_id="evt-ambiguous",
+                text="哪个?",
+                create_time=int(time.time() * 1000),
+            )
+            assert feishu.ambiguity_notices == ["ou_alice"]
+
+            # registration failure must not touch the card's own response
+            store.register_card_message = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down"))
+            broken = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "card-register-broken",
+                },
+            )
+            assert broken.status == 201
+            assert (await broken.json())["status"] == "pending"
+        finally:
+            await client.close()
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(runner())
+    assert "fallback_register_failed" in caplog.text
+
+
+def test_card_content_patch_keeps_the_guards_the_other_routes_have(tmp_path):
+    """The content route must not be a softer door than POST /v1/cards."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import create_agent_relay_app
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            made = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "guard-card",
+                },
+            )
+            card_id = (await made.json())["card_id"]
+            before = len(feishu.card_updates)
+
+            # identity keys are rejected at ANY depth, exactly like POST /v1/cards
+            identity = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": [{"tag": "markdown", "open_id": "ou_bob"}]}},
+            )
+            assert identity.status == 400
+            assert (await identity.json())["error"]["code"] == "identity_field_forbidden"
+
+            oversized = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": [{"tag": "markdown", "content": "x" * 32000}]}},
+            )
+            assert oversized.status == 400
+            assert (await oversized.json())["error"]["code"] == "content_too_large"
+
+            # neither rejection may reach Feishu
+            assert len(feishu.card_updates) == before
+
+            # p1: the empty body must keep its historical error code
+            empty = await client.patch(f"/v1/cards/{card_id}", headers=alice, json={})
+            assert empty.status == 400
+            assert (await empty.json())["error"]["code"] == "invalid_close"
+
+            # p1: Feishu transport failures map like the sibling routes do
+            real_update = feishu.update_card
+
+            async def hang(**kw):
+                raise TimeoutError
+
+            feishu.update_card = hang
+            timed_out = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": []}},
+            )
+            assert timed_out.status == 504
+            assert (await timed_out.json())["error"]["code"] == "upstream_timeout"
+
+            from hermes_multitenancy.agent_relay import FeishuApiError
+
+            async def rejected(**kw):
+                raise FeishuApiError(400, None, code=230001, message="bad card")
+
+            feishu.update_card = rejected
+            refused = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"content": {"elements": []}},
+            )
+            assert refused.status == 400
+            assert (await refused.json())["error"]["code"] == "invalid_card"
+            feishu.update_card = real_update
+
+            # a close with NO content still drives the card to its terminal look —
+            # this is the shape every pre-existing client sends
+            closed = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=alice,
+                json={"status": "closed", "reason": "client_timeout"},
+            )
+            assert closed.status == 200
+            assert (await closed.json())["status"] == "closed"
+            assert len(feishu.card_updates) == before + 1
+            assert feishu.card_updates[-1].get("status") == "closed"
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_update_card_ships_the_composed_card_not_the_raw_argument():
+    """Transport-level: FakeFeishu only records kwargs, so the HTTP body needs its own test."""
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    client = FeishuRelayClient.__new__(FeishuRelayClient)
+    sent: list[dict] = []
+    client._tenant_access = lambda: "t-token"
+    client._request_json = lambda url, **kw: sent.append({"url": url, **kw}) or {}
+
+    # no caller content → the server-composed terminal card must go out, never "null"
+    client._update_card(message_id="om_x", status="closed")
+    body = json.loads(sent[-1]["body"]["content"])
+    assert body == {"elements": [{"tag": "markdown", "content": "Status: closed"}]}
+
+    client._update_card(message_id="om_x", status="actioned", action_id="approve")
+    assert json.loads(sent[-1]["body"]["content"])["elements"][0]["content"] == (
+        "Status: actioned (approve)"
+    )
+
+    # caller content → verbatim, not re-wrapped
+    caller = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "done"}]}}
+    client._update_card(message_id="om_x", content=caller)
+    assert json.loads(sent[-1]["body"]["content"]) == caller

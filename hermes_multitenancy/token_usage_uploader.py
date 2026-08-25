@@ -14,7 +14,7 @@
   3. 按 (owner_open_id, model) 聚合 sum(input/output/total)。
   4. owner_open_id → {email, dept}：**纯路由表**（lookup_by_open_id → user_id），
      email = ``<user_id>@<域名>`` —— user_id 即 LDAP 即全公司排行榜的统一身份键
-     （已在 prod 用现有数据验证 sunke→sunke@keep.com 精确匹配），故 **不需要飞书
+     （已在 prod 用现有数据验证 sunke→sunke@example.com 精确匹配），故 **不需要飞书
      email scope**。合成/占位身份(ou_* / 空)解析不到 → 跳过并计数（不污染他人）。
   5. POST 到收集端 `POST <COLLECTOR>/v1/usage/report`（工件 2 的 additive 端点），
      `{"source":"hermes","client":"Hermes","date":..., "records":[...]}`，Bearer 鉴权。
@@ -24,9 +24,9 @@
 
 环境变量：
   HERMES_TOKEN_USAGE_LEDGER_PATH    台账路径（默认 /var/log/hermes/token-usage.jsonl）
-  HERMES_TOKSCALE_COLLECTOR         收集端 base（默认 https://tokscale.gotokeep.com）
+  HERMES_TOKSCALE_COLLECTOR         收集端 base（默认 https://tokscale.example.com）
   HERMES_TOKSCALE_REPORT_KEY        上报 Bearer（必填，非 dry-run 时）
-  HERMES_TOKEN_USAGE_EMAIL_DOMAIN   邮箱域名（必填，非 dry-run；如 keep.com）
+  HERMES_TOKEN_USAGE_EMAIL_DOMAIN   邮箱域名（必填，非 dry-run；如 example.com）
   HERMES_MULTITENANCY_DB            路由表路径（默认 ~/.hermes/multitenancy.db）
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ from typing import Any, Callable, Iterable
 
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 DEFAULT_LEDGER_PATH = Path("/var/log/hermes/token-usage.jsonl")
-DEFAULT_COLLECTOR = "https://tokscale.gotokeep.com"
+DEFAULT_COLLECTOR = "https://tokscale.example.com"
 SOURCE = "hermes"
 CLIENT = "Hermes"
 # Feishu multi-person chat types — both bill to the group owner (mirror router._GROUP_CHAT_TYPES).
@@ -217,7 +217,7 @@ class RoutingOwnerLookup:
         """归属人 open_id → {email, dept}。
 
         email = ``<user_id>@<domain>`` —— user_id 即 LDAP 即全公司排行榜的统一身份键
-        （已在 prod 用现有数据验证 sunke→sunke@keep.com 精确匹配），故无需飞书 email scope。
+        （已在 prod 用现有数据验证 sunke→sunke@example.com 精确匹配），故无需飞书 email scope。
         合成/占位 user_id（``ou_*`` 或空）无法可靠归属 → 返回 None（调用方跳过计数）。
         dept 取路由表 display_label（次要；看板按 email JOIN people 表补全部门）。
         """
@@ -290,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     owner_of = make_owner_resolver(routing.group_owner, routing.profile_owner)
     email_domain = (os.getenv("HERMES_TOKEN_USAGE_EMAIL_DOMAIN") or "").strip()
     if not args.dry_run and not email_domain:
-        print("[uploader] ERROR: HERMES_TOKEN_USAGE_EMAIL_DOMAIN unset (e.g. keep.com)", file=sys.stderr)
+        print("[uploader] ERROR: HERMES_TOKEN_USAGE_EMAIL_DOMAIN unset (e.g. example.com)", file=sys.stderr)
         return 2
     email_domain = email_domain or "example.com"  # dry-run placeholder
     resolver = lambda open_id: routing.email_dept_for_open_id(open_id, email_domain)

@@ -44,7 +44,7 @@
 
 归属人 open_id 经路由表 `resolve_owner_root`/`lookup_by_open_id` 拿到 **user_id（即 LDAP）**，
 邮箱 = `<user_id>@<HERMES_TOKEN_USAGE_EMAIL_DOMAIN>`。这是**全公司排行榜的统一身份键**
-（已在 prod 用现有数据验证 `sunke`→`sunke@keep.com` 精确匹配各个源 + people 表），所以
+（已在 prod 用现有数据验证 `sunke`→`sunke@example.com` 精确匹配各个源 + people 表），所以
 Hermes 用量会和该人的 Cursor/Claude Code/MDM 等数据**合并到同一行**，不裂成两个人。
 multitenancy 飞书 app **没有** `contact:user.email:readonly` scope，本方案因此**不依赖**它。
 合成/占位身份（user_id=`ou_*` 或空）解析不到 → 跳过（不误记）。
@@ -54,7 +54,7 @@ multitenancy 飞书 app **没有** `contact:user.email:readonly` scope，本方�
 1. 替换 `hermes-token-uploader.service` 里的占位符 + 设环境：
    - `@PYTHON@` → gateway venv 的 python（`/home/hermes/.hermes/hermes-agent/venv/bin/python`）。
    - `HERMES_TOKSCALE_REPORT_KEY` → 上报 Bearer（= 员工 Mac MDM 同一把，收集端 COLLECTOR_API_TOKENS 之一）。
-   - `HERMES_TOKEN_USAGE_EMAIL_DOMAIN=keep.com`（必填）。
+   - `HERMES_TOKEN_USAGE_EMAIL_DOMAIN=example.com`（必填）。
    - `HERMES_MULTITENANCY_DB`（可选，默认 `~/.hermes/multitenancy.db`）。
    - 不再需要 `HERMES_HOME`/sync-root：邮箱与归属都只读路由表。
 2. 拷进用户级 systemd 并启用：
@@ -65,7 +65,7 @@ multitenancy 飞书 app **没有** `contact:user.email:readonly` scope，本方�
    ```
 3. 先手动干跑一次确认归属正确（不写网）：
    ```
-   HERMES_TOKEN_USAGE_EMAIL_DOMAIN=keep.com python3 -m hermes_multitenancy.token_usage_uploader --dry-run
+   HERMES_TOKEN_USAGE_EMAIL_DOMAIN=example.com python3 -m hermes_multitenancy.token_usage_uploader --dry-run
    ```
 
 ### 首次初始化：回写台账里所有历史日期
