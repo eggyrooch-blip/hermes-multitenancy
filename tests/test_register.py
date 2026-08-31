@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 import sys
+import types
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -123,6 +124,10 @@ def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_p
     """The WebUI broker sidecar is opt-in but wired during plugin register."""
     import hermes_multitenancy
 
+    gateway_run = types.ModuleType("gateway.run")
+    gateway_run.GatewayRunner = type("GatewayRunner", (), {})
+    monkeypatch.setitem(sys.modules, "gateway.run", gateway_run)
+
     calls = []
 
     class FakeCtx:
@@ -144,6 +149,10 @@ def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_p
 
 def test_router_register_disables_direct_helpdesk_and_installs_clarify_after_media_retry(monkeypatch):
     import hermes_multitenancy
+
+    gateway_run = types.ModuleType("gateway.run")
+    gateway_run.GatewayRunner = type("GatewayRunner", (), {})
+    monkeypatch.setitem(sys.modules, "gateway.run", gateway_run)
     from hermes_multitenancy import feishu_clarify_cards, feishu_media_retry
     from hermes_multitenancy import feishu_helpdesk_events, group_inviter_hook
 

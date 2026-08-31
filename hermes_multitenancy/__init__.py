@@ -112,6 +112,7 @@ def _register(ctx) -> None:
     install_when_gateway_runner_ready(
         "trusted-feishu-ingress",
         lambda _runner: _install_trusted_feishu_ingress(),
+        required=True,
     )
     # Make core skill resolution honor the CURRENT HERMES_HOME (not the frozen
     # import-time value). Unconditional: in the router gateway it fixes
@@ -138,7 +139,19 @@ def _register(ctx) -> None:
 def _install_trusted_feishu_ingress() -> None:
     from .trusted_feishu_ingress import install_trusted_feishu_ingress_admission
 
-    install_trusted_feishu_ingress_admission()
+    try:
+        install_trusted_feishu_ingress_admission()
+    except RuntimeError as exc:
+        if str(exc) != "Feishu core lacks trusted ingress contract":
+            raise
+        # Hermes 0.20.5 removed the private peer-bot admission seam. Human
+        # messages still pass the core adapter's own admission and the router's
+        # authoritative group/DM route checks; only peer-bot ticket ingress is
+        # unavailable on this host version.
+        logger.warning(
+            "[multitenancy] trusted peer-bot ingress unavailable on this Hermes "
+            "version; human group and DM routing remain enabled"
+        )
 
 
 def _install_router_gateway_integrations() -> None:

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-import importlib
+import os
+import signal
 import sys
 import threading
 import time
@@ -11,7 +12,7 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_pending: dict[str, Callable[[Any], None]] = {}
+_pending: dict[str, tuple[Callable[[Any], None], bool]] = {}
 _installed: set[str] = set()
 _inflight: set[str] = set()
 _failed: set[str] = set()
@@ -20,11 +21,6 @@ _worker: threading.Thread | None = None
 
 def _gateway_runner() -> Any | None:
     module = sys.modules.get("gateway.run")
-    if module is None:
-        # Standalone plugin loading (tests/CLI) may legitimately run before the
-        # gateway module is imported at all. That import is safe; only the
-        # *present but incomplete* module state must never be re-imported.
-        module = importlib.import_module("gateway.run")
     return getattr(module, "GatewayRunner", None) if module is not None else None
 
 
@@ -37,7 +33,7 @@ def _apply_ready() -> None:
         for name, _callback in callbacks:
             _pending.pop(name, None)
             _inflight.add(name)
-    for name, callback in callbacks:
+    for name, (callback, required) in callbacks:
         try:
             callback(runner)
         except Exception:
@@ -45,6 +41,13 @@ def _apply_ready() -> None:
             with _lock:
                 _inflight.discard(name)
                 _failed.add(name)
+            if required:
+                logger.critical(
+                    "[multitenancy] required deferred gateway patch %s failed; "
+                    "terminating startup",
+                    name,
+                )
+                _abort_gateway_startup()
         else:
             with _lock:
                 _inflight.discard(name)
@@ -69,7 +72,11 @@ def _wait_for_gateway_runner() -> None:
 
 
 def install_when_gateway_runner_ready(
-    name: str, callback: Callable[[Any], None], *, repeat_when_ready: bool = False
+    name: str,
+    callback: Callable[[Any], None],
+    *,
+    repeat_when_ready: bool = False,
+    required: bool = False,
 ) -> bool:
     """Install now when safe, otherwise poll ``sys.modules`` without importing.
 
@@ -89,7 +96,7 @@ def install_when_gateway_runner_ready(
         return True
     with _lock:
         if name not in _inflight:
-            _pending.setdefault(name, callback)
+            _pending.setdefault(name, (callback, required))
 
     _apply_ready()
     with _lock:
@@ -103,3 +110,8 @@ def install_when_gateway_runner_ready(
             )
             _worker.start()
     return False
+
+
+def _abort_gateway_startup() -> None:
+    """Terminate the host process when a required late boundary cannot install."""
+    os.kill(os.getpid(), signal.SIGTERM)

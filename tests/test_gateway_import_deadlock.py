@@ -26,6 +26,20 @@ def test_gateway_runner_patch_waits_for_partially_initialized_module(monkeypatch
     assert seen == [runner]
 
 
+def test_deferred_installer_never_imports_gateway_run(monkeypatch):
+    from hermes_multitenancy import gateway_deferred
+
+    monkeypatch.delitem(sys.modules, "gateway.run", raising=False)
+    monkeypatch.setattr(
+        "importlib.import_module",
+        lambda name: (_ for _ in ()).throw(AssertionError(f"unexpected import: {name}")),
+    )
+
+    assert gateway_deferred.install_when_gateway_runner_ready(
+        "no-import-test-patch", lambda _runner: None
+    ) is False
+
+
 def test_concurrent_ready_checks_install_a_patch_once(monkeypatch):
     from hermes_multitenancy.gateway_deferred import install_when_gateway_runner_ready
 
@@ -59,3 +73,25 @@ def test_concurrent_ready_checks_install_a_patch_once(monkeypatch):
         thread.join()
 
     assert seen == [module.GatewayRunner]
+
+
+def test_required_deferred_failure_aborts_gateway_startup(monkeypatch):
+    from hermes_multitenancy import gateway_deferred
+
+    module = types.ModuleType("gateway.run")
+    module.GatewayRunner = type("GatewayRunner", (), {})
+    monkeypatch.setitem(sys.modules, "gateway.run", module)
+    aborted = []
+    monkeypatch.setattr(gateway_deferred, "_abort_gateway_startup", lambda: aborted.append(True))
+
+    def fail(_runner):
+        raise RuntimeError("required boundary failed")
+
+    assert gateway_deferred.install_when_gateway_runner_ready(
+        "required-failure-test", fail, required=True
+    ) is False
+    deadline = time.monotonic() + 2
+    while not aborted and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert aborted == [True]
