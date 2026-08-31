@@ -218,27 +218,27 @@ def install_gateway_startup_watcher() -> None:
     global _gateway_watcher_installed
     if _gateway_watcher_installed:
         return
-    try:
-        from gateway.run import GatewayRunner
-    except Exception:
-        logger.exception("[multitenancy] failed to install gateway cron startup watcher")
-        return
+    from ..gateway_deferred import install_when_gateway_runner_ready
 
-    original = getattr(GatewayRunner, "_create_adapter", None)
-    if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+    def _install(GatewayRunner: Any) -> None:
+        global _gateway_watcher_installed
+        original = getattr(GatewayRunner, "_create_adapter", None)
+        if original is None or getattr(original, "_hermes_multitenancy_patched", False):
+            _gateway_watcher_installed = True
+            return
+
+        @functools.wraps(original)
+        def wrapped_create_adapter(self: Any, *args: Any, **kwargs: Any) -> Any:
+            adapter = original(self, *args, **kwargs)
+            _cw._schedule_startup_watch(self)
+            return adapter
+
+        setattr(wrapped_create_adapter, "_hermes_multitenancy_patched", True)
+        GatewayRunner._create_adapter = wrapped_create_adapter
         _gateway_watcher_installed = True
-        return
+        logger.info("[multitenancy] installed gateway cron startup watcher")
 
-    @functools.wraps(original)
-    def wrapped_create_adapter(self: Any, *args: Any, **kwargs: Any) -> Any:
-        adapter = original(self, *args, **kwargs)
-        _cw._schedule_startup_watch(self)
-        return adapter
-
-    setattr(wrapped_create_adapter, "_hermes_multitenancy_patched", True)
-    GatewayRunner._create_adapter = wrapped_create_adapter
-    _gateway_watcher_installed = True
-    logger.info("[multitenancy] installed gateway cron startup watcher")
+    install_when_gateway_runner_ready("gateway-cron-startup", _install)
 
 
 def _schedule_startup_watch(gateway: Any) -> None:

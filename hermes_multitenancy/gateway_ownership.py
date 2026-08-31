@@ -73,15 +73,14 @@ def may_own_cron_runtime() -> bool:
 
 def install_gateway_ownership_guard() -> None:
     """Patch GatewayRunner so non-router profile gateways never create Feishu."""
-    try:
-        from gateway.run import GatewayRunner
-    except Exception:
-        logger.exception("[multitenancy] failed to install gateway ownership guard")
-        return
+    from .gateway_deferred import install_when_gateway_runner_ready
 
-    _patch_gateway_runner_init(GatewayRunner)
-    _patch_gateway_runner_create_adapter(GatewayRunner)
-    logger.info("[multitenancy] installed gateway ownership guard")
+    def _install(GatewayRunner: Any) -> None:
+        _patch_gateway_runner_init(GatewayRunner)
+        _patch_gateway_runner_create_adapter(GatewayRunner)
+        logger.info("[multitenancy] installed gateway ownership guard")
+
+    install_when_gateway_runner_ready("gateway-ownership", _install)
 
 
 def _patch_gateway_runner_init(GatewayRunner: Any) -> None:
