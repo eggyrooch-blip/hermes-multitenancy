@@ -95,6 +95,11 @@ def install_when_gateway_runner_ready(
     if already_installed:
         return True
     with _lock:
+        # State may have changed while the callback ran on another thread.
+        # Re-check under the same lock used to enqueue, otherwise a late caller
+        # can re-add a callback immediately after the first install completed.
+        if name in _installed or name in _failed:
+            return True
         if name not in _inflight:
             _pending.setdefault(name, (callback, required))
 
