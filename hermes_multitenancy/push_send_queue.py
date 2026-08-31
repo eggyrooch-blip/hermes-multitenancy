@@ -166,14 +166,15 @@ def install_gateway_push_card_adapter_capture() -> None:
     global _gateway_adapter_capture_installed
     if _gateway_adapter_capture_installed:
         return
-    try:
-        from gateway.run import GatewayRunner
-    except Exception:
-        logger.exception("[push_card] gateway adapter capture install failed")
-        return
-    if _patch_gateway_create_adapter(GatewayRunner):
-        _gateway_adapter_capture_installed = True
-        logger.info("[push_card] installed gateway Feishu adapter capture")
+    from .gateway_deferred import install_when_gateway_runner_ready
+
+    def _install(GatewayRunner: Any) -> None:
+        global _gateway_adapter_capture_installed
+        if _patch_gateway_create_adapter(GatewayRunner):
+            _gateway_adapter_capture_installed = True
+            logger.info("[push_card] installed gateway Feishu adapter capture")
+
+    install_when_gateway_runner_ready("gateway-push-card-capture", _install)
 
 
 def ensure_push_card_adapter_patches_armed(adapter: Any) -> None:

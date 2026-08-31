@@ -17,10 +17,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Run hotfix acceptance tests
         run: |
-          uv run --extra test pytest -q \
+          ./scripts/run_tests.sh \
             tests/test_run_broker_ingest.py::test_ingest_async_fake_bearer_dry_run_constructs_authorization_without_leak \
             tests/test_run_broker_ingest.py::test_ingest_async_secrets_are_files_only_and_terminal_cleanup_redacts_poll
-          uv run --extra test pytest -q \
+          ./scripts/run_tests.sh \
             tests/test_run_broker_ingest.py::test_ingest_secret_prompt_requires_direct_execution_and_no_secret_echo \
             tests/test_aiagent_subprocess.py::test_run_with_aiagent_removes_delegation_toolset_for_ingest_runs \
             tests/test_aiagent_subprocess.py::test_run_with_aiagent_adds_terminal_for_ingest_strict_toolsets \
@@ -29,7 +29,7 @@ jobs:
             tests/test_aiagent_subprocess.py::test_run_with_aiagent_removes_real_resolver_delegation_for_ingest_runs \
             tests/test_aiagent_subprocess.py::test_run_with_aiagent_keeps_delegation_toolset_for_non_ingest_runs \
             tests/test_run_broker_ingest.py::test_ingest_async_default_dispatch_streams_terminal_with_secret_env_without_leak
-          uv run --extra test pytest -q \
+          ./scripts/run_tests.sh \
             tests/test_run_broker_ingest.py::test_ingest_sync_failure_log_redacts_secret_prefix_preview \
             tests/test_run_broker_ingest.py::test_ingest_async_classifies_agent_max_iterations_in_poll_and_logs_run_id \
             tests/test_run_broker_ingest.py::test_ingest_async_redacts_secret_before_error_truncation \
@@ -39,7 +39,7 @@ jobs:
             tests/test_aiagent_subprocess.py::test_run_aiagent_subprocess_redacts_ingest_secret_from_child_errors \
             tests/test_aiagent_subprocess.py::test_stream_aiagent_subprocess_redacts_ingest_secret_events \
             tests/test_aiagent_subprocess.py::test_ingest_runtime_redactor_redacts_opaque_secret_prefix
-          uv run --extra test pytest -q \
+          ./scripts/run_tests.sh \
             tests/test_run_broker_ingest.py::test_ingest_async_duplicate_idempotency_returns_same_run_without_dispatching_twice \
             tests/test_run_broker_ingest.py::test_ingest_async_same_idempotency_with_different_secret_fingerprint_is_409 \
             tests/test_run_broker_ingest.py::test_ingest_duplicate_returns_cached_result \

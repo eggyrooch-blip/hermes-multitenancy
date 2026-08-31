@@ -108,8 +108,12 @@ def _register(ctx) -> None:
 
     override_pool(_build_runtime_pool(_real_factory))
     install_gateway_ownership_guard()
-    from .trusted_feishu_ingress import install_trusted_feishu_ingress_admission
-    install_trusted_feishu_ingress_admission()
+    from .gateway_deferred import install_when_gateway_runner_ready
+    install_when_gateway_runner_ready(
+        "trusted-feishu-ingress",
+        lambda _runner: _install_trusted_feishu_ingress(),
+        required=True,
+    )
     # Make core skill resolution honor the CURRENT HERMES_HOME (not the frozen
     # import-time value). Unconditional: in the router gateway it fixes
     # cross-profile "skill not found" for cron jobs; in profile-native runtimes
@@ -121,64 +125,75 @@ def _register(ctx) -> None:
         install_cron_runtime_patches()
         install_gateway_startup_watcher()
     if is_router_profile_runtime():
-        from .feishu_group_topic_session import install_feishu_group_topic_session_patch
-        install_feishu_group_topic_session_patch()
-        from .group_inviter_hook import install_feishu_bot_added_hook
-        install_feishu_bot_added_hook()
-        from .feishu_media_retry import install_feishu_media_retry_patch
-        install_feishu_media_retry_patch()
-        # ONE card-action dispatcher owns the live callback; the feature
-        # installers below only register/reuse their business handlers.
-        from .feishu_card_action_dispatcher import install_feishu_card_action_dispatcher
-        install_feishu_card_action_dispatcher()
-        from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
-        install_feishu_clarify_card_action_patch()
-        try:
-            from .push_card_matcher import install_feishu_push_card_matcher_patch
-            install_feishu_push_card_matcher_patch()
-        except Exception:
-            # Matcher wiring is fail-open by design; a deferred/failed install
-            # must never block the broker/credential subsystems started below.
-            logger.exception("[push_card] matcher install failed; continuing without inbound matching")
-        try:
-            from .push_card_confirm import install_feishu_push_card_confirm_patch
-            install_feishu_push_card_confirm_patch()
-        except Exception:
-            # 5th card.action.trigger patch; undefined放行 delegates to the other
-            # four. Fail-open like its siblings — never block the broker below.
-            logger.exception("[push_card] confirm patch install failed; continuing without confirm handling")
-        try:
-            # Bind the proactive card sender (notify-card dispatch has no inbound
-            # event to carry the adapter) and start the sweep worker — without
-            # these the live sender never fires and the expiry/re-drive/reconcile
-            # sweeps are dead code.
-            from .push_send_queue import (
-                install_gateway_push_card_adapter_capture,
-                install_live_push_card_sender,
-            )
-            install_live_push_card_sender()
-            # Capture the live Feishu adapter at gateway startup so the FIRST
-            # proactive push works without the user messaging the bot first
-            # (cold-start; the inbound stash is only a fallback).
-            install_gateway_push_card_adapter_capture()
-            from .push_card_workers import ensure_push_card_sweeps_started
-            ensure_push_card_sweeps_started()
-        except Exception:
-            logger.exception("[push_card] send-sender / sweep wiring failed; continuing")
-        try:
-            from .feishu_message_trace import install_message_trace_filter
-            install_message_trace_filter()
-        except Exception:
-            # Diagnostic sugar must not block the broker / credential subsystems
-            # that this same block starts right after (sibling installs above
-            # swallow too, for the same reason).
-            logger.exception("[message_trace] install failed; continuing without per-message log tracing")
-        webui_broker_server.ensure_run_broker_server_started()
-        _start_credential_renewal_subsystem()
+        install_when_gateway_runner_ready(
+            "router-gateway-integrations",
+            lambda _runner: _install_router_gateway_integrations(),
+            repeat_when_ready=True,
+        )
 
     register_credential_status_tool(ctx)
     _register_optional_vod_image_gen_provider(ctx)
     ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
+
+
+def _install_trusted_feishu_ingress() -> None:
+    from .trusted_feishu_ingress import install_trusted_feishu_ingress_admission
+
+    try:
+        install_trusted_feishu_ingress_admission()
+    except RuntimeError as exc:
+        if str(exc) != "Feishu core lacks trusted ingress contract":
+            raise
+        # Hermes 0.20.5 removed the private peer-bot admission seam. Human
+        # messages still pass the core adapter's own admission and the router's
+        # authoritative group/DM route checks; only peer-bot ticket ingress is
+        # unavailable on this host version.
+        logger.warning(
+            "[multitenancy] trusted peer-bot ingress unavailable on this Hermes "
+            "version; human group and DM routing remain enabled"
+        )
+
+
+def _install_router_gateway_integrations() -> None:
+    """Install integrations that require Hermes gateway modules to be complete."""
+    from .feishu_group_topic_session import install_feishu_group_topic_session_patch
+    install_feishu_group_topic_session_patch()
+    from .group_inviter_hook import install_feishu_bot_added_hook
+    install_feishu_bot_added_hook()
+    from .feishu_media_retry import install_feishu_media_retry_patch
+    install_feishu_media_retry_patch()
+    from .feishu_card_action_dispatcher import install_feishu_card_action_dispatcher
+    install_feishu_card_action_dispatcher()
+    from .feishu_clarify_cards import install_feishu_clarify_card_action_patch
+    install_feishu_clarify_card_action_patch()
+    try:
+        from .push_card_matcher import install_feishu_push_card_matcher_patch
+        install_feishu_push_card_matcher_patch()
+    except Exception:
+        logger.exception("[push_card] matcher install failed; continuing without inbound matching")
+    try:
+        from .push_card_confirm import install_feishu_push_card_confirm_patch
+        install_feishu_push_card_confirm_patch()
+    except Exception:
+        logger.exception("[push_card] confirm patch install failed; continuing without confirm handling")
+    try:
+        from .push_send_queue import (
+            install_gateway_push_card_adapter_capture,
+            install_live_push_card_sender,
+        )
+        install_live_push_card_sender()
+        install_gateway_push_card_adapter_capture()
+        from .push_card_workers import ensure_push_card_sweeps_started
+        ensure_push_card_sweeps_started()
+    except Exception:
+        logger.exception("[push_card] send-sender / sweep wiring failed; continuing")
+    try:
+        from .feishu_message_trace import install_message_trace_filter
+        install_message_trace_filter()
+    except Exception:
+        logger.exception("[message_trace] install failed; continuing without per-message log tracing")
+    webui_broker_server.ensure_run_broker_server_started()
+    _start_credential_renewal_subsystem()
 
 
 def _register_optional_vod_image_gen_provider(ctx) -> bool:
