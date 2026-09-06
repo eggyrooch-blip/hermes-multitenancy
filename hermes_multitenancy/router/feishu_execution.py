@@ -7,13 +7,49 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import router as _m
+from .. import turn_tool_context
 from ..run_broker import AdmittedRun, RunBroker, RunRejected
 from ..run_models import RunResult
+from ..trusted_feishu_ingress import TrustedFeishuAdmission
 from .feishu_completion import begin_deferred_completion
 from .vision_admission import vision_block_reply
 
 
 _FEISHU_COMPLETION_TIMEOUT_SECONDS = 5.0
+# Unit separator — same delimiter ``session_scope`` uses; cannot appear in a
+# chat_id or an open_id.
+_CARRY_SEP = "\x1f"
+
+
+def _carry_admission(event: Any, profile_name: str) -> Optional[TrustedFeishuAdmission]:
+    """The sealed DM admission this run may carry tool context under, else None.
+
+    Same boundary the credential materializer enforces
+    (``agent_real/_core.py`` ``_resolve_runtime_credentials``): only a sealed,
+    employee-actor, ``feishu:user``-scoped admission whose profile agrees with
+    the routed one. Group runs execute under ``feishu:bot`` and therefore bind
+    nothing — no carry, no capture.
+    """
+    admission = getattr(event, "trusted_feishu_ingress_admission", None)
+    if (
+        isinstance(admission, TrustedFeishuAdmission)
+        and admission.is_authentic()
+        and getattr(admission, "actor_kind", "user") == "user"
+        and getattr(admission, "tool_scope", "") == "feishu:user"
+        and getattr(admission, "profile_name", "") == profile_name
+    ):
+        return admission
+    return None
+
+
+def _carry_session_id(hist_key: tuple, admission: Any) -> str:
+    """Session dimension of the carryover key: history key + chat.
+
+    With STRICT_CONTEXT off ``SessionScope.history_key`` is only
+    ``(profile, user_key)``, so the chat_id suffix is the load-bearing part
+    that keeps a DM's carried tool output from reaching a group turn.
+    """
+    return f"{hist_key[1]}{_CARRY_SEP}{getattr(admission, 'chat_id', '') or ''}"
 
 
 async def _complete_feishu_processing(adapter: Any, event: Any, *, failed: bool) -> None:
@@ -127,6 +163,27 @@ async def execute_admitted_feishu_run(
     user_msg = _m._build_user_message(event, text_override=contextual_text)
     conversation = prior + [user_msg]
     _m._persist_user_message(hist_key, user_msg)
+    # Bind BEFORE the event is cloned: ``_event_with_text`` /
+    # ``_event_with_run_metadata`` are ``copy.copy`` shallow copies, so the
+    # clones the child streams through share this one RunCarry object and
+    # mark_done/record_transcript land on the instance ``commit_turn`` reads.
+    carry_admission = _carry_admission(event, profile_name)
+    if carry_admission is not None:
+        turn_tool_context.bind(
+            event,
+            channel="feishu",
+            profile_name=profile_name,
+            user_key=carry_admission.actor_subject,
+            session_id=_carry_session_id(hist_key, carry_admission),
+            user_text=user_msg["content"],
+            # The FULL conversation, exactly what WebUI hands it
+            # (``periphery`` passes its own ``messages``): ``align`` drops
+            # ``history[:-1]`` as the in-flight user message. Passing ``prior``
+            # would eat the last PRIOR row instead — invisible when it is an
+            # assistant reply, fatal after a media-only turn that persisted
+            # none, whose user row would never count as answered.
+            messages=conversation,
+        )
     if current is not None and _m._user_inflight_tasks.get(inflight_key) is current:
         _m._user_inflight_history_keys[inflight_key] = hist_key
     agent_event = _m._event_with_text(event, user_msg["content"])
@@ -192,6 +249,11 @@ async def execute_admitted_feishu_run(
 
         if response_text and isinstance(response_text, str):
             _m._persist_assistant_message(hist_key, response_text)
+        # Outside the ``response_text`` guard on purpose: a media-only or empty
+        # answer still ran tools, and every failure path (cancel / RunRejected /
+        # exception / concurrent replacement) returns before this line. The
+        # terminal-done gate lives inside commit_turn, which logs its verdict.
+        turn_tool_context.commit_turn(event)
         _m._touch_route(sender, sender_alt)
         return run_result
     except asyncio.CancelledError:

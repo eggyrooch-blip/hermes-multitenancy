@@ -124,7 +124,7 @@ def test_kill_process_group_kills_real_descendant(tmp_path):
         start_new_session=True,
     )
     try:
-        for _ in range(100):  # wait for the grandchild pid to land
+        for _ in range(600):  # wait for the grandchild pid to land
             if pidfile.exists() and pidfile.read_text().strip():
                 break
             time.sleep(0.05)

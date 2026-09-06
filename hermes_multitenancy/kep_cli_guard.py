@@ -5,6 +5,7 @@ import textwrap
 from pathlib import Path
 
 from . import kep_live_identity
+from .oauth_cli_guard import HEADLESS_OAUTH_ENTRY_WORDS
 from .security_audit import DEFAULT_AUDIT_PATH
 
 KEP_SHIM_NAMES: tuple[str, ...] = (
@@ -250,6 +251,17 @@ def _shim_program(
                 return ""
             return "read-only kep/hades command denied: command is not in the read allowlist"
 
+        def _headless_oauth_reason(argv) -> str:
+            if COMMAND_NAME != "kep-auth" or _is_help_request(argv):
+                return ""
+            words = _readonly_words(argv)
+            if words.intersection({set(HEADLESS_OAUTH_ENTRY_WORDS | {"auth"})!r}):
+                return (
+                    "Interactive kep-auth OAuth is disabled in headless runs. "
+                    "Use the Hermes Connectors authorization link."
+                )
+            return ""
+
         def _parse_env_name(argv) -> str:
             for idx, arg in enumerate(argv):
                 if arg == "--env" and idx + 1 < len(argv):
@@ -363,6 +375,10 @@ def _shim_program(
             argv = list(sys.argv[1:])
             if not _has_explicit_profile(argv):
                 argv = ["--profile", EXPECTED_PROFILE, *argv]
+            oauth_reason = _headless_oauth_reason(argv)
+            if oauth_reason:
+                print(oauth_reason, file=sys.stderr)
+                return 77
             readonly_reason = _readonly_write_reason(argv)
             if readonly_reason:
                 print(readonly_reason, file=sys.stderr)

@@ -1871,14 +1871,14 @@ def _refresh_env(monkeypatch, db, payer_ids):
 
 
 def test_routing_sentinel_enrolls_whoever_sync_routes(monkeypatch, tmp_path):
-    """The 2026-08-14 gap: lisi joined, feishu-sync routed him, and the
+    """The 2026-08-14 gap: chenjunjiang joined, feishu-sync routed him, and the
     frozen HERMES_LITELLM_BILLING_PAYER_IDS list still didn't know him — so the
     sweep never minted. With "@routing" the routing table IS the cohort."""
     from hermes_multitenancy import billing_employee_key as bek
 
     db = _routing_db(tmp_path, [
         ("sunke", "sunke", 1, "user", "sync"),
-        ("lisi", "lisi", 1, "user", "sync"),
+        ("chenjunjiang", "chenjunjiang", 1, "user", "sync"),
         ("departed", "departed", 0, "user", "sync"),      # inactive: retired
         ("svc-bot", "svc-bot", 1, "user", "manual"),      # not sync: excluded
         ("grp", "grp", 1, "group", "sync"),               # not a user: excluded
@@ -1886,7 +1886,7 @@ def test_routing_sentinel_enrolls_whoever_sync_routes(monkeypatch, tmp_path):
     _refresh_env(monkeypatch, db, "@routing")
 
     out = bek.run_refresh(dry_run=True)
-    assert out["would_issue"] == ["lisi", "sunke"]
+    assert out["would_issue"] == ["chenjunjiang", "sunke"]
     assert out["cohort"] == 2
 
 
@@ -1899,13 +1899,13 @@ def test_routing_sentinel_reports_noncanonical_ids_instead_of_minting(
 
     db = _routing_db(tmp_path, [
         ("sunke", "sunke", 1, "user", "sync"),
-        ("ou_eeeeeeeeeeeeeeee0000000000000001", "ghost", 1, "user", "sync"),
+        ("ou_bbbbbbbbbbbbbbbb0000000000000001", "ghost", 1, "user", "sync"),
     ])
     _refresh_env(monkeypatch, db, "@routing")
 
     out = bek.run_refresh(dry_run=True)
     assert out["would_issue"] == ["sunke"]
-    assert out["unrouted"] == ["ou_eeeeeeeeeeeeeeee0000000000000001"]
+    assert out["unrouted"] == ["ou_bbbbbbbbbbbbbbbb0000000000000001"]
 
 
 def test_a_list_containing_the_sentinel_stays_static(monkeypatch, tmp_path):
@@ -1915,13 +1915,13 @@ def test_a_list_containing_the_sentinel_stays_static(monkeypatch, tmp_path):
 
     db = _routing_db(tmp_path, [
         ("sunke", "sunke", 1, "user", "sync"),
-        ("lisi", "lisi", 1, "user", "sync"),
+        ("chenjunjiang", "chenjunjiang", 1, "user", "sync"),
     ])
     _refresh_env(monkeypatch, db, "sunke,@routing")
 
     out = bek.run_refresh(dry_run=True)
     assert out["would_issue"] == ["sunke"]
-    assert "lisi" not in out["would_issue"]
+    assert "chenjunjiang" not in out["would_issue"]
     assert out["unrouted"] == ["@routing"]
 
 
@@ -1953,7 +1953,7 @@ def test_routing_sentinel_refuses_a_cohort_with_no_mintable_member(
     from hermes_multitenancy import billing_employee_key as bek
 
     db = _routing_db(tmp_path, [
-        ("ou_eeeeeeeeeeeeeeee0000000000000001", "ghost", 1, "user", "sync"),
+        ("ou_bbbbbbbbbbbbbbbb0000000000000001", "ghost", 1, "user", "sync"),
     ])
     _refresh_env(monkeypatch, db, "@routing")
 

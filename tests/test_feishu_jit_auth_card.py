@@ -326,3 +326,35 @@ async def test_second_jit_does_not_double_poll(monkeypatch: pytest.MonkeyPatch) 
     router._start_feishu_auth_poll_task(session_id="sess-1", **common)
     await asyncio.sleep(0)
     assert started == 2
+
+
+@pytest.mark.asyncio
+async def test_same_run_emits_one_safe_auth_required_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_multitenancy import agent_real
+
+    official = {"provider": "feishu", "connector_id": "lark-cli"}
+    unsafe_duplicate = {
+        "provider": "feishu",
+        "connector_id": "lark-cli",
+        "hint": "paste token here",
+        "access_token": "must-not-surface",
+    }
+
+    async def duplicate_auth_stream(*_args, **_kwargs):
+        agent_real._CREDENTIAL_EXPIRY_SIGNAL.get().set(official)
+        agent_real._PERMISSION_AUTH_SIGNAL.get().set(unsafe_duplicate)
+        yield "done", "OAuth stopped"
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", duplicate_auth_stream)
+    event = SimpleNamespace(text="read calendar", message_id="om-1", source=None)
+
+    chunks = [item async for item in agent_real.stream_run_agent(event, tmp_path)]
+    auth_signals = [payload for kind, payload in chunks if kind == "auth_required"]
+
+    assert auth_signals == [official]
+    visible = str(auth_signals).lower()
+    assert "paste token" not in visible
+    assert "must-not-surface" not in visible

@@ -36,7 +36,7 @@ def _materialize_response_artifacts(response: str, profile_home: Path) -> str:
     the existing outbound MEDIA safety boundary.
     """
     text = str(response or "")
-    if "```hermes-artifact-json" not in text.lower():
+    if _m._ARTIFACT_JSON_RE.search(text) is None:
         return text
     root = profile_home.expanduser().resolve(strict=False)
     workspace = (root / "workspace").resolve(strict=False)

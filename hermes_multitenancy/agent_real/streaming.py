@@ -21,6 +21,16 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 
+def _persistable_tool_call(tool_name: str, preview: Any, args: Any) -> dict[str, Any]:
+    if tool_name == "lark_cli":
+        return {
+            "name": "lark_cli",
+            "args": {"redacted": True},
+            "preview": "lark_cli",
+        }
+    return {"name": str(tool_name), "args": args, "preview": preview}
+
+
 class _ProtocolPlaceholderStreamSanitizer:
     """Remove the empty-message marker even when it crosses stream chunks."""
 
@@ -163,6 +173,43 @@ async def _stream_loop(
     raise RuntimeError("streaming exhausted (no usable provider returned content)")
 
 
+class AiagentToolStallTimeout(RuntimeError):
+    """The child produced no stream events for ``timeout_s`` and was killed.
+
+    Carries the tool that was in flight (if any) so the log line and the user
+    notice can say WHICH tool stalled instead of the generic 中途出错 — prod
+    2026-09-03: a 5-minute ``./oup adobe init`` died at 300s with zero log
+    lines and the next turn's model invented "沙箱受限" from the dangling call.
+    The message keeps the historical "produced no stream events" prefix.
+    """
+
+    def __init__(
+        self,
+        timeout_s: float,
+        *,
+        tool_call_id: str = "",
+        tool_name: str = "",
+        elapsed_s: float | None = None,
+    ) -> None:
+        self.timeout_s = float(timeout_s)
+        self.tool_call_id = tool_call_id or ""
+        self.tool_name = tool_name or ""
+        self.elapsed_s = elapsed_s
+        detail = ""
+        if self.tool_name and self.elapsed_s is not None:
+            detail = f" (tool {self.tool_name} in flight for {self.elapsed_s:.0f}s)"
+        super().__init__(
+            f"AIAgent subprocess produced no stream events for {self.timeout_s:g}s{detail}"
+        )
+
+    @property
+    def user_notice(self) -> str:
+        if self.tool_name:
+            secs = f"{self.elapsed_s:.0f}" if self.elapsed_s is not None else f"{self.timeout_s:g}"
+            return f"⚠️ 工具 {self.tool_name} 已运行 {secs} 秒没有输出，本轮已中止。请重新发送指令。"
+        return f"⚠️ 后台执行 {self.timeout_s:g} 秒没有任何输出，本轮已中止。请重新发送指令。"
+
+
 async def _stream_aiagent_subprocess(
     event: Any,
     profile_home: Path,
@@ -272,6 +319,12 @@ async def _stream_aiagent_subprocess(
             return str(int(_time.time()))
 
     session_id = f"{_canonical_session_id}:epoch:{_resolve_epoch()}"
+    from . import executor_map as _executor_map
+
+    _stage_codex_output = (
+        _executor_map.runtime_for_event(event, profile_home)
+        == _executor_map.CODEX_APP_SERVER
+    )
 
     class _StateDbMirror:
         """Parent-side write-through to ``profile_home/state.db`` for web-ui visibility.
@@ -289,6 +342,8 @@ async def _stream_aiagent_subprocess(
             self.session_ensured: bool = False
             self.user_inserted: bool = False
             self.retagged: bool = False
+            self.stage_output = _stage_codex_output
+            self.staged_operations: list[tuple[Any, ...]] = []
 
         def _audit(
             self,
@@ -330,6 +385,11 @@ async def _stream_aiagent_subprocess(
                 logger.exception("[multitenancy] mirror schema init failed")
             try:
                 with closing(self._conn()) as conn, conn:
+                    columns = {
+                        str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")
+                    }
+                    if "tool_call_id" not in columns:
+                        conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT")
                     conn.execute(
                         "INSERT OR IGNORE INTO sessions (id, source, started_at) "
                         "VALUES (?, 'feishu', ?)",
@@ -369,6 +429,8 @@ async def _stream_aiagent_subprocess(
                 self.assistant_reasoning += reasoning_delta
             if not self.assistant_content and not self.assistant_reasoning:
                 return
+            if self.stage_output:
+                return
             self.ensure_session()
             try:
                 with closing(self._conn()) as conn, conn:
@@ -407,6 +469,21 @@ async def _stream_aiagent_subprocess(
                 logger.exception("[multitenancy] mirror upsert_assistant failed")
 
         def seal_assistant(self, finish_reason: str | None = None) -> None:
+            if self.stage_output:
+                if self.assistant_content or self.assistant_reasoning:
+                    self.staged_operations.append(
+                        (
+                            "assistant",
+                            self.assistant_content,
+                            self.assistant_reasoning,
+                            finish_reason,
+                        )
+                    )
+                self.active_assistant_id = None
+                self.active_assistant_timestamp = None
+                self.assistant_content = ""
+                self.assistant_reasoning = ""
+                return
             if self.active_assistant_id is not None:
                 self._audit(
                     message_id=self.active_assistant_id,
@@ -420,13 +497,24 @@ async def _stream_aiagent_subprocess(
             self.assistant_content = ""
             self.assistant_reasoning = ""
 
-        def insert_tool_call(self, tool_name: str, preview: Any, args: Any) -> None:
-            if not tool_name:
+        def insert_tool_call(
+            self,
+            tool_call_id: str,
+            tool_name: str,
+            preview: Any,
+            args: Any,
+        ) -> None:
+            if not tool_call_id or not tool_name:
+                return
+            if self.stage_output:
+                self.staged_operations.append(
+                    ("tool", tool_call_id, tool_name, preview, args)
+                )
                 return
             self.ensure_session()
             try:
                 payload = json.dumps(
-                    {"name": str(tool_name), "args": args, "preview": preview},
+                    _persistable_tool_call(str(tool_name), preview, args),
                     ensure_ascii=False,
                     default=str,
                 )
@@ -436,9 +524,16 @@ async def _stream_aiagent_subprocess(
                 with closing(self._conn()) as conn, conn:
                     ts = _time.time()
                     cur = conn.execute(
-                        "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp) "
-                        "VALUES (?, 'assistant', '', ?, ?, ?)",
-                        (str(session_id), str(tool_name), payload, ts),
+                        "INSERT INTO messages"
+                        " (session_id, role, content, tool_name, tool_calls, tool_call_id, timestamp)"
+                        " VALUES (?, 'assistant', '', ?, ?, ?, ?)",
+                        (
+                            str(session_id),
+                            str(tool_name),
+                            payload,
+                            str(tool_call_id),
+                            ts,
+                        ),
                     )
                     message_id = cur.lastrowid
                 self._audit(
@@ -452,7 +547,42 @@ async def _stream_aiagent_subprocess(
             except Exception:
                 logger.exception("[multitenancy] mirror insert_tool_call failed")
 
+        def insert_tool_outcome(self, payload: dict[str, Any]) -> None:
+            tool_call_id = str(payload.get("tool_call_id") or "").strip()
+            tool_name = str(payload.get("name") or "").strip()
+            if not tool_call_id or not tool_name:
+                return
+            if self.stage_output:
+                self.staged_operations.append(("tool_outcome", dict(payload)))
+                return
+            safe = {
+                "failure_subsystem": payload.get("failure_subsystem"),
+                "error_code": payload.get("error_code"),
+                "retryable": payload.get("retryable") is True,
+                "is_error": payload.get("is_error") is True,
+            }
+            try:
+                content = json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
+                with closing(self._conn()) as conn, conn:
+                    conn.execute(
+                        "INSERT INTO messages"
+                        " (session_id, role, content, tool_name, tool_call_id, timestamp)"
+                        " VALUES (?, 'tool', ?, ?, ?, ?)",
+                        (
+                            str(session_id),
+                            content,
+                            tool_name,
+                            tool_call_id,
+                            _time.time(),
+                        ),
+                    )
+            except Exception:
+                logger.exception("[multitenancy] mirror insert_tool_outcome failed")
+
         def retag_source(self) -> None:
+            if self.stage_output:
+                self.staged_operations.append(("retag",))
+                return
             if self.retagged:
                 return
             try:
@@ -462,27 +592,104 @@ async def _stream_aiagent_subprocess(
                 logger.exception("[multitenancy] mirror retag_source failed")
 
         def dedupe(self) -> None:
+            if self.stage_output:
+                self.staged_operations.append(("dedupe",))
+                return
             try:
                 with closing(self._conn()) as conn, conn:
                     conn.execute(
                         "DELETE FROM messages WHERE session_id = ? AND id NOT IN ("
                         "SELECT MIN(id) FROM messages WHERE session_id = ? "
-                        "GROUP BY role, IFNULL(content,''), IFNULL(tool_name,''))",
+                        "GROUP BY role, IFNULL(content,''), IFNULL(tool_name,''),"
+                        " IFNULL(tool_call_id,''))",
                         (str(session_id), str(session_id)),
                     )
             except Exception:
                 logger.exception("[multitenancy] mirror dedupe failed")
 
+        def record_source_refs(self, source_refs: list[dict[str, Any]]) -> None:
+            if self.stage_output:
+                self.staged_operations.append(("source_refs", source_refs))
+                return
+            from ..run_broker import record_current_run_source_refs
+
+            record_current_run_source_refs(source_refs)
+
+        def commit_staged(self) -> None:
+            operations = tuple(self.staged_operations)
+            self.staged_operations.clear()
+            self.stage_output = False
+            for operation in operations:
+                kind, *args = operation
+                if kind == "assistant":
+                    content, reasoning, finish_reason = args
+                    self.assistant_content = content
+                    self.assistant_reasoning = reasoning
+                    self.upsert_assistant("", "")
+                    self.seal_assistant(finish_reason=finish_reason)
+                elif kind == "tool":
+                    self.insert_tool_call(*args)
+                elif kind == "tool_outcome":
+                    self.insert_tool_outcome(*args)
+                elif kind == "retag":
+                    self.retag_source()
+                elif kind == "dedupe":
+                    self.dedupe()
+                elif kind == "source_refs":
+                    self.record_source_refs(args[0])
+
     _mirror = _StateDbMirror()
+    if _stage_codex_output:
+        event._trusted_codex_state_commit = _mirror.commit_staged
     # Pre-write the user message so the web-ui shows the question instantly,
     # even if the run later times out / aborts before any reply.
     _mirror.insert_user(user_text)
 
+    # Before the payload snapshot: a codex-mapped run's cwd only reaches the
+    # child through `raw_event["workspace"]` (PLAN C6).
+    codex_workspace = await asyncio.to_thread(
+        _bind_codex_run_workspace, event, profile_home
+    )
+    # Previous turns' tool transcript (WebUI + trusted actor only; the binder in
+    # webui_broker/periphery decides). Resolved HERE, in the parent, because the
+    # parent is the only side that knows the runtime, the resume-thread state and
+    # the carried counts — so agent.log gets exactly ONE line per run, and the
+    # child stays a dumb injector.
+    from .. import turn_tool_context as _turn_tool_context
+    from . import executor_map as _executor_map_for_carry
+
+    _turn_tool_context.begin_attempt(event)  # new attempt id; supersedes any replay
+    # ponytail: presence, not value. `_core.py:3393` (`if local_harness:`) is the
+    # ONLY place this attribute is set (and 3455-3456 the only delattr), while
+    # the harness's FIRST turn carries `resume_thread_id is None` — so a value
+    # test would let turn 1 capture tool bodies into a store the harness can
+    # never read back.
+    _harness_thread = hasattr(event, "_harness_resume_thread_id")
+    _stamped_runtime = ""
+    _raw_event_for_runtime = getattr(event, "raw_event", None)
+    if isinstance(_raw_event_for_runtime, dict):
+        _stamped_runtime = str(
+            _raw_event_for_runtime.get(_executor_map_for_carry.EVENT_RUNTIME_KEY) or ""
+        )
+    event._turn_tool_context_text = _turn_tool_context.resolve_carry_text(
+        event,
+        runtime=(
+            "codex"
+            if _stamped_runtime == _executor_map_for_carry.CODEX_APP_SERVER
+            else "hermes"
+        ),
+        # A local-harness Codex thread carries its own full history on the Codex
+        # side; injecting would duplicate it and capturing would only fill a
+        # store that is never read.
+        harness_thread=_harness_thread,
+    )
     payload = json.dumps(
         _event_to_subprocess_payload(event, profile_home, messages=messages),
         ensure_ascii=False,
     ).encode("utf-8")
     timeout_s = float(os.getenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", "300"))
+    # tool_call_id -> (name, monotonic start); named in the stall kill below.
+    inflight_tools: dict[str, tuple[str, float]] = {}
     approval_dir = Path(tempfile.mkdtemp(prefix="hermes-mt-approval-"))
     warm_run = None
     warm_worker_requested = _aiagent_warm_worker_enabled()
@@ -497,11 +704,16 @@ async def _stream_aiagent_subprocess(
             warm_worker_requested = False
     env_scope_entered = False
     try:
+        env_scope_kwargs: dict[str, Any] = {
+            "approval_dir": approval_dir,
+            "event_stream": True,
+        }
+        if codex_workspace is not None:
+            env_scope_kwargs["codex_workspace"] = codex_workspace
         env_scope = _pkg._aiagent_subprocess_env_scope(
             event,
             profile_home,
-            approval_dir=approval_dir,
-            event_stream=True,
+            **env_scope_kwargs,
         )
         env = env_scope.__enter__()
         env_scope_entered = True
@@ -624,12 +836,24 @@ async def _stream_aiagent_subprocess(
                         break
                     heartbeat_count += 1
                     total_elapsed = time.monotonic() - started_at
+                    if inflight_tools:
+                        _tool_name, _tool_started = min(
+                            inflight_tools.values(), key=lambda entry: entry[1]
+                        )
+                        phase = f"工具 {_tool_name} 已运行 {time.monotonic() - _tool_started:.0f} 秒"
+                    elif first_event_logged:
+                        phase = "等待当前工具或子任务输出"
+                    else:
+                        phase = "准备响应"
+                    # The status event itself carries only an animation marker
+                    # (_animated_stream_status drops the phase by design); the
+                    # running tool + elapsed seconds are observable HERE.
                     logger.info(
-                        "[multitenancy] waiting for AIAgent subprocess stream event elapsed=%.3fs heartbeat=%s",
+                        "[multitenancy] waiting for AIAgent subprocess stream event elapsed=%.3fs heartbeat=%s phase=%s",
                         total_elapsed,
                         heartbeat_count,
+                        phase,
                     )
-                    phase = "等待当前工具或子任务输出" if first_event_logged else "准备响应"
                     yield (
                         "status",
                         _animated_stream_status(phase, heartbeat_count),
@@ -707,7 +931,10 @@ async def _stream_aiagent_subprocess(
                 _mirror.seal_assistant(finish_reason="stop")
                 _mirror.retag_source()
                 _mirror.dedupe()
-                _write_token_ledger_from_child(event, profile_home, data.get("usage"))
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    event._trusted_codex_usage = dict(usage)
+                _write_token_ledger_from_child(event, profile_home, usage)
                 try:  # shim injects the name (agent_real/__init__ step-2); guard even NameError
                     _bump_expert_usage_from_event(event)
                 except Exception:
@@ -722,7 +949,6 @@ async def _stream_aiagent_subprocess(
                     _mirror.upsert_assistant(content_text, "")
                     yield "content", content_text
             elif event_name == "source_refs":
-                from ..run_broker import record_current_run_source_refs
                 from ..source_envelope import normalize_tool_source_refs
 
                 source_refs = normalize_tool_source_refs(
@@ -730,20 +956,34 @@ async def _stream_aiagent_subprocess(
                     profile_home,
                 )
                 if source_refs:
-                    record_current_run_source_refs(source_refs)
+                    _mirror.record_source_refs(source_refs)
             elif event_name == "thinking":
                 thinking_text = _redact_billing_runtime_text(
                     data.get("text"), event, env
                 )
                 _mirror.upsert_assistant("", thinking_text)
                 yield "thinking", thinking_text
+            elif event_name == "tool_transcript":
+                # PRIVATE. Consumed into gateway memory for the next turn and
+                # NEVER yielded: periphery forwards whatever this generator
+                # yields straight into RunEvent/SSE, so yielding here would put
+                # a tool body on the wire. Also never mirrored to state.db.
+                _turn_tool_context.record_transcript(
+                    event, {k: v for k, v in data.items() if k != "event"}
+                )
             elif event_name in {
                 "tool_started",
                 "tool_completed",
                 "approval_required",
                 "approval_resolved",
+                "gate_required",
+                "gate_resolved",
+                "workflow_stage",
+                "auth_required",
+                "auth_resolved",
                 "clarify_required",
                 "clarify_resolved",
+                "harness_thread_bound",
             }:
                 payload_data = _redact_ingest_runtime_value(
                     {k: v for k, v in data.items() if k != "event"},
@@ -760,16 +1000,30 @@ async def _stream_aiagent_subprocess(
                     # to insert the sessions row by now.
                     _mirror.seal_assistant(finish_reason="tool_calls")
                     _mirror.insert_tool_call(
+                        str(payload_data.get("tool_call_id") or ""),
                         str(payload_data.get("name") or ""),
                         payload_data.get("preview"),
                         payload_data.get("args"),
                     )
                     _mirror.retag_source()
+                    if payload_data.get("tool_call_id"):
+                        # setdefault: a duplicate start must not reset the clock.
+                        inflight_tools.setdefault(
+                            str(payload_data["tool_call_id"]),
+                            (str(payload_data.get("name") or ""), time.monotonic()),
+                        )
                 elif event_name == "tool_completed":
+                    inflight_tools.pop(str(payload_data.get("tool_call_id") or ""), None)
                     # Tool finished — subsequent assistant text is a new
                     # bubble. Seal so upsert starts a fresh row.
                     _mirror.seal_assistant()
+                    _mirror.insert_tool_outcome(payload_data)
                 yield str(event_name), payload_data
+            elif event_name == "tool_heartbeat":
+                # PRIVATE liveness from agent_real/tool_heartbeat.py: arriving
+                # at all is what resets the watchdog above. Never yielded,
+                # never mirrored — the card already animates its own status.
+                logger.debug("[multitenancy] tool heartbeat: %s", data.get("inflight"))
             else:
                 logger.debug("[multitenancy] ignoring unknown child stream event: %s", event_name)
 
@@ -867,14 +1121,55 @@ async def _stream_aiagent_subprocess(
         if _delegation_signal:
             yield "auth_required", _delegation_signal
     except asyncio.TimeoutError as exc:
+        killed_at = time.monotonic()
+        # Oldest first: the oldest call names the kill; every call gets closed.
+        stalled_calls = sorted(inflight_tools.items(), key=lambda kv: kv[1][1])
+        stall = AiagentToolStallTimeout(timeout_s)
+        if stalled_calls:
+            call_id, (name, started) = stalled_calls[0]
+            stall = AiagentToolStallTimeout(
+                timeout_s,
+                tool_call_id=call_id,
+                tool_name=name,
+                elapsed_s=killed_at - started,
+            )
         if using_warm_worker:
             await _discard_aiagent_warm_worker(profile_home)
         if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
-        raise RuntimeError(
-            f"AIAgent subprocess produced no stream events for {timeout_s:g}s"
-        ) from exc
+        # The only durable trace of a stall kill: _core swallows the exception
+        # into a user notice once content has streamed (prod 2026-09-03 had
+        # zero log lines for a 6-minute dead turn). Contracted logger name for
+        # incident tooling: hermes_multitenancy.agent_real (SPEC 我拍的数).
+        logging.getLogger("hermes_multitenancy.agent_real").warning(
+            "[multitenancy] AIAgent subprocess stalled and was killed: timeout=%gs tool=%s tool_call_id=%s elapsed=%s inflight=%d profile=%s",
+            timeout_s,
+            stall.tool_name or "<none>",
+            stall.tool_call_id or "-",
+            f"{stall.elapsed_s:.0f}s" if stall.elapsed_s is not None else "-",
+            len(stalled_calls),
+            profile_home.name,
+        )
+        if stalled_calls:
+            # Close EVERY dangling tool_call in state.db so the next turn's
+            # model sees interrupted results instead of inventing why they
+            # are missing (concurrent tool calls can all be in flight).
+            _mirror.seal_assistant()
+            for call_id, (name, _started) in stalled_calls:
+                if not name:
+                    continue
+                _mirror.insert_tool_outcome(
+                    {
+                        "tool_call_id": call_id,
+                        "name": name,
+                        "is_error": True,
+                        "failure_subsystem": "runtime",
+                        "error_code": "TOOL_INTERRUPTED",
+                        "retryable": True,
+                    }
+                )
+        raise stall from exc
     except asyncio.CancelledError:
         if using_warm_worker:
             await _discard_aiagent_warm_worker(profile_home)
@@ -920,7 +1215,10 @@ async def _stream_aiagent_subprocess(
                     )
             finally:
                 if env_scope_entered:
-                    env_scope.__exit__(*sys.exc_info())
+                    await _pkg._exit_aiagent_subprocess_env_scope(
+                        env_scope,
+                        sys.exc_info(),
+                    )
         finally:
             if proc is not None and proc.returncode is None:
                 proc.kill()

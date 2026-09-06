@@ -343,3 +343,28 @@ def test_cli_reports_missing_or_empty_ledger(tmp_path: Path, capsys) -> None:
     empty.write_text("", encoding="utf-8")
     assert _main(["--path", str(empty)]) == 1
     assert "没有数据" in capsys.readouterr().out
+
+
+def test_budget_exhausted_row_carries_the_flag_and_omits_it_otherwise(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """预算耗尽必须落盘可 grep；正常回合不给每行加一列。"""
+    from hermes_multitenancy.token_usage_ledger import append_token_usage
+
+    ledger = tmp_path / "token-usage.jsonl"
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_TOKEN_USAGE_LEDGER_PATH", str(ledger))
+
+    append_token_usage(
+        sender_open_id="ou_a", profile="owner", platform="webui", chat_type="p2p",
+        model="gpt-5", input_tokens=1, output_tokens=1, total_tokens=260000,
+        api_calls=64, budget_exhausted=True,
+    )
+    append_token_usage(
+        sender_open_id="ou_a", profile="owner", platform="webui", chat_type="p2p",
+        model="gpt-5", input_tokens=1, output_tokens=1, total_tokens=2,
+        api_calls=3,
+    )
+    rows = _read_lines(ledger)
+    assert rows[0]["budget_exhausted"] is True
+    assert "budget_exhausted" not in rows[1]

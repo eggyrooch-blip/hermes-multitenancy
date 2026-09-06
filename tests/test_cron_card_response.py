@@ -80,6 +80,21 @@ def test_build_cron_card_empty_body_returns_none():
     assert media == []
 
 
+def test_build_cron_card_media_only_summary_uses_job_name(monkeypatch):
+    fake_base = SimpleNamespace(
+        BasePlatformAdapter=SimpleNamespace(
+            extract_media=lambda _content: (["/tmp/a.png"], ""),
+            filter_media_delivery_paths=lambda paths: paths,
+        )
+    )
+    monkeypatch.setitem(sys.modules, "gateway.platforms.base", fake_base)
+
+    card, media = _build_cron_card({"id": "x", "name": "Daily media"}, "MEDIA:/tmp/a.png")
+
+    assert card["config"]["summary"]["content"] == "Daily media"
+    assert media == ["/tmp/a.png"]
+
+
 def test_card_response_enabled_defaults_true():
     # cron.config is unavailable in the test env → must default ON.
     assert _cron_card_response_enabled() is True
@@ -144,6 +159,7 @@ def test_send_cron_card_requires_nonblank_message_id_when_requested(monkeypatch)
 
 def test_send_cron_card_receipt_path_uses_one_raw_attempt(monkeypatch):
     calls = []
+    receipt = {}
     adapter = SimpleNamespace(
         _send_raw_message=lambda **kwargs: calls.append(("raw", kwargs)) or "raw-coro",
         _feishu_send_with_retry=lambda **kwargs: calls.append(("retry", kwargs)) or "retry-coro",
@@ -161,10 +177,12 @@ def test_send_cron_card_receipt_path_uses_one_raw_attempt(monkeypatch):
         None,
         object(),
         require_receipt=True,
+        receipt_out=receipt,
     )
 
     assert err is None
     assert [kind for kind, _kwargs in calls] == ["raw"]
+    assert receipt == {"message_id": "om_once"}
 
 
 def test_send_cron_card_detects_non_success_response(monkeypatch):
@@ -336,3 +354,93 @@ def test_delivery_requires_static_card_when_receipt_required(monkeypatch):
     )
 
     assert err == "feishu confirmed card unavailable"
+
+
+def test_receipt_delivery_builds_card_for_media_only_payload(monkeypatch):
+    target = {"platform": "feishu", "chat_id": "ou_abc"}
+    adapter = SimpleNamespace(_send_raw_message=lambda **k: None)
+    calls = []
+    monkeypatch.setattr(cron_worker, "_adapter_for_platform", lambda adapters, name: adapter)
+    monkeypatch.setattr(cron_worker, "_cron_card_response_enabled", lambda: True)
+    monkeypatch.setattr(
+        cron_worker, "_cron_delivery_payload_for_adapter", lambda job, content: ("", [("/tmp/a.png", False)])
+    )
+    monkeypatch.setattr(
+        cron_worker,
+        "_build_cron_card",
+        lambda job, content: ({"elements": []}, [("/tmp/a.png", False)]),
+    )
+    monkeypatch.setattr(
+        cron_worker,
+        "_send_cron_card_via_live_adapter",
+        lambda *a, **k: calls.append("card") or k["receipt_out"].update(message_id="om_card"),
+    )
+    monkeypatch.setattr(
+        cron_worker,
+        "_send_media_files_via_live_adapter",
+        lambda *a, **k: calls.append("media") or None,
+    )
+    receipt = {}
+
+    err = _deliver_cron_feishu_via_live_adapter(
+        _fake_scheduler(target),
+        {"id": "j1", "name": "task"},
+        "MEDIA:/tmp/a.png",
+        adapters={"feishu": adapter},
+        loop=_running_loop(),
+        require_receipt=True,
+        receipt_out=receipt,
+    )
+
+    assert err is None
+    assert calls == ["card", "media"]
+    assert receipt == {"message_id": "om_card"}
+
+
+def test_media_provider_receipt_failure_is_consumed(monkeypatch):
+    import types
+
+    scheduler = types.ModuleType("cron.scheduler")
+    scheduler._send_media_via_adapter = lambda *a, **k: SimpleNamespace(
+        success=False,
+        error_code="missing_receipt",
+    )
+    cron_pkg = types.ModuleType("cron")
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setitem(sys.modules, "gateway.config", SimpleNamespace(Platform=lambda value: value))
+
+    error = cron_worker._send_media_files_via_live_adapter(
+        object(),
+        "sink",
+        [("media", False)],
+        None,
+        object(),
+        {"id": "job"},
+    )
+
+    assert error == "cron media delivery unconfirmed (missing_receipt)"
+
+
+def test_media_provider_missing_receipt_fails_closed(monkeypatch):
+    import types
+
+    scheduler = types.ModuleType("cron.scheduler")
+    scheduler._send_media_via_adapter = lambda *a, **k: None
+    cron_pkg = types.ModuleType("cron")
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setitem(sys.modules, "gateway.config", SimpleNamespace(Platform=lambda value: value))
+
+    error = cron_worker._send_media_files_via_live_adapter(
+        object(),
+        "sink",
+        [("media", False)],
+        None,
+        object(),
+        {"id": "job"},
+    )
+
+    assert error == "cron media delivery unconfirmed (unconfirmed)"

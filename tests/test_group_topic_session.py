@@ -16,13 +16,15 @@ def _strict_context(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _topic_event(
     *,
-    thread_id: str = "omt_topic",
+    thread_id: str | None = "omt_topic",
+    message_id: str = "om_message",
+    root_id: str | None = None,
     sender: str = "ou_a",
     sender_name: str = "Alice",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         text="do the thing",
-        message_id="om_message",
+        message_id=message_id,
         source=SimpleNamespace(
             platform=SimpleNamespace(value="feishu"),
             chat_id="oc_group",
@@ -30,6 +32,8 @@ def _topic_event(
             user_id=sender,
             user_name=sender_name,
             thread_id=thread_id,
+            hermes_raw_thread_id=thread_id,
+            hermes_root_id=root_id,
             hermes_group_topic=True,
         ),
     )
@@ -118,6 +122,11 @@ def test_strict_off_group_topic_remains_legacy_sender_scoped(
     ) != agent_real._resolve_aiagent_session_id(
         _topic_event(sender="ou_b"), profile_home, "ou_b"
     )
+    strict_off_with_root = agent_real._resolve_aiagent_session_id(
+        _topic_event(root_id="om_root"), profile_home, "ou_a"
+    )
+    assert "thread:omt_topic" in strict_off_with_root
+    assert "thread:om_root" not in strict_off_with_root
     assert group_topic_epoch_actor(_topic_event(sender="ou_a"), "ou_a") == "ou_a"
     assert group_topic_epoch_actor(_topic_event(sender="ou_b"), "ou_b") == "ou_b"
 
@@ -138,6 +147,79 @@ def test_group_topic_aiagent_session_matches_across_senders(tmp_path: Path) -> N
     assert alice != other_topic
     assert "thread:omt_topic" in alice
     assert "user:" not in alice
+
+
+def test_topic_root_and_later_reply_share_history_without_sharing_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_multitenancy import agent_real, router
+    from hermes_multitenancy.feishu_group_topic_session import (
+        group_topic_conversation_id,
+        group_topic_thread,
+    )
+
+    monkeypatch.setattr(router, "_route_version_for", lambda *args, **kwargs: 7)
+    root = _topic_event(
+        thread_id=None,
+        message_id="om_root",
+        sender="ou_alice",
+    )
+    reply = _topic_event(
+        thread_id="omt_topic",
+        message_id="om_reply",
+        root_id="om_root",
+        sender="ou_bob",
+    )
+
+    root_scope = router._dispatch_session_scope(
+        "security", "ou_alice", None, "oc_group", root
+    )
+    reply_scope = router._dispatch_session_scope(
+        "security", "ou_bob", None, "oc_group", reply
+    )
+    other_scope = router._dispatch_session_scope(
+        "security",
+        "ou_alice",
+        None,
+        "oc_group",
+        _topic_event(thread_id=None, message_id="om_other"),
+    )
+    other_chat = _topic_event(thread_id=None, message_id="om_root")
+    other_chat.source.chat_id = "oc_other"
+    other_chat_scope = router._dispatch_session_scope(
+        "security", "ou_alice", None, "oc_other", other_chat
+    )
+    other_profile_scope = router._dispatch_session_scope(
+        "finance", "ou_alice", None, "oc_group", root
+    )
+    profile_home = tmp_path / "profiles" / "security"
+
+    assert group_topic_conversation_id(root) == "om_root"
+    assert group_topic_conversation_id(reply) == "om_root"
+    assert group_topic_thread(root) is None
+    assert group_topic_thread(reply) == "omt_topic"
+    assert root_scope.history_key == reply_scope.history_key
+    assert root_scope.inflight_key != reply_scope.inflight_key
+    assert root_scope.history_key != other_scope.history_key
+    assert root_scope.history_key != other_chat_scope.history_key
+    assert root_scope.history_key != other_profile_scope.history_key
+    assert agent_real._resolve_aiagent_session_id(
+        root, profile_home, "ou_alice"
+    ) == agent_real._resolve_aiagent_session_id(reply, profile_home, "ou_bob")
+    assert agent_real._resolve_aiagent_session_id(
+        root, profile_home, "ou_alice"
+    ) != agent_real._resolve_aiagent_session_id(
+        root, tmp_path / "profiles" / "finance", "ou_alice"
+    )
+    assert router._run_request_for_routed_event(
+        event=reply,
+        profile_name="security",
+        sender="ou_bob",
+        sender_alt=None,
+        chat_id="oc_group",
+        text="continue",
+    ).credential_subject == "ou_bob"
 
 
 def test_group_topic_user_turn_is_attributed() -> None:
@@ -274,10 +356,11 @@ class _FakeAdapter:
 def _message_response(
     *,
     thread_id: str | None,
+    root_id: str | None = None,
     chat_id: str = "oc_group",
     success: bool = True,
 ) -> Any:
-    item = SimpleNamespace(thread_id=thread_id, chat_id=chat_id)
+    item = SimpleNamespace(thread_id=thread_id, root_id=root_id, chat_id=chat_id)
     return SimpleNamespace(
         success=lambda: success,
         data=SimpleNamespace(items=[item]),
@@ -330,7 +413,7 @@ def test_root_only_event_is_hydrated_before_dispatch(
     assert adapter.last_event.source.hermes_root_id == "om_root"
 
 
-def test_hydration_failure_keeps_narrow_legacy_scope(
+def test_topic_root_identity_survives_thread_hydration_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -358,7 +441,7 @@ def test_hydration_failure_keeps_narrow_legacy_scope(
         )
 
     assert adapter.last_event.source.thread_id == "om_root"
-    assert adapter.last_event.source.hermes_group_topic is False
+    assert adapter.last_event.source.hermes_group_topic is True
     assert "unavailable" in caplog.text
     assert "om_root" not in caplog.text
     assert "om_current" not in caplog.text
@@ -393,9 +476,10 @@ def test_hydration_rejects_cross_chat_message(
 
     assert adapter.last_event.source.thread_id == "om_root"
     assert adapter.last_event.source.hermes_group_topic is False
+    assert topic_patch.group_topic_conversation_id(adapter.last_event) is None
 
 
-def test_raw_thread_id_needs_no_api_hydration(
+def test_raw_thread_id_without_root_hydrates_stable_root_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from hermes_multitenancy import feishu_group_topic_session as topic_patch
@@ -403,11 +487,13 @@ def test_raw_thread_id_needs_no_api_hydration(
     monkeypatch.setattr(topic_patch, "_HOOK_INSTALLED", False)
     monkeypatch.setattr(topic_patch, "load_feishu_adapter", lambda: _FakeAdapter)
     topic_patch.install_feishu_group_topic_session_patch()
-    adapter = _FakeAdapter(_message_response(thread_id=None))
+    adapter = _FakeAdapter(
+        _message_response(thread_id="omt_direct", root_id="om_root")
+    )
     message = SimpleNamespace(
         chat_id="oc_group",
         thread_id="omt_direct",
-        root_id="om_root",
+        root_id=None,
     )
 
     asyncio.run(
@@ -422,7 +508,9 @@ def test_raw_thread_id_needs_no_api_hydration(
 
     assert adapter.last_event.source.thread_id == "omt_direct"
     assert adapter.last_event.source.hermes_group_topic is True
-    assert adapter.message_api.calls == 0
+    assert adapter.last_event.source.hermes_root_id == "om_root"
+    assert topic_patch.group_topic_conversation_id(adapter.last_event) == "om_root"
+    assert adapter.message_api.calls == 1
     assert adapter.chat_api.calls == 1
 
 
@@ -512,6 +600,7 @@ def test_auth_complete_replay_preserves_topic_context(
         seen.append(kwargs["event"])
 
     monkeypatch.setattr(router, "handle_async", handle_async)
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "0")
     original = _topic_event()
     original.source.chat_topic = None
     original.source.hermes_raw_thread_id = None

@@ -11,7 +11,7 @@
 ## 2026-07-30 mt-transient-replay-retry-silence · 部署重启伤亡三条残留(SPEC 明确 out of scope,待 sunke 拍板)
 
 背景:2026-07-30 17:04:24 / 17:05:47 两次 gateway 重启(另一会话部署 mt,prod reflog 17:05:41 pull 到 2603f40),
-in-flight run 随进程组一起吃 SIGTERM。wangwu 那轮 `saw_done=False`、elapsed 34.245s 被打断。
+in-flight run 随进程组一起吃 SIGTERM。qiaojunlong 那轮 `saw_done=False`、elapsed 34.245s 被打断。
 本 slug 只修了"错误文案撒谎"(信号死不再拼陈旧 stderr 尾巴),下列三条**没修**:
 
 **D1 — 无 graceful drain / 在途 run 不会自动重发(需产品拍板)**
@@ -114,10 +114,10 @@ CI（`.gitlab-ci.yml`）首次真跑全量测试时暴露的，逐条记账。�
 ### D1 — 脚本里硬编码开发机绝对路径（**CI 抓出来的真缺陷**，优先级最高）
 
 - `scripts/lark_cli_matrix_runner.mjs:18`
-  `import { io } from '/Users/dev/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
-  另有 4 处 `/Users/dev/.hermes/...`（第 138、158、388、393 行）
+  `import { io } from '/Users/hermes/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js'`
+  另有 4 处 `/Users/hermes/.hermes/...`（第 138、158、388、393 行）
 - `scripts/feishu_file_media_matrix_runner.py:27`
-  `SHARED_HOME = Path("/Users/dev/.hermes")`，第 387 行 `"/Users/dev/.hermes/profiles" in text`
+  `SHARED_HOME = Path("/Users/hermes/.hermes")`，第 387 行 `"/Users/hermes/.hermes/profiles" in text`
 
 后果：这 17 条测试**只在 sunke 那台 Mac 上能过**，生产机和任何新同事的机器都会失败
 （容器里直接 `PermissionError: '/Users'`）。这违反 CLAUDE.md 的「Never hardcode paths」。
@@ -494,3 +494,19 @@ dispatcher 现在对每个**已识别**动作（built-in + 注册的 business；
 - 触发面：**仅**事件循环关停时 `_stream_aiagent_subprocess` 的 finally 里那个 await 可能不被驱动，warm worker 未 discard；进程随即退出。
 - 实际风险：**残留子进程**，不是 broker 泄漏（broker 随进程消亡）。
 - 未做原因：用 GC 时机做断言不稳，写不出可靠的红绿测试。要做就得把 kill 改成同步操作或加进程级收割。
+
+## relay 的 HTTP 端口要等飞书 ws 握手完才 bind（探针错配的真根因）
+- 来源：slug `relay-probe-timeout`（2026-08-27）。两次发布假失败（2026-08-15
+  release-20260815-01、2026-08-27 release-20260827-01）都是它的下游症状。
+- 机制：`agent_relay.py::create_agent_relay_app` 的 `on_startup` 里调
+  `start_event_stream`，而它在 `agent_relay_feishu.py:447` 用 `ready.wait(
+  EVENT_STREAM_START_TIMEOUT_SECONDS)`（10s）**同步阻塞**等飞书 ws 连上，失败路径再
+  `thread.join(timeout=5)`。aiohttp 是跑完 on_startup **才** bind socket，所以飞书
+  慢或不通时，relay 的 :8770 最坏 15s 后才存在——对外表现是"服务已 started 但连不上"。
+- 本次只修了发布器侧（`RELAY_PROBE_TIMEOUT` 15 → 90，带守卫测试），**没动 relay**。
+- 根治：把 ws 启动挪出 on_startup 的阻塞路径（先 bind，ws 在后台连；连不上走既有的
+  auto_reconnect，而不是拖住 bind）。收益不只是发布探针——真实客户端在 relay 重启后
+  那 15s 里同样连不上。
+- 未做原因：动的是 relay 运行时代码，走 `/opt/hermes-agent-relay` 下独立 venv 的
+  4 文件同步链（`agent_relay*.py` + `credentials.py`），blast radius 远大于改一个
+  超时值；且"ws 没连上算不算启动成功"是产品语义决定，要 engineer 拍。

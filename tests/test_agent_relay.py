@@ -1595,3 +1595,609 @@ def test_update_card_ships_the_composed_card_not_the_raw_argument():
     caller = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "done"}]}}
     client._update_card(message_id="om_x", content=caller)
     assert json.loads(sent[-1]["body"]["content"]) == caller
+
+
+ADMIN_TOKEN = "admin-token-canary"
+LOG_FIELDS = {"id", "ts", "level", "logger", "event", "status", "actor", "card_id", "message_id", "raw"}
+
+
+def _capture_relay_logs(app):
+    """Wire the production log outlet onto this app's store; returns the undo."""
+    from hermes_multitenancy.agent_relay import RELAY_STORE_KEY, install_relay_log_handler
+
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.INFO)
+    handler = install_relay_log_handler(app[RELAY_STORE_KEY])
+
+    def undo() -> None:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+
+    return undo
+
+
+def _relay_app(tmp_path, feishu, oauth=None):
+    from hermes_multitenancy.agent_relay import create_agent_relay_app
+
+    return create_agent_relay_app(
+        db_path=tmp_path / "relay.db",
+        encryption_key="test-encryption-key",
+        oauth=oauth or FakeOAuth(),
+        feishu=feishu,
+    )
+
+
+def test_admin_endpoints_are_admin_only_and_range_checked(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_relay
+
+    assert agent_relay.ADMIN_LOG_LIMIT == 5000
+    assert agent_relay.ADMIN_MAX_WINDOW_MS == 7 * 86_400_000
+
+    async def runner() -> None:
+        app = _relay_app(tmp_path, FakeFeishu())
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        undo = _capture_relay_logs(app)
+        try:
+            token, _ = await enroll(client)
+            actor = {"Authorization": f"Bearer {token}"}
+            admin = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+            now = int(time.time() * 1000)
+            window = {"since": now - 60_000, "until": now + 60_000}
+
+            # Unset admin token: fail closed for everyone, rest of the relay untouched.
+            monkeypatch.delenv("HERMES_AGENT_RELAY_ADMIN_TOKEN", raising=False)
+            for path in ("/v1/admin/logs", "/v1/admin/stats"):
+                closed = await client.get(path, headers=admin, params=window)
+                assert closed.status == 403
+                assert (await closed.json())["error"]["code"] == "forbidden"
+            assert (await client.get("/v1/whoami", headers=actor)).status == 200
+
+            monkeypatch.setenv("HERMES_AGENT_RELAY_ADMIN_TOKEN", ADMIN_TOKEN)
+            for path in ("/v1/admin/logs", "/v1/admin/stats"):
+                anonymous = await client.get(path, params=window)
+                assert anonymous.status == 401
+                assert (await anonymous.json())["error"]["code"] == "unauthorized"
+                # A perfectly valid relay token is still not an admin token.
+                forbidden = await client.get(path, headers=actor, params=window)
+                assert forbidden.status == 403
+                assert (await forbidden.json())["error"]["code"] == "forbidden"
+
+                for bad in (
+                    {},
+                    {"since": now},
+                    {"until": now},
+                    {"since": "abc", "until": now},
+                    {"since": now, "until": "1e9"},
+                    {"since": now, "until": now},
+                    {"since": now, "until": now - 1},
+                    {"since": now, "until": now + 7 * 86_400_000 + 1},
+                ):
+                    invalid = await client.get(path, headers=admin, params=bad)
+                    assert invalid.status == 400, bad
+                    assert (await invalid.json())["error"]["code"] == "invalid_range", bad
+
+                ok = await client.get(path, headers=admin, params=window)
+                assert ok.status == 200
+
+            # The window boundary itself is inclusive and exactly 7 days is allowed.
+            widest = await client.get(
+                "/v1/admin/logs",
+                headers=admin,
+                params={"since": now, "until": now + 7 * 86_400_000},
+            )
+            assert widest.status == 200
+
+            monkeypatch.setattr(agent_relay, "ADMIN_LOG_LIMIT", 3)
+            store = app[agent_relay.RELAY_STORE_KEY]
+            for index in range(4):
+                store.append_log(
+                    ts=now + index, level="INFO", logger="probe", raw=f"relay_audit event=probe n={index}"
+                )
+            capped = await client.get("/v1/admin/logs", headers=admin, params=window)
+            capped_body = await capped.json()
+            assert capped_body["truncated"] is True
+            assert len(capped_body["items"]) == 3
+
+            store.append_log(ts=now, level="INFO", logger="probe", raw="relay_audit event=probe n=only")
+            monkeypatch.setattr(agent_relay, "ADMIN_LOG_LIMIT", 5000)
+            whole = await client.get("/v1/admin/logs", headers=admin, params=window)
+            whole_body = await whole.json()
+            assert whole_body["truncated"] is False
+            assert [item["ts"] for item in whole_body["items"]] == sorted(
+                item["ts"] for item in whole_body["items"]
+            )
+            assert all(set(item) == LOG_FIELDS for item in whole_body["items"])
+        finally:
+            undo()
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_admin_logs_reconstruct_a_card_lifecycle_without_ssh(tmp_path, monkeypatch):
+    """The 8-25 incident, replayed: three audit rows, all carrying card + message id."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("HERMES_AGENT_RELAY_ADMIN_TOKEN", ADMIN_TOKEN)
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = _relay_app(tmp_path, feishu)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        undo = _capture_relay_logs(app)
+        try:
+            from hermes_multitenancy.agent_relay import RELAY_EVENTS_KEY
+
+            token, _ = await enroll(client)
+            auth = {"Authorization": f"Bearer {token}"}
+            admin = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+            since = int(time.time() * 1000) - 60_000
+
+            created = await client.post(
+                "/v1/cards",
+                headers=auth,
+                json={
+                    "content": {"elements": [{"tag": "markdown", "content": "CARD-BODY-CANARY"}]},
+                    "actions": [{"id": "approve", "label": "Approve"}],
+                    "expires_in": 600,
+                    "idempotency_key": "incident-card-1",
+                },
+            )
+            assert created.status == 201
+            card = await created.json()
+            card_id, message_id = card["card_id"], card["message_id"]
+
+            assert await app[RELAY_EVENTS_KEY].ingest_card_action(
+                actor_id="ou_alice",
+                card_id=card_id,
+                nonce=feishu.cards[0]["nonce"],
+                message_id=message_id,
+                action_id="approve",
+            )
+            patched = await client.patch(
+                f"/v1/cards/{card_id}",
+                headers=auth,
+                json={"content": {"elements": [{"tag": "markdown", "content": "CARD-BODY-CANARY done"}]}},
+            )
+            assert patched.status == 200
+
+            listed = await client.get(
+                "/v1/admin/logs",
+                headers=admin,
+                params={"since": since, "until": int(time.time() * 1000) + 60_000},
+            )
+            assert listed.status == 200
+            items = (await listed.json())["items"]
+            lifecycle = [
+                (item["event"], item["status"]) for item in items if item["card_id"] == card_id
+            ]
+            assert lifecycle == [
+                ("card", "pending"),
+                ("card_action", "actioned"),
+                ("card", "actioned"),
+            ]
+            for item in items:
+                if item["card_id"] == card_id:
+                    assert item["message_id"] == message_id
+                    assert item["actor"] and len(item["actor"]) == 12
+                    assert item["raw"].startswith(
+                        "INFO:hermes_multitenancy.agent_relay:relay_audit "
+                    )
+            assert "content=yes" in items[-1]["raw"]
+            # The store is a second log outlet, not a second copy of the payload.
+            assert "CARD-BODY-CANARY" not in json.dumps(await listed.json())
+            assert "ou_alice" not in json.dumps(await listed.json())
+        finally:
+            undo()
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_admin_logs_keep_warnings_and_drop_routine_chatter(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("HERMES_AGENT_RELAY_ADMIN_TOKEN", ADMIN_TOKEN)
+
+    async def runner() -> None:
+        app = _relay_app(tmp_path, FakeFeishu())
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        undo = _capture_relay_logs(app)
+        try:
+            since = int(time.time() * 1000) - 60_000
+            lark = logging.getLogger("Lark")
+            lark.error("receive message loop exit")
+            lark.info("connected to wss://open.feishu.cn")
+
+            listed = await client.get(
+                "/v1/admin/logs",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                params={"since": since, "until": int(time.time() * 1000) + 60_000},
+            )
+            items = [item for item in (await listed.json())["items"] if item["logger"] == "Lark"]
+            assert [(item["level"], item["raw"]) for item in items] == [
+                ("ERROR", "ERROR:Lark:receive message loop exit")
+            ]
+        finally:
+            undo()
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_relay_log_rows_are_pruned_after_thirty_days(tmp_path):
+    from hermes_multitenancy.agent_relay_store import RelayStore
+
+    store = RelayStore(tmp_path / "relay.db", "test-encryption-key")
+    try:
+        now = int(time.time() * 1000)
+        for age_days, raw in ((31, "too old"), (29, "still here")):
+            store.append_log(
+                ts=now - age_days * 86_400_000, level="INFO", logger="probe", raw=raw
+            )
+        store.prune()
+        assert [row["raw"] for row in store.list_logs(0, now)] == ["still here"]
+    finally:
+        store.close()
+
+
+def test_admin_stats_counts_the_window_only(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("HERMES_AGENT_RELAY_ADMIN_TOKEN", ADMIN_TOKEN)
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        assert (
+            await client.get(
+                "/v1/enroll/callback", params={"state": state, "code": f"oauth-code-{name}"}
+            )
+        ).status == 200
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        app = _relay_app(tmp_path, FakeFeishu(), oauth=MultiOAuth())
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            admin = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+            since = int(time.time() * 1000) - 60_000
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            bob = {"Authorization": f"Bearer {await enroll_as(client, 'bob')}"}
+
+            for headers, key in ((alice, "alice-1"), (bob, "bob-1")):
+                sent = await client.post(
+                    "/v1/messages",
+                    headers=headers,
+                    json={"type": "text", "content": {"text": "hi"}, "idempotency_key": key},
+                )
+                assert sent.status == 201
+            carded = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": {"elements": []},
+                    "actions": [{"id": "ok", "label": "OK"}],
+                    "expires_in": 600,
+                    "idempotency_key": "alice-card-1",
+                },
+            )
+            assert carded.status == 201
+
+            stats = await client.get(
+                "/v1/admin/stats",
+                headers=admin,
+                params={"since": since, "until": int(time.time() * 1000) + 60_000},
+            )
+            assert stats.status == 200
+            assert await stats.json() == {
+                # The card's text-reply fallback row is one card, not a second message.
+                "messages": {"total": 2, "by_kind": {"text": 2}},
+                "cards": {"total": 1, "by_status": {"pending": 1}},
+                "active_users": 2,
+                "enrolled_users": 2,
+            }
+
+            earlier = await client.get(
+                "/v1/admin/stats",
+                headers=admin,
+                params={"since": since - 86_400_000, "until": since - 1},
+            )
+            assert await earlier.json() == {
+                "messages": {"total": 0, "by_kind": {}},
+                "cards": {"total": 0, "by_status": {}},
+                "active_users": 0,
+                "enrolled_users": 2,
+            }
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_admin_hardening_from_cross_family_review(tmp_path, monkeypatch):
+    """Round-1 codex findings: unicode auth, int64 bounds, journald-identical raw,
+    send audit carries msg=, and keyset pagination through same-millisecond ties."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_relay
+
+    monkeypatch.setenv("HERMES_AGENT_RELAY_ADMIN_TOKEN", ADMIN_TOKEN)
+
+    async def runner() -> None:
+        app = _relay_app(tmp_path, FakeFeishu())
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        undo = _capture_relay_logs(app)
+        try:
+            now = int(time.time() * 1000)
+            window = {"since": now - 60_000, "until": now + 60_000}
+            admin = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+            for path in ("/v1/admin/logs", "/v1/admin/stats"):
+                # Non-ASCII bearer values must 403, never TypeError → 500.
+                weird = await client.get(
+                    path, headers={"Authorization": "Bearer é✓"}, params=window
+                )
+                assert weird.status == 403
+                # Beyond-int64 and negative values must 400, never OverflowError → 500.
+                for bad in (
+                    {"since": str(2**63), "until": str(2**63 + 60_000)},
+                    {"since": "-2", "until": "-1"},
+                ):
+                    invalid = await client.get(path, headers=admin, params=bad)
+                    assert invalid.status == 400, bad
+                    assert (await invalid.json())["error"]["code"] == "invalid_range"
+
+            # A delivered message's audit row carries msg= so the admin correlates
+            # without timestamp archaeology.
+            token, _ = await enroll(client)
+            actor = {"Authorization": f"Bearer {token}"}
+            sent = await client.post(
+                "/v1/messages",
+                headers=actor,
+                json={"type": "text", "content": {"text": "hi"}, "idempotency_key": "corr-1"},
+            )
+            assert sent.status == 201
+            message_id = (await sent.json())["message_id"]
+            body = await (
+                await client.get("/v1/admin/logs", headers=admin, params=window)
+            ).json()
+            send_rows = [row for row in body["items"] if row["event"] == "send"]
+            assert send_rows and send_rows[-1]["message_id"] == message_id
+            assert send_rows[-1]["raw"].startswith(
+                "INFO:hermes_multitenancy.agent_relay:relay_audit event=send"
+            )
+
+            # raw is the journald line byte-for-byte, traceback included.
+            try:
+                raise RuntimeError("boom")
+            except RuntimeError:
+                logging.getLogger("Lark").error("receive message loop exit", exc_info=True)
+            body = await (
+                await client.get("/v1/admin/logs", headers=admin, params=window)
+            ).json()
+            lark_rows = [row for row in body["items"] if row["logger"] == "Lark"]
+            assert len(lark_rows) == 1
+            assert lark_rows[0]["raw"].startswith("ERROR:Lark:receive message loop exit\n")
+            assert "RuntimeError: boom" in lark_rows[0]["raw"]
+
+            # Keyset pagination makes progress through a burst sharing one millisecond.
+            monkeypatch.setattr(agent_relay, "ADMIN_LOG_LIMIT", 2)
+            store = app[agent_relay.RELAY_STORE_KEY]
+            tie_ts = now + 60_001
+            for n in range(5):
+                store.append_log(
+                    ts=tie_ts, level="INFO", logger="probe",
+                    raw=f"relay_audit event=tie n={n}", event="tie",
+                )
+            params = {"since": tie_ts - 1, "until": tie_ts + 1, "after_id": 0}
+            collected, pages = [], 0
+            while True:
+                pages += 1
+                assert pages <= 10, "pagination failed to terminate"
+                page = await (
+                    await client.get("/v1/admin/logs", headers=admin, params=params)
+                ).json()
+                collected.extend(page["items"])
+                if not page["truncated"]:
+                    break
+                last = page["items"][-1]
+                params = {"since": last["ts"], "until": tie_ts + 1, "after_id": last["id"]}
+            tie_rows = [row["raw"] for row in collected if row["event"] == "tie"]
+            assert tie_rows == [f"relay_audit event=tie n={n}" for n in range(5)]
+            assert len({row["id"] for row in collected}) == len(collected)
+            assert pages >= 3
+        finally:
+            undo()
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_duplicate_click_ack_replays_only_patched_content(tmp_path):
+    """重复点击的 ack 只回放 PATCH 过的内容；从未更新过则维持纯 toast。
+
+    钉的是 2026-08-27 的受控矩阵：内容 PATCH 之后、客户端按钮消失之前的重复点击，
+    ack 不带卡片会让飞书把会话流渲染永久钉在旧版本（4/4 复现，跨设备、冷启动
+    不恢复）；而 PATCH 之前的重复点击走纯 toast 是被验证安全的路径，不得改变。
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.agent_relay import (
+        RELAY_EVENTS_KEY,
+        create_agent_relay_app,
+    )
+
+    async def enroll_as(client, name: str) -> str:
+        started = await client.post("/v1/enroll/sessions")
+        body = await started.json()
+        state = parse_qs(urlparse(body["authorize_url"]).query)["state"][0]
+        await client.get(
+            "/v1/enroll/callback",
+            params={"state": state, "code": f"oauth-code-{name}"},
+        )
+        claimed = await client.get(f"/v1/enroll/sessions/{body['enroll_id']}")
+        return (await claimed.json())["token"]
+
+    async def runner() -> None:
+        feishu = FakeFeishu()
+        app = create_agent_relay_app(
+            db_path=tmp_path / "relay.db",
+            encryption_key="test-encryption-key",
+            oauth=MultiOAuth(),
+            feishu=feishu,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            alice = {"Authorization": f"Bearer {await enroll_as(client, 'alice')}"}
+            events = app[RELAY_EVENTS_KEY]
+
+            original = {
+                "header": {"title": {"tag": "plain_text", "content": "Approve?"}},
+                "elements": [{"tag": "markdown", "content": "rm -rf ./build"}],
+            }
+            made = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": original,
+                    "actions": [{"id": "allow", "label": "Allow"}],
+                    "expires_in": 600,
+                    "idempotency_key": "card-replay-1",
+                },
+            )
+            assert made.status == 201
+            body = await made.json()
+            creds = dict(
+                actor_id="ou_alice",
+                card_id=body["card_id"],
+                nonce=feishu.cards[0]["nonce"],
+                message_id=body["message_id"],
+            )
+
+            # 发卡原文从不入缓存：PATCH 之前无论怎么点，都没有内容可回放
+            assert await events.replay_card_content(**creds) is None
+            assert await events.ingest_card_action(**creds, action_id="allow")
+            assert not await events.ingest_card_action(**creds, action_id="allow")
+            assert await events.replay_card_content(**creds) is None
+
+            # 消息路径 PATCH 成功之后，重复点击回放的就是最新内容
+            terminal = {
+                "header": {"title": {"tag": "plain_text", "content": "Approve?"}},
+                "elements": [{"tag": "markdown", "content": "✅ approved"}],
+            }
+            updated = await client.patch(
+                f"/v1/messages/{body['message_id']}",
+                headers=alice,
+                json={"content": terminal},
+            )
+            assert updated.status == 200
+            assert await events.replay_card_content(**creds) == terminal
+
+            # 回放守卫与点击一致：nonce、归属、消息三重比对，缺一不可
+            assert await events.replay_card_content(**{**creds, "nonce": "forged"}) is None
+            assert await events.replay_card_content(**{**creds, "actor_id": "ou_bob"}) is None
+            assert (
+                await events.replay_card_content(**{**creds, "message_id": "om_other"})
+                is None
+            )
+
+            # 卡片路径（close + content）同样入缓存 —— 解锁收回/超时的终态也要能回放
+            made2 = await client.post(
+                "/v1/cards",
+                headers=alice,
+                json={
+                    "content": original,
+                    "actions": [{"id": "allow", "label": "Allow"}],
+                    "expires_in": 600,
+                    "idempotency_key": "card-replay-2",
+                },
+            )
+            body2 = await made2.json()
+            closed_look = {"elements": [{"tag": "markdown", "content": "已在电脑本地接管"}]}
+            closed = await client.patch(
+                f"/v1/cards/{body2['card_id']}",
+                headers=alice,
+                json={"content": closed_look, "status": "closed", "reason": "local_resumed"},
+            )
+            assert closed.status == 200
+            assert (
+                await events.replay_card_content(
+                    actor_id="ou_alice",
+                    card_id=body2["card_id"],
+                    nonce=feishu.cards[1]["nonce"],
+                    message_id=body2["message_id"],
+                )
+                == closed_look
+            )
+        finally:
+            await client.close()
+
+    asyncio.run(runner())
+
+
+def test_duplicate_click_ack_carries_the_replayed_card(monkeypatch):
+    """ack 形状：有回放内容时带 raw 卡片，没有时保持纯 toast（字段都不出现）。"""
+    stub = types.ModuleType("lark_oapi.event.callback.model.p2_card_action_trigger")
+
+    class P2CardActionTriggerResponse:
+        pass
+
+    stub.P2CardActionTriggerResponse = P2CardActionTriggerResponse
+    parents = {
+        "lark_oapi": types.ModuleType("lark_oapi"),
+        "lark_oapi.event": types.ModuleType("lark_oapi.event"),
+        "lark_oapi.event.callback": types.ModuleType("lark_oapi.event.callback"),
+        "lark_oapi.event.callback.model": types.ModuleType("lark_oapi.event.callback.model"),
+    }
+    for name, module in parents.items():
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(
+        sys.modules, "lark_oapi.event.callback.model.p2_card_action_trigger", stub
+    )
+
+    from hermes_multitenancy.agent_relay_feishu import FeishuRelayClient
+
+    replayed = {"elements": [{"tag": "markdown", "content": "✅ approved"}]}
+    ack = FeishuRelayClient._ack("Already resolved", "info", card=replayed)
+    assert ack.toast == {"type": "info", "content": "Already resolved"}
+    # raw 形式 + 原样内容：飞书按这份 JSON 重渲染这条消息（版本 1.0 对 1.0）
+    assert ack.card == {"type": "raw", "data": replayed}
+
+    plain = FeishuRelayClient._ack("Recorded", "success")
+    assert plain.toast == {"type": "success", "content": "Recorded"}
+    assert not hasattr(plain, "card")
+
+
+def test_store_migrates_relay_cards_content_column(tmp_path):
+    """已部署的库没有 content_payload 列 —— 打开时必须原地补上，否则上线即崩。
+
+    _SCHEMA 全是 CREATE TABLE IF NOT EXISTS，对已存在的表不加列；
+    迁移靠 __init__ 里的 PRAGMA table_info 探测 + ALTER，这里钉住它。
+    """
+    from hermes_multitenancy.agent_relay_store import _SCHEMA, RelayStore
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_SCHEMA.replace("    content_payload TEXT,\n", ""))
+    conn.commit()
+    conn.close()
+
+    store = RelayStore(db, "test-encryption-key")
+    try:
+        cols = {row[1] for row in store._conn.execute("PRAGMA table_info(relay_cards)")}
+        assert "content_payload" in cols
+    finally:
+        store.close()

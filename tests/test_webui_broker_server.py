@@ -5,6 +5,7 @@ import asyncio
 import pathlib
 import json
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -69,6 +70,384 @@ def test_webui_run_broker_endpoint_streams_channel_neutral_events():
         assert seen[0].requires_host_tools is True
 
     asyncio.run(runner())
+
+
+def test_link_preview_endpoint_uses_trusted_owner_for_every_feishu_tenant(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    table = RoutingTable(tmp_path / "routing.db")
+    table.upsert(
+        user_id="owner-user",
+        profile_name="owner",
+        open_id="ou_owner",
+        provenance="sync",
+    )
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: table)
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile: tmp_path / "profiles" / profile)
+    seen = []
+
+    def resolve(profile_home, owner, urls):
+        seen.append((profile_home, owner, urls))
+        return [
+            {
+                "kind": "wiki",
+                "title": "跨租户规划",
+                "type_label": "知识库文档",
+                "url": urls[0],
+                "status": "resolved",
+            },
+            {
+                "kind": "task",
+                "title": "",
+                "type_label": "飞书任务",
+                "url": urls[1],
+                "status": "generic",
+            },
+        ]
+
+    async def runner():
+        app = create_run_broker_app(resolve_link_previews=resolve)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/link-previews",
+                json={
+                    "profile_name": "owner",
+                    "owner": "ou_forged",
+                    "urls": [
+                        "https://acme.feishu.cn/wiki/wikcnA",
+                        "https://globex.larksuite.com/client/todo/task?guid=task-1",
+                    ],
+                },
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+            )
+            body = await response.json()
+        finally:
+            await client.close()
+        return response.status, body
+
+    try:
+        status, body = asyncio.run(runner())
+    finally:
+        table.close()
+
+    assert status == 200
+    assert [item["status"] for item in body["previews"]] == ["resolved", "generic"]
+    assert seen == [
+        (
+            tmp_path / "profiles" / "owner",
+            "ou_owner",
+            [
+                "https://acme.feishu.cn/wiki/wikcnA",
+                "https://globex.larksuite.com/client/todo/task?guid=task-1",
+            ],
+        )
+    ]
+
+
+def test_link_preview_endpoint_fails_closed_without_owner_identity():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    called = []
+
+    async def runner():
+        app = create_run_broker_app(resolve_link_previews=lambda *_args: called.append(True))
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/link-previews",
+                json={"profile_name": "owner", "urls": ["https://acme.feishu.cn/wiki/token"]},
+            )
+            await response.text()
+        finally:
+            await client.close()
+        return response.status
+
+    assert asyncio.run(runner()) == 403
+    assert called == []
+
+
+def test_link_preview_two_actors_resolve_self_and_cannot_select_each_other_profile(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.routing import RoutingTable
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    table = RoutingTable(tmp_path / "routing.db")
+    table.upsert(user_id="user-a", profile_name="profile-a", open_id="ou_a", provenance="sync")
+    table.upsert(user_id="user-b", profile_name="profile-b", open_id="ou_b", provenance="sync")
+    monkeypatch.setattr(router_mod, "_get_routing_table", lambda: table)
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda profile: tmp_path / "profiles" / profile)
+    resolved = []
+
+    def resolve(profile_home, owner, urls):
+        resolved.append((profile_home.name, owner))
+        return [{"kind": "wiki", "title": owner, "type_label": "知识库文档", "url": urls[0], "status": "resolved"}]
+
+    async def runner():
+        app = create_run_broker_app(resolve_link_previews=resolve)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            statuses = []
+            for owner, requested_profile in (
+                ("ou_a", "profile-a"),
+                ("ou_b", "profile-b"),
+                ("ou_a", "profile-b"),
+            ):
+                response = await client.post(
+                    "/api/run-broker/link-previews",
+                    json={"profile_name": requested_profile, "urls": ["https://acme.feishu.cn/wiki/token"]},
+                    headers={"X-Hermes-Owner-Open-Id": owner},
+                )
+                statuses.append(response.status)
+                await response.text()
+        finally:
+            await client.close()
+        return statuses
+
+    try:
+        assert asyncio.run(runner()) == [200, 200, 200]
+    finally:
+        table.close()
+    assert resolved == [
+        ("profile-a", "ou_a"),
+        ("profile-b", "ou_b"),
+        ("profile-a", "ou_a"),
+    ]
+
+
+def test_link_preview_default_resolver_reads_documents_and_labels_other_products(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    inspected = []
+
+    def inspect_document(profile_home, owner, url):
+        inspected.append((profile_home, owner, url))
+        return {"title": "Hermes 2026 H2 产品规划", "type": "wiki"}
+
+    profile_home = tmp_path / "profiles" / "owner"
+    urls = [
+        "https://acme.feishu.cn/wiki/Q9mXwXqfhi2j5SkR6HjctEpEncf",
+        "https://globex.larksuite.com/client/todo/task?guid=task-1",
+        "https://project.feishu.cn/project/view/abc",
+    ]
+
+    previews = resolve_feishu_link_previews(
+        profile_home,
+        "ou_owner",
+        urls,
+        inspect_document=inspect_document,
+    )
+
+    assert previews == [
+        {
+            "kind": "wiki",
+            "title": "Hermes 2026 H2 产品规划",
+            "type_label": "知识库文档",
+            "url": urls[0],
+            "status": "resolved",
+        },
+        {
+            "kind": "task",
+            "title": "",
+            "type_label": "飞书任务",
+            "url": urls[1],
+            "status": "generic",
+        },
+        {
+            "kind": "meegle",
+            "title": "",
+            "type_label": "飞书项目",
+            "url": urls[2],
+            "status": "generic",
+        },
+    ]
+    assert inspected == [(profile_home, "ou_owner", urls[0])]
+
+
+@pytest.mark.parametrize(
+    ("url", "kind", "label"),
+    [
+        ("https://tenant.feishu.cn/client/todo/task?guid=1", "task", "飞书任务"),
+        ("https://tenant.feishu.cn/calendar/event/1", "calendar", "飞书日历"),
+        ("https://tenant.feishu.cn/approval/instance/1", "approval", "飞书审批"),
+        ("https://tenant.feishu.cn/vc/meeting/1", "meeting", "飞书会议"),
+        ("https://tenant.feishu.cn/minutes/1", "minutes", "飞书妙记"),
+        ("https://tenant.feishu.cn/client/chat/1", "im", "飞书消息"),
+        ("https://project.feishu.cn/project/view/1", "meegle", "飞书项目"),
+    ],
+)
+def test_link_preview_labels_non_document_products(url: str, kind: str, label: str, tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    preview = resolve_feishu_link_previews(tmp_path / "profile", "ou_owner", [url])[0]
+
+    assert (preview["kind"], preview["type_label"], preview["status"]) == (kind, label, "generic")
+
+
+def test_link_preview_resolves_only_public_open_platform_document_pages(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    fetched = []
+
+    def inspect_public_page(url):
+        fetched.append(url)
+        if "open.feishu.cn" in url:
+            return "获取文件元数据 - 服务端 API - 飞书开放平台"
+        return None
+
+    urls = [
+        "https://open.feishu.cn/document/server-docs/docs/drive-v1/file/batch_query",
+        "https://open.larksuite.com/document/server-docs/missing",
+        "https://open.feishu.cn/community/article/123",
+        "https://acme.feishu.cn/document/private-page",
+    ]
+    previews = resolve_feishu_link_previews(
+        tmp_path / "profiles" / "owner",
+        "ou_owner",
+        urls,
+        inspect_public_page=inspect_public_page,
+    )
+
+    assert previews == [
+        {
+            "kind": "open_platform",
+            "title": "获取文件元数据 - 服务端 API - 飞书开放平台",
+            "type_label": "开放平台文档",
+            "url": urls[0],
+            "status": "resolved",
+        },
+        {
+            "kind": "open_platform",
+            "title": "",
+            "type_label": "开放平台文档",
+            "url": urls[1],
+            "status": "generic",
+        },
+        {
+            "kind": "feishu",
+            "title": "",
+            "type_label": "飞书链接",
+            "url": urls[2],
+            "status": "generic",
+        },
+        {
+            "kind": "feishu",
+            "title": "",
+            "type_label": "飞书链接",
+            "url": urls[3],
+            "status": "generic",
+        },
+    ]
+    assert fetched == urls[:2]
+
+
+def test_link_preview_public_fetch_enforces_anonymous_no_redirect_reader(monkeypatch):
+    from hermes_multitenancy import feishu_link_preview as preview_mod
+
+    seen = {}
+
+    class Headers:
+        def get_content_type(self):
+            return "text/html"
+
+        def get_content_charset(self):
+            return "utf-8"
+
+    class Response:
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            seen["read_size"] = size
+            return b'<html><head><meta property="og:title" content="Public API"></head></html>'
+
+    class Opener:
+        def open(self, request, timeout):
+            seen["url"] = request.full_url
+            seen["headers"] = dict(request.header_items())
+            seen["timeout"] = timeout
+            return Response()
+
+    def build(handler):
+        seen["handler"] = handler
+        return Opener()
+
+    monkeypatch.setattr(preview_mod, "build_opener", build)
+
+    assert preview_mod._inspect_public_page("https://open.feishu.cn/document/test") == "Public API"
+    assert seen["handler"] is preview_mod._NoRedirect
+    assert seen["timeout"] == 2
+    assert seen["read_size"] == preview_mod._MAX_PUBLIC_HTML_BYTES + 1
+    assert "Cookie" not in seen["headers"]
+
+
+def test_link_preview_one_inspector_timeout_does_not_poison_the_batch(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    def timeout(*_args):
+        raise subprocess.TimeoutExpired("lark-cli", 2)
+
+    previews = resolve_feishu_link_previews(
+        tmp_path / "profile",
+        "ou_owner",
+        [
+            "https://tenant.feishu.cn/wiki/token",
+            "https://tenant.feishu.cn/calendar/event",
+        ],
+        inspect_document=timeout,
+    )
+
+    assert [item["status"] for item in previews] == ["forbidden", "generic"]
+
+
+def test_link_preview_normalizes_path_before_product_policy_match(tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    seen = []
+    previews = resolve_feishu_link_previews(
+        tmp_path / "profile",
+        "ou_owner",
+        ["https://open.feishu.cn/server/../document/test"],
+        inspect_public_page=lambda url: seen.append(url) or "Public API",
+    )
+
+    assert previews[0]["kind"] == "open_platform"
+    assert previews[0]["status"] == "resolved"
+    assert seen == ["https://open.feishu.cn/server/../document/test"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://acme.feishu.cn/wiki/token",
+        "https://evilfeishu.cn/wiki/token",
+        "https://feishu.cn.evil.example/wiki/token",
+        "https://example.com/wiki/token",
+        "https://user:password@open.feishu.cn/document/server-docs/example",
+        "https://open.feishu.cn:8443/document/server-docs/example",
+    ],
+)
+def test_link_preview_default_resolver_rejects_non_feishu_hosts(url: str, tmp_path: Path):
+    from hermes_multitenancy.feishu_link_preview import resolve_feishu_link_previews
+
+    with pytest.raises(ValueError, match="unsupported Feishu link"):
+        resolve_feishu_link_previews(tmp_path / "profile", "ou_owner", [url])
 
 
 def test_webui_workspace_is_profile_relative_and_invalid_paths_never_dispatch(monkeypatch, tmp_path: Path):
@@ -316,7 +695,8 @@ def test_webui_session_store_mark_failure_emits_error_and_retry_succeeds(monkeyp
 
     assert [status for status, _body in responses] == [200, 200, 200]
     assert '"kind": "error"' in responses[0][1]
-    assert "session store write failed" in responses[0][1]
+    assert "Run is unavailable" in responses[0][1]
+    assert "session store write failed" not in responses[0][1]
     assert '"text": "ok"' in responses[1][1]
     assert '"kind": "content"' not in responses[2][1]
     assert prepare_calls == 2
@@ -370,7 +750,8 @@ def test_webui_missing_session_store_emits_error_eof_without_dispatch(monkeypatc
 
     assert status == 200
     assert '"kind": "error"' in body
-    assert "SessionStore unavailable" in body
+    assert "Run is unavailable" in body
+    assert "SessionStore unavailable" not in body
     assert body.endswith("\n\n")
     assert prepare_calls == []
     assert dispatches == []
@@ -505,6 +886,7 @@ def test_internal_session_search_broker_uses_parent_profile_db(monkeypatch, tmp_
 
     profile_home = tmp_path / "profiles" / "owner"
     profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "isolated-hermes-home"))
     db = SessionDB(db_path=profile_home / "state.db")
     try:
         db.create_session("session-one", source="feishu")
@@ -1365,6 +1747,232 @@ def test_webui_run_broker_buffers_split_media_directives(monkeypatch, tmp_path: 
     asyncio.run(runner())
 
 
+def test_webui_run_broker_hides_and_materializes_split_artifact_protocol(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    writes: list[Path] = []
+    write_artifact = router_mod._write_response_artifact
+
+    def record_write(path, spec):
+        writes.append(path)
+        return write_artifact(path, spec)
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", "done\n"
+        artifact = '```hermes-artifact-json\n{"filename":"out.md","format":"md","content":"# title\\n"}\n```'
+        for character in artifact:
+            yield "content", character
+        yield "content", "\nafter"
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):  # pragma: no cover
+        raise AssertionError("real_run_agent fallback should not run when stream yielded content")
+
+    monkeypatch.setattr(
+        router_mod,
+        "_profile_name_to_home",
+        lambda profile_name: tmp_path / "profiles" / profile_name,
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+    monkeypatch.setattr(router_mod, "_write_response_artifact", record_write)
+
+    async def runner():
+        app = create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "create document",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "hermes-artifact-json" not in body
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        content = [event["text"] for event in events if event["kind"] == "content"]
+        assert "hermes-artifact-json" not in "".join(content)
+        assert sum("MEDIA:/workspace/Downloads/out.md" in text for text in content) == 1
+        assert writes == [profile_home / "workspace" / "Downloads" / "out.md"]
+        assert "done" in body
+        assert "after" in body
+        assert (profile_home / "workspace" / "Downloads" / "out.md").read_text() == "# title\n"
+
+    asyncio.run(runner())
+
+
+def test_webui_artifact_parser_uses_raw_string_offsets_and_drops_partial_terminal_marker(tmp_path: Path):
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy import webui_broker_server as server
+
+    profile_home = tmp_path / "profiles" / "owner"
+    artifact = '```hermes-artifact-json\n{"filename":"unicode.md","content":"ok"}\n```'
+    pending, items = server._webui_streamable_media_text(
+        f"önİce {artifact} son",
+        router_mod=router_mod,
+        profile_home=profile_home,
+        terminal=True,
+    )
+
+    joined = "".join(items)
+    assert pending == ""
+    assert "hermes-artifact-json" not in joined
+    assert "önİce" in joined and "son" in joined
+    assert "MEDIA:/workspace/Downloads/unicode.md" in joined
+    assert (profile_home / "workspace" / "Downloads" / "unicode.md").read_text() == "ok"
+
+    pending, items = server._webui_streamable_media_text(
+        "tail text ```hermes-artifact-jso",
+        router_mod=router_mod,
+        profile_home=profile_home,
+        terminal=True,
+    )
+    assert pending == ""
+    assert "".join(items) == "tail text "
+
+    for ordinary in ("Use `ls`", "value is ``", "```python\nprint(1)\n```"):
+        pending, items = server._webui_streamable_media_text(
+            ordinary,
+            router_mod=router_mod,
+            profile_home=profile_home,
+            terminal=True,
+        )
+        assert pending == ""
+        assert "".join(items) == ordinary
+
+    unicode_marker = artifact.replace("hermes", "hermeſ")
+    split_at = unicode_marker.index("ſ") + 1
+    pending, items = server._webui_streamable_media_text(
+        unicode_marker[:split_at],
+        router_mod=router_mod,
+        profile_home=profile_home,
+    )
+    pending, tail_items = server._webui_streamable_media_text(
+        pending + unicode_marker[split_at:],
+        router_mod=router_mod,
+        profile_home=profile_home,
+        terminal=True,
+    )
+    joined = "".join(items + tail_items)
+    assert pending == ""
+    assert "hermeſ-artifact-json" not in joined
+    assert '"filename":"unicode.md"' not in joined
+    assert "MEDIA:/workspace/Downloads/unicode.md" in joined
+
+
+def test_webui_run_broker_does_not_retry_or_leak_an_unterminated_artifact(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+    fallback_calls = 0
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        assert profile_home_arg == profile_home
+        yield "content", '```hermes-artifact-json\n{"filename":"secret.md","content":"private"}'
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return "must not run"
+
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda _profile: profile_home)
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "create document",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert fallback_calls == 0
+        assert "hermes-artifact-json" not in body
+        assert "private" not in body
+        assert "must not run" not in body
+
+    asyncio.run(runner())
+
+
+def test_webui_run_broker_one_shot_fallback_uses_the_artifact_seam(monkeypatch, tmp_path: Path):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.webui_broker_server import create_run_broker_app
+
+    profile_home = tmp_path / "profiles" / "owner"
+
+    async def fake_stream_run_agent(event, profile_home_arg, *, messages=None):
+        if False:
+            yield "content", ""
+
+    async def fake_real_run_agent(event, profile_home_arg, *, messages=None):
+        return '```hermes-artifact-json\n{"filename":"fallback.md","content":"safe"}\n```'
+
+    monkeypatch.setattr(router_mod, "_profile_name_to_home", lambda _profile: profile_home)
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream_run_agent)
+    monkeypatch.setattr(agent_real, "real_run_agent", fake_real_run_agent)
+
+    async def runner():
+        app = create_run_broker_app(mark_seen=lambda _request: True, sandbox_available=lambda: True)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/run-broker/runs", json={
+                "channel": "webui",
+                "profile_name": "owner",
+                "user_key": "ou_webui",
+                "content": "create document",
+                "session_id": "session-webui",
+                "requires_host_tools": True,
+            })
+            body = await response.text()
+        finally:
+            await client.close()
+
+        assert response.status == 200
+        assert "hermes-artifact-json" not in body
+        assert "MEDIA:/workspace/Downloads/fallback.md" in body
+        assert (profile_home / "workspace" / "Downloads" / "fallback.md").read_text() == "safe"
+
+    asyncio.run(runner())
+
+
 def test_webui_run_broker_materializes_split_remote_markdown_image(monkeypatch, tmp_path: Path):
     import socket
     import urllib.request
@@ -2049,6 +2657,218 @@ def test_webui_run_broker_event_exposes_owner_open_id_for_lark_cli_identity():
 
     assert event.sender_open_id == "ou_owner"
     assert _resolve_subprocess_sender_open_id(event) == "ou_owner"
+
+
+def test_webui_event_carries_only_an_explicit_sealed_runtime_principal():
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.trusted_runtime_principal import issue_webui_principal
+    from hermes_multitenancy.webui_broker_server import _build_webui_event
+
+    request = RunRequest(
+        channel="webui",
+        profile_name="owner",
+        user_key="ou_owner",
+        credential_subject="ou_owner",
+        content="analyze repository",
+    )
+    assert _build_webui_event(request).trusted_runtime_principal is None
+
+    principal = issue_webui_principal(
+        profile_name="owner",
+        actor_subject="ou_owner",
+        credential_subject="ou_owner",
+    )
+    event = _build_webui_event(request, trusted_principal=principal)
+    assert event.trusted_runtime_principal is principal
+    assert event.trusted_runtime_principal.is_authentic() is True
+
+
+def test_webui_authenticated_owner_is_sealed_before_default_dispatch(
+    monkeypatch,
+):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker
+
+    captured = {}
+
+    def prepare_codex_evidence(_event, _profile_home):  # pragma: no cover
+        raise AssertionError("dispatch stub should only capture this callback")
+
+    async def dispatch(request, **kwargs):
+        captured["request"] = request
+        captured["principal"] = kwargs.get("trusted_principal")
+        captured["prepare_codex_evidence"] = kwargs.get("prepare_codex_evidence")
+        return "ok"
+
+    monkeypatch.setattr(broker, "_default_dispatch_agent", dispatch)
+    monkeypatch.setattr(
+        broker,
+        "_resolve_owner_scoped_profile",
+        lambda _request, _payload: ("owner", None),
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+            prepare_codex_evidence=prepare_codex_evidence,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                headers={"X-Hermes-Owner-Open-Id": "ou_owner"},
+                json={
+                    "channel": "webui",
+                    "profile_name": "ignored",
+                    "user_key": "ignored",
+                    "credential_subject": "ignored",
+                    "content": "analyze repository",
+                },
+            )
+            await response.text()
+        finally:
+            await client.close()
+        assert response.status == 200
+
+    asyncio.run(runner())
+    principal = captured["principal"]
+    assert captured["request"].profile_name == "owner"
+    assert captured["request"].user_key == "ou_owner"
+    assert principal.is_authentic() is True
+    assert principal.profile_name == "owner"
+    assert principal.actor_subject == "ou_owner"
+    assert principal.credential_subject == "ou_owner"
+    assert captured["prepare_codex_evidence"] is prepare_codex_evidence
+
+
+def test_webui_harness_header_mints_server_admission_after_owner_binding(monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy import webui_broker_server as broker
+    from hermes_multitenancy.agent_real import harness_webui_runtime
+
+    captured = {}
+    admission = object()
+
+    def issue(**kwargs):
+        captured["issue"] = kwargs
+        return admission
+
+    async def dispatch(_request, **kwargs):
+        captured["admission"] = kwargs.get("trusted_harness_admission")
+        captured["prepare_codex_evidence"] = kwargs.get("prepare_codex_evidence")
+        return "ok"
+
+    monkeypatch.setattr(harness_webui_runtime, "issue_webui_harness_admission", issue)
+    monkeypatch.setattr(broker, "_default_dispatch_agent", dispatch)
+    monkeypatch.setattr(
+        broker,
+        "_resolve_owner_scoped_profile",
+        lambda _request, _payload: ("owner", None),
+    )
+
+    async def runner():
+        app = broker.create_run_broker_app(
+            mark_seen=lambda _request: True,
+            sandbox_available=lambda: True,
+            prepare_codex_evidence=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("Harness must not use GitLab Codex evidence")
+            ),
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/run-broker/runs",
+                headers={
+                    "X-Hermes-Owner-Open-Id": "ou_owner",
+                    "X-Hermes-Expert-Engine": "harness",
+                },
+                json={
+                    "channel": "webui",
+                    "profile_name": "ignored",
+                    "user_key": "ignored",
+                    "credential_subject": "ignored",
+                    "session_id": "session-1",
+                    "content": "/server-bugfix analyze repository",
+                },
+            )
+            await response.text()
+        finally:
+            await client.close()
+        assert response.status == 200
+
+    asyncio.run(runner())
+    assert captured["issue"] == {
+        "profile_name": "owner",
+        "actor_subject": "ou_owner",
+        "session_id": "session-1",
+        "engine": "harness",
+        "flow": "server-bugfix",
+        "workspace": None,
+    }
+    assert captured["admission"] is admission
+    assert captured["prepare_codex_evidence"] is None
+
+
+def test_default_dispatch_attaches_only_server_prepared_codex_evidence(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy import router as router_mod
+    from hermes_multitenancy.run_models import RunRequest
+    from hermes_multitenancy.trusted_runtime_principal import issue_webui_principal
+    from hermes_multitenancy.webui_broker_server import _default_dispatch_agent
+
+    trusted = (object(), b"trusted-fingerprint-key", object())
+    seen = {}
+
+    def prepare(event, profile_home):
+        seen["principal"] = event.trusted_runtime_principal
+        seen["profile_home"] = profile_home
+        return trusted
+
+    async def stream(event, _profile_home, *, messages=None):
+        assert messages is None
+        assert event.trusted_gitlab_run_attestation is trusted[0]
+        assert event.trusted_gitlab_fingerprint_key is trusted[1]
+        assert event.trusted_single_actor_spend_state is trusted[2]
+        assert event.raw_event["metadata"]["trusted_gitlab_run_attestation"] == "forged"
+        yield "content", "ok"
+
+    monkeypatch.setattr(
+        router_mod, "_profile_name_to_home", lambda _name: tmp_path / "profiles" / "owner"
+    )
+    monkeypatch.setattr(agent_real, "stream_run_agent", stream)
+    principal = issue_webui_principal(
+        profile_name="owner",
+        actor_subject="ou_owner",
+        credential_subject="ou_owner",
+    )
+
+    async def emit(_event):
+        return None
+
+    result = asyncio.run(
+        _default_dispatch_agent(
+            RunRequest(
+                channel="webui",
+                profile_name="owner",
+                user_key="ou_owner",
+                content="analyze repository",
+                metadata={"trusted_gitlab_run_attestation": "forged"},
+            ),
+            emit_event=emit,
+            trusted_principal=principal,
+            prepare_codex_evidence=prepare,
+        )
+    )
+    assert result == ""
+    assert seen["principal"] is principal
+    assert seen["profile_home"] == tmp_path / "profiles" / "owner"
 
 
 def test_webui_run_broker_event_preserves_metadata_without_a_second_time_source():
@@ -2879,6 +3699,7 @@ def test_shared_agent_session_search_is_actor_scoped(monkeypatch, tmp_path: Path
 
     profile_home = tmp_path / "profiles" / "owned_agent_profile"
     profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     db = SessionDB(db_path=profile_home / "state.db")
     try:
         db.create_session("owner-session", source="api_server", user_id="ou_owner")
@@ -5713,6 +6534,7 @@ def test_gitlab_token_endpoint_ignores_identity_fields_smuggled_in_the_body(monk
         # 无论放行与否，都绝不能拿 body 里的 victim 去入库
         assert captured.get("profile_name") == "owner_profile", captured
         assert captured.get("open_id") is None
+        assert captured.get("credential_subject") == "ou_owner"
         # 老客户端仍会在 payload 里带 expires_on；端点必须静默丢掉它，
         # 到期日只有一个来源 —— GitLab 上 token 自己那一行。
         assert "expires_on" not in captured, captured
@@ -5772,4 +6594,3 @@ def test_gitlab_token_endpoint_never_echoes_the_token(monkeypatch):
         assert secret not in text, "响应体里不得出现 token 明文"
 
     _run(runner)
-

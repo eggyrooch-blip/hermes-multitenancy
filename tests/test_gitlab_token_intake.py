@@ -470,6 +470,7 @@ def test_clean_token_lands_in_the_submitters_own_profile(monkeypatch, tmp_path):
         tier=TIER_READ,
         shared_home=shared,
         prober=_ok(READ_SCOPES),
+        credential_subject="ou_alice",
     )
     assert result["stored"] and result["tier"] == TIER_READ
     assert result["scopes"] == READ_SCOPES
@@ -486,6 +487,8 @@ def test_clean_token_lands_in_the_submitters_own_profile(monkeypatch, tmp_path):
             secret_kind="token",
         )
         assert payload["token"] == "glpat-clean"
+        assert payload["owner_actor_subject"] == "ou_alice"
+        assert payload["token_owner_verified"] is False
         # And NOT under the shared profile — that would hand one employee's
         # token to every other user.
         with pytest.raises(PermissionError):
@@ -581,6 +584,7 @@ def test_harness_reaches_the_vault_when_every_guard_passes(submit_harness):
     assert len(captured) == 1
     assert captured[0]["profile_name"] == "alice"
     assert captured[0]["token"] == "glpat-typed"
+    assert captured[0]["credential_subject"] == "ou_alice"
     # The Feishu path must not resurrect the deprecated expiry argument.
     assert "expires_on" not in captured[0]
 

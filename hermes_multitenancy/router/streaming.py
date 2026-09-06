@@ -88,6 +88,20 @@ def _billing_failure_stream_notice(exc: BaseException | None) -> Optional[str]:
     return None
 
 
+def _stall_failure_stream_notice(exc: BaseException | None) -> Optional[str]:
+    """A child killed for stream silence names the tool that hung."""
+    from ..agent_real.streaming import AiagentToolStallTimeout
+
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(seen) < 10:
+        if isinstance(cur, AiagentToolStallTimeout):
+            return cur.user_notice
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def _stream_failure_content(
     text: str,
     profile_home: Optional[Path] = None,
@@ -95,7 +109,11 @@ def _stream_failure_content(
 ) -> str:
     from ..agent_real import _PARTIAL_FAILURE_NOTICE
 
-    notice = _billing_failure_stream_notice(exc) or _PARTIAL_FAILURE_NOTICE
+    notice = (
+        _billing_failure_stream_notice(exc)
+        or _stall_failure_stream_notice(exc)
+        or _PARTIAL_FAILURE_NOTICE
+    )
     partial = _clean_stream_display_text(text, profile_home).rstrip()
     if notice in partial:
         return partial
@@ -806,8 +824,11 @@ async def _stream_into_feishu_shared_consumer(
                                 last_reasoning_edit = now
                         continue
 
-                    if kind == "status":
-                        text = str(delta or "").strip()
+                    if kind in ("status", "heartbeat"):
+                        if kind == "heartbeat":
+                            text = str(delta.get("text") or "").strip() if isinstance(delta, dict) else ""
+                        else:
+                            text = str(delta or "").strip()
                         if text:
                             try:
                                 await consumer.update_streaming_card_status(text)
@@ -1316,8 +1337,11 @@ async def _stream_into_feishu(
 
                         await handle_feishu_clarify_resolved(adapter, delta)
                         continue
-                    elif kind == "status":
-                        status_text = str(delta or "").strip()
+                    elif kind in ("status", "heartbeat"):
+                        if kind == "heartbeat":
+                            status_text = str(delta.get("text") or "").strip() if isinstance(delta, dict) else ""
+                        else:
+                            status_text = str(delta or "").strip()
                         if status_text:
                             try:
                                 await _update_feishu_stream_status(

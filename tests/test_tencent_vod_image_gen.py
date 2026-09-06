@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from multiprocessing import Process
+from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
@@ -284,8 +284,16 @@ def test_generate_serializes_vod_tasks_across_processes(tmp_path: Path):
     lock_dir.mkdir()
     markers.mkdir()
 
-    first = Process(target=_vod_lock_worker, args=(str(lock_dir), str(markers), "first"))
-    second = Process(target=_vod_lock_worker, args=(str(lock_dir), str(markers), "second"))
+    # This assertion is about an OS-level lock, not Python's spawn importer.
+    # A fork context keeps the worker in the xdist test process's import world
+    # and avoids making the test module itself an installed runtime dependency.
+    process_context = get_context("fork")
+    first = process_context.Process(
+        target=_vod_lock_worker, args=(str(lock_dir), str(markers), "first")
+    )
+    second = process_context.Process(
+        target=_vod_lock_worker, args=(str(lock_dir), str(markers), "second")
+    )
 
     first.start()
     try:

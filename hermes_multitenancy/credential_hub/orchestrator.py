@@ -111,4 +111,7 @@ def collect_credential_statuses(
         shared_home=shared_home,
         home_dir=home_dir,
     )
-    return [compat.to_credential_row(status) for status in statuses]
+    # The unified registry may add bundle-only connectors. The legacy endpoint and
+    # Feishu /auth card remain byte-identical until they explicitly adopt them.
+    legacy_ids = set(_hub.CREDENTIAL_ORDER)
+    return [compat.to_credential_row(status) for status in statuses if status.id in legacy_ids]

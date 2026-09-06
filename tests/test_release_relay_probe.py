@@ -154,3 +154,74 @@ def test_release_script_uses_the_lib_and_stays_syntactically_valid():
     assert "relay_probe_wait" in text, "主脚本必须走 lib 的等待逻辑"
     assert subprocess.run(["bash", "-n", str(RELEASE_SH)]).returncode == 0
     assert subprocess.run(["bash", "-n", str(LIB)]).returncode == 0
+
+
+# ── 探针上限 vs relay 自己的 pre-bind 耗时 ───────────────────────────────
+# 2026-08-27 release-20260827-01 第二次假失败后加的守卫。前面那些测试证明
+# 「等待逻辑」是对的，但没人证明【等多久】是对的 —— 15s 这个数字从来没有依据，
+# 而 relay 的 bind 时间有一个可算的下界，两者的错配才是复发的真原因。
+RELAY_FEISHU = Path(__file__).resolve().parents[1] / "hermes_multitenancy" / "agent_relay_feishu.py"
+
+#: relay 放弃飞书 ws 后还要 join 工作线程（agent_relay_feishu.py 里的
+#: `thread.join(timeout=5)`）。没抽成常量是有意的：动它要改 relay 运行时代码，
+#: 而那份代码走 /opt 下独立 venv 的同步链，为一个字面量不值当。
+RELAY_WS_JOIN_SECONDS = 5
+#: 下界之上的余量倍数：冷启动要 import lark_oapi / aiohttp / cryptography，
+#: 飞书握手本身也会抖。真死的 relay 只是晚报红，代价远小于一次假失败。
+PROBE_HEADROOM_FACTOR = 4
+
+
+def _shell_default(text: str, name: str) -> int:
+    """从 `NAME="${NAME:-<n>}"` 里取出发货默认值。"""
+    import re
+
+    match = re.search(rf'^{name}="\$\{{{name}:-(\d+)\}}"', text, re.MULTILINE)
+    assert match, f"{name} 的默认值形状变了（必须仍可被环境变量覆盖）"
+    return int(match.group(1))
+
+
+def _py_constant(text: str, name: str) -> int:
+    import re
+
+    match = re.search(rf"^{name}\s*=\s*(\d+)", text, re.MULTILINE)
+    assert match, f"读不到 {name}"
+    return int(match.group(1))
+
+
+def test_probe_timeout_covers_relay_pre_bind_worst_case():
+    """探针上限必须数倍于 relay 放弃飞书 ws 所需的时间。
+
+    aiohttp 跑完 on_startup 才 bind socket，而 on_startup 里同步等 ws：
+    relay 最坏要 EVENT_STREAM_START_TIMEOUT_SECONDS + join 才可能 bind。
+    探针上限 ≤ 这个数，就是结构性地保证超时（15s vs 10+5=15s，两次事故）。
+
+    relay 侧把 ws 上限调大而这里没跟上 → 本测试红，逼一次有意识的决定。
+    """
+    ws = _py_constant(RELAY_FEISHU.read_text(encoding="utf-8"), "EVENT_STREAM_START_TIMEOUT_SECONDS")
+    probe = _shell_default(RELEASE_SH.read_text(encoding="utf-8"), "RELAY_PROBE_TIMEOUT")
+    floor = (ws + RELAY_WS_JOIN_SECONDS) * PROBE_HEADROOM_FACTOR
+
+    assert probe >= floor, (
+        f"RELAY_PROBE_TIMEOUT={probe}s 盖不住 relay 的 pre-bind 最坏耗时："
+        f"ws {ws}s + join {RELAY_WS_JOIN_SECONDS}s，需 ≥{floor}s"
+    )
+
+
+def test_slow_bind_passes_at_shipped_timeout_but_failed_at_the_old_15(tmp_path):
+    """一次真实形状的慢 bind：新默认下通过，旧的 15s 下失败。
+
+    红绿双向 —— 只证"现在绿了"无法证明这次改动就是原因。
+    """
+    slow = ["000000"] * 16 + ["401"]
+    shipped = _shell_default(RELEASE_SH.read_text(encoding="utf-8"), "RELAY_PROBE_TIMEOUT")
+    # 两轮各用自己的目录：_wait 的游标是会被吃掉的文件，共用目录会串味。
+    for sub in ("new", "old"):
+        (tmp_path / sub).mkdir()
+
+    rc, waited, last = _wait(list(slow), timeout=shipped, tmp_path=tmp_path / "new")
+    assert (rc, waited, last) == (0, 16, "401"), "发货默认值必须等得过 16s 的慢 bind"
+
+    rc_old, waited_old, last_old = _wait(list(slow), timeout=15, tmp_path=tmp_path / "old")
+    assert rc_old == 1, "旧的 15s 必须在这条序列上失败，否则这次改动没有解释力"
+    assert waited_old == 15
+    assert last_old == "000000"

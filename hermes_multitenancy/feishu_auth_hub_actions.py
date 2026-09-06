@@ -270,6 +270,7 @@ def _handle_gitlab_token_submit(adapter: Any, event: Any, action: Any) -> Any:
             token=token,
             tier=tier,
             shared_home=shared,
+            credential_subject=open_id,
         )
     except TokenRejected as exc:
         # Re-render the form with the reason so the user can correct it without

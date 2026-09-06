@@ -33,6 +33,7 @@ dependencies = [
     "openai>=1.0",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
+    "mcp>=1.26,<2",
     "cryptography>=43.0",
     "tencentcloud-sdk-python-vod>=3.0",
 ]
@@ -65,6 +66,16 @@ hermes-multitenancy-billing-shadow = "hermes_multitenancy.billing_shadow:main"
 hermes-multitenancy-billing-refresh = "hermes_multitenancy.billing_employee_key:refresh_main"
 hermes-multitenancy-account-ledger-export = "hermes_multitenancy.account_ledger_export:main"
 hermes-agent-relay = "hermes_multitenancy.agent_relay:main"
+hermes-multitenancy-mcp = "hermes_multitenancy.connector_mcp_http:main"
+hermes-multitenancy-mcp-config = "hermes_multitenancy.connector_client_adapters:main"
+hermes-multitenancy-connector-conformance = "hermes_multitenancy.connector_catalog_conformance:main"
+hermes-multitenancy-connector-icon-import = "hermes_multitenancy.connector_icon_import:main"
+hermes-multitenancy-connector-probe = "hermes_multitenancy.connector_remote_probe:main"
+hermes-multitenancy-connector-remote-sweep = "hermes_multitenancy.connector_remote_sweep:main"
+hermes-multitenancy-connector-stdio-admission = "hermes_multitenancy.connector_stdio_admission:main"
+hermes-multitenancy-connector-credential-schema = "hermes_multitenancy.connector_credential_schema:main"
+hermes-multitenancy-connector-report = "hermes_multitenancy.connector_conformance_report:main"
+hermes-multitenancy-connector-stdio-sandbox = "hermes_multitenancy.connector_stdio_sandbox:main"
 
 [project.entry-points."hermes_agent.plugins"]
 multitenancy = "hermes_multitenancy"
@@ -73,4 +84,4 @@ multitenancy = "hermes_multitenancy"
 packages = ["hermes_multitenancy", "hermes_multitenancy.agent_real", "hermes_multitenancy.analytics", "hermes_multitenancy.card", "hermes_multitenancy.compat", "hermes_multitenancy.connectors", "hermes_multitenancy.cron", "hermes_multitenancy.credential_hub", "hermes_multitenancy.credential_hub.readers", "hermes_multitenancy.router", "hermes_multitenancy.sync", "hermes_multitenancy.webui_broker"]
 
 [tool.setuptools.package-data]
-hermes_multitenancy = ["plugin.yaml"]
+hermes_multitenancy = ["plugin.yaml", "connector_catalog_data/*.jsonl", "connector_catalog_data/icons/*"]

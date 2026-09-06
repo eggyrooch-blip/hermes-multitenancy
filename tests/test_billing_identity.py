@@ -1085,6 +1085,7 @@ def test_disabled_path_strips_every_spoofable_field(tmp_path, monkeypatch):
             "litellm_billing_enforced": True,
             "litellm_billing_user_id": "spoofed",
             "litellm_billing_key_id": "spoofed",
+            "litellm_billing_actor_subject": "ou_spoofed",
         },
     })
 
@@ -1092,6 +1093,24 @@ def test_disabled_path_strips_every_spoofable_field(tmp_path, monkeypatch):
 
     assert "litellm_billing_enforced" not in prepared.metadata
     assert "litellm_billing_key_id" not in prepared.metadata
+    assert "litellm_billing_actor_subject" not in prepared.metadata
+
+
+def test_trusted_harness_actor_is_the_payer_for_a_shared_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_ENABLED", "true")
+    monkeypatch.setenv("HERMES_LITELLM_BILLING_PAYER_IDS", "member")
+    credentials = _FakeCredentials()
+    preparer = _identity_preparer(tmp_path, credentials)
+
+    prepared = preparer.prepare(
+        _request(profile_name="owner"), actor_open_id="ou_member"
+    )
+
+    assert credentials.calls[0][0].employee_user_id == "member"
+    assert prepared.metadata["litellm_billing_employee_user_id"] == "member"
+    assert prepared.metadata["litellm_billing_actor_subject"] == "ou_member"
 
 
 # ---------------------------------------------- source-routed 401 repair

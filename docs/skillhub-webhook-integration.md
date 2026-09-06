@@ -45,9 +45,12 @@ Content-Type: application/json
 ```
 
 - **必填**：`event_type`、`skill_code`。缺了返回 400。
-- `audience.auth_type=all` → 全员；`auth` → 按 `users[].profile_id`。
+- `audience.auth_type=all` → 全员；`auth` → 按 `users[].profile_id`。`profile_id` 必须是 Hermes routing 的 LDAP/`user_id`；若同时提供 `employee_id`，它必须等于同一 LDAP，`open_id` 则必须等于该唯一 active user route 的 open_id。缺失、歧义或不一致会让整条事件以 `AUDIENCE_IDENTITY_INVALID` 失败，且在下载和安装前停止；routing DB 不可用单独返回 `AUDIENCE_ROUTING_UNAVAILABLE`。
 - plugin `skill_status=inactive` 只禁用展示与运行，保留已保存包和 audience；无显式 status 的 permission 事件不得把它重新启用。
 - active plugin 的 profile audience 默认包含经 Hermes routing 与 profile 目录双重证明的 `sunke`；上游 permission 用户增量追加。该默认身份无法证明时事件显式失败，不做无声 no-op。
+- AiDock trusted publisher 免人工复审，但不跳过包完整性、插件所有权、身份绑定、profile 隔离或候选健康检查。同一插件的新 release（包括缓存重试）可原子替换自己的受管 shared/private source；失败会恢复 manifest、shared/private source 和 profile fanout。
+- profile 已有同名技能时只跳过该技能入口，不覆盖旧安装，也不撤销已批准的专家 audience；专家运行时仍从各插件的受信 repo 加载隔离技能，未授权 profile 继续 fail-closed。
+- 候选健康检查只要求 `owned_skills` 中由该插件实际安装的 profile 入口精确命中 shared/private source；被明确跳过的外部同名入口不再把整个授权判失败，包预检与 expert repo 解析仍必须通过。
 - PRD §9.5 的全量嵌套格式（`skill{}`/`release.package{}`/`audience.type`）也兼容，二选一即可。
 
 ### 🙏 希望你补两个字段（强烈建议）
@@ -93,11 +96,10 @@ curl -s -X POST https://hermes.example.com/api/run-broker/skillhub/events \
   -d '{"event_type":"skill.install_approved","skill_code":"daily-breaking","release_id":"rel_001","version":"1.0.3","download_url":"https://example.invalid/1.0.3.zip","skill_status":"active","audience":{"auth_type":"auth","users":[{"profile_id":"profile-owner"}]}}'
 ```
 
-## 6. 还需要你确认的 3 件事
+## 6. 还需要你确认的 2 件事
 
-1. `audience.users[].profile_id` 里的值，和 Hermes 的 profile 名怎么映射？（你早先发过 `profile-owner` + `ldap`）
-2. 你那边的 **callback endpoint**（Hermes 装完回传状态用）地址 + 鉴权，方便我下一期对接。
-3. 鉴权已定：**固定 Bearer key**（专用 key，我私发给你，不用 HMAC）。
+1. 你那边的 **callback endpoint**（Hermes 装完回传状态用）地址 + 鉴权，方便我下一期对接。
+2. 鉴权已定：**固定 Bearer key**（专用 key，我私发给你，不用 HMAC）。
 
 ## 7. 当前实现边界
 

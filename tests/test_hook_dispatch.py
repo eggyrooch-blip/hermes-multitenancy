@@ -802,8 +802,11 @@ def test_cron_delivery_patch_preserves_explicit_feishu_intent(monkeypatch, deliv
     )["chat_id"] == "oc_explicit"
 
 
-def test_cron_delivery_patch_preserves_multi_target_delivery(monkeypatch):
-    """A bare Feishu token inside a multi-target job stays on core's path."""
+@pytest.mark.parametrize("deliver_value", ["feishu,slack", "all", ["feishu", "slack"]])
+def test_cron_delivery_patch_preserves_non_feishu_leg_with_confirmed_receipt(
+    monkeypatch, deliver_value,
+):
+    """Resolved targets, not the raw deliver shape, own mixed delivery."""
     import sys
     import types
 
@@ -811,8 +814,13 @@ def test_cron_delivery_patch_preserves_multi_target_delivery(monkeypatch):
 
     cron_pkg = types.ModuleType("cron")
     scheduler = types.ModuleType("cron.scheduler")
-    original_calls = []
-    scheduler._deliver_result = lambda job, content, adapters=None, loop=None: original_calls.append(job["deliver"])
+    original_targets = []
+
+    def original_deliver(job, content, adapters=None, loop=None):
+        original_targets.append(scheduler._resolve_delivery_targets(job))
+        return None
+
+    scheduler._deliver_result = original_deliver
     scheduler._resolve_delivery_targets = lambda _job: [
         {"platform": "feishu", "chat_id": "oc_original"},
         {"platform": "slack", "chat_id": "channel"},
@@ -820,18 +828,76 @@ def test_cron_delivery_patch_preserves_multi_target_delivery(monkeypatch):
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)
     monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda _job, _target: True)
+    feishu_calls = []
+
+    def confirmed_feishu(*_args, receipt_out=None, **_kwargs):
+        feishu_calls.append(True)
+        receipt_out["message_id"] = "om_confirmed"
+        return None
+
+    monkeypatch.setattr(
+        cron_worker,
+        "_deliver_cron_feishu_via_live_adapter",
+        confirmed_feishu,
+    )
+    mirrored = []
+    monkeypatch.setattr(
+        cron_worker,
+        "_mirror_cron_delivery_to_owner",
+        lambda job, content: mirrored.append((job["id"], content)),
+    )
 
     cron_worker._patch_cron_delivery_mirror()
 
+    job = {"id": "job123", "deliver": deliver_value}
     error = scheduler._deliver_result(
-        {"id": "job123", "deliver": "feishu,slack"},
+        job,
         "cron body",
         adapters={},
         loop=types.SimpleNamespace(is_running=lambda: True),
     )
 
     assert error is None
-    assert original_calls == ["feishu,slack"]
+    assert original_targets == [[{"platform": "slack", "chat_id": "channel"}]]
+    assert feishu_calls == [True]
+    assert job["_hermes_feishu_receipt_expected"] is True
+    assert job["_hermes_delivery_message_id"] == "om_confirmed"
+    assert mirrored == [("job123", "cron body")]
+
+
+@pytest.mark.parametrize("deliver_value", ["feishu", "all", ["slack", "feishu"]])
+def test_cron_delivery_patch_without_resolver_fails_closed_for_feishu(
+    monkeypatch, deliver_value,
+):
+    """A partial/old scheduler must never send Feishu without receipt support."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    core_calls = []
+    scheduler._deliver_result = (
+        lambda job, content, adapters=None, loop=None:
+        core_calls.append((job, content)) or None
+    )
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+
+    cron_worker._patch_cron_delivery_mirror()
+
+    error = scheduler._deliver_result(
+        {"id": "job123", "deliver": deliver_value},
+        "cron body",
+        adapters={},
+        loop=types.SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert error == "cron delivery target resolution unavailable"
+    assert core_calls == []
 
 
 def test_cron_run_broker_patch_submits_cron_run_request(monkeypatch, tmp_path):
@@ -1269,8 +1335,14 @@ def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missi
     monkeypatch.setattr(cron_worker, "_cron_delivery_identity_is_bound", lambda _job, _target: True)
     cron_worker._patch_cron_delivery_mirror()
 
+    job = {
+        "id": "job123",
+        "name": "IT reminder",
+        "owner_open_id": "ou_owner",
+        "owner_profile": "owner",
+    }
     error = scheduler._deliver_result(
-        {"id": "job123", "name": "IT reminder", "owner_open_id": "ou_owner", "owner_profile": "owner"},
+        job,
         "cron body",
         adapters={"feishu": Adapter()},
         loop=types.SimpleNamespace(is_running=lambda: True),
@@ -1282,6 +1354,56 @@ def test_cron_delivery_patch_uses_live_feishu_adapter_when_platform_config_missi
     assert sent[0][1] == "interactive"
     assert "IT reminder" in sent[0][2]
     assert "cron body" in sent[0][2]
+    assert job["_hermes_feishu_receipt_expected"] is True
+    assert job["_hermes_delivery_message_id"] == "om_confirmed"
+
+
+def test_cron_delivery_non_feishu_core_uses_one_authoritative_resolution(monkeypatch):
+    """Core cannot re-resolve a non-Feishu target into a receiptless Feishu send."""
+    import sys
+    import types
+
+    from hermes_multitenancy import cron_worker
+
+    cron_pkg = types.ModuleType("cron")
+    scheduler = types.ModuleType("cron.scheduler")
+    resolve_calls = []
+
+    def resolve_targets(_job):
+        resolve_calls.append(True)
+        if len(resolve_calls) == 1:
+            return [{"platform": "slack", "chat_id": "channel"}]
+        return [{"platform": "feishu", "chat_id": "oc_changed"}]
+
+    def original_deliver(job, _content, **_kwargs):
+        resolved = scheduler._resolve_delivery_targets(job)
+        if any(target["platform"] == "feishu" for target in resolved):
+            return "platform 'feishu' not configured/enabled"
+        return None
+
+    scheduler._deliver_result = original_deliver
+    scheduler._resolve_delivery_targets = resolve_targets
+    cron_pkg.scheduler = scheduler
+    monkeypatch.setitem(sys.modules, "cron", cron_pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    fallback_calls = []
+    monkeypatch.setattr(
+        cron_worker,
+        "_deliver_cron_feishu_via_live_adapter",
+        lambda *_args, **_kwargs: fallback_calls.append(True) or None,
+    )
+    monkeypatch.setattr(
+        cron_worker,
+        "_mirror_cron_delivery_to_owner",
+        lambda *_args, **_kwargs: None,
+    )
+
+    cron_worker._patch_cron_delivery_mirror()
+    job = {"id": "job123", "deliver": "slack"}
+
+    assert scheduler._deliver_result(job, "cron body", adapters={}, loop=object()) is None
+    assert resolve_calls == [True]
+    assert fallback_calls == []
 
 
 @pytest.mark.parametrize(
@@ -1701,6 +1823,49 @@ def test_cron_delivery_identity_requires_one_matching_active_route(monkeypatch, 
     assert cron_worker._cron_delivery_identity_is_bound(job, target) is False
 
 
+def test_cron_delivery_two_actor_profile_routes_have_zero_cross_match(monkeypatch, tmp_path):
+    """Two actor/profile cron sessions bind only to their own sink."""
+    import sqlite3
+
+    from hermes_multitenancy import cron_worker
+
+    db_path = tmp_path / "multitenancy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE multitenancy_routing "
+            "(open_id TEXT, owner_open_id TEXT, profile_name TEXT, active INTEGER, "
+            "chat_id TEXT, kind TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO multitenancy_routing VALUES (?, NULL, ?, 1, ?, 'user')",
+            [
+                ("ou_actor_a", "profile_a", "oc_sink_a"),
+                ("ou_actor_b", "profile_b", "oc_sink_b"),
+            ],
+        )
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(tmp_path))
+    jobs = [
+        {"id": "job_a", "owner_open_id": "ou_actor_a", "owner_profile": "profile_a"},
+        {"id": "job_b", "owner_open_id": "ou_actor_b", "owner_profile": "profile_b"},
+    ]
+    targets = [
+        {"platform": "feishu", "chat_id": "oc_sink_a"},
+        {"platform": "feishu", "chat_id": "oc_sink_b"},
+    ]
+
+    self_matches = sum(
+        cron_worker._cron_delivery_identity_is_bound(job, target)
+        for job, target in zip(jobs, targets)
+    )
+    cross_matches = sum(
+        cron_worker._cron_delivery_identity_is_bound(job, target)
+        for job, target in zip(jobs, reversed(targets))
+    )
+
+    assert self_matches == 2
+    assert cross_matches == 0
+
+
 def test_cron_delivery_patch_filters_thread_id_for_feishu_dm(monkeypatch):
     """Fallback must not pass stale thread_id metadata to Feishu open_id DMs."""
     import sys
@@ -1762,13 +1927,18 @@ def test_cron_delivery_patch_handles_media_branch_without_name_error(monkeypatch
     monkeypatch.setattr(cron_worker, "_cron_delivery_payload_for_adapter", lambda _job, _content: ("text body", [("/tmp/a.png", False)]))
     monkeypatch.setattr(
         cron_worker,
+        "_build_cron_card",
+        lambda _job, _content: ({"elements": []}, [("/tmp/a.png", False)]),
+    )
+    monkeypatch.setattr(
+        cron_worker,
         "_send_media_files_via_live_adapter",
         lambda _adapter, chat_id, media_files, _metadata, _loop, _job: media_sent.append((chat_id, media_files)) or None,
     )
 
     class Adapter:
-        async def send(self, chat_id, text, metadata=None):
-            sent.append((chat_id, text, metadata))
+        async def _send_raw_message(self, *, chat_id, msg_type, payload, reply_to, metadata):
+            sent.append((chat_id, msg_type, payload, metadata))
             return types.SimpleNamespace(success=True, message_id="om_confirmed")
 
     def run_now(coro, _loop):
@@ -1787,7 +1957,8 @@ def test_cron_delivery_patch_handles_media_branch_without_name_error(monkeypatch
     )
 
     assert error is None
-    assert sent == [("oc_target", "text body", None)]
+    assert len(sent) == 1
+    assert sent[0][:2] == ("oc_target", "interactive")
     assert media_sent == [("oc_target", [("/tmp/a.png", False)])]
 
 
@@ -1803,7 +1974,8 @@ def test_cron_delivery_patch_rejects_unbound_media_before_core(monkeypatch):
     original_calls = []
     scheduler._deliver_result = lambda *args, **kwargs: original_calls.append(True) or None
     scheduler._resolve_delivery_targets = lambda _job: [
-        {"platform": "feishu", "chat_id": "oc_target", "thread_id": None}
+        {"platform": "feishu", "chat_id": "oc_target", "thread_id": None},
+        {"platform": "slack", "chat_id": "channel", "thread_id": None},
     ]
     cron_pkg.scheduler = scheduler
     monkeypatch.setitem(sys.modules, "cron", cron_pkg)

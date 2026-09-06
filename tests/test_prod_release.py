@@ -26,10 +26,10 @@ RELEASE_SH = DEPLOY / "hermes-release.sh"
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="需要 git")
 
 
-def _git(repo: Path, *args: str) -> str:
+def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=env,
     ).stdout.strip()
 
 
@@ -197,7 +197,8 @@ def env(tmp_path: Path):
 
 def _tag(env, name: str, body: str) -> None:
     src = env["_mt_src"]
-    _git(src, "tag", "-a", name, "-m", body)
+    tag_env = {**os.environ, "GIT_COMMITTER_DATE": env["_tagger_date"]} if "_tagger_date" in env else None
+    _git(src, "tag", "-a", name, "-m", body, env=tag_env)
     _git(Path(env["RELEASES"]) / ".repo-mt", "fetch", "-q", "--tags", "origin")
 
 
@@ -209,6 +210,58 @@ def _run(env) -> subprocess.CompletedProcess:
 def _links(env):
     c = Path(env["CODE"])
     return os.readlink(c / "hermes-multitenancy"), os.readlink(c / "hermes-web-ui")
+
+
+@pytest.mark.parametrize(("ss_mode", "returncode", "message"), [
+    ("delayed", 0, "apiserver :8652 在听"),
+    ("delayed_line_end", 0, "apiserver :8652 在听"),
+    ("wrong_port", 1, "apiserver :8652 没在听（等了 10s）"),
+    ("absent", 1, "apiserver :8652 没在听（等了 10s）"),
+])
+def test_apiserver_probe_polls_the_real_port_check(tmp_path: Path, ss_mode: str, returncode: int, message: str):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    state = tmp_path / "ss-count"
+
+    stubs = {
+        "curl": '#!/usr/bin/env bash\ncase "$*" in *api/health*) printf 401;; *run-broker*) printf 401;; *) printf 200;; esac\n',
+        "sleep": "#!/usr/bin/env bash\nexit 0\n",
+        "ss": """#!/usr/bin/env bash
+n=$(cat "$SS_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$SS_STATE"
+printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\\n'
+[ "$SS_MODE" = delayed ] && [ "$n" -ge 2 ] && printf 'LISTEN 0 128 127.0.0.1:8652 0.0.0.0:*\\n'
+[ "$SS_MODE" = delayed_line_end ] && [ "$n" -ge 2 ] && printf 'LISTEN 0 128 127.0.0.1:8652\\n'
+[ "$SS_MODE" = wrong_port ] && printf 'LISTEN 0 128 127.0.0.1:86520 0.0.0.0:*\\n'
+""",
+    }
+    for name, body in stubs.items():
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o755)
+
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text('#!/usr/bin/env bash\n[ "$1" = is-active ] && printf active\nexit 0\n')
+    systemctl.chmod(0o755)
+    env = {
+        **os.environ,
+        "LC_ALL": "C",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "HERMES_HOME_DIR": str(tmp_path / "hermes"),
+        "HERMES_WEBUI_DIR": str(tmp_path / "webui"),
+        "PROBE_PY": str(tmp_path / "missing-probe.py"),
+        "SYSTEMCTL": str(systemctl),
+        "USER_UNITS": "hermes-gateway.service",
+        "BOOT_WAIT": "10",
+        "SS_MODE": ss_mode,
+        "SS_STATE": str(state),
+    }
+
+    result = subprocess.run(["bash", str(DEPLOY / "hermes-release-probes.sh")], env=env, capture_output=True, text=True)
+
+    assert result.returncode == returncode
+    assert message in result.stdout
+    assert state.read_text().strip() == "2"
 
 
 # ── 1. 没有新东西时一个字节都不许动 ──────────────────────────────────
@@ -779,6 +832,7 @@ def test_env_hash_survives_a_release(env):
 
 def test_prune_never_removes_the_rollback_target(env):
     """裁剪按绝对路径精确比对：当前版本和上一版(回滚目标)都不许删。"""
+    env["_tagger_date"] = "2026-08-28T00:00:00+00:00"
     src = env["_mt_src"]
     kept = []
     for i in range(3):
@@ -813,6 +867,7 @@ def test_stable_bin_bootstrap_only_after_success(env, tmp_path):
     """执行器自身只在发布成功之后才同步到稳定路径 —— 否则一个坏版本
     会把下次部署和回滚工具一起弄坏，连退路都没有。"""
     stable = tmp_path / "stable-bin"
+    env["_tagger_date"] = "2026-08-28T00:00:00+00:00"
     src = env["_mt_src"]
 
     # 先来一次会失败的发布：稳定路径不该被写
@@ -967,3 +1022,90 @@ def test_relay_file_list_is_globbed_not_hardcoded(env):
     env["_mt_sha"] = _git(mt_src, "rev-parse", "HEAD")
     _deploy_once(env, "release-relay-4")
     assert _relay_text(env, "agent_relay_newthing.py") == "# NEW agent_relay_newthing.py\n"
+
+
+def test_harness_pilot_check_requires_pinned_clean_source_and_codex(tmp_path: Path):
+    source = tmp_path / "source"
+    rev = _make_repo(source, with_probes=False)
+    codex = tmp_path / "codex"
+    codex.write_text("#!/bin/sh\necho codex-cli 0.150.1\n")
+    codex.chmod(0o755)
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n")
+    systemctl.chmod(0o755)
+    ready = tmp_path / "harness.ready"
+    ready.write_text(f"{rev}\n")
+    env_file = tmp_path / "harness.env"
+    env_file.write_text(
+        "\n".join([
+            "HERMES_WEBUI_HARNESS_ENABLED=1",
+            "HERMES_WEBUI_HARNESS_PROFILES=sunke",
+            f"HERMES_WEBUI_HARNESS_SOURCE_REV={rev}",
+        ]) + "\n"
+    )
+    run_env = {
+        **os.environ,
+        "HARNESS_PLATFORM": "Linux",
+        "HARNESS_SOURCE_DIR": str(source),
+        "HARNESS_CODEX_BIN": str(codex),
+        "HARNESS_ENV_FILE": str(env_file),
+        "HARNESS_READY_FILE": str(ready),
+        "SYSTEMCTL": str(systemctl),
+    }
+
+    ok = subprocess.run(
+        [str(DEPLOY / "prepare-harness-pilot.sh"), "--check"],
+        capture_output=True, text=True, env=run_env,
+    )
+    assert ok.returncode == 0, ok.stderr
+
+    (source / "drift").write_text("x\n")
+    drift = subprocess.run(
+        [str(DEPLOY / "prepare-harness-pilot.sh"), "--check"],
+        capture_output=True, text=True, env=run_env,
+    )
+    assert drift.returncode != 0
+    assert "source repository is dirty" in drift.stderr
+
+
+def test_harness_pilot_default_codex_root_is_inside_shared_runtime(tmp_path: Path):
+    source = tmp_path / "source"
+    rev = _make_repo(source, with_probes=False)
+    home = tmp_path / "home"
+    codex = (
+        home
+        / ".hermes/bin/hermes-codex-0.150.1/node_modules/.bin/codex"
+    )
+    codex.parent.mkdir(parents=True)
+    codex.write_text("#!/bin/sh\necho codex-cli 0.150.1\n")
+    codex.chmod(0o755)
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n")
+    systemctl.chmod(0o755)
+    ready = tmp_path / "harness.ready"
+    ready.write_text(f"{rev}\n")
+    env_file = tmp_path / "harness.env"
+    env_file.write_text(
+        "\n".join([
+            "HERMES_WEBUI_HARNESS_ENABLED=1",
+            "HERMES_WEBUI_HARNESS_PROFILES=sunke",
+            f"HERMES_WEBUI_HARNESS_SOURCE_REV={rev}",
+        ]) + "\n"
+    )
+
+    result = subprocess.run(
+        [str(DEPLOY / "prepare-harness-pilot.sh"), "--check"],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "HARNESS_PLATFORM": "Linux",
+            "HARNESS_SOURCE_DIR": str(source),
+            "HARNESS_ENV_FILE": str(env_file),
+            "HARNESS_READY_FILE": str(ready),
+            "SYSTEMCTL": str(systemctl),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr

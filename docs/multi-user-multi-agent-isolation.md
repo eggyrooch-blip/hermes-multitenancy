@@ -89,12 +89,12 @@
 
 - **存量单用户零回归**：不带 agent_id / 单 profile openid 的端到端路径行为与改造前完全一致，有针对性回归测试佐证。
 - **TDD**：每个行为变更先写一个**没有修复就失败**的回归测试，实证 fail-without 再 pass-with。
-- **生产安全**：迁移幂等；US-02 必须先于 US-03 的 backfill；不碰远端 `10.0.0.249`。
+- **生产安全**：迁移幂等；US-02 必须先于 US-03 的 backfill；不碰远端 `192.0.2.249`。
 - **仓库边界诚实**：kanban tasks 表 schema 属 hermes CLI，BFF 层尽力 + 残留缺口明确标注，不过度承诺。
 
 ## 6. US-08 看板隔离 — BFF 强制 vs 残留缺口（实现后确认）
 
-> 环境实测：本环境安装的 `hermes` CLI（`/Users/dev/.local/bin/hermes`）**没有 `kanban` 子命令**（子命令为 chat/model/gateway/cron/… 无 kanban）。因此 per-owner 任务隔离**无法在 DB/schema 层**实现——那属于本仓库集合之外的上游 hermes CLI。US-08 因此是 BFF（server controller）层的尽力边界，不是完整 DB 隔离。
+> 环境实测：本环境安装的 `hermes` CLI（`/Users/hermes/.local/bin/hermes`）**没有 `kanban` 子命令**（子命令为 chat/model/gateway/cron/… 无 kanban）。因此 per-owner 任务隔离**无法在 DB/schema 层**实现——那属于本仓库集合之外的上游 hermes CLI。US-08 因此是 BFF（server controller）层的尽力边界，不是完整 DB 隔离。
 
 **BFF 层已强制**：每个 kanban 端点要求已验证的飞书 `openid`（否则 HTTP 401）；`assign`/`searchSessions` 拒绝调用者不拥有的 client 提供的 agent `profile`（HTTP 403）；`list` 只返回 `created_by`（CLI 填充时优先）或 `assignee` agent 为调用者拥有的任务；`get` 对非拥有任务返回 HTTP 404 使 task id 不可枚举；归属检查 fail-closed —— multitenancy routing DB 不可用时拒绝。
 

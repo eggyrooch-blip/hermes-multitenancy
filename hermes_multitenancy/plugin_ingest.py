@@ -25,7 +25,7 @@ Design redlines (cross-model reviewed — see vault PLAN §4):
     pollute the profile's default agent).  The plugin.json carries no persona.
   * audience must be numeric `department_ids` (the org matcher ignores `dept`/
     name keys → silent 0-match).  Unknown audience → hard error, never silent.
-  * online-by-default is forbidden: governance.env_default must be `pre`.
+  * governance.env_default must be a supported execution environment.
 
 Usage:
     python3 -m hermes_multitenancy.plugin_ingest <plugin-repo> --audience <ids|profile>
@@ -245,12 +245,9 @@ def load_plugin_manifest(repo: Path) -> dict[str, Any]:
     if gov.get("approval_required"):
         if not entry:
             raise PluginIngestError(f"{path}: entry_skill is required for governed plugins")
-        if not any("orchestrat" in name for name in skills["list"]):
-            raise PluginIngestError(f"{path}: skills.list must declare an orchestrator skill")
-    if gov.get("env_default") not in (None, "pre"):
+    if gov.get("env_default") not in (None, "pre", "online"):
         raise PluginIngestError(
-            f"{path}: governance.env_default={gov.get('env_default')!r} — online-by-default is "
-            "forbidden; a plugin distributed to many employees must default to `pre`"
+            f"{path}: governance.env_default={gov.get('env_default')!r} must be `pre` or `online`"
         )
 
     _validate_experts(data.get("experts"), repo=repo, path=path)
@@ -419,6 +416,27 @@ def _resolve_installed_binary(cli_id: str, *, env: dict[str, str]) -> Optional[P
 
 # ─────────────────────────── skill distribution ──────────────────────────
 
+def _active_manifest_declares_skill(shared_home: Path, plugin_id: str, name: str) -> bool:
+    """True when ``plugin_id``'s ACTIVE managed manifest still lists ``name``.
+
+    The former owner's manifest is the only authority on whether it still
+    ships a skill: a missing / inactive manifest, or one whose ``skills`` no
+    longer contains the name, means the owner has let go of it.
+    """
+    try:
+        safe_id = _safe_component(plugin_id, kind="plugin id")
+    except Exception:
+        return False
+    manifest_path = shared_home / MANAGED_DIR / f"{safe_id}.json"
+    try:
+        managed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+    if not isinstance(managed, dict) or managed.get("status") not in {None, "", "active"}:
+        return False
+    return name in (managed.get("skills") or [])
+
+
 def _register_shared_skill_source(
     repo: Path,
     shared_skills: Path,
@@ -428,8 +446,18 @@ def _register_shared_skill_source(
     skills_dir: str,
     dry_run: bool,
     force: bool,
+    collision_fallback: Optional[Path] = None,
+    handover_from: Optional[str] = None,
 ) -> str:
-    """Copy the plugin's skill dir into the shared distribution source."""
+    """Copy the plugin's skill dir into the shared distribution source.
+
+    Ownership handover (2026-09-04, kep-ub-gen incident): when the shared
+    source is owned by ANOTHER plugin that no longer declares the skill in its
+    active manifest — or the operator names it via ``handover_from`` — this
+    plugin takes the shared source over instead of being namespaced away, so
+    profiles already linked to the shared path receive the new owner's copy.
+    An owner that still declares the skill is never displaced.
+    """
     _safe_skill_name(name)  # defense in depth (already validated at manifest load)
     src = repo / skills_dir / name
     if not src.is_dir():
@@ -484,9 +512,43 @@ def _register_shared_skill_source(
                     "digest": _skill_tree_digest(dst),
                 }
             if owner is not None and owner.get("plugin_id") != plugin_id:
-                raise PluginIngestError(
-                    f"shared skill source collision: {name!r} belongs to plugin {owner.get('plugin_id')!r}"
+                former = str(owner.get("plugin_id") or "")
+                handover = bool(former) and (
+                    handover_from == former
+                    or not _active_manifest_declares_skill(shared_skills.parent, former, name)
                 )
+                if handover:
+                    if dry_run:
+                        return "would-handover"
+                    if dst.is_symlink():
+                        dst.unlink()
+                    elif dst.exists():
+                        # keep the former owner's bytes recoverable; never delete
+                        dst.rename(dst.parent / f".{name}.handover-{int(time.time())}")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(src, dst)
+                    owners[name] = {
+                        "plugin_id": plugin_id,
+                        "digest": source_digest,
+                        "handover_from": former,
+                    }
+                    _write_json_atomic(registry_path, {"skills": owners})
+                    return "handover-registered"
+                if collision_fallback is None:
+                    raise PluginIngestError(
+                        f"shared skill source collision: {name!r} belongs to plugin {owner.get('plugin_id')!r}"
+                    )
+                dst = collision_fallback
+                if dst.exists():
+                    if _skill_tree_digest(dst) == source_digest:
+                        return "namespaced-present"
+                if dry_run:
+                    return "would-register-namespaced"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+                return "namespaced-registered"
             if dst.exists():
                 target_digest = _skill_tree_digest(dst)
                 if target_digest == source_digest and (owner or {}).get("digest") in {None, target_digest}:
@@ -647,6 +709,10 @@ def _managed_skill_present(profile_home: Path, name: str) -> bool:
     return isinstance(skills, dict) and name in skills
 
 
+def _private_skill_source_root(shared_home: Path, plugin_id: Any) -> Path:
+    return shared_home / MANAGED_DIR / ".sources" / _safe_component(plugin_id, kind="plugin id")
+
+
 def _install_skills_to_profile(
     plugin: dict[str, Any],
     audience: Audience,
@@ -655,14 +721,18 @@ def _install_skills_to_profile(
     profiles_root: Path,
     dry_run: bool,
     force: bool,
+    handover_from: Optional[str] = None,
 ) -> dict[str, Any]:
     repo = Path(plugin["_repo"])
     shared_skills = shared_home / "skills"
     names = list(plugin["skills"]["list"])
     version = str(plugin.get("version") or "")
     skills_dir = plugin["_skills_dir"]
-    source_actions = {
-        name: _register_shared_skill_source(
+    private_root = _private_skill_source_root(shared_home, plugin["id"])
+    source_actions: dict[str, str] = {}
+    source_paths: dict[str, Path] = {}
+    for name in names:
+        action = _register_shared_skill_source(
             repo,
             shared_skills,
             name,
@@ -670,18 +740,29 @@ def _install_skills_to_profile(
             skills_dir=skills_dir,
             dry_run=dry_run,
             force=force,
+            collision_fallback=private_root / name,
+            handover_from=handover_from,
         )
-        for name in names
-    }
+        source_actions[name] = action
+        source_paths[name] = (
+            private_root / name if "namespaced" in action else shared_skills / name
+        )
 
     installed: list[dict[str, Any]] = []
     owned: dict[str, list[str]] = {}
+    eligible_profiles: list[str] = []
+    excluded_profiles: list[str] = []
     for profile in audience.profiles:
         profile_home = profiles_root / profile
         if not profile_home.is_dir():
             raise PluginIngestError(f"profile home {profile_home} does not exist")
+        eligible_profiles.append(profile)
+
+    for profile in eligible_profiles:
+        profile_home = profiles_root / profile
         for name in names:
-            my_source = str(shared_skills / name)
+            source = source_paths[name]
+            my_source = str(source)
             existing = _personal_install_target(profile_home, name)
             # COEXISTENCE GUARD: never hijack a skill this profile already has from
             # someone else — a personal install from a DIFFERENT source (employee upload
@@ -697,14 +778,14 @@ def _install_skills_to_profile(
                     owned.setdefault(profile, []).append(name)
                     continue
                 identical = _displace_standalone_skill(
-                    profile_home, name, plugin_source=shared_skills / name
+                    profile_home, name, plugin_source=source
                 )
                 try:
                     install_shared_skill_for_profile(
                         shared_home=shared_home,
                         profile_home=profile_home,
                         skill_path=name,
-                        source=shared_skills / name,
+                        source=source,
                         version=version,
                     )
                 except BaseException:
@@ -720,23 +801,84 @@ def _install_skills_to_profile(
                 })
                 owned.setdefault(profile, []).append(name)
                 continue
-            if existing is not None and existing != my_source:
+            if existing is not None and not _same_install_path(existing, source):
                 installed.append({"profile": profile, "skill": name, "action": "skipped-foreign", "target": existing})
                 continue
+            # A profile whose ledger already points at the shared path we just took
+            # over from another plugin is being handed over, not merely ensured.
+            handed_over = existing is not None and source_actions[name] in {
+                "handover-registered",
+                "would-handover",
+            }
             if dry_run:
-                installed.append({"profile": profile, "skill": name, "action": "would-install"})
+                installed.append({
+                    "profile": profile,
+                    "skill": name,
+                    "action": "would-handover-relink" if handed_over else "would-install",
+                })
                 owned.setdefault(profile, []).append(name)
                 continue
             install_shared_skill_for_profile(
                 shared_home=shared_home,
                 profile_home=profile_home,
                 skill_path=name,
-                source=shared_skills / name,
+                source=source,
                 version=version,
             )
-            installed.append({"profile": profile, "skill": name, "action": "ensured"})
+            if handed_over:
+                installed.append({
+                    "profile": profile,
+                    "skill": name,
+                    "action": "handover-relinked",
+                    "previous_target": existing,
+                })
+            else:
+                installed.append({"profile": profile, "skill": name, "action": "ensured"})
             owned.setdefault(profile, []).append(name)
-    return {"source_actions": source_actions, "installed": installed, "owned": owned}
+    return {
+        "source_actions": source_actions,
+        "installed": installed,
+        "owned": owned,
+        "eligible_profiles": eligible_profiles,
+        "excluded_profiles": excluded_profiles,
+        "link_summary": _link_summary(installed),
+    }
+
+
+def _same_install_path(existing: str, source: Path) -> bool:
+    """Ledger target vs. our source — string match first, resolved path second."""
+    if existing == str(source):
+        return True
+    try:
+        return Path(existing).expanduser().resolve(strict=False) == source.resolve(strict=False)
+    except OSError:
+        return False
+
+
+def _link_summary(installed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-profile link actions so a silent skip can never hide again."""
+    counts: dict[str, int] = {}
+    foreign_targets: dict[str, int] = {}
+    for item in installed:
+        action = str(item.get("action") or "")
+        counts[action] = counts.get(action, 0) + 1
+        if action == "skipped-foreign":
+            target = str(item.get("target") or "")
+            foreign_targets[target] = foreign_targets.get(target, 0) + 1
+    summary: dict[str, Any] = {
+        "installed": counts.get("ensured", 0) + counts.get("would-install", 0),
+        "handover_relinked": counts.get("handover-relinked", 0) + counts.get("would-handover-relink", 0),
+        "takeover_standalone": counts.get("takeover-standalone", 0) + counts.get("would-takeover-standalone", 0),
+        "skipped_foreign": counts.get("skipped-foreign", 0),
+        "skipped_managed": counts.get("skipped-managed", 0),
+    }
+    if foreign_targets:
+        summary["skipped_foreign_targets"] = foreign_targets
+        summary["warning"] = (
+            f"{summary['skipped_foreign']} profile link(s) skipped-foreign — those profiles keep "
+            f"another source for this skill; see skipped_foreign_targets"
+        )
+    return summary
 
 
 def _register_department_distribution(
@@ -932,8 +1074,8 @@ def assert_governance(plugin: dict[str, Any]) -> dict[str, Any]:
     """Contract-level governance check (the plugin declaration)."""
     gov = plugin.get("governance") or {}
     env_default = gov.get("env_default") or "pre"
-    if env_default != "pre":
-        raise PluginIngestError(f"governance.env_default={env_default!r} must be 'pre' for distribution")
+    if env_default not in ("pre", "online"):
+        raise PluginIngestError(f"governance.env_default={env_default!r} must be 'pre' or 'online'")
     gates = list(gov.get("approval_required") or [])
     if not gates:
         # not fatal, but loud: a plugin with high-risk writes and no gates is suspicious
@@ -963,7 +1105,7 @@ def _assert_skill_content_governance(
     # ADVISORY since 2026-07-29 (sunke): AiDock is the trusted publishing source —
     # content-governance findings (gate literals absent from SKILL.md, missing
     # entry/orchestrator) WARN and land in the report, but never block ingest.
-    # env_default=pre stays hard-enforced in assert_governance().
+    # env_default stays validated in assert_governance().
     gov = plugin.get("governance") or {}
     gates = list(gov.get("approval_required") or [])
     installed = set(installed_skills)
@@ -1262,6 +1404,7 @@ def _active_plugin_state_transaction_locked(
     paths = {
         manifest_path,
         shared_home / MANAGED_DIR / ".locks" / "source-owners.json",
+        _private_skill_source_root(shared_home, plugin["id"]),
         shared_home / SKILL_DISTRIBUTION_FILE,
         shared_home / MANAGED_ASSETS_DIR / plugin["id"],
         *(shared_home / "skills" / name for name in old_skills | new_skills),
@@ -1325,6 +1468,7 @@ def _preflight_plugin_candidate(
     *,
     shared_home: Path,
     force: bool,
+    allow_profile_source_collisions: bool = False,
 ) -> None:
     """Run deterministic package/source checks before touching active content."""
     assert_governance(plugin)
@@ -1345,6 +1489,11 @@ def _preflight_plugin_candidate(
             skills_dir=plugin["_skills_dir"],
             dry_run=True,
             force=force,
+            collision_fallback=(
+                _private_skill_source_root(shared_home, plugin["id"]) / name
+                if allow_profile_source_collisions
+                else None
+            ),
         )
     install_clis(
         plugin.get("clis") or [],
@@ -1367,6 +1516,7 @@ def ingest(
     profiles_root: Optional[Path] = None,
     dry_run: bool = False,
     force: bool = False,
+    handover_from: Optional[str] = None,
     allow_create_distribution: bool = False,
     activate: bool = False,
     release_version: str | None = None,
@@ -1385,6 +1535,7 @@ def ingest(
             profiles_root=profiles_root,
             dry_run=dry_run,
             force=force,
+            handover_from=handover_from,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
             release_version=release_version,
@@ -1399,6 +1550,7 @@ def ingest(
             profiles_root=profiles_root,
             dry_run=False,
             force=force,
+            handover_from=handover_from,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
             release_version=release_version,
@@ -1417,6 +1569,7 @@ def _ingest_locked(
     force: bool,
     allow_create_distribution: bool,
     activate: bool,
+    handover_from: Optional[str],
     release_version: str | None,
     release_id: str | None,
 ) -> dict[str, Any]:
@@ -1430,6 +1583,7 @@ def _ingest_locked(
             profiles_root=profiles_root,
             dry_run=True,
             force=force,
+            handover_from=handover_from,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
             release_version=release_version,
@@ -1449,6 +1603,7 @@ def _ingest_locked(
             profiles_root=profiles_root,
             dry_run=False,
             force=force,
+            handover_from=handover_from,
             allow_create_distribution=allow_create_distribution,
             activate=activate,
             release_version=release_version,
@@ -1467,6 +1622,7 @@ def _ingest_locked_impl(
     force: bool,
     allow_create_distribution: bool,
     activate: bool,
+    handover_from: Optional[str],
     release_version: str | None,
     release_id: str | None,
 ) -> dict[str, Any]:
@@ -1486,6 +1642,7 @@ def _ingest_locked_impl(
             plugin,
             shared_home=shared_home,
             force=force,
+            allow_profile_source_collisions=aud.mode == "profile",
         )
 
     report: dict[str, Any] = {
@@ -1508,6 +1665,7 @@ def _ingest_locked_impl(
         "owned_skills": {},
         "clis": [c["id"] for c in plugin.get("clis") or []],
         "connectors": [c["id"] for c in plugin.get("connectors") or []],
+        "governance": {"env_default": report["governance"]["env_default"]},
         "install_mode": plugin.get("install_mode") or "copy",
         "repo": str(plugin.get("_repo") or ""),
         "experts": list(plugin.get("experts") or []),
@@ -1533,8 +1691,23 @@ def _ingest_locked_impl(
 
     if aud.mode == "profile":
         report["skills"] = _install_skills_to_profile(
-            plugin, aud, shared_home=shared_home, profiles_root=profiles_root, dry_run=dry_run, force=force
+            plugin,
+            aud,
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            dry_run=dry_run,
+            force=force,
+            handover_from=handover_from,
         )
+        manifest["audience"]["profiles"] = report["skills"]["eligible_profiles"]
+        manifest["skill_sources"] = {
+            name: (
+                "private"
+                if "namespaced" in report["skills"]["source_actions"].get(name, "")
+                else "shared"
+            )
+            for name in plugin["skills"]["list"]
+        }
     elif aud.mode == "all":
         report["skills"] = _register_global_distribution(
             plugin,
@@ -1559,9 +1732,18 @@ def _ingest_locked_impl(
     if asset_report:
         report["assets"] = asset_report
 
-    manifest["owned_skills"] = (
-        report["skills"].get("owned", {}) if aud.mode == "profile" else {}
-    )
+    if aud.mode == "profile":
+        owned = dict(report["skills"].get("owned", {}))
+        previous_owned = existing.get("owned_skills")
+        if isinstance(previous_owned, dict):
+            for profile in report["skills"].get("excluded_profiles", []):
+                names = previous_owned.get(profile)
+                if isinstance(names, list) and names:
+                    owned[profile] = list(names)
+        manifest["owned_skills"] = owned
+        report["effective_profiles"] = list(manifest["audience"]["profiles"])
+    else:
+        manifest["owned_skills"] = {}
     manifest["experts"] = experts
     manifest["assets"] = assets
     # A new or already-inactive plugin keeps the recoverable inactive manifest above.
@@ -1573,7 +1755,10 @@ def _ingest_locked_impl(
             assert_profile_governance(plugin, profiles_root / p, owned.get(p, []))
             for p in aud.profiles
         ]
-    if not dry_run and (activate or existing_status == "active"):
+    has_effective_audience = (
+        aud.mode != "profile" or bool(manifest["audience"]["profiles"])
+    )
+    if not dry_run and has_effective_audience and (activate or existing_status == "active"):
         manifest["status"] = "active"
     _write_managed_manifest(shared_home, manifest, dry_run=dry_run)
 
@@ -1704,12 +1889,15 @@ def _uninstall_locked(
                 # source (employee re-installed over it), leave it alone.
                 entry = _personal_install_metadata(profile_home, name)
                 tgt = entry.get("target") if entry is not None else None
-                my_source = str(shared_home / "skills" / name)
+                my_sources = {
+                    str(shared_home / "skills" / name),
+                    str(_private_skill_source_root(shared_home, plugin_id) / name),
+                }
                 target = profile_home / "skills" / name
                 if (
                     tgt is not None
                     and (
-                        tgt != my_source
+                        tgt not in my_sources
                         or (
                             (target.exists() or target.is_symlink())
                             and not _personal_install_is_unchanged(
@@ -1776,6 +1964,10 @@ def _uninstall_locked(
         )
 
     if not dry_run and not manifest_kept:
+        shutil.rmtree(
+            _private_skill_source_root(shared_home, plugin_id),
+            ignore_errors=True,
+        )
         if retain_status is None:
             path.unlink()
         else:
@@ -1859,6 +2051,15 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--uninstall", metavar="PLUGIN_ID", help="roll back a previously ingested plugin by id")
     ap.add_argument("--dry-run", action="store_true", help="print all actions, write nothing")
     ap.add_argument("--force", action="store_true", help="reinstall CLIs/skills even if present")
+    ap.add_argument(
+        "--handover-from",
+        default=None,
+        help=(
+            "plugin id that currently owns a shared skill source this plugin also declares; "
+            "take the shared source over even though that owner still lists the skill "
+            "(automatic handover only fires once the former owner's active manifest drops it)"
+        ),
+    )
     ap.add_argument("--allow-create-distribution", action="store_true",
                     help="(department mode) permit CREATING skill-distribution.yaml when absent "
                          "(DANGEROUS: overrides every profile's default-skill source)")
@@ -1883,6 +2084,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             report = ingest(
                 Path(args.repo), audience=args.audience, shared_home=args.shared_home,
                 profiles_root=args.profiles_root, dry_run=args.dry_run, force=args.force,
+                handover_from=args.handover_from,
                 allow_create_distribution=args.allow_create_distribution,
             )
     except PluginIngestError as exc:

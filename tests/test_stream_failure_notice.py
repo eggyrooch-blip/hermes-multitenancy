@@ -138,3 +138,15 @@ def test_non_errored_card_has_no_header() -> None:
         }
     )
     assert "header" not in card
+
+
+def test_stalled_tool_names_the_tool_not_generic_notice() -> None:
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    inner = AiagentToolStallTimeout(300, tool_call_id="c1", tool_name="terminal", elapsed_s=305)
+    outer = RuntimeError("streaming recovery exhausted")
+    outer.__cause__ = inner
+    out = _stream_failure_content("", None, exc=outer)
+    assert out == inner.user_notice
+    assert "terminal" in out and "305" in out
+    assert _PARTIAL_FAILURE_NOTICE not in out

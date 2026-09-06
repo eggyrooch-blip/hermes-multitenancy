@@ -15,7 +15,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname } from 'node:path';
-import { io } from '/Users/dev/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js';
+import { io } from '/Users/hermes/code/hermes-web-ui/node_modules/socket.io-client/build/esm/index.js';
 
 const SCENARIOS = {
   t1: {
@@ -135,7 +135,7 @@ function sqliteJson(dbPath, sql, options = {}) {
 }
 
 function collectStateRows({ profile, mark }) {
-  const dbPath = `/Users/dev/.hermes/profiles/${profile}/state.db`;
+  const dbPath = `/Users/hermes/.hermes/profiles/${profile}/state.db`;
   const users = sqliteJson(
     dbPath,
     `select id from messages where role='user' and content like '%${mark}%' order by id desc limit 1;`,
@@ -155,7 +155,7 @@ function collectStateRows({ profile, mark }) {
 }
 
 function logToolRows({ profile, platform, startTs, endTs }) {
-  const logPath = `/Users/dev/.hermes/profiles/${profile}/logs/agent.log`;
+  const logPath = `/Users/hermes/.hermes/profiles/${profile}/logs/agent.log`;
   if (!existsSync(logPath) || !startTs) return [];
   const effectiveEnd = endTs || '9999-12-31 23:59:59';
   const marker = `[agent:profile:${profile}:platform:${platform}:`;
@@ -385,13 +385,13 @@ function sendFeishuMessage({ scenario, text }) {
   const py = String.raw`
 import json, os, subprocess, sys
 from pathlib import Path
-sys.path.insert(0, "/Users/dev/code/hermes-multitenancy")
+sys.path.insert(0, "/Users/hermes/code/hermes-multitenancy")
 from hermes_multitenancy.webui_broker_server import load_run_broker_shared_env
 from hermes_multitenancy.agent_real import _lark_cli_auth_broker_scope
 
 payload = json.loads(sys.argv[1])
-load_run_broker_shared_env(Path('/Users/dev/.hermes'))
-profile = Path('/Users/dev/.hermes/profiles') / payload['senderProfile']
+load_run_broker_shared_env(Path('/Users/hermes/.hermes'))
+profile = Path('/Users/hermes/.hermes/profiles') / payload['senderProfile']
 with _lark_cli_auth_broker_scope(profile, payload['openid']) as extra:
     env = {k: v for k, v in os.environ.items() if k in {'PATH','HOME','LANG','LC_ALL','TERM','TMPDIR'}}
     env.update(extra)
@@ -413,11 +413,11 @@ with _lark_cli_auth_broker_scope(profile, payload['openid']) as extra:
     chatId: scenario.chatId,
     text,
   };
-  const proc = spawnSync('/Users/dev/.hermes/hermes-feishu-uat/venv/bin/python', ['-c', py, JSON.stringify(payload)], {
+  const proc = spawnSync('/Users/hermes/.hermes/hermes-feishu-uat/venv/bin/python', ['-c', py, JSON.stringify(payload)], {
     encoding: 'utf8',
     env: {
       ...process.env,
-      PYTHONPATH: '/Users/dev/code/hermes-multitenancy:/Users/dev/.hermes/hermes-feishu-uat',
+      PYTHONPATH: '/Users/hermes/code/hermes-multitenancy:/Users/hermes/.hermes/hermes-feishu-uat',
     },
     maxBuffer: 1024 * 1024 * 4,
   });

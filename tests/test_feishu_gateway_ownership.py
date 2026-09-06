@@ -232,4 +232,8 @@ def test_register_does_not_start_router_only_sidecars_on_non_router(monkeypatch,
     assert ("cron_watcher", None) not in calls
     assert ("cron_patches", None) not in calls
     assert ("bot_added_hook", None) not in calls
-    assert [name for name, _cb in calls] == ["pre_gateway_dispatch"]
+    assert [name for name, _cb in calls] == [
+        "post_tool_call",
+        "transform_tool_result",
+        "pre_gateway_dispatch",
+    ]

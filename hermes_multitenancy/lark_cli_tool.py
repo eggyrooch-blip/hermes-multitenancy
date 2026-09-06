@@ -8,12 +8,16 @@ routed AIAgent runtime imports this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -28,6 +32,7 @@ from .lark_cli_guard import (
     HERMES_LARK_CLI_RUN_TOKEN,
 )
 from .runtime import strict_context_enabled
+from .oauth_cli_guard import is_headless_oauth_attempt
 from .update_center import sanitize_user_visible_output
 
 try:
@@ -45,6 +50,319 @@ except ModuleNotFoundError:
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 120
 logger = logging.getLogger(__name__)
+_OPERATION_FIELD = "_hermes_operation"
+_OPERATION_DB_NAME = "operation-checkpoints.db"
+_STRICT_WRITE_VERBS = frozenset(
+    {
+        "add",
+        "append",
+        "archive",
+        "create",
+        "delete",
+        "import",
+        "move",
+        "patch",
+        "remove",
+        "replace",
+        "reply",
+        "send",
+        "set",
+        "update",
+        "upload",
+    }
+)
+_STRICT_READ_SCHEMA_METHODS = frozenset(
+    {
+        ("approval", "approvals", "get"),
+        ("approval", "instances", "get"),
+        ("approval", "instances", "initiated"),
+        ("approval", "tasks", "query"),
+        ("calendar", "calendars", "get"),
+        ("calendar", "calendars", "list"),
+        ("calendar", "calendars", "primary"),
+        ("calendar", "calendars", "search"),
+        ("calendar", "event.attendees", "list"),
+        ("calendar", "events", "get"),
+        ("calendar", "events", "instance_view"),
+        ("calendar", "events", "search_event"),
+        ("calendar", "events", "share_info"),
+        ("calendar", "freebusys", "list"),
+        ("contact", "user_profiles", "batch_query"),
+        ("drive", "file.comment.replys", "list"),
+        ("drive", "file.comments", "batch_query"),
+        ("drive", "file.comments", "list"),
+        ("drive", "file.statistics", "get"),
+        ("drive", "file.view_records", "list"),
+        ("drive", "files", "list"),
+        ("drive", "metas", "batch_query"),
+        ("drive", "permission.members", "auth"),
+        ("drive", "permission.public", "get"),
+        ("drive", "quota_details", "get"),
+        ("drive", "user", "subscription_status"),
+        ("im", "chat.members", "bots"),
+        ("im", "chat.members", "get"),
+        ("im", "chat.moderation", "get"),
+        ("im", "chat.nickname", "get"),
+        ("im", "chat.user_setting", "batch_query"),
+        ("im", "chats", "get"),
+        ("im", "feed.groups", "batch_query"),
+        ("im", "messages", "read_users"),
+        ("im", "pins", "list"),
+        ("im", "reactions", "batch_query"),
+        ("im", "reactions", "list"),
+        ("mail", "user_mailbox.drafts", "get"),
+        ("mail", "user_mailbox.drafts", "list"),
+        ("mail", "user_mailbox.folders", "get"),
+        ("mail", "user_mailbox.folders", "list"),
+        ("mail", "user_mailbox.labels", "get"),
+        ("mail", "user_mailbox.labels", "list"),
+        ("mail", "user_mailbox.mail_contacts", "list"),
+        ("mail", "user_mailbox.message.attachments", "download_url"),
+        ("mail", "user_mailbox.messages", "get"),
+        ("mail", "user_mailbox.messages", "list"),
+        ("mail", "user_mailbox.messages", "send_status"),
+        ("mail", "user_mailbox.rules", "list"),
+        ("mail", "user_mailbox.sent_messages", "get_recall_detail"),
+        ("mail", "user_mailbox.settings", "send_as"),
+        ("mail", "user_mailbox.template.attachments", "download_url"),
+        ("mail", "user_mailbox.templates", "get"),
+        ("mail", "user_mailbox.templates", "list"),
+        ("mail", "user_mailbox.threads", "get"),
+        ("mail", "user_mailbox.threads", "list"),
+        ("mail", "user_mailboxes", "accessible_mailboxes"),
+        ("mail", "user_mailboxes", "profile"),
+        ("mindnotes", "nodes", "list"),
+        ("minutes", "minutes", "get"),
+        ("okr", "alignments", "get"),
+        ("okr", "categories", "list"),
+        ("okr", "cycle.objectives", "list"),
+        ("okr", "cycles", "list"),
+        ("okr", "key_result.indicators", "list"),
+        ("okr", "key_results", "get"),
+        ("okr", "objective.alignments", "list"),
+        ("okr", "objective.indicators", "list"),
+        ("okr", "objective.key_results", "list"),
+        ("okr", "objectives", "get"),
+        ("slides", "xml_presentation.history", "list"),
+        ("slides", "xml_presentation.history", "revert_status"),
+        ("slides", "xml_presentation.slide", "get"),
+        ("slides", "xml_presentation.slide_image", "list"),
+        ("slides", "xml_presentations", "get"),
+        ("task", "custom_fields", "get"),
+        ("task", "custom_fields", "list"),
+        ("task", "sections", "get"),
+        ("task", "sections", "list"),
+        ("task", "sections", "tasks"),
+        ("task", "subtasks", "list"),
+        ("task", "tasklists", "get"),
+        ("task", "tasklists", "list"),
+        ("task", "tasklists", "tasks"),
+        ("task", "tasks", "get"),
+        ("task", "tasks", "list"),
+        ("vc", "meeting", "get"),
+        ("wiki", "members", "list"),
+        ("wiki", "nodes", "list"),
+        ("wiki", "spaces", "get"),
+        ("wiki", "spaces", "get_node"),
+        ("wiki", "spaces", "list"),
+    }
+)
+_STRICT_READ_SHORTCUTS = frozenset(
+    {
+        ("application", "+slash-command-list"),
+        ("apps", "+access-scope-get"),
+        ("apps", "+analytics-list"),
+        ("apps", "+automation-get"),
+        ("apps", "+automation-list"),
+        ("apps", "+cache-get"),
+        ("apps", "+db-audit-list"),
+        ("apps", "+db-audit-status"),
+        ("apps", "+db-changelog-list"),
+        ("apps", "+db-data-export"),
+        ("apps", "+db-env-diff"),
+        ("apps", "+db-quota-get"),
+        ("apps", "+db-recovery-diff"),
+        ("apps", "+db-sync-get"),
+        ("apps", "+db-sync-list"),
+        ("apps", "+db-table-get"),
+        ("apps", "+db-table-list"),
+        ("apps", "+env-list"),
+        ("apps", "+file-download"),
+        ("apps", "+file-get"),
+        ("apps", "+file-list"),
+        ("apps", "+file-quota-get"),
+        ("apps", "+file-sign"),
+        ("apps", "+get"),
+        ("apps", "+git-credential-list"),
+        ("apps", "+list"),
+        ("apps", "+log-get"),
+        ("apps", "+log-list"),
+        ("apps", "+member-list"),
+        ("apps", "+member-settings-get"),
+        ("apps", "+metric-list"),
+        ("apps", "+openapi-key-get"),
+        ("apps", "+openapi-key-list"),
+        ("apps", "+plugin-list"),
+        ("apps", "+release-get"),
+        ("apps", "+release-list"),
+        ("apps", "+role-get"),
+        ("apps", "+role-list"),
+        ("apps", "+role-match-list"),
+        ("apps", "+role-member-list"),
+        ("apps", "+session-get"),
+        ("apps", "+session-list"),
+        ("apps", "+session-messages-list"),
+        ("apps", "+trace-get"),
+        ("apps", "+trace-list"),
+        ("apps", "+user-id-convert"),
+        ("base", "+base-block-list"),
+        ("base", "+base-get"),
+        ("base", "+dashboard-block-get"),
+        ("base", "+dashboard-block-get-data"),
+        ("base", "+dashboard-block-list"),
+        ("base", "+dashboard-get"),
+        ("base", "+dashboard-list"),
+        ("base", "+data-query"),
+        ("base", "+field-get"),
+        ("base", "+field-list"),
+        ("base", "+field-search-options"),
+        ("base", "+form-detail"),
+        ("base", "+form-get"),
+        ("base", "+form-list"),
+        ("base", "+form-questions-list"),
+        ("base", "+record-download-attachment"),
+        ("base", "+record-get"),
+        ("base", "+record-history-list"),
+        ("base", "+record-list"),
+        ("base", "+record-search"),
+        ("base", "+role-get"),
+        ("base", "+role-list"),
+        ("base", "+table-copy-status"),
+        ("base", "+table-get"),
+        ("base", "+table-list"),
+        ("base", "+title-resolve"),
+        ("base", "+url-resolve"),
+        ("base", "+view-get"),
+        ("base", "+view-get-card"),
+        ("base", "+view-get-filter"),
+        ("base", "+view-get-group"),
+        ("base", "+view-get-sort"),
+        ("base", "+view-get-timebar"),
+        ("base", "+view-get-visible-fields"),
+        ("base", "+view-list"),
+        ("base", "+workflow-get"),
+        ("base", "+workflow-list"),
+        ("calendar", "+agenda"),
+        ("calendar", "+freebusy"),
+        ("calendar", "+get"),
+        ("calendar", "+meeting"),
+        ("calendar", "+room-find"),
+        ("calendar", "+search-event"),
+        ("calendar", "+suggestion"),
+        ("contact", "+get-user"),
+        ("contact", "+search-bot"),
+        ("contact", "+search-user"),
+        ("docs", "+fetch"),
+        ("docs", "+history-list"),
+        ("docs", "+history-revert-status"),
+        ("docs", "+media-download"),
+        ("docs", "+media-preview"),
+        ("docs", "+resource-download"),
+        ("docs", "+script"),
+        ("docs", "+search"),
+        ("drive", "+batch-query-comments"),
+        ("drive", "+cover"),
+        ("drive", "+download"),
+        ("drive", "+export"),
+        ("drive", "+export-download"),
+        ("drive", "+inspect"),
+        ("drive", "+list-comments"),
+        ("drive", "+list-replies"),
+        ("drive", "+member-list"),
+        ("drive", "+permission-get-setting"),
+        ("drive", "+preview"),
+        ("drive", "+search"),
+        ("drive", "+secure-label-list"),
+        ("drive", "+status"),
+        ("drive", "+task_result"),
+        ("drive", "+version-get"),
+        ("drive", "+version-history"),
+        ("im", "+chat-list"),
+        ("im", "+chat-members-list"),
+        ("im", "+chat-messages-list"),
+        ("im", "+chat-search"),
+        ("im", "+feed-group-list"),
+        ("im", "+feed-group-list-item"),
+        ("im", "+feed-group-query-item"),
+        ("im", "+feed-shortcut-list"),
+        ("im", "+flag-list"),
+        ("im", "+messages-mget"),
+        ("im", "+messages-search"),
+        ("im", "+threads-messages-list"),
+        ("mail", "+lint-html"),
+        ("mail", "+message"),
+        ("mail", "+messages"),
+        ("mail", "+signature"),
+        ("mail", "+thread"),
+        ("mail", "+triage"),
+        ("mail", "+watch"),
+        ("markdown", "+diff"),
+        ("markdown", "+fetch"),
+        ("minutes", "+detail"),
+        ("minutes", "+download"),
+        ("minutes", "+search"),
+        ("note", "+detail"),
+        ("note", "+transcript"),
+        ("okr", "+cycle-detail"),
+        ("okr", "+cycle-list"),
+        ("okr", "+progress-get"),
+        ("okr", "+progress-list"),
+        ("sheets", "+cells-get"),
+        ("sheets", "+cells-search"),
+        ("sheets", "+changeset-get"),
+        ("sheets", "+chart-list"),
+        ("sheets", "+cond-format-list"),
+        ("sheets", "+csv-get"),
+        ("sheets", "+dropdown-get"),
+        ("sheets", "+filter-list"),
+        ("sheets", "+filter-view-list"),
+        ("sheets", "+float-image-list"),
+        ("sheets", "+formula-verify"),
+        ("sheets", "+history-list"),
+        ("sheets", "+history-revert-status"),
+        ("sheets", "+pivot-list"),
+        ("sheets", "+revision-get"),
+        ("sheets", "+sheet-info"),
+        ("sheets", "+sparkline-list"),
+        ("sheets", "+table-get"),
+        ("sheets", "+workbook-export"),
+        ("sheets", "+workbook-info"),
+        ("slides", "+history-list"),
+        ("slides", "+history-revert-status"),
+        ("slides", "+screenshot"),
+        ("slides", "+xml-get"),
+        ("task", "+get-my-tasks"),
+        ("task", "+get-related-tasks"),
+        ("task", "+search"),
+        ("task", "+tasklist-search"),
+        ("vc", "+detail"),
+        ("vc", "+meeting-events"),
+        ("vc", "+meeting-list-active"),
+        ("vc", "+recording"),
+        ("vc", "+search"),
+        ("whiteboard", "+export"),
+        ("wiki", "+member-list"),
+        ("wiki", "+node-get"),
+        ("wiki", "+node-list"),
+        ("wiki", "+space-list"),
+    }
+)
+_RESUMABLE_SHORTCUT_WRITES = frozenset(
+    {
+        ("im", "+messages-send"),
+        ("im", "+messages-reply"),
+    }
+)
 
 POLICY_PATH = Path(__file__).resolve().parents[1] / "config" / "lark_cli_policy.yaml"
 _PERSONAL_FEISHU_IM_USER_AUTH_REQUIRED = (
@@ -84,9 +402,16 @@ _SAFE_ENV_NAMES = {
     "HERMES_FEISHU_USER_OPEN_ID",
     "HERMES_FEISHU_BOT_ALLOWED_CHAT_IDS",
     "HERMES_LARK_CLI_BIN",
-    "HERMES_LARK_CLI_AUTHORIZED",
+    # HERMES_LARK_CLI_AUTHORIZED is deliberately absent: the grant must be
+    # minted from THIS dispatch's run token (set explicitly at the two spawn
+    # sites), never inherited from a stale/dirty ambient environment.
     "HERMES_LARK_CLI_RUN_TOKEN",
     "HERMES_LARK_CLI_REAL_BIN",
+    "CODEX_HOME",
+    "HERMES_CODEX_PLUGIN_SOURCE",
+    "HERMES_TRUSTED_FEISHU_TOOL_SCOPE",
+    "HERMES_TRUSTED_FEISHU_CHAT_TYPE",
+    "HERMES_TRUSTED_FEISHU_CHAT_FENCE",
     "HERMES_MULTITENANCY_FEISHU_EXPERT_READONLY",
     "HERMES_MT_SECURITY_AUDIT_PATH",
     "LARKSUITE_CLI_AUTH_PROXY",
@@ -98,6 +423,7 @@ _SAFE_ENV_NAMES = {
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
 }
 
 
@@ -125,6 +451,315 @@ def _failure_fields(
 
 def _classified_tool_error(message: str, *, failure_hint: str, **kwargs: Any) -> str:
     return tool_error(message, **kwargs, **_failure_fields(failure_hint=failure_hint))
+
+
+def _operation_result(result: Any, receipt: dict[str, str]) -> str:
+    if isinstance(result, dict):
+        payload = dict(result)
+    else:
+        try:
+            payload = json.loads(str(result))
+        except (TypeError, json.JSONDecodeError):
+            payload = {"ok": False, "error": "lark-cli returned an invalid host result"}
+    if not isinstance(payload, dict):
+        payload = {"ok": False, "error": "lark-cli returned an invalid host result"}
+    payload[_OPERATION_FIELD] = receipt
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _operation_store_path(env: dict[str, str]) -> Path | None:
+    state_home = str(env.get("XDG_STATE_HOME") or "").strip()
+    if state_home:
+        return Path(state_home).expanduser() / _OPERATION_DB_NAME
+    profile_home = str(env.get("HERMES_HOME") or "").strip()
+    if profile_home:
+        return Path(profile_home).expanduser() / "state" / _OPERATION_DB_NAME
+    return None
+
+
+def _command_verb(argv: list[str]) -> str:
+    words = []
+    for item in argv:
+        if item.startswith("-"):
+            break
+        if item:
+            words.append(item)
+    if not words:
+        return ""
+    return words[-1].lstrip("+").replace("_", "-").rsplit("-", 1)[-1].lower()
+
+
+def _strict_operation_kind(mode: str, argv: list[str]) -> str:
+    """Classify from the executable request, never the model-declared risk."""
+    if mode == "api":
+        request = _api_request_from_argv(argv)
+        if request is None:
+            return "unknown"
+        return "read" if request[0] == "GET" else "write"
+    if not argv or any(item in {"--help", "-h", "help"} for item in argv):
+        return "read"
+    if mode == "schema":
+        if tuple(argv[:3]) in _STRICT_READ_SCHEMA_METHODS:
+            return "read"
+        return "write" if _command_verb(argv) in _STRICT_WRITE_VERBS else "unknown"
+    if argv[0] in {"auth", "doctor", "schema"}:
+        return "read"
+    shortcut = _shortcut_prefix(argv)
+    if shortcut in _RESUMABLE_SHORTCUT_WRITES:
+        return "write"
+    if shortcut == ("im", "+messages-resources-download"):
+        return "write"
+    if shortcut in _STRICT_READ_SHORTCUTS:
+        return "read"
+    verb = _command_verb(argv)
+    if verb in _STRICT_WRITE_VERBS:
+        return "write"
+    return "unknown"
+
+
+def _is_mutating_operation(mode: str, argv: list[str], risk: str) -> bool:
+    if mode == "api":
+        request = _api_request_from_argv(argv)
+        if request is not None:
+            return request[0] != "GET"
+    kind = _strict_operation_kind(mode, argv)
+    return kind == "write" or (kind == "unknown" and risk in {"write", "admin"})
+
+
+def _operation_not_resumable_error(mode: str, argv: list[str]) -> str:
+    return tool_error(
+        "lark-cli command is not in the strict typed allowlist",
+        ok=False,
+        retryable=False,
+        error_code="FEISHU_OPERATION_NOT_RESUMABLE",
+        failure_subsystem="lark_api",
+        mode=mode,
+        command=argv,
+    )
+
+
+def _server_idempotency_key(
+    *,
+    profile_name: str,
+    subject: str,
+    session_id: str,
+    tool_call_id: str,
+) -> str:
+    return "hm_" + hashlib.sha256(
+        "\0".join((profile_name, subject, session_id, tool_call_id)).encode("utf-8")
+    ).hexdigest()[:40]
+
+
+def _prepare_resumable_write(
+    *,
+    env: dict[str, str],
+    mode: str,
+    argv: list[str],
+    session_id: str,
+    tool_call_id: str,
+) -> tuple[list[str], str | None, str | None]:
+    """Return connector argv + opaque intent, or a fail-closed error."""
+    kind = _strict_operation_kind(mode, argv)
+    if kind == "read":
+        return argv, None, None
+    if _shortcut_prefix(argv) not in _RESUMABLE_SHORTCUT_WRITES:
+        return argv, None, _operation_not_resumable_error(mode, argv)
+    if _message_write_descriptor(argv) is None:
+        return argv, None, _operation_not_resumable_error(mode, argv)
+    profile_name = str(env.get("HERMES_PROFILE") or "").strip()
+    subject = str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip()
+    session_id = str(session_id or "").strip()
+    tool_call_id = str(tool_call_id or "").strip()
+    if not profile_name or not subject or not session_id or not tool_call_id:
+        return argv, None, _classified_tool_error(
+            "resumable lark-cli write requires actor, session, and tool call identity",
+            failure_hint="identity_unbound",
+        )
+    key = _server_idempotency_key(
+        profile_name=profile_name,
+        subject=subject,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+    )
+    clean = []
+    skip = False
+    for item in argv:
+        if skip:
+            skip = False
+            continue
+        if item == "--idempotency-key":
+            skip = True
+            continue
+        if item.startswith("--idempotency-key="):
+            continue
+        clean.append(item)
+    return [*clean, "--idempotency-key", key], f"call:{session_id}:{tool_call_id}", None
+
+
+def _begin_lark_cli_operation(
+    *,
+    env: dict[str, str],
+    mode: str,
+    argv: list[str],
+    identity: str,
+    risk: str,
+    task_id: str,
+    intent_key: str | None = None,
+) -> tuple[dict[str, str] | None, str | None]:
+    """Claim one exact host step; never infer whether an uncertain write landed."""
+    if not strict_context_enabled() or not _is_mutating_operation(mode, argv, risk):
+        return None, None
+    profile_name = str(env.get("HERMES_PROFILE") or "").strip()
+    subject = str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip()
+    db_path = _operation_store_path(env)
+    task_id = str(task_id or "").strip()
+    if not profile_name or not subject or db_path is None or not task_id:
+        return None, _classified_tool_error(
+            "durable lark-cli write requires an actor-bound task context",
+            failure_hint="identity_unbound",
+        )
+
+    if not intent_key or not intent_key.startswith("call:"):
+        return None, _classified_tool_error(
+            "durable lark-cli write requires a connector-owned call identity",
+            failure_hint="identity_unbound",
+        )
+    from .operation_checkpoint import OperationCheckpointStore
+
+    store = OperationCheckpointStore(db_path)
+    try:
+        session_ref = None
+        call_ref = None
+        if intent_key.startswith("call:"):
+            _prefix, session_ref, call_ref = intent_key.split(":", 2)
+        row, created = store.claim(
+            profile_name=profile_name,
+            subject=subject,
+            connector="lark-cli",
+            intent_key=intent_key,
+            step="execute",
+            session_ref=session_ref,
+            call_ref=call_ref,
+            tool_scope=str(env.get("HERMES_TRUSTED_FEISHU_TOOL_SCOPE") or "").strip() or None,
+            chat_type=str(env.get("HERMES_TRUSTED_FEISHU_CHAT_TYPE") or "").strip() or None,
+            chat_fence=str(env.get("HERMES_TRUSTED_FEISHU_CHAT_FENCE") or "").strip() or None,
+        )
+        if (
+            not created
+            and intent_key.startswith("call:")
+            and row["state"] == "confirmed"
+            and row.get("result_ref")
+        ):
+            receipt = {
+                "operation_id": str(row["operation_id"]),
+                "state": "confirmed",
+                "step": str(row["step"]),
+            }
+            return receipt, _operation_result(
+                tool_result(
+                    ok=True,
+                    approval_required=False,
+                    mode=mode,
+                    identity=identity,
+                    recovered=True,
+                    json={"code": 0, "data": {"message_id": row["result_ref"]}},
+                    failure_subsystem=None,
+                    error_code=None,
+                    retryable=False,
+                ),
+                receipt,
+            )
+    finally:
+        store.close()
+    receipt = {
+        "operation_id": str(row["operation_id"]),
+        "state": str(row["state"]),
+        "step": str(row["step"]),
+    }
+    if created:
+        return receipt, None
+    return receipt, _operation_result(
+        tool_error(
+            "previous lark-cli write outcome is not confirmed; automatic replay blocked",
+            ok=False,
+            retryable=False,
+            error_code="FEISHU_OPERATION_OUTCOME_UNCERTAIN",
+            failure_subsystem="lark_api",
+            mode=mode,
+            identity=identity,
+        ),
+        receipt,
+    )
+
+
+def post_lark_cli_operation(*, tool_name: str, result: Any, **_kwargs: Any) -> None:
+    """Persist the wrapper-owned receipt after real registry dispatch."""
+    if tool_name != "lark_cli":
+        return
+    try:
+        payload = result if isinstance(result, dict) else json.loads(str(result))
+    except (TypeError, json.JSONDecodeError):
+        return
+    receipt = payload.get(_OPERATION_FIELD) if isinstance(payload, dict) else None
+    if not isinstance(receipt, dict) or receipt.get("state") not in {"confirmed", "uncertain", "waiting_auth"}:
+        return
+    env = _safe_env()
+    profile_name = str(env.get("HERMES_PROFILE") or "").strip()
+    subject = str(env.get("HERMES_FEISHU_USER_OPEN_ID") or "").strip()
+    db_path = _operation_store_path(env)
+    operation_id = str(receipt.get("operation_id") or "").strip()
+    if not profile_name or not subject or db_path is None or not operation_id:
+        return
+    from .operation_checkpoint import OperationCheckpointStore
+
+    store = OperationCheckpointStore(db_path)
+    try:
+        store.transition(
+            operation_id,
+            profile_name=profile_name,
+            subject=subject,
+            expected_state="running",
+            state=str(receipt["state"]),
+            step=str(receipt.get("step") or "execute"),
+            result_ref=str(receipt.get("result_ref") or "") or None,
+        )
+    finally:
+        store.close()
+
+
+def _remove_operation_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _remove_operation_fields(item)
+            for key, item in value.items()
+            if key != _OPERATION_FIELD
+        }
+    if isinstance(value, list):
+        return [_remove_operation_fields(item) for item in value]
+    return value
+
+
+def transform_lark_cli_operation_result(*, tool_name: str, result: Any, **_kwargs: Any) -> str | None:
+    """Remove host-only operation metadata before the model sees the result."""
+    if tool_name != "lark_cli":
+        return None
+    try:
+        payload = result if isinstance(result, dict) else json.loads(str(result))
+        cleaned = _remove_operation_fields(payload)
+        if cleaned == payload:
+            return None
+        return json.dumps(cleaned, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        # The host treats transform errors as fail-open, so keep this boundary total.
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "lark-cli result unavailable",
+                "error_code": "FEISHU_OPERATION_RESULT_UNAVAILABLE",
+                "retryable": False,
+            },
+            ensure_ascii=False,
+        )
 
 
 def _redact(text: str) -> str:
@@ -258,16 +893,77 @@ def _requested_json_format(argv: list[str]) -> bool:
     return False
 
 
-def _argv_with_json_format(argv: list[str], mode: str = "api") -> list[str]:
-    if _has_format_flag(argv) or mode != "api" or (argv and argv[0] in {"schema", "doctor"}):
+def _is_help_command(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if argv[0] == "help":
+        return True
+    return any(
+        item in {"--help", "-h"}
+        and (idx == 0 or not (argv[idx - 1].startswith("-") and "=" not in argv[idx - 1]))
+        for idx, item in enumerate(argv)
+    )
+
+
+def _control_or_diagnostic_kind(argv: list[str]) -> str:
+    if _is_help_command(argv):
+        return "help"
+    if not argv:
+        return ""
+    if argv[0] in {"schema", "doctor", "whoami"}:
+        return argv[0]
+    return {
+        ("auth", "status"): "auth_status",
+        ("auth", "list"): "auth_list",
+        ("auth", "check"): "auth_check",
+        ("skills", "list"): "skills_list",
+        ("skills", "read"): "skills_read",
+        ("config", "show"): "config_show",
+        ("config", "default-as"): "config_default_as",
+        ("profile", "list"): "profile_list",
+    }.get(tuple(argv[:2]), "")
+
+
+def _is_control_or_diagnostic_command(argv: list[str]) -> bool:
+    return bool(_control_or_diagnostic_kind(argv))
+
+
+def _argv_with_json_format(argv: list[str], mode: str = "api", risk: str = "") -> list[str]:
+    needs_json = mode == "api" or (mode == "shortcut" and risk == "read")
+    if _has_format_flag(argv) or not needs_json or _is_control_or_diagnostic_command(argv):
         return argv
     return [*argv, "--format", "json"]
 
 
+def _read_projection_hides_protocol(argv: list[str]) -> bool:
+    if any(item.startswith("-q") or item == "--jq" or item.startswith("--jq=") for item in argv):
+        return True
+    for idx, item in enumerate(argv):
+        if item == "--format" and idx + 1 < len(argv):
+            return argv[idx + 1].strip().lower() in {"table", "csv", "ndjson"}
+        if item.startswith("--format="):
+            return item.split("=", 1)[1].strip().lower() in {"table", "csv", "ndjson"}
+    return False
+
+
 def _supports_identity_flag(argv: list[str], mode: str) -> bool:
-    if not argv or argv[0] in {"auth", "doctor", "schema"}:
+    if not argv:
         return False
-    if any(item in {"--help", "-h", "help"} for item in argv):
+    if argv[0] in {"auth", "doctor", "schema"}:
+        return False
+    if _control_or_diagnostic_kind(argv) in {
+        "help",
+        "auth_status",
+        "auth_list",
+        "auth_check",
+        "skills_list",
+        "skills_read",
+        "config_show",
+        "config_default_as",
+        "profile_list",
+        "doctor",
+        "schema",
+    }:
         return False
     return not (mode == "shortcut" and argv[0] in {"event"})
 
@@ -699,6 +1395,704 @@ def _parse_json_output(stdout: str) -> Any:
         return None
 
 
+def _typed_resumable_result_ref(mode: str, argv: list[str], parsed: Any) -> str:
+    if _shortcut_prefix(argv) not in _RESUMABLE_SHORTCUT_WRITES:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        data = parsed
+    value = str(data.get("message_id") or "").strip()
+    return value if 0 < len(value) <= 240 else ""
+
+
+def _content_fingerprint(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _message_write_descriptor(argv: list[str]) -> dict[str, str] | None:
+    shortcut = _shortcut_prefix(argv)
+    if shortcut not in _RESUMABLE_SHORTCUT_WRITES:
+        return None
+    if shortcut == ("im", "+messages-send"):
+        target_kind = "chat_id"
+        target = _argv_option_value(argv, "--chat-id")
+    else:
+        target_kind = "parent_id"
+        target = _argv_option_value(argv, "--message-id")
+    if not target:
+        return None
+
+    text = _argv_option_value(argv, "--text")
+    raw_content = _argv_option_value(argv, "--content")
+    if text:
+        msg_type = "text"
+        content: Any = {"text": text}
+    elif raw_content:
+        try:
+            content = json.loads(raw_content)
+        except json.JSONDecodeError:
+            return None
+        msg_type = _argv_option_value(argv, "--msg-type") or "text"
+    else:
+        return None
+    return {
+        "target_kind": target_kind,
+        "target": target,
+        "msg_type": msg_type,
+        "content_fp": _content_fingerprint(content),
+    }
+
+
+def _message_rows(parsed: Any) -> list[dict[str, Any]]:
+    if not isinstance(parsed, dict):
+        return []
+    container = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+    rows = (
+        container.get("items") or container.get("messages")
+        if isinstance(container, dict)
+        else None
+    )
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _readback_resumable_message(
+    *,
+    binary: str,
+    env: dict[str, str],
+    cwd: str | None,
+    timeout: int,
+    identity: str,
+    argv: list[str],
+    message_id: str,
+) -> str | None:
+    descriptor = _message_write_descriptor(argv)
+    if descriptor is None:
+        return "FEISHU_OPERATION_READBACK_UNAVAILABLE"
+    command = [
+        binary,
+        "api",
+        "GET",
+        "/open-apis/im/v1/messages/mget",
+        "--params",
+        json.dumps({"message_ids": message_id}, separators=(",", ":")),
+        "--format",
+        "json",
+    ]
+    if identity in {"user", "bot"}:
+        command.extend(["--as", identity])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            cwd=cwd,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, PermissionError, OSError):
+        return "FEISHU_OPERATION_READBACK_UNAVAILABLE"
+    parsed = _parse_json_output(completed.stdout)
+    if completed.returncode != 0 or parsed is None:
+        return "FEISHU_OPERATION_READBACK_UNAVAILABLE"
+    if _failure_fields(
+        exit_code=completed.returncode,
+        stderr=_redact(completed.stderr),
+        business_payload=parsed,
+    )["error_code"] is not None:
+        return "FEISHU_OPERATION_READBACK_UNAVAILABLE"
+    rows = [row for row in _message_rows(parsed) if str(row.get("message_id") or "") == message_id]
+    if len(rows) != 1:
+        return "FEISHU_OPERATION_READBACK_MISMATCH"
+    row = rows[0]
+    if descriptor["target_kind"] == "chat_id":
+        target_matches = str(row.get("chat_id") or "") == descriptor["target"]
+    else:
+        target_matches = descriptor["target"] in {
+            str(row.get("parent_id") or ""),
+            str(row.get("root_id") or ""),
+        }
+    if (
+        not target_matches
+        or str(row.get("msg_type") or "") != descriptor["msg_type"]
+        or _content_fingerprint(row.get("content")) != descriptor["content_fp"]
+    ):
+        return "FEISHU_OPERATION_READBACK_MISMATCH"
+    return None
+
+
+_READ_CURSOR_KEYS = ("page_token", "next_page_token", "cursor", "next_cursor")
+_MAX_RECURSIVE_READ_REQUESTS = 1000
+
+
+def _pagination_nodes(value: Any):
+    if not isinstance(value, dict):
+        return
+    if isinstance(value.get("has_more"), bool):
+        yield value
+    data = value.get("data")
+    if isinstance(data, dict) and isinstance(data.get("has_more"), bool):
+        yield data
+
+
+def _requested_read_cursors(argv: list[str]) -> set[str]:
+    params = {**_argv_path_query_params(argv), **_argv_params_option(argv)}
+    direct = _argv_option_value(argv, "--page-token")
+    return {
+        str(value).strip()
+        for value in (direct, *(params.get(key) for key in _READ_CURSOR_KEYS))
+        if str(value or "").strip()
+    }
+
+
+def _read_terminal_state(parsed: Any, argv: list[str]) -> tuple[bool, str | None, str | None]:
+    pending = [node for node in _pagination_nodes(parsed) if node["has_more"]]
+    if not pending:
+        return True, None, None
+
+    requested = _requested_read_cursors(argv)
+    cursors_by_node = [
+        [
+            str(node.get(key) or "").strip()
+            for key in _READ_CURSOR_KEYS
+            if str(node.get(key) or "").strip()
+        ]
+        for node in pending
+    ]
+    if any(not cursors for cursors in cursors_by_node):
+        return False, "FEISHU_READ_CURSOR_MISSING", "cursor_missing"
+    cursors = [cursor for node_cursors in cursors_by_node for cursor in node_cursors]
+    if requested.intersection(cursors):
+        return False, "FEISHU_READ_CURSOR_LOOP", "cursor_loop"
+
+    page_all = "--page-all" in argv
+    page_limit = _argv_option_value(argv, "--page-limit")
+    if page_all and page_limit != "0":
+        return False, "FEISHU_READ_INCOMPLETE", "page_limit_reached"
+    return False, "FEISHU_READ_INCOMPLETE", "pagination_remaining"
+
+
+def _without_argv_options(argv: list[str], names: frozenset[str]) -> list[str]:
+    cleaned: list[str] = []
+    skip_value = False
+    for item in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if item in names:
+            skip_value = item not in {"--page-all"}
+            continue
+        if any(item.startswith(name + "=") for name in names):
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def _tool_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _recursive_read_failure(
+    result: dict[str, Any],
+    *,
+    error_code: str,
+    reason: str,
+    requests: int,
+    pending: int,
+) -> str:
+    result.update(
+        ok=False,
+        read_complete=False,
+        failure_subsystem="lark_api",
+        error_code=error_code,
+        retryable=False,
+        read_incomplete_reason=reason,
+        read_requests=requests,
+        read_pending_count=max(1, pending),
+    )
+    return tool_result(**result)
+
+
+def _bounded_recursive_wiki_read(args: dict[str, Any], argv: list[str]) -> str:
+    if _shortcut_prefix(argv) != ("wiki", "+node-list"):
+        return _classified_tool_error(
+            "recursive_read currently requires shortcut wiki +node-list",
+            failure_hint="request_invalid",
+        )
+    if _argv_option_value(argv, "--page-token"):
+        return _classified_tool_error(
+            "recursive_read must start before the first page",
+            failure_hint="request_invalid",
+        )
+    try:
+        limit = int(args.get("recursive_read_limit") or 100)
+    except (TypeError, ValueError):
+        limit = 0
+    if not 1 <= limit <= _MAX_RECURSIVE_READ_REQUESTS:
+        return _classified_tool_error(
+            f"recursive_read_limit must be between 1 and {_MAX_RECURSIVE_READ_REQUESTS}",
+            failure_hint="request_invalid",
+        )
+
+    root_parent = _argv_option_value(argv, "--parent-node-token")
+    base_argv = _without_argv_options(
+        argv,
+        frozenset({"--page-all", "--page-limit", "--page-token", "--parent-node-token"}),
+    )
+    queue: list[tuple[str, str]] = [(root_parent, "")]
+    queued = set(queue)
+    visited_pages: set[tuple[str, str]] = set()
+    seen_nodes = {root_parent} if root_parent else set()
+    nodes: list[dict[str, Any]] = []
+    requests = 0
+    final_result: dict[str, Any] = {}
+    aggregate_json: dict[str, Any] = {}
+
+    while queue:
+        if requests >= limit:
+            return _recursive_read_failure(
+                final_result,
+                error_code="FEISHU_READ_LIMIT_REACHED",
+                reason="read_limit_reached",
+                requests=requests,
+                pending=len(queue),
+            )
+
+        parent_token, page_token = queue.pop(0)
+        queued.discard((parent_token, page_token))
+        page_key = (parent_token, page_token)
+        if page_key in visited_pages:
+            return _recursive_read_failure(
+                final_result,
+                error_code="FEISHU_READ_CURSOR_LOOP",
+                reason="cursor_loop",
+                requests=requests,
+                pending=len(queue) + 1,
+            )
+
+        page_argv = list(base_argv)
+        if parent_token:
+            page_argv.extend(["--parent-node-token", parent_token])
+        if page_token:
+            page_argv.extend(["--page-token", page_token])
+        page_args = {**args, "argv": page_argv, "recursive_read": False}
+        result = _tool_payload(_handle_lark_cli_execute(page_args))
+        requests += 1
+        final_result = result
+        page_json = result.get("json")
+        data = page_json.get("data") if isinstance(page_json, dict) else None
+        page_nodes = data.get("nodes") if isinstance(data, dict) else None
+        pagination_only = (
+            result.get("error_code") == "FEISHU_READ_INCOMPLETE"
+            and result.get("read_incomplete_reason") == "pagination_remaining"
+        )
+        if not (result.get("ok") is True or pagination_only):
+            result.update(
+                read_complete=False,
+                read_requests=requests,
+                read_pending_count=max(1, len(queue) + 1),
+            )
+            return tool_result(**result)
+        if not isinstance(page_nodes, list) or not all(isinstance(node, dict) for node in page_nodes):
+            return _recursive_read_failure(
+                result,
+                error_code="FEISHU_READ_SHAPE_INVALID",
+                reason="read_shape_invalid",
+                requests=requests,
+                pending=len(queue) + 1,
+            )
+
+        if not aggregate_json:
+            aggregate_json = dict(page_json)
+        visited_pages.add(page_key)
+        for node in page_nodes:
+            token = str(node.get("node_token") or "").strip()
+            if token and token in seen_nodes:
+                return _recursive_read_failure(
+                    result,
+                    error_code="FEISHU_READ_NODE_LOOP",
+                    reason="node_loop",
+                    requests=requests,
+                    pending=len(queue) + 1,
+                )
+            if token:
+                seen_nodes.add(token)
+            nodes.append(node)
+
+        if data.get("has_more") is True:
+            next_cursor = str(data.get("page_token") or data.get("next_page_token") or "").strip()
+            next_page = (parent_token, next_cursor)
+            if not next_cursor:
+                return _recursive_read_failure(
+                    result,
+                    error_code="FEISHU_READ_CURSOR_MISSING",
+                    reason="cursor_missing",
+                    requests=requests,
+                    pending=len(queue) + 1,
+                )
+            if next_page in visited_pages or next_page in queued:
+                return _recursive_read_failure(
+                    result,
+                    error_code="FEISHU_READ_CURSOR_LOOP",
+                    reason="cursor_loop",
+                    requests=requests,
+                    pending=len(queue) + 1,
+                )
+            queue.append(next_page)
+            queued.add(next_page)
+
+        for node in page_nodes:
+            if node.get("has_child") is not True:
+                continue
+            child_token = str(node.get("node_token") or "").strip()
+            if not child_token:
+                return _recursive_read_failure(
+                    result,
+                    error_code="FEISHU_READ_NODE_TOKEN_MISSING",
+                    reason="node_token_missing",
+                    requests=requests,
+                    pending=len(queue) + 1,
+                )
+            child_page = (child_token, "")
+            if child_page in visited_pages or child_page in queued:
+                return _recursive_read_failure(
+                    result,
+                    error_code="FEISHU_READ_NODE_LOOP",
+                    reason="node_loop",
+                    requests=requests,
+                    pending=len(queue) + 1,
+                )
+            queue.append(child_page)
+            queued.add(child_page)
+
+    aggregate_data = dict(aggregate_json.get("data") or {})
+    aggregate_data.update(nodes=nodes, has_more=False, page_token="")
+    aggregate_json["data"] = aggregate_data
+    final_result.update(
+        ok=True,
+        command=argv,
+        json=aggregate_json,
+        stdout="",
+        failure_subsystem=None,
+        error_code=None,
+        retryable=False,
+        read_complete=True,
+        read_requests=requests,
+        read_pending_count=0,
+    )
+    final_result.pop("read_incomplete_reason", None)
+    return tool_result(**final_result)
+
+
+SCRIPT_DEFAULT_TIMEOUT_SECONDS = 300
+SCRIPT_MAX_TIMEOUT_SECONDS = 900
+_SCRIPT_OUTPUT_CLIP_CHARS = 20_000
+
+
+def _clip_output_tail(text: str, limit: int = _SCRIPT_OUTPUT_CLIP_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"…[clipped {len(text) - limit} chars]…" + text[-limit:]
+
+
+def _kill_process_group(proc: "subprocess.Popen[Any]") -> None:
+    """Kill the whole process group of a start_new_session child, then reap.
+
+    Timeout kills only the direct child otherwise; descendants would inherit the
+    authorization env and keep writing. A setsid-escaping grandchild can still
+    leave the group — a known residual noted in the SPEC.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _aidock_trusted_roots() -> list[Path]:
+    """The read-only AiDock / plugin distribution roots, resolved.
+
+    These are exactly the shared-skill roots the sandbox ``--ro-bind`` mounts
+    (see ``_shared_skill_symlink_bwrap_args`` in agent_real/_core): AiDock
+    SkillHub releases, shared skills, skill-releases, and expert-plugin managed
+    sources. A script whose real (symlink-resolved) bytes live under one of
+    these is AiDock-distributed and internally reviewed — sunke's standing
+    directive is to trust and run it without content restriction. The profile
+    skills dir itself is RW inside the sandbox, so a file that resolves to the
+    profile tree (or workspace/tmp) is NOT trusted — that is the one boundary
+    that keeps run-authored terminal code from borrowing the credential grant.
+    """
+    shared_raw = str(os.environ.get("HERMES_SHARED_HOME") or "").strip()
+    if not shared_raw:
+        return []
+    shared = Path(shared_raw).expanduser()
+    return [
+        (shared / "skills").resolve(strict=False),
+        (shared / "skill-releases").resolve(strict=False),
+        (shared / "_managed" / "aidock-skillhub").resolve(strict=False),
+        (shared / ".hermes-plugin-managed" / ".sources").resolve(strict=False),
+    ]
+
+
+def _resolve_skill_script(argv0: str, env: dict[str, str]) -> tuple[Path | None, str | None]:
+    """Resolve a mode=script path fail-closed to an AiDock-distributed file.
+
+    The single gate: the symlink-RESOLVED target must be a regular file under
+    one of the read-only AiDock distribution roots. Naming a profile skills
+    symlink (the normal case), or the shared target directly, both pass; a
+    symlink or path that resolves into the RW profile tree, workspace, or tmp
+    does not — so terminal-planted code cannot ride the channel. There is no
+    content or extension restriction: whatever the plugin distributes runs
+    (sunke 2026-08-31, twice — the source check IS the whole gate).
+    """
+    if _profile_home(env) is None:
+        return None, "script channel requires a routed profile runtime"
+    raw = str(argv0 or "").strip()
+    if not raw:
+        return None, "mode=script requires argv[0] to be the script path"
+    candidate = Path(raw).expanduser()
+    candidates = [candidate]
+    if not candidate.is_absolute():
+        workspace = _workspace_root(env)
+        if workspace is None:
+            return None, "script channel requires a workspace to resolve relative paths"
+        # A relative path is tried against the workspace first (historical
+        # contract), then against the skills roots — the tool schema tells the
+        # model to name a script "relative to its SKILL.md", and the natural
+        # spelling of that is `<skill>/scripts/x.py` (2026-09-04: kep-ub-gen
+        # injection died twice on "script not found" for exactly that form).
+        # The trusted-roots gate below is unchanged, so this widens only how a
+        # name is looked up, never what is allowed to run.
+        candidates = [workspace / candidate]
+        profile_home = _profile_home(env)
+        if profile_home is not None:
+            candidates.append(profile_home / "skills" / candidate)
+        shared_raw = str(env.get("HERMES_SHARED_HOME") or os.environ.get("HERMES_SHARED_HOME") or "").strip()
+        if shared_raw:
+            candidates.append(Path(shared_raw).expanduser() / "skills" / candidate)
+    roots = _aidock_trusted_roots()
+    if not roots:
+        return None, "script channel cannot resolve the shared AiDock roots"
+    resolved: Path | None = None
+    for option in candidates:
+        try:
+            resolved = option.resolve(strict=True)
+            break
+        except (OSError, RuntimeError):
+            continue
+    if resolved is None:
+        return None, "script not found"
+    if not any(resolved == root or root in resolved.parents for root in roots):
+        # Codex reads a hardened copy under CODEX_HOME. Map it back to the
+        # actor-bound Plugin source and require byte equality.
+        try:
+            codex_home = Path(env["CODEX_HOME"]).expanduser().resolve(strict=True)
+            plugin_source = (
+                Path(env["HERMES_CODEX_PLUGIN_SOURCE"])
+                .expanduser()
+                .resolve(strict=True)
+            )
+            if resolved.is_relative_to(codex_home / "skills"):
+                relative = resolved.relative_to(codex_home / "skills")
+                mapped = plugin_source / "skills" / relative
+            elif resolved.is_relative_to(codex_home / "plugins"):
+                relative = resolved.relative_to(codex_home / "plugins")
+                mapped = plugin_source.joinpath(*relative.parts[1:])
+            else:
+                raise ValueError("not a Codex Plugin copy")
+            mapped = mapped.resolve(strict=True)
+            if not any(mapped == root or root in mapped.parents for root in roots):
+                raise ValueError("mapped source is outside trusted roots")
+            if not mapped.is_file() or mapped.read_bytes() != resolved.read_bytes():
+                raise ValueError("Codex Plugin copy differs from trusted source")
+            resolved = mapped
+        except (KeyError, OSError, RuntimeError, ValueError):
+            return None, "script must be an AiDock-distributed skill script"
+    if not resolved.is_file():
+        return None, "script path is not a regular file"
+    return resolved, None
+
+
+def _handle_script_channel(*, argv: list[str], risk: str, timeout_raw: Any) -> str:
+    env = _safe_env()
+    runtime_error = _profile_runtime_error(env)
+    if runtime_error:
+        hint = "dependency_unavailable" if "broker is unavailable" in runtime_error else "permission_denied"
+        return _classified_tool_error(runtime_error, failure_hint=hint, mode="script", command=argv, risk=risk)
+    run_token = str(os.environ.get(HERMES_LARK_CLI_RUN_TOKEN) or "")
+    if not run_token:
+        # The run token is minted ONLY by subprocess_env's strict build path
+        # (and stripped for local_harness), so its presence is the strict-
+        # runtime proof. The worker's own environ does NOT carry
+        # HERMES_MULTITENANCY_STRICT_CONTEXT (2026-08-31 production incident:
+        # gating on strict_context_enabled() here rejected every call), so the
+        # token is the one signal that survives into this process. Fail closed
+        # without it — no shim, no sanctioned way to hand the grant out. The
+        # same token-only rule now governs the AUTHORIZED passthrough for
+        # non-script modes further down in _handle_lark_cli_execute.
+        return _classified_tool_error(
+            "script channel requires the strict profile runtime",
+            failure_hint="dependency_unavailable",
+            mode="script",
+            command=argv,
+            risk=risk,
+        )
+    script, script_error = _resolve_skill_script(argv[0], env)
+    if script is None:
+        return _classified_tool_error(
+            script_error or "invalid skill script path",
+            failure_hint="request_invalid",
+            mode="script",
+            command=argv,
+            risk=risk,
+        )
+
+    # argv bounds: a dirty packaged script must not crash the worker with E2BIG.
+    if len(argv) > 256 or any(len(a) > 8192 for a in argv):
+        return _classified_tool_error(
+            "script channel argv too large",
+            failure_hint="request_invalid",
+            mode="script",
+            command=argv[:8],
+            risk=risk,
+        )
+
+    # Audit is a required control here: a full/unwritable log must fail the call
+    # closed rather than run a grant with no record. force=True writes even under
+    # a default-off deploy; the return signals a real write failure.
+    from .security_audit import append_security_event
+
+    audited = append_security_event(
+        event_type="lark_cli.script_channel.granted",
+        force=True,
+        profile=str(env.get("HERMES_PROFILE") or ""),
+        command_name=script.name,
+        path=str(script),
+        command_hash=hashlib.sha256(script.read_bytes()).hexdigest()[:16],
+        reason=f"skill script exec: {script.name} args={len(argv) - 1}",
+    )
+    if not audited:
+        return _classified_tool_error(
+            "script channel audit write failed; refusing to run ungranted",
+            failure_hint="dependency_unavailable",
+            mode="script",
+            command=argv,
+            risk=risk,
+        )
+
+    # P0-2: pin a trusted interpreter and a freshly-written shim, never a PATH
+    # lookup. The profile tree is RW inside the sandbox, so terminal code could
+    # plant a `python3`/`lark-cli` on any inherited PATH entry; sys.executable
+    # lives in the ro venv, and we write our own shim (pointing at the ro
+    # authsidecar binary) into a private 0700 dir used only for this call.
+    shim_tmp = Path(tempfile.mkdtemp(prefix="lark-script-", dir=str(_profile_home(env) / "tmp")))
+    real_bin = str(os.environ.get(HERMES_LARK_CLI_REAL_BIN) or "").strip()
+    try:
+        if real_bin:
+            from .lark_cli_guard import install_lark_cli_shim
+
+            install_lark_cli_shim(shim_tmp, real_binary=Path(real_bin))
+        env["PATH"] = os.pathsep.join([str(shim_tmp), "/usr/bin", "/bin"])
+        # The grant: lark-cli children pass the freshly-written shim. The
+        # credential never enters this env — calls still proxy through the
+        # authsidecar/broker with unchanged identity, host and risk policy.
+        env[HERMES_LARK_CLI_AUTHORIZED] = run_token
+        env.pop("CODEX_HOME", None)
+        env.pop("HERMES_CODEX_PLUGIN_SOURCE", None)
+
+        try:
+            timeout = int(timeout_raw or SCRIPT_DEFAULT_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            timeout = SCRIPT_DEFAULT_TIMEOUT_SECONDS
+        timeout = max(1, min(timeout, SCRIPT_MAX_TIMEOUT_SECONDS))
+        workspace = _workspace_root(env)
+        cwd = str(workspace) if workspace is not None and workspace.exists() else None
+
+        # Interpreter dispatch: .py rides the trusted sys.executable (P0-2);
+        # an executable file runs as shipped (its env-shebang can only search
+        # the narrowed PATH above); anything else goes through /bin/bash.
+        if script.suffix == ".py":
+            cmd = [sys.executable, str(script), *argv[1:]]
+        elif os.access(script, os.X_OK):
+            cmd = [str(script), *argv[1:]]
+        else:
+            cmd = ["/bin/bash", str(script), *argv[1:]]
+
+        # P0-3: run in a fresh process group and kill the whole tree on timeout,
+        # so descendants can't keep holding the grant after the parent exits.
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                errors="replace",
+                env=env,
+                cwd=cwd,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            return _classified_tool_error(
+                f"skill script failed to start: {_redact(str(exc))}",
+                failure_hint="permission_denied",
+                mode="script",
+                command=argv,
+                risk=risk,
+            )
+        try:
+            raw_out, raw_err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            raw_out, raw_err = proc.communicate()
+            return tool_error(
+                f"skill script timed out after {timeout}s",
+                mode="script",
+                command=argv,
+                risk=risk,
+                stdout_redacted=_clip_output_tail(_redact(raw_out or "")),
+                stderr_redacted=_clip_output_tail(_redact(raw_err or "")),
+                **_failure_fields(timed_out=True),
+            )
+    finally:
+        shutil.rmtree(shim_tmp, ignore_errors=True)
+
+    completed = subprocess.CompletedProcess(argv, proc.returncode, raw_out, raw_err)
+    stdout = _clip_output_tail(_redact(completed.stdout or ""))
+    stderr = _clip_output_tail(_strip_non_business_notices(_redact(completed.stderr or "")))
+    payload: dict[str, Any] = {
+        "mode": "script",
+        "script": script.name,
+        "command": argv,
+        "risk": risk,
+        "exit_code": completed.returncode,
+        "stdout_redacted": stdout,
+        "stderr_redacted": stderr,
+    }
+    if completed.returncode != 0:
+        return tool_error(
+            f"skill script exited {completed.returncode}",
+            **payload,
+            **_failure_fields(exit_code=completed.returncode, stderr=stderr),
+        )
+    return tool_result(**payload)
+
+
 LARK_CLI_SCHEMA = {
     "name": "lark_cli",
     "description": (
@@ -711,13 +2105,26 @@ LARK_CLI_SCHEMA = {
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["shortcut", "schema", "api"],
-                "description": "Command family: shortcut, schema method, or raw OpenAPI api call.",
+                "enum": ["shortcut", "schema", "api", "script"],
+                "description": (
+                    "Command family: shortcut, schema method, raw OpenAPI api call, or "
+                    "script (run any packaged skill script/executable that may call "
+                    "lark-cli itself). MANDATORY: when an installed Skill/Plugin instructs "
+                    "running any file it distributes (through any interpreter or direct "
+                    "execution, in any subdirectory), resolve that path relative to its "
+                    "SKILL.md and call mode=script; do not use terminal/execute_code."
+                ),
             },
             "argv": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "lark-cli arguments excluding the binary name.",
+                "description": (
+                    "lark-cli arguments excluding the binary name. For mode=script: "
+                    "[installed_script_path, ...script_args]; preserve the Skill command's "
+                    "remaining arguments. The script must be a file this "
+                    "profile's installed skills/plugins distribute (any type: .py, "
+                    ".sh, executables)."
+                ),
             },
             "identity": {
                 "type": "string",
@@ -735,6 +2142,16 @@ LARK_CLI_SCHEMA = {
             },
             "reason": {"type": "string", "description": "Why this lark-cli call is needed."},
             "timeout_seconds": {"type": "integer", "description": "Optional timeout, capped by Hermes."},
+            "recursive_read": {
+                "type": "boolean",
+                "description": "Boundedly traverse every page and child for wiki +node-list.",
+            },
+            "recursive_read_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _MAX_RECURSIVE_READ_REQUESTS,
+                "description": "Maximum page/subtree requests before the recursive read fails closed.",
+            },
         },
         "required": ["mode", "argv", "risk", "reason"],
     },
@@ -745,8 +2162,11 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     mode = str(args.get("mode") or "").strip()
     risk = str(args.get("risk") or "read").strip()
     argv_raw = args.get("argv")
-    if mode not in {"shortcut", "schema", "api"}:
-        return _classified_tool_error("mode must be one of shortcut, schema, api", failure_hint="request_invalid")
+    if mode not in {"shortcut", "schema", "api", "script"}:
+        return _classified_tool_error(
+            "mode must be one of shortcut, schema, api, script",
+            failure_hint="request_invalid",
+        )
     if risk not in {"read", "write", "export", "admin"}:
         return _classified_tool_error(
             "risk must be one of read, write, export, admin",
@@ -756,6 +2176,23 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         return _classified_tool_error(
             "argv must be a non-empty list of strings",
             failure_hint="request_invalid",
+        )
+    if mode == "script":
+        # P0-1: a packaged script is a general write channel; a read-only expert
+        # session must not reach it (the per-command readonly allowlist below is
+        # bypassed by the early return, so gate it here).
+        if _feishu_expert_readonly_enabled():
+            return _classified_tool_error(
+                "read-only lark-cli denied script execution",
+                failure_hint="permission_denied",
+                mode="script",
+                command=[str(item) for item in argv_raw][:8],
+                risk=risk,
+            )
+        return _handle_script_channel(
+            argv=[str(item) for item in argv_raw],
+            risk=risk,
+            timeout_raw=args.get("timeout_seconds"),
         )
     if any(item == "--" for item in argv_raw):
         return _classified_tool_error(
@@ -779,6 +2216,29 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         )
     elif argv and argv[0] == "api":
         return _classified_tool_error("api command must use mode=api", failure_hint="request_invalid")
+
+    if mode in {"shortcut", "schema"} and is_headless_oauth_attempt(argv):
+        return tool_result(
+            ok=False,
+            error="Interactive lark-cli OAuth is disabled in headless runs.",
+            mode=mode,
+            command=argv,
+            risk=risk,
+            auth_required=True,
+            auth_method="official",
+            auth_hint="Use /feishu_auth in a Feishu DM or Lark-cli in WebUI Connectors.",
+            failure_subsystem="credential",
+            error_code="FEISHU_AUTH_INTERACTIVE_BLOCKED",
+            retryable=False,
+        )
+
+    if args.get("recursive_read") is True:
+        if mode != "shortcut" or risk != "read":
+            return _classified_tool_error(
+                "recursive_read requires shortcut mode with read risk",
+                failure_hint="request_invalid",
+            )
+        return _bounded_recursive_wiki_read(args, argv)
 
     readonly_error = _readonly_lark_cli_error(mode, argv, risk)
     if readonly_error:
@@ -809,7 +2269,13 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
 
     env = _safe_env()
     run_token = str(os.environ.get(HERMES_LARK_CLI_RUN_TOKEN) or "")
-    if strict_context_enabled() and run_token:
+    if run_token:
+        # Token presence is the strict-runtime proof (same rule as the script
+        # channel): it is minted only by subprocess_env's strict build path and
+        # the worker env never carries HERMES_MULTITENANCY_STRICT_CONTEXT, so
+        # gating on strict_context_enabled() here left descendants of sanctioned
+        # tool dispatches shim-denied in production while tests (which set the
+        # var) stayed green.
         env[HERMES_LARK_CLI_AUTHORIZED] = run_token
     requested_identity = str(args.get("identity") or "auto").strip().lower()
     allow_explicit_bot = requested_identity == "bot" and (
@@ -825,7 +2291,7 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
     identity = _effective_identity(args.get("identity"), allow_explicit_bot=allow_explicit_bot)
     if identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
         argv = _without_identity_flag(argv)
-    command = [binary, *_argv_with_json_format(argv, mode)]
+    command = [binary, *_argv_with_json_format(argv, mode, risk)]
     if not _has_identity_flag(command) and identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
         command.extend(["--as", identity])
 
@@ -872,6 +2338,34 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             identity=identity,
         )
 
+    visible_argv = list(argv)
+    operation_intent = None
+    if strict_context_enabled():
+        argv, operation_intent, resume_error = _prepare_resumable_write(
+            env=env,
+            mode=mode,
+            argv=argv,
+            session_id=str(_kwargs.get("session_id") or ""),
+            tool_call_id=str(_kwargs.get("tool_call_id") or ""),
+        )
+        if resume_error is not None:
+            return resume_error
+        command = [binary, *_argv_with_json_format(argv, mode, risk)]
+        if not _has_identity_flag(command) and identity in {"user", "bot"} and _supports_identity_flag(argv, mode):
+            command.extend(["--as", identity])
+
+    operation, operation_decision = _begin_lark_cli_operation(
+        env=env,
+        mode=mode,
+        argv=argv,
+        identity=identity,
+        risk=risk,
+        task_id=str(_kwargs.get("task_id") or ""),
+        intent_key=operation_intent,
+    )
+    if operation_decision is not None:
+        return operation_decision
+
     cwd = str(workspace) if workspace is not None and workspace.exists() else None
     try:
         completed = subprocess.run(
@@ -884,7 +2378,7 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return tool_error(
+        timeout_result = tool_error(
             f"lark-cli timed out after {timeout}s",
             mode=mode,
             command=argv,
@@ -893,14 +2387,22 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
             stderr_redacted=_redact(str(exc.stderr or "")),
             **_failure_fields(timed_out=True),
         )
+        if operation is not None:
+            operation = {**operation, "state": "uncertain"}
+            return _operation_result(timeout_result, operation)
+        return timeout_result
     except PermissionError as exc:
-        return _classified_tool_error(
+        permission_result = _classified_tool_error(
             f"lark-cli failed in profile sandbox: {_redact(str(exc))}",
             failure_hint="permission_denied",
             mode=mode,
             command=argv,
             risk=risk,
         )
+        if operation is not None:
+            operation = {**operation, "state": "uncertain"}
+            return _operation_result(permission_result, operation)
+        return permission_result
 
     stdout = _redact(completed.stdout)
     stderr = _strip_non_business_notices(_redact(completed.stderr))
@@ -925,6 +2427,33 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         business_payload=parsed if isinstance(parsed, dict) else None,
         failure_hint="output_unparseable" if json_parse_failed else None,
     )
+    typed_result_ref = _typed_resumable_result_ref(mode, argv, parsed)
+    typed_receipt_missing = bool(
+        operation_intent and fields["error_code"] is None and not typed_result_ref
+    )
+    readback_error = None
+    if operation_intent and fields["error_code"] is None and typed_result_ref:
+        readback_error = _readback_resumable_message(
+            binary=binary,
+            env=env,
+            cwd=cwd,
+            timeout=timeout,
+            identity=identity,
+            argv=argv,
+            message_id=typed_result_ref,
+        )
+    if typed_receipt_missing:
+        fields = {
+            "failure_subsystem": "lark_api",
+            "error_code": "FEISHU_OPERATION_OUTCOME_UNCERTAIN",
+            "retryable": False,
+        }
+    elif readback_error:
+        fields = {
+            "failure_subsystem": "lark_api",
+            "error_code": readback_error,
+            "retryable": False,
+        }
     # Live assertion for the run-scoped auth broker: a refused dial to our own
     # localhost proxy means the broker died before the run that owns it did.
     # Silent until it happens, greppable/alertable when it does — this counter
@@ -944,7 +2473,7 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         "approval_required": False,
         "mode": mode,
         "identity": identity,
-        "command": argv,
+        "command": visible_argv,
         "exit_code": completed.returncode,
         "json": parsed,
         "stdout": stdout if parsed is None else "",
@@ -952,10 +2481,53 @@ def _handle_lark_cli_execute(args: dict, **_kwargs: Any) -> str:
         "files": _existing_output_files(output_paths),
         **fields,
     }
+    if typed_receipt_missing:
+        result["error"] = "lark-cli write returned no typed connector receipt"
+    elif readback_error:
+        result["error"] = "lark-cli write could not be independently read back"
+    if risk == "read":
+        unstructured_read = (
+            not _is_control_or_diagnostic_command(argv)
+            and (not isinstance(parsed, dict) or _read_projection_hides_protocol(argv))
+        )
+        if unstructured_read:
+            read_complete, read_error_code, read_reason = (
+                False,
+                "FEISHU_OUTPUT_UNPARSEABLE",
+                "output_unparseable",
+            )
+        else:
+            read_complete, read_error_code, read_reason = _read_terminal_state(parsed, argv)
+        result["read_complete"] = bool(result["ok"] and read_complete)
+        if result["ok"] and not read_complete:
+            result.update(
+                ok=False,
+                failure_subsystem="lark_api",
+                error_code=read_error_code,
+                retryable=False,
+                read_incomplete_reason=read_reason,
+            )
     if json_parse_failed:
         result["json_parse_failed"] = True
     result = annotate_permission_error(result, app_id=env.get("LARKSUITE_CLI_APP_ID"))
-    return tool_result(**result)
+    rendered = tool_result(**result)
+    if operation is None:
+        return rendered
+    operation_state = (
+        "confirmed"
+        if fields["error_code"] is None
+        else "waiting_auth"
+        if fields["error_code"] == "FEISHU_AUTH_REAUTH_REQUIRED"
+        else "uncertain"
+    )
+    return _operation_result(
+        rendered,
+        {
+            **operation,
+            "state": operation_state,
+            **({"result_ref": typed_result_ref} if operation_state == "confirmed" else {}),
+        },
+    )
 
 
 if registry is not None:

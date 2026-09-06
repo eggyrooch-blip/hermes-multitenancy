@@ -67,6 +67,8 @@ _synthetic_session_guards: dict[str, Any] = {}
 import threading as _threading
 from collections import OrderedDict as _OrderedDict
 
+from ..plugin_script_policy import PLUGIN_SCRIPT_SOUL_RULE
+
 _CHAT_INVITER_CACHE_MAX = 512
 _CHAT_INVITER_CACHE_TTL_S = 3600  # compatibility fallback TTL
 _chat_inviter_cache: "_OrderedDict[str, dict[str, Any]]" = _OrderedDict()
@@ -76,12 +78,15 @@ _GROUP_CHAT_TYPES: frozenset[str] = frozenset({"group", "topic"})
 _LARK_CLI_PROFILE_TOOLSETS = [
     "lark-cli",
 ]
+# Keep the packaged-script routing rule aligned with LARK_CLI_SCHEMA in
+# lark_cli_tool.py: profiles and tool discovery must teach the same contract.
 _LARK_CLI_SOUL_GUIDANCE = "\n".join(
     [
         "Feishu/Lark capability rules:",
         "- 飞书/Lark 的读写、导出和长尾 OpenAPI 能力必须通过 `lark_cli` 工具完成。",
         "- 当用户明确要求“调用 lark_cli / 使用 lark-cli / 必须真实调用工具”时，即使你从历史上下文知道答案，也必须重新调用 `lark_cli`，不得只凭记忆回答。",
         "- 不要通过 `terminal`、`code_execution`、`npx`、`which lark-cli` 或 shell 直接运行 lark-cli/lark-mcp 来绕开 profile runtime。",
+        PLUGIN_SCRIPT_SOUL_RULE,
         "- 如果 `lark_cli` 工具不可见或不可用，直接说明当前 profile 未暴露 lark-cli 能力；不要自行安装、探测或模拟结果。",
         "- 如果需要调用飞书能力，必须等待真实工具结果；不要编造 message_id、文档链接或调用结果。",
         "- 如果 `lark_cli` 返回 credential unavailable、validation、unsupported 或权限错误，立即停止重试并如实说明需要授权/权限/命令支持。",
@@ -163,6 +168,10 @@ def _pending_auth_replay_key(profile_name: str, open_id: str) -> str:
 
 def _capture_pending_auth_replay(profile_name: str, open_id: str, text: str) -> None:
     """Stash the user's last substantive request for post-/feishu_auth replay."""
+    from ..runtime import strict_context_enabled
+
+    if strict_context_enabled():
+        return
     clean_text = str(text or "").strip()
     clean_profile = str(profile_name or "").strip()
     clean_open_id = str(open_id or "").strip()
@@ -193,6 +202,16 @@ def _take_pending_auth_replay(profile_name: str, open_id: str) -> Optional[str]:
     if time.time() - ts > _PENDING_AUTH_REPLAY_TTL_SECONDS:
         return None
     return text
+
+
+def _resume_pending_lark_cli_step(
+    profile_home: Path, subject: str, trusted_chat_id: str
+) -> dict[str, Any] | None:
+    from ..agent_real import resume_pending_lark_cli_step
+
+    return resume_pending_lark_cli_step(
+        profile_home, subject, trusted_chat_id=trusted_chat_id
+    )
 
 
 def _inflight_key(
@@ -304,9 +323,9 @@ def _dispatch_session_scope(
     route_version = 0
     shared_history = False
     if strict_context_enabled():
-        from ..feishu_group_topic_session import group_topic_thread
+        from ..feishu_group_topic_session import group_topic_conversation_id
 
-        canonical_topic = group_topic_thread(event)
+        canonical_topic = group_topic_conversation_id(event)
         thread_id = canonical_topic or _event_thread_id(event)
         shared_history = canonical_topic is not None
         route_version = _route_version_for(sender, sender_alt, chat_id)

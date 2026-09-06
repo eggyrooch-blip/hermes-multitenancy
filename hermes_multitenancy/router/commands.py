@@ -15,12 +15,15 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from .. import router as _m
+from .. import turn_tool_context
 from ..feishu_message_trace import reset_trace_context, set_trace_context
 from .feishu_completion import (
     deferred_completion_is_covered,
     has_deferred_completion_claim,
 )
 from .feishu_execution import (
+    _carry_admission,
+    _carry_session_id,
     _complete_feishu_processing,
     execute_admitted_feishu_run,
 )
@@ -752,6 +755,15 @@ async def _handle_command(
         if profile_name:
             key = _m._dispatch_session_scope(profile_name, sender, sender_alt, chat_id, event).history_key
             _m._clear_history(key)
+            # Same reset, same breath: drop the carried tool transcript AND bump
+            # the generation so a turn still in flight cannot repopulate it.
+            reset_admission = _carry_admission(event, profile_name)
+            if reset_admission is not None:
+                turn_tool_context.invalidate(
+                    profile_name,
+                    reset_admission.actor_subject,
+                    _carry_session_id(key, reset_admission),
+                )
             reply = "会话已重置 ✅"
         else:
             reply = "(未路由的用户) 没有历史可重置"
@@ -1098,6 +1110,25 @@ async def _dispatch_synthetic_auth_complete(
             )
             return False
 
+        from ..runtime import strict_context_enabled
+
+        if strict_context_enabled():
+            await asyncio.to_thread(
+                _m._resume_pending_lark_cli_step,
+                _m._profile_name_to_home(clean_profile_name),
+                str(open_id or "").strip(),
+                clean_chat_id,
+            )
+            adapter = _m._get_feishu_adapter(gateway)
+            if adapter is None:
+                return False
+            await _m._safe_call(
+                adapter.send,
+                clean_chat_id,
+                "飞书授权已完成。为保护消息内容，原请求未保存也不会自动重放，请重新发送原请求。",
+            )
+            return True
+
         if text == _m.SYNTHETIC_AUTH_COMPLETE_TEXT:
             replay = _m._take_pending_auth_replay(clean_profile_name, str(open_id or "").strip())
             if replay:
@@ -1112,6 +1143,9 @@ async def _dispatch_synthetic_auth_complete(
         )
         sender_id = sender_open_id or str(open_id or "").strip()
 
+        from ..feishu_group_topic_session import group_topic_conversation_id
+
+        topic_conversation_id = group_topic_conversation_id(event)
         synthetic_source = SimpleNamespace(
             chat_id=clean_chat_id,
             message_id=synthetic_message_id,
@@ -1126,7 +1160,7 @@ async def _dispatch_synthetic_auth_complete(
             chat_topic=getattr(source, "chat_topic", None) if source is not None else None,
             hermes_group_topic=getattr(source, "hermes_group_topic", False) if source is not None else False,
             hermes_raw_thread_id=getattr(source, "hermes_raw_thread_id", None) if source is not None else None,
-            hermes_root_id=getattr(source, "hermes_root_id", None) if source is not None else None,
+            hermes_root_id=topic_conversation_id,
         )
         # Credential delegation: a 允许一次 grant is bound to THIS replay. Carried
         # both as an attribute and in raw_event metadata so it survives whichever

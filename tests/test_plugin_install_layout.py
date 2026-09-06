@@ -50,7 +50,11 @@ def test_root_directory_plugin_shim_registers_hook(monkeypatch, tmp_path):
                 hooks.append((name, callback))
 
         module.register(FakeCtx())
-        assert [name for name, _callback in hooks] == ["pre_gateway_dispatch"]
+        assert [name for name, _callback in hooks] == [
+            "post_tool_call",
+            "transform_tool_result",
+            "pre_gateway_dispatch",
+        ]
         assert callable(module.on_pre_gateway_dispatch)
     finally:
         for name in list(sys.modules):

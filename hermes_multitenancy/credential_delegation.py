@@ -458,6 +458,7 @@ def owner_gitlab_env(shared_home: Path, owner_profile: str) -> dict[str, str]:
     try:
         from .credential_materializer import (
             _payload_content,
+            git_auth_env,
             resolve_runtime_secret,
         )
         from .credentials import CredentialStore
@@ -487,6 +488,9 @@ def owner_gitlab_env(shared_home: Path, owner_profile: str) -> dict[str, str]:
                 if key:
                     env.setdefault(key, str(value))
         env.setdefault("GITLAB_HOST", "gitlab.example.com")
+        # Same shared helper as the regular credential env producer: a borrowed
+        # token has to drive plain `git`, not only `glab`.
+        env.update(git_auth_env(env, token_env_name=env_name))
         return env
     except Exception:
         logger.debug("[cred_delegation] owner gitlab env resolution failed", exc_info=True)

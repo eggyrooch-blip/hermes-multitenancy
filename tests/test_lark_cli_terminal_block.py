@@ -6,6 +6,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 def _write_executable(path: Path, body: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,3 +243,65 @@ def test_lark_cli_tool_rejects_missing_auth_broker_even_when_strict_context_is_o
     result = raw if isinstance(raw, dict) else json.loads(raw)
 
     assert result["error"] == "lark-cli auth broker is unavailable in the current profile runtime"
+
+
+@pytest.mark.parametrize(
+    "auth_argv",
+    [
+        ["auth", "login", "--scope", "calendar:calendar:readonly"],
+        ["--profile", "personal", "auth", "login"],
+        ["-p", "work", "auth", "login"],
+        ["--profile=personal", "auth", "login"],
+        ["-p", "login"],
+        ["--env", "oauth"],
+    ],
+)
+def test_registered_lark_cli_blocks_headless_auth_login_before_spawn_when_policy_is_missing(
+    monkeypatch,
+    tmp_path: Path,
+    auth_argv,
+) -> None:
+    from hermes_multitenancy import lark_cli_tool
+
+    profile_home = tmp_path / "profile"
+    workspace = profile_home / "workspace"
+    workspace.mkdir(parents=True)
+    binary = _make_real_binary(tmp_path / "bin" / "lark-cli-authsidecar", sentinel="MUST_NOT_RUN")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_LARK_CLI_BIN", str(binary))
+    monkeypatch.setenv("LARKSUITE_CLI_AUTH_PROXY", "http://127.0.0.1:16384")
+    monkeypatch.setenv("LARKSUITE_CLI_PROXY_KEY", "per-run-proxy-key")
+    monkeypatch.setenv("LARKSUITE_CLI_APP_ID", "cli_public")
+    assert not lark_cli_tool.POLICY_PATH.exists()
+
+    spawned: list[list[str]] = []
+
+    def must_not_spawn(command, **_kwargs):
+        spawned.append(command)
+        raise AssertionError("headless auth must stop before subprocess execution")
+
+    monkeypatch.setattr(lark_cli_tool.subprocess, "run", must_not_spawn)
+
+    raw = lark_cli_tool._handle_lark_cli_execute(
+        {
+            "mode": "shortcut",
+            "argv": auth_argv,
+            "risk": "write",
+            "reason": "model attempted interactive OAuth",
+        }
+    )
+    result = raw if isinstance(raw, dict) else json.loads(raw)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "FEISHU_AUTH_INTERACTIVE_BLOCKED"
+    assert result["auth_required"] is True
+    assert result["auth_method"] == "official"
+    assert "/feishu_auth" in result["auth_hint"]
+    assert "WebUI" in result["auth_hint"]
+    assert spawned == []
+    visible = json.dumps(result, ensure_ascii=False).lower()
+    assert "paste token" not in visible
+    assert "provide token" not in visible
+    assert "粘贴 token" not in visible
+    assert "提供 token" not in visible

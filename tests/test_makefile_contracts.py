@@ -50,15 +50,19 @@ def test_canonical_test_runner_forwards_targets_and_preserves_ci_non_root(tmp_pa
     _executable(fake_bin / "uv", f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {log!s}\n")
     env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
     env.pop("CI", None)
+    env.pop("HERMES_HOME", None)
     subprocess.run([runner, "tests/test_feishu_trusted_ingress.py"], cwd=ROOT, env=env, check=True)
     assert log.read_text(encoding="utf-8").splitlines() == [
         "run", "--extra", "test", "pytest", "-q", "tests/test_feishu_trusted_ingress.py",
     ]
 
     _executable(fake_bin / "id", "#!/bin/sh\necho 0\n")
+    handoff = tmp_path / "handoff.log"
+    _executable(fake_bin / "chown", f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {handoff!s}\n")
     _executable(fake_bin / "su", f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {log!s}\n")
     subprocess.run([runner], cwd=ROOT, env={**env, "CI": "true"}, check=True)
     ci_call = log.read_text(encoding="utf-8")
+    assert handoff.read_text(encoding="utf-8").splitlines()[0] == "ci"
     assert ci_call.startswith("ci\n-c\n")
     assert "--ignore=tests/test_billing_readiness.py" in ci_call
     assert "--deselect tests/test_aiagent_subprocess.py::test_session_search_proxy_covers_real_agent_tool_dispatch" in ci_call

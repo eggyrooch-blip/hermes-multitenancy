@@ -11,6 +11,7 @@ import json
 import itertools
 import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +49,7 @@ if _quota is not None and not os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
 
 
 _CARD_MESSAGES = itertools.count()
+_SYNTHETIC_FEISHU_ADAPTER = "hermes_plugins.feishu_platform.adapter"
 
 
 class _CardTicket:
@@ -148,6 +150,28 @@ def _enable_security_audit(monkeypatch):
     audit CONTENT (redaction/hashing/event presence), so it opts audit ON here.
     The dedicated default-off behavior test overrides this env explicitly."""
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loaded_feishu_plugin(monkeypatch):
+    """Tests must opt into Agent's process-global Feishu plugin state.
+
+    Agent plugin discovery is process-global: besides loading the synthetic
+    module it leaves a concrete or deferred ``feishu`` registry entry behind.
+    Removing only the module lets ``load_feishu_module()`` immediately
+    materialize it again, so fake legacy/plugin fixtures become order-dependent
+    under xdist.  Hide all three pieces for each test; tests of deferred loading
+    install their own isolated registry and synthetic module explicitly.
+    """
+    monkeypatch.delitem(sys.modules, _SYNTHETIC_FEISHU_ADAPTER, raising=False)
+    registry_module = sys.modules.get("gateway.platform_registry")
+    registry = getattr(registry_module, "platform_registry", None)
+    entries = getattr(registry, "_entries", None)
+    deferred = getattr(registry, "_deferred", None)
+    if isinstance(entries, dict):
+        monkeypatch.delitem(entries, "feishu", raising=False)
+    if isinstance(deferred, dict):
+        monkeypatch.delitem(deferred, "feishu", raising=False)
 
 
 @pytest.fixture(autouse=True)

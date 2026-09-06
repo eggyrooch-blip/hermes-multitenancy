@@ -52,6 +52,35 @@ def _event() -> SimpleNamespace:
     )
 
 
+def test_lark_cli_tool_call_persistence_keeps_only_non_sensitive_shape() -> None:
+    from hermes_multitenancy.agent_real.streaming import _persistable_tool_call
+
+    payload = _persistable_tool_call(
+        "lark_cli",
+        "lark_cli im +messages-send --text secret-message",
+        {
+            "mode": "shortcut",
+            "argv": [
+                "im",
+                "+messages-send",
+                "--chat-id",
+                "oc_private",
+                "--text",
+                "secret-message",
+            ],
+            "risk": "write",
+        },
+    )
+
+    assert payload == {
+        "name": "lark_cli",
+        "args": {"redacted": True},
+        "preview": "lark_cli",
+    }
+    assert "secret-message" not in json.dumps(payload)
+    assert "oc_private" not in json.dumps(payload)
+
+
 def _install_fake_feishu_oapi(monkeypatch) -> None:
     current_sender_open_id = contextvars.ContextVar("current_sender_open_id", default=None)
 
@@ -248,7 +277,18 @@ async def test_stream_run_agent_preserves_post_tool_recovery_events(monkeypatch,
     expiry = {"provider": "feishu", "connector_id": "lark-cli"}
 
     async def failing_stream(*_args, **_kwargs):
-        yield ("tool_started", {"name": "lark_cli"})
+        yield ("tool_started", {"name": "lark_cli", "session_id": "session-1", "tool_call_id": "call-1"})
+        yield (
+            "tool_completed",
+            {
+                "name": "lark_cli",
+                "session_id": "session-1",
+                "tool_call_id": "call-1",
+                "failure_subsystem": "credential",
+                "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+                "retryable": False,
+            },
+        )
         yield ("content", "partial")
         agent_real._CREDENTIAL_EXPIRY_SIGNAL.get().set(expiry)
         raise RuntimeError("tool run failed")
@@ -261,9 +301,26 @@ async def test_stream_run_agent_preserves_post_tool_recovery_events(monkeypatch,
     monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
     chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
     assert chunks == [
-        ("tool_started", {"name": "lark_cli"}),
+        ("tool_started", {"name": "lark_cli", "session_id": "session-1", "tool_call_id": "call-1"}),
+        (
+            "tool_completed",
+            {
+                "name": "lark_cli",
+                "session_id": "session-1",
+                "tool_call_id": "call-1",
+                "failure_subsystem": "credential",
+                "error_code": "FEISHU_AUTH_REAUTH_REQUIRED",
+                "retryable": False,
+            },
+        ),
         ("content", "partial"),
-        ("auth_required", expiry),
+        (
+            "auth_required",
+            {
+                **expiry,
+                "operation_ref": {"session_id": "session-1", "tool_call_id": "call-1"},
+            },
+        ),
         ("content", "\n\n" + agent_real._PARTIAL_FAILURE_NOTICE),
     ]
 
@@ -430,8 +487,14 @@ def test_aiagent_subprocess_runs_in_terminal_cwd_and_restores(monkeypatch, tmp_p
     assert Path.cwd() == original
 
 
-def test_run_with_aiagent_keeps_selected_workspace_for_tools(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("local_harness", [False, True])
+def test_run_with_aiagent_keeps_selected_workspace_for_tools(
+    monkeypatch, tmp_path: Path, local_harness: bool
+):
+    # Reads os.environ INSIDE run_conversation: the spawn env dict is not the
+    # child's effective env, because run.py re-asserts the profile anchors twice.
     from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import executor_map, harness_webui_runtime
 
     profile_home = tmp_path / "profiles" / "coder"
     selected = profile_home / "workspace" / "project-a"
@@ -450,6 +513,8 @@ def test_run_with_aiagent_keeps_selected_workspace_for_tools(monkeypatch, tmp_pa
         def run_conversation(self, **_kwargs):
             seen["terminal_cwd"] = os.environ["TERMINAL_CWD"]
             seen["forced_terminal_cwd"] = os.environ["_HERMES_FORCE_TERMINAL_CWD"]
+            seen["home"] = os.environ["HOME"]
+            seen["forced_home"] = os.environ["_HERMES_FORCE_HOME"]
             return {"final_response": "ok"}
 
         def cleanup(self):
@@ -458,6 +523,30 @@ def test_run_with_aiagent_keeps_selected_workspace_for_tools(monkeypatch, tmp_pa
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
     _install_fake_feishu_oapi(monkeypatch)
     _install_fake_gateway_session_context(monkeypatch)
+    expected_home = profile_home / "home"
+    if local_harness:
+        # The private 0700 workflow home _codex_runtime_env hands the child.
+        expected_home = tmp_path / "workflow" / "home"
+        expected_home.mkdir(parents=True)
+        codex_bin = tmp_path / "bin" / executor_map.CODEX_BINARY
+        codex_bin.parent.mkdir()
+        codex_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        codex_bin.chmod(0o755)
+
+        @contextmanager
+        def _no_resume(*_args, **_kwargs):
+            yield
+
+        monkeypatch.setenv("PATH", str(codex_bin.parent))
+        monkeypatch.setenv("HERMES_LOCAL_HARNESS", "1")
+        monkeypatch.setenv(
+            agent_real.EXECUTOR_RUNTIME_ENV, executor_map.CODEX_APP_SERVER
+        )
+        monkeypatch.setenv("HOME", str(expected_home))
+        monkeypatch.setenv("_HERMES_FORCE_HOME", str(expected_home))
+        monkeypatch.setattr(
+            harness_webui_runtime, "codex_thread_resume_scope", _no_resume
+        )
     event = _event()
     event.raw_event = {"workspace": "project-a"}
 
@@ -465,6 +554,8 @@ def test_run_with_aiagent_keeps_selected_workspace_for_tools(monkeypatch, tmp_pa
     assert seen == {
         "terminal_cwd": str(selected),
         "forced_terminal_cwd": str(selected),
+        "home": str(expected_home),
+        "forced_home": str(expected_home),
     }
 
 
@@ -916,7 +1007,7 @@ os._exit(0)
     env["HERMES_MULTITENANCY_SESSION_SEARCH_TOKEN"] = "tok-session"
     env["PYTHONPATH"] = os.pathsep.join([
         str(Path.cwd()),
-        "/Users/dev/.hermes/hermes-feishu-uat",
+        "/Users/hermes/.hermes/hermes-feishu-uat",
         env.get("PYTHONPATH", ""),
     ])
     completed = subprocess.run(
@@ -1116,15 +1207,29 @@ credentials:
     monkeypatch.setitem(sys.modules, "tools", tools_mod)
     monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake_env_passthrough)
 
-    assert agent_real._credential_env_for_aiagent(profile_home) == {
-        "GITLAB_TOKEN": "glpat-test",
-    }
+    from hermes_multitenancy.credential_materializer import git_auth_env, git_identity_env
+
+    credential_env = agent_real._credential_env_for_aiagent(profile_home)
+    # The token now travels with the git auth env that makes plain `git` use it
+    # (helper + insteadOf, see tests/test_git_auth_env.py) plus the commit
+    # identity riding the same GIT_CONFIG_* channel (see
+    # tests/test_git_identity_env.py) — and nothing else. Composed in the
+    # production order: identity seeded first, auth appended onto its count.
+    assert credential_env["GITLAB_TOKEN"] == "glpat-test"
+    expected = {"GITLAB_TOKEN": "glpat-test"}
+    expected.update(git_identity_env(expected, profile="alice"))
+    expected.update(git_auth_env(expected))
+    assert set(credential_env) == set(expected)
+    # Identity holds slot 0: git lets later entries win, so appending auth
+    # after it is the only order that keeps an explicit identity able to win.
+    assert credential_env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert credential_env["GIT_CONFIG_VALUE_0"] == "alice"
 
     agent_real._install_credential_env_passthrough(profile_home)
 
-    assert registered == [["GITLAB_TOKEN"]]
+    assert registered == [sorted(credential_env)]
     assert fake_env_passthrough._config_passthrough == frozenset(
-        {"EXISTING_TOKEN", "GITLAB_TOKEN"}
+        {"EXISTING_TOKEN", *credential_env}
     )
 
 
@@ -1857,6 +1962,110 @@ def test_stream_aiagent_subprocess_initializes_state_db_schema_for_fresh_profile
         ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_ok", [False, True])
+async def test_mapped_stream_commits_state_only_after_receipt(
+    monkeypatch, tmp_path: Path, receipt_ok: bool
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real import _core, executor_map
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+
+    class FakeStdin:
+        def write(self, _payload):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = [
+                b'{"event":"content","text":"gated answer"}\n',
+                b'{"event":"done","result":"gated answer","error":null,"usage":{"api_calls":1}}\n',
+            ]
+
+        async def readline(self):
+            return self.lines.pop(0) if self.lines else b""
+
+    class FakeStderr:
+        async def read(self):
+            return b""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = FakeStderr()
+            self.pid = 123
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc()
+
+    @contextmanager
+    def fake_env_scope(*_args, **_kwargs):
+        yield dict(os.environ)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(agent_real, "_aiagent_subprocess_env_scope", fake_env_scope)
+    monkeypatch.setitem(
+        agent_real._stream_aiagent_subprocess.__globals__,
+        "_bind_codex_run_workspace",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        executor_map,
+        "runtime_for_event",
+        lambda *_args: executor_map.CODEX_APP_SERVER,
+    )
+
+    async def complete(_event, _profile):
+        with sqlite3.connect(profile_home / "state.db") as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant'"
+            ).fetchone()[0] == 0
+        if not receipt_ok:
+            raise executor_map.ExecutorUnavailable("receipt rejected")
+
+    monkeypatch.setattr(_core, "_complete_codex_spend_receipt", complete)
+    event = _event()
+    stream = _core._verified_codex_stream(event, profile_home)
+    if receipt_ok:
+        assert [item async for item in stream] == [
+            ("content", "gated answer"),
+            ("done", "gated answer"),
+        ]
+    else:
+        with pytest.raises(executor_map.ExecutorUnavailable, match="receipt rejected"):
+            _ = [item async for item in stream]
+
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages ORDER BY id"
+        ).fetchall()
+    assert rows == (
+        [("user", event.text), ("assistant", "gated answer")]
+        if receipt_ok
+        else [("user", event.text)]
+    )
+
+
 def test_stream_aiagent_subprocess_redacts_ingest_secret_events(monkeypatch, tmp_path: Path):
     from hermes_multitenancy import agent_real
 
@@ -2092,9 +2301,19 @@ def test_stream_aiagent_subprocess_appends_conversation_audit_jsonl(
                 json.dumps({"event": "content", "text": "world"}).encode() + b"\n",
                 json.dumps({
                     "event": "tool_started",
+                    "tool_call_id": "call-audit-1",
                     "name": "terminal",
                     "preview": "echo ok",
                     "args": {"command": "echo ok"},
+                }).encode() + b"\n",
+                json.dumps({
+                    "event": "tool_completed",
+                    "tool_call_id": "call-audit-1",
+                    "name": "terminal",
+                    "is_error": False,
+                    "failure_subsystem": None,
+                    "error_code": None,
+                    "retryable": False,
                 }).encode() + b"\n",
                 b'{"event": "done", "result": "ok", "error": null}\n',
             ]
@@ -2143,9 +2362,18 @@ def test_stream_aiagent_subprocess_appends_conversation_audit_jsonl(
         ("content", "hello "),
         ("content", "world"),
         ("tool_started", {
+            "tool_call_id": "call-audit-1",
             "name": "terminal",
             "preview": "echo ok",
             "args": {"command": "echo ok"},
+        }),
+        ("tool_completed", {
+            "tool_call_id": "call-audit-1",
+            "name": "terminal",
+            "is_error": False,
+            "failure_subsystem": None,
+            "error_code": None,
+            "retryable": False,
         }),
         ("done", "ok"),
     ]
@@ -2165,6 +2393,19 @@ def test_stream_aiagent_subprocess_appends_conversation_audit_jsonl(
         "args": {"command": "echo ok"},
         "preview": "echo ok",
     }
+    with sqlite3.connect(profile_home / "state.db") as conn:
+        mirrored = conn.execute(
+            "SELECT role,tool_call_id,content FROM messages"
+            " WHERE tool_call_id='call-audit-1' ORDER BY id"
+        ).fetchall()
+    assert mirrored == [
+        ("assistant", "call-audit-1", ""),
+        (
+            "tool",
+            "call-audit-1",
+            '{"failure_subsystem":null,"error_code":null,"retryable":false,"is_error":false}',
+        ),
+    ]
 
 
 def test_stream_aiagent_subprocess_audits_text_only_done_finish_reason(
@@ -3165,6 +3406,19 @@ def test_event_payload_carries_router_messages(tmp_path: Path):
     assert payload["messages"] == messages
 
 
+def test_event_payload_canonicalizes_profile_home_before_sandbox(tmp_path: Path):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "real-profile"
+    profile_home.mkdir()
+    alias = tmp_path / "profile-alias"
+    alias.symlink_to(profile_home, target_is_directory=True)
+
+    payload = agent_real._event_to_subprocess_payload(_event(), alias)
+
+    assert payload["profile_home"] == str(profile_home.resolve())
+
+
 def test_event_payload_preserves_webui_raw_session_for_child_replay(tmp_path: Path):
     from hermes_multitenancy import agent_real
     from hermes_multitenancy import aiagent_subprocess
@@ -3693,6 +3947,7 @@ def test_run_with_aiagent_passes_expert_ephemeral_prompt_to_core(monkeypatch, tm
     assert ephemeral.startswith("ROLE OVERRIDE\n我是资源投放专家")
     assert "任务进度规则" in ephemeral
     assert ephemeral.index("ROLE OVERRIDE") < ephemeral.index("任务进度规则")
+    assert 'lark_cli` tool with `mode="script"' in ephemeral
     # and NOT smuggled through run_conversation(system_message=...)
     assert captured.get("run_system_message") is None
 
@@ -3783,12 +4038,13 @@ def test_run_with_aiagent_omits_expert_system_message_without_expert(
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert "identity_override" not in captured
     ephemeral = captured.get("ephemeral_system_prompt")
+    assert isinstance(ephemeral, str)
+    assert 'lark_cli` tool with `mode="script"' in ephemeral
     if has_todo_rules:
-        assert isinstance(ephemeral, str)
         assert ephemeral.startswith("任务进度规则")
         assert "ROLE OVERRIDE" not in ephemeral
     else:
-        assert ephemeral is None
+        assert ephemeral.startswith("Installed Plugin/Skill script execution:")
 
 
 def test_run_with_aiagent_omits_todo_rules_when_todo_toolset_disabled(monkeypatch, tmp_path: Path):
@@ -3826,7 +4082,9 @@ def test_run_with_aiagent_omits_todo_rules_when_todo_toolset_disabled(monkeypatc
     event.source.platform = SimpleNamespace(value="feishu")
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
-    assert "ephemeral_system_prompt" not in captured
+    assert 'lark_cli` tool with `mode="script"' in str(
+        captured.get("ephemeral_system_prompt") or ""
+    )
 
 
 def test_run_with_aiagent_omits_todo_rules_in_explicit_mode_without_todo(monkeypatch, tmp_path: Path):
@@ -3866,7 +4124,9 @@ def test_run_with_aiagent_omits_todo_rules_in_explicit_mode_without_todo(monkeyp
 
     assert agent_real._run_with_aiagent(event, profile_home) == "ok"
     assert captured.get("enabled_toolsets") == ["file"]
-    assert "ephemeral_system_prompt" not in captured
+    assert 'lark_cli` tool with `mode="script"' in str(
+        captured.get("ephemeral_system_prompt") or ""
+    )
 
 
 def test_run_with_aiagent_applies_expert_skill_scope_cleanup(monkeypatch, tmp_path: Path):
@@ -4374,6 +4634,92 @@ def test_run_with_aiagent_passes_disabled_toolsets_to_core(monkeypatch, tmp_path
         "enabled_toolsets": ["delegation", "file", "terminal", "web"],
         "disabled_toolsets": ["delegation"],
     }
+
+
+def test_run_with_aiagent_applies_frozen_project_context(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.projects import ProjectStore
+
+    profile_home = tmp_path / "profiles" / "coder"
+    (profile_home / "workspace" / "reports").mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n", encoding="utf-8"
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    store = ProjectStore(profile_home)
+    project = store.create_project(
+        "actor-a",
+        {
+            "name": "Alpha",
+            "description": "Validate visible context, continuity, and task archives.",
+            "instructions": "Use the approved template.",
+            "primary_folder": "reports",
+        },
+    )
+    context = store.bind_session(
+        actor_subject="actor-a",
+        session_id="session-a",
+        requested_project_id=project["id"],
+        requested_supplied=True,
+        requested_workspace=None,
+    )
+    event = _event()
+    event.source.platform = SimpleNamespace(value="webui")
+    event.source.user_id = "actor-a"
+    event.raw_event = {
+        "session_id": "session-a",
+        "workspace": "reports",
+        "metadata": {},
+    }
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            captured["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            return {"final_response": "ok"}
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert captured["skip_memory"] is True
+    assert {"memory", "session_search"}.issubset(set(captured["disabled_toolsets"]))
+    assert captured["terminal_cwd"] == str((profile_home / "workspace" / "reports").resolve())
+    prompt = str(captured["ephemeral_system_prompt"])
+    assert "Project description: Validate visible context, continuity, and task archives." in prompt
+    assert "Use the approved template." in prompt
+    assert context.instructions_fingerprint in prompt
+
+    (profile_home / "workspace" / "other").mkdir()
+    event.raw_event["workspace"] = "other"
+    with pytest.raises(RuntimeError, match="workspace binding mismatch"):
+        agent_real._run_with_aiagent(event, profile_home)
+
+    no_folder_project = store.create_project(
+        "actor-a",
+        {"name": "No folder", "instructions": "Stay concise."},
+    )
+    store.bind_session(
+        actor_subject="actor-a",
+        session_id="session-b",
+        requested_project_id=no_folder_project["id"],
+        requested_supplied=True,
+        requested_workspace=None,
+    )
+    event.raw_event = {"session_id": "session-b", "workspace": None, "metadata": {}}
+    assert agent_real._run_with_aiagent(event, profile_home) == "ok"
+    assert "bind a development folder to the Project first" in str(
+        captured["ephemeral_system_prompt"]
+    )
+    assert {"code_execution", "delegation", "file", "terminal"}.issubset(
+        set(captured["disabled_toolsets"])
+    )
 
 
 def test_run_with_aiagent_removes_delegation_toolset_for_ingest_runs(monkeypatch, tmp_path: Path):
@@ -5370,8 +5716,8 @@ def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path:
             self.kwargs = kwargs
 
         def run_conversation(self, user_message, task_id, persist_user_message=None):
-            self.kwargs["tool_progress_callback"](
-                "tool.started", "feishu_task_tasklist", "rename", {"action": "patch"}
+            self.kwargs["tool_start_callback"](
+                "call-1", "feishu_task_tasklist", {"action": "patch"}
             )
             self.kwargs["reasoning_callback"]("我在处理工具结果")
             self.kwargs["stream_delta_callback"]("已完成")
@@ -5380,8 +5726,15 @@ def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path:
                 "feishu_task_tasklist",
                 None,
                 None,
-                duration=1.2,
-                is_error=False,
+                duration=0.25,
+                is_error=True,
+                result="Error: connector failed",
+            )
+            self.kwargs["tool_complete_callback"](
+                "call-1",
+                "feishu_task_tasklist",
+                {"action": "patch"},
+                "Error: connector failed",
             )
             return {"final_response": "已完成"}
 
@@ -5402,18 +5755,82 @@ def test_run_with_aiagent_forwards_stream_and_tool_events(monkeypatch, tmp_path:
     assert events == [
         {
             "event": "tool_started",
+            "session_id": "agent:profile:coder:platform:feishu:chat_type:dm:chat:oc_test:user:ou_test",
+            "tool_call_id": "call-1",
             "name": "feishu_task_tasklist",
-            "preview": "rename",
+            "preview": None,
             "args": {"action": "patch"},
         },
         {"event": "thinking", "text": "我在处理工具结果"},
         {"event": "content", "text": "已完成"},
         {
             "event": "tool_completed",
+            "session_id": "agent:profile:coder:platform:feishu:chat_type:dm:chat:oc_test:user:ou_test",
+            "tool_call_id": "call-1",
             "name": "feishu_task_tasklist",
-            "duration": 1.2,
-            "is_error": False,
+            "duration": 0.25,
+            "is_error": True,
+            "failure_subsystem": None,
+            "error_code": None,
+            "retryable": False,
         },
+    ]
+
+
+def test_run_with_aiagent_correlates_same_name_completion_metadata_by_result(
+    monkeypatch, tmp_path: Path
+):
+    from hermes_multitenancy import agent_real
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: openai/test-model\n", encoding="utf-8"
+    )
+    (profile_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run_conversation(self, user_message, task_id, persist_user_message=None):
+            first_result = {"ok": True, "value": "first"}
+            second_result = {"ok": False, "error_code": "SECOND_FAILED"}
+            for call_id in ("call-1", "call-2"):
+                self.kwargs["tool_start_callback"](call_id, "same_tool", {})
+            self.kwargs["tool_progress_callback"](
+                "tool.completed", "same_tool", None, None,
+                duration=1.0, is_error=False, result=first_result,
+            )
+            self.kwargs["tool_progress_callback"](
+                "tool.completed", "same_tool", None, None,
+                duration=2.0, is_error=True, result=second_result,
+            )
+            self.kwargs["tool_complete_callback"](
+                "call-2", "same_tool", {}, second_result
+            )
+            self.kwargs["tool_complete_callback"](
+                "call-1", "same_tool", {}, first_result
+            )
+            return {"final_response": "done"}
+
+        def cleanup(self):
+            pass
+
+    events: list[dict] = []
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    _install_fake_feishu_oapi(monkeypatch)
+
+    agent_real._run_with_aiagent(
+        _event(),
+        profile_home,
+        event_sink=lambda event, **payload: events.append({"event": event, **payload}),
+    )
+
+    completed = [event for event in events if event["event"] == "tool_completed"]
+    assert [(event["tool_call_id"], event["duration"], event["is_error"]) for event in completed] == [
+        ("call-2", 2.0, True),
+        ("call-1", 1.0, False),
     ]
 
 
@@ -5790,7 +6207,7 @@ def test_run_with_aiagent_prefills_webui_uploaded_image_analysis(monkeypatch, tm
     )
 
 
-def test_run_with_aiagent_guards_against_inference_when_webui_image_analysis_fails(
+def test_run_with_aiagent_fails_closed_when_webui_image_analysis_fails(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -5822,18 +6239,9 @@ def test_run_with_aiagent_guards_against_inference_when_webui_image_analysis_fai
         lambda *_args, **_kwargs: (False, "vision provider unavailable"),
     )
 
-    observed: dict[str, object] = {}
-
     class FakeAgent:
         def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-        def run_conversation(self, user_message, task_id, persist_user_message=None):
-            observed["user_message"] = user_message
-            return {"final_response": "done"}
-
-        def cleanup(self):
-            pass
+            raise AssertionError("vision-unavailable request must stop before AIAgent")
 
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
     _install_fake_feishu_oapi(monkeypatch)
@@ -5853,11 +6261,10 @@ def test_run_with_aiagent_guards_against_inference_when_webui_image_analysis_fai
         )
     )
 
-    assert agent_real._run_with_aiagent(event, profile_home) == "done"
-    user_message = str(observed["user_message"])
-    assert "Status: failed" in user_message
-    assert "vision provider unavailable" in user_message
-    assert "Do not infer this image's visual contents" in user_message
+    reply = agent_real._run_with_aiagent(event, profile_home)
+
+    assert "视觉能力暂不可用" in reply
+    assert "vision provider unavailable" not in reply
 
 
 def test_run_with_aiagent_uses_custom_provider_for_webui_image_preflight(monkeypatch, tmp_path: Path):
@@ -6017,10 +6424,11 @@ def test_run_with_aiagent_does_not_prefill_webui_image_outside_workspace(monkeyp
         )
     )
 
-    assert agent_real._run_with_aiagent(event, profile_home) == "done"
-    user_message = str(observed["user_message"])
-    assert "Status: not analyzed (outside profile workspace)." in user_message
-    assert "Do not infer this image's visual contents" in user_message
+    assert (
+        agent_real._run_with_aiagent(event, profile_home)
+        == agent_real._WEBUI_VISION_UNAVAILABLE_REPLY
+    )
+    assert observed == {}
 
 
 def test_run_with_aiagent_only_prefills_webui_images_from_uploads(monkeypatch, tmp_path: Path):
@@ -6087,14 +6495,11 @@ def test_run_with_aiagent_only_prefills_webui_images_from_uploads(monkeypatch, t
         )
     )
 
-    assert agent_real._run_with_aiagent(event, profile_home) == "done"
-    user_message = str(observed["user_message"])
-    assert "Status: not analyzed (not a WebUI upload image)." in user_message
-    assert "Status: not analyzed (not a supported image file)." in user_message
-    assert "Image path: /tmp/workspace/uploads/receipt.png" in user_message
-    assert "Status: not analyzed (outside profile workspace)." in user_message
-    assert "Status: not analyzed (not a local profile-workspace path)." in user_message
-    assert "Do not infer this image's visual contents" in user_message
+    assert (
+        agent_real._run_with_aiagent(event, profile_home)
+        == agent_real._WEBUI_VISION_UNAVAILABLE_REPLY
+    )
+    assert observed == {}
 
 
 def test_run_with_aiagent_skips_webui_image_preflight_for_ingest_source(monkeypatch, tmp_path: Path):
@@ -7356,6 +7761,188 @@ def test_build_subprocess_env_installs_kep_shims_only_for_existing_bins(monkeypa
     assert set(kep_cli_guard.kep_cli_real_bin_env_keys()).issubset(allowlist)
 
 
+def test_build_subprocess_env_meegle_guard_never_resolves_real_binary_from_inherited_shim_path(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    marker = tmp_path / "real-meegle-ran"
+    for name in ("lark-cli-authsidecar", "meegle"):
+        path = shared_bin / name
+        path.write_text(
+            f"#!/bin/sh\ntouch {marker}\n" if name == "meegle" else "#!/bin/sh\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    first = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    monkeypatch.setenv("PATH", first["PATH"])
+    second = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+
+    allowed = subprocess.run([str(shim), "auth", "status"], env=second, check=False)
+    assert allowed.returncode == 0
+    assert marker.exists()
+    assert str(shared_bin / "meegle") in shim.read_text(encoding="utf-8")
+    assert f"real_binary = {str(shim)!r}" not in shim.read_text(encoding="utf-8")
+
+
+def test_build_subprocess_env_guards_meegle_resolved_from_actual_connector_path(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    marker = tmp_path / "real-meegle-ran"
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    actual_bin = tmp_path / "local-bin"
+    actual_bin.mkdir()
+    meegle = actual_bin / "meegle"
+    meegle.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    meegle.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{actual_bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+
+    denied = subprocess.run([env["HERMES_MEEGLE_BIN"], "auth", "login"], env=env, check=False)
+    assert shim.is_file()
+    assert env["HERMES_MEEGLE_BIN"] == str(shim)
+    assert denied.returncode == 77
+    assert not marker.exists()
+
+    allowed = subprocess.run([env["HERMES_MEEGLE_BIN"], "auth", "status"], env=env, check=False)
+    assert allowed.returncode == 0
+    assert marker.exists()
+
+
+def test_build_subprocess_env_blocks_meegle_npx_oauth_without_blocking_other_npx(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    marker = tmp_path / "real-npx-ran"
+    node_bin = tmp_path / "node-bin"
+    node_bin.mkdir()
+    npx = node_bin / "npx"
+    npx.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    npx.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{node_bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim_dir = profile / "tmp" / "lark-cli-shim"
+
+    for npx_argv in (
+        ["-y", "@lark-project/meegle@1.0.19", "auth", "login"],
+        ["-y", "@lark-project/meegle@1.0.19", "-p", "login"],
+        ["-y", "@lark-project/meegle@1.0.19", "--env", "oauth"],
+        ["--package=@lark-project/meegle@1.0.19", "-c", "meegle auth"],
+        ["--package", "@lark-project/meegle@1.0.19", "-c", "meegle login"],
+        ["-p", "@lark-project/meegle@1.0.19", "-c", "meegle login"],
+    ):
+        denied = subprocess.run([str(shim_dir / "npx"), *npx_argv], env=env, check=False)
+        assert denied.returncode == 77
+        assert not marker.exists()
+
+    allowed = subprocess.run(
+        [str(shim_dir / "npx"), "-y", "unrelated-package", "--version"],
+        env=env,
+        check=False,
+    )
+    assert allowed.returncode == 0
+    assert marker.exists()
+
+
+def test_build_subprocess_env_rewrites_explicit_meegle_path_to_guard(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    profile.mkdir(parents=True)
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    marker = tmp_path / "explicit-meegle-ran"
+    explicit = tmp_path / "explicit-meegle"
+    explicit.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    explicit.chmod(0o755)
+    (profile / ".env").write_text(f"HERMES_MEEGLE_BIN={explicit}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+    denied = subprocess.run([env["HERMES_MEEGLE_BIN"], "login"], env=env, check=False)
+
+    assert env["HERMES_MEEGLE_BIN"] == str(shim)
+    assert denied.returncode == 77
+    assert not marker.exists()
+
+
+def test_build_subprocess_env_installs_deny_only_meegle_guard_when_cli_missing(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.credential_hub.readers import feishu_project
+
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setattr(feishu_project.shutil, "which", lambda *_args, **_kwargs: None)
+
+    env = agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+    shim = profile / "tmp" / "lark-cli-shim" / "meegle"
+    denied = subprocess.run([str(shim), "auth", "login"], env=env, check=False)
+    unavailable = subprocess.run([str(shim), "auth", "status"], env=env, check=False)
+
+    assert env["HERMES_MEEGLE_BIN"] == str(shim)
+    assert denied.returncode == 77
+    assert unavailable.returncode == 75
+
+
 def test_lark_cli_auth_broker_scope_starts_per_run_broker_and_closes(monkeypatch, tmp_path: Path):
     """Each AIAgent run gets a short-lived sidecar key and localhost broker."""
     from hermes_multitenancy import agent_real
@@ -8306,6 +8893,7 @@ def test_wrap_with_sandbox_falls_back_when_binary_missing(monkeypatch, tmp_path:
 def test_wrap_with_sandbox_builds_full_invocation(monkeypatch, tmp_path: Path):
     """HERMES_USE_SANDBOX=1 + policy present + binary present → full wrap."""
     import os as _os
+    import pwd
     from hermes_multitenancy import agent_real
 
     fake_policy = tmp_path / "sandbox" / "profile-default.sb"
@@ -8342,8 +8930,12 @@ def test_wrap_with_sandbox_builds_full_invocation(monkeypatch, tmp_path: Path):
         else:
             break
     for required in ("PROFILE_HOME", "SHARED_HOME", "USER_HOME",
-                     "HERMES_VENV", "HERMES_AGENT_REPO", "HERMES_MT_REPO"):
+                     "HERMES_VENV", "HERMES_AGENT_REPO", "HERMES_MT_REPO",
+                     "CODEX_BIN", "CODEX_CODE_MODE_HOST", "HARNESS_PROFILE_ENV",
+                     "HARNESS_PROFILE_USER_HOME", "HARNESS_SHARED_AUTH",
+                     "HARNESS_USER_LARK"):
         assert required in params, f"-D {required}=... missing from sandbox-exec args"
+    assert params["USER_HOME"] == pwd.getpwuid(_os.getuid()).pw_dir
 
     # Original cmd is appended verbatim at the end.
     assert wrapped[-len(cmd):] == cmd
@@ -8371,9 +8963,22 @@ def test_sandbox_policy_file_is_valid_syntax():
             "-D", "USER_HOME=/tmp/probe-user",
             "-D", "HERMES_VENV=/tmp/probe-venv",
             "-D", "HERMES_AGENT_INSTALL=/tmp/probe-install",
-            "-D", "HERMES_AGENT_REPO=/tmp/probe-agent",
-            "-D", "HERMES_MT_REPO=/tmp/probe-mt",
-            "/usr/bin/true",
+                "-D", "HERMES_AGENT_REPO=/tmp/probe-agent",
+                "-D", "HERMES_MT_REPO=/tmp/probe-mt",
+                "-D", "CODEX_BIN=/usr/bin/false",
+                "-D", "CODEX_CODE_MODE_HOST=/usr/bin/false",
+                "-D", "HARNESS_PROFILE_ENV=/tmp/no-secret/.env",
+                "-D", "HARNESS_PROFILE_AUTH=/tmp/no-secret/auth.json",
+                "-D", "HARNESS_PROFILE_UAT=/tmp/no-secret/uat",
+                "-D", "HARNESS_PROFILE_TOKENS=/tmp/no-secret/tokens",
+                "-D", "HARNESS_PROFILE_CREDENTIALS=/tmp/no-secret/credentials",
+                "-D", "HARNESS_PROFILE_USER_HOME=/tmp/no-secret/home",
+                "-D", "HARNESS_SHARED_ENV=/tmp/no-secret/shared-env",
+                "-D", "HARNESS_SHARED_AUTH=/tmp/no-secret/shared-auth",
+                "-D", "HARNESS_SHARED_UAT=/tmp/no-secret/shared-uat",
+                "-D", "HARNESS_USER_KEP=/tmp/no-secret/kep",
+                "-D", "HARNESS_USER_LARK=/tmp/no-secret/lark",
+                "/usr/bin/true",
         ],
         capture_output=True,
         text=True,
@@ -8383,6 +8988,138 @@ def test_sandbox_policy_file_is_valid_syntax():
         f"sandbox-exec rejected policy {policy}:\n"
         f"stderr: {result.stderr}\nstdout: {result.stdout}"
     )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec behavior")
+def test_macos_sandbox_can_resolve_profile_ancestor_without_listing_home(monkeypatch):
+    """A production-shaped profile is reachable without exposing its peers or home."""
+    import subprocess
+    import tempfile
+    from pathlib import Path as _P
+
+    from hermes_multitenancy import agent_real
+
+    user_home = _P.home().resolve()
+    shared_home = user_home / ".hermes"
+    profiles_home = shared_home / "profiles"
+    profiles_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+
+    with (
+        tempfile.TemporaryDirectory(prefix="sandbox-owner-", dir=profiles_home) as owner,
+        tempfile.TemporaryDirectory(prefix="sandbox-peer-", dir=profiles_home) as peer,
+        tempfile.NamedTemporaryFile(prefix=".sandbox-host-", dir=user_home) as host_file,
+    ):
+        profile = _P(owner)
+        peer_secret = _P(peer) / "secret.txt"
+        peer_secret.write_text("peer", encoding="utf-8")
+
+        def run(command):
+            return subprocess.run(
+                agent_real._wrap_with_sandbox(command, profile),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        resolve = run([
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).resolve(strict=True)",
+            str(profile),
+        ])
+        assert resolve.returncode == 0, resolve.stderr
+
+        denied = (
+            run([sys.executable, "-c", "import os; os.listdir('/Users')"]),
+            run([sys.executable, "-c", "import os,sys; os.listdir(sys.argv[1])", str(user_home)]),
+            run([
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).stat()",
+                host_file.name,
+            ]),
+            run([
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import sys; Path(sys.argv[1]).read_text()",
+                str(peer_secret),
+            ]),
+        )
+        assert all(result.returncode != 0 for result in denied)
+        assert all("Operation not permitted" in result.stderr for result in denied)
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec policy")
+def test_local_harness_sandbox_masks_profile_credentials(monkeypatch, tmp_path: Path):
+    import subprocess
+    from hermes_multitenancy import agent_real
+
+    profile = tmp_path / ".hermes" / "profiles" / "alice"
+    workspace = profile / "workspace"
+    workspace.mkdir(parents=True)
+    (profile / ".env").write_text("secret", encoding="utf-8")
+    ambient_keep = profile / "home" / ".keep"
+    ambient_keep.mkdir(parents=True)
+    (ambient_keep / ".calorie.env").write_text("ambient-secret", encoding="utf-8")
+    visible = workspace / "visible.txt"
+    visible.write_text("visible", encoding="utf-8")
+    workflow_home = workspace / "runs" / "workflow-1" / "home"
+    workflow_home.mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+
+    denied = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            ["/bin/cat", str(profile / ".env")], profile, local_harness=True
+        ),
+        capture_output=True,
+        text=True,
+    )
+    ambient_denied = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            ["/bin/cat", str(ambient_keep / ".calorie.env")],
+            profile,
+            local_harness=True,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    allowed = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            ["/bin/cat", str(visible)], profile, local_harness=True
+        ),
+        capture_output=True,
+        text=True,
+    )
+    private_home = subprocess.run(
+        agent_real._wrap_with_sandbox(
+            [
+                sys.executable,
+                "-c",
+                "import os; from pathlib import Path; "
+                "assert os.environ['HOME'] == os.environ['_HERMES_FORCE_HOME']; "
+                "p = Path('~/.config/x').expanduser(); p.parent.mkdir(parents=True); "
+                "p.write_text('private-home'); print(p.read_text())",
+            ],
+            profile,
+            local_harness=True,
+        ),
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(workflow_home),
+            "_HERMES_FORCE_HOME": str(workflow_home),
+        },
+    )
+
+    assert denied.returncode != 0
+    assert "secret" not in denied.stdout
+    assert ambient_denied.returncode != 0
+    assert "ambient-secret" not in ambient_denied.stdout
+    assert allowed.returncode == 0
+    assert allowed.stdout == "visible"
+    assert private_home.returncode == 0, private_home.stderr
+    assert private_home.stdout.strip() == "private-home"
 
 
 def test_sandbox_policy_only_allows_signalling_children():
@@ -8496,7 +9233,7 @@ def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
     linked_venv.parent.mkdir()
     linked_venv.symlink_to(real_venv, target_is_directory=True)
     cmd = [str(linked_venv / "bin" / "python"), "child.py"]
-    wrapped = agent_real._wrap_with_sandbox(cmd, profile)
+    wrapped = agent_real._wrap_with_sandbox(cmd, profile, local_harness=True)
 
     assert wrapped[0] == str(fake_bin)
     # PROFILE_HOME substitution happened.
@@ -8512,6 +9249,10 @@ def test_wrap_linux_bwrap_builds_full_invocation(monkeypatch, tmp_path: Path):
     assert any(
         wrapped[index:index + 3] == ["--ro-bind", runtime_root, runtime_root]
         for index in range(len(wrapped) - 2)
+    )
+    assert any(
+        wrapped[index:index + 2] == ["--tmpfs", str(profile.resolve() / "home")]
+        for index in range(len(wrapped) - 1)
     )
 
 
@@ -8846,6 +9587,49 @@ def test_wrap_linux_bwrap_binds_managed_skillhub_release_targets(monkeypatch, tm
     assert ("--ro-bind", str(shared / "_managed"), str(shared / "_managed")) not in triples
 
 
+def test_wrap_linux_bwrap_binds_plugin_managed_skill_targets(monkeypatch, tmp_path: Path):
+    """Expert plugin skills must resolve inside bwrap without mounting all plugin state."""
+    import os as _os
+    from hermes_multitenancy import agent_real
+
+    fake_policy = tmp_path / "bwrap.args"
+    fake_policy.write_text("--dir ${SHARED_HOME}\n--bind ${PROFILE_HOME} ${PROFILE_HOME}\n")
+    fake_bin = tmp_path / "bwrap"
+    fake_bin.write_text("#!/bin/sh\nexec \"$@\"\n")
+    _os.chmod(fake_bin, 0o755)
+
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "owner"
+    plugin_source = shared / ".hermes-plugin-managed" / ".sources" / "keep-product"
+    skill_sources = [plugin_source / "kep-ub-gen", plugin_source / "kep-ub-archive"]
+    for skill_source in skill_sources:
+        (skill_source / "scripts").mkdir(parents=True)
+        (skill_source / "references").mkdir()
+        (skill_source / "SKILL.md").write_text(f"# {skill_source.name}\n", encoding="utf-8")
+        (skill_source / "scripts" / "run.py").write_text("print('ok')\n", encoding="utf-8")
+        (skill_source / "references" / "schema.json").write_text("{}\n", encoding="utf-8")
+        skill_link = profile / "skills" / skill_source.name
+        skill_link.parent.mkdir(parents=True, exist_ok=True)
+        skill_link.symlink_to(skill_source, target_is_directory=True)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_USE_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_AGENT_REPO", str(tmp_path / "agent-repo"))
+    monkeypatch.setattr(agent_real, "_BWRAP_ARGS_FILE", fake_policy)
+    monkeypatch.setattr(agent_real, "_BWRAP_EXEC", str(fake_bin))
+
+    wrapped = agent_real._wrap_with_sandbox(["/usr/bin/python3"], profile)
+
+    triples = set(zip(wrapped, wrapped[1:], wrapped[2:]))
+    assert {("--ro-bind", str(source), str(source)) for source in skill_sources} <= triples
+    plugin_root = shared / ".hermes-plugin-managed"
+    assert ("--ro-bind", str(plugin_root), str(plugin_root)) not in triples
+    sources_root = plugin_root / ".sources"
+    assert ("--ro-bind", str(sources_root), str(sources_root)) not in triples
+    assert ("--ro-bind", str(plugin_source), str(plugin_source)) not in triples
+
+
 def test_wrap_linux_bwrap_skips_managed_skillhub_target_without_skill_md(monkeypatch, tmp_path: Path):
     """The SKILL.md existence gate applies to _managed/ targets like any other root."""
     import os as _os
@@ -9062,6 +9846,7 @@ def test_sandbox_child_gets_run_scoped_broker_token_not_master_key(monkeypatch, 
         token = env["HERMES_RUN_BROKER_KEY"]
         assert token != "master-key-shared-by-everyone"
         assert env["HERMES_MULTITENANCY_RUN_BROKER_KEY"] == token
+        assert env["HERMES_RUN_BROKER_URL"].startswith("http://127.0.0.1:")
         record = _lookup_run_broker_scoped_token(token)
         assert record is not None
         assert record["profile_name"] == "alice"
@@ -9468,3 +10253,254 @@ def test_stream_aiagent_subprocess_orphan_discard_survives_cancel_during_teardow
 
     assert "orphan_run_killed" in order, order
     assert "auth_broker_closed" in order, order
+
+
+# ── tool in flight vs. stall watchdog (prod 2026-09-03: 5-min ./oup call killed at 300s) ──
+
+
+class _StallFakeStdin:
+    def write(self, _payload):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+class _StallFakeStderr:
+    async def read(self):
+        return b""
+
+
+def _stall_fake_proc(stdout):
+    class FakeProc:
+        def __init__(self):
+            self.stdin = _StallFakeStdin()
+            self.stdout = stdout
+            self.stderr = _StallFakeStderr()
+            self.pid = 123
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    return FakeProc()
+
+
+def _stall_fast_timeout(monkeypatch, seconds: str):
+    real_getenv = os.getenv
+
+    def fast_default_timeout(name, default=None):
+        if name == "HERMES_AIAGENT_SUBPROCESS_TIMEOUT":
+            assert default == "300"
+            return seconds
+        return real_getenv(name, default)
+
+    monkeypatch.delenv("HERMES_AIAGENT_SUBPROCESS_TIMEOUT", raising=False)
+    monkeypatch.setattr(os, "getenv", fast_default_timeout)
+    monkeypatch.setenv("HERMES_AIAGENT_WAIT_HEARTBEAT_SECONDS", "0.01")
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_tool_heartbeat_keeps_run_alive(monkeypatch, tmp_path: Path):
+    """A tool that outlives the watchdog window must NOT get the turn killed while
+    the child keeps sending private tool_heartbeat lines; the heartbeat itself
+    never reaches the periphery."""
+    from hermes_multitenancy import agent_real
+
+    class FakeStdout:
+        def __init__(self):
+            self.heartbeats = 0
+            self.lines = [
+                b'{"event": "tool_started", "name": "terminal", "tool_call_id": "call-1", "session_id": "s1"}\n',
+            ]
+            self.tail = [
+                b'{"event": "tool_completed", "name": "terminal", "tool_call_id": "call-1", "session_id": "s1", "is_error": false}\n',
+                b'{"event": "content", "text": "done"}\n',
+                b'{"event": "done", "result": "done", "error": null}\n',
+            ]
+
+        async def readline(self):
+            if self.lines:
+                return self.lines.pop(0)
+            if self.heartbeats < 12:
+                # 12 gaps of 0.03s = 0.36s of "tool running" > 0.3s watchdog,
+                # with a 0.27s slack per gap so xdist load jitter cannot fire
+                # the watchdog between two heartbeats (flaked at 0.01/0.08).
+                self.heartbeats += 1
+                await asyncio.sleep(0.03)
+                return (
+                    b'{"event": "tool_heartbeat", "inflight": '
+                    b'[{"tool_call_id": "call-1", "name": "terminal", "elapsed": 1.0}]}\n'
+                )
+            if self.tail:
+                return self.tail.pop(0)
+            return b""
+
+    created = {}
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        created["proc"] = _stall_fake_proc(FakeStdout())
+        return created["proc"]
+
+    _stall_fast_timeout(monkeypatch, "0.3")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    items = [item async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path)]
+    kinds = [kind for kind, _ in items]
+
+    assert created["proc"].stdout.heartbeats == 12
+    assert created["proc"].killed is False
+    assert "tool_heartbeat" not in kinds
+    assert kinds.count("tool_started") == 1
+    assert "tool_completed" in kinds
+    assert "done" in kinds
+
+
+@pytest.mark.asyncio
+async def test_stream_aiagent_subprocess_idle_timeout_names_inflight_tool_and_closes_call(
+    monkeypatch, tmp_path: Path, caplog
+):
+    """Silence with a tool in flight: the kill names the tool, logs a WARNING,
+    and closes the dangling tool_call in state.db as TOOL_INTERRUPTED."""
+    import sqlite3
+
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    class FakeStdout:
+        def __init__(self):
+            self.calls = 0
+
+        async def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return b'{"event": "tool_started", "name": "terminal", "tool_call_id": "call-1", "session_id": "s1"}\n'
+            if self.calls == 2:
+                # A second, younger concurrent call: must ALSO be closed on kill.
+                return b'{"event": "tool_started", "name": "lark_cli", "tool_call_id": "call-2", "session_id": "s1"}\n'
+            await asyncio.sleep(60)
+            return b""
+
+    created = {}
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        created["proc"] = _stall_fake_proc(FakeStdout())
+        return created["proc"]
+
+    _stall_fast_timeout(monkeypatch, "0.02")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    seen: list = []
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(AiagentToolStallTimeout) as info:
+            async for item in agent_real._stream_aiagent_subprocess(_event(), tmp_path):
+                seen.append(item)
+
+    exc = info.value
+    assert "produced no stream events" in str(exc)
+    # The OLDEST call names the kill.
+    assert exc.tool_name == "terminal" and exc.tool_call_id == "call-1"
+    assert exc.elapsed_s is not None and exc.elapsed_s >= 0.02
+    assert "terminal" in exc.user_notice and agent_real._PARTIAL_FAILURE_NOTICE != exc.user_notice
+    assert created["proc"].killed is True
+    stall_logs = [r for r in caplog.records if "stalled and was killed" in r.getMessage()]
+    assert stall_logs and "tool=terminal" in stall_logs[0].getMessage()
+    assert "inflight=2" in stall_logs[0].getMessage()
+    assert stall_logs[0].name == "hermes_multitenancy.agent_real"
+    # The 15s wait heartbeat names the running tool + elapsed seconds in the
+    # parent log (the status event itself is an animation marker by design).
+    assert any(kind == "status" for kind, _ in seen)
+    waiting = [r.getMessage() for r in caplog.records if "waiting for AIAgent subprocess stream event" in r.getMessage()]
+    assert waiting and any("phase=工具 terminal 已运行" in m for m in waiting), waiting
+
+    rows = sqlite3.connect(tmp_path / "state.db").execute(
+        "SELECT role, tool_name, tool_call_id, content FROM messages WHERE role = 'tool' ORDER BY id"
+    ).fetchall()
+    interrupted = [(r[1], r[2]) for r in rows if "TOOL_INTERRUPTED" in (r[3] or "")]
+    assert interrupted == [("terminal", "call-1"), ("lark_cli", "call-2")], rows
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_names_stalled_tool_instead_of_generic_notice(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    stall = AiagentToolStallTimeout(300, tool_call_id="call-1", tool_name="terminal", elapsed_s=305.0)
+
+    async def stalled_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "terminal", "session_id": "s1", "tool_call_id": "call-1"})
+        yield ("content", "我来加载 skill")
+        raise stall
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stalled_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+
+    assert chunks[-1] == ("content", "\n\n" + stall.user_notice)
+    assert all(agent_real._PARTIAL_FAILURE_NOTICE not in str(chunk) for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_names_stalled_tool_even_without_preamble(monkeypatch, tmp_path: Path):
+    """Model called the tool before saying anything: the named notice must still
+    reach the user as content (not a raised exception the transports render
+    as a generic failure)."""
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    stall = AiagentToolStallTimeout(300, tool_call_id="call-1", tool_name="terminal", elapsed_s=301.0)
+
+    async def stalled_stream(*_args, **_kwargs):
+        yield ("tool_started", {"name": "terminal", "session_id": "s1", "tool_call_id": "call-1"})
+        raise stall
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stalled_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    chunks = [item async for item in agent_real.stream_run_agent(_event(), tmp_path)]
+
+    assert chunks[-1] == ("content", stall.user_notice)
+    assert all(agent_real._PARTIAL_FAILURE_NOTICE not in str(chunk) for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_stream_run_agent_stall_without_tool_or_content_still_raises(monkeypatch, tmp_path: Path):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.agent_real.streaming import AiagentToolStallTimeout
+
+    async def stalled_stream(*_args, **_kwargs):
+        raise AiagentToolStallTimeout(300)
+        yield
+
+    async def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("legacy fallback should not run")
+        yield
+
+    monkeypatch.setattr(agent_real, "_stream_aiagent_subprocess", stalled_stream)
+    monkeypatch.setattr(agent_real, "_stream_loop", fail_legacy)
+
+    with pytest.raises(AiagentToolStallTimeout):
+        async for _item in agent_real.stream_run_agent(_event(), tmp_path):
+            pass

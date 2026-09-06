@@ -190,14 +190,19 @@ def test_real_aiagent_tool_complete_seam_forwards_only_normalized_refs(
             self.kwargs = kwargs
 
         def run_conversation(self, **_kwargs):
+            tool_result = json.dumps(fixture["tool_result"])
             self.kwargs["tool_progress_callback"](
-                "tool.completed", "controlled_source_tool", duration=0.1, is_error=False
+                "tool.completed",
+                "controlled_source_tool",
+                duration=0.1,
+                is_error=False,
+                result=tool_result,
             )
             self.kwargs["tool_complete_callback"](
                 "call-1",
                 "controlled_source_tool",
                 {},
-                json.dumps(fixture["tool_result"]),
+                tool_result,
             )
             self.kwargs["stream_delta_callback"]("final answer")
             return {"final_response": "final answer"}
@@ -233,12 +238,17 @@ def test_real_aiagent_tool_complete_seam_forwards_only_normalized_refs(
 
     assert result == "final answer"
     assert events[:-1] == [
-        {
-            "event": "tool_completed",
-            "name": "controlled_source_tool",
-            "duration": 0.1,
-            "is_error": False,
-        },
+            {
+                "event": "tool_completed",
+                "session_id": "agent:profile:profile_a:platform:feishu:chat_type:dm:chat:chat-1:user:user-1",
+                "tool_call_id": "call-1",
+                "name": "controlled_source_tool",
+                "duration": 0.1,
+                "is_error": False,
+                "failure_subsystem": None,
+                "error_code": None,
+                "retryable": False,
+            },
         {"event": "content", "text": "final answer"},
     ]
     assert events[-1] == {

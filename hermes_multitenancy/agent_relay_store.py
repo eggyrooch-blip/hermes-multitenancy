@@ -91,12 +91,29 @@ CREATE TABLE IF NOT EXISTS relay_cards (
     close_reason TEXT,
     message_id TEXT,
     conversation_payload TEXT,
+    content_payload TEXT,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(token_id, idempotency_key)
 );
+CREATE TABLE IF NOT EXISTS relay_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    logger TEXT NOT NULL,
+    event TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    card_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    raw TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS relay_logs_ts ON relay_logs(ts);
 """
+
+LOG_RETENTION_MS = 30 * 86_400_000
+LOG_FIELDS = ("ts", "level", "logger", "event", "status", "actor", "card_id", "message_id", "raw")
 
 
 def _now_ms() -> int:
@@ -135,6 +152,10 @@ class RelayStore:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # 老库升级：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(relay_cards)")}
+            if "content_payload" not in cols:
+                self._conn.execute("ALTER TABLE relay_cards ADD COLUMN content_payload TEXT")
             self._conn.commit()
         self._secure_files()
 
@@ -677,6 +698,54 @@ class RelayStore:
             self._conn.commit()
         return changed == 1
 
+    def cache_card_content(self, token_id: str, message_id: str, content: dict[str, Any]) -> bool:
+        """记住这条卡片消息最后一次成功 PATCH 的内容，重复点击的 ack 靠它回放。
+
+        只在调用方 PATCH 成功之后调用 —— 于是「缓存里有内容」就等价于「内容更新过」，
+        这正是 ack 带不带卡片的判断条件。发卡原文从不入缓存：终态没回来时的重复点击
+        维持纯 toast（那条路被 2026-08-27 的实验矩阵证明是好的），此时贸然把原文
+        塞进 ack 反而可能把旧样钉进会话流。
+        """
+        now = _now_ms()
+        with self._lock:
+            changed = self._conn.execute(
+                "UPDATE relay_cards SET content_payload=?, updated_at=? "
+                "WHERE message_id=? AND token_id=?",
+                (_seal_json(content, self._key), now, message_id, token_id),
+            ).rowcount
+            self._conn.commit()
+        return changed == 1
+
+    def replay_card_content(
+        self, *, actor_id: str, card_id: str, nonce: str, message_id: str
+    ) -> dict[str, Any] | None:
+        """重复点击时 ack 里要回放的最新内容；没有可回放的就返回 None（ack 退回纯 toast）。
+
+        守卫与 action_card 一致（actor 归属、nonce、message_id 三重比对）——
+        ingest_card_action 返回 False 也可能是伪造回调，不能凭 card_id 就把内容吐出去。
+        不再要求 status=pending：重复点击发生时状态必然已经流转过了。
+        """
+        token_ids = self._token_ids_for_actor(actor_id)
+        if not token_ids:
+            return None
+        marks = ",".join("?" for _ in token_ids)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT * FROM relay_cards WHERE card_id=? AND token_id IN ({marks})",
+                (card_id, *token_ids),
+            ).fetchone()
+        if (
+            row is None
+            or not row["content_payload"]
+            or not hmac.compare_digest(str(row["nonce_hash"]), _sha(nonce))
+            or not hmac.compare_digest(str(row["message_id"] or ""), message_id)
+        ):
+            return None
+        try:
+            return _open_json(str(row["content_payload"]), self._key)
+        except Exception:
+            return None
+
     def close_reply_window(self, token_id: str, message_id: str) -> bool:
         """Expire an open reply window now so the next window is unambiguous.
 
@@ -705,6 +774,79 @@ class RelayStore:
             self._conn.commit()
         return self.card_state(token_id, card_id), changed == 1
 
+    def append_log(
+        self,
+        *,
+        ts: int,
+        level: str,
+        logger: str,
+        raw: str,
+        event: str = "",
+        status: str = "",
+        actor: str = "",
+        card_id: str = "",
+        message_id: str = "",
+    ) -> None:
+        """Persist one already-redacted log line; `raw` is the journald text verbatim."""
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO relay_logs ({','.join(LOG_FIELDS)}) "
+                f"VALUES ({','.join('?' for _ in LOG_FIELDS)})",
+                (ts, level, logger, event, status, actor, card_id, message_id, raw),
+            )
+            self._conn.commit()
+
+    def list_logs(
+        self, since: int, until: int, limit: int = 5000, after_id: int = 0
+    ) -> list[dict[str, Any]]:
+        # Keyset pagination on (ts, id): a page boundary inside one millisecond can
+        # still make progress — inclusive-ts-only continuation loops forever on ties.
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, {','.join(LOG_FIELDS)} FROM relay_logs "
+                "WHERE (ts>? OR (ts=? AND id>?)) AND ts<=? "
+                "ORDER BY ts, id LIMIT ?",
+                (since, since, after_id, until, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def usage_stats(self, since: int, until: int) -> dict[str, Any]:
+        """Message / card / people counts for one window, straight off the existing tables."""
+        # ponytail: `request_hash != ''` drops the text-fallback rows register_card_message
+        # writes for button cards — those are one card, not a second message.
+        sent = "status='sent' AND request_hash!='' AND created_at>=? AND created_at<=?"
+        made = "created_at>=? AND created_at<=?"
+        with self._lock:
+            by_kind = {
+                str(row["kind"]): int(row["n"])
+                for row in self._conn.execute(
+                    f"SELECT kind, COUNT(*) AS n FROM relay_messages WHERE {sent} GROUP BY kind",
+                    (since, until),
+                ).fetchall()
+            }
+            by_status = {
+                str(row["status"]): int(row["n"])
+                for row in self._conn.execute(
+                    f"SELECT status, COUNT(*) AS n FROM relay_cards WHERE {made} GROUP BY status",
+                    (since, until),
+                ).fetchall()
+            }
+            active = self._conn.execute(
+                "SELECT COUNT(DISTINCT actor_fingerprint) AS n FROM relay_tokens WHERE token_id IN ("
+                f"SELECT token_id FROM relay_messages WHERE {sent} "
+                f"UNION SELECT token_id FROM relay_cards WHERE {made})",
+                (since, until, since, until),
+            ).fetchone()["n"]
+            enrolled = self._conn.execute(
+                "SELECT COUNT(DISTINCT actor_fingerprint) AS n FROM relay_tokens WHERE status='active'"
+            ).fetchone()["n"]
+        return {
+            "messages": {"total": sum(by_kind.values()), "by_kind": by_kind},
+            "cards": {"total": sum(by_status.values()), "by_status": by_status},
+            "active_users": int(active),
+            "enrolled_users": int(enrolled),
+        }
+
     def prune(self, now_ms: int | None = None) -> int:
         now = _now_ms() if now_ms is None else now_ms
         with self._lock:
@@ -726,6 +868,9 @@ class RelayStore:
                 """,
                 (_seal_json({"text": ""}, self._key), now, now),
             ).rowcount
+            self._conn.execute(
+                "DELETE FROM relay_logs WHERE ts < ?", (now - LOG_RETENTION_MS,)
+            )
             self._conn.commit()
         return changed
 

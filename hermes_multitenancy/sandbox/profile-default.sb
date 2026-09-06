@@ -30,6 +30,8 @@
 ;;;   HERMES_AGENT_REPO — hermes-agent main repo (gateway/, tools/,
 ;;;                     hermes_cli/ source).
 ;;;   HERMES_MT_REPO  — hermes-multitenancy plugin source.
+;;;   CODEX_BIN       — resolved Codex CLI executable for app-server runs.
+;;;   CODEX_CODE_MODE_HOST — version-matched Codex code-mode helper executable.
 ;;;
 ;;; If a parameter is undefined at sandbox-exec spawn time, sandbox-exec
 ;;; refuses to start (visible error). Don't make any of these optional.
@@ -67,7 +69,9 @@
     ;; sandbox-exec checks the *resolved* binary path before allowing
     ;; exec. Without this rule sandboxed spawn fails with
     ;; "Operation not permitted" on execvp() (gateway 13:59-14:12 logs).
-    (subpath (string-append (param "USER_HOME") "/.local/share/uv")))
+    (subpath (string-append (param "USER_HOME") "/.local/share/uv"))
+    (subpath (param "CODEX_BIN"))
+    (subpath (param "CODEX_CODE_MODE_HOST")))
 
 ;; The agent must be able to terminate child tools it spawned when a
 ;; subprocess timeout fires (for example lark-cli-authsidecar). Limiting this
@@ -100,6 +104,8 @@
     (subpath (param "HERMES_AGENT_INSTALL"))
     (subpath (param "HERMES_AGENT_REPO"))
     (subpath (param "HERMES_MT_REPO"))
+    (subpath (param "CODEX_BIN"))
+    (subpath (param "CODEX_CODE_MODE_HOST"))
     (subpath "/opt/homebrew")
     (subpath (string-append (param "SHARED_HOME") "/browser-browsers"))
     ;; uv-managed Python install (venv/bin/python is a symlink into here).
@@ -109,6 +115,13 @@
 
 ;; ── Host home: ONLY the specific dotdirs host CLI tools need ──────────
 ;;
+;; Path.resolve() must stat the two ancestors before reaching PROFILE_HOME.
+;; Exact metadata grants permit traversal only; they do not permit listing or
+;; reading files from the host home.
+(allow file-read-metadata
+    (literal "/Users")
+    (literal (param "USER_HOME")))
+
 ;; These are READ-ONLY for the sandboxed subprocess. kep-cli still
 ;; *writes* tokens via its own non-sandboxed login flow (the user runs
 ;; ``kep-auth login`` in their normal shell, not from inside an AIAgent
@@ -164,7 +177,7 @@
 ;; Audio cache directory for tts_tool — read AND write because hermes
 ;; populates it at runtime. Verified necessary during sandbox e2e
 ;; probe: ``Could not import tool module tools.tts_tool: [Errno 1]
-;; Operation not permitted: '/Users/dev/.hermes/audio_cache'``.
+;; Operation not permitted: '/Users/hermes/.hermes/audio_cache'``.
 (allow file-read* file-write*
     (subpath (string-append (param "SHARED_HOME") "/audio_cache")))
 
@@ -203,6 +216,11 @@
     (subpath "/private/tmp")
     (subpath "/private/var/folders"))
 
+;; Path.resolve() stats the /private ancestor before reaching the allowed temp
+;; subtree. Directory metadata alone permits traversal, not file contents.
+(allow file-read-metadata
+    (literal "/private"))
+
 ;; ── Network — outbound HTTPS / HTTP only ──────────────────────────────
 ;;
 ;; Default policy is "deny network" but with explicit allowance for the
@@ -231,7 +249,7 @@
 (allow network-bind (local udp "localhost:*"))
 
 ;; Intranet egress — explicitly denied. Skills should not be able to
-;; reach 10.0.0.249 (Keep production) or any office subnet from inside
+;; reach 192.0.2.249 (Keep production) or any office subnet from inside
 ;; the sandbox. If a legitimate use case shows up, lift this surgically
 ;; under the "trusted" policy variant, not in the default.
 ;;
@@ -243,6 +261,22 @@
 ;;
 ;; TODO: pair this policy with an outbound HTTP client interceptor that
 ;; rejects RFC1918 destinations unless HERMES_ALLOW_INTRANET=1.
+
+;; Local Harness runs pass real credential paths for these parameters; normal
+;; runs pass a nonexistent sentinel. Kept last so these denies override the
+;; broad routed-profile compatibility allows above.
+(deny file-read* file-write*
+    (literal (param "HARNESS_PROFILE_ENV"))
+    (literal (param "HARNESS_PROFILE_AUTH"))
+    (subpath (param "HARNESS_PROFILE_UAT"))
+    (subpath (param "HARNESS_PROFILE_TOKENS"))
+    (subpath (param "HARNESS_PROFILE_CREDENTIALS"))
+    (subpath (param "HARNESS_PROFILE_USER_HOME"))
+    (literal (param "HARNESS_SHARED_ENV"))
+    (literal (param "HARNESS_SHARED_AUTH"))
+    (subpath (param "HARNESS_SHARED_UAT"))
+    (subpath (param "HARNESS_USER_KEP"))
+    (subpath (param "HARNESS_USER_LARK")))
 
 ;; ── Diagnostics: log denied operations to syslog ──────────────────────
 ;;

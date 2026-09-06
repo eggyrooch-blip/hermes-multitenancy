@@ -224,10 +224,9 @@ def test_plugin_install_approved_installs_for_authorized_profiles_only(tmp_path:
 
     assert result["action"] == "plugin_install"
     assert result["plugin_id"] == PLUGIN_ID
-    assert result["users"] == {
-        "alice-ldap": {"status": "resolved", "profile": "alice"},
-        "bob-ldap": {"status": "resolved", "profile": "bob"},
-    }
+    assert len(result["users"]) == 2
+    assert all(row == {"status": "resolved"} for row in result["users"].values())
+    assert "alice-ldap" not in result["users"]
     managed = _managed_manifest(shared_home)
     assert managed["audience"]["profiles"] == ["alice", "bob", "sunke"]
     assert Path(str(managed["repo"])) == shared_home / "_managed" / "aidock-skillhub-plugin" / PLUGIN_ID / PLUGIN_VERSION
@@ -387,6 +386,258 @@ def test_plugin_new_release_same_inner_version_refreshes_content(tmp_path: Path)
     duplicate_manifest = _managed_manifest(shared_home)
     assert Path(str(duplicate_manifest["repo"])).name == "1.0.1-r168"
     assert duplicate_manifest["release_installed_at"] == installed_at
+
+
+def test_active_namespaced_plugin_upgrade_uses_private_sources_for_health(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "owner", "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    pi.ingest(
+        _plugin_repo(tmp_path / "owner-plugin", plugin_id="owner-plugin"),
+        audience="owner",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        activate=True,
+    )
+    process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(with_expert=True),
+    )
+
+    result = process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.1", release_id="101"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(content_tag="RELEASE-101", with_expert=True),
+    )
+
+    assert result["action"] == "plugin_install"
+    manifest = _managed_manifest(shared_home)
+    assert manifest["release_version"] == "1.0.1"
+    private_root = shared_home / pi.MANAGED_DIR / ".sources" / PLUGIN_ID
+    for profile in ("alice", "sunke"):
+        assert expert_overlay.resolve_expert(
+            profiles_root / profile,
+            "kep-trevi-resource-delivery-expert",
+        ) is not None
+        for name in PLUGIN_SKILLS:
+            target = profiles_root / profile / "skills" / name
+            assert target.resolve() == (private_root / name).resolve()
+            assert "RELEASE-101" in (target / "SKILL.md").read_text(encoding="utf-8")
+
+    for name in PLUGIN_SKILLS:
+        target = profiles_root / "alice" / "skills" / name
+        target.unlink()
+        target.symlink_to(shared_home / "skills" / name)
+    monkeypatch.setattr(pi, "install_shared_skill_for_profile", lambda **_kwargs: None)
+    with pytest.raises(SkillhubInstallError, match="health check failed"):
+        process_event(
+            _plugin_event(users=["alice-ldap"], version="1.0.2", release_id="102"),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(content_tag="RELEASE-102", with_expert=True),
+        )
+
+
+def test_plugin_health_accepts_foreign_collision_not_recorded_as_owned(tmp_path: Path) -> None:
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.skillhub_installer import process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob", "outsider")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    owner_repo = _plugin_repo(tmp_path / "owner-plugin", plugin_id="owner-plugin")
+    pi.ingest(
+        owner_repo,
+        audience="sunke",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        activate=True,
+    )
+    old_targets = {
+        name: (profiles_root / "sunke" / "skills" / name).resolve()
+        for name in PLUGIN_SKILLS
+    }
+
+    process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(with_expert=True),
+    )
+    result = process_event(
+        _plugin_event(
+            event_type="skill.permission_approved",
+            users=["bob-ldap"],
+            download_url=None,
+            version="1.0.0",
+            release_id="100",
+        ),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+    )
+
+    assert result["action"] == "plugin_install"
+    manifest = _managed_manifest(shared_home)
+    assert set(manifest["audience"]["profiles"]) == {"alice", "bob", "sunke"}
+    assert "sunke" not in manifest["owned_skills"]
+    assert all(
+        (profiles_root / "sunke" / "skills" / name).resolve() == old_targets[name]
+        for name in PLUGIN_SKILLS
+    )
+    assert expert_overlay.resolve_expert(
+        profiles_root / "sunke", "kep-trevi-resource-delivery-expert"
+    ) is not None
+    assert expert_overlay.resolve_expert(
+        profiles_root / "outsider", "kep-trevi-resource-delivery-expert"
+    ) is None
+
+
+def test_failed_namespaced_upgrade_restores_private_sources(tmp_path: Path, monkeypatch) -> None:
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "owner", "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    pi.ingest(
+        _plugin_repo(tmp_path / "owner-plugin", plugin_id="owner-plugin"),
+        audience="owner",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        activate=True,
+    )
+    process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(with_expert=True),
+    )
+    private_root = shared_home / pi.MANAGED_DIR / ".sources" / PLUGIN_ID
+    before = {
+        "manifest": _managed_manifest(shared_home),
+        "shared": _tree_snapshot(shared_home / "skills"),
+        "private": _tree_snapshot(private_root),
+        "alice": _tree_snapshot(profiles_root / "alice" / "skills"),
+        "sunke": _tree_snapshot(profiles_root / "sunke" / "skills"),
+    }
+
+    monkeypatch.setattr(expert_overlay, "list_experts", lambda *_args, **_kwargs: [])
+    with pytest.raises(SkillhubInstallError, match="plugin health check failed"):
+        process_event(
+            _plugin_event(users=["alice-ldap"], version="1.0.1", release_id="101"),
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: _plugin_zip(content_tag="RELEASE-101", with_expert=True),
+        )
+
+    assert _managed_manifest(shared_home) == before["manifest"]
+    assert _tree_snapshot(shared_home / "skills") == before["shared"]
+    assert _tree_snapshot(private_root) == before["private"]
+    assert _tree_snapshot(profiles_root / "alice" / "skills") == before["alice"]
+    assert _tree_snapshot(profiles_root / "sunke" / "skills") == before["sunke"]
+
+
+def test_cached_verified_release_retries_active_upgrade(tmp_path: Path, monkeypatch) -> None:
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "owner", "alice")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice")])
+    pi.ingest(
+        _plugin_repo(tmp_path / "owner-plugin", plugin_id="owner-plugin"),
+        audience="owner",
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        activate=True,
+    )
+    process_event(
+        _plugin_event(users=["alice-ldap"], version="1.0.0", release_id="100"),
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(with_expert=True),
+    )
+    event = _plugin_event(users=["alice-ldap"], version="1.0.1", release_id="101")
+    package = _plugin_zip(content_tag="RELEASE-101", with_expert=True)
+    original_list = expert_overlay.list_experts
+    monkeypatch.setattr(expert_overlay, "list_experts", lambda *_args, **_kwargs: [])
+    with pytest.raises(SkillhubInstallError, match="plugin health check failed"):
+        process_event(
+            event,
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: package,
+        )
+    monkeypatch.setattr(expert_overlay, "list_experts", original_list)
+
+    result = process_event(
+        event,
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: package,
+    )
+
+    assert result["action"] == "plugin_install"
+    assert _managed_manifest(shared_home)["release_version"] == "1.0.1"
+    private_root = shared_home / pi.MANAGED_DIR / ".sources" / PLUGIN_ID
+    assert "RELEASE-101" in (
+        profiles_root / "alice" / "skills" / PLUGIN_SKILLS[0] / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert (profiles_root / "alice" / "skills" / PLUGIN_SKILLS[0]).resolve() == (
+        private_root / PLUGIN_SKILLS[0]
+    ).resolve()
+    assert "RELEASE-101" not in (
+        shared_home / "skills" / PLUGIN_SKILLS[0] / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_plugin_audience_identifiers_must_bind_to_one_route_before_writes(tmp_path: Path) -> None:
+    from hermes_multitenancy.skillhub_installer import SkillhubInstallError, process_event
+
+    shared_home = tmp_path / ".hermes"
+    profiles_root = _make_profile_dirs(shared_home, "alice", "bob")
+    _seed_routing_db(shared_home, [("alice-ldap", "alice"), ("bob-ldap", "bob")])
+    event = _plugin_event(users=[])
+    event["audience"]["users"] = [
+        {"profile_id": "alice-ldap", "open_id": "ou_bob-ldap"}
+    ]
+    before = _tree_snapshot(profiles_root)
+
+    with pytest.raises(SkillhubInstallError) as exc:
+        process_event(
+            event,
+            shared_home=shared_home,
+            profiles_root=profiles_root,
+            downloader=lambda _: pytest.fail("identity must fail before download"),
+        )
+
+    assert exc.value.error_code == "AUDIENCE_IDENTITY_INVALID"
+    assert not (shared_home / pi.MANAGED_DIR / f"{PLUGIN_ID}.json").exists()
+    assert not (shared_home / pi.MANAGED_DIR / ".sources" / PLUGIN_ID).exists()
+    assert _tree_snapshot(profiles_root) == before
+
+    valid = _plugin_event(users=[])
+    valid["audience"]["users"] = [
+        {
+            "profile_id": "alice-ldap",
+            "employee_id": "alice-ldap",
+            "open_id": "ou_alice-ldap",
+        }
+    ]
+    assert process_event(
+        valid,
+        shared_home=shared_home,
+        profiles_root=profiles_root,
+        downloader=lambda _: _plugin_zip(),
+    )["action"] == "plugin_install"
 
 
 def test_failed_plugin_upgrade_keeps_previous_expert_active(
@@ -1142,7 +1393,8 @@ def test_plugin_permission_approved_uses_cached_repo_and_keeps_existing_audience
     managed = _managed_manifest(shared_home)
     assert result["action"] == "plugin_install"
     assert result["mode"] == "from_existing"
-    assert result["users"] == {"bob-ldap": {"status": "resolved", "profile": "bob"}}
+    assert list(result["users"].values()) == [{"status": "resolved"}]
+    assert "bob-ldap" not in result["users"]
     assert set(managed["audience"]["profiles"]) == {"alice", "bob", "sunke"}
     assert (profiles_root / "alice" / "skills" / "kep-halo-cli").exists()
     assert (profiles_root / "bob" / "skills" / "kep-halo-cli").exists()

@@ -1,8 +1,8 @@
 .PHONY: test skills-uat skills-uat-strict
 
 HERMES_SKILLS_UAT_EVIDENCE_DIR ?= /tmp/hermes-skills-uat
-HERMES_REAL_HOME ?= /Users/dev/.hermes
-HERMES_OBSIDIAN_VAULT ?= /Users/dev/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain
+HERMES_REAL_HOME ?= /Users/hermes/.hermes
+HERMES_OBSIDIAN_VAULT ?= /Users/hermes/Library/Mobile Documents/iCloud~md~obsidian/Documents/My-Second-Brain
 HERMES_FEEDBACK_TRANSCRIPT ?= $(HERMES_SKILLS_UAT_EVIDENCE_DIR)/current-production-feedback.txt
 HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_SOURCE ?=
 HERMES_HISTORICAL_FEEDBACK_IMAGE_REJECTION_LABEL ?= Image \#1

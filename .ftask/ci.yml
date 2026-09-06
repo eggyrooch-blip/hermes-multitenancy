@@ -1,0 +1,225 @@
+# hermes-multitenancy 分层 CI manifest（ftask ci sync 渲染 → ../hermes-ci-gates/gates/multitenancy.yml）
+# 语义：MR 只跑受改动影响的模块（按 import graph 的闭包选），全量只在 nightly schedule；
+# 改到 shared_paths 跑全部模块；改到没有模块认领的文件走 unmapped 审计（fail-open，nightly 兜底）。
+header: |
+  # ══════════════════════════════════════════════════════════════════════════════
+  # hermes-multitenancy 的合并门禁 —— 由 hermes-multitenancy/.ftask/ci.yml 经
+  # `ftask ci sync` 渲染，手改会被下次 sync 覆盖。故意放在另一个项目里：
+  # ci_config_path 指向自己无效（MR 能改自己分支上的门）。
+  # 2026-09-02 起分层：MR 只跑受影响模块（Python import graph），全量归 nightly schedule。
+  # ══════════════════════════════════════════════════════════════════════════════
+output: "../hermes-ci-gates/gates/multitenancy.yml"
+image: "hermes-ci-test:20260902-02"
+tags:
+  - "hermes"
+timeout: "10m"
+setup:
+  - "node --version && /usr/bin/python3 --version && uv --version && git --version && sqlite3 --version"
+  - "chown -R ci \"$CI_PROJECT_DIR\""
+variables:
+  GIT_STRATEGY: "clone"
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
+cache:
+  key: "uv-cache-v1"
+  when: "always"
+  paths:
+    - ".uv-cache"
+after_script:
+  - "uv cache prune"
+docs_paths:
+  - "**/*.md"
+  - "docs/**/*"
+  - "examples/**/*"
+shared_paths:
+  - "tests/conftest.py"
+  - "pytest.ini"
+  - "pyproject.toml"
+  - "uv.lock"
+  - "scripts/run_tests.sh"
+graph:
+  max_patterns: 300
+quick:
+  cmd: "uv run --extra test python -m compileall -q hermes_multitenancy tests"
+modules:
+  feishu:
+    roots:
+      - "tests/test_feishu_*.py"
+      - "tests/test_lark_*.py"
+      - "tests/test_larkcli_*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  card:
+    roots:
+      - "tests/test_card*.py"
+      - "tests/test_push_*.py"
+      - "tests/test_group_*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  connector:
+    roots:
+      - "tests/test_connector*.py"
+      - "tests/test_credential*.py"
+      - "tests/test_credhub_*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  cron:
+    roots:
+      - "tests/test_cron*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  plugins:
+    roots:
+      - "tests/test_skillhub*.py"
+      - "tests/test_skills_*.py"
+      - "tests/test_skill_*.py"
+      - "tests/test_expert*.py"
+      - "tests/test_plugin*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  agent:
+    roots:
+      - "tests/test_codex*.py"
+      - "tests/test_harness*.py"
+      - "tests/test_aiagent*.py"
+      - "tests/test_agent*.py"
+      - "tests/test_run_*.py"
+      - "tests/test_executor*.py"
+      - "tests/test_turn_*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  billing:
+    roots:
+      - "tests/test_billing*.py"
+      - "tests/test_token*.py"
+      - "tests/test_budget*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  webui:
+    roots:
+      - "tests/test_webui*.py"
+      - "tests/test_session*.py"
+      - "tests/test_sessions*.py"
+      - "tests/test_stream*.py"
+      - "tests/test_console*.py"
+      - "tests/test_browser*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  release:
+    roots:
+      - "tests/test_release*.py"
+      - "tests/test_prod_*.py"
+      - "tests/test_deploy*.py"
+      - "tests/test_gitlab*.py"
+      - "tests/test_make*.py"
+      - "tests/test_finalize*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+  core:
+    rest_of: "tests/test_*.py"
+    cmd: "scripts/run_tests.sh {roots}"
+full:
+  cmd:
+    - "scripts/run_tests.sh"
+extra_jobs: |
+  # policy / leak: same logic as the hand-written gate (rationale lives in hermes-ci-gates history)
+  policy:
+    cache: []
+    stage: test
+    image:
+      name: docker.io/alpine/git:v2.45.2
+      entrypoint: [""]
+    variables:
+      GIT_DEPTH: "0"
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    script:
+      - |
+        git config --global --add safe.directory "$CI_PROJECT_DIR"
+        SRC="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}"
+        BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+        if [ -z "$BASE" ]; then
+          TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-main}"
+          git fetch -q origin "refs/heads/$TARGET" || true
+          BASE=$(git merge-base FETCH_HEAD "$SRC" 2>/dev/null || true)
+        fi
+        if [ -z "$BASE" ] || [ -z "$SRC" ]; then
+          echo "policy: cannot determine diff range (base='$BASE' src='$SRC') — refusing"
+          exit 1
+        fi
+        changed=$(git diff --name-only "$BASE" "$SRC" -- \
+          .gitlab-ci.yml .gitleaks.toml .gitleaksignore .ftask/ci.yml .ftask/ci.lock.yml)
+        test -z "$changed" || { echo "Protected CI policy changed:"; echo "$changed"; exit 1; }
+
+  leak:
+    cache: []
+    stage: test
+    variables:
+      GIT_DEPTH: "0"
+      GIT_STRATEGY: clone
+      GIT_NO_REPLACE_OBJECTS: "1"
+    image:
+      name: docker.io/zricethezav/gitleaks:latest
+      entrypoint: [""]
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      - if: $CI_COMMIT_BRANCH == "main"
+    script:
+      - |
+        set -eu
+        if [ "${CI_PIPELINE_SOURCE:-}" != "merge_request_event" ]; then
+          echo "leak: full-history scan of $CI_COMMIT_SHA (not a merge request)"
+          gitleaks detect --source . --config .gitleaks.toml --no-banner --redact --verbose \
+            --log-opts="$CI_COMMIT_SHA"
+          exit 0
+        fi
+        SRC="${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-${CI_COMMIT_SHA:-}}"
+        TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-main}"
+        git fetch -q origin "refs/heads/$TARGET" || {
+          echo "leak: cannot fetch target branch '$TARGET' — refusing"
+          exit 1
+        }
+        TARGET_SHA="$(git rev-parse FETCH_HEAD 2>/dev/null || true)"
+        BASE="${CI_MERGE_REQUEST_DIFF_BASE_SHA:-}"
+        if [ -z "$BASE" ]; then
+          BASE="$(git merge-base "$TARGET_SHA" "$SRC" 2>/dev/null || true)"
+        fi
+        if [ -z "$BASE" ] || [ -z "$SRC" ]; then
+          echo "leak: cannot determine diff range (base='$BASE' src='$SRC') — refusing"
+          exit 1
+        fi
+        for _ref in "$BASE" "$SRC" "$TARGET_SHA"; do
+          git cat-file -e "${_ref}^{commit}" 2>/dev/null || {
+            echo "leak: '$_ref' is not a commit in this clone — refusing"
+            exit 1
+          }
+        done
+        git merge-base --is-ancestor "$BASE" "$SRC" 2>/dev/null || {
+          echo "leak: base '$BASE' is not an ancestor of '$SRC' — range unusable, refusing"
+          exit 1
+        }
+        COUNT="$(git rev-list --count "$BASE..$SRC")"
+        if [ "$COUNT" = "0" ]; then
+          echo "leak: $BASE..$SRC is empty — this MR adds no commits; nothing to scan"
+        else
+          echo "leak: scanning $BASE..$SRC ($COUNT commit(s) — this MR's own only)"
+          gitleaks detect --source . --config .gitleaks.toml --no-banner --redact --verbose \
+            --log-opts "$BASE..$SRC"
+        fi
+        MERGE_RC=0
+        MERGE_OUT="$(git merge-tree --write-tree "$TARGET_SHA" "$SRC" 2>&1)" || MERGE_RC=$?
+        MERGED_TREE="$(printf '%s\n' "$MERGE_OUT" | head -n1)"
+        if ! git cat-file -e "${MERGED_TREE}^{tree}" 2>/dev/null; then
+          echo "leak: cannot compute a merge result for '$TARGET_SHA' + '$SRC' — refusing"
+          printf '%s\n' "$MERGE_OUT" | head -n 5
+          exit 1
+        fi
+        if [ "$MERGE_RC" != "0" ]; then
+          echo "leak: this MR conflicts with '$TARGET' — there is no mergeable result to scan."
+          echo "leak: rebase onto '$TARGET' and re-run. This is NOT a secret finding."
+          exit 1
+        fi
+        TREE_DIR="$(mktemp -d)"
+        mkdir "$TREE_DIR/target" "$TREE_DIR/merged"
+        GIT_INDEX_FILE="$TREE_DIR/target.index" git read-tree "$TARGET_SHA"
+        GIT_INDEX_FILE="$TREE_DIR/target.index" git checkout-index --all --prefix="$TREE_DIR/target/"
+        GIT_INDEX_FILE="$TREE_DIR/merged.index" git read-tree "$MERGED_TREE"
+        GIT_INDEX_FILE="$TREE_DIR/merged.index" git checkout-index --all --prefix="$TREE_DIR/merged/"
+        (cd "$TREE_DIR/target" && gitleaks detect --no-git --source . \
+          --config "$CI_PROJECT_DIR/.gitleaks.toml" --exit-code 0 --no-banner --redact \
+          --report-format json --report-path "$TREE_DIR/baseline.json")
+        (cd "$TREE_DIR/merged" && gitleaks detect --no-git --source . \
+          --config "$CI_PROJECT_DIR/.gitleaks.toml" --baseline-path "$TREE_DIR/baseline.json" \
+          --no-banner --redact --verbose)

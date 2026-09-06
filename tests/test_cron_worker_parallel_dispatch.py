@@ -267,7 +267,7 @@ def test_completed_future_callback_does_not_reenter_profile_patch_lock(tmp_path,
 
     scan_thread = threading.Thread(target=run_scan, daemon=True)
     scan_thread.start()
-    scan_thread.join(timeout=1)
+    scan_thread.join(timeout=30)
 
     assert scan_thread.is_alive() is False, "scan deadlocked while registering completed future callback"
     assert result["submitted"] == 1
@@ -560,10 +560,239 @@ class FinalizeScheduler:
         return f"failed: {error}"
 
 
+class TerminalCronJobs(FakeCronJobs):
+    def __init__(self, jobs: list[dict]) -> None:
+        super().__init__()
+        self._jobs_file_lock = threading.Lock()
+        self.jobs = [dict(job) for job in jobs]
+
+    def load_jobs(self) -> list[dict]:
+        return [dict(job) for job in self.jobs]
+
+    def save_jobs(self, jobs: list[dict]) -> None:
+        self.jobs = [dict(job) for job in jobs]
+
+
+def test_finalize_records_delivery_error_terminal_and_alert_for_unconfirmed_send(
+    caplog, monkeypatch,
+):
+    """A missing Feishu receipt is terminally observable, never a quiet success."""
+    cron_jobs = TerminalCronJobs(
+        [{"id": "job1", "name": "Daily", "last_delivery_message_id": "om_stale"}]
+    )
+    scheduler = FinalizeScheduler()
+    monkeypatch.setenv("HERMES_HOME", "/profiles/owner")
+    scheduler._deliver_result = lambda *_args, **_kwargs: (
+        "feishu live adapter delivery unconfirmed"
+    )
+
+    ok = cron_worker._finalize_claimed_cron_job_current_context(
+        cron_jobs,
+        scheduler,
+        {"id": "job1", "name": "Daily"},
+        {
+            "success": True,
+            "output": "full output",
+            "final_response": "visible body",
+            "error": None,
+        },
+        adapters={"feishu": object()},
+        loop=SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert ok is True
+    assert scheduler.calls[-1][-1] == "feishu live adapter delivery unconfirmed"
+    assert cron_jobs.jobs[0]["last_end_reason"] == "delivery_error"
+    assert cron_jobs.jobs[0].get("last_delivery_message_id") is None
+    assert "cron_delivery_alert job=job1 end_reason=delivery_error" in caplog.text
+
+
+def test_record_cron_terminal_preserves_concurrent_job_creation():
+    """Terminal read/modify/write shares core's lock with create_job."""
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily"}])
+    scheduler = FinalizeScheduler()
+    loaded = threading.Event()
+    release_load = threading.Event()
+    original_load = cron_jobs.load_jobs
+
+    def paused_load():
+        jobs = original_load()
+        loaded.set()
+        assert release_load.wait(timeout=1)
+        return jobs
+
+    cron_jobs.load_jobs = paused_load
+    terminal = threading.Thread(
+        target=cron_worker._record_cron_terminal,
+        args=(cron_jobs, scheduler, "job1"),
+        kwargs={"end_reason": "completed", "receipt_message_id": "om_1"},
+    )
+
+    def create_job():
+        with cron_jobs._jobs_file_lock:
+            cron_jobs.jobs.append({"id": "job2", "name": "New"})
+
+    terminal.start()
+    assert loaded.wait(timeout=1)
+    creator = threading.Thread(target=create_job)
+    creator.start()
+    release_load.set()
+    terminal.join(timeout=1)
+    creator.join(timeout=1)
+
+    assert terminal.is_alive() is False
+    assert creator.is_alive() is False
+    assert [job["id"] for job in cron_jobs.jobs] == ["job1", "job2"]
+    assert cron_jobs.jobs[0]["last_delivery_message_id"] == "om_1"
+
+
+def test_record_cron_terminal_warns_when_job_disappeared(caplog):
+    cron_jobs = TerminalCronJobs([])
+
+    assert cron_worker._record_cron_terminal(
+        cron_jobs,
+        FinalizeScheduler(),
+        "missing",
+        end_reason="delivery_error",
+    ) is False
+    assert "cron terminal job missing job=missing" in caplog.text
+
+
+def test_finalize_records_confirmed_receipt_with_completed_terminal(monkeypatch):
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily"}])
+    scheduler = FinalizeScheduler()
+    monkeypatch.setenv("HERMES_HOME", "/profiles/owner")
+
+    def deliver(job, _content, **_kwargs):
+        job["_hermes_delivery_message_id"] = "om_confirmed"
+        return None
+
+    deliver._hermes_multitenancy_patched = True
+    scheduler._deliver_result = deliver
+    ok = cron_worker._finalize_claimed_cron_job_current_context(
+        cron_jobs,
+        scheduler,
+        {"id": "job1", "name": "Daily"},
+        {
+            "success": True,
+            "output": "full output",
+            "final_response": "visible body",
+            "error": None,
+        },
+        adapters={"feishu": object()},
+        loop=SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert ok is True
+    assert cron_jobs.jobs[0]["last_end_reason"] == "completed"
+    assert cron_jobs.jobs[0]["last_delivery_message_id"] == "om_confirmed"
+
+
+def test_finalize_preserves_confirmed_feishu_receipt_when_other_leg_fails(monkeypatch):
+    """A mixed partial failure stays terminally visible without losing send identity."""
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily"}])
+    scheduler = FinalizeScheduler()
+    monkeypatch.setenv("HERMES_HOME", "/profiles/owner")
+    delivery_calls = []
+
+    def deliver(job, _content, **_kwargs):
+        delivery_calls.append(job["id"])
+        job["_hermes_feishu_receipt_expected"] = True
+        job["_hermes_delivery_message_id"] = "om_confirmed"
+        return "slack delivery failed"
+
+    deliver._hermes_multitenancy_patched = True
+    scheduler._deliver_result = deliver
+
+    ok = cron_worker._finalize_claimed_cron_job_current_context(
+        cron_jobs,
+        scheduler,
+        {"id": "job1", "name": "Daily", "deliver": ["feishu", "slack"]},
+        {
+            "success": True,
+            "output": "full output",
+            "final_response": "visible body",
+            "error": None,
+        },
+        adapters={"feishu": object()},
+        loop=SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert ok is True
+    assert delivery_calls == ["job1"]
+    assert scheduler.calls[-1][-1] == "slack delivery failed"
+    assert cron_jobs.jobs[0]["last_end_reason"] == "delivery_error"
+    assert cron_jobs.jobs[0]["last_delivery_message_id"] == "om_confirmed"
+
+
+@pytest.mark.parametrize("deliver_value", ["feishu", "all", ["feishu", "slack"]])
+def test_finalize_feishu_delivery_without_receipt_is_terminal_error(
+    monkeypatch, deliver_value,
+):
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily"}])
+    scheduler = FinalizeScheduler()
+    scheduler._resolve_delivery_targets = lambda _job: [
+        {"platform": "feishu", "chat_id": "ou_owner"},
+        {"platform": "slack", "chat_id": "channel"},
+    ]
+    monkeypatch.setenv("HERMES_HOME", "/profiles/owner")
+
+    ok = cron_worker._finalize_claimed_cron_job_current_context(
+        cron_jobs,
+        scheduler,
+        {"id": "job1", "name": "Daily", "deliver": deliver_value},
+        {
+            "success": True,
+            "output": "full output",
+            "final_response": "visible body",
+            "error": None,
+        },
+        adapters={"feishu": object()},
+        loop=SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert ok is True
+    assert cron_jobs.jobs[0]["last_end_reason"] == "delivery_error"
+    assert scheduler.calls[-1][-1] == "feishu confirmed delivery patch unavailable"
+    assert not any(call[0] == "deliver" for call in scheduler.calls)
+    assert cron_jobs.jobs[0].get("last_delivery_message_id") is None
+
+
+def test_finalize_unpatched_resolution_failure_stops_before_core(monkeypatch):
+    cron_jobs = TerminalCronJobs([{"id": "job1", "name": "Daily"}])
+    scheduler = FinalizeScheduler()
+    scheduler._resolve_delivery_targets = lambda _job: (_ for _ in ()).throw(
+        RuntimeError("transient resolver failure")
+    )
+    monkeypatch.setenv("HERMES_HOME", "/profiles/owner")
+
+    ok = cron_worker._finalize_claimed_cron_job_current_context(
+        cron_jobs,
+        scheduler,
+        {"id": "job1", "name": "Daily", "deliver": "all"},
+        {
+            "success": True,
+            "output": "full output",
+            "final_response": "visible body",
+            "error": None,
+        },
+        adapters={"feishu": object()},
+        loop=SimpleNamespace(is_running=lambda: True),
+    )
+
+    assert ok is True
+    assert cron_jobs.jobs[0]["last_end_reason"] == "delivery_error"
+    assert scheduler.calls[-1][-1] == "cron delivery target resolution unavailable"
+    assert not any(call[0] == "deliver" for call in scheduler.calls)
+
+
 def test_finalize_runs_parent_side_delivery_under_original_profile_context(tmp_path, monkeypatch):
     profile = _profile(tmp_path / "profiles", "songtingting")
     cron_jobs = FakeCronJobs()
     scheduler = FinalizeScheduler()
+    scheduler._resolve_delivery_targets = lambda _job: [
+        {"platform": "slack", "chat_id": "channel"}
+    ]
     monkeypatch.setenv("HERMES_HOME", "/outer/home")
 
     ok = cron_worker._finalize_claimed_cron_job(

@@ -225,6 +225,38 @@ class CredentialStore:
     def close(self) -> None:
         self._conn.close()
 
+    def payload_value_is_unique(
+        self,
+        *,
+        provider: str,
+        secret_kind: str,
+        field: str,
+        value: str,
+        owner_profile: str,
+        owner_subject: str,
+    ) -> bool:
+        """Check one encrypted upstream identity is not active for another owner."""
+        provider = _clean_id("provider", provider)
+        secret_kind = _clean_id("secret_kind", secret_kind)
+        owner = (_clean_id("profile_name", owner_profile), _clean_id("subject_id", owner_subject))
+        wanted = str(value)
+        rows = self._conn.execute(
+            """
+            SELECT profile_name, subject_id, encrypted_payload
+            FROM multitenancy_credentials
+            WHERE provider = ? AND secret_kind = ? AND active = 1
+            """,
+            (provider, secret_kind),
+        ).fetchall()
+        key = _require_key(self._key)
+        for row in rows:
+            if (str(row["profile_name"]), str(row["subject_id"])) == owner:
+                continue
+            payload = _open_json(row["encrypted_payload"], key)
+            if hmac.compare_digest(str(payload.get(field) or ""), wanted):
+                return False
+        return True
+
     def delete_credential(
         self,
         *,

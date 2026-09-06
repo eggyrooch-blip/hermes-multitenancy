@@ -96,10 +96,10 @@ test:
     #
     # A) CI 抓出来的真缺陷 —— 脚本里硬编码了开发机绝对路径，只在那台 Mac 上能跑：
     #      scripts/lark_cli_matrix_runner.mjs:18
-    #        import ... from '/Users/dev/code/hermes-web-ui/node_modules/socket.io-client/...'
-    #        （另有 4 处 /Users/dev/.hermes/...）
+    #        import ... from '/Users/hermes/code/hermes-web-ui/node_modules/socket.io-client/...'
+    #        （另有 4 处 /Users/hermes/.hermes/...）
     #      scripts/feishu_file_media_matrix_runner.py:27
-    #        SHARED_HOME = Path("/Users/dev/.hermes")   → 容器里 PermissionError: '/Users'
+    #        SHARED_HOME = Path("/Users/hermes/.hermes")   → 容器里 PermissionError: '/Users'
     #    这违反 CLAUDE.md 的「Never hardcode paths」。已记 DEBT，单独开任务改成相对路径后放回门禁。
     #
     # B) 需要 kep-cli 这个业务 CLI，CI 容器里没有也不该有。

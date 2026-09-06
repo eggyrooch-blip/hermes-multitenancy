@@ -1991,7 +1991,7 @@ async def _run_stream_into_feishu_uses_gateway_stream_consumer_for_card_transpor
                 "preview": str(home / "home" / "generated_art.png"),
                 "args": {
                     "path": str(home / "workspace" / "docs" / "plan.md"),
-                    "host_path": "/Users/dev/.ssh/id_rsa",
+                    "host_path": "/Users/hermes/.ssh/id_rsa",
                 },
             },
         )

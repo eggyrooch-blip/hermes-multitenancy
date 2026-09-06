@@ -230,6 +230,9 @@ def test_ensure_group_profile_extends_existing_lark_guidance_without_duplicate_h
     assert "credential unavailable" in soul_text
     assert "terminal" in soul_text
     assert "npx" in soul_text
+    assert 'mode="script"' in soul_text
+    assert "任何解释器或直接执行方式" in soul_text
+    assert "不限文件类型或所在目录" in soul_text
 
 
 def test_lark_cli_defaults_cover_webui_api_server_platform():

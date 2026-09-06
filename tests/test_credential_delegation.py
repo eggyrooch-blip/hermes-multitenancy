@@ -22,6 +22,7 @@ import pytest
 import yaml
 
 from hermes_multitenancy import credential_delegation as leases
+from hermes_multitenancy.credential_materializer import git_auth_env
 
 
 GROUP = "feishu_group_abc123"
@@ -495,10 +496,13 @@ def test_env_injection_from_lease_and_once_consumption(shared_home):
     env = leases.delegation_env_for_run(
         profile_home, sender_open_id=OWNER_OPEN_ID, delegation_id="dg-inject"
     )
-    assert env == {
+    expected = {
         "GITLAB_TOKEN": "glpat-alice-personal",
         "GITLAB_HOST": "gitlab.example.com",
     }
+    # The borrowed token also has to drive plain `git`, not only `glab`
+    # (tests/test_git_auth_env.py owns that contract).
+    assert env == expected | git_auth_env(expected)
     used = [row for row in _audit_rows(shared_home) if row["action"] == "used"]
     assert len(used) == 1
     # `once` died on first use — the next run of the same sender gets nothing.
@@ -565,6 +569,44 @@ def test_build_subprocess_env_wires_delegation_and_forced_mirror(
     )
     assert "GITLAB_TOKEN" not in env_b
     assert "_HERMES_FORCE_GITLAB_TOKEN" not in env_b
+
+
+def test_mapped_codex_env_never_consumes_or_carries_delegated_write_token(
+    monkeypatch, shared_home
+):
+    from hermes_multitenancy import agent_real, credential_delegation as cd
+    from hermes_multitenancy.agent_real import executor_map
+
+    profile_home = shared_home / "profiles" / GROUP
+    monkeypatch.setenv("HERMES_SHARED_HOME", str(shared_home))
+    calls: list[str] = []
+
+    def fake_delegation(ph, *, sender_open_id, delegation_id="", existing_env_names=()):
+        calls.append(sender_open_id)
+        return {
+            "GITLAB_TOKEN": "glpat-write-must-not-enter-codex",
+            "GITLAB_HOST": "gitlab.example.com",
+            **git_auth_env({"GITLAB_TOKEN": "glpat-write-must-not-enter-codex"}),
+        }
+
+    monkeypatch.setattr(cd, "delegation_env_for_run", fake_delegation)
+
+    env = agent_real._build_subprocess_env(
+        profile_home,
+        approval_dir=shared_home / "approvals",
+        extra={
+            "HERMES_FEISHU_USER_OPEN_ID": OWNER_OPEN_ID,
+            agent_real.EXECUTOR_RUNTIME_ENV: executor_map.CODEX_APP_SERVER,
+        },
+    )
+
+    assert calls == []
+    assert "glpat-write-must-not-enter-codex" not in env.values()
+    assert not {
+        "GITLAB_TOKEN",
+        "_HERMES_FORCE_GITLAB_TOKEN",
+        "GIT_CONFIG_COUNT",
+    } & env.keys()
 
 
 # --------------------------------------------------------------------------- #

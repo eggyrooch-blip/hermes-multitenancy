@@ -24,12 +24,12 @@ def test_group_profile_embedded_chat_id_is_hashed(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit))
 
-    append_security_event(event_type="route.denied", profile="feishu_group_oc_bbbbbbbbbbbbbbbb", reason="x")
+    append_security_event(event_type="route.denied", profile="feishu_group_oc_1914a6e2c17a197a", reason="x")
 
     raw = audit.read_text()
-    assert "oc_bbbbbbbbbbbbbbbb" not in raw  # raw chat_id never logged
+    assert "oc_1914a6e2c17a197a" not in raw  # raw chat_id never logged
     row = _rows(audit)[-1]
-    assert row["profile"] == f"feishu_group_oc_{_h('oc_bbbbbbbbbbbbbbbb')}"
+    assert row["profile"] == f"feishu_group_oc_{_h('oc_1914a6e2c17a197a')}"
 
 
 def test_user_profile_embedded_open_id_is_hashed(monkeypatch, tmp_path):
@@ -39,12 +39,12 @@ def test_user_profile_embedded_open_id_is_hashed(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
     monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit))
 
-    append_security_event(event_type="credential.lease.denied", profile="feishu_ou_aaaaaaaaaaaaaaaa", decision="denied")
+    append_security_event(event_type="credential.lease.denied", profile="feishu_ou_cf23e7c262afa4b7", decision="denied")
 
     raw = audit.read_text()
-    assert "ou_aaaaaaaaaaaaaaaa" not in raw
+    assert "ou_cf23e7c262afa4b7" not in raw
     row = _rows(audit)[-1]
-    assert row["profile"] == f"feishu_ou_{_h('ou_aaaaaaaaaaaaaaaa')}"
+    assert row["profile"] == f"feishu_ou_{_h('ou_cf23e7c262afa4b7')}"
 
 
 def test_plain_profile_name_passes_through(monkeypatch, tmp_path):
@@ -109,14 +109,14 @@ def test_conversation_audit_profile_is_redacted(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_CONVERSATION_AUDIT_PATH", str(audit))
 
     append_conversation_audit_event(
-        profile_name="feishu_group_oc_bbbbbbbbbbbbbbbb",
+        profile_name="feishu_group_oc_1914a6e2c17a197a",
         platform="feishu", chat_type="group", session_id="s1",
         message_id=1, role="user", content="hi", timestamp=1700000000,
     )
     raw = audit.read_text()
-    assert "oc_bbbbbbbbbbbbbbbb" not in raw
+    assert "oc_1914a6e2c17a197a" not in raw
     row = _rows(audit)[-1]
-    assert row["profile"] == f"feishu_group_oc_{_h('oc_bbbbbbbbbbbbbbbb')}"
+    assert row["profile"] == f"feishu_group_oc_{_h('oc_1914a6e2c17a197a')}"
 
 
 def test_shim_denied_path_redacts_profile(monkeypatch, tmp_path):
@@ -136,8 +136,8 @@ def test_shim_denied_path_redacts_profile(monkeypatch, tmp_path):
     audit = tmp_path / "sec.jsonl"
     env = {
         "PATH": "/usr/bin:/bin",
-        "HERMES_PROFILE": "feishu_group_oc_bbbbbbbbbbbbbbbb",
-        "HERMES_FEISHU_USER_OPEN_ID": "ou_aaaaaaaaaaaaaaaa",
+        "HERMES_PROFILE": "feishu_group_oc_1914a6e2c17a197a",
+        "HERMES_FEISHU_USER_OPEN_ID": "ou_cf23e7c262afa4b7",
         "HERMES_MT_SECURITY_AUDIT_ENABLED": "1",
         "HERMES_MT_SECURITY_AUDIT_PATH": str(audit),
         # no run token → denied path
@@ -145,8 +145,8 @@ def test_shim_denied_path_redacts_profile(monkeypatch, tmp_path):
     proc = subprocess.run([sys.executable, str(shim_dir / "lark-cli"), "im"], env=env, capture_output=True)
     assert proc.returncode == 126
     raw = audit.read_text()
-    assert "oc_bbbbbbbbbbbbbbbb" not in raw          # group chat_id not leaked
-    assert "ou_aaaaaaaaaaaaaaaa" not in raw          # open_id not leaked (hashed)
+    assert "oc_1914a6e2c17a197a" not in raw          # group chat_id not leaked
+    assert "ou_cf23e7c262afa4b7" not in raw          # open_id not leaked (hashed)
     row = _rows(audit)[-1]
     assert row["event_type"] == "lark_cli.direct_exec.denied"
-    assert row["profile"] == f"feishu_group_oc_{_h('oc_bbbbbbbbbbbbbbbb')}"
+    assert row["profile"] == f"feishu_group_oc_{_h('oc_1914a6e2c17a197a')}"

@@ -569,6 +569,24 @@ def _plugin_managed_status(shared_home: Path, plugin_id: str) -> str | None:
     return str(status) if status in {"active", "inactive"} else None
 
 
+def _plugin_release_changed(shared_home: Path, plugin_id: str, event: dict[str, Any]) -> bool:
+    path = plugin_ingest._managed_path(shared_home, plugin_id)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+    version = _first_str(event.get("version"))
+    release_id = _first_str(event.get("release_id"))
+    return bool(
+        isinstance(manifest, dict)
+        and manifest.get("plugin_id") == plugin_id
+        and (
+            (version is not None and manifest.get("release_version") != version)
+            or (release_id is not None and manifest.get("release_id") != release_id)
+        )
+    )
+
+
 def _set_plugin_status(
     shared_home: Path, plugin_id: str, status: str, *, _lock_held: bool = False
 ) -> bool:
@@ -693,6 +711,14 @@ def _assert_plugin_candidate_health(
         if str(name).strip()
     }
     audience = manifest.get("audience") if isinstance(manifest.get("audience"), dict) else {}
+    source_modes = manifest.get("skill_sources")
+    owned_skills = manifest.get("owned_skills")
+    if audience.get("mode") == "profile" and (
+        not isinstance(source_modes, dict) or set(source_modes) != skill_names
+    ):
+        raise plugin_ingest.PluginIngestError(
+            "plugin health check found no authoritative skill sources"
+        )
     if audience.get("mode") == "profile":
         targets = [profiles / str(name) for name in (audience.get("profiles") or [])]
     elif audience.get("mode") == "all":
@@ -716,15 +742,30 @@ def _assert_plugin_candidate_health(
         skills_ready = audience.get("mode") != "profile"
         if not skills_ready:
             skills_ready = True
-            for name in skill_names:
-                source = shared / "skills" / name
+            owned = (
+                owned_skills.get(profile_home.name, [])
+                if isinstance(owned_skills, dict)
+                else skill_names
+            )
+            for name in set(owned) & skill_names:
+                mode = source_modes.get(name) if isinstance(source_modes, dict) else None
+                source = (
+                    plugin_ingest._private_skill_source_root(shared, plugin_id) / name
+                    if mode == "private"
+                    else shared / "skills" / name
+                )
                 target = profile_home / "skills" / name
                 if target.is_symlink():
-                    matches = target.resolve() == source.resolve()
+                    matches = (
+                        mode in {"private", "shared"}
+                        and source.is_dir()
+                        and target.resolve() == source.resolve()
+                    )
                 else:
                     matches = (
-                        source.is_dir()
+                        mode in {"private", "shared"}
                         and target.is_dir()
+                        and source.is_dir()
                         and plugin_ingest._skill_tree_digest(target)
                         == plugin_ingest._skill_tree_digest(source)
                     )
@@ -1013,6 +1054,49 @@ def _resolve_profile_name(shared_home: Path, ldap: str) -> str | None:
     if row is None:
         return None
     return _first_str(row[0])
+
+
+def _resolve_plugin_audience_profile(
+    shared_home: Path, entry: dict[str, Any]
+) -> tuple[str, str]:
+    profile_id = _first_str(entry.get("profile_id"))
+    if profile_id is None:
+        raise SkillhubInstallError(
+            "plugin audience identity could not be proven",
+            error_code="AUDIENCE_IDENTITY_INVALID",
+        )
+    db_path = _routing_db_path(shared_home)
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as conn:
+            rows = conn.execute(
+                "SELECT user_id, profile_name, open_id FROM multitenancy_routing "
+                "WHERE user_id = ? AND active = 1 AND kind = 'user'",
+                (profile_id,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise SkillhubInstallError(
+            "plugin audience routing is unavailable",
+            error_code="AUDIENCE_ROUTING_UNAVAILABLE",
+        ) from exc
+    if len(rows) != 1:
+        raise SkillhubInstallError(
+            "plugin audience identity could not be proven",
+            error_code="AUDIENCE_IDENTITY_INVALID",
+        )
+    user_id, profile_name, open_id = rows[0]
+    employee_id = _first_str(entry.get("employee_id"))
+    claimed_open_id = _first_str(entry.get("open_id"))
+    resolved = _first_str(profile_name)
+    if (
+        resolved is None
+        or (employee_id is not None and employee_id != _first_str(user_id))
+        or (claimed_open_id is not None and claimed_open_id != _first_str(open_id))
+    ):
+        raise SkillhubInstallError(
+            "plugin audience identity could not be proven",
+            error_code="AUDIENCE_IDENTITY_INVALID",
+        )
+    return profile_id, resolved
 
 
 def _profile_skill_matches(
@@ -1379,6 +1463,7 @@ def _process_plugin_event_locked(
 
     auth_type = _resolve_auth_type(event)
     download_url = _first_str(event.get("download_url"))
+    release_changed = _plugin_release_changed(shared, plugin_id, event)
     if auth_type.strip().lower() == "all":
         # Resolve the repo BEFORE any uninstall: the no-download path reads the cached repo
         # pointer from the managed manifest, and uninstall unlinks that manifest. If we can't
@@ -1429,7 +1514,7 @@ def _process_plugin_event_locked(
                     # this behind allow_create_distribution (default False), and the
                     # plugin path must match. MED-4, audit 2026-07-03.
                     allow_create_distribution=allow_create_distribution,
-                    force=fresh_repo,
+                    force=fresh_repo or release_changed,
                     activate=activate,
                     health_required=was_active,
                     release_version=_first_str(event.get("version")),
@@ -1458,18 +1543,17 @@ def _process_plugin_event_locked(
     resolved_names: list[str] = []
     for entry in users:
         if not isinstance(entry, dict):
-            continue
-        ldap = _first_str(entry.get("profile_id"), entry.get("employee_id"), entry.get("open_id"))
-        if not ldap:
-            continue
-        profile_name = _resolve_profile_name(shared, ldap)
-        if not profile_name:
-            user_report[ldap] = {"status": "PROFILE_NOT_FOUND", "profile": None}
-            continue
-        profiles.joinpath(profile_name).mkdir(parents=True, exist_ok=True)
-        user_report[ldap] = {"status": "resolved", "profile": profile_name}
+            raise SkillhubInstallError(
+                "plugin audience identity could not be proven",
+                error_code="AUDIENCE_IDENTITY_INVALID",
+            )
+        ldap, profile_name = _resolve_plugin_audience_profile(shared, entry)
+        fingerprint = hashlib.sha256(ldap.encode("utf-8")).hexdigest()[:12]
+        user_report[fingerprint] = {"status": "resolved"}
         if profile_name not in resolved_names:
             resolved_names.append(profile_name)
+    for profile_name in resolved_names:
+        profiles.joinpath(profile_name).mkdir(parents=True, exist_ok=True)
 
     if (
         incremental
@@ -1523,7 +1607,7 @@ def _process_plugin_event_locked(
                     audience=target_audience,
                     shared=shared,
                     profiles=profiles,
-                    force=fresh_repo,
+                    force=fresh_repo or release_changed,
                     activate=activate,
                     health_required=was_active,
                     release_version=_first_str(event.get("version")),

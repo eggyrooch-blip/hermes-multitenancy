@@ -67,3 +67,91 @@ def test_install_is_idempotent(tmp_path, monkeypatch):
     first = st.skill_view
     install_dynamic_skills_dir_patch()  # second call must not re-wrap
     assert st.skill_view is first
+
+
+# ── pending-activation hint (skill-install-visible-in-session) ──────────────
+# Mid-session installs appear as dangling symlinks / empty stub dirs in the
+# sandbox; the wrapper must surface "installed, activates in a new session"
+# instead of silently skipping (zhaofanrong 2026-08-25).
+
+def _pending_home(tmp_path: Path) -> Path:
+    home = tmp_path / "profileP"
+    (home / "skills").mkdir(parents=True, exist_ok=True)
+    return home
+
+
+def test_dangling_symlink_reported_pending(tmp_path, monkeypatch):
+    import tools.skills_tool as st
+
+    home = _pending_home(tmp_path)
+    (home / "skills" / "freshskill").symlink_to(tmp_path / "nowhere" / "freshskill")
+
+    install_dynamic_skills_dir_patch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    listed = json.loads(st.skills_list())
+    pending = {row["name"]: row["note"] for row in listed.get("pending_activation", [])}
+    assert "freshskill" in pending
+    assert "新开一个会话" in pending["freshskill"]
+
+    viewed = json.loads(st.skill_view("freshskill", preprocess=False))
+    assert viewed["success"] is False
+    assert viewed.get("pending_activation") is True
+    assert "新开一个会话" in viewed["error"]
+
+
+def test_empty_stub_dir_reported_pending(tmp_path, monkeypatch):
+    import tools.skills_tool as st
+
+    home = _pending_home(tmp_path)
+    (home / "skills" / "stubskill").mkdir()
+
+    install_dynamic_skills_dir_patch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    listed = json.loads(st.skills_list())
+    assert any(row["name"] == "stubskill" for row in listed.get("pending_activation", []))
+
+    viewed = json.loads(st.skill_view("stubskill", preprocess=False))
+    assert viewed["success"] is False
+    assert viewed.get("pending_activation") is True
+
+
+def test_category_nested_pending_and_base_name_match(tmp_path, monkeypatch):
+    import tools.skills_tool as st
+
+    home = _pending_home(tmp_path)
+    _make_profile_with_skill(home, "Keep/realskill")  # category has a real skill
+    (home / "skills" / "Keep" / "newcli").symlink_to(tmp_path / "gone" / "newcli")
+
+    install_dynamic_skills_dir_patch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    listed = json.loads(st.skills_list())
+    names = [row["name"] for row in listed.get("pending_activation", [])]
+    assert names == ["Keep/newcli"]
+
+    viewed = json.loads(st.skill_view("newcli", preprocess=False))
+    assert viewed.get("pending_activation") is True
+
+
+def test_no_pending_output_byte_identical(tmp_path, monkeypatch):
+    import tools.skills_tool as st
+
+    home = _make_profile_with_skill(tmp_path / "profileQ", "steadyskill")
+
+    install_dynamic_skills_dir_patch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    wrapped_list = st.skills_list()
+    assert st.skills_list.__wrapped__() == wrapped_list
+    assert "pending_activation" not in json.loads(wrapped_list)
+
+    wrapped_view = st.skill_view("steadyskill", preprocess=False)
+    assert st.skill_view.__wrapped__("steadyskill", preprocess=False) == wrapped_view
+    assert json.loads(wrapped_view).get("success", True) is not False
+
+    # a genuinely-missing skill stays a plain not-found (no pending noise)
+    missing = json.loads(st.skill_view("no-such-skill", preprocess=False))
+    assert missing["success"] is False
+    assert "pending_activation" not in missing

@@ -61,8 +61,8 @@ def test_pyproject_declares_all_python_packages():
     assert discovered <= declared
 
 
-def test_register_calls_register_hook_once():
-    """register(ctx) must call ctx.register_hook('pre_gateway_dispatch', callback) exactly once.
+def test_register_calls_required_hooks():
+    """register(ctx) wires routing plus durable lark-cli result interception.
 
     The callback may be a thin wrapper around ``on_pre_gateway_dispatch``
     (used to lazy-start the multi-profile cron worker on first dispatch).
@@ -77,10 +77,12 @@ def test_register_calls_register_hook_once():
             calls.append((name, cb))
 
     register(FakeCtx())
-    assert len(calls) == 1, f"expected exactly one register_hook call, got {len(calls)}"
-    name, cb = calls[0]
-    assert name == "pre_gateway_dispatch"
-    assert callable(cb)
+    assert [name for name, _cb in calls] == [
+        "post_tool_call",
+        "transform_tool_result",
+        "pre_gateway_dispatch",
+    ]
+    assert all(callable(cb) for _name, cb in calls)
 
 
 def test_register_terminates_when_required_boundary_fails(monkeypatch):
@@ -114,7 +116,11 @@ def test_register_adds_tencent_vod_image_provider_when_supported():
 
     register(FakeCtx())
 
-    assert len(hook_calls) == 1
+    assert [name for name, _cb in hook_calls] == [
+        "post_tool_call",
+        "transform_tool_result",
+        "pre_gateway_dispatch",
+    ]
     assert len(image_providers) == 1
     assert image_providers[0].name == "tencent-vod"
 
@@ -315,3 +321,47 @@ def test_log_task_failure_silent_on_cancel():
         _log_task_failure(task)
 
     asyncio.run(runner())
+
+
+def test_every_lazily_mapped_name_resolves():
+    """The lazy __init__ contract: no mapped name may dangle.
+
+    A renamed/dropped symbol behind PEP 562 is invisible until Hermes calls
+    register() at startup and the plugin exits SystemExit(1). This is the check
+    `hermes_multitenancy._import_smoke` runs during the release-bundle build.
+    """
+    import hermes_multitenancy as pkg
+
+    for name in (*pkg._LAZY_ATTRS, *pkg._LAZY_SUBMODULES):
+        assert getattr(pkg, name) is not None, name
+
+
+def test_import_smoke_fails_when_a_mapped_symbol_goes_missing(monkeypatch):
+    """The deploy smoke must actually fail on a broken mapping."""
+    import importlib
+    import sys
+
+    import hermes_multitenancy as pkg
+
+    monkeypatch.setitem(pkg._LAZY_ATTRS, "_symbol_that_does_not_exist", ".plugin_entry")
+    monkeypatch.delitem(sys.modules, f"{pkg.__name__}._import_smoke", raising=False)
+
+    with pytest.raises(AttributeError):
+        importlib.import_module(f"{pkg.__name__}._import_smoke")
+
+
+def test_attribute_probing_never_imports_an_unaudited_submodule():
+    """`hasattr(pkg, "tencent_vod_image_gen")` must not import it.
+
+    The eager version only bound the six audited submodules on the package;
+    an open-ended __getattr__ would widen that and let a probe raise
+    ModuleNotFoundError from an optional module's own missing dependency.
+    """
+    import hermes_multitenancy as pkg
+
+    # __getattr__ directly: a submodule imported by some other test would be
+    # bound on the package and short-circuit plain attribute access.
+    with pytest.raises(AttributeError):
+        pkg.__getattr__("tencent_vod_image_gen")
+
+    assert pkg.__getattr__("webui_broker_server").__name__.endswith("webui_broker_server")

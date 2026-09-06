@@ -35,6 +35,7 @@ from .credential_broker import (
 )
 from .run_broker import RunBroker, RunRejected
 from .run_models import RunEvent, RunRequest, RunResult, resolve_profile_workspace
+from .projects import ProjectError, ProjectStore
 from .security_audit import append_security_event
 from .source_authorization import authorize_private_source_refs
 
@@ -98,21 +99,61 @@ _LIVE_STATE_OWNERS = {
 # server funcs + each submodule's imported names) so ``create_run_broker_app`` and
 # external importers see them exactly as before. Includes underscore + imported
 # names; skips live-state (proxied) so identity/freshness is preserved.
-for _sub in (_constants, _periphery):
-    for _n, _v in vars(_sub).items():
-        if _n.startswith("__"):
-            continue
-        if _n in _LIVE_STATE_OWNERS:
-            continue
-        globals()[_n] = _v
-del _sub, _n, _v
+def _export_owner_names(*, only_missing: bool) -> None:
+    _g = globals()
+    for _sub in (_constants, _periphery):
+        for _n, _v in vars(_sub).items():
+            if _n.startswith("__") or _n in _LIVE_STATE_OWNERS:
+                continue
+            if only_missing and _n in _g:
+                continue
+            _g[_n] = _v
+
+
+_export_owner_names(only_missing=False)
+
+# The re-export above can only see what each owner had defined at the moment this
+# module was imported. When periphery is imported FIRST it reaches back here
+# (``from .. import webui_broker_server as _m``) while still half-executed, so the
+# snapshot silently misses every name periphery defines below that import — and the
+# facade's OWN functions read those names as bare globals, which no ``__getattr__``
+# can intercept. Remember that we snapshotted early and retake it once the owner has
+# finished. False in the normal (facade-first) order, so production is untouched.
+_EXPORTS_INCOMPLETE = getattr(getattr(_periphery, "__spec__", None), "_initializing", False)
+
+
+def _owner_still_initializing() -> bool:
+    return bool(getattr(getattr(_periphery, "__spec__", None), "_initializing", False))
+
+
+def _finish_exports() -> None:
+    global _EXPORTS_INCOMPLETE
+    _EXPORTS_INCOMPLETE = False
+    _export_owner_names(only_missing=True)  # never overwrites: only fills the gaps
 
 
 class _ShimModule(_ModuleType):
+    def __getattribute__(self, name):
+        # ponytail: one bool check per attribute read; only ever True in the
+        # periphery-first import order, and self-clearing on the first read after
+        # periphery finishes.
+        if _EXPORTS_INCOMPLETE and not _owner_still_initializing():
+            _finish_exports()
+        return super().__getattribute__(name)
+
     def __getattr__(self, name):  # only fires on normal-lookup miss
         owner = _LIVE_STATE_OWNERS.get(name)
         if owner is not None:
             return getattr(owner, name)
+        # Covers the window where periphery is still executing and _finish_exports
+        # therefore cannot run yet: resolve straight off the owner instead of
+        # reporting a name that only looks absent because we snapshotted early.
+        if not name.startswith("__"):
+            for _owner in (_periphery, _constants):
+                try:
+                    return getattr(_owner, name)
+                except AttributeError:
+                    pass
         raise AttributeError(name)
 
     def __setattr__(self, name, value):
@@ -163,6 +204,9 @@ def create_run_broker_app(
     mark_seen: Optional[MarkSeen] = None,
     is_seen: Optional[IsSeen] = None,
     sandbox_available: Optional[SandboxAvailable] = None,
+    resolve_link_previews: Optional[Callable[[Path, str, list[str]], list[dict[str, str]]]] = None,
+    prepare_codex_evidence: Optional[Callable[[Any, Path], Any]] = None,
+    harness_credential_available: Optional[Callable[[Any, str], bool]] = None,
 ):
     try:
         from aiohttp import web
@@ -209,7 +253,9 @@ def create_run_broker_app(
         effective_mark_seen = mark_seen if mark_seen is not None else _default_mark_seen
         effective_is_seen = is_seen if is_seen is not None else _default_is_seen
 
-    async def _stream_run_request(request, run_request, *, stash_payload):
+    async def _stream_run_request(
+        request, run_request, *, stash_payload, harness_engine: str = ""
+    ):
         """Admit + SSE-stream a run_request. Shared by handle_run and replay.
 
         Mints a fresh ``signal_run_id`` and parks ``stash_payload`` so any
@@ -220,9 +266,11 @@ def create_run_broker_app(
         the bounded store and can't evict a genuinely-pending re-auth request.
         """
         signal_run_id = secrets.token_urlsafe(24)
+        from .runtime import strict_context_enabled
+
         _auth_signal_stash(
             signal_run_id,
-            payload=stash_payload,
+            payload={} if strict_context_enabled() else stash_payload,
             profile_name=run_request.profile_name,
             subject=run_request.user_key,
         )
@@ -256,20 +304,84 @@ def create_run_broker_app(
             nonlocal auth_required_seen
             if event.kind == "auth_required":
                 auth_required_seen = True
-                _auth_signal_touch(signal_run_id)  # restart TTL/eviction clock at emission
+                from .runtime import strict_context_enabled
+
+                if strict_context_enabled():
+                    event_payload = event.payload if isinstance(event.payload, dict) else {}
+                    operation_ref = event_payload.get("operation_ref")
+                    _auth_signal_stash(
+                        signal_run_id,
+                        payload={
+                            "operation_ref": operation_ref
+                            if isinstance(operation_ref, dict)
+                            else {}
+                        },
+                        profile_name=run_request.profile_name,
+                        subject=run_request.user_key,
+                    )
+                else:
+                    _auth_signal_touch(signal_run_id)  # restart TTL/eviction clock at emission
             await emitter.emit(event)
 
         try:
+            trusted_principal = None
+            trusted_harness_admission = None
+            trusted_owner = str(
+                request.headers.get(_OWNER_OPEN_ID_HEADER, "") or ""
+            ).strip()
+            if (
+                trusted_owner
+                and trusted_owner == run_request.user_key
+                and trusted_owner == run_request.credential_subject
+            ):
+                from .trusted_runtime_principal import issue_webui_principal
+
+                trusted_principal = issue_webui_principal(
+                    profile_name=run_request.profile_name,
+                    actor_subject=trusted_owner,
+                    credential_subject=trusted_owner,
+                )
+            if harness_engine == "harness":
+                if trusted_principal is None:
+                    raise PermissionError("Harness requires a trusted WebUI principal")
+                from .agent_real.harness_webui_runtime import (
+                    harness_flow_for_content,
+                    issue_webui_harness_admission,
+                )
+
+                trusted_harness_admission = issue_webui_harness_admission(
+                    profile_name=run_request.profile_name,
+                    actor_subject=trusted_owner,
+                    session_id=run_request.session_id,
+                    engine=harness_engine,
+                    workspace=run_request.workspace,
+                    flow=harness_flow_for_content(run_request.content),
+                )
+            billing_preparer = prepare_billing_request
+            if trusted_harness_admission is not None:
+                async def billing_preparer(req):
+                    return await prepare_billing_request(
+                        req, actor_open_id=trusted_owner
+                    )
             admission_broker = RunBroker(
                 dispatch_agent=lambda _req: "",
                 mark_seen=effective_mark_seen,
                 is_seen=effective_is_seen,
                 sandbox_available=sandbox_available or _default_sandbox_available,
-                prepare_request=prepare_billing_request,
+                prepare_request=billing_preparer,
             )
             broker_dispatch = dispatch_agent or (
                 lambda req: _default_dispatch_agent(
-                    req, emit_event=emit_event, auth_signal_run_id=signal_run_id
+                    req,
+                    emit_event=emit_event,
+                    auth_signal_run_id=signal_run_id,
+                    trusted_principal=trusted_principal,
+                    trusted_harness_admission=trusted_harness_admission,
+                    prepare_codex_evidence=(
+                        None
+                        if trusted_harness_admission is not None
+                        else prepare_codex_evidence
+                    ),
                 )
             )
             result = await admission_broker.prepare_and_execute(
@@ -284,7 +396,8 @@ def create_run_broker_app(
                 await emit_event(RunEvent(kind="done"))
         except Exception as exc:
             logger.exception("[multitenancy] WebUI run broker request failed")
-            await emit_event(RunEvent(kind="error", text=str(exc), payload={"error": str(exc)}))
+            message = "Harness is unavailable" if harness_engine == "harness" else "Run is unavailable"
+            await emit_event(RunEvent(kind="error", text=message, payload={"error": message}))
         finally:
             # Retain the parked request ONLY when this run signalled re-auth;
             # otherwise drop it so the bounded store holds only pending-reauth
@@ -305,11 +418,37 @@ def create_run_broker_app(
 
         try:
             payload = await request.json()
+            harness_engine = str(
+                request.headers.get(_EXPERT_ENGINE_HEADER, "") or ""
+            ).strip().lower()
+            if harness_engine not in {"", "hermes", "harness"}:
+                return web.json_response({"error": "unsupported expert engine"}, status=400)
             resolved_profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
             if resolution_error is not None:
                 return web.json_response({"error": resolution_error}, status=403)
             trusted_owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
-            metadata = _sanitize_ingest_metadata(payload.get("metadata") or {})
+            supplied_metadata = payload.get("metadata") or {}
+            if isinstance(supplied_metadata, dict) and any(
+                str(key).startswith("_trusted_") for key in supplied_metadata
+            ):
+                return web.json_response({"error": "reserved metadata is not allowed"}, status=400)
+            metadata = _sanitize_ingest_metadata(supplied_metadata)
+            session_id = str(payload.get("session_id") or "").strip()
+            if "project_id" in payload and (not session_id or not trusted_owner):
+                return web.json_response({"error": "verified Project session is required"}, status=400)
+            project_context = None
+            if session_id and trusted_owner:
+                project_context = ProjectStore(
+                    _profile_home_for_name(str(resolved_profile_name or ""))
+                ).bind_session(
+                    actor_subject=trusted_owner,
+                    session_id=session_id,
+                    requested_project_id=payload.get("project_id"),
+                    requested_supplied="project_id" in payload,
+                    requested_workspace=payload.get("workspace"),
+                )
+                metadata["_trusted_project_id"] = project_context.project_id or ""
+                metadata["_trusted_project_session"] = project_context.session_id
             _apply_expert_id_to_metadata(request, payload, metadata)
             share_context = _agent_share_context_for_request(
                 request,
@@ -321,7 +460,7 @@ def create_run_broker_app(
             from . import router as router_mod
             resolved_workspace, _workspace_cwd = resolve_profile_workspace(
                 router_mod._profile_name_to_home(str(resolved_profile_name or "")),
-                payload.get("workspace"),
+                project_context.workspace if project_context is not None else payload.get("workspace"),
             )
             run_request = RunRequest(
                 channel=payload.get("channel"),
@@ -339,10 +478,19 @@ def create_run_broker_app(
                 metadata=metadata,
                 messages=payload.get("messages") or [],
             )
+        except ProjectError as exc:
+            return web.json_response({"error": str(exc)}, status=exc.status)
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
-        return await _stream_run_request(request, run_request, stash_payload=payload)
+        stashed_payload = dict(payload)
+        stashed_payload["_trusted_harness_engine"] = harness_engine
+        return await _stream_run_request(
+            request,
+            run_request,
+            stash_payload=stashed_payload,
+            harness_engine=harness_engine,
+        )
 
     async def handle_source_refs_authorize(request):
         if not _authorized(request):
@@ -369,6 +517,41 @@ def create_run_broker_app(
             logger.warning("[multitenancy] private source authorization unavailable")
             authorized = []
         return web.json_response({"refs": authorized})
+
+    async def handle_link_previews(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid request"}, status=400)
+        profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        owner = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        urls = payload.get("urls")
+        if resolution_error is not None or not profile_name or not owner:
+            return web.json_response({"error": "link preview identity unavailable"}, status=403)
+        if (
+            not isinstance(urls, list)
+            or not 1 <= len(urls) <= 10
+            or not all(isinstance(url, str) and 0 < len(url) <= 2048 for url in urls)
+        ):
+            return web.json_response({"error": "urls must contain 1 to 10 links"}, status=400)
+        resolver = resolve_link_previews
+        if resolver is None:
+            from .feishu_link_preview import resolve_feishu_link_previews
+
+            resolver = resolve_feishu_link_previews
+        try:
+            previews = await asyncio.wait_for(
+                asyncio.to_thread(resolver, _profile_home_for_name(profile_name), owner, urls),
+                timeout=3,
+            )
+        except ValueError:
+            return web.json_response({"error": "unsupported Feishu link"}, status=400)
+        except Exception:
+            logger.warning("[multitenancy] Feishu link preview unavailable")
+            return web.json_response({"error": "link preview unavailable"}, status=503)
+        return web.json_response({"previews": previews})
 
     async def handle_credential_replay(request):
         """Re-run a request that failed on expired lark-cli credentials.
@@ -414,7 +597,45 @@ def create_run_broker_app(
             return web.json_response({"error": "signal_run_id does not belong to caller"}, status=403)
 
         stashed_payload = dict(entry.get("payload") or {})
+        from .runtime import strict_context_enabled
+
+        if strict_context_enabled():
+            operation_ref = stashed_payload.get("operation_ref")
+            if not isinstance(operation_ref, dict):
+                return web.json_response({"error": "connector step reference unavailable"}, status=409)
+            session_ref = str(operation_ref.get("session_id") or "").strip()
+            call_ref = str(operation_ref.get("tool_call_id") or "").strip()
+            if not session_ref or not call_ref:
+                return web.json_response({"error": "connector step reference unavailable"}, status=409)
+            from .agent_real import resume_pending_lark_cli_step
+
+            result = await asyncio.to_thread(
+                resume_pending_lark_cli_step,
+                _profile_home_for_name(stashed_profile),
+                stashed_subject,
+                session_ref=session_ref,
+                call_ref=call_ref,
+            )
+            if not result:
+                return web.json_response({"error": "connector step is not resumable"}, status=409)
+            _auth_signal_consume(signal_run_id)
+            return web.json_response(result, status=200 if result.get("ok") else 409)
         try:
+            replay_metadata = _sanitize_ingest_metadata(stashed_payload.get("metadata") or {})
+            replay_session_id = str(stashed_payload.get("session_id") or "").strip()
+            project_context = None
+            if replay_session_id and stashed_subject:
+                project_context = ProjectStore(
+                    _profile_home_for_name(stashed_profile)
+                ).bind_session(
+                    actor_subject=stashed_subject,
+                    session_id=replay_session_id,
+                    requested_project_id=stashed_payload.get("project_id"),
+                    requested_supplied="project_id" in stashed_payload,
+                    requested_workspace=stashed_payload.get("workspace"),
+                )
+                replay_metadata["_trusted_project_id"] = project_context.project_id or ""
+                replay_metadata["_trusted_project_session"] = project_context.session_id
             run_request = RunRequest(
                 channel=stashed_payload.get("channel"),
                 profile_name=stashed_profile or stashed_payload.get("profile_name") or stashed_payload.get("profile"),
@@ -432,16 +653,26 @@ def create_run_broker_app(
                 delivery_mode=stashed_payload.get("delivery_mode") or "socket",
                 credential_subject=stashed_subject or stashed_payload.get("credential_subject"),
                 requires_host_tools=bool(stashed_payload.get("requires_host_tools")),
-                metadata=_sanitize_ingest_metadata(stashed_payload.get("metadata") or {}),
+                workspace=project_context.workspace if project_context is not None else stashed_payload.get("workspace"),
+                metadata=replay_metadata,
                 messages=stashed_payload.get("messages") or [],
             )
+        except ProjectError as exc:
+            return web.json_response({"error": str(exc)}, status=exc.status)
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
         # One-shot: consume before dispatch so a retry can't double-fire the
         # same parked request; the new run parks its own fresh entry.
         _auth_signal_consume(signal_run_id)
-        return await _stream_run_request(request, run_request, stash_payload=stashed_payload)
+        return await _stream_run_request(
+            request,
+            run_request,
+            stash_payload=stashed_payload,
+            harness_engine=str(
+                stashed_payload.get("_trusted_harness_engine") or ""
+            ),
+        )
 
     # Result cache for ingest idempotency (gap D): a duplicate submission
     # returns the SAME result the first one produced, instead of an empty
@@ -1844,6 +2075,254 @@ def create_run_broker_app(
             return web.json_response({"error": "clarify request not found"}, status=404)
         return web.json_response({"ok": True, "clarify_id": clarify_id})
 
+    async def handle_approval_respond(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        approval_id = str(request.match_info.get("approval_id") or "").strip()
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid request"}, status=400)
+        profile_name, resolution_error = _resolve_owner_scoped_profile(request, payload)
+        if resolution_error is not None:
+            return web.json_response({"error": resolution_error}, status=403)
+        owner = _trusted_owner_from_request(request)
+        session_id = str(payload.get("session_id") or "").strip()
+        choice = str(payload.get("choice") or "").strip().lower()
+        if not owner or not approval_id or not session_id or choice not in {
+            "once", "deny", "approve", "reject", "rework"
+        }:
+            return web.json_response({"error": "invalid approval response"}, status=400)
+        if choice in {"once", "deny"} and _write_pending_approval_response(
+            approval_id=approval_id,
+            owner_open_id=owner,
+            profile_name=profile_name or "",
+            session_id=session_id,
+            choice=choice,
+        ):
+            return web.json_response({"ok": True, "approval_id": approval_id})
+        if choice not in {"approve", "reject", "rework"}:
+            return web.json_response({"error": "approval request not found"}, status=404)
+        try:
+            from .agent_real.harness_webui_runtime import workflow_id_for
+            from .agent_real.harness_workflow import HarnessWorkflowStore
+            from .trusted_runtime_principal import issue_webui_principal
+
+            workflow_id = workflow_id_for(profile_name or "", owner, session_id)
+            principal = issue_webui_principal(
+                profile_name=profile_name or "", actor_subject=owner, credential_subject=owner
+            )
+            store = HarnessWorkflowStore(_profile_home_for_name(profile_name or "") / "harness-runtime.db")
+            try:
+                store.resolve_gate(
+                    principal, approval_id, choice, str(payload.get("comment") or ""), workflow_id
+                )
+            finally:
+                store.close()
+        except Exception:
+            logger.warning("[multitenancy] harness gate response rejected", exc_info=True)
+            return web.json_response({"error": "approval request not found"}, status=404)
+        return web.json_response({"ok": True, "approval_id": approval_id})
+
+    async def handle_harness_workflow(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from .agent_real.harness_webui_runtime import (
+            is_harness_enabled,
+            is_harness_profile_enabled,
+            is_harness_runtime_ready,
+        )
+
+        if not is_harness_enabled(os.environ):
+            return web.json_response({"error": "harness unavailable"}, status=503)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid request"}, status=400)
+        action = str(payload.get("action") or "snapshot").strip()
+        try:
+            profile_name, owner = _owner_scoped_tenant(
+                request, payload, require_write=action != "snapshot"
+            )
+            run_scope = _run_broker_scope_for_request(request)
+        except (PermissionError, RunScopeRevoked) as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+        workflow_id = str(request.match_info.get("workflow_id") or "").strip()
+        if not profile_name or not owner:
+            return web.json_response({"error": "workflow identity unavailable"}, status=403)
+        if (
+            not is_harness_profile_enabled(os.environ, profile_name)
+            or not is_harness_runtime_ready(os.environ)
+        ):
+            return web.json_response({"error": "harness unavailable"}, status=503)
+        try:
+            from .agent_real.harness_webui_runtime import workflow_id_for
+            from .agent_real.harness_workflow import HarnessWorkflowStore
+            from .trusted_runtime_principal import issue_webui_principal
+
+            if run_scope is not None:
+                expected = str(run_scope.get("workflow_id") or "").strip()
+                if not expected:
+                    return web.json_response({"error": "workflow unavailable for this run"}, status=403)
+            else:
+                session_id = str(payload.get("session_id") or "").strip()
+                if not session_id:
+                    return web.json_response({"error": "session_id required"}, status=400)
+                expected = workflow_id_for(profile_name, owner, session_id)
+                if workflow_id == "by-session":
+                    workflow_id = expected
+            if workflow_id != expected:
+                return web.json_response({"error": "workflow mismatch"}, status=403)
+            principal = issue_webui_principal(
+                profile_name=profile_name, actor_subject=owner, credential_subject=owner
+            )
+            store = HarnessWorkflowStore(_profile_home_for_name(profile_name) / "harness-runtime.db")
+            try:
+                if action == "start":
+                    if run_scope is not None:
+                        return web.json_response({"error": "workflow already server-bound"}, status=409)
+                    store.start(
+                        principal, workflow_id, str(payload.get("thread_id") or ""),
+                        str(payload.get("flow") or "server-dev"),
+                    )
+                    result = store.snapshot(principal, workflow_id)
+                elif action == "request_gate":
+                    gate = str(payload.get("gate") or "").strip().upper()
+                    checklist = (
+                        payload.get("checklist")
+                        if isinstance(payload.get("checklist"), list)
+                        else []
+                    )
+                    approval_id = store.request_gate(
+                        principal, workflow_id, gate,
+                        checklist,
+                    )
+                    result = {
+                        "event": "gate_required", "approval_id": approval_id, "gate": gate,
+                        "description": f"Gate {gate} requires a decision",
+                        "checklist": checklist,
+                        "choices": ["approve", "reject", "rework"],
+                    }
+                elif action == "pause_credential":
+                    credential_kind = str(payload.get("credential_kind") or "")
+                    from .agent_real.harness_workflow import connector_for_credential
+
+                    connector_id = connector_for_credential(credential_kind)
+                    store.pause_for_credential(
+                        principal, workflow_id, credential_kind
+                    )
+                    result = store.snapshot(principal, workflow_id)
+                    await emit_harness_workflow_event(
+                        workflow_id,
+                        "auth_required",
+                        {
+                            "workflow_id": workflow_id,
+                            "credential_kind": credential_kind,
+                            "connector_id": connector_id,
+                        },
+                    )
+                elif action == "resume_credential":
+                    if run_scope is not None:
+                        return web.json_response(
+                            {"error": "credential resume requires the trusted WebUI BFF"},
+                            status=403,
+                        )
+                    credential_kind = str(payload.get("credential_kind") or "")
+                    from .agent_real.harness_workflow import connector_for_credential
+
+                    connector_id = str(payload.get("connector_id") or "").strip()
+                    verified_by_bff = (
+                        _periphery._presented_master_key(request)
+                        and payload.get("credential_verified") is True
+                        and connector_id == connector_for_credential(credential_kind)
+                    )
+                    store.resume_credential(
+                        principal,
+                        workflow_id,
+                        credential_kind,
+                        validator=(
+                            harness_credential_available
+                            or (lambda _principal, _kind: verified_by_bff)
+                        ),
+                    )
+                    result = store.snapshot(principal, workflow_id)
+                    await emit_harness_workflow_event(
+                        workflow_id,
+                        "auth_resolved",
+                        {
+                            "workflow_id": workflow_id,
+                            "credential_kind": credential_kind,
+                            "connector_id": connector_id,
+                        },
+                    )
+                elif action == "set_stage":
+                    related_ids = payload.get("related_ids")
+                    if not isinstance(related_ids, dict):
+                        return web.json_response({"error": "related_ids must be an object"}, status=400)
+                    result = store.set_stage(
+                        principal,
+                        workflow_id,
+                        str(payload.get("stage") or ""),
+                        str(payload.get("status") or ""),
+                        str(payload.get("summary") or ""),
+                        related_ids,
+                    )
+                    await emit_harness_workflow_event(workflow_id, "workflow_stage", result)
+                elif action == "snapshot":
+                    result = store.snapshot(principal, workflow_id)
+                elif action == "execute":
+                    arguments = payload.get("arguments")
+                    if not isinstance(arguments, dict):
+                        return web.json_response({"error": "arguments must be an object"}, status=400)
+                    operation = str(payload.get("operation") or "").strip()
+                    idempotency_key = str(payload.get("idempotency_key") or "").strip()
+                    repo = (
+                        _profile_home_for_name(profile_name)
+                        / "workspace" / "runs" / workflow_id / "repo"
+                    ).resolve(strict=True)
+
+                    def local_adapter(name, values):
+                        fingerprint = hashlib.sha256(
+                            json.dumps(
+                                {"operation": name, "arguments": values},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()[:20]
+                        audit = repo / ".hermes-harness-operations.jsonl"
+                        with audit.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps({
+                                "operation": name,
+                                "argument_fingerprint": fingerprint,
+                            }, sort_keys=True) + "\n")
+                        return {
+                            "ok": True,
+                            "simulated": True,
+                            "operation": name,
+                            "argument_fingerprint": fingerprint,
+                        }
+
+                    result = {
+                        "event": "tool",
+                        "result": store.execute(
+                            principal,
+                            workflow_id,
+                            operation,
+                            arguments,
+                            idempotency_key,
+                            local_adapter,
+                        ),
+                    }
+                else:
+                    return web.json_response({"error": "action invalid"}, status=400)
+            finally:
+                store.close()
+        except Exception as exc:
+            logger.warning("[multitenancy] harness workflow action rejected: %s", exc)
+            return web.json_response({"error": "workflow action rejected"}, status=409)
+        return web.json_response({"ok": True, **result})
+
     async def handle_session_command(request):
         if not _authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -2717,6 +3196,7 @@ def create_run_broker_app(
                 shared_home=_shared_home_from_env(),
                 # 群 profile 绑定的第二道 owner 证明（intake 侧纵深防御）。
                 group_owner_open_id=trusted_owner if profile_scope == "group" else None,
+                credential_subject=trusted_owner,
             )
         except TokenRejected as exc:
             # 员工可自行修正的输入问题 —— 必须把可读理由原样回去，否则他只会看到
@@ -2739,6 +3219,178 @@ def create_run_broker_app(
         if scope_note:
             body["note"] = scope_note
         return web.json_response(body)
+
+    async def handle_github_credential(request):
+        """Connect/revoke only the verified WebUI caller's personal GitHub PAT."""
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        profile_name, error = _resolve_owner_scoped_profile(request, {})
+        subject_id = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if error or not profile_name or not subject_id:
+            return web.json_response({"error": error or "owner identity required"}, status=403)
+        from . import github_mcp_connector as github
+
+        try:
+            if request.method == "DELETE":
+                deleted = await asyncio.to_thread(
+                    github.revoke, _shared_home_from_env(), profile_name, subject_id
+                )
+                from .connectors import registry
+                registry.clear_cache()
+                return web.json_response({"ok": True, "revoked": deleted})
+            payload = await request.json()
+            result = await asyncio.to_thread(
+                github.connect,
+                _shared_home_from_env(),
+                profile_name,
+                subject_id,
+                str(payload.get("token") or ""),
+            )
+            from .connectors import registry
+            registry.clear_cache()
+            return web.json_response(result)
+        except github.ConnectorUnavailable as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            logger.exception("GitHub credential operation failed (token redacted)")
+            return web.json_response({"error": "GitHub 凭据服务暂不可用，请稍后重试。"}, status=500)
+
+    async def handle_mcp_oauth_approval(request):
+        """Complete one OAuth request with the already authenticated WebUI owner."""
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        profile_name, error = _resolve_owner_scoped_profile(request, {})
+        subject_id = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if error or not profile_name or not subject_id:
+            return web.json_response({"error": error or "owner identity required"}, status=403)
+        try:
+            payload = await request.json()
+            request_id = str(payload.get("request_id") or "").strip()
+            if not request_id:
+                return web.json_response({"error": "request_id is required"}, status=400)
+            origin = str(os.environ.get("HERMES_MCP_PUBLIC_ORIGIN") or "").strip().rstrip("/")
+            if not origin:
+                return web.json_response({"error": "MCP OAuth is unavailable"}, status=503)
+            from .connector_client_auth import ClientTokenStore, HermesOAuthProvider
+            from .trusted_runtime_principal import issue_webui_principal
+
+            token_store = ClientTokenStore(
+                _shared_home_from_env() / "multitenancy.db",
+                issuer=origin,
+                resource=f"{origin}/mcp",
+            )
+            provider = HermesOAuthProvider(token_store)
+            try:
+                redirect_url = provider.approve(
+                    request_id,
+                    issue_webui_principal(
+                        profile_name=profile_name,
+                        actor_subject=subject_id,
+                        credential_subject=subject_id,
+                    ),
+                )
+            finally:
+                provider.close()
+                token_store.close()
+            return web.json_response({"ok": True, "redirect_url": redirect_url})
+        except PermissionError:
+            return web.json_response({"error": "authorization unavailable"}, status=403)
+        except Exception:
+            logger.exception("MCP OAuth approval failed (identity and tokens redacted)")
+            return web.json_response({"error": "MCP OAuth approval is unavailable"}, status=500)
+
+    async def handle_mcp_oauth_request(request):
+        """Return display-only metadata for a pending OAuth consent request."""
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        profile_name, error = _resolve_owner_scoped_profile(request, {})
+        subject_id = str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip()
+        if error or not profile_name or not subject_id:
+            return web.json_response({"error": error or "owner identity required"}, status=403)
+        origin = str(os.environ.get("HERMES_MCP_PUBLIC_ORIGIN") or "").strip().rstrip("/")
+        if not origin:
+            return web.json_response({"error": "MCP OAuth is unavailable"}, status=503)
+        from .connector_client_auth import ClientTokenStore, HermesOAuthProvider
+
+        token_store = ClientTokenStore(
+            _shared_home_from_env() / "multitenancy.db",
+            issuer=origin,
+            resource=f"{origin}/mcp",
+        )
+        provider = HermesOAuthProvider(token_store)
+        try:
+            metadata = provider.pending_request(str(request.match_info.get("request_id") or ""))
+        finally:
+            provider.close()
+            token_store.close()
+        if metadata is None:
+            return web.json_response({"error": "authorization unavailable"}, status=404)
+        return web.json_response(metadata)
+
+    def _github_run_scope(request):
+        try:
+            scope = _run_broker_scope_for_request(request)
+        except RunScopeRevoked as exc:
+            return None, web.json_response({"error": str(exc)}, status=401)
+        if scope is None:
+            return None, web.json_response({"error": "run-scoped token required"}, status=403)
+        conflict = _run_scoped_assertion_conflict(
+            scope,
+            str(request.headers.get(_OWNER_OPEN_ID_HEADER, "") or "").strip(),
+            str(request.query.get("profile_name") or request.query.get("profile") or "").strip(),
+        )
+        if conflict:
+            return None, web.json_response({"error": conflict}, status=403)
+        if not str(scope.get("open_id") or "").strip():
+            return None, web.json_response({"error": "run-scoped token has no bound owner"}, status=403)
+        return scope, None
+
+    async def handle_github_mcp_tools(request):
+        """Data plane: authoritative identity comes only from the live run token."""
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        scope, error = _github_run_scope(request)
+        if error is not None:
+            return error
+        from . import github_mcp_connector as github
+
+        try:
+            tools = await github.list_tools(
+                _shared_home_from_env(), scope["profile_name"], scope["open_id"]
+            )
+            return web.json_response({"tools": tools})
+        except github.ConnectorUnavailable as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+        except Exception:
+            logger.exception("GitHub MCP tools/list failed (credentials redacted)")
+            return web.json_response({"error": "GitHub MCP 暂不可用"}, status=502)
+
+    async def handle_github_mcp_call(request):
+        if not _authorized(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        scope, error = _github_run_scope(request)
+        if error is not None:
+            return error
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "request body must be JSON"}, status=400)
+        name = str(payload.get("name") or "").strip()
+        arguments = payload.get("arguments") or {}
+        if not name or not isinstance(arguments, dict):
+            return web.json_response({"error": "name and object arguments are required"}, status=400)
+        from . import github_mcp_connector as github
+
+        try:
+            result = await github.call_tool(
+                _shared_home_from_env(), scope["profile_name"], scope["open_id"], name, arguments
+            )
+            return web.json_response({"result": result})
+        except PermissionError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+        except Exception:
+            logger.exception("GitHub MCP tools/call failed (credentials redacted)")
+            return web.json_response({"error": "GitHub MCP 暂不可用"}, status=502)
 
     async def handle_credential_lease(request):
         header = request.headers.get("Authorization", "")
@@ -2852,6 +3504,45 @@ def create_run_broker_app(
             text="<html><body style='font-family:sans-serif'>✅ kep-cli 认证成功，可关闭本页面，返回飞书查看结果。</body></html>",
             content_type="text/html",
         )
+
+    async def handle_internal_feishu_oauth_scope(request):
+        if not _presented_master_key(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import feishu_uat_auth
+
+        try:
+            scope = await asyncio.to_thread(feishu_uat_auth.login_oauth_scope)
+            return web.json_response({"scope": scope})
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception:
+            logger.exception("[multitenancy] internal Feishu OAuth scope lookup failed")
+            return web.json_response({"error": "Feishu OAuth scope lookup failed"}, status=500)
+
+    async def handle_internal_feishu_uat_import(request):
+        if not _presented_master_key(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        from . import feishu_uat_auth
+
+        owner_open_id = _trusted_owner_from_request(request)
+        if not owner_open_id:
+            return web.json_response({"error": "owner identity required"}, status=403)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                return web.json_response({"error": "request body must be an object"}, status=400)
+            result = await asyncio.to_thread(
+                feishu_uat_auth.import_login_oauth_uat,
+                profile_name=payload.get("profile_name"),
+                open_id=owner_open_id,
+                token=payload.get("token"),
+            )
+            return web.json_response(result)
+        except feishu_uat_auth.FeishuUatAuthError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception:
+            logger.exception("[multitenancy] internal Feishu OAuth credential import failed")
+            return web.json_response({"error": "Feishu OAuth credential import failed"}, status=500)
 
     async def handle_feishu_auth_start(request):
         if not _authorized(request):
@@ -3374,6 +4065,7 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/feishu/helpdesk/events", handle_feishu_helpdesk_events)
     app.router.add_post("/api/run-broker/runs", handle_run)
     app.router.add_post("/api/run-broker/source-refs/authorize", handle_source_refs_authorize)
+    app.router.add_post("/api/run-broker/link-previews", handle_link_previews)
     app.router.add_post(
         "/api/run-broker/credentials/replay/{signal_run_id}", handle_credential_replay
     )
@@ -3382,6 +4074,8 @@ def create_run_broker_app(
     app.router.add_post("/api/run-broker/ingest", handle_ingest)
     app.router.add_get("/api/run-broker/ingest/agents", handle_ingest_agents)
     app.router.add_post("/api/run-broker/clarify/{clarify_id}/respond", handle_clarify_respond)
+    app.router.add_post("/api/run-broker/approval/{approval_id}/respond", handle_approval_respond)
+    app.router.add_post("/api/run-broker/harness/workflows/{workflow_id}", handle_harness_workflow)
     app.router.add_post("/api/run-broker/session-commands", handle_session_command)
     app.router.add_post("/api/run-broker/internal/session-search", handle_internal_session_search)
     app.router.add_post("/api/run-broker/goals/evaluate", handle_goal_evaluate)
@@ -3392,13 +4086,60 @@ def create_run_broker_app(
     app.router.add_delete("/api/run-broker/agents/{agent_id}/shares/{share_key}", handle_revoke_agent_share)
     app.router.add_get("/api/run-broker/slash/commands", handle_slash_commands)
     app.router.add_post("/api/run-broker/credentials/gitlab", handle_gitlab_personal_token)
+    app.router.add_post("/api/run-broker/credentials/github", handle_github_credential)
+    app.router.add_delete("/api/run-broker/credentials/github", handle_github_credential)
+    app.router.add_get(
+        "/api/run-broker/connectors/mcp-oauth/requests/{request_id}", handle_mcp_oauth_request
+    )
+    app.router.add_post("/api/run-broker/connectors/mcp-oauth/approve", handle_mcp_oauth_approval)
     app.router.add_post("/api/run-broker/credentials/lease", handle_credential_lease)
     app.router.add_get("/api/run-broker/credentials/feishu/uat/status", handle_feishu_uat_status)
     app.router.add_get("/api/run-broker/credentials/hub", handle_credential_hub)
     app.router.add_get("/api/run-broker/connectors", handle_connectors)
+    app.router.add_get("/api/run-broker/connectors/github-mcp/tools", handle_github_mcp_tools)
+    app.router.add_post("/api/run-broker/connectors/github-mcp/call", handle_github_mcp_call)
+    from . import connector_catalog_api as _connector_catalog_api
+
+    _connector_catalog_api.register_routes(
+        app,
+        authorize=_authorized,
+        owner_tenant=_owner_scoped_tenant,
+        shared_home=_shared_home_from_env,
+    )
+    from . import cowork_enterprise as _cowork_enterprise
+    from . import router as _router
+
+    def cowork_credential_bound(request, profile_name: str, actor: str, run_id: str) -> bool:
+        record = _lookup_credential_broker_token(
+            request.headers.get("X-Hermes-Run-Credential-Token", "")
+        )
+        return bool(
+            record
+            and record["profile_name"] == profile_name
+            and record["open_id"] == actor
+            and record["run_id"] == run_id
+        )
+
+    _cowork_enterprise.register_routes(
+        app,
+        authorize=_authorized,
+        owner_tenant=_owner_scoped_tenant,
+        profile_home=_router._profile_name_to_home,
+        credential_bound=cowork_credential_bound,
+    )
+    from . import projects as _projects
+
+    _projects.register_routes(
+        app,
+        authorize=_authorized,
+        owner_tenant=_owner_scoped_tenant,
+        profile_home=_router._profile_name_to_home,
+    )
     app.router.add_get("/api/run-broker/experts", handle_experts)
     app.router.add_get("/api/run-broker/plugin-assets/{plugin_id}/{asset_name}", handle_plugin_asset)
     app.router.add_get("/api/run-broker/credentials/kep-cli/callback/{session_id}", handle_kep_cli_callback)
+    app.router.add_get("/api/run-broker/internal/feishu/oauth-scope", handle_internal_feishu_oauth_scope)
+    app.router.add_post("/api/run-broker/internal/feishu/uat/import", handle_internal_feishu_uat_import)
     app.router.add_post("/api/run-broker/feishu-auth/sessions", handle_feishu_auth_start)
     app.router.add_get("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_poll)
     app.router.add_delete("/api/run-broker/feishu-auth/sessions/{session_id}", handle_feishu_auth_cancel)

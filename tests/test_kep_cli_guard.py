@@ -407,6 +407,32 @@ def test_install_kep_cli_shim_relays_auth_failure_with_stable_exit_code(tmp_path
     assert "【Hermes】kep-cli pre 需要授权" in result.stderr
 
 
+def test_install_kep_cli_shim_blocks_headless_login_before_real_binary(tmp_path: Path):
+    from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+    marker = tmp_path / "spawned"
+    real_bin = tmp_path / "real-bin" / "kep-auth"
+    real_bin.parent.mkdir(parents=True)
+    real_bin.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    real_bin.chmod(0o755)
+    [wrapper] = install_kep_cli_shim(
+        tmp_path / "shim",
+        real_bins={"kep-auth": str(real_bin)},
+        expected_profile="alice",
+    )
+
+    result = subprocess.run(
+        [str(wrapper), "login"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 77
+    assert not marker.exists()
+    assert "Connectors authorization link" in result.stderr
+
+
 def test_install_kep_cli_shim_detects_auth_failure_from_output(tmp_path: Path):
     real_bin = _write_fake_real_bin(tmp_path / "real-bin" / "kep-dune-cli")
     with _verified_shim(tmp_path, name="kep-dune-cli", real_bin=real_bin, profile="alice") as (wrapper, env):

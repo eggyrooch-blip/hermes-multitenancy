@@ -246,6 +246,113 @@ def test_auth_required_run_retains_stash_with_original_payload(monkeypatch, tmp_
     assert entry["subject"] == "ou_alice"
 
 
+def test_strict_auth_required_stashes_only_opaque_connector_step(monkeypatch, tmp_path) -> None:
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy import agent_real, router
+
+    async def fake_stream(event, profile_home, *, messages=None):
+        yield "content", "working…"
+        yield "auth_required", {
+            "provider": "feishu",
+            "connector_id": "lark-cli",
+            "operation_ref": {"session_id": "session-1", "tool_call_id": "call-1"},
+        }
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setattr(agent_real, "stream_run_agent", fake_stream)
+    monkeypatch.setattr(router, "_profile_name_to_home", lambda name: tmp_path)
+    monkeypatch.setattr(
+        broker, "_webui_streamable_media_text", lambda text, **kw: ("", [text] if text else [])
+    )
+
+    async def _body() -> None:
+        client = TestClient(TestServer(broker.create_run_broker_app(
+            mark_seen=lambda _request: True, sandbox_available=lambda: True
+        )))
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/run-broker/runs",
+                json={
+                    "channel": "webui",
+                    "profile_name": "alice",
+                    "user_key": "ou_alice",
+                    "content": "含业务文档内容的原请求",
+                },
+            )
+            await resp.read()
+        finally:
+            await client.close()
+
+    asyncio.run(_body())
+
+    entry = next(iter(broker._auth_signal_store.values()))
+    assert entry["payload"] == {
+        "operation_ref": {"session_id": "session-1", "tool_call_id": "call-1"}
+    }
+    assert "含业务文档内容的原请求" not in repr(entry)
+
+
+def test_strict_replay_returns_explicit_resend_without_model_dispatch(monkeypatch, tmp_path) -> None:
+    from aiohttp.test_utils import TestClient, TestServer
+    from hermes_multitenancy import agent_real
+
+    resumed = []
+    model_dispatches = []
+
+    def fake_resume(profile_home, subject, *, session_ref=None, call_ref=None):
+        resumed.append((profile_home, subject, session_ref, call_ref))
+        return {
+            "ok": False,
+            "recovered": False,
+            "error_code": "FEISHU_OPERATION_RESEND_REQUIRED",
+            "resend_required": True,
+        }
+
+    async def dispatch(request):
+        model_dispatches.append(request)
+        return "should not run"
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setattr(broker, "_profile_home_for_name", lambda _name: tmp_path / "alice")
+    monkeypatch.setattr(agent_real, "resume_pending_lark_cli_step", fake_resume)
+    broker._auth_signal_stash(
+        "sig-1",
+        payload={
+            "operation_ref": {"session_id": "session-1", "tool_call_id": "call-1"}
+        },
+        profile_name="alice",
+        subject="ou_alice",
+    )
+
+    status_body = {}
+
+    async def _body() -> None:
+        client = TestClient(TestServer(_app(dispatch)))
+        await client.start_server()
+        try:
+            resp = await client.post("/api/run-broker/credentials/replay/sig-1")
+            status_body["status"] = resp.status
+            status_body["json"] = await resp.json()
+        finally:
+            await client.close()
+
+    asyncio.run(_body())
+
+    assert status_body == {
+        "status": 409,
+        "json": {
+            "ok": False,
+            "recovered": False,
+            "error_code": "FEISHU_OPERATION_RESEND_REQUIRED",
+            "resend_required": True,
+        },
+    }
+    assert resumed == [(tmp_path / "alice", "ou_alice", "session-1", "call-1")]
+    assert model_dispatches == []
+    assert "sig-1" not in broker._auth_signal_store
+
+
 def test_normal_run_does_not_retain_stash() -> None:
     """Churn guard (codex MEDIUM): a run that does NOT signal auth_required must
     consume its own speculative stash entry, so normal traffic never fills the

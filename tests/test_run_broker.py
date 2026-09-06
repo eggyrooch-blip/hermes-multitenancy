@@ -31,6 +31,318 @@ def test_run_request_rejects_unknown_channel():
         RunRequest(channel="email", profile_name="owner", user_key="ou_1", content="hi")
 
 
+def _write_cowork_expert_manifest(shared_home, *, audience="alice", **expert_overrides):
+    import json
+
+    managed = shared_home / ".hermes-plugin-managed"
+    managed.mkdir(parents=True, exist_ok=True)
+    expert = {
+        "id": "finance",
+        "name": "Finance",
+        "version": "1.2.3",
+        "agent_scope": "finance_lead",
+        "skills": ["sheet", "report"],
+        "hermes_tool_scopes": ["mail.read", "docs.read"],
+        **expert_overrides,
+    }
+    path = managed / f"plugin-{len(list(managed.iterdir()))}.json"
+    path.write_text(
+        json.dumps({
+            "status": "active",
+            "plugin_id": path.stem,
+            "audience": audience if isinstance(audience, dict) else {"profiles": [audience]},
+            "experts": [expert],
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_cowork_expert_mapping_is_unique_authorized_and_deterministic(tmp_path):
+    from hermes_multitenancy.cowork_enterprise import (
+        CoworkExpertConflict,
+        CoworkExpertNotFound,
+        resolve_expert_mapping,
+    )
+
+    shared = tmp_path / "shared"
+    alice = shared / "profiles" / "alice"
+    bob = shared / "profiles" / "bob"
+    _write_cowork_expert_manifest(shared)
+
+    mapping = resolve_expert_mapping(alice, "finance")
+    repeated = resolve_expert_mapping(alice, "finance")
+    assert mapping == repeated
+    assert mapping.agent_scope == "finance_lead"
+    assert mapping.expert_version == "1.2.3"
+    assert mapping.hermes_tool_scopes == ("docs.read", "mail.read")
+    assert len(mapping.source_fingerprint) == 64
+    with pytest.raises(CoworkExpertNotFound):
+        resolve_expert_mapping(bob, "finance")
+
+    default = resolve_expert_mapping(alice, None)
+    assert default.agent_scope == "lead_agent"
+    assert default.expert_id is None
+    assert default.hermes_tool_scopes == ()
+
+    _write_cowork_expert_manifest(shared)
+    with pytest.raises(CoworkExpertConflict):
+        resolve_expert_mapping(alice, "finance")
+
+
+def test_cowork_expert_mapping_fails_closed_for_disabled_or_incomplete(tmp_path):
+    from hermes_multitenancy.cowork_enterprise import (
+        CoworkCapabilityDenied,
+        CoworkEnterpriseUnavailable,
+        resolve_expert_mapping,
+    )
+
+    shared = tmp_path / "shared"
+    profile = shared / "profiles" / "alice"
+    _write_cowork_expert_manifest(shared, status="disabled")
+    with pytest.raises(CoworkCapabilityDenied):
+        resolve_expert_mapping(profile, "finance")
+
+    for path in (shared / ".hermes-plugin-managed").iterdir():
+        path.unlink()
+    _write_cowork_expert_manifest(shared, agent_scope="")
+    with pytest.raises(CoworkEnterpriseUnavailable):
+        resolve_expert_mapping(profile, "finance")
+
+    for path in (shared / ".hermes-plugin-managed").iterdir():
+        path.unlink()
+    _write_cowork_expert_manifest(
+        shared,
+        agent_scope=None,
+        legacy_agent_scope="legacy_lead",
+    )
+    with pytest.raises(CoworkEnterpriseUnavailable, match="product-specific agent scope"):
+        resolve_expert_mapping(profile, "finance")
+
+    for path in (shared / ".hermes-plugin-managed").iterdir():
+        path.unlink()
+    _write_cowork_expert_manifest(shared, legacy_agent_scope="legacy_lead")
+    with pytest.raises(CoworkEnterpriseUnavailable, match="product-specific agent scope"):
+        resolve_expert_mapping(profile, "finance")
+
+    for path in (shared / ".hermes-plugin-managed").iterdir():
+        path.unlink()
+    _write_cowork_expert_manifest(shared, agent_scope="runtime:lead")
+    with pytest.raises(CoworkEnterpriseUnavailable, match="agent_scope is invalid"):
+        resolve_expert_mapping(profile, "finance")
+
+
+def test_cowork_expert_mapping_resolves_trusted_department_server_side(tmp_path, monkeypatch):
+    from hermes_multitenancy import expert_overlay
+    from hermes_multitenancy.cowork_enterprise import CoworkExpertNotFound, resolve_expert_mapping
+
+    shared = tmp_path / "shared"
+    profile = shared / "profiles" / "alice"
+    _write_cowork_expert_manifest(shared, audience={"department_ids": ["dept-a"]})
+    monkeypatch.setattr(
+        expert_overlay, "resolve_caller_departments",
+        lambda _home, **kwargs: ["dept-a"] if kwargs.get("open_id") == "actor-a" else None,
+    )
+    assert resolve_expert_mapping(profile, "finance", actor_subject="actor-a").expert_id == "finance"
+    with pytest.raises(CoworkExpertNotFound, match="unavailable"):
+        resolve_expert_mapping(profile, "finance", actor_subject="actor-b")
+
+
+def test_cowork_capability_binds_every_dimension_and_is_one_use():
+    from hermes_multitenancy.cowork_enterprise import (
+        CoworkCapabilityDenied,
+        CoworkCapabilityRegistry,
+    )
+
+    clock = [100.0]
+    registry = CoworkCapabilityRegistry(clock=lambda: clock[0])
+    token, _expires_at = registry.issue(
+        profile_name="alice",
+        actor_subject="actor-a",
+        thread_id="thread-a",
+        run_id="run-a",
+        tool="mail.search",
+        scope="mail.read",
+        credential_subject="actor-a",
+        allowed_scopes=("mail.read",),
+        ttl_seconds=30,
+    )
+    assertions = dict(
+        profile_name="alice",
+        actor_subject="actor-a",
+        thread_id="thread-a",
+        run_id="run-a",
+        tool="mail.search",
+        scope="mail.read",
+        credential_subject="actor-a",
+    )
+    with pytest.raises(CoworkCapabilityDenied, match="assertion mismatch"):
+        registry.authorize(token, **(assertions | {"thread_id": "thread-b"}))
+    with pytest.raises(CoworkCapabilityDenied, match="invalid or expired"):
+        registry.authorize(token, **assertions)
+
+    token, _ = registry.issue(
+        profile_name="alice",
+        actor_subject="actor-a",
+        thread_id="thread-a",
+        run_id="run-a",
+        tool="mail.search",
+        scope="mail.read",
+        credential_subject="actor-a",
+        allowed_scopes=("mail.read",),
+    )
+    assert registry.authorize(token, **assertions) == {
+        "tool": "mail.search",
+        "scope": "mail.read",
+        "run_id": "run-a",
+    }
+    with pytest.raises(CoworkCapabilityDenied, match="invalid or expired"):
+        registry.authorize(token, **assertions)
+
+    expiring, _ = registry.issue(
+        profile_name="alice",
+        actor_subject="actor-a",
+        thread_id="thread-a",
+        run_id="run-b",
+        tool="mail.search",
+        scope="mail.read",
+        credential_subject="actor-a",
+        allowed_scopes=("mail.read",),
+        ttl_seconds=1,
+    )
+    clock[0] += 2
+    with pytest.raises(CoworkCapabilityDenied, match="invalid or expired"):
+        registry.authorize(expiring, **(assertions | {"run_id": "run-b"}))
+
+
+def test_cowork_capability_rejects_subject_scope_and_terminal_run():
+    from hermes_multitenancy.cowork_enterprise import (
+        CoworkCapabilityDenied,
+        CoworkCapabilityRegistry,
+    )
+
+    registry = CoworkCapabilityRegistry()
+    base = dict(
+        profile_name="alice",
+        actor_subject="actor-a",
+        thread_id="thread-a",
+        run_id="run-a",
+        tool="mail.search",
+        scope="mail.read",
+        credential_subject="actor-a",
+        allowed_scopes=("mail.read",),
+    )
+    with pytest.raises(CoworkCapabilityDenied, match="credential subject"):
+        registry.issue(**(base | {"credential_subject": "actor-b"}))
+    with pytest.raises(CoworkCapabilityDenied, match="scope"):
+        registry.issue(**(base | {"scope": "mail.write"}))
+    with pytest.raises(CoworkCapabilityDenied, match="scope"):
+        registry.issue(**(base | {"tool": "docs.delete"}))
+
+    token, _ = registry.issue(**base)
+    assert registry.revoke_run(
+        profile_name="alice", actor_subject="actor-a", run_id="run-a"
+    ) == 1
+    with pytest.raises(CoworkCapabilityDenied, match="invalid or expired"):
+        registry.authorize(token, **{key: base[key] for key in (
+            "profile_name", "actor_subject", "thread_id", "run_id", "tool",
+            "scope", "credential_subject",
+        )})
+
+
+def test_cowork_capability_registry_is_bounded():
+    from hermes_multitenancy.cowork_enterprise import (
+        CoworkCapabilityRateLimited,
+        CoworkCapabilityRegistry,
+    )
+
+    registry = CoworkCapabilityRegistry(max_records=1)
+    base = dict(
+        profile_name="alice", actor_subject="actor-a", thread_id="thread-a",
+        run_id="run-a", tool="mail.search", scope="mail.read",
+        credential_subject="actor-a", allowed_scopes=("mail.read",),
+    )
+    registry.issue(**base)
+    with pytest.raises(CoworkCapabilityRateLimited):
+        registry.issue(**(base | {"run_id": "run-b"}))
+
+
+def test_cowork_internal_api_denial_is_redacted_and_never_dispatches(tmp_path, monkeypatch):
+    import json
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_multitenancy.cowork_enterprise import register_routes
+
+    shared = tmp_path / "shared"
+    _write_cowork_expert_manifest(shared)
+    audit_path = tmp_path / "security.jsonl"
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_ENABLED", "1")
+    monkeypatch.setenv("HERMES_MT_SECURITY_AUDIT_PATH", str(audit_path))
+    dispatched = []
+
+    def owner_tenant(_request, body=None, **_kwargs):
+        payload = body or {}
+        return str(payload.get("profile_name") or "alice"), str(payload.get("user_key") or "actor-a")
+
+    async def exercise(credential_bound=True):
+        app = web.Application()
+        register_routes(
+            app,
+            authorize=lambda _request: True,
+            owner_tenant=owner_tenant,
+            profile_home=lambda profile: shared / "profiles" / profile,
+            credential_bound=lambda *_args: credential_bound,
+        )
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            granted = await client.post("/api/run-broker/internal/cowork/capabilities", json={
+                "profile_name": "alice",
+                "user_key": "actor-a",
+                "expert_id": "finance",
+                "thread_id": "thread-a",
+                "run_id": "run-a",
+                "tool": "mail.search",
+                "scope": "mail.read",
+                "credential_subject": "actor-a",
+            })
+            granted_payload = await granted.json()
+            response = await client.post("/api/run-broker/internal/cowork/capabilities", json={
+                "profile_name": "alice",
+                "user_key": "actor-a",
+                "expert_id": "finance",
+                "thread_id": "thread-a",
+                "run_id": "run-a",
+                "tool": "mail.search",
+                "scope": "mail.read",
+                "credential_subject": "actor-b",
+            })
+            return granted.status, granted_payload, response.status, await response.json()
+        finally:
+            await client.close()
+
+    granted_status, granted_payload, status, payload = asyncio.run(exercise())
+    assert granted_status == 201
+    assert granted_payload["capability"]
+    assert status == 403
+    assert payload["code"] == "COWORK_CAPABILITY_DENIED"
+    assert dispatched == []
+    audit_text = audit_path.read_text(encoding="utf-8")
+    events = [json.loads(line) for line in audit_text.splitlines()]
+    assert [event["decision"] for event in events] == ["granted", "denied"]
+    event = events[-1]
+    assert event["decision"] == "denied"
+    assert event["reason"] == "COWORK_CAPABILITY_DENIED"
+    assert event["open_id_hash"]
+    assert "actor-a" not in audit_text
+    assert "actor-b" not in audit_text
+    assert granted_payload["capability"] not in audit_text
+
+    audit_path.unlink()
+    unavailable_status, _, _, _ = asyncio.run(exercise(credential_bound=False))
+    assert unavailable_status == 503
+
+
 def test_run_broker_writes_one_terminal_for_completed_expert(
     monkeypatch,
     tmp_path,

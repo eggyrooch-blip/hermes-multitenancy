@@ -92,7 +92,11 @@ def _shim_program(real_binary: Path) -> str:
                 command_name=command_name,
                 reason=reason,
             )
-            print("Direct execution denied. Use the registered lark_cli tool.", file=sys.stderr)
+            print(
+                "Direct execution denied. Use the registered lark_cli tool."
+                ' Packaged skill scripts run via lark_cli mode="script".',
+                file=sys.stderr,
+            )
             return 126
 
         if __name__ == "__main__":

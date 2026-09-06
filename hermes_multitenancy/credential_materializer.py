@@ -10,10 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -33,6 +34,155 @@ SELF_PROFILE_MARKER = "__self__"
 _DEFAULT_PAYLOAD_KEYS = ("token", "content", "value")
 _FORBIDDEN_TARGET_NAMES = {".env", "auth.json", "feishu_uat.json"}
 _ALL_ACTIVE_PROFILE_MARKERS = {"*", "all", "all_active", "__all_active__"}
+#: Host assumed when a GitLab entry carries no ``GITLAB_HOST`` companion var.
+DEFAULT_GITLAB_HOST = "gitlab.example.com"
+#: A host must be usable verbatim inside a git config KEY. Anything else (a
+#: space, a quote, a path) would render a config line git cannot parse, so it
+#: falls back to the deployment default rather than emitting a broken key.
+#: Size matters as much as shape: the host is copied into five env values, so an
+#: oversized vault value is amplified until `execve` refuses the whole subprocess
+#: with E2BIG — i.e. every tool call for that profile dies, not just git. Hence
+#: real DNS limits (253 bytes total, 63 per label) rather than "no weird chars".
+_GIT_HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_GIT_HOST_MAX_LEN = 253
+_GIT_PORT_RE = re.compile(r"[0-9]{1,5}")
+
+
+def _normalized_git_host(raw: Any) -> str:
+    """A host safe to interpolate into git config, or the deployment default."""
+    host = str(raw or "").strip()
+    if len(host) > _GIT_HOST_MAX_LEN + 16:  # scheme/port slack; anything longer is not a host
+        return DEFAULT_GITLAB_HOST
+    host = host.split("://", 1)[-1].strip().strip("/")
+    host, has_port, port = host.partition(":")
+    # `str.isdigit()` is Unicode-aware: it says yes to '²' (which int() then
+    # REJECTS with ValueError) and to full-width/Arabic-Indic digits (which
+    # int() silently accepts, leaving a non-ASCII port in the config). A raise
+    # here is the worse half — both producers catch broadly, so one odd vault
+    # value would drop the whole credential env and the agent is back to
+    # unauthenticated git. ASCII digits only, checked before int().
+    if has_port and not (_GIT_PORT_RE.fullmatch(port) and 1 <= int(port) <= 65535):
+        return DEFAULT_GITLAB_HOST
+    if not host or len(host) > _GIT_HOST_MAX_LEN:
+        return DEFAULT_GITLAB_HOST
+    if not all(_GIT_HOST_LABEL_RE.fullmatch(label) for label in host.split(".")):
+        return DEFAULT_GITLAB_HOST
+    return f"{host}:{port}" if has_port else host
+
+
+#: The token env name is interpolated into a shell credential helper, so it is
+#: held to plain identifier shape — a config typo must not become a command.
+_GIT_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def git_auth_env(
+    env: Mapping[str, str],
+    *,
+    token_env_name: str = "GITLAB_TOKEN",
+) -> dict[str, str]:
+    """The extra env that lets plain ``git`` use an injected GitLab token.
+
+    ``GITLAB_TOKEN``/``GITLAB_HOST`` drive ``glab``, but bare ``git`` reads
+    neither: over https it prompts for a username (in a non-interactive agent
+    run that is ``fatal: could not read Username``), and over ``git@host:`` it
+    wants an ssh key the profile-pivoted HOME does not have. 2026-08-26: an
+    employee with a valid write-scoped token was told by the agent that "this
+    Hermes environment cannot reach your internal git".
+
+    Returns ``GIT_TERMINAL_PROMPT=0`` plus ``GIT_CONFIG_COUNT``/``KEY_n``/
+    ``VALUE_n`` entries (git's env-only config channel, ≥ 2.31) that:
+
+      * answer credential requests for the host with ``oauth2`` + the token,
+        read from ``$<token_env_name>`` **when git asks** — the literal never
+        enters a config value, so it cannot be recovered from the rendered git
+        config, only from the env var that already carries it;
+      * rewrite both ssh forms of the host to https, so a model that types the
+        conventional ``git@host:group/repo.git`` still authenticates.
+
+    Empty dict unless a non-empty token is present: half an env (rewrites but
+    no credential, or a helper reading an unset variable) fails later and less
+    legibly than no env at all. Any ``GIT_CONFIG_COUNT`` already in ``env`` is
+    extended, never overwritten.
+    """
+    token = str((env or {}).get(token_env_name) or "").strip()
+    if not token or not _GIT_ENV_NAME_RE.match(str(token_env_name or "")):
+        return {}
+
+    host = _normalized_git_host((env or {}).get("GITLAB_HOST"))
+
+    https = f"https://{host}/"
+    pairs = (
+        (
+            f"credential.https://{host}.helper",
+            "!f(){ printf 'username=oauth2\\npassword=%s\\n' "
+            f'"${token_env_name}"; }}; f',
+        ),
+        (f"url.{https}.insteadOf", f"git@{host}:"),
+        (f"url.{https}.insteadOf", f"ssh://git@{host}/"),
+    )
+
+    try:
+        start = max(0, int(str((env or {}).get("GIT_CONFIG_COUNT") or "0").strip()))
+    except (TypeError, ValueError):
+        start = 0
+
+    extra = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": str(start + len(pairs))}
+    for offset, (key, value) in enumerate(pairs):
+        extra[f"GIT_CONFIG_KEY_{start + offset}"] = key
+        extra[f"GIT_CONFIG_VALUE_{start + offset}"] = value
+    return extra
+
+
+#: A profile name is copied verbatim into git config values (user.name and the
+#: local-part of user.email); confine it to charset that cannot break either.
+_GIT_IDENTITY_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def git_identity_env(env: Mapping[str, str], *, profile: str) -> dict[str, str]:
+    """Commit identity (``user.name``/``user.email``) for the pivoted runtime.
+
+    The profile-pivoted HOME has no ``~/.gitconfig``, so the first
+    ``git commit`` dies with "Please tell me who you are". 2026-08-26 guide-repo
+    session: the agent had to break flow mid-commit, ask the user for a
+    name/email, and improvise an address the user then had to vouch for.
+
+    Same env-only config channel as :func:`git_auth_env`, appended to whatever
+    ``GIT_CONFIG_COUNT`` the given ``env`` already carries. Skipped entirely
+    when a ``user.name``/``user.email`` pair is already present — an explicit
+    identity (operator-provided, or a future per-profile config) outranks the
+    derived one, and git lets later entries win so ours must not come after it.
+
+    The address is the GitLab noreply convention
+    (``<profile>@users.noreply.<host>``), NOT a guessed corporate mailbox:
+    commits stay attributable to the profile without impersonating a real
+    inbox nobody authorized.
+    """
+    profile = str(profile or "").strip()
+    if not _GIT_IDENTITY_PROFILE_RE.fullmatch(profile):
+        return {}
+
+    try:
+        start = max(0, int(str((env or {}).get("GIT_CONFIG_COUNT") or "0").strip()))
+    except (TypeError, ValueError):
+        start = 0
+    existing = {
+        str((env or {}).get(f"GIT_CONFIG_KEY_{index}") or "").strip().lower()
+        for index in range(start)
+    }
+    if "user.name" in existing or "user.email" in existing:
+        return {}
+
+    # Email must not carry a port; the host default matches the deployment.
+    host = _normalized_git_host((env or {}).get("GITLAB_HOST")).partition(":")[0]
+    pairs = (
+        ("user.name", profile),
+        ("user.email", f"{profile}@users.noreply.{host}"),
+    )
+    extra = {"GIT_CONFIG_COUNT": str(start + len(pairs))}
+    for offset, (key, value) in enumerate(pairs):
+        extra[f"GIT_CONFIG_KEY_{start + offset}"] = key
+        extra[f"GIT_CONFIG_VALUE_{start + offset}"] = value
+    return extra
 
 
 def materialize_credentials(

@@ -40,10 +40,16 @@ Thumbs.db
 /CLAUDE.md
 /AGENTS.md
 /ISA-*.md
-/.ftask/
+/.ftask/*
+# ftask tiered CI manifest + lock are repo contract, not audit trail — tracked on purpose
+!/.ftask/ci.yml
+!/.ftask/ci.lock.yml
 /docs/plans/
 
 # ftask: per-slug runtime files (env + sim artifacts) — never committed
 .ftask/*/STATE.json
 .ftask/*/STATE.json.tmp
 .gstack/
+
+# ftask: per-slug runtime files (env + sim artifacts) — never committed
+.ftask/*/qa/

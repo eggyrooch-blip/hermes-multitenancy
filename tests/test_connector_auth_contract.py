@@ -15,9 +15,191 @@ It also pins the action-dict round-trip per ``kind`` and the kep-cli expired-JWT
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 import hashlib
 import json
+import os
+from pathlib import Path
+import subprocess
 import time
+
+import pytest
+
+
+def _oauth_connector_ids() -> tuple[str, ...]:
+    from hermes_multitenancy.connectors.builtin import BUILTIN_CONNECTORS
+
+    return tuple(
+        connector_id
+        for connector_id, definition in BUILTIN_CONNECTORS.items()
+        if definition.ui.action in {"oauth_url", "feishu_device_flow"}
+        and definition.invocation.detail
+    )
+
+
+@pytest.mark.parametrize("connector_id", _oauth_connector_ids())
+def test_every_registered_oauth_cli_has_a_headless_stop_gate(
+    connector_id,
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy.connectors.builtin import BUILTIN_CONNECTORS
+    from hermes_multitenancy.oauth_cli_guard import OAUTH_CLI_GATE_BY_DETAIL
+
+    definition = BUILTIN_CONNECTORS[connector_id]
+    gate = OAUTH_CLI_GATE_BY_DETAIL.get(definition.invocation.detail)
+    assert gate is not None, f"unmapped OAuth CLI: {definition.invocation.detail}"
+    real = tmp_path / f"real-{connector_id}"
+    marker = tmp_path / f"spawned-{connector_id}"
+    real.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    real.chmod(0o755)
+
+    if gate == "lark-registered-tool":
+        from hermes_multitenancy import lark_cli_tool
+
+        monkeypatch.setattr(
+            lark_cli_tool.subprocess,
+            "run",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("registered OAuth gate launched lark-cli")
+            ),
+        )
+        raw = lark_cli_tool._handle_lark_cli_execute(
+            {
+                "mode": "shortcut",
+                "argv": ["--profile", "personal", "auth", "login"],
+                "risk": "write",
+                "reason": "inventory gate probe",
+            }
+        )
+        result = raw if isinstance(raw, dict) else json.loads(raw)
+        assert result["error_code"] == "FEISHU_AUTH_INTERACTIVE_BLOCKED"
+        rendered = json.dumps(result).lower()
+    elif gate == "meegle-shim":
+        from hermes_multitenancy.oauth_cli_guard import install_meegle_oauth_guard
+
+        wrapper = install_meegle_oauth_guard(tmp_path / "meegle-shim", real_binary=real)
+        denied = subprocess.run(
+            [str(wrapper), "auth"], text=True, capture_output=True, check=False
+        )
+        assert denied.returncode == 77
+        rendered = f"{denied.stdout}\n{denied.stderr}".lower()
+    elif gate == "kep-auth-shim":
+        from hermes_multitenancy.kep_cli_guard import install_kep_cli_shim
+
+        [wrapper] = install_kep_cli_shim(
+            tmp_path / f"kep-shim-{connector_id}",
+            real_bins={"kep-auth": str(real)},
+            expected_profile="alice",
+        )
+        denied = subprocess.run(
+            [str(wrapper), "auth"],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "KEP_PROFILE": "alice"},
+            check=False,
+        )
+        assert denied.returncode == 77
+        rendered = f"{denied.stdout}\n{denied.stderr}".lower()
+    else:
+        pytest.fail(f"OAuth CLI gate {gate!r} has no executable contract probe")
+
+    assert not marker.exists()
+    assert "token" not in rendered
+
+
+def test_oauth_connector_inventory_is_complete():
+    from hermes_multitenancy.connectors.builtin import BUILTIN_CONNECTORS
+
+    assert set(_oauth_connector_ids()) == {
+        connector_id
+        for connector_id, definition in BUILTIN_CONNECTORS.items()
+        if definition.ui.action in {"oauth_url", "feishu_device_flow"}
+    }
+
+
+def test_unknown_registered_oauth_cli_detail_fails_closed_at_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.connectors.builtin import BUILTIN_CONNECTORS
+
+    existing = BUILTIN_CONNECTORS["feishu-project"]
+    monkeypatch.setitem(
+        BUILTIN_CONNECTORS,
+        "qa-new-oauth",
+        replace(
+            existing,
+            id="qa-new-oauth",
+            invocation=replace(existing.invocation, detail="qa-new-cli"),
+        ),
+    )
+    shared_home = tmp_path / ".hermes"
+    shared_bin = shared_home / "bin"
+    shared_bin.mkdir(parents=True)
+    lark = shared_bin / "lark-cli-authsidecar"
+    lark.write_text("#!/bin/sh\n", encoding="utf-8")
+    lark.chmod(0o755)
+    profile = shared_home / "profiles" / "alice"
+    approval_dir = tmp_path / "approval"
+    approval_dir.mkdir()
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    with pytest.raises(RuntimeError, match="qa-new-cli"):
+        agent_real._build_subprocess_env(profile, approval_dir=approval_dir)
+
+
+def test_meegle_oauth_guard_blocks_bare_auth_and_login_but_allows_status(tmp_path):
+    from hermes_multitenancy.oauth_cli_guard import install_meegle_oauth_guard
+
+    marker = tmp_path / "spawned"
+    real = tmp_path / "real-meegle"
+    real.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    real.chmod(0o755)
+    wrapper = install_meegle_oauth_guard(tmp_path / "shim", real_binary=real)
+
+    for argv in (
+        ["auth"],
+        ["--profile", "alice", "auth", "login"],
+        ["signin"],
+        ["authorize"],
+        ["-p", "login"],
+        ["--env", "oauth"],
+    ):
+        denied = subprocess.run(
+            [str(wrapper), *argv],
+            text=True,
+            capture_output=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+        assert denied.returncode == 77
+        assert not marker.exists()
+        assert "Connectors authorization link" in denied.stderr
+
+    allowed = subprocess.run(
+        [str(wrapper), "--profile", "alice", "auth", "status"],
+        env=os.environ.copy(),
+        check=False,
+    )
+    assert allowed.returncode == 0
+    assert marker.exists()
+
+
+def test_meegle_oauth_guard_rejects_real_binary_resolving_to_its_own_shim(tmp_path):
+    from hermes_multitenancy.oauth_cli_guard import install_meegle_oauth_guard
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    wrapper = shim_dir / "meegle"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    alias = tmp_path / "meegle-alias"
+    alias.symlink_to(wrapper)
+
+    with pytest.raises(ValueError, match="shim"):
+        install_meegle_oauth_guard(shim_dir, real_binary=alias)
 
 
 # --- helpers (mirrors test_credential_hub conventions) ----------------------

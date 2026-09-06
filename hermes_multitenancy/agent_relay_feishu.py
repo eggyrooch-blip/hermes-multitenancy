@@ -326,6 +326,20 @@ class FeishuRelayClient:
                 message_id=str(context.get("open_message_id") or ""),
                 action_id=str(value.get("action_id") or ""),
             )
+        if event_type == "card_action_replay":
+            # 与 card_action 同一套字段提取；只在 ingest 判定为重复点击后才会走到这里
+            action = event.get("action") or {}
+            value = action.get("value") or {}
+            if not isinstance(value, dict) or value.get("relay_action") is not True:
+                return None
+            operator = event.get("operator") or {}
+            context = event.get("context") or {}
+            return await events.replay_card_content(
+                actor_id=str(operator.get("open_id") or ""),
+                card_id=str(value.get("card_id") or ""),
+                nonce=str(value.get("nonce") or ""),
+                message_id=str(context.get("open_message_id") or ""),
+            )
         return False
 
     def start_event_stream(
@@ -361,7 +375,21 @@ class FeishuRelayClient:
             accepted = submit(
                 self.ingest_event_payload(events, "card_action", payload), "card_action"
             ).result(timeout=2)
-            return self._toast("Recorded" if accepted else "Already resolved", "success" if accepted else "info")
+            if accepted:
+                return self._ack("Recorded", "success")
+            # 重复点击：ack 必须回放最新内容。飞书会把会话流渲染钉在这次 ack 的
+            # 版本上（不带卡片 = 钉住点击时客户端手里的旧样，永久且跨设备；
+            # 2026-08-27 受控矩阵 4/4 复现）。整个 ack 有 3 秒预算，上面已花 2 秒，
+            # 这里只留 0.8 秒 —— 本地 sqlite 读取绰绰有余，超了宁可退回纯 toast。
+            try:
+                replay = submit(
+                    self.ingest_event_payload(events, "card_action_replay", payload),
+                    "card_action_replay",
+                ).result(timeout=0.8)
+            except Exception:
+                replay = None
+            return self._ack("Already resolved", "info",
+                             card=replay if isinstance(replay, dict) else None)
 
         handler = (
             EventDispatcherHandler.builder("", "")
@@ -453,9 +481,13 @@ class FeishuRelayClient:
         return stop_event_stream
 
     @staticmethod
-    def _toast(content: str, level: str) -> Any:
+    def _ack(content: str, level: str, card: dict[str, Any] | None = None) -> Any:
         from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
 
         response = P2CardActionTriggerResponse()
         response.toast = {"type": level, "content": content}
+        if card is not None:
+            # 官方三种 ack 方式之一「更新卡片」：客户端按这份内容重渲染这条消息。
+            # 我们的卡都是 JSON 1.0 结构，原样回放即满足「版本必须匹配」的约束。
+            response.card = {"type": "raw", "data": card}
         return response

@@ -378,6 +378,7 @@ def _install_fake_scheduler(monkeypatch) -> tuple[types.ModuleType, list[dict]]:
 
     fake_scheduler = types.ModuleType("cron.scheduler")
     fake_scheduler._deliver_result = original_deliver_result  # type: ignore[attr-defined]
+    fake_scheduler._resolve_delivery_targets = lambda _job: []  # type: ignore[attr-defined]
     fake_cron = types.ModuleType("cron")
     fake_cron.scheduler = fake_scheduler  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "cron", fake_cron)

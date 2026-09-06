@@ -271,7 +271,7 @@ def test_lark_cli_history_sanitizer_removes_stale_bot_identity_note():
         "测试标记：CALENDAR\n\n"
         "命令执行成功，但今天日程数量为 0。\n"
         "当前 bot 身份下的 primary 日历今日无日程。",
-        Path("/Users/dev/.hermes/profiles/feishu_g41a5b5g"),
+        Path("/Users/hermes/.hermes/profiles/feishu_g41a5b5g"),
     )
     assert "bot 身份" not in display
     assert "今天日程数量为 0" in display

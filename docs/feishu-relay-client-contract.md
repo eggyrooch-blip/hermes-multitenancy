@@ -414,7 +414,72 @@ stateDiagram-v2
 
 ---
 
-## 6. 已知限制
+## 6. 管理面 `/v1/admin/*`（只读，管理员专用）
+
+> 给 relay 客户端管理员自查用：不建日志服务器，直接按时间窗拉 relay 模块的日志与用量。
+> **两个接口的鉴权与参数校验完全一致**。
+
+### 6.1 鉴权 —— 与 actor token 是两套东西
+
+| 项 | 契约 |
+|---|---|
+| 请求头 | `Authorization: Bearer <HERMES_AGENT_RELAY_ADMIN_TOKEN>` |
+| 比对 | `hmac.compare_digest`，明文等值，不入库、不哈希 |
+| 无 `Bearer ` 头 | `401 unauthorized` |
+| token 不匹配 **或环境变量未配置** | `403 forbidden`（fail-closed：没配就是谁都进不来） |
+| 普通 relay token | `403 forbidden` —— 有效的 actor token 不等于管理员 |
+
+**发布前置（root 手工，不在代码里）**：生产 `/etc/hermes-agent-relay.env` 增加
+`HERMES_AGENT_RELAY_ADMIN_TOKEN=<随机串>`，`sync_relay` 重启后生效。不加这行，
+两个接口对所有人返回 403，relay 其余功能不受影响。
+
+### 6.2 时间窗参数（两个接口共用）
+
+`since` / `until` 都是**必填**的毫秒时间戳整数，必须 `until > since` 且窗口 ≤ 7 天，
+两端闭区间。任一条不满足 → `400 invalid_range`。
+
+### 6.3 `GET /v1/admin/logs`
+
+返回 `{"items":[...], "truncated": false}`，`items` 按 `ts` 升序（同毫秒按写入顺序）。
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 单调递增的行号，配合 `ts` 做续拉游标 |
+| `ts` | 毫秒时间戳 |
+| `level` | `INFO` / `WARNING` / `ERROR` … |
+| `logger` | 日志器名，如 `hermes_multitenancy.agent_relay`、`Lark` |
+| `event` `status` `actor` `card_id` `message_id` | 从行文本里的 `event=` `status=` `actor=` `card=` `msg=` 解析出来；解析不到就是空字符串 |
+| `raw` | 与 journald 里那一行**完全相同**的原文 |
+
+**入库范围**：所有 `relay_audit ` 开头的行（任意级别），加上任意 logger 的 `≥WARNING`。
+其他 logger 的 INFO/DEBUG 不入库。非 `logging` 产生的输出（aiohttp banner、SDK 的 `print`）拿不到。
+
+**截断**：单次最多 5000 条；超出时截断并返回 `"truncated": true`。
+续拉用 keyset 游标：`since=<最后一条的 ts>&after_id=<最后一条的 id>`（`until` 不变）。
+只用 `ts` 续拉在同毫秒多条时会原地打转——`after_id` 才能穿过同毫秒的并列行。
+
+**留存 30 天**，由既有的每小时 `prune()` 删除。journald 那一份不受影响。
+
+`raw` 是脱敏后的审计原文，不含消息/卡片正文，`actor` 是 12 位指纹哈希不是 `open_id`。
+
+### 6.4 `GET /v1/admin/stats`
+
+```json
+{"messages":{"total":2,"by_kind":{"text":2}},
+ "cards":{"total":1,"by_status":{"pending":1}},
+ "active_users":2,"enrolled_users":2}
+```
+
+| 字段 | 口径 |
+|---|---|
+| `messages` | 窗口内创建、`status='sent'` 的 `relay_messages`，按 `kind` 分组。**不含**按钮卡为回复兜底补登的那一行（那是一张卡，不是第二条消息） |
+| `cards` | 窗口内创建的 `relay_cards`，按当前 `status` 分组 |
+| `active_users` | 窗口内有消息或卡片的 token，去重到 actor 指纹 |
+| `enrolled_users` | 当前 `status='active'` 的 token 去重到 actor 指纹，**与时间窗无关** |
+
+---
+
+## 7. 已知限制
 
 | # | 限制 | 依据 |
 |---|---|---|

@@ -16,8 +16,13 @@ RunEventKind = Literal[
     "approval_required",
     "approval_resolved",
     "auth_required",
+    "auth_resolved",
+    "gate_required",
+    "gate_resolved",
+    "workflow_stage",
     "done",
     "error",
+    "heartbeat",  # t02: zero-model status ping, see agent_real/codex_event_heartbeat.py
 ]
 
 _VALID_CHANNELS = {"feishu", "webui", "cron", "kanban"}

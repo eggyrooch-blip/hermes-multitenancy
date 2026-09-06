@@ -64,6 +64,7 @@ def _deliver_cron_feishu_via_live_adapter(
     loop: Any = None,
     require_receipt: bool = False,
     targets_override: Optional[list[dict]] = None,
+    receipt_out: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Fallback for multitenancy gateways where Feishu exists only as a live adapter."""
     if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
@@ -98,7 +99,7 @@ def _deliver_cron_feishu_via_live_adapter(
     card: Optional[dict] = None
     card_sender_name = "_send_raw_message" if require_receipt else "_feishu_send_with_retry"
     if (
-        text_to_send
+        (text_to_send or media_files)
         and _cw._cron_card_response_enabled()
         and callable(getattr(adapter, card_sender_name, None))
     ):
@@ -127,6 +128,7 @@ def _deliver_cron_feishu_via_live_adapter(
                 card_error = _cw._send_cron_card_via_live_adapter(
                     adapter, chat_id, card, metadata, loop,
                     require_receipt=require_receipt,
+                    receipt_out=receipt_out,
                 )
                 if card_error is None:
                     sent_payload = True
@@ -175,6 +177,8 @@ def _deliver_cron_feishu_via_live_adapter(
                 if require_receipt and not str(getattr(result, "message_id", "") or "").strip():
                     errors.append("feishu live adapter send missing message_id")
                     continue
+                if require_receipt and receipt_out is not None:
+                    receipt_out["message_id"] = str(result.message_id).strip()
             if media_files:
                 media_error = _cw._send_media_files_via_live_adapter(
                     adapter,
@@ -255,6 +259,7 @@ def _send_cron_card_via_live_adapter(
     loop: Any,
     *,
     require_receipt: bool = False,
+    receipt_out: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Send one interactive card on the gateway loop. Returns error str or None.
 
@@ -311,6 +316,8 @@ def _send_cron_card_via_live_adapter(
             )
         if require_receipt and not str(getattr(result, "message_id", "") or "").strip():
             return "feishu card send missing message_id"
+        if require_receipt and receipt_out is not None:
+            receipt_out["message_id"] = str(result.message_id).strip()
         return None
     except Exception as exc:
         return f"feishu card send raised for {chat_id}: {exc}"
@@ -328,7 +335,7 @@ def _send_media_files_via_live_adapter(
         import cron.scheduler as scheduler
         from gateway.config import Platform
 
-        scheduler._send_media_via_adapter(
+        receipt = scheduler._send_media_via_adapter(
             adapter,
             chat_id,
             media_files,
@@ -337,6 +344,9 @@ def _send_media_files_via_live_adapter(
             job,
             platform=Platform("feishu"),
         )
+        if getattr(receipt, "success", None) is not True:
+            code = str(getattr(receipt, "error_code", None) or "unconfirmed")
+            return f"cron media delivery unconfirmed ({code})"
         return None
     except Exception:
         logger.warning("[multitenancy] cron media delivery via live Feishu adapter failed", exc_info=True)

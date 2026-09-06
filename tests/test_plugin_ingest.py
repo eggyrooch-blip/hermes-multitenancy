@@ -131,21 +131,32 @@ def test_load_manifest_rejects_unsafe_plugin_id(tmp_path):
         pi.load_plugin_manifest(repo)
 
 
-@pytest.mark.parametrize("missing", ["entry", "orchestrator"])
-def test_load_manifest_requires_entry_and_orchestrator(tmp_path, missing):
+def test_load_manifest_requires_entry_for_governed_plugin(tmp_path):
     repo = _write_plugin_repo(tmp_path / "plug")
     mf = repo / pi.PLUGIN_MANIFEST_REL
     data = json.loads(mf.read_text(encoding="utf-8"))
-    if missing == "entry":
-        data.pop("entry_skill")
-    else:
-        data["skills"]["list"] = [
-            name for name in data["skills"]["list"] if "orchestrat" not in name
-        ]
+    data.pop("entry_skill")
     mf.write_text(json.dumps(data), encoding="utf-8")
 
-    with pytest.raises(pi.PluginIngestError, match=missing):
+    with pytest.raises(pi.PluginIngestError, match="entry"):
         pi.load_plugin_manifest(repo)
+
+
+def test_ingest_governed_plugin_without_orchestrator_is_advisory(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", skills=["keep-product"])
+    home = _shared_home(tmp_path)
+    plugin = pi.load_plugin_manifest(repo)
+    assert plugin["governance"]["approval_required"]
+    assert plugin["entry_skill"] == "keep-product"
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home)
+
+    assert Path(report["managed_manifest"]).exists()
+    assert report["profile_governance"]
+    assert any(
+        "orchestrator skills must be declared" in warning
+        for warning in report["profile_governance"][0]["governance_warnings"]
+    )
 
 
 def test_load_manifest_rejects_unsafe_cli_id(tmp_path):
@@ -511,20 +522,93 @@ def test_nonprofile_governance_warns_but_distributes(tmp_path, audience):
     assert (home / pi.MANAGED_DIR / "test-plugin.json").exists()
 
 
-def test_profile_ingest_rejects_shared_source_owned_by_other_plugin(tmp_path):
-    first = _write_plugin_repo(tmp_path / "first")
-    home = _shared_home(tmp_path)
-    pi.ingest(first, audience="feishu_test", shared_home=home)
-    second = _write_plugin_repo(tmp_path / "second")
+def test_profile_ingest_namespaces_collision_without_revoking_expert(tmp_path):
+    from hermes_multitenancy import expert_overlay
+
+    first = _write_plugin_repo(tmp_path / "first", plugin_id="first-plugin", skills=["shared-name"])
+    home = _shared_home(tmp_path, profiles=("feishu_a", "feishu_b"))
+    pi.ingest(first, audience="feishu_a", shared_home=home)
+    second = _write_plugin_repo(tmp_path / "second", plugin_id="second-plugin", skills=["shared-name"])
+    (second / "skills" / "shared-name" / "SKILL.md").write_text(
+        "---\nname: shared-name\n---\nsecond plugin body\n", encoding="utf-8"
+    )
     manifest_path = second / pi.PLUGIN_MANIFEST_REL
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["id"] = "other-plugin"
+    manifest["id"] = "second-plugin"
+    manifest["experts"] = [{
+        "id": "second-expert",
+        "name": "Second Expert",
+        "agent_md": "./agents/second-expert.md",
+        "skills": ["shared-name"],
+    }]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (second / "agents").mkdir()
+    (second / "agents" / "second-expert.md").write_text("# Second expert\n", encoding="utf-8")
 
-    with pytest.raises(pi.PluginIngestError, match="belongs to plugin 'test-plugin'"):
-        pi.ingest(second, audience="feishu_test", shared_home=home)
+    report = pi.ingest(second, audience="feishu_a,feishu_b", shared_home=home)
 
-    assert not (home / pi.MANAGED_DIR / "other-plugin.json").exists()
+    first_target = home / "profiles" / "feishu_a" / "skills" / "shared-name"
+    second_target = home / "profiles" / "feishu_b" / "skills" / "shared-name"
+    assert pi._skill_tree_digest(first_target) == pi._skill_tree_digest(first / "skills" / "shared-name")
+    assert pi._skill_tree_digest(second_target) == pi._skill_tree_digest(second / "skills" / "shared-name")
+    assert report["skills"]["excluded_profiles"] == []
+    managed = json.loads(
+        (home / pi.MANAGED_DIR / "second-plugin.json").read_text(encoding="utf-8")
+    )
+    assert managed["audience"]["profiles"] == ["feishu_a", "feishu_b"]
+    assert set(managed["owned_skills"]) == {"feishu_b"}
+    assert expert_overlay.resolve_expert(
+        home / "profiles" / "feishu_a", "second-expert"
+    ) is not None
+
+    private_root = home / pi.MANAGED_DIR / ".sources" / "second-plugin"
+    assert private_root.is_dir()
+    (second / "skills" / "shared-name" / "SKILL.md").write_text(
+        "---\nname: shared-name\n---\nsecond plugin updated\n", encoding="utf-8"
+    )
+    pi.ingest(second, audience="feishu_a,feishu_b", shared_home=home)
+    assert pi._skill_tree_digest(second_target) == pi._skill_tree_digest(
+        second / "skills" / "shared-name"
+    )
+
+    pi.uninstall("second-plugin", shared_home=home)
+    assert first_target.exists()
+    assert not second_target.exists()
+    assert not private_root.exists()
+
+
+def test_profile_reingest_drops_conflicted_skill_ownership_without_revoking_profile(tmp_path):
+    repo = _write_plugin_repo(
+        tmp_path / "plug", skills=["owned-name", "conflicted-name"]
+    )
+    home = _shared_home(tmp_path)
+    pi.ingest(repo, audience="feishu_test", shared_home=home)
+    profile_skills = home / "profiles" / "feishu_test" / "skills"
+    conflicted = profile_skills / "conflicted-name"
+    if conflicted.is_symlink():
+        conflicted.unlink()
+    else:
+        shutil.rmtree(conflicted)
+    conflicted.mkdir()
+    (conflicted / "SKILL.md").write_text("employee version\n", encoding="utf-8")
+    personal_path = profile_skills / ".hermes-personal-installs.json"
+    personal = json.loads(personal_path.read_text(encoding="utf-8"))
+    personal["skills"]["conflicted-name"]["target"] = str(tmp_path / "employee-source")
+    personal_path.write_text(json.dumps(personal), encoding="utf-8")
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home, force=True)
+
+    assert report["effective_profiles"] == ["feishu_test"]
+    managed = json.loads(
+        (home / pi.MANAGED_DIR / "test-plugin.json").read_text(encoding="utf-8")
+    )
+    assert managed["status"] == "active"
+    assert managed["audience"]["profiles"] == ["feishu_test"]
+    assert managed["owned_skills"]["feishu_test"] == ["owned-name"]
+
+    pi.uninstall("test-plugin", shared_home=home)
+    assert not (profile_skills / "owned-name").exists()
+    assert conflicted.exists()
 
 
 def test_legacy_shared_source_migration_rejects_multiple_manifest_claims(tmp_path):
@@ -660,9 +744,20 @@ def test_load_manifest_rejects_absolute_skills_dir(tmp_path):
         pi.load_plugin_manifest(repo)
 
 
-def test_load_manifest_online_default_rejected(tmp_path):
+def test_ingest_online_default_succeeds_and_preserves_governance(tmp_path):
     repo = _write_plugin_repo(tmp_path / "plug", env_default="online")
-    with pytest.raises(pi.PluginIngestError, match="online-by-default is forbidden"):
+    home = _shared_home(tmp_path)
+
+    report = pi.ingest(repo, audience="feishu_test", shared_home=home, activate=True)
+
+    assert report["governance"]["env_default"] == "online"
+    managed = json.loads(Path(report["managed_manifest"]).read_text(encoding="utf-8"))
+    assert managed["governance"]["env_default"] == "online"
+
+
+def test_load_manifest_rejects_unknown_env_default(tmp_path):
+    repo = _write_plugin_repo(tmp_path / "plug", env_default="typo")
+    with pytest.raises(pi.PluginIngestError, match="governance.env_default"):
         pi.load_plugin_manifest(repo)
 
 
@@ -1167,3 +1262,103 @@ def test_standalone_install_blocks_during_first_plugin_ingest(tmp_path, monkeypa
     b.join(SYNC_TIMEOUT)
     assert not a.is_alive() and not b.is_alive()
     assert results["standalone"]["status"] == "skipped-plugin-owned"
+
+
+# ─────────────────────── shared-skill ownership handover ───────────────────────
+# 2026-09-04 kep-ub-gen incident: plugin A shipped a skill into shared skills/, plugin B
+# later shipped a newer copy of the same skill, got namespaced away, and every profile
+# already linked to A's copy was silently `skipped-foreign` — 15 profiles stuck on a
+# stale script. Handover must be automatic once A stops declaring the skill, explicit
+# via handover_from while A still does, and loud (link_summary) when neither applies.
+
+def _two_plugins(tmp_path, *, b_body="B version\n"):
+    home = _shared_home(tmp_path)
+    repo_a = _write_plugin_repo(tmp_path / "plugA", plugin_id="plug-a", skills=["kep-ub-gen"])
+    repo_b = _write_plugin_repo(tmp_path / "plugB", plugin_id="plug-b", skills=["kep-ub-gen"])
+    (repo_b / "skills" / "kep-ub-gen" / "SKILL.md").write_text(
+        "---\nname: kep-ub-gen\n---\n" + b_body, encoding="utf-8"
+    )
+    return home, repo_a, repo_b
+
+
+def _drop_skill_from_manifest(home, plugin_id, name):
+    path = home / pi.MANAGED_DIR / f"{plugin_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["skills"] = [s for s in data["skills"] if s != name]
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _ledger_target(home, profile, name):
+    data = json.loads((home / "profiles" / profile / "skills" / ".hermes-personal-installs.json").read_text())
+    return data["skills"][name]["target"]
+
+
+def _owners(home):
+    return json.loads((home / pi.MANAGED_DIR / ".locks" / "source-owners.json").read_text())["skills"]
+
+
+def test_handover_when_former_owner_dropped_skill(tmp_path):
+    home, repo_a, repo_b = _two_plugins(tmp_path)
+    pi.ingest(repo_a, audience="feishu_test", shared_home=home)
+    shared = home / "skills" / "kep-ub-gen"
+    assert Path(_ledger_target(home, "feishu_test", "kep-ub-gen")).resolve() == shared.resolve()
+    _drop_skill_from_manifest(home, "plug-a", "kep-ub-gen")  # A's new release no longer ships it
+
+    report = pi.ingest(repo_b, audience="feishu_test", shared_home=home)
+
+    assert report["skills"]["source_actions"]["kep-ub-gen"] == "handover-registered"
+    acts = {i["skill"]: i["action"] for i in report["skills"]["installed"]}
+    assert acts["kep-ub-gen"] == "handover-relinked"
+    assert (shared / "SKILL.md").read_text(encoding="utf-8").endswith("B version\n")
+    linked = home / "profiles" / "feishu_test" / "skills" / "kep-ub-gen" / "SKILL.md"
+    assert linked.read_text(encoding="utf-8").endswith("B version\n")  # the profile sees B now
+    owner = _owners(home)["kep-ub-gen"]
+    assert owner["plugin_id"] == "plug-b" and owner["handover_from"] == "plug-a"
+    assert any(p.name.startswith(".kep-ub-gen.handover-") for p in (home / "skills").iterdir())  # A's bytes kept
+    assert report["skills"]["link_summary"]["handover_relinked"] == 1
+    assert "kep-ub-gen" in report["skills"]["owned"]["feishu_test"]
+
+
+def test_no_handover_while_former_owner_still_declares_but_summary_is_loud(tmp_path):
+    home, repo_a, repo_b = _two_plugins(tmp_path)
+    pi.ingest(repo_a, audience="feishu_test", shared_home=home)
+
+    report = pi.ingest(repo_b, audience="feishu_test", shared_home=home)
+
+    assert report["skills"]["source_actions"]["kep-ub-gen"] == "namespaced-registered"
+    acts = {i["skill"]: i["action"] for i in report["skills"]["installed"]}
+    assert acts["kep-ub-gen"] == "skipped-foreign"
+    summary = report["skills"]["link_summary"]
+    assert summary["skipped_foreign"] == 1
+    assert list(summary["skipped_foreign_targets"]) == [_ledger_target(home, "feishu_test", "kep-ub-gen")]
+    assert "skipped-foreign" in summary["warning"]
+    assert (home / "skills" / "kep-ub-gen" / "SKILL.md").read_text(encoding="utf-8").endswith("# kep-ub-gen\n")
+    assert _owners(home)["kep-ub-gen"]["plugin_id"] == "plug-a"
+
+
+def test_explicit_handover_from_overrides_active_owner(tmp_path):
+    home, repo_a, repo_b = _two_plugins(tmp_path)
+    pi.ingest(repo_a, audience="feishu_test", shared_home=home)
+
+    report = pi.ingest(repo_b, audience="feishu_test", shared_home=home, handover_from="plug-a")
+
+    assert report["skills"]["source_actions"]["kep-ub-gen"] == "handover-registered"
+    acts = {i["skill"]: i["action"] for i in report["skills"]["installed"]}
+    assert acts["kep-ub-gen"] == "handover-relinked"
+    assert _owners(home)["kep-ub-gen"]["plugin_id"] == "plug-b"
+
+
+def test_handover_dry_run_changes_nothing(tmp_path):
+    home, repo_a, repo_b = _two_plugins(tmp_path)
+    pi.ingest(repo_a, audience="feishu_test", shared_home=home)
+    _drop_skill_from_manifest(home, "plug-a", "kep-ub-gen")
+    before = (home / "skills" / "kep-ub-gen" / "SKILL.md").read_text(encoding="utf-8")
+
+    report = pi.ingest(repo_b, audience="feishu_test", shared_home=home, dry_run=True)
+
+    assert report["skills"]["source_actions"]["kep-ub-gen"] == "would-handover"
+    acts = {i["skill"]: i["action"] for i in report["skills"]["installed"]}
+    assert acts["kep-ub-gen"] == "would-handover-relink"
+    assert (home / "skills" / "kep-ub-gen" / "SKILL.md").read_text(encoding="utf-8") == before
+    assert _owners(home)["kep-ub-gen"]["plugin_id"] == "plug-a"
+    assert not any(p.name.startswith(".kep-ub-gen.handover-") for p in (home / "skills").iterdir())

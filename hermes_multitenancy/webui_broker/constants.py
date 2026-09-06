@@ -27,6 +27,9 @@ _OWNER_OPEN_ID_HEADER = "X-Hermes-Owner-Open-Id"
 _EXPERT_ID_HEADER = "X-Hermes-Expert-Id"
 
 
+_EXPERT_ENGINE_HEADER = "X-Hermes-Expert-Engine"
+
+
 _AGENT_ID_HEADER = "X-Hermes-Agent-Id"
 
 
@@ -158,6 +161,8 @@ _INGEST_RESERVED_METADATA_KEYS = {
     "ingest_secret_dir",
     "ingest_secret_fingerprint",
     "ingest_secrets",
+    "_trusted_project_id",
+    "_trusted_project_session",
 }
 
 __all__ = [
@@ -168,6 +173,7 @@ __all__ = [
     'SandboxAvailable',
     '_OWNER_OPEN_ID_HEADER',
     '_EXPERT_ID_HEADER',
+    '_EXPERT_ENGINE_HEADER',
     '_AGENT_ID_HEADER',
     '_ACTOR_PRINCIPAL_ID_HEADER',
     '_ACTOR_PROVIDER_HEADER',

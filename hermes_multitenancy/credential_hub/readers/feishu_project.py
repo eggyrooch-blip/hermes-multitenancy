@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from hermes_multitenancy import credential_hub as _hub
 
@@ -34,7 +34,7 @@ def _meegle_allow_npx_status() -> bool:
     return True  # WebUI default (NODE_ENV !== 'test')
 
 
-def _meegle_search_path(*extra: str) -> str:
+def _meegle_search_path(*extra: str, environ: Optional[Mapping[str, str]] = None) -> str:
     """PATH for meegle/npx/node lookup, mirroring the WebUI ``meeglePathDirs``.
 
     The broker may run under a narrow launchd/systemd PATH that lacks node/npx; the
@@ -45,9 +45,10 @@ def _meegle_search_path(*extra: str) -> str:
     found ``npx`` can locate the sibling ``node`` (handles non-standard installs like
     a version-manager bin that is itself on PATH but whose node isn't globally linked).
     """
-    extra_env = os.environ.get("HERMES_MEEGLE_EXTRA_PATHS", "")
+    source = os.environ if environ is None else environ
+    extra_env = source.get("HERMES_MEEGLE_EXTRA_PATHS", "")
     candidates = [
-        *os.environ.get("PATH", "").split(os.pathsep),
+        *source.get("PATH", "").split(os.pathsep),
         *(p for p in extra_env.split(os.pathsep) if p),
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -67,16 +68,26 @@ def _which_meegle(name: str) -> Optional[str]:
     return shutil.which(name, path=_hub._meegle_search_path())
 
 
-def _meegle_invocation(*, allow_npx: bool = True) -> Optional[list[str]]:
-    explicit = os.environ.get("HERMES_MEEGLE_BIN", "").strip()
+def _meegle_invocation(
+    *,
+    allow_npx: bool = True,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[list[str]]:
+    source = os.environ if environ is None else environ
+    explicit = source.get("HERMES_MEEGLE_BIN", "").strip()
     if explicit:
         return [explicit]
-    direct = _hub._which_meegle("meegle")
+    if environ is None:
+        resolve = _hub._which_meegle
+    else:
+        search_path = _meegle_search_path(environ=source)
+        resolve = lambda name: shutil.which(name, path=search_path)
+    direct = resolve("meegle")
     if direct:
         return [direct]
     if not allow_npx:
         return None
-    npx = _hub._which_meegle("npx")
+    npx = resolve("npx")
     if npx:
         return [npx, "-y", _MEEGLE_PACKAGE]
     return None

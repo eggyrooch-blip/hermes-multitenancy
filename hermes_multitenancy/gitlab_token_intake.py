@@ -323,6 +323,7 @@ def submit_personal_token(
     db_path: Optional[Path] = None,
     prober: Any = None,
     group_owner_open_id: Optional[str] = None,
+    credential_subject: str = "",
 ) -> dict[str, Any]:
     """Validate an employee's token and store it under their own profile.
 
@@ -339,6 +340,9 @@ def submit_personal_token(
     """
     shared_home = Path(shared_home)
     cleaned = str(token or "").strip()
+    submitted_by = str(credential_subject or "").strip()
+    if submitted_by and not submitted_by.startswith("ou_"):
+        raise TokenRejected("无法确认提交人的员工身份，没有保存。")
     if not cleaned:
         raise TokenRejected("没收到 token。")
     if tier not in VALID_TIERS:
@@ -427,7 +431,11 @@ def submit_personal_token(
             subject_id=subject_id,
             provider="gitlab",
             secret_kind="token",
-            payload={"token": cleaned},
+            payload={
+                "token": cleaned,
+                "owner_actor_subject": submitted_by,
+                "token_owner_verified": False,
+            },
             scopes=sorted(granted) + [SCOPE_BINDING_UNVERIFIED],
             expires_at=expires_at,
         )

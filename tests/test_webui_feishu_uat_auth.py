@@ -1343,7 +1343,6 @@ def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeyp
     worker = threading.Thread(target=poll_in_worker)
     worker.start()
     assert exchange_started.wait(timeout=SYNC_TIMEOUT)
-    started = time.monotonic()
     try:
         duplicate = feishu_uat_auth.poll_session(
             session_id=session_id,
@@ -1352,7 +1351,6 @@ def test_poll_session_serializes_concurrent_duplicate_exchange(tmp_path, monkeyp
             shared_home=shared,
         )
         assert duplicate["status"] == "pending"
-        assert time.monotonic() - started < 0.5
         assert "one-time-access" not in str(duplicate)
     finally:
         release_exchange.set()

@@ -28,6 +28,8 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
 from .. import cron_api
+from .. import turn_tool_context
+from ..trusted_runtime_principal import TrustedRuntimePrincipal
 from ..credential_broker import (
     LeaseError,
     assert_lease_binding,
@@ -47,6 +49,8 @@ from .constants import *  # noqa: F401,F403 -- re-export constants into this nam
 from .. import webui_broker_server as _m  # noqa: E402
 
 logger = logging.getLogger("hermes_multitenancy.webui_broker_server")
+
+_ARTIFACT_MARKER_RE = re.compile(r"```hermes-artifact-json", re.IGNORECASE)
 
 
 _runner: Any = None
@@ -74,6 +78,7 @@ _server_thread_lock = threading.Lock()
 
 
 _pending_clarifies: dict[str, dict[str, Any]] = {}
+_pending_approvals: dict[str, dict[str, Any]] = {}
 
 
 _credential_broker_tokens: dict[str, dict[str, str]] = {}
@@ -93,6 +98,12 @@ _run_broker_scoped_tokens: dict[str, dict[str, str]] = {}
 
 
 _run_broker_scoped_tokens_lock = threading.Lock()
+
+
+_harness_workflow_emitters: dict[str, EmitRunEvent] = {}
+
+
+_harness_workflow_emitters_lock = threading.Lock()
 
 
 _session_search_broker_tokens: dict[str, dict[str, str]] = {}
@@ -348,6 +359,7 @@ def register_run_broker_scoped_token(
     run_id: str,
     agent_id: str = "",
     share_role: str = "",
+    workflow_id: str = "",
 ) -> None:
     """Bind a per-run RunBroker bearer to the tenant it may act as."""
     key = str(token or "").strip()
@@ -360,6 +372,7 @@ def register_run_broker_scoped_token(
             "run_id": str(run_id or "").strip(),
             "agent_id": str(agent_id or "").strip(),
             "share_role": str(share_role or "").strip(),
+            "workflow_id": str(workflow_id or "").strip(),
         }
 
 
@@ -382,6 +395,30 @@ def _lookup_run_broker_scoped_token(token: str) -> dict[str, str] | None:
         return dict(record)
 
 
+def register_harness_workflow_emitter(workflow_id: str, emitter: EmitRunEvent) -> None:
+    workflow_id = str(workflow_id or "").strip()
+    if not workflow_id:
+        raise RuntimeError("workflow emitter id missing")
+    with _harness_workflow_emitters_lock:
+        if workflow_id in _harness_workflow_emitters:
+            raise RuntimeError("workflow emitter already active")
+        _harness_workflow_emitters[workflow_id] = emitter
+
+
+def unregister_harness_workflow_emitter(workflow_id: str) -> None:
+    with _harness_workflow_emitters_lock:
+        _harness_workflow_emitters.pop(str(workflow_id or "").strip(), None)
+
+
+async def emit_harness_workflow_event(
+    workflow_id: str, kind: str, payload: dict[str, Any]
+) -> None:
+    with _harness_workflow_emitters_lock:
+        emitter = _harness_workflow_emitters.get(str(workflow_id or "").strip())
+    if emitter is not None:
+        await emitter(RunEvent(kind=kind, payload=dict(payload)))
+
+
 # Routes a sandboxed agent's run-scoped token may reach. The ONLY in-sandbox
 # consumer is `cron/run_broker_bridge.trigger_profile_cron_job_via_run_broker`
 # (native `cronjob(action=run)` → POST /api/run-broker/jobs/<id>/run), and every
@@ -391,7 +428,11 @@ def _lookup_run_broker_scoped_token(token: str) -> dict[str, str] | None:
 # profile provisioning …). They were reachable while the child held the master
 # key; pinning the run-scoped token to this prefix closes that whole class for
 # this credential instead of leaving 15 siblings open.
-_RUN_SCOPED_TOKEN_PATH_PREFIXES: tuple[str, ...] = ("/api/run-broker/jobs",)
+_RUN_SCOPED_TOKEN_PATH_PREFIXES: tuple[str, ...] = (
+    "/api/run-broker/jobs",
+    "/api/run-broker/harness/workflows/",
+    "/api/run-broker/connectors/github-mcp/",
+)
 
 # A shared-agent run carries the sharer's role. `viewer` means read-only, so its
 # token must not mutate the OWNER's cron store — the jobs prefix includes
@@ -1455,6 +1496,9 @@ def _dispatch_session_history_command(
     )
     if command_name in {"new", "reset"}:
         cleared = bool(router_mod._clear_history(key))
+        # Same reset, same breath: drop the carried tool transcript AND bump the
+        # generation so a turn still in flight cannot repopulate the cleared key.
+        turn_tool_context.invalidate(profile_name, user_key, session_id)
         return {
             "handled": True,
             "command": command_name,
@@ -2310,6 +2354,51 @@ def _sanitize_clarify_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _sanitize_approval_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(payload)
+    cleaned.pop("decision_path", None)
+    cleaned.pop("open_id", None)
+    return cleaned
+
+
+def _register_pending_approval(run_request: RunRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    approval_id = str(payload.get("approval_id") or "").strip()
+    decision_path = str(payload.get("decision_path") or "").strip()
+    if approval_id and decision_path:
+        _pending_approvals[approval_id] = {
+            "owner_open_id": str(run_request.user_key or "").strip(),
+            "profile_name": str(run_request.profile_name or "").strip(),
+            "session_id": str(run_request.session_id or "").strip(),
+            "decision_path": decision_path,
+        }
+    return _sanitize_approval_payload(payload)
+
+
+def _clear_pending_approval(payload: dict[str, Any]) -> None:
+    approval_id = str(payload.get("approval_id") or "").strip()
+    if approval_id:
+        _pending_approvals.pop(approval_id, None)
+
+
+def _write_pending_approval_response(
+    *, approval_id: str, owner_open_id: str, profile_name: str,
+    session_id: str, choice: str,
+) -> bool:
+    pending = _pending_approvals.get(approval_id)
+    if pending is None or choice not in {"once", "deny"}:
+        return False
+    if (
+        pending["owner_open_id"] != owner_open_id
+        or pending["profile_name"] != profile_name
+        or pending["session_id"] != session_id
+    ):
+        return False
+    path = Path(pending["decision_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"choice": choice}), encoding="utf-8")
+    return True
+
+
 def _register_pending_clarify(run_request: RunRequest, payload: dict[str, Any]) -> dict[str, Any]:
     clarify_id = str(payload.get("clarify_id") or "").strip()
     response_path = str(payload.get("response_path") or "").strip()
@@ -2359,7 +2448,7 @@ def _write_pending_clarify_response(
     return True
 
 
-def _build_webui_event(request: RunRequest) -> Any:
+def _build_webui_event(request: RunRequest, *, trusted_principal: Any = None) -> Any:
     """Create the smallest event shape expected by ProfileRuntime/agent_real."""
     metadata = dict(request.metadata or {})
     secret_prompt = _ingest_secret_manifest_prompt(
@@ -2388,6 +2477,7 @@ def _build_webui_event(request: RunRequest) -> Any:
             "workspace": request.workspace,
             "metadata": metadata,
         },
+        trusted_runtime_principal=trusted_principal,
     )
 
 
@@ -2396,6 +2486,9 @@ async def _default_dispatch_agent(
     *,
     emit_event: Optional[EmitRunEvent] = None,
     auth_signal_run_id: Optional[str] = None,
+    trusted_principal: Any = None,
+    trusted_harness_admission: Any = None,
+    prepare_codex_evidence: Optional[Callable[[Any, Path], Any]] = None,
 ) -> str:
     # Plan-A surgical fix (user-approved 2026-05-17). Keeps the streaming path
     # so tool_started/tool_completed/thinking frames reach the WebUI (the
@@ -2412,23 +2505,71 @@ async def _default_dispatch_agent(
     from ..runtime import _PROFILE_HOME_VAR
 
     profile_home = router_mod._profile_name_to_home(request.profile_name)
-    event = _build_webui_event(request)
+    event = _build_webui_event(request, trusted_principal=trusted_principal)
+    if trusted_harness_admission is not None:
+        event.trusted_harness_admission = trusted_harness_admission
+    if prepare_codex_evidence is not None:
+        prepared = prepare_codex_evidence(event, profile_home)
+        if inspect.isawaitable(prepared):
+            prepared = await prepared
+        if not isinstance(prepared, tuple) or len(prepared) != 3:
+            raise RuntimeError("codex evidence preparer returned an invalid result")
+        (
+            event.trusted_gitlab_run_attestation,
+            event.trusted_gitlab_fingerprint_key,
+            event.trusted_single_actor_spend_state,
+        ) = prepared
     if emit_event is None:
         return await router_mod._get_pool().dispatch(request.profile_name, profile_home, event)
 
     emitter = _DisconnectTolerantEmitter(emit_event)
+    workflow_emitter_id = str(
+        getattr(trusted_harness_admission, "workflow_id", "") or ""
+    ).strip()
+    if workflow_emitter_id:
+        register_harness_workflow_emitter(workflow_emitter_id, emitter.emit)
     content_parts: list[str] = []
     pending_media_text = ""
+    saw_stream_content = False
     token = _PROFILE_HOME_VAR.set(profile_home)
     try:
         messages = request.messages or None
+        # Previous turns' tool calls/results, held in gateway memory only. The
+        # actor dimension of that key is a SECRET boundary, so it may only come
+        # from the sealed principal the gateway itself issued — never from
+        # request.user_key, which in compatibility/local broker mode is just
+        # payload a bearer-authorized caller asserts about itself. No authentic
+        # principal (or a profile that disagrees with it) → bind nothing.
+        carry_principal = (
+            trusted_principal
+            if isinstance(trusted_principal, TrustedRuntimePrincipal)
+            and trusted_principal.is_authentic()
+            and trusted_principal.channel == "webui"
+            and trusted_principal.profile_name == request.profile_name
+            else None
+        )
+        if carry_principal is not None:
+            turn_tool_context.bind(
+                event,
+                channel=request.channel,
+                profile_name=carry_principal.profile_name,
+                user_key=carry_principal.actor_subject,
+                session_id=request.session_id,
+                user_text=request.content,
+                messages=messages,
+            )
         async for kind, payload in stream_run_agent(event, profile_home, messages=messages):
             if kind == "content":
-                pending_media_text, text_items = _m._webui_streamable_media_text(
-                    pending_media_text + str(payload or ""),
+                saw_stream_content = True
+                pending_media_text, text_items = await asyncio.to_thread(
+                    _webui_streamable_media_delta,
+                    pending_media_text,
+                    str(payload or ""),
                     router_mod=router_mod,
                     profile_home=profile_home,
                 )
+                if len(pending_media_text) > _RUN_BROKER_DEFAULT_CLIENT_MAX_SIZE:
+                    raise RunRejected("artifact protocol block exceeds the 32MB broker limit")
                 for text in text_items:
                     if text:
                         content_parts.append(text)
@@ -2471,14 +2612,41 @@ async def _default_dispatch_agent(
                     )
                 )
                 continue
+            if kind == "done":
+                # ``stream_run_agent`` consumes the child's done rather than
+                # re-yielding it, so this branch only fires for streams that
+                # surface one directly; the flag it sets is the same one.
+                turn_tool_context.mark_done(event)
+                continue
+            if kind == "heartbeat":
+                hb = payload if isinstance(payload, dict) else {}
+                hb_text = str(hb.get("text") or "")
+                await emitter.emit(
+                    RunEvent(
+                        kind="heartbeat",
+                        text=hb_text,
+                        payload={"state": hb.get("state"), "text": hb_text},
+                    )
+                )
+                continue
             if kind in {"approval_required", "approval_resolved"}:
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
+                if kind == "approval_required":
+                    event_payload = _register_pending_approval(request, event_payload)
+                else:
+                    _clear_pending_approval(event_payload)
+                    event_payload = _sanitize_approval_payload(event_payload)
                 await emitter.emit(RunEvent(kind=kind, payload=event_payload))
                 continue
-            if kind == "auth_required":
+            if kind in {"gate_required", "gate_resolved"}:
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {}
-                event_payload["run_id"] = auth_signal_run_id
-                await emitter.emit(RunEvent(kind="auth_required", payload=event_payload))
+                await emitter.emit(RunEvent(kind=kind, payload=event_payload))
+                continue
+            if kind in {"auth_required", "auth_resolved", "workflow_stage"}:
+                event_payload = dict(payload or {}) if isinstance(payload, dict) else {}
+                if kind == "auth_required":
+                    event_payload["run_id"] = auth_signal_run_id
+                await emitter.emit(RunEvent(kind=kind, payload=event_payload))
                 continue
             if kind == "clarify_required":
                 event_payload = dict(payload or {}) if isinstance(payload, dict) else {"text": payload}
@@ -2496,12 +2664,16 @@ async def _default_dispatch_agent(
                 continue
 
         if pending_media_text:
-            text = await asyncio.to_thread(
-                router_mod._webui_profile_scoped_media_response,
+            _, text_items = await asyncio.to_thread(
+                _m._webui_streamable_media_text,
                 pending_media_text,
-                profile_home,
+                router_mod=router_mod,
+                profile_home=profile_home,
+                terminal=True,
             )
-            if text:
+            for text in text_items:
+                if not text:
+                    continue
                 content_parts.append(text)
                 await emitter.emit(
                     RunEvent(
@@ -2511,7 +2683,7 @@ async def _default_dispatch_agent(
                     )
                 )
 
-        if "".join(content_parts).strip():
+        if saw_stream_content:
             remote_media_text = await _webui_streamed_remote_media_additions(
                 "".join(content_parts),
                 router_mod=router_mod,
@@ -2526,31 +2698,101 @@ async def _default_dispatch_agent(
                         payload={"text": remote_media_text},
                     )
                 )
+            # Only a run that reached this line succeeded end-to-end, so this is
+            # the single commit point: an exception, a cancel, a disconnect or a
+            # billing-retry replay never gets here and its buffered tool bodies
+            # die with the event. Streamed content is NOT success either — the
+            # terminal-done gate lives inside commit_turn, which logs its verdict.
+            turn_tool_context.commit_turn(event)
             # Answer already delivered via streamed content frames above.
             # Return "" so RunBroker.run does NOT emit it a second time.
             return ""
         # Nothing streamed — fall back to one-shot; RunBroker emits it once.
         fallback_text = await real_run_agent(event, profile_home, messages=messages)
+        _, fallback_items = await asyncio.to_thread(
+            _m._webui_streamable_media_text,
+            fallback_text,
+            router_mod=router_mod,
+            profile_home=profile_home,
+            terminal=True,
+        )
         return await asyncio.to_thread(
             router_mod._webui_profile_scoped_media_response,
-            fallback_text,
+            "".join(fallback_items),
             profile_home,
         )
     finally:
+        if workflow_emitter_id:
+            unregister_harness_workflow_emitter(workflow_emitter_id)
         _PROFILE_HOME_VAR.reset(token)
 
 
-def _webui_streamable_media_text(text: str, *, router_mod, profile_home: Path) -> tuple[str, list[str]]:
-    """Return pending trailing MEDIA directive text and safe-to-stream chunks."""
+def _webui_streamable_media_text(
+    text: str,
+    *,
+    router_mod,
+    profile_home: Path,
+    terminal: bool = False,
+) -> tuple[str, list[str]]:
+    """Return pending internal directives and safe-to-stream chunks."""
     raw = str(text or "")
+    artifact_marker = "```hermes-artifact-json"
+    visible: list[str] = []
+    artifact_pending = ""
+    cursor = 0
+
+    while True:
+        artifact_match = _ARTIFACT_MARKER_RE.search(raw, cursor)
+        if artifact_match is None:
+            tail = raw[cursor:]
+            max_partial = min(len(tail), len(artifact_marker) - 1)
+            for size in range(max_partial, 0, -1):
+                if re.fullmatch(
+                    re.escape(artifact_marker[:size]),
+                    tail[-size:],
+                    re.IGNORECASE,
+                ):
+                    if terminal and size <= 3:
+                        visible.append(tail)
+                    else:
+                        visible.append(tail[:-size])
+                        if not terminal:
+                            artifact_pending = tail[-size:]
+                    break
+            else:
+                visible.append(tail)
+            break
+
+        artifact_index = artifact_match.start()
+        visible.append(raw[cursor:artifact_index])
+        block_end = raw.find("```", artifact_index + len(artifact_marker))
+        if block_end < 0:
+            if not terminal:
+                artifact_pending = raw[artifact_index:]
+            break
+
+        block_end += 3
+        materialized = router_mod._materialize_response_artifacts(
+            raw[artifact_index:block_end],
+            profile_home,
+        )
+        visible.append(router_mod._ARTIFACT_JSON_RE.sub("", materialized))
+        cursor = block_end
+
+    raw = "".join(visible)
     marker_index = raw.rfind("MEDIA:")
     if marker_index < 0:
-        return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home, materialize_remote_images=False)]
+        chunks = (
+            [router_mod._webui_profile_scoped_media_response(raw, profile_home, materialize_remote_images=False)]
+            if raw
+            else []
+        )
+        return artifact_pending, chunks
 
     newline_after_marker = raw.find("\n", marker_index)
-    if newline_after_marker < 0:
+    if newline_after_marker < 0 and not terminal:
         prefix = raw[:marker_index]
-        pending = raw[marker_index:]
+        pending = raw[marker_index:] + artifact_pending
         items = (
             [router_mod._webui_profile_scoped_media_response(prefix, profile_home, materialize_remote_images=False)]
             if prefix
@@ -2558,7 +2800,24 @@ def _webui_streamable_media_text(text: str, *, router_mod, profile_home: Path) -
         )
         return pending, items
 
-    return "", [router_mod._webui_profile_scoped_media_response(raw, profile_home, materialize_remote_images=False)]
+    return artifact_pending, [
+        router_mod._webui_profile_scoped_media_response(raw, profile_home, materialize_remote_images=False)
+    ]
+
+
+def _webui_streamable_media_delta(
+    pending: str,
+    delta: str,
+    *,
+    router_mod,
+    profile_home: Path,
+) -> tuple[str, list[str]]:
+    """Join and parse a streamed delta off the shared broker event loop."""
+    return _m._webui_streamable_media_text(
+        pending + delta,
+        router_mod=router_mod,
+        profile_home=profile_home,
+    )
 
 
 async def _webui_streamed_remote_media_additions(text: str, *, router_mod, profile_home: Path) -> str:

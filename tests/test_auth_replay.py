@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+import json
+import hashlib
 
 import pytest
 
@@ -69,6 +71,113 @@ async def test_dispatch_synthetic_auth_complete_replays_captured_request(
     assert len(captured) == 1
     assert captured[0][0].text == "把上周销售额导出到飞书表格"
     assert router._pending_auth_replay_key("alice", "ou_sender") not in router._pending_auth_replay
+
+
+@pytest.mark.asyncio
+async def test_strict_auth_complete_reports_resend_without_replaying_model_or_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    resumed: list[tuple[Any, str]] = []
+    model_dispatches: list[Any] = []
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_resume(profile_home, subject, chat_id):
+        resumed.append((profile_home, subject, chat_id))
+        return {
+            "ok": False,
+            "error_code": "FEISHU_OPERATION_RESEND_REQUIRED",
+            "resend_required": True,
+        }
+
+    class Adapter:
+        async def send(self, chat_id, text):
+            sent.append((chat_id, text))
+
+    async def fake_handle_async(*, event: Any, gateway: Any) -> None:
+        model_dispatches.append(event)
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+    monkeypatch.setattr(router, "_profile_name_to_home", lambda _name: tmp_path / "alice")
+    monkeypatch.setattr(router, "_resume_pending_lark_cli_step", fake_resume)
+    monkeypatch.setattr(router, "handle_async", fake_handle_async)
+    router._capture_pending_auth_replay("alice", "ou_sender", "含业务文档内容的原请求")
+
+    dispatched = await router._dispatch_synthetic_auth_complete(
+        event=_event(),
+        gateway=SimpleNamespace(adapters={"feishu": Adapter()}),
+        chat_id="oc_auth",
+        profile_name="alice",
+        open_id="ou_sender",
+    )
+
+    assert dispatched is True
+    assert resumed == [(tmp_path / "alice", "ou_sender", "oc_auth")]
+    assert model_dispatches == []
+    assert sent == [
+        (
+            "oc_auth",
+            "飞书授权已完成。为保护消息内容，原请求未保存也不会自动重放，请重新发送原请求。",
+        )
+    ]
+    assert router._pending_auth_replay == {}
+
+
+def test_durable_resume_never_reads_transcript_payload_and_keeps_actor_fence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from hermes_multitenancy import agent_real
+    from hermes_multitenancy.operation_checkpoint import OperationCheckpointStore
+
+    profile = tmp_path / "alice"
+    (profile / "state").mkdir(parents=True)
+    store = OperationCheckpointStore(profile / "state" / "operation-checkpoints.db")
+    store.put(
+        operation_id="op-1",
+        profile_name="alice",
+        subject="ou_alice",
+        connector="lark-cli",
+        intent_key="call:session-1:call-1",
+        step="execute",
+        state="waiting_auth",
+        session_ref="session-1",
+        call_ref="call-1",
+        tool_scope="feishu:user",
+        chat_type="p2p",
+        chat_fence=hashlib.sha256(b"oc_auth").hexdigest(),
+    )
+    store.close()
+
+    monkeypatch.setenv("HERMES_MULTITENANCY_STRICT_CONTEXT", "1")
+
+    assert agent_real.resume_pending_lark_cli_step(
+        profile,
+        "ou_alice",
+        trusted_chat_id="oc_other",
+        session_ref="session-1",
+        call_ref="call-1",
+    ) is None
+
+    result = agent_real.resume_pending_lark_cli_step(
+        profile,
+        "ou_alice",
+        trusted_chat_id="oc_auth",
+        session_ref="session-1",
+        call_ref="call-1",
+    )
+    assert result == {
+        "ok": False,
+        "recovered": False,
+        "failure_subsystem": "permission",
+        "error_code": "FEISHU_OPERATION_RESEND_REQUIRED",
+        "retryable": False,
+        "resend_required": True,
+    }
+    assert agent_real.resume_pending_lark_cli_step(
+        profile, "ou_bob", trusted_chat_id="oc_auth"
+    ) is None
 
 
 @pytest.mark.asyncio

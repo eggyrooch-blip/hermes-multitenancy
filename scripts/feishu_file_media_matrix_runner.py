@@ -24,7 +24,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SHARED_HOME = Path("/Users/dev/.hermes")
+SHARED_HOME = Path("/Users/hermes/.hermes")
 PROFILE = "feishu_g41a5b5g"
 OPEN_ID = "ou_aaaaaaaaaaaaaaaa0000000000000001"
 CHAT_ID = "oc_bbbbbbbbbbbbbbbb0000000000000001"
@@ -384,7 +384,7 @@ def _unsupported(text: str) -> bool:
 
 
 def _path_leaked(text: str) -> bool:
-    return "/Users/dev/.hermes/profiles" in text
+    return "/Users/hermes/.hermes/profiles" in text
 
 
 def _write_jsonl(path: Path, record: dict[str, Any]) -> None:

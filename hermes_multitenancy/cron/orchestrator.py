@@ -227,6 +227,46 @@ def _result_field(result: Any, name: str, default: Any = None) -> Any:
     return getattr(result, name, default)
 
 
+def _record_cron_terminal(
+    cron_jobs: Any,
+    cron_scheduler: Any,
+    job_id: str,
+    *,
+    end_reason: str,
+    receipt_message_id: Optional[str] = None,
+) -> bool:
+    """Persist the delivery terminal beside core's existing run status fields."""
+    try:
+        load_jobs = _cw._cron_scheduler_function(cron_jobs, cron_scheduler, "load_jobs")
+        save_jobs = _cw._cron_scheduler_function(cron_jobs, cron_scheduler, "save_jobs")
+        lock = getattr(cron_jobs, "_jobs_file_lock", None)
+        with lock if lock is not None else contextlib.nullcontext():
+            jobs = load_jobs()
+            for stored in jobs:
+                if str(stored.get("id") or "") != job_id:
+                    continue
+                stored["last_end_reason"] = end_reason
+                receipt = str(receipt_message_id or "").strip()
+                if receipt:
+                    stored["last_delivery_message_id"] = receipt
+                else:
+                    stored.pop("last_delivery_message_id", None)
+                save_jobs(jobs)
+                return True
+        logger.warning(
+            "[multitenancy] cron terminal job missing job=%s end_reason=%s",
+            job_id,
+            end_reason,
+        )
+    except Exception:
+        logger.exception(
+            "[multitenancy] failed to record cron terminal job=%s end_reason=%s",
+            job_id,
+            end_reason,
+        )
+    return False
+
+
 def _finalize_claimed_cron_job_current_context(
     cron_jobs: Any,
     cron_scheduler: Any,
@@ -270,17 +310,71 @@ def _finalize_claimed_cron_job_current_context(
 
         delivery_error = None
         if should_deliver:
-            try:
-                delivery_error = deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-            except Exception as de:
-                delivery_error = str(de)
-                logger.error("[multitenancy] cron delivery failed for job %s: %s", job["id"], de)
+            patched_delivery = getattr(
+                deliver_result, "_hermes_multitenancy_patched", False
+            )
+            resolve_targets = getattr(cron_scheduler, "_resolve_delivery_targets", None)
+            if not patched_delivery and callable(resolve_targets):
+                try:
+                    resolved_targets = resolve_targets(job)
+                except Exception:
+                    delivery_error = "cron delivery target resolution unavailable"
+                else:
+                    if any(
+                        str(target.get("platform") or "").strip().lower() == "feishu"
+                        for target in resolved_targets
+                    ):
+                        delivery_error = "feishu confirmed delivery patch unavailable"
+            if delivery_error is None:
+                try:
+                    delivery_error = deliver_result(
+                        job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                    )
+                except Exception as de:
+                    delivery_error = str(de)
+                    logger.error("[multitenancy] cron delivery failed for job %s: %s", job["id"], de)
 
         if success and not final_response.strip():
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        receipt_message_id = str(job.pop("_hermes_delivery_message_id", "") or "").strip()
+        receipt_expected = bool(job.pop("_hermes_feishu_receipt_expected", False))
+        if success and should_deliver and receipt_expected and not receipt_message_id and not delivery_error:
+            delivery_error = "feishu delivery completed without provider receipt"
+        end_reason = (
+            "delivery_error"
+            if delivery_error
+            else "completed"
+            if success
+            else "execution_error"
+        )
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        _cw._record_cron_terminal(
+            cron_jobs,
+            cron_scheduler,
+            str(job["id"]),
+            end_reason=end_reason,
+            # A different delivery leg may fail after Feishu was confirmed.
+            # Keep that provider identity beside the partial terminal so an
+            # operator/retry path cannot mistake the already-landed card for
+            # an unattempted send and duplicate it.
+            receipt_message_id=receipt_message_id,
+        )
+        if delivery_error:
+            logger.warning(
+                "[multitenancy] cron_delivery_alert job=%s end_reason=delivery_error",
+                job["id"],
+            )
+        logger.info(
+            "[multitenancy] cron terminal job=%s end_reason=%s receipt=%s",
+            job["id"],
+            end_reason,
+            "confirmed" if receipt_message_id else "none",
+        )
         return True
     except Exception as exc:
         logger.error("[multitenancy] error finalizing cron job %s: %s", job.get("id"), exc)

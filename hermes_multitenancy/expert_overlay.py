@@ -370,59 +370,75 @@ def resolve_expert(
     eid = str(expert_id or "").strip()
     if not eid:
         return None
-    profile_names = _audience_profile_names(profile_home)
     resolved: Optional[ExpertOverlay] = None
     try:
-        for manifest, _path in _iter_managed_manifests(profile_home):
-            if not _manifest_is_active(manifest):
-                continue
-            experts = manifest.get("experts")
-            if not isinstance(experts, list):
-                continue
-            manifest_audience = manifest.get("audience")
-            for expert in experts:
-                if not isinstance(expert, dict) or str(expert.get("id") or "") != eid:
-                    continue
-                if not _effective_audience_allows(
-                    manifest_audience,
-                    expert.get("audience"),
-                    profile_names=profile_names,
-                    department_ids=department_ids,
-                ):
-                    logger.info(
-                        "[multitenancy] expert %r denied for profiles %r (audience)",
-                        eid,
-                        sorted(profile_names),
-                    )
-                    return None
-                agent_md = _read_agent_md(manifest, expert)
-                if not agent_md:
-                    logger.warning(
-                        "[multitenancy] expert %r found but persona markdown missing/unreadable", eid
-                    )
-                    return None
-                skills = expert.get("skills")
-                gov = expert.get("governance")
-                aud = expert.get("audience")
-                skill_names = [str(s) for s in skills] if isinstance(skills, list) else []
-                overlay = ExpertOverlay(
-                    expert_id=eid,
-                    name=str(expert.get("name") or expert.get("title") or eid),
-                    agent_md=agent_md,
-                    plugin_id=str(manifest.get("plugin_id") or ""),
-                    skills=skill_names,
-                    skill_dirs=_expert_skill_dirs(manifest, skill_names),
-                    governance=dict(gov) if isinstance(gov, dict) else {},
-                    audience=dict(aud) if isinstance(aud, dict) else {},
+        for manifest, expert in authorized_expert_records(
+            profile_home, eid, department_ids=department_ids
+        ):
+            agent_md = _read_agent_md(manifest, expert)
+            if not agent_md:
+                logger.warning(
+                    "[multitenancy] expert %r found but persona markdown missing/unreadable", eid
                 )
-                if resolved is not None:
-                    logger.warning("[multitenancy] duplicate visible expert id %r", eid)
-                    return None
-                resolved = overlay
+                return None
+            skills = expert.get("skills")
+            gov = expert.get("governance")
+            aud = expert.get("audience")
+            skill_names = [str(s) for s in skills] if isinstance(skills, list) else []
+            overlay = ExpertOverlay(
+                expert_id=eid,
+                name=str(expert.get("name") or expert.get("title") or eid),
+                agent_md=agent_md,
+                plugin_id=str(manifest.get("plugin_id") or ""),
+                skills=skill_names,
+                skill_dirs=_expert_skill_dirs(manifest, skill_names),
+                governance=dict(gov) if isinstance(gov, dict) else {},
+                audience=dict(aud) if isinstance(aud, dict) else {},
+            )
+            if resolved is not None:
+                logger.warning("[multitenancy] duplicate visible expert id %r", eid)
+                return None
+            resolved = overlay
     except Exception:  # absolute fail-safe — overlay must never break a run
         logger.warning("[multitenancy] resolve_expert(%r) failed; running without overlay", eid, exc_info=True)
         return None
     return resolved
+
+
+def authorized_expert_records(
+    profile_home: Path,
+    expert_id: str,
+    *,
+    department_ids: Optional[list[str]] = None,
+    include_inactive: bool = False,
+    strict: bool = False,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Return registry records admitted by the shared Expert audience policy."""
+    eid = str(expert_id or "").strip()
+    if not eid:
+        return []
+    profile_names = _audience_profile_names(profile_home)
+    rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for manifest, _path in _iter_managed_manifests(profile_home, strict=strict):
+        experts = manifest.get("experts")
+        if not isinstance(experts, list):
+            continue
+        for expert in experts:
+            if not isinstance(expert, dict) or str(expert.get("id") or "").strip() != eid:
+                continue
+            if not _effective_audience_allows(
+                manifest.get("audience"),
+                expert.get("audience"),
+                profile_names=profile_names,
+                department_ids=department_ids,
+            ):
+                continue
+            active = _manifest_is_active(manifest) and str(
+                expert.get("status") or "active"
+            ).strip().lower() == "active"
+            if include_inactive or active:
+                rows.append((manifest, expert))
+    return rows
 
 
 def build_role_override_block(overlay: ExpertOverlay) -> str:

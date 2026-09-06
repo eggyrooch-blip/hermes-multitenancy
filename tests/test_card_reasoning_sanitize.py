@@ -50,7 +50,7 @@ class TestUnescapeDisplayWhitespace:
         """Reproduces the reported card text shape end to end."""
         raw = (
             "发送通知邮件\\n\\n"
-            "密码: 已发送到 zhangsan@example.com\\n"
+            "密码: 已发送到 zhanghailong@example.com\\n"
             "（密送 it@example.com）\\n\\n\\n\\n"
         )
         out = _unescape_display_whitespace(raw)

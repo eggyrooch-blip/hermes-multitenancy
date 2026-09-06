@@ -36,14 +36,93 @@ skills_tool's own functions — deleting the attribute would make
 ``skill_view`` raise ``NameError`` internally. Refresh-on-entry avoids that.
 
 Idempotent — safe to call from plugin ``register()``.
+
+Pending-activation hint (2026-08-25, skill-install-visible-in-session)
+----------------------------------------------------------------------
+Sandbox shared-skill binds are computed once at agent spawn, so a skill
+installed/granted MID-session shows up in the profile ``skills/`` dir as a
+dangling symlink (or an empty bwrap stub dir) that core silently skips —
+users then see "面板有 / agent 没有" and file tickets (zhaofanrong 2026-08-25).
+The same wrapper therefore also detects those entries and surfaces them:
+``skills_list`` gains a ``pending_activation`` block and ``skill_view`` on a
+pending name explains itself instead of returning a bare "not found". With no
+pending entries both outputs are returned byte-identical.
 """
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import threading
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Agent-facing explanation for an installed-but-not-yet-mounted skill.
+PENDING_NOTE = "已安装，但内容尚未挂载到当前会话——新开一个会话后生效"
+
+_PENDING_FALLBACK_EXCLUDED = frozenset({"__pycache__", "node_modules", ".git"})
+
+
+def _dir_has_skill_md(path: Path) -> bool:
+    try:
+        if (path / "SKILL.md").is_file():
+            return True
+        return any(True for _ in path.rglob("SKILL.md"))
+    except OSError:
+        return False
+
+
+def _entry_pending(entry: Path) -> bool:
+    """Installed-but-unusable entry: dangling symlink, or dir with no SKILL.md."""
+    try:
+        if entry.is_symlink():
+            if not entry.exists():
+                return True  # dangling — target not mounted in this sandbox
+            return entry.is_dir() and not _dir_has_skill_md(entry)
+        if entry.is_dir():
+            return not _dir_has_skill_md(entry)
+    except OSError:
+        return False
+    return False
+
+
+def _scan_pending_skills(skills_dir: Path, excluded: frozenset[str] = frozenset()) -> list[str]:
+    """Relative names (depth ≤ 2, matching managed install layouts) of pending entries.
+
+    A real dir that has nested SKILL.md files is a category dir — recurse one
+    level so ``Keep/<name>`` style installs are covered too. An empty category
+    dir is indistinguishable from an install stub and is reported as pending
+    (rare, harmless).
+    """
+    skip = excluded | _PENDING_FALLBACK_EXCLUDED
+    pending: list[str] = []
+    try:
+        entries = sorted(skills_dir.iterdir())
+    except OSError:
+        return pending
+    for entry in entries:
+        name = entry.name
+        if name.startswith(".") or name in skip:
+            continue
+        try:
+            if entry.is_file() and not entry.is_symlink():
+                continue
+            if _entry_pending(entry):
+                pending.append(name)
+                continue
+            if entry.is_dir() and not entry.is_symlink() and not (entry / "SKILL.md").is_file():
+                # category dir — check its direct children
+                for child in sorted(entry.iterdir()):
+                    if child.name.startswith(".") or child.name in skip:
+                        continue
+                    if child.is_file() and not child.is_symlink():
+                        continue
+                    if _entry_pending(child):
+                        pending.append(f"{name}/{child.name}")
+        except OSError:
+            continue
+    return pending
 
 _PATCH_FLAG = "_hermes_mt_dynamic_skills_dir"
 _WRAP_FLAG = "_hermes_mt_dynamic_wrapped"
@@ -93,12 +172,64 @@ def install_dynamic_skills_dir_patch() -> None:
         except Exception:
             logger.debug("[multitenancy] dynamic SKILLS_DIR refresh failed", exc_info=True)
 
-    def _wrap(orig):
+    def _pending_names() -> list[str]:
+        excluded = getattr(st, "_EXCLUDED_SKILL_DIRS", None)
+        excluded = frozenset(excluded) if excluded else frozenset()
+        return _scan_pending_skills(Path(st.SKILLS_DIR), excluded)
+
+    def _augment_skills_list(result):
+        # Byte-identical passthrough unless something is actually pending.
+        try:
+            pending = _pending_names()
+            if not pending:
+                return result
+            data = json.loads(result)
+            if not isinstance(data, dict):
+                return result
+            data["pending_activation"] = [
+                {"name": name, "note": PENDING_NOTE} for name in pending
+            ]
+            return json.dumps(data, ensure_ascii=False)
+        except Exception:
+            logger.debug("[multitenancy] pending-activation augment failed", exc_info=True)
+            return result
+
+    def _augment_skill_view(result, args, kwargs):
+        try:
+            data = json.loads(result)
+            if not isinstance(data, dict) or data.get("success") is not False:
+                return result
+            name = args[0] if args else kwargs.get("name")
+            if not name:
+                return result
+            req = str(name)
+            req_base = req.rsplit("/", 1)[-1]
+            for rel in _pending_names():
+                if req == rel or req_base == rel.rsplit("/", 1)[-1]:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": f"Skill '{name}' {PENDING_NOTE}",
+                            "pending_activation": True,
+                        },
+                        ensure_ascii=False,
+                    )
+            return result
+        except Exception:
+            logger.debug("[multitenancy] pending-activation augment failed", exc_info=True)
+            return result
+
+    def _wrap(orig, fname):
         @functools.wraps(orig)
         def wrapper(*args, **kwargs):
             with _resolution_lock:
                 _refresh_skills_dir()
-                return orig(*args, **kwargs)
+                result = orig(*args, **kwargs)
+                if fname == "skills_list":
+                    return _augment_skills_list(result)
+                if fname == "skill_view":
+                    return _augment_skill_view(result, args, kwargs)
+                return result
 
         setattr(wrapper, _WRAP_FLAG, True)
         return wrapper
@@ -108,7 +239,7 @@ def install_dynamic_skills_dir_patch() -> None:
         orig = getattr(st, fname, None)
         if orig is None or getattr(orig, _WRAP_FLAG, False):
             continue
-        setattr(st, fname, _wrap(orig))
+        setattr(st, fname, _wrap(orig, fname))
         wrapped += 1
 
     setattr(st, _PATCH_FLAG, True)

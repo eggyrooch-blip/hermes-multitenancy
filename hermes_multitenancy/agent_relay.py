@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import inspect
 import json
 import logging
 import os
+import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,11 @@ from .agent_relay_feishu import (
 
 logger = logging.getLogger(__name__)
 MAX_CONTENT_BYTES = 30 * 1024
+ADMIN_TOKEN_ENV = "HERMES_AGENT_RELAY_ADMIN_TOKEN"
+ADMIN_MAX_WINDOW_MS = 7 * 86_400_000
+ADMIN_LOG_LIMIT = 5000
+_AUDIT_PREFIX = "relay_audit "
+_LOG_FIELD_RE = re.compile(r"\b(event|status|actor|card|msg)=(\S+)")
 RELAY_STORE_KEY = AppKey("relay_store", object)
 RELAY_EVENTS_KEY = AppKey("relay_events", object)
 RELAY_RETENTION_TASK_KEY = AppKey("relay_retention_task", asyncio.Task)
@@ -113,15 +121,45 @@ class RelayEvents:
             return False
         changed = self.store.action_card(**event)
         if changed:
-            # 不在这里改卡片外观：调用方拿到 action_id 后会用自己手里的原文做局部替换
-            # （只换按钮那一块、正文保留）。服务端拼不出那个内容，硬拼只会把仓库、
-            # 命令、意图全抹成一行状态，对用户是负收益。
+            # 首次点击不在这里改卡片外观：调用方拿到 action_id 后会用自己手里的原文
+            # 做局部替换（只换按钮那一块、正文保留）。服务端拼不出那个内容，硬拼只会
+            # 把仓库、命令、意图全抹成一行状态，对用户是负收益。
+            # 重复点击则相反 —— 必须由 ack 带卡片回放最新内容，见 replay_card_content。
             logger.info(
-                "relay_audit event=card_action status=actioned action=%s actor=%s",
+                "relay_audit event=card_action status=actioned action=%s card=%s msg=%s actor=%s",
                 event["action_id"],
+                event["card_id"],
+                event["message_id"],
                 _sha(str(event["actor_id"]))[:12],
             )
         return changed
+
+    async def replay_card_content(self, **event: Any) -> dict[str, Any] | None:
+        """重复点击的 ack 卡片内容；守卫失败或内容从未更新过 → None（ack 退回纯 toast）。
+
+        为什么必须回放：内容 PATCH 之后、客户端按钮消失之前的重复点击，其 ack 若不带
+        卡片，飞书会把会话流渲染永久钉在点击时客户端手里的旧版本（跨设备、冷启动不
+        恢复；2026-08-27 受控矩阵 4/4 复现）。ack 带上最新内容，钉住的就是正确版本。
+        """
+        if (
+            any(not event.get(key) for key in ("actor_id", "card_id", "nonce", "message_id"))
+            or not _valid_actor_id(str(event["actor_id"]))
+        ):
+            return None
+        content = self.store.replay_card_content(
+            actor_id=str(event["actor_id"]),
+            card_id=str(event["card_id"]),
+            nonce=str(event["nonce"]),
+            message_id=str(event["message_id"]),
+        )
+        if content is not None:
+            logger.info(
+                "relay_audit event=card_action status=replayed card=%s msg=%s actor=%s",
+                event["card_id"],
+                event["message_id"],
+                _sha(str(event["actor_id"]))[:12],
+            )
+        return content
 
 
 def _error(
@@ -137,6 +175,57 @@ def _error(
     return web.json_response({"error": error}, status=status, headers=headers)
 
 
+class RelayLogHandler(logging.Handler):
+    """Mirror relay logs into the store so an admin can read them over HTTP.
+
+    journald stays the primary sink and its lines are untouched — this only adds a
+    second, queryable outlet. Every `relay_audit` line is kept at any level (they are
+    already redacted at the call site); anything else only from WARNING up, so the
+    admin sees real failures without the store becoming a firehose.
+    """
+
+    def __init__(self, store: Any) -> None:
+        super().__init__(level=logging.NOTSET)
+        self._store = store
+        self._busy = threading.local()
+        # raw must byte-match the journald line (basicConfig default format) so the
+        # admin can correlate API evidence with the host log; format() also appends
+        # tracebacks, which journald shows too.
+        self.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(self._busy, "on", False):
+            return
+        self._busy.on = True
+        try:
+            message = record.getMessage()
+            if not message.startswith(_AUDIT_PREFIX) and record.levelno < logging.WARNING:
+                return
+            fields = dict(_LOG_FIELD_RE.findall(message))
+            self._store.append_log(
+                ts=int(record.created * 1000),
+                level=record.levelname,
+                logger=record.name,
+                event=fields.get("event", ""),
+                status=fields.get("status", ""),
+                actor=fields.get("actor", ""),
+                card_id=fields.get("card", ""),
+                message_id=fields.get("msg", ""),
+                raw=self.format(record),
+            )
+        except Exception:
+            # A broken log sink must never surface in an HTTP handler or the ws thread.
+            self.handleError(record)
+        finally:
+            self._busy.on = False
+
+
+def install_relay_log_handler(store: Any) -> RelayLogHandler:
+    handler = RelayLogHandler(store)
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
 def create_agent_relay_app(
     *, db_path: Path | str, encryption_key: str | bytes | None, oauth: Any, feishu: Any
 ):
@@ -148,6 +237,56 @@ def create_agent_relay_app(
         header = str(request.headers.get("Authorization", "") or "")
         token = header[7:].strip() if header.startswith("Bearer ") else ""
         return store.authenticate(token) if token else None
+
+    def admin_denied(request: Any):
+        """Fail closed: no header → 401, wrong or unset admin token → 403."""
+        header = str(request.headers.get("Authorization", "") or "")
+        if not header.startswith("Bearer "):
+            return _error("unauthorized", "admin token required", 401)
+        expected = os.environ.get(ADMIN_TOKEN_ENV, "").strip()
+        # compare_digest raises TypeError on non-ASCII str — compare UTF-8 bytes.
+        offered = header[7:].strip().encode("utf-8", "surrogatepass")
+        if not expected or not hmac.compare_digest(offered, expected.encode("utf-8")):
+            return _error("forbidden", "admin access is not configured for this token", 403)
+        return None
+
+    def admin_window(request: Any):
+        """Auth then range; returns (window, error) with exactly one of them set."""
+        denied = admin_denied(request)
+        if denied is not None:
+            return None, denied
+        try:
+            since = int(request.query["since"])
+            until = int(request.query["until"])
+        except (KeyError, ValueError):
+            return None, _error("invalid_range", "since and until must be integer milliseconds", 400)
+        if not (0 <= since < 2**63 and 0 <= until < 2**63):
+            # SQLite binds int64 only; anything beyond is a 400, never an OverflowError 500.
+            return None, _error("invalid_range", "since and until must be integer milliseconds", 400)
+        if until <= since or until - since > ADMIN_MAX_WINDOW_MS:
+            return None, _error("invalid_range", "until must be after since and within 7 days", 400)
+        return (since, until), None
+
+    async def admin_logs(request):
+        window, denied = admin_window(request)
+        if denied is not None:
+            return denied
+        try:
+            after_id = int(request.query.get("after_id", "0"))
+            if not 0 <= after_id < 2**63:
+                raise ValueError
+        except ValueError:
+            return _error("invalid_range", "after_id must be a nonnegative integer", 400)
+        items = store.list_logs(*window, limit=ADMIN_LOG_LIMIT + 1, after_id=after_id)
+        return web.json_response(
+            {"items": items[:ADMIN_LOG_LIMIT], "truncated": len(items) > ADMIN_LOG_LIMIT}
+        )
+
+    async def admin_stats(request):
+        window, denied = admin_window(request)
+        if denied is not None:
+            return denied
+        return web.json_response(store.usage_stats(*window))
 
     async def start_enrollment(_request):
         return web.json_response(store.create_enrollment(oauth), status=201)
@@ -286,8 +425,9 @@ def create_agent_relay_app(
         }
         store.finish_message(str(row["resource_id"]), public_result)
         logger.info(
-            "relay_audit event=send kind=%s status=sent actor=%s",
+            "relay_audit event=send kind=%s status=sent msg=%s actor=%s",
             msg_type,
+            public_result["message_id"],
             actor["identity_fingerprint"],
         )
         return web.json_response(public_result, status=201 if created else 200)
@@ -315,7 +455,8 @@ def create_agent_relay_app(
             if not store.close_reply_window(actor["token_id"], message_id):
                 return _error("window_not_open", "no open reply window for this message", 409)
             logger.info(
-                "relay_audit event=reply_window status=closed actor=%s",
+                "relay_audit event=reply_window status=closed msg=%s actor=%s",
+                message_id,
                 actor["identity_fingerprint"],
             )
             return web.json_response({"message_id": message_id, "reply_window_seconds": 0})
@@ -336,11 +477,11 @@ def create_agent_relay_app(
                 timeout=5,
             )
         except TimeoutError:
-            logger.warning("relay_audit event=update status=timeout actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=update status=timeout msg=%s actor=%s", message_id, actor["identity_fingerprint"])
             return _error("upstream_timeout", "Feishu update timed out", 504)
         except FeishuApiError as exc:
             if exc.status == 429:
-                logger.warning("relay_audit event=update status=rate_limited actor=%s", actor["identity_fingerprint"])
+                logger.warning("relay_audit event=update status=rate_limited msg=%s actor=%s", message_id, actor["identity_fingerprint"])
                 return _error(
                     "rate_limited",
                     _feishu_error_message("Feishu rate limited the request", exc),
@@ -348,22 +489,25 @@ def create_agent_relay_app(
                     exc.retry_after or 1,
                 )
             if exc.status == 400:
-                logger.warning("relay_audit event=update status=rejected actor=%s", actor["identity_fingerprint"])
+                logger.warning("relay_audit event=update status=rejected msg=%s actor=%s", message_id, actor["identity_fingerprint"])
                 return _error(
                     "invalid_message",
                     _feishu_error_message("Feishu rejected the payload", exc),
                     400,
                 )
-            logger.warning("relay_audit event=update status=upstream_error actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=update status=upstream_error msg=%s actor=%s", message_id, actor["identity_fingerprint"])
             return _error(
                 "upstream_unavailable",
                 _feishu_error_message("Feishu update failed", exc),
                 502,
             )
         except Exception:
-            logger.warning("relay_audit event=update status=upstream_error actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=update status=upstream_error msg=%s actor=%s", message_id, actor["identity_fingerprint"])
             return _error("upstream_unavailable", "Feishu update failed", 502)
-        logger.info("relay_audit event=update status=updated actor=%s", actor["identity_fingerprint"])
+        # PATCH 成功才缓存 —— 重复点击的 ack 要回放这份内容（见 replay_card_content）。
+        # 非卡片消息在上面已被拦掉，这里 rowcount=0 只说明这条 message 不是按钮卡。
+        store.cache_card_content(actor["token_id"], message_id, content)
+        logger.info("relay_audit event=update status=updated msg=%s actor=%s", message_id, actor["identity_fingerprint"])
         return web.json_response({"message_id": message_id})
 
     async def revoke_token(request):
@@ -485,7 +629,9 @@ def create_agent_relay_app(
                     )
                 except Exception:
                     logger.warning(
-                        "relay_audit event=card status=fallback_register_failed actor=%s",
+                        "relay_audit event=card status=fallback_register_failed card=%s msg=%s actor=%s",
+                        row["card_id"],
+                        row["message_id"],
                         actor["identity_fingerprint"],
                     )
             return web.json_response(store._public_card(row))
@@ -504,11 +650,11 @@ def create_agent_relay_app(
                 timeout=5,
             )
         except TimeoutError:
-            logger.warning("relay_audit event=card status=timeout actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=card status=timeout card=%s actor=%s", row["card_id"], actor["identity_fingerprint"])
             return _error("upstream_timeout", "Feishu send timed out", 504)
         except FeishuApiError as exc:
             if exc.status == 429:
-                logger.warning("relay_audit event=card status=rate_limited actor=%s", actor["identity_fingerprint"])
+                logger.warning("relay_audit event=card status=rate_limited card=%s actor=%s", row["card_id"], actor["identity_fingerprint"])
                 return _error(
                     "rate_limited",
                     _feishu_error_message("Feishu rate limited the request", exc),
@@ -517,26 +663,26 @@ def create_agent_relay_app(
                 )
             if exc.status == 400:
                 store.fail_card(str(row["card_id"]))
-                logger.warning("relay_audit event=card status=rejected actor=%s", actor["identity_fingerprint"])
+                logger.warning("relay_audit event=card status=rejected card=%s actor=%s", row["card_id"], actor["identity_fingerprint"])
                 return _error(
                     "invalid_card",
                     _feishu_error_message("Feishu rejected the payload", exc),
                     400,
                 )
-            logger.warning("relay_audit event=card status=upstream_error actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=card status=upstream_error card=%s actor=%s", row["card_id"], actor["identity_fingerprint"])
             return _error(
                 "upstream_unavailable",
                 _feishu_error_message("Feishu send failed", exc),
                 502,
             )
         except Exception:
-            logger.warning("relay_audit event=card status=upstream_error actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=card status=upstream_error card=%s actor=%s", row["card_id"], actor["identity_fingerprint"])
             return _error("upstream_unavailable", "Feishu send failed", 502)
         result = dict(result or {})
         message_id = str(result.get("message_id") or "").strip()
         if not message_id:
             store.fail_card(str(row["card_id"]))
-            logger.warning("relay_audit event=card status=missing_receipt actor=%s", actor["identity_fingerprint"])
+            logger.warning("relay_audit event=card status=missing_receipt card=%s actor=%s", row["card_id"], actor["identity_fingerprint"])
             return _error("missing_receipt", "Feishu returned no message_id", 502)
         store.finish_card(
             str(row["card_id"]), message_id, str(result.get("conversation_id") or "")
@@ -550,11 +696,14 @@ def create_agent_relay_app(
         except Exception:
             # ponytail: the text fallback is a bonus — never fail a delivered card over it.
             logger.warning(
-                "relay_audit event=card status=fallback_register_failed actor=%s",
+                "relay_audit event=card status=fallback_register_failed card=%s msg=%s actor=%s",
+                row["card_id"],
+                message_id,
                 actor["identity_fingerprint"],
             )
         state = store.card_state(actor["token_id"], str(row["card_id"]))
-        logger.info("relay_audit event=card status=pending actor=%s", actor["identity_fingerprint"])
+        logger.info("relay_audit event=card status=pending card=%s msg=%s actor=%s",
+                    row["card_id"], message_id, actor["identity_fingerprint"])
         return web.json_response(state, status=201 if created else 200)
 
     async def get_card(request):
@@ -650,8 +799,12 @@ def create_agent_relay_app(
                 return _error("upstream_unavailable",
                               "card state updated but Feishu update failed", 502)
 
-        logger.info("relay_audit event=card status=%s content=%s actor=%s",
+        if content is not None:
+            # 与 update_message 同一条纪律：只有真的写出去了才缓存
+            store.cache_card_content(actor["token_id"], str(state.get("message_id") or ""), content)
+        logger.info("relay_audit event=card status=%s content=%s card=%s msg=%s actor=%s",
                     state.get("status"), "yes" if content is not None else "no",
+                    card_id, state.get("message_id") or "",
                     actor["identity_fingerprint"])
         return web.json_response(state)
 
@@ -699,6 +852,8 @@ def create_agent_relay_app(
     app.router.add_get("/v1/cards/{card_id}", get_card)
     app.router.add_patch("/v1/cards/{card_id}", close_card)
     app.router.add_post("/v1/tokens/{token_id}/revoke", revoke_token)
+    app.router.add_get("/v1/admin/logs", admin_logs)
+    app.router.add_get("/v1/admin/stats", admin_stats)
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)
     return app
@@ -720,6 +875,7 @@ def main() -> None:
         oauth=transport,
         feishu=transport,
     )
+    install_relay_log_handler(app[RELAY_STORE_KEY])
     web.run_app(
         app,
         host=os.environ.get("HERMES_AGENT_RELAY_HOST", "127.0.0.1"),

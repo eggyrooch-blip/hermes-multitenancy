@@ -23,6 +23,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 import traceback
 import importlib.util
 from contextlib import contextmanager
@@ -106,9 +107,15 @@ def _run_payload(
     )
     billing_retry_safe = supports_event_sink
 
+    # The tool heartbeat thread (agent_real/tool_heartbeat.py) writes lines
+    # concurrently with the main thread; one lock keeps every line whole.
+    emit_lock = threading.Lock()
+
     def emit(event: str, **payload) -> None:
-        protocol_stdout.write(json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n")
-        protocol_stdout.flush()
+        line = json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n"
+        with emit_lock:
+            protocol_stdout.write(line)
+            protocol_stdout.flush()
 
     def track(event_name: str, **event_payload) -> None:
         nonlocal billing_retry_safe
@@ -143,6 +150,14 @@ def _run_payload(
         run_kwargs = {"usage_sink": usage}
         if supports_event_sink:
             run_kwargs["event_sink"] = track
+        # Previous turns' tool transcript, already rendered + sanitized by the
+        # parent. Arrives on the stdin pipe only; neither side writes it to disk.
+        carried_context = payload.get("turn_tool_context")
+        if isinstance(carried_context, dict):
+            run_kwargs["turn_tool_context"] = str(carried_context.get("text") or "")
+            run_kwargs["turn_tool_attempt_id"] = str(
+                carried_context.get("attempt_id") or ""
+            )
         if messages is None:
             result = _run_with_aiagent(
                 event,

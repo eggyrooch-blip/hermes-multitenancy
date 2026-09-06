@@ -15,6 +15,7 @@ scope so a cached entry can never leak across profiles (asserted by
 from __future__ import annotations
 
 import os
+import logging
 import threading
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Optional
 
 from . import builtin, compat
 from .drivers import driver_for
-from .models import ConnectorDefinition, ConnectorStatus
+from .models import AuthAction, ConnectorDefinition, ConnectorStatus
 from .requirements import (
     ConnectorRequirementSet,
     SkillRequirementInput,
@@ -31,6 +32,8 @@ from .requirements import (
 
 
 # --- definitions ------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 
 def list_definitions() -> list[ConnectorDefinition]:
@@ -100,6 +103,29 @@ def collect_connector_statuses(
         home_dir=home_dir,
     )
     statuses = _enrich_rows(rows, profile=profile_name)
+    from .. import feishu_uat_auth
+    from ..github_mcp_connector import status as github_status
+
+    try:
+        shared = Path(shared_home) if shared_home else feishu_uat_auth.resolve_shared_home()
+        statuses.append(github_status(shared, profile_name, open_id))
+    except Exception as exc:
+        logger.warning("GitHub connector status unavailable (%s)", type(exc).__name__)
+        statuses.append(ConnectorStatus(
+            id="github-mcp",
+            title="GitHub",
+            provider="github",
+            installed=False,
+            status="error",
+            detail="GitHub Connector 状态暂不可用",
+            action=AuthAction(kind="manual", label="重试"),
+            profile=profile_name,
+            scope="profile",
+            acting_identity="user",
+            credential_owner=profile_name,
+            runtime_policy_owner="run_broker",
+            kind="external",
+        ))
 
     # Always refresh the cache after a live compute — INCLUDING a use_cache=False
     # (fresh) read. A fresh read bypasses the cache for its own result, but if it did

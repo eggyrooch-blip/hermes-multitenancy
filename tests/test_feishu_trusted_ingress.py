@@ -1,13 +1,17 @@
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import sys
 import time
-from types import SimpleNamespace as NS
+from types import ModuleType, SimpleNamespace as NS
 
 import pytest
 
 from hermes_multitenancy import trusted_feishu_ingress as ingress
 from hermes_multitenancy import router
+from hermes_multitenancy.feishu_adapter_compat import load_live_feishu_module
 from hermes_multitenancy.routing import RoutingTable
 
 
@@ -53,6 +57,30 @@ def routes(tmp_path, monkeypatch):
     ingress._reset_seen_for_tests()
     yield table
     table.close()
+
+
+@pytest.fixture
+def sender_open_id_scope(monkeypatch):
+    """Provide only the optional legacy ambient identity context under test."""
+    current_sender_open_id = ContextVar("test_current_sender_open_id", default=None)
+
+    @contextmanager
+    def scope(value):
+        token = current_sender_open_id.set(value)
+        try:
+            yield
+        finally:
+            current_sender_open_id.reset(token)
+
+    module = ModuleType("tools.feishu_oapi_client")
+    module.current_sender_open_id = current_sender_open_id
+    module.sender_open_id_scope = scope
+    monkeypatch.setitem(sys.modules, "tools.feishu_oapi_client", module)
+    import tools
+
+    monkeypatch.setattr(tools, "feishu_oapi_client", module, raising=False)
+    yield scope
+    assert current_sender_open_id.get() is None
 
 
 class FakeAdapter:
@@ -397,10 +425,24 @@ def test_lark_broker_allows_only_the_sealed_identity(
         assert captured["context"].allowed_identities == frozenset({allowed_identity})
 
 
-def test_real_agent_ticket_crosses_mt_runtime_boundary(routes, tmp_path, monkeypatch, caplog):
-    feishu = pytest.importorskip("gateway.platforms.feishu")
-    if not hasattr(feishu.FeishuAdapter, "_trusted_ingress_admitter"):
-        pytest.skip("installed hermes-agent lacks the trusted ingress contract")
+def test_real_agent_ticket_crosses_mt_runtime_boundary(
+    routes, tmp_path, monkeypatch, caplog, sender_open_id_scope
+):
+    try:
+        from gateway.platforms import feishu as legacy_feishu
+    except ImportError:
+        legacy_feishu = None
+    if legacy_feishu is not None and not hasattr(legacy_feishu.FeishuAdapter, "_trusted_ingress_admitter"):
+        pytest.skip("legacy installed hermes-agent lacks the trusted ingress contract")
+
+    from hermes_cli.plugins import discover_plugins
+
+    # This test requires a real Agent plugin boundary, not whichever discovery
+    # state a previous test left in the xdist worker.  Force rediscovery after
+    # the suite-wide Feishu registry isolation fixture clears that state.
+    discover_plugins(force=True)
+    feishu = load_live_feishu_module()
+    assert hasattr(feishu.FeishuAdapter, "_trusted_ingress_admitter")
     monkeypatch.setattr(ingress, "load_feishu_module", lambda: feishu)
     captured = {}
 
@@ -537,8 +579,6 @@ def test_real_agent_ticket_crosses_mt_runtime_boundary(routes, tmp_path, monkeyp
     root = __import__("hermes_multitenancy")
     monkeypatch.setattr(root, "is_router_profile_runtime", lambda: False)
     monkeypatch.setattr(root, "may_own_cron_runtime", lambda: False)
-
-    from tools.feishu_oapi_client import sender_open_id_scope
 
     with sender_open_id_scope("ou_a"):
         result = root._dispatch_with_worker_init(event=event, gateway=NS())

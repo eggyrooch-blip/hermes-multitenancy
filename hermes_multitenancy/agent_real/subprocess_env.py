@@ -13,6 +13,7 @@ import tempfile
 import uuid
 import re
 import secrets
+import shutil
 import importlib
 import threading
 from contextlib import closing, contextmanager
@@ -67,6 +68,7 @@ def _build_subprocess_env(
     env-derived key as an "ambient" credential.
     """
     parent = os.environ
+    local_harness = str((extra or {}).get("HERMES_LOCAL_HARNESS") or "") == "1"
     env: dict[str, str] = {
         key: parent[key] for key in _SUBPROCESS_ENV_ALLOWLIST if key in parent
     }
@@ -81,7 +83,7 @@ def _build_subprocess_env(
     env.update(
         _profile_env_for_aiagent(
             profile_home,
-            include_profile_secrets=not shared_agent_run,
+            include_profile_secrets=not shared_agent_run and not local_harness,
         )
     )
     credential_env = {} if shared_agent_run else _credential_env_for_aiagent(profile_home)
@@ -104,6 +106,10 @@ def _build_subprocess_env(
     env["HERMES_GATEWAY_SESSION"]           = "1"
     env["HERMES_EXEC_ASK"]                  = "1"
     env["HERMES_MULTITENANCY_APPROVAL_DIR"] = str(approval_dir)
+    # NOTE: KEP_AGENT_MODE / KEP_WORKSPACE_DIR are NOT set here. They are
+    # profile anchors (`_profile_anchor_env_for_aiagent`), applied above with
+    # HOME/WORKSPACE/KEP_PROFILE and mirrored through the force channel below —
+    # so the in-process run path gets them too, which a local injection missed.
     # terminal/execute_code apply a second subprocess env scrub.  Force only
     # non-secret profile anchors through that boundary so profile-scoped CLIs
     # such as kep-auth/ocean-cli read the same HOME and KEP_PROFILE as the
@@ -112,7 +118,8 @@ def _build_subprocess_env(
     lark_cli_env = _lark_cli_sidecar_env_for_aiagent(profile_home)
     env.update(lark_cli_env)
     env.update(_force_env_for_terminal_passthrough(lark_cli_env))
-    env.update(_browser_env_for_aiagent(profile_home))
+    if not local_harness:
+        env.update(_browser_env_for_aiagent(profile_home))
     if event_stream:
         env["HERMES_AIAGENT_EVENT_STREAM"] = "1"
 
@@ -123,15 +130,39 @@ def _build_subprocess_env(
     deduped = [part for part in path_parts if part != shared_bin]
     env["PATH"] = os.pathsep.join([shared_bin, *deduped])
     if strict_context_enabled():
+        from ..credential_hub.readers.feishu_project import (
+            _meegle_invocation,
+            _meegle_search_path,
+        )
+        from ..oauth_cli_guard import (
+            install_meegle_npx_oauth_guard,
+            install_meegle_oauth_guard,
+            require_registered_oauth_cli_gates,
+        )
+        from ..connectors.builtin import BUILTIN_CONNECTORS
+
+        require_registered_oauth_cli_gates(BUILTIN_CONNECTORS)
+
         real_bin = _resolve_lark_cli_authsidecar_binary(profile_home)
         shim_dir = profile_home / "tmp" / "lark-cli-shim"
         install_lark_cli_shim(shim_dir, real_binary=real_bin)
         env[HERMES_LARK_CLI_REAL_BIN] = str(real_bin)
         env[HERMES_LARK_CLI_RUN_TOKEN] = generate_lark_cli_run_token()
-        env.setdefault(
-            "HERMES_MT_SECURITY_AUDIT_PATH",
-            str(_default_security_audit_path_for_subprocess(profile_home)),
-        )
+        # Audit controls are SEALED at the end of this function from trusted
+        # sources only (extra > gateway parent env > profile-local default) —
+        # never set here, where a profile .env value merged above would win a
+        # setdefault. See the builder-owned seal block near the return.
+        # DECISION (2026-08-31, wf_46aff7d5 risk analysis): we deliberately do
+        # NOT inject HERMES_MULTITENANCY_STRICT_CONTEXT into the worker env.
+        # Flipping it would activate the dormant strict write regime inside
+        # workers — lark_cli_tool _prepare_resumable_write allowlists only
+        # im +messages-send/reply, so every api-mode non-GET, schema write and
+        # non-IM shortcut write across all tenants would be rejected with
+        # FEISHU_OPERATION_NOT_RESUMABLE, and checkpoint claiming would
+        # identity_unbound cron IM sends. Enabling that regime is a product
+        # decision requiring a real-traffic allowlist, not an env tweak.
+        # Worker-side gates that ARE meant to hold anchor on the run token
+        # instead (lark_cli_tool script channel + AUTHORIZED passthrough).
         real_bins = {
             name: str(shared_bin_dir / name)
             for name in kep_cli_guard.KEP_SHIM_NAMES
@@ -145,6 +176,31 @@ def _build_subprocess_env(
             )
             for name, real_path in real_bins.items():
                 env[f"HERMES_KEP_CLI_REAL_BIN_{name.replace('-', '_').upper()}"] = real_path
+        resolver_env = dict(env)
+        resolver_env["PATH"] = os.pathsep.join(
+            part
+            for part in resolver_env.get("PATH", "").split(os.pathsep)
+            if part and Path(part).resolve(strict=False) != shim_dir.resolve(strict=False)
+        )
+        explicit_meegle = resolver_env.get("HERMES_MEEGLE_BIN", "")
+        if explicit_meegle:
+            try:
+                if Path(explicit_meegle).resolve(strict=False).is_relative_to(shim_dir):
+                    resolver_env.pop("HERMES_MEEGLE_BIN", None)
+            except OSError:
+                resolver_env.pop("HERMES_MEEGLE_BIN", None)
+        meegle_invocation = _meegle_invocation(allow_npx=True, environ=resolver_env)
+        meegle_wrapper = install_meegle_oauth_guard(
+            shim_dir,
+            real_command=meegle_invocation,
+        )
+        env["HERMES_MEEGLE_BIN"] = str(meegle_wrapper)
+        npx_binary = shutil.which(
+            "npx",
+            path=_meegle_search_path(environ=resolver_env),
+        )
+        if npx_binary:
+            install_meegle_npx_oauth_guard(shim_dir, real_binary=Path(npx_binary))
         strict_path_parts = [part for part in env["PATH"].split(os.pathsep) if part]
         env["PATH"] = os.pathsep.join(
             [str(shim_dir), *[part for part in strict_path_parts if part != str(shim_dir)]]
@@ -160,6 +216,23 @@ def _build_subprocess_env(
     if extra:
         env.update(extra)
 
+    if local_harness:
+        # Harness keeps run-scoped capabilities but never ambient vault keys.
+        for name in (
+            "HERMES_MULTITENANCY_CREDENTIAL_KEY",
+            "HERMES_CREDENTIAL_KEY",
+        ):
+            env.pop(name, None)
+        env.pop("HERMES_YOLO_MODE", None)
+        env.pop("HERMES_SANDBOX_HOST", None)
+
+    from . import executor_map
+
+    mapped_codex = (
+        str((extra or {}).get(EXECUTOR_RUNTIME_ENV) or "").strip()
+        == executor_map.CODEX_APP_SERVER
+    )
+
     # GitLab credential delegation (group profiles only): inject the initiator's
     # leased personal token at RUN level. Env-only by contract — never written to
     # the shared profile's config/, vault, or workspace/credentials/.
@@ -172,7 +245,7 @@ def _build_subprocess_env(
     # /proc/<pid>/environ, and it silently burned that user's once-lease.
     # `delegation_enabled=False` closes the same hole positively rather than by
     # name-blacklisting the resulting variables.
-    if delegation_enabled and not shared_agent_run:
+    if delegation_enabled and not shared_agent_run and (not mapped_codex or local_harness):
         try:
             from ..credential_delegation import (
                 DELEGATION_ID_ENV,
@@ -201,7 +274,7 @@ def _build_subprocess_env(
                 "[multitenancy] delegation env injection failed", exc_info=True
             )
 
-    if sandboxed_profile:
+    if sandboxed_profile and not local_harness:
         env["HERMES_SANDBOX_HOST"] = "1"
         env.setdefault("HERMES_YOLO_MODE", "1")
         if sys.platform.startswith("linux"):
@@ -229,6 +302,34 @@ def _build_subprocess_env(
         except Exception:
             pass
 
+    # LAST WORD on the strict flag — positioned after every env source (parent
+    # allowlist, profile .env via _profile_env_for_aiagent, `extra`) for the
+    # same reason as the broker-key pop below: an earlier exclusion can be
+    # silently undone by a later merge. The DECISION comment in the strict
+    # build block above pins strict OFF in workers; this pop enforces it
+    # against a dirty profile .env or a caller-supplied extra.
+    env.pop("HERMES_MULTITENANCY_STRICT_CONTEXT", None)
+    if strict_context_enabled() and not local_harness:
+        # SEAL builder-owned audit controls from trusted sources only. The env
+        # dict at this point may carry values merged from the tenant-writable
+        # profile .env — for these keys that is an attack surface, not config:
+        # PATH=/dev/null or ENABLED=0 there would silently discard forced
+        # script_channel.granted events and disable worker audit. Authority
+        # order: caller-constructed `extra` > explicit gateway parent env >
+        # profile-local durable default. Profile .env has no say.
+        _audit_path_default = str(
+            _default_security_audit_path_for_subprocess(profile_home)
+        )
+        for _audit_key, _audit_default in (
+            ("HERMES_MT_SECURITY_AUDIT_PATH", _audit_path_default),
+            ("HERMES_MT_SECURITY_AUDIT_ENABLED", "1"),
+        ):
+            _trusted = (
+                str((extra or {}).get(_audit_key) or "").strip()
+                or str(parent.get(_audit_key) or "").strip()
+            )
+            env[_audit_key] = _trusted or _audit_default
+
     # LAST WORD on the RunBroker bearer — must stay at the very end.
     #
     # The SHARED master key must never reach a tenant child: owner identity on
@@ -249,6 +350,34 @@ def _build_subprocess_env(
     for _broker_key_name in ("HERMES_RUN_BROKER_KEY", "HERMES_MULTITENANCY_RUN_BROKER_KEY"):
         if not _minted or str(env.get(_broker_key_name) or "").strip() != _minted:
             env.pop(_broker_key_name, None)
+
+    # Codex app-server plumbing is per-run, so THIS spawn's `extra` is the only
+    # source of it. A run that was not mapped to codex must be byte-identical to
+    # today: a CODEX_HOME inherited from the gateway env would aim it at the
+    # operator's own ~/.codex (the isolation `codex_home.materialize` exists to
+    # give), and an inherited key would hand it a credential no one billed. The
+    # warm worker's shared base env passes no `extra` and is cleaned the same way.
+    if not mapped_codex:
+        for _codex_env_name in _CODEX_RUNTIME_ENV_NAMES:
+            env.pop(_codex_env_name, None)
+    else:
+        # The mapped run already cloned with its actor-bound read credential in
+        # <wf>/.git-credentials. Do not re-expose that literal through the
+        # profile's generic GitLab env compatibility path.
+        if not local_harness:
+            for _gitlab_env_name in _gitlab_runtime_env_names_for_aiagent(
+                profile_home, env
+            ):
+                env.pop(_gitlab_env_name, None)
+        # Codex itself may invoke Git for plugin catalogs. Keep it away from
+        # the operator's config/keychain even though the run's clone is done.
+        env.update(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
 
     return env
 

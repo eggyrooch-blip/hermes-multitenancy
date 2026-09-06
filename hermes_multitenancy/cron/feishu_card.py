@@ -121,17 +121,18 @@ def _build_cron_card(job: dict, content: str) -> tuple[Optional[dict[str, Any]],
         body = content.strip()
         media_files = []
 
-    if not body:
+    media_only = not body and bool(media_files)
+    if not body and not media_only:
         return None, media_files
 
     try:
         from ..card.sanitization import _plain_summary
 
-        summary = _plain_summary(body)
+        summary = str(job.get("name") or "Hermes") if media_only else _plain_summary(body)
     except Exception:
-        summary = "Hermes"
+        summary = str(job.get("name") or "Hermes") if media_only else "Hermes"
 
-    if wrap_response:
+    if wrap_response or media_only:
         body_md = _cw._build_cron_card_body(job, body)
     else:
         body_md = _cw._cardify_markdown_for_feishu(body)

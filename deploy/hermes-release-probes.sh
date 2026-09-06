@@ -73,10 +73,17 @@ case "$b" in
 esac
 
 # ── 4. profile apiserver 端口 ────────────────────────────────────────
-if ss -ltn 2>/dev/null | grep -q ":${APISERVER_PORT}\b"; then
+apiserver_listening=0
+for _ in $(seq 1 $((BOOT_WAIT / 5))); do
+  case "$(ss -ltn 2>/dev/null)"$'\n' in
+    *":${APISERVER_PORT}"[![:digit:]]*) apiserver_listening=1; break ;;
+  esac
+  sleep 5
+done
+if [ "$apiserver_listening" -eq 1 ]; then
   ok "apiserver :${APISERVER_PORT} 在听"
 else
-  bad "apiserver :${APISERVER_PORT} 没在听"
+  bad "apiserver :${APISERVER_PORT} 没在听（等了 ${BOOT_WAIT}s）"
 fi
 
 # ── 5. 数据库完好 ────────────────────────────────────────────────────

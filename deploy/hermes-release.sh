@@ -54,8 +54,17 @@ _relay_curl_probe() {
     -d '{"reply_window_seconds":0}' 2>/dev/null || echo 000
 }
 RELAY_PROBE_CMD="${RELAY_PROBE_CMD:-_relay_curl_probe}"
-# 只覆盖「重启后还没 bind」这一小段；relay 真起不来时不该把发布拖很久。
-RELAY_PROBE_TIMEOUT="${RELAY_PROBE_TIMEOUT:-15}"
+# 覆盖「重启后还没 bind」那一段。15s 是错的，两次假失败（2026-08-15
+# release-20260815-01、2026-08-27 release-20260827-01）都栽在同一个可算的错配上：
+# relay 的 aiohttp on_startup 里 start_event_stream 同步阻塞等飞书 ws 连上
+# （agent_relay_feishu.py: EVENT_STREAM_START_TIMEOUT_SECONDS = 10），失败路径再
+# thread.join(timeout=5)，而 aiohttp 是【跑完 on_startup 才 bind socket】。所以飞书
+# 连接不顺时 relay 要 10+5=15s 才放弃 ws、之后才可能 bind —— 上限恰好等于探针的上限，
+# 探针必然先超时。下界因此是 ws timeout + join；再乘余量盖住冷启动（lark_oapi /
+# aiohttp / cryptography 的 import）与飞书抖动。tests/test_release_relay_probe.py
+# 里有守卫：relay 侧把 ws 上限调大而这里没跟上就红。
+# 代价只有「relay 真死时晚 75s 报红」，换掉的是一整类假失败 + 无谓的 relay 还原。
+RELAY_PROBE_TIMEOUT="${RELAY_PROBE_TIMEOUT:-90}"
 # 探针等待逻辑住在自己的文件里：本脚本是顶层直接执行的，source 它就等于跑一次真发布，
 # 所以那段判定过去无法自动化覆盖（2026-08-15 的假失败就出在那里）。
 # shellcheck source=deploy/relay-probe-lib.sh
@@ -96,7 +105,7 @@ git -C "$RELEASES/.repo-mt" fetch -q --tags --prune origin 2>/dev/null \
   || git -C "$RELEASES/.repo-mt" fetch -q --tags --prune github 2>/dev/null \
   || log "警告：拉取标签失败，用本地已有的（GitLab/GitHub 不可用时不影响当前运行的版本）"
 
-TAG=$(git -C "$RELEASES/.repo-mt" tag -l 'release-*' --sort=-creatordate | head -1)
+TAG=$(git -C "$RELEASES/.repo-mt" tag -l 'release-*' --sort=-refname --sort=-creatordate | head -1)
 CURRENT=$(cat "$STATE_FILE" 2>/dev/null || echo "")
 
 # ── 漂移探针：活的软链，是不是真等于当前标签钉的 SHA ──────────────────

@@ -2,6 +2,17 @@ from pathlib import Path
 
 import pytest
 
+from hermes_multitenancy.credential_materializer import git_auth_env, git_identity_env
+
+
+def _expected_credential_env(profile: str, token_env: dict[str, str]) -> dict[str, str]:
+    """Identity is seeded first, then the token, then git auth extends the count
+    (see test_git_identity_env.py for the seeding contract)."""
+    env = git_identity_env({}, profile=profile)
+    env.update(token_env)
+    env.update(git_auth_env(env))
+    return env
+
 
 def test_materialize_shared_group_token_to_profile_workspaces(monkeypatch, tmp_path: Path):
     from hermes_multitenancy.credential_materializer import materialize_credentials
@@ -249,8 +260,11 @@ def test_self_lane_env_prefers_personal_token_and_falls_back_to_shared(monkeypat
     shared = _self_lane_home(tmp_path, personal_holders=("alice",))
     profiles = shared / "profiles"
 
-    assert _credential_env_for_aiagent(profiles / "alice") == {"GITLAB_TOKEN": "personal-alice"}
-    assert _credential_env_for_aiagent(profiles / "bob") == {"GITLAB_TOKEN": "global-token"}
+    for profile, token in (("alice", "personal-alice"), ("bob", "global-token")):
+        # git auth env rides along with whichever token is live.
+        assert _credential_env_for_aiagent(profiles / profile) == _expected_credential_env(
+            profile, {"GITLAB_TOKEN": token}
+        )
 
 
 def test_self_lane_file_and_env_never_disagree_about_which_token_is_live(monkeypatch, tmp_path: Path):
@@ -392,11 +406,13 @@ credentials:
         store.close()
 
     alice = _credential_env_for_aiagent(profiles / "alice")
-    assert alice == {"GITLAB_TOKEN": "personal-alice", "GITLAB_HOST": "gitlab.example.com"}
+    assert alice == _expected_credential_env(
+        "alice", {"GITLAB_TOKEN": "personal-alice", "GITLAB_HOST": "gitlab.example.com"}
+    )
 
     # bob has neither a personal record nor a shared one -> no token, and
-    # therefore no companion vars either.
-    assert _credential_env_for_aiagent(profiles / "bob") == {}
+    # therefore no companion vars either; only the seeded commit identity stays.
+    assert _credential_env_for_aiagent(profiles / "bob") == git_identity_env({}, profile="bob")
 
 
 def test_default_shared_lane_is_untouched_by_the_self_marker(monkeypatch, tmp_path: Path):

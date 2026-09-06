@@ -82,8 +82,8 @@ def read_agent_session_tokens(agent: Any) -> dict[str, int]:
 
     ``cache_read_tokens`` / ``cache_write_tokens`` 来自核心的
     ``session_cache_read_tokens`` / ``session_cache_write_tokens``（``run_agent.py`` 约
-    751-752 定义），``api_calls`` 来自 ``_api_call_count``（``agent/agent_init.py`` 初始化、
-    ``agent/conversation_loop.py`` 每次模型调用后更新）。这三项是判断「换模型是否划算」
+    751-752 定义），``api_calls`` 优先来自所有 transport 共用的
+    ``session_api_calls``，旧核心才回退 ``_api_call_count``。这三项是判断「换模型是否划算」
     的判据：缓存读价只有输入价的 0.1x，换模型打掉前缀缓存的代价可能反超降级省下的差价；
     而每轮调用次数决定了「小模型多绕几轮反而更慢/更贵」能不能被观测到。
     核心版本不同可能缺这些属性（MT 测试环境与生产跑的不是同一条 core 线），故一律 getattr 兜底。
@@ -94,7 +94,9 @@ def read_agent_session_tokens(agent: Any) -> dict[str, int]:
         "total_tokens": _int(getattr(agent, "session_total_tokens", 0)),
         "cache_read_tokens": _int(getattr(agent, "session_cache_read_tokens", 0)),
         "cache_write_tokens": _int(getattr(agent, "session_cache_write_tokens", 0)),
-        "api_calls": _int(getattr(agent, "_api_call_count", 0)),
+        "api_calls": _int(
+            getattr(agent, "session_api_calls", getattr(agent, "_api_call_count", 0))
+        ),
     }
 
 
@@ -113,6 +115,7 @@ def append_token_usage(
     cache_read_tokens: Any = 0,
     cache_write_tokens: Any = 0,
     api_calls: Any = 0,
+    budget_exhausted: bool = False,
 ) -> None:
     """追加一行 token 台账。开关关 / token 非正 / 任何异常 → 静默 no-op。
 
@@ -144,6 +147,9 @@ def append_token_usage(
         "cache_write_tokens": _int(cache_write_tokens),
         "api_calls": _int(api_calls),
     }
+    if budget_exhausted:
+        # 只在真耗尽时写这个键：预算耗尽是异常样本，不给每一行都加一列。
+        event["budget_exhausted"] = True
 
     try:
         path = token_usage_ledger_path()

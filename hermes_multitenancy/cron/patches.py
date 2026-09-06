@@ -421,6 +421,42 @@ def _patch_cron_delivery_mirror() -> None:
     if original is None or getattr(original, "_hermes_multitenancy_patched", False):
         return
 
+    original_resolve_targets = getattr(scheduler, "_resolve_delivery_targets", None)
+    target_override_marker = object()
+
+    def raw_delivery_may_include_feishu(job: dict) -> bool:
+        raw_deliver = job.get("deliver", "local")
+        if isinstance(raw_deliver, (list, tuple, set)):
+            parts = [str(part).strip().lower() for part in raw_deliver]
+        else:
+            parts = [
+                part.strip().lower()
+                for part in str(raw_deliver or "local").split(",")
+            ]
+        platforms = {part.split(":", 1)[0] for part in parts if part}
+        if "feishu" in platforms or "all" in platforms:
+            return True
+        if "origin" not in platforms:
+            return False
+        origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+        origin_platform = str(origin.get("platform") or "").strip().lower()
+        # An origin-less legacy job can fall back to any configured home target.
+        return not origin_platform or origin_platform == "feishu"
+
+    if callable(original_resolve_targets):
+        @functools.wraps(original_resolve_targets)
+        def resolve_delivery_targets(job: dict) -> list[dict]:
+            override = job.get("_hermes_delivery_targets_override")
+            if (
+                isinstance(override, tuple)
+                and len(override) == 2
+                and override[0] is target_override_marker
+            ):
+                return list(override[1])
+            return original_resolve_targets(job)
+
+        scheduler._resolve_delivery_targets = resolve_delivery_targets
+
     @functools.wraps(original)
     def deliver_result(job: dict, content: str, adapters: Any = None, loop: Any = None) -> Optional[str]:
         # Once the gateway is draining, every Feishu send is doomed (the SDK
@@ -436,6 +472,10 @@ def _patch_cron_delivery_mirror() -> None:
                 job.get("id", "?"),
             )
             return "cron delivery skipped: gateway is shutting down"
+        if not callable(original_resolve_targets):
+            if raw_delivery_may_include_feishu(job):
+                return "cron delivery target resolution unavailable"
+            return original(job, content, adapters=adapters, loop=loop)
 
         # A cron delivery has no interactive caller watching a stream. Send its
         # single Feishu target once and require the resulting message receipt;
@@ -446,25 +486,26 @@ def _patch_cron_delivery_mirror() -> None:
             deliver == "origin"
             and str(origin.get("platform") or "").strip().lower() == "feishu"
         )
-        requests_feishu = any(
-            part.strip().split(":", 1)[0] == "feishu" for part in deliver.split(",")
-        ) or owner_dm_delivery
+        raw_requests_feishu = raw_delivery_may_include_feishu(job)
         try:
             targets = scheduler._resolve_delivery_targets(job)
         except Exception:
-            if requests_feishu:
+            if raw_requests_feishu:
                 return "failed to resolve cron delivery target"
             return original(job, content, adapters=adapters, loop=loop)
-        if requests_feishu and (
-            not targets
-            or (
-                len(targets) == 1
-                and str(targets[0].get("platform") or "").strip().lower() != "feishu"
-            )
-        ):
+        feishu_targets = [
+            target
+            for target in targets
+            if str(target.get("platform") or "").strip().lower() == "feishu"
+        ]
+        if raw_requests_feishu and not targets:
             return "failed to resolve cron delivery target"
-        if len(targets) == 1 and str(targets[0].get("platform") or "").strip().lower() == "feishu":
-            target = targets[0]
+        if feishu_targets:
+            job["_hermes_feishu_receipt_expected"] = True
+            other_targets = [target for target in targets if target not in feishu_targets]
+            if len(feishu_targets) != 1:
+                return "failed to resolve cron delivery target"
+            target = feishu_targets[0]
             try:
                 _, media_files = _cw._cron_delivery_payload_for_adapter(job, content)
             except Exception:
@@ -485,61 +526,78 @@ def _patch_cron_delivery_mirror() -> None:
                     }
                 else:
                     return "cron delivery identity is unavailable or ambiguous"
-            if not media_files:
-                live_error = _cw._deliver_cron_feishu_via_live_adapter(
-                    scheduler,
-                    job,
+            other_error = None
+            if other_targets:
+                core_job = dict(job)
+                core_job["_hermes_delivery_targets_override"] = (
+                    target_override_marker,
+                    tuple(other_targets),
+                )
+                other_error = original(
+                    core_job,
                     content,
                     adapters=adapters,
                     loop=loop,
-                    require_receipt=True,
-                    targets_override=[target],
                 )
-                if live_error is None:
-                    _cw._mirror_cron_delivery_to_owner(job, content)
-                    return None
-                if live_error == "feishu live adapter unavailable":
-                    return live_error
-                reason = "other"
-                for marker, code in (
-                    ("no payload", "no_payload"),
-                    ("missing message_id", "missing_receipt"),
-                    ("timed out", "timeout"),
-                    ("loop unavailable", "loop_unavailable"),
-                    ("schedule", "loop_unavailable"),
-                    ("send failed", "rejected"),
-                    ("send raised", "exception"),
-                    ("delivery to", "exception"),
-                    ("serialize", "serialize"),
-                ):
-                    if marker in live_error:
-                        reason = code
-                        break
-                logger.warning(
-                    "[multitenancy] cron Feishu delivery unconfirmed job=%s reason=%s",
-                    job.get("id", "?"),
-                    reason,
-                )
-                return "feishu live adapter delivery unconfirmed"
-
-        error = original(job, content, adapters=adapters, loop=loop)
-        if error is not None and _cw._is_feishu_platform_config_error(error):
+            receipt: dict[str, str] = {}
             live_error = _cw._deliver_cron_feishu_via_live_adapter(
                 scheduler,
                 job,
                 content,
                 adapters=adapters,
                 loop=loop,
+                require_receipt=True,
+                targets_override=[target],
+                receipt_out=receipt,
             )
             if live_error is None:
+                message_id = str(receipt.get("message_id") or "").strip()
+                if not message_id:
+                    logger.warning(
+                        "[multitenancy] cron Feishu delivery unconfirmed job=%s reason=missing_receipt",
+                        job.get("id", "?"),
+                    )
+                    return "feishu live adapter delivery unconfirmed"
+                job["_hermes_delivery_message_id"] = message_id
+                if other_error:
+                    return other_error
                 _cw._mirror_cron_delivery_to_owner(job, content)
                 return None
+            if live_error == "feishu live adapter unavailable":
+                return live_error
+            reason = "other"
+            for marker, code in (
+                ("no payload", "no_payload"),
+                ("missing message_id", "missing_receipt"),
+                ("media delivery unconfirmed", "media_unconfirmed"),
+                ("timed out", "timeout"),
+                ("loop unavailable", "loop_unavailable"),
+                ("schedule", "loop_unavailable"),
+                ("send failed", "rejected"),
+                ("send raised", "exception"),
+                ("delivery to", "exception"),
+                ("serialize", "serialize"),
+            ):
+                if marker in live_error:
+                    reason = code
+                    break
             logger.warning(
-                "[multitenancy] cron live Feishu delivery fallback failed job=%s: %s",
+                "[multitenancy] cron Feishu delivery unconfirmed job=%s reason=%s",
                 job.get("id", "?"),
-                live_error,
+                reason,
             )
-            return f"{error}; live Feishu fallback failed: {live_error}"
+            errors = [other_error, "feishu live adapter delivery unconfirmed"]
+            return "; ".join(error for error in errors if error)
+
+        # Core must consume the same authoritative resolution we inspected.
+        # Letting it resolve the raw job again can change a non-Feishu leg into
+        # Feishu and re-enter the legacy receiptless config fallback.
+        core_job = dict(job)
+        core_job["_hermes_delivery_targets_override"] = (
+            target_override_marker,
+            tuple(targets),
+        )
+        error = original(core_job, content, adapters=adapters, loop=loop)
         if error is None:
             _cw._mirror_cron_delivery_to_owner(job, content)
         return error

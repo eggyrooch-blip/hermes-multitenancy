@@ -721,6 +721,23 @@ sqlite3 ~/.hermes/multitenancy.db \
 
 ---
 
+## Owner-scoped connector gateway (local candidate)
+
+The unified connector candidate keeps the seven existing CLI connectors and the `github-mcp` bundle, and adds the frozen 642-row marketplace catalog (330 canonical rows) plus its archived icons. A trusted WebUI principal may import only HTTPS Streamable HTTP or SSE `mcpServers`; `command` / `args`, private-network destinations, redirects, and non-read-only upstream tools fail closed. Definitions and secrets are stored under the exact profile/subject/connector owner tuple, and every discovery/call revalidates the destination and current installation before dispatch.
+
+Connecting also installs `skills/github-mcp/SKILL.md` and a secretless `mcp_servers.hermes-connectors` profile entry. Revocation deletes the exact owner row and never falls back to ambient GitHub auth. Run the focused contract with:
+
+```bash
+uv run --extra test pytest -q tests/test_unified_connector_mcp.py \
+  tests/test_connector_registry.py tests/test_connector_auth_contract.py \
+  tests/test_connector_status_cache_isolation.py tests/test_credentials.py \
+  tests/test_credential_broker_scope.py
+```
+
+The catalog and custom-remote addition is local-only until explicitly shipped. Focused local verification covers all 642 rows and icon confinement, cross-owner denial, encrypted credential storage, SSRF/rebinding defenses, read-only tool admission, and immediate revocation. It does not turn rejected or sandbox-required catalog rows into enabled production tools, and it does not read ambient CLI credentials.
+
+The latest focused gateway suite passes 216 tests. Production enablement still requires the paired WebUI release, normal release gates, and two-identity post-restart canaries.
+
 ## 🤝 Contributing
 
 Issues and PRs welcome.

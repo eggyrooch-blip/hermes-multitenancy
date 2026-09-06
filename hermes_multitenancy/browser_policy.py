@@ -30,7 +30,7 @@ _METADATA_IPS = {
     ipaddress.ip_address("169.254.170.2"),
     ipaddress.ip_address("100.100.100.200"),
 }
-_BENCHMARK_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+_BENCHMARK_FAKE_IP_NET = ipaddress.ip_network("192.0.2.0/15")
 
 
 @dataclass(frozen=True)

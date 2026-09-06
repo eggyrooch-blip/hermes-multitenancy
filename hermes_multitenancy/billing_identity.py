@@ -40,6 +40,11 @@ from .token_usage_uploader import make_owner_resolver
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _RUNTIME_KEY_ENV = "HERMES_LITELLM_RUNTIME_API_KEY"
+#: Public alias: the codex runtime seam (`agent_real/_core.py`) re-exports this
+#: same key value under codex' own `env_key` name, and must read the payer key
+#: out of the env dict `runtime_env_for_billing_metadata` just returned. Naming
+#: it here keeps that seam from hard-coding a fourth copy of the string.
+RUNTIME_KEY_ENV = _RUNTIME_KEY_ENV
 _RUNTIME_BASE_URL_ENV = "HERMES_LITELLM_RUNTIME_BASE_URL"
 _RUNTIME_EMPLOYEE_ENV = "HERMES_LITELLM_RUNTIME_EMPLOYEE_ID"
 
@@ -55,6 +60,7 @@ _RESERVED_METADATA = frozenset({
     "litellm_billing_credential_version",
     "litellm_billing_expires_at",
     "litellm_billing_base_url",
+    "litellm_billing_actor_subject",
 })
 
 
@@ -242,9 +248,19 @@ class BillingIdentityPreparer:
             self._profile_owner,
         )
 
-    def prepare(self, request: RunRequest) -> RunRequest:
+    def prepare(self, request: RunRequest, *, actor_open_id: str = "") -> RunRequest:
         metadata = _clean_metadata(request.metadata)
-        payer = self._payer(request, metadata)
+        actor_open_id = str(actor_open_id or "").strip()
+        if actor_open_id:
+            with self._routing_lock:
+                row = self._employee_row(actor_open_id)
+            payer = (
+                _ResolvedPayer(row.user_id, row.profile_name or row.user_id, "")
+                if row is not None
+                else None
+            )
+        else:
+            payer = self._payer(request, metadata)
         if payer is None:
             profile_binding = self._store.get_by_profile(request.profile_name)
             owner = self._employee_row(self._profile_owner(request.profile_name))
@@ -277,7 +293,8 @@ class BillingIdentityPreparer:
             return request if metadata == request.metadata else replace(request, metadata=metadata)
         profile_binding = self._store.get_by_profile(request.profile_name)
         if (
-            profile_binding is not None
+            not actor_open_id
+            and profile_binding is not None
             and profile_binding.employee_user_id != payer.employee_user_id
         ):
             raise RunRejected("billing payer profile drift detected")
@@ -315,6 +332,8 @@ class BillingIdentityPreparer:
         binding = replace(binding, migration_state="enforced")
         self._store.put(binding)
         metadata.update(_metadata_for_binding(binding, _billing_model_base_url()))
+        if actor_open_id:
+            metadata["litellm_billing_actor_subject"] = actor_open_id
         return replace(request, metadata=metadata)
 
     def repair_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -533,7 +552,9 @@ def _log_billing_degraded(*, employee_id: str, profile_name: str, reason: str) -
             pass
 
 
-async def prepare_billing_request(request: RunRequest) -> RunRequest:
+async def prepare_billing_request(
+    request: RunRequest, *, actor_open_id: str = ""
+) -> RunRequest:
     """Resolve the payer before idempotency is consumed; never trust caller metadata."""
     import asyncio
     from . import router
@@ -546,7 +567,9 @@ async def prepare_billing_request(request: RunRequest) -> RunRequest:
             store=preparer._store,
             credentials=preparer._credentials,
         )
-    return await asyncio.to_thread(preparer.prepare, request)
+    return await asyncio.to_thread(
+        preparer.prepare, request, actor_open_id=actor_open_id
+    )
 
 
 def runtime_env_for_billing_metadata(metadata: dict[str, Any]) -> dict[str, str]:

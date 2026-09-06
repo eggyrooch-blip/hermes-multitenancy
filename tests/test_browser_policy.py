@@ -160,14 +160,14 @@ def test_url_guard_allows_public_hostname_resolved_to_fake_ip(
                 browser_policy.socket.SOCK_STREAM,
                 6,
                 "",
-                ("198.18.18.245", 0),
+                ("192.0.2.245", 0),
             )
         ]
 
     monkeypatch.setattr(browser_policy.socket, "getaddrinfo", fake_getaddrinfo)
 
     assert browser_policy.decide_url("https://example.com/", decision).allowed is True
-    assert browser_policy.decide_url("http://198.18.18.245/", decision).allowed is False
+    assert browser_policy.decide_url("http://192.0.2.245/", decision).allowed is False
 
 
 def test_url_guard_allows_private_dns_when_enabled_but_never_metadata(

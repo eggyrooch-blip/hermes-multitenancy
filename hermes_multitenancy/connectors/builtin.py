@@ -27,8 +27,9 @@ KEP_CLI_ONLINE = "kep-cli-online"
 KEP_CLI_PRE = "kep-cli-pre"
 GITLAB = "gitlab"
 GITLAB_PERSONAL = "gitlab-personal"
+GITHUB_MCP = "github-mcp"
 
-CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB, GITLAB_PERSONAL)
+CONNECTOR_ORDER = (LARK_CLI, FEISHU_PROJECT, KEEP_RECORD, KEP_CLI_ONLINE, KEP_CLI_PRE, GITLAB, GITLAB_PERSONAL, GITHUB_MCP)
 
 
 BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
@@ -209,6 +210,23 @@ BUILTIN_CONNECTORS: dict[str, ConnectorDefinition] = {
             runtime_policy_owner="connector_driver",
         ),
         ui=ConnectorUiSpec(group="internal-systems", action="manual"),
+    ),
+    GITHUB_MCP: ConnectorDefinition(
+        id=GITHUB_MCP,
+        title="GitHub",
+        provider="github",
+        kind="external",
+        scope="profile",
+        invocation=InvocationSpec(type="mcp", detail="https://api.githubcopilot.com/mcp/"),
+        auth_flow=AuthFlowSpec(type="manual_token", status_probe="github_mcp_connector.status"),
+        policy=ConnectorPolicy(
+            supported_identities=("user",),
+            default_identity="user",
+            audit=True,
+            secrets_owner="profile_home",
+            runtime_policy_owner="run_broker",
+        ),
+        ui=ConnectorUiSpec(group="other-credentials", action="manual"),
     ),
 }
 

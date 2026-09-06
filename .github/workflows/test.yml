@@ -15,6 +15,24 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v5
+      - name: Run Codex W0 harness and invariant guard
+        run: |
+          uv run --extra test pytest -q tests/test_w0_ci_guard.py
+          uv run --extra test pytest -q \
+            tests/test_executor_runtime_map.py \
+            tests/test_codex_provider_proxy.py \
+            tests/test_codex_home.py \
+            tests/test_run_workspace_env.py \
+            tests/test_codex_runtime_key_env.py \
+            tests/test_codex_runtime_integration.py \
+            tests/test_agent_mode_env.py \
+            tests/test_git_auth_env.py \
+            tests/test_gitlab_owner_scope_attestation.py \
+            tests/test_single_actor_spend_receipt.py \
+            tests/test_webui_broker_server.py::test_webui_authenticated_owner_is_sealed_before_default_dispatch \
+            tests/test_webui_broker_server.py::test_default_dispatch_attaches_only_server_prepared_codex_evidence \
+            tests/test_aiagent_subprocess.py::test_build_subprocess_env_drops_non_allowlisted_parent_env \
+            tests/test_aiagent_subprocess.py::test_mapped_stream_commits_state_only_after_receipt
       - name: Run hotfix acceptance tests
         run: |
           uv run --extra test pytest -q \

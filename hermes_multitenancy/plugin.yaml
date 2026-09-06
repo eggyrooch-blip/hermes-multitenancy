@@ -5,4 +5,6 @@ description: "Multi-tenant Feishu routing for Hermes: one bot, many users, isola
 author: Hermes Multitenancy Contributors
 kind: standalone
 provides_hooks:
+  - post_tool_call
+  - transform_tool_result
   - pre_gateway_dispatch

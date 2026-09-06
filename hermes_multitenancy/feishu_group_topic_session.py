@@ -22,6 +22,10 @@ _CHAT_CAPABILITY_ATTR = "_mt_group_topic_chat_capability"
 _MAP_MAX = 256
 
 
+class _TopicHydrationRejected(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class _PendingTopic:
     canonical_thread_id: Optional[str]
@@ -40,8 +44,32 @@ def group_topic_thread(event: Any) -> Optional[str]:
     return thread_id if chat_id and thread_id else None
 
 
+def group_topic_conversation_id(event: Any) -> Optional[str]:
+    """Return the stable root identity for an API-attested topic conversation."""
+    source = getattr(event, "source", None)
+    if source is None or getattr(source, "hermes_group_topic", False) is not True:
+        return None
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not chat_id:
+        return None
+    root_id = str(getattr(source, "hermes_root_id", "") or "").strip()
+    raw_thread_id = str(
+        getattr(source, "hermes_raw_thread_id", "") or ""
+    ).strip()
+    message_id = str(
+        getattr(event, "message_id", None)
+        or getattr(source, "message_id", None)
+        or ""
+    ).strip()
+    if root_id:
+        return root_id
+    if not raw_thread_id and message_id:
+        return message_id
+    return group_topic_thread(event)
+
+
 def is_group_topic_event(event: Any) -> bool:
-    return group_topic_thread(event) is not None
+    return group_topic_conversation_id(event) is not None
 
 
 def is_shared_group_topic_event(event: Any) -> bool:
@@ -50,7 +78,7 @@ def is_shared_group_topic_event(event: Any) -> bool:
 
 def group_topic_epoch_actor(event: Any, sender_open_id: str) -> str:
     return (
-        group_topic_thread(event)
+        group_topic_conversation_id(event)
         if is_shared_group_topic_event(event)
         else None
     ) or sender_open_id or "unknown"
@@ -70,27 +98,32 @@ def _put_bounded(mapping: dict[str, Any], key: str, value: Any) -> None:
     mapping[key] = value
 
 
-async def _fetch_thread_id(adapter: Any, message_id: str, chat_id: str) -> Optional[str]:
+async def _fetch_topic_ids(
+    adapter: Any,
+    message_id: str,
+    chat_id: str,
+) -> tuple[Optional[str], Optional[str]]:
     client = getattr(adapter, "_client", None)
     if client is None or not message_id or not chat_id:
-        return None
+        return None, None
     request = adapter._build_get_message_request(message_id)
     response = await adapter._run_blocking(client.im.v1.message.get, request)
     if not response or getattr(response, "success", lambda: False)() is False:
         logger.debug("[multitenancy] group-topic hydration unavailable")
-        return None
+        return None, None
     items = getattr(getattr(response, "data", None), "items", None) or []
     item = items[0] if items else None
     if item is None:
         logger.debug("[multitenancy] group-topic hydration unavailable")
-        return None
+        return None, None
     if str(getattr(item, "chat_id", "") or "") != chat_id:
         logger.debug("[multitenancy] group-topic hydration rejected (chat mismatch)")
-        return None
+        raise _TopicHydrationRejected
     thread_id = str(getattr(item, "thread_id", "") or "").strip() or None
+    root_id = str(getattr(item, "root_id", "") or "").strip() or None
     if thread_id is None:
         logger.debug("[multitenancy] group-topic hydration unavailable")
-    return thread_id
+    return thread_id, root_id
 
 
 async def _is_topic_capable_chat(adapter: Any, chat_id: str) -> bool:
@@ -171,7 +204,13 @@ def _patch_process_inbound(adapter_type: Any) -> None:
                 canonical_thread_id = cached[1]
             else:
                 try:
-                    canonical_thread_id = await _fetch_thread_id(self, message_id, chat_id)
+                    canonical_thread_id, hydrated_root_id = await _fetch_topic_ids(
+                        self, message_id, chat_id
+                    )
+                    root_id = root_id or hydrated_root_id
+                except _TopicHydrationRejected:
+                    topic_capable = False
+                    root_id = None
                 except Exception as exc:
                     logger.debug(
                         "[multitenancy] group-topic hydration failed (%s)",
@@ -182,6 +221,17 @@ def _patch_process_inbound(adapter_type: Any) -> None:
                     _mapping(self, _CACHE_ATTR),
                     cache_key,
                     (chat_id, canonical_thread_id),
+                )
+        elif topic_capable and not root_id:
+            try:
+                _, root_id = await _fetch_topic_ids(self, message_id, chat_id)
+            except _TopicHydrationRejected:
+                topic_capable = False
+                canonical_thread_id = None
+            except Exception as exc:
+                logger.debug(
+                    "[multitenancy] group-topic hydration failed (%s)",
+                    type(exc).__name__,
                 )
 
         if canonical_thread_id and root_id:
@@ -195,7 +245,7 @@ def _patch_process_inbound(adapter_type: Any) -> None:
                 canonical_thread_id=canonical_thread_id,
                 raw_thread_id=raw_thread_id,
                 root_id=root_id,
-                is_topic=bool(canonical_thread_id and topic_capable),
+                is_topic=bool(topic_capable and (root_id or message_id or canonical_thread_id)),
             )
         if canonical_thread_id:
             setattr(message, "thread_id", canonical_thread_id)

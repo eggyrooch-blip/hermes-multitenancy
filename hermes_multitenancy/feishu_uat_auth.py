@@ -299,6 +299,89 @@ def parse_scopes(raw: str | Iterable[str] | None) -> list[str]:
     return sorted({value.strip() for value in values if value.strip()})
 
 
+def login_oauth_scope(*, shared_home: Optional[Path] = None) -> str:
+    """Return the fixed app's current user scope set without app credentials."""
+    shared = shared_home or resolve_shared_home()
+    client_id, client_secret = _feishu_app_credentials(shared)
+    granted = _app_granted_scope_names(client_id, client_secret)
+    return _scope_with_offline_access(None, granted)
+
+
+def import_login_oauth_uat(
+    *,
+    profile_name: str,
+    open_id: str,
+    token: dict[str, Any],
+    shared_home: Optional[Path] = None,
+) -> dict[str, bool]:
+    """Live-verify and persist one WebUI OAuth result through the UAT vault."""
+    shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
+    _assert_route(shared, profile_name, open_id)
+    if not isinstance(token, dict):
+        raise FeishuUatAuthError("Feishu OAuth token payload is required", status=400)
+
+    client_id, client_secret = _feishu_app_credentials(shared)
+    if str(token.get("app_id") or "").strip() != client_id:
+        raise FeishuUatAuthError("Feishu OAuth app does not match the configured app", status=403)
+    access_token = str(token.get("access_token") or "").strip()
+    if not access_token:
+        raise FeishuUatAuthError("Feishu OAuth access_token is required", status=400)
+    if not str(token.get("refresh_token") or "").strip():
+        raise FeishuUatAuthError("Feishu OAuth refresh_token is required", status=400)
+    if "offline_access" not in parse_scopes(token.get("scope")):
+        raise FeishuUatAuthError("Feishu OAuth scope must include offline_access", status=400)
+    # _token_payload defaults a missing expires_in to 7200 for the device flow, where
+    # the field has always been present. On this path a missing one means the v3
+    # response is malformed, and defaulting would persist an invented expires_at that
+    # drives refresh timing. Reject instead of guessing.
+    if token.get("expires_in") is None:
+        raise FeishuUatAuthProtocolError("Feishu OAuth response has invalid expires_in", status=502)
+    # 提交的 TTL 仍要当场校验并 fail fast。下面存的是刷新后的那一对,若不在这里查,
+    # 一个畸形的 expires_in(负数/天文数字)就会被静默丢弃而不是拒绝 —— 契约上它
+    # 代表调用方声称的 token 寿命,不合法就说明这次 OAuth 响应本身有问题。
+    _bounded_ttl_seconds(
+        token.get("expires_in"),
+        field_name="expires_in",
+        default=7200,
+        maximum=_MAX_ACCESS_TOKEN_TTL_SECONDS,
+    )
+
+    # The access_token and the refresh_token arrive as two independent fields, and
+    # only the access one can be checked with user_info. Verifying just that leaves a
+    # token-splicing hole: owner A's access_token + owner B's refresh_token passes,
+    # and the later refresh then mints B's access token under A's name — cross-tenant
+    # credential access (codex review #p0). So the refresh token must prove ownership
+    # too, and the ONLY way to make it prove anything is to spend it: exchange it, and
+    # verify the account behind the token it returns.
+    refresh_token = str(token.get("refresh_token") or "").strip()
+    rotated = _refresh_uat_token(refresh_token, client_id, client_secret)
+    rotated_access = str(rotated.get("access_token") or "").strip()
+    if not rotated_access:
+        raise FeishuUatAuthProtocolError("Feishu refresh response is missing access_token", status=502)
+
+    user_info = _fetch_user_info(rotated_access)
+    if not isinstance(user_info, dict):
+        raise FeishuUatAuthProtocolError("Feishu user_info response is not an object", status=502)
+    token_open_id = str(user_info.get("open_id") or "").strip()
+    if not token_open_id:
+        raise FeishuUatAuthProtocolError("Feishu user_info response is missing open_id", status=502)
+    if token_open_id != open_id:
+        raise FeishuUatAuthError("authorized account does not match requesting user", status=403)
+
+    # Persist the rotated pair, never the submitted one: it is the pair we just proved
+    # belongs to `open_id`, and Feishu rotates the refresh token on every exchange, so
+    # the submitted one may already be spent.
+    rotated_payload = dict(rotated)
+    rotated_payload.setdefault("scope", token.get("scope"))
+    payload = _token_payload(
+        rotated_payload, open_id=open_id, app_id=client_id, scope=str(token["scope"])
+    )
+    if not _store_uat(shared, profile_name, open_id, payload):
+        raise FeishuUatAuthError("Feishu OAuth credential import expired before commit", status=409)
+    return {"ok": True}
+
+
 def credential_status(
     *,
     profile_name: str,
@@ -371,6 +454,32 @@ def credential_status(
         status["refresh_error"] = refresh_error
     status["lark_cli"] = _lark_cli_status(shared, profile_name, open_id)
     return status
+
+
+def revoke_uat_credential(
+    *,
+    profile_name: str,
+    open_id: str,
+    shared_home: Optional[Path] = None,
+) -> bool:
+    """Delete only the routed owner's Feishu UAT and compatibility copy."""
+    shared = shared_home or resolve_shared_home()
+    _load_shared_env(shared)
+    _assert_route(shared, profile_name, open_id)
+    store = CredentialStore(shared / "multitenancy.db")
+    try:
+        deleted = store.delete_credential(
+            profile_name=profile_name,
+            subject_id=open_id,
+            provider="feishu",
+            secret_kind="uat",
+        )
+    finally:
+        store.close()
+    legacy = shared / "profiles" / profile_name / "feishu_uat" / f"{open_id}.json"
+    legacy_existed = legacy.is_file()
+    legacy.unlink(missing_ok=True)
+    return deleted or legacy_existed
 
 
 def _refresh_error_requires_reauth(exc: FeishuUatAuthError) -> bool:

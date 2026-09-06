@@ -13,6 +13,7 @@ from hermes_multitenancy import feishu_media_retry
 
 _MODULE_NAMES = (
     "gateway",
+    "gateway.platform_registry",
     "gateway.platforms",
     "gateway.platforms.feishu",
     "hermes_plugins",
