@@ -1424,7 +1424,6 @@ def _resolve_custom_provider_api_key(
             if key_env:
                 key = str(
                     (env_overrides or {}).get(key_env)
-                    or os.environ.get(key_env)
                     or ""
                 ).strip()
                 if key:
