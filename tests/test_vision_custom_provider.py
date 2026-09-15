@@ -56,6 +56,34 @@ _RUNTIME = {
 }
 
 
+def test_image_prep_runtime_reads_named_custom_key_from_profile_env(tmp_path):
+    shared = tmp_path / ".hermes"
+    profile = shared / "profiles" / "group"
+    profile.mkdir(parents=True)
+    (shared / "config.yaml").write_text(
+        """custom_providers:
+- name: zai-coding-plan
+  base_url: https://api.z.ai/api/coding/paas/v4
+  key_env: ZAI_API_KEY
+"""
+    )
+    (profile / "config.yaml").write_text(
+        """model:
+  default: custom:zai-coding-plan/glm-5.3
+  provider: custom:zai-coding-plan
+"""
+    )
+    (profile / ".env").write_text("ZAI_API_KEY=zai-profile-key\n")
+
+    assert router._profile_main_runtime_for_image_prep(profile) == {
+        "provider": "custom:zai-coding-plan",
+        "model": "glm-5.3",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "api_key": "zai-profile-key",
+        "api_mode": "",
+    }
+
+
 def _install_fake_aux(monkeypatch):
     fake = types.ModuleType("agent.auxiliary_client")
     fake._PROVIDER_VISION_MODELS = {}

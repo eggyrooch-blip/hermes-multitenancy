@@ -737,7 +737,9 @@ async def _legacy_real_run_agent(
             logger.debug("real_run_agent: bad model spec %r: %s", model_spec, exc)
             continue
 
-        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
+        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(
+            config, provider, env_overrides
+        )
         if not api_key:
             logger.debug("real_run_agent: no API key for provider %s", provider)
             continue
@@ -1376,6 +1378,7 @@ def _resolve_api_key(
 def _resolve_custom_provider_api_key(
     config: dict[str, Any],
     provider: str,
+    env_overrides: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
     """Inline ``api_key`` for a ``custom:<name>`` provider from config.yaml.
 
@@ -1417,6 +1420,14 @@ def _resolve_custom_provider_api_key(
             key = str(entry.get("api_key") or "").strip()
             if key:
                 return key
+            key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+            if key_env:
+                key = str(
+                    (env_overrides or {}).get(key_env)
+                    or ""
+                ).strip()
+                if key:
+                    return key
     return None
 
 
@@ -1435,6 +1446,20 @@ def _resolve_base_url(
             value = (env_overrides or {}).get(env_name) or os.environ.get(env_name)
             if value:
                 return str(value)
+    if provider.lower() == "custom" or provider.lower().startswith("custom:"):
+        want_name = provider.split(":", 1)[1].strip().lower() if ":" in provider else ""
+        model_base_url = str((config.get("model") or {}).get("base_url") or "").strip()
+        for entry in config.get("custom_providers") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip().lower().replace(" ", "-")
+            base_url = str(
+                entry.get("base_url") or entry.get("url") or entry.get("api") or ""
+            ).strip()
+            if want_name and name == want_name and base_url:
+                return base_url
+            if not want_name and model_base_url and base_url.rstrip("/") == model_base_url.rstrip("/"):
+                return base_url
     return _PROVIDER_BASE_URLS.get(provider)
 
 

@@ -129,7 +129,9 @@ def _run_with_aiagent(
         primary,
         strip_custom_context_suffix=True,
     )
-    api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
+    api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(
+        config, provider, env_overrides
+    )
     base_url = _resolve_base_url(provider, True, config, env_overrides)
     from ..billing_identity import (
         billing_endpoint_allowed,

@@ -101,3 +101,44 @@ def test_inline_custom_key_streams_content(monkeypatch, tmp_path):
 
     _setup(monkeypatch, tmp_path, _OkClient)
     assert asyncio.run(_collect(tmp_path)) == [("content", "成"), ("content", "功")]
+
+
+def test_key_env_custom_provider_uses_registered_endpoint(monkeypatch, tmp_path):
+    """A generated group profile may omit model.base_url; the named custom
+    provider remains the authority for both its key_env and endpoint."""
+    config = {
+        "model": {
+            "default": "custom:zai-coding-plan/glm-5.3",
+            "provider": "custom:zai-coding-plan",
+        },
+        "custom_providers": [{
+            "name": "zai-coding-plan",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "key_env": "ZAI_API_KEY",
+        }],
+    }
+    seen = {}
+
+    class _OkClient:
+        def __init__(self, api_key=None, base_url=None):
+            seen.update(api_key=api_key, base_url=base_url)
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        async def _create(self, **_kwargs):
+            async def _gen():
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                    content="OK", reasoning_content=None
+                ))])
+            return _gen()
+
+    (tmp_path / "auth.json").write_text(json.dumps({"credential_pool": {}}))
+    (tmp_path / ".env").write_text("ZAI_API_KEY=zai-test-key\n")
+    monkeypatch.setattr(ar, "_load_profile_config", lambda _home: config)
+    monkeypatch.setattr(streaming_mod, "_compose_system_text", lambda *a: "system")
+    monkeypatch.setattr("openai.AsyncOpenAI", _OkClient)
+
+    assert asyncio.run(_collect(tmp_path)) == [("content", "OK")]
+    assert seen == {
+        "api_key": "zai-test-key",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+    }
