@@ -10,4 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: ./scripts/run_tests.sh
+      - name: Test custom provider routing and failure notices
+        run: >-
+          ./scripts/run_tests.sh
+          tests/test_custom_provider_key.py
+          tests/test_streaming_custom_provider_key.py
+          tests/test_vision_custom_provider.py
+          tests/test_stream_failure_notice.py
