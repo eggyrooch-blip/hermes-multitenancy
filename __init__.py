@@ -15,9 +15,9 @@ def __getattr__(name: str):
     if name != "on_pre_gateway_dispatch":
         raise AttributeError(name)
     try:
-        from .hermes_multitenancy import on_pre_gateway_dispatch
+        from .hermes_multitenancy import _bootstrap_dispatch
     except ImportError:  # pragma: no cover - top-level pytest compatibility.
-        from hermes_multitenancy import on_pre_gateway_dispatch
-    return on_pre_gateway_dispatch
+        from hermes_multitenancy import _bootstrap_dispatch
+    return _bootstrap_dispatch
 
 __all__ = ["register"]

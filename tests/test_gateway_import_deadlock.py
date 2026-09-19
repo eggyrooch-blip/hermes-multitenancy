@@ -28,6 +28,9 @@ spec = importlib.util.spec_from_file_location(
 plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
+# Hermes resolves every manifest-declared hook during discovery, before it
+# calls register(). That lookup must remain just as import-light as register.
+manifest_hook = plugin.on_pre_gateway_dispatch
 
 class Ctx:
     def __init__(self):
@@ -41,7 +44,11 @@ forbidden = sorted(
     name for name in sys.modules
     if name == "gateway.run" or name.endswith("hermes_multitenancy.router")
 )
-print(json.dumps({"hooks": [name for name, _ in ctx.hooks], "forbidden": forbidden}))
+print(json.dumps({
+    "hooks": [name for name, _ in ctx.hooks],
+    "forbidden": forbidden,
+    "same_callback": ctx.hooks[0][1] is manifest_hook,
+}))
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -53,5 +60,5 @@ print(json.dumps({"hooks": [name for name, _ in ctx.hooks], "forbidden": forbidd
     )
 
     assert completed.stdout.strip() == (
-        '{"hooks": ["pre_gateway_dispatch"], "forbidden": []}'
+        '{"hooks": ["pre_gateway_dispatch"], "forbidden": [], "same_callback": true}'
     )
