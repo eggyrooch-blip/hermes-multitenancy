@@ -1,4 +1,4 @@
-name: Full suite
+name: ftask full suite
 
 on:
   push:
