@@ -6,8 +6,18 @@ at the package implementation used by editable/pip installs and tests.
 """
 
 try:
-    from .hermes_multitenancy import on_pre_gateway_dispatch, register
+    from .hermes_multitenancy import register
 except ImportError:  # pytest imports repo-root __init__.py as a top-level module.
-    from hermes_multitenancy import on_pre_gateway_dispatch, register
+    from hermes_multitenancy import register
 
-__all__ = ["register", "on_pre_gateway_dispatch"]
+
+def __getattr__(name: str):
+    if name != "on_pre_gateway_dispatch":
+        raise AttributeError(name)
+    try:
+        from .hermes_multitenancy import on_pre_gateway_dispatch
+    except ImportError:  # pragma: no cover - top-level pytest compatibility.
+        from hermes_multitenancy import on_pre_gateway_dispatch
+    return on_pre_gateway_dispatch
+
+__all__ = ["register"]

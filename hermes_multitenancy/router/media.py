@@ -984,7 +984,12 @@ def _profile_main_runtime_for_image_prep(profile_home: Path) -> Optional[dict[st
 
     api_key = ""
     try:
-        api_key = str(_resolve_custom_provider_api_key(config, provider) or "").strip()
+        from dotenv import dotenv_values
+
+        profile_env = dict(dotenv_values(Path(profile_home) / ".env"))
+        api_key = str(
+            _resolve_custom_provider_api_key(config, provider, profile_env) or ""
+        ).strip()
     except Exception as exc:
         _m.logger.debug("multitenancy: cannot resolve custom provider api key for image prep (%s)", exc)
 

@@ -76,7 +76,7 @@ def _build_runtime_pool(runtime_factory):
     )
 
 
-def _register(ctx) -> None:
+def _register(ctx, *, register_dispatch_hook: bool = True) -> None:
     """Hermes plugin entry point — wires the multitenancy router to pre_gateway_dispatch.
 
     Called by Hermes plugin loader once at startup. ``ctx`` is a PluginContext
@@ -174,7 +174,8 @@ def _register(ctx) -> None:
     _register_optional_vod_image_gen_provider(ctx)
     ctx.register_hook("post_tool_call", post_lark_cli_operation)
     ctx.register_hook("transform_tool_result", transform_lark_cli_operation_result)
-    ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
+    if register_dispatch_hook:
+        ctx.register_hook("pre_gateway_dispatch", _dispatch_with_worker_init)
 
 
 def _register_optional_vod_image_gen_provider(ctx) -> bool:

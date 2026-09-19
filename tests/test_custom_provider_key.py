@@ -52,6 +52,36 @@ def test_entry_without_key_returns_none():
     assert ar._resolve_custom_provider_api_key(cfg, "custom:litellm-sre") is None
 
 
+def test_resolves_key_env_from_profile_environment():
+    cfg = _cfg()
+    cfg["custom_providers"][0].pop("api_key")
+    cfg["custom_providers"][0]["key_env"] = "ZAI_API_KEY"
+
+    assert ar._resolve_custom_provider_api_key(
+        cfg, "custom:litellm-sre", {"ZAI_API_KEY": "zai-test-key"}
+    ) == "zai-test-key"
+
+
+def test_custom_key_env_does_not_read_untrusted_ambient_environment(monkeypatch):
+    cfg = _cfg()
+    cfg["custom_providers"][0].pop("api_key")
+    cfg["custom_providers"][0]["key_env"] = "FEISHU_APP_SECRET"
+    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-leave-host")
+
+    assert ar._resolve_custom_provider_api_key(
+        cfg, "custom:litellm-sre", {}
+    ) is None
+
+
+def test_named_custom_provider_resolves_its_registered_base_url():
+    cfg = _cfg()
+    cfg["model"].pop("base_url")
+
+    assert ar._resolve_base_url(
+        "custom:litellm-sre", True, cfg, {}
+    ) == "https://litellm.sre.example.com/v1"
+
+
 def test_slug_name_normalized_with_spaces():
     cfg = _cfg()
     cfg["custom_providers"][0]["name"] = "Lite LLM SRE"  # normalizes to "lite-llm-sre"
