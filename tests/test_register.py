@@ -115,7 +115,6 @@ def test_register_adds_tencent_vod_image_provider_when_supported():
             image_providers.append(provider)
 
     register(FakeCtx())
-
     assert [name for name, _cb in hook_calls] == [
         "post_tool_call",
         "transform_tool_result",

@@ -132,7 +132,9 @@ async def _stream_loop(
             )
         except ValueError:
             continue
-        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(config, provider)
+        api_key = _resolve_api_key(provider, env_overrides, auth) or _resolve_custom_provider_api_key(
+            config, provider, env_overrides
+        )
         if not api_key:
             continue
         base_url = _resolve_base_url(provider, model_spec == primary, config, env_overrides)

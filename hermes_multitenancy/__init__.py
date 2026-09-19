@@ -97,5 +97,4 @@ def register(ctx) -> None:
         logger.critical("[multitenancy] required plugin registration failed: %s", type(exc).__name__)
         raise SystemExit(1) from None
 
-
 __all__ = ["register", "on_pre_gateway_dispatch", "_build_runtime_pool"]
