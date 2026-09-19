@@ -24,10 +24,15 @@ class QuarantineReport:
 
 def _live_pid(path: Path) -> bool:
     try:
-        pid = int(path.read_text(encoding="utf-8").strip())
+        raw = path.read_text(encoding="utf-8").strip()
+        try:
+            pid = int(raw)
+        except ValueError:
+            payload = json.loads(raw)
+            pid = int(payload["pid"])
         os.kill(pid, 0)
         return True
-    except (OSError, ValueError):
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
 
@@ -47,7 +52,7 @@ def _cron_profile_names(value: Any, known: set[str]) -> set[str]:
 def _db_references(shared_home: Path) -> set[str] | None:
     db_path = shared_home / "multitenancy.db"
     if not db_path.is_file():
-        return set()
+        return None
     refs: set[str] = set()
     queries = (
         "SELECT profile_name FROM multitenancy_routing WHERE active = 1",
@@ -100,12 +105,16 @@ def quarantine_orphan_profiles(shared_home: Path, *, apply: bool = False) -> Qua
         if (profile / ".keep").exists() or _live_pid(profile / "gateway.pid"):
             refs.add(name)
 
-    cron_path = shared_home / "cron" / "jobs.json"
-    if cron_path.is_file():
-        try:
-            refs.update(_cron_profile_names(json.loads(cron_path.read_text()), known))
-        except (OSError, json.JSONDecodeError):
-            return report
+    cron_paths = [shared_home / "cron" / "jobs.json"]
+    cron_paths.extend(profile / "cron" / "jobs.json" for profile in profiles.values())
+    for cron_path in cron_paths:
+        if cron_path.is_file():
+            try:
+                refs.update(_cron_profile_names(json.loads(cron_path.read_text()), known))
+                if cron_path.parent.parent.name in known:
+                    refs.add(cron_path.parent.parent.name)
+            except (OSError, json.JSONDecodeError):
+                return report
 
     report.referenced = sorted(refs & known)
     report.candidates = sorted(known - refs)

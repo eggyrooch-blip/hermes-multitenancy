@@ -77,48 +77,12 @@ def test_register_calls_required_hooks():
             calls.append((name, cb))
 
     register(FakeCtx())
-    # Cold registration is deliberately import-light; operational hooks are
-    # installed by this bootstrap callback on the first live dispatch.
-    assert [name for name, _cb in calls] == ["pre_gateway_dispatch"]
+    assert [name for name, _cb in calls] == [
+        "post_tool_call",
+        "transform_tool_result",
+        "pre_gateway_dispatch",
+    ]
     assert all(callable(cb) for _name, cb in calls)
-
-
-def test_first_dispatch_bootstraps_once_then_routes_every_message(monkeypatch):
-    """The public gateway callback must not trade cold-start safety for lost messages."""
-    import hermes_multitenancy
-
-    callbacks = []
-    bootstrap_calls = []
-    routed = []
-
-    class FakeCtx:
-        def register_hook(self, name, cb):
-            assert name == "pre_gateway_dispatch"
-            callbacks.append(cb)
-
-    monkeypatch.setattr(hermes_multitenancy, "_bootstrap_ctx", None)
-    monkeypatch.setattr(hermes_multitenancy, "_bootstrap_ready", False)
-    monkeypatch.setattr(
-        hermes_multitenancy,
-        "_register",
-        lambda ctx, *, register_dispatch_hook: bootstrap_calls.append(
-            (ctx, register_dispatch_hook)
-        ),
-    )
-    monkeypatch.setattr(
-        hermes_multitenancy,
-        "_dispatch_with_worker_init",
-        lambda **kwargs: routed.append(kwargs["event"]) or {"action": "skip"},
-    )
-
-    ctx = FakeCtx()
-    hermes_multitenancy.register(ctx)
-    first = callbacks[0](event="first", gateway=object())
-    second = callbacks[0](event="second", gateway=object())
-
-    assert bootstrap_calls == [(ctx, False)]
-    assert routed == ["first", "second"]
-    assert first == second == {"action": "skip"}
 
 
 def test_register_terminates_when_required_boundary_fails(monkeypatch):
@@ -150,19 +114,11 @@ def test_register_adds_tencent_vod_image_provider_when_supported():
         def register_image_gen_provider(self, provider):
             image_providers.append(provider)
 
-    ctx = FakeCtx()
-    register(ctx)
-
-    assert [name for name, _cb in hook_calls] == ["pre_gateway_dispatch"]
-
-    # Exercise the post-bootstrap registration surface directly; the separate
-    # cold-start test proves it is not reached during plugin discovery.
-    import hermes_multitenancy
-    hermes_multitenancy._register(ctx, register_dispatch_hook=False)
+    register(FakeCtx())
     assert [name for name, _cb in hook_calls] == [
-        "pre_gateway_dispatch",
         "post_tool_call",
         "transform_tool_result",
+        "pre_gateway_dispatch",
     ]
     assert len(image_providers) == 1
     assert image_providers[0].name == "tencent-vod"
@@ -186,7 +142,7 @@ def test_register_schedules_optional_webui_run_broker_sidecar(monkeypatch, tmp_p
         lambda: calls.append(("run_broker_server", None)),
     )
 
-    hermes_multitenancy._register(FakeCtx(), register_dispatch_hook=False)
+    hermes_multitenancy.register(FakeCtx())
 
     assert ("run_broker_server", None) in calls
 
@@ -215,7 +171,7 @@ def test_router_register_disables_direct_helpdesk_and_installs_clarify_after_med
     monkeypatch.setattr(hermes_multitenancy.webui_broker_server, "ensure_run_broker_server_started", lambda: None)
     monkeypatch.setattr(hermes_multitenancy, "_start_credential_renewal_subsystem", lambda: None)
 
-    hermes_multitenancy._register(FakeCtx(), register_dispatch_hook=False)
+    hermes_multitenancy.register(FakeCtx())
 
     assert calls == ["media", "clarify"]
 

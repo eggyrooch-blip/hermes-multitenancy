@@ -65,6 +65,38 @@ def test_stale_gateway_pid_is_not_a_live_reference(tmp_path):
     profile.mkdir(parents=True)
     (profile / "gateway.pid").write_text("999999999\n")
 
+    _db(tmp_path / "multitenancy.db")
     report = quarantine_orphan_profiles(tmp_path, apply=False)
 
     assert report.candidates == ["stale"]
+
+
+def test_json_gateway_pid_and_profile_local_cron_are_live_references(tmp_path, monkeypatch):
+    from hermes_multitenancy import profile_lifecycle
+
+    profiles = tmp_path / "profiles"
+    live = profiles / "live"
+    scheduled = profiles / "scheduled"
+    live.mkdir(parents=True)
+    (scheduled / "cron").mkdir(parents=True)
+    (live / "gateway.pid").write_text(json.dumps({"pid": 4242}))
+    (scheduled / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{}]}))
+    _db(tmp_path / "multitenancy.db")
+    monkeypatch.setattr(profile_lifecycle.os, "kill", lambda pid, signal: None if pid == 4242 else None)
+
+    report = profile_lifecycle.quarantine_orphan_profiles(tmp_path)
+
+    assert report.candidates == []
+    assert report.referenced == ["live", "scheduled"]
+
+
+def test_missing_routing_database_fails_closed(tmp_path):
+    from hermes_multitenancy.profile_lifecycle import quarantine_orphan_profiles
+
+    (tmp_path / "profiles" / "only-profile").mkdir(parents=True)
+
+    report = quarantine_orphan_profiles(tmp_path, apply=True)
+
+    assert report.candidates == []
+    assert report.quarantined == []
+    assert (tmp_path / "profiles" / "only-profile").is_dir()

@@ -16,12 +16,8 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
-import threading
 
 logger = logging.getLogger(__name__)
-_bootstrap_ctx = None
-_bootstrap_ready = False
-_bootstrap_lock = threading.Lock()
 
 # Importing ANY hermes_multitenancy submodule executes this package __init__
 # first, so an eager import here drags 187 of the package's 225 files into
@@ -91,40 +87,14 @@ def _self():
 
 
 def register(ctx) -> None:
-    """Register an import-light gateway boundary.
-
-    Hermes may discover plugins on a worker while ``gateway.run`` is still
-    importing on the main thread.  Importing the router/runtime graph here can
-    form a cross-thread import-lock cycle, so production initialisation is
-    deferred until the first dispatch, after gateway discovery has completed.
-    """
-    global _bootstrap_ctx
-    _bootstrap_ctx = ctx
+    """Register the production isolation boundary or terminate startup."""
     try:
-        ctx.register_hook("pre_gateway_dispatch", _bootstrap_dispatch)
+        _self()._register(ctx)
     except Exception as exc:
         # The host treats plugin registration errors as optional.  Converting a
         # multitenancy failure to SystemExit keeps production fail-closed
         # without changing hermes-agent.
         logger.critical("[multitenancy] required plugin registration failed: %s", type(exc).__name__)
         raise SystemExit(1) from None
-
-
-def _bootstrap_dispatch(**kwargs):
-    """Initialise once at the first live gateway event, then route it."""
-    global _bootstrap_ready
-    if not _bootstrap_ready:
-        with _bootstrap_lock:
-            if not _bootstrap_ready:
-                if _bootstrap_ctx is None:
-                    return {"action": "skip", "reason": "multitenancy bootstrap unavailable"}
-                try:
-                    _self()._register(_bootstrap_ctx, register_dispatch_hook=False)
-                except Exception:
-                    logger.exception("[multitenancy] lazy plugin bootstrap failed; dropping event")
-                    return {"action": "skip", "reason": "multitenancy bootstrap failed"}
-                _bootstrap_ready = True
-    return _self()._dispatch_with_worker_init(**kwargs)
-
 
 __all__ = ["register", "on_pre_gateway_dispatch", "_build_runtime_pool"]
