@@ -2850,4 +2850,5 @@ from .provisioning import (  # noqa: E402,F401
     _write_group_profile_env,
     _disable_webui_agent_feishu_platform_file,
     _disable_webui_agent_feishu_platform,
+    repair_group_profile_feishu_platforms,
 )

@@ -391,11 +391,11 @@ def _ensure_group_profile(
     config_path = profile_home / "config.yaml"
     if config_path.exists():
         _m._normalize_profile_config_file(config_path, shared_home=shared_home)
+        _m._disable_webui_agent_feishu_platform_file(config_path)
     else:
-        config_path.write_text(
-            _m._dump_profile_config(_m._profile_config_from_shared_home(shared_home)),
-            encoding="utf-8",
-        )
+        config = _m._profile_config_from_shared_home(shared_home)
+        _m._disable_webui_agent_feishu_platform(config)
+        config_path.write_text(_m._dump_profile_config(config), encoding="utf-8")
 
     soul_path = profile_home / "SOUL.md"
     if not soul_path.exists():
@@ -606,6 +606,12 @@ def _write_group_profile_env(profile_home: Path, shared_home: Path, chat_id: str
 
 
 def _disable_webui_agent_feishu_platform_file(config_path: Path) -> None:
+    """Disable a routed profile's direct Feishu listener on disk.
+
+    Despite the historical WebUI-specific name, this boundary applies to every
+    routed group profile: the default profile owns the one live Feishu ingress,
+    while group profiles retain Feishu/lark-cli tool configuration only.
+    """
     try:
         import yaml
 
@@ -624,7 +630,74 @@ def _disable_webui_agent_feishu_platform_file(config_path: Path) -> None:
 
 
 def _disable_webui_agent_feishu_platform(config: dict[str, Any]) -> None:
-    """WebUI group agents use lark-cli bot auth but must not connect Feishu."""
+    """Routed group agents use lark-cli bot auth but must not connect Feishu."""
     platforms = config.setdefault("platforms", {})
     if isinstance(platforms, dict):
         platforms["feishu"] = {"enabled": False}
+
+
+def repair_group_profile_feishu_platforms(
+    *,
+    shared_home: Path | None = None,
+    profiles_root: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Backfill the single-ingress invariant for existing Feishu group profiles.
+
+    Hermes 0.21 rejects multiple adapters that claim the same bot credential.
+    Older generated group configs copied the default profile's Feishu block,
+    which made multiplex startup open duplicate WebSocket clients.  Group turns
+    are already admitted and routed by the default adapter, so their own
+    platform listener must remain explicitly disabled.
+    """
+    root = (shared_home or Path(os.environ.get("HERMES_HOME", "~/.hermes"))).expanduser()
+    profiles = profiles_root or (root / "profiles")
+    stats = {
+        "scanned": 0,
+        "updated": 0,
+        "planned_updated": 0,
+        "kept": 0,
+        "skipped_non_group": 0,
+        "skipped_missing": 0,
+        "skipped_invalid": 0,
+        "errors": 0,
+    }
+    if not profiles.exists():
+        return stats
+
+    for profile_home in sorted(path for path in profiles.iterdir() if path.is_dir()):
+        stats["scanned"] += 1
+        if not is_group_profile_name(profile_home.name):
+            stats["skipped_non_group"] += 1
+            continue
+        config_path = profile_home / "config.yaml"
+        if not config_path.is_file():
+            stats["skipped_missing"] += 1
+            continue
+        try:
+            import yaml
+
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(loaded, dict):
+                stats["skipped_invalid"] += 1
+                continue
+            before = json.dumps(loaded, sort_keys=True, ensure_ascii=True)
+            _disable_webui_agent_feishu_platform(loaded)
+            after = json.dumps(loaded, sort_keys=True, ensure_ascii=True)
+            if after == before:
+                stats["kept"] += 1
+                continue
+            if dry_run:
+                stats["planned_updated"] += 1
+                continue
+            tmp = config_path.with_name(f".{config_path.name}.tmp.{os.getpid()}")
+            tmp.write_text(_m._dump_profile_config(loaded), encoding="utf-8")
+            os.replace(tmp, config_path)
+            stats["updated"] += 1
+        except Exception:
+            _m.logger.exception(
+                "multitenancy: failed to disable group Feishu listener profile=%s",
+                profile_home.name,
+            )
+            stats["errors"] += 1
+    return stats

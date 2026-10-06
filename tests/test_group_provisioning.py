@@ -160,6 +160,7 @@ def test_ensure_group_profile_writes_marker_and_soul(tmp_path):
     assert "feishu_docx" not in config_text
     config = _read_yaml(profile_home / "config.yaml")
     assert config["image_gen"] == {"provider": "tencent-vod", "model": "gem-3.1"}
+    assert config["platforms"]["feishu"] == {"enabled": False}
     # The group profile marker exists and forbids feishu_auth.
     marker = json.loads((profile_home / "group_profile.json").read_text("utf-8"))
     assert marker["kind"] == "group"
@@ -195,6 +196,58 @@ def test_ensure_group_profile_is_idempotent(tmp_path):
     soul_after = (profile_home / "SOUL.md").read_text("utf-8")
     assert soul_after == soul_before
     assert soul_after.count("Feishu/Lark capability rules:") == 1
+
+
+def test_existing_group_profile_keeps_direct_feishu_listener_disabled(tmp_path):
+    from hermes_multitenancy.router import _ensure_group_profile
+
+    shared = tmp_path / ".hermes"
+    shared.mkdir()
+    (shared / "config.yaml").write_text(
+        "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: stale-app\n",
+        encoding="utf-8",
+    )
+    profile_home = shared / "profiles" / "feishu_group_existing"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: stale-app\n",
+        encoding="utf-8",
+    )
+
+    _ensure_group_profile(
+        profile_name=profile_home.name,
+        profile_home=profile_home,
+        chat_id="oc_existing",
+        owner_open_id="ou_owner",
+        display_label="Existing",
+    )
+
+    config = _read_yaml(profile_home / "config.yaml")
+    assert config["platforms"]["feishu"] == {"enabled": False}
+
+
+def test_repair_group_profile_feishu_platforms_updates_only_group_profiles(tmp_path):
+    from hermes_multitenancy.router import repair_group_profile_feishu_platforms
+
+    shared = tmp_path / ".hermes"
+    profiles = shared / "profiles"
+    group = profiles / "feishu_group_old"
+    user = profiles / "user_profile"
+    group.mkdir(parents=True)
+    user.mkdir(parents=True)
+    stale = "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: stale-app\n"
+    (group / "config.yaml").write_text(stale, encoding="utf-8")
+    (user / "config.yaml").write_text(stale, encoding="utf-8")
+
+    first = repair_group_profile_feishu_platforms(shared_home=shared)
+    second = repair_group_profile_feishu_platforms(shared_home=shared)
+
+    assert first["updated"] == 1
+    assert first["skipped_non_group"] == 1
+    assert second["updated"] == 0
+    assert second["kept"] == 1
+    assert _read_yaml(group / "config.yaml")["platforms"]["feishu"] == {"enabled": False}
+    assert _read_yaml(user / "config.yaml")["platforms"]["feishu"]["enabled"] is True
 
 
 def test_ensure_group_profile_extends_existing_lark_guidance_without_duplicate_heading(tmp_path):
